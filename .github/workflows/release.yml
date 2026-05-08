@@ -1,0 +1,212 @@
+name: Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Package index to publish to
+        required: true
+        default: TestPyPI
+        type: choice
+        options:
+          - TestPyPI
+          - PyPI
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_COLOR: "1"
+  UV_NO_PROGRESS: "1"
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Reject PyPI dispatch without a release tag
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.target == 'PyPI' &&
+          !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "PyPI publishing requires running this workflow from a v* tag."
+          exit 1
+
+      - name: Validate release tag version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(
+            python - <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as pyproject:
+              print(tomllib.load(pyproject)["project"]["version"])
+          PY
+          )"
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ "$tag_version" != "$version" ]; then
+            echo "Tag version $tag_version does not match pyproject.toml version $version."
+            exit 1
+          fi
+
+      - name: Build source and wheel distributions
+        run: uv build
+
+      - name: Check package metadata
+        run: uv run --with twine --no-project python -m twine check dist/*
+
+      - name: List distributions
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          for path in sorted(Path("dist").iterdir()):
+              print(f"{path.name}\t{path.stat().st_size}")
+          PY
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: Test wheel on ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Verify uv interpreter
+        shell: bash
+        run: |
+          actual="$(
+            uv run --no-project python - <<'PY'
+          import sys
+
+          print(f"{sys.version_info.major}.{sys.version_info.minor}")
+          PY
+          )"
+          if [ "$actual" != "$UV_PYTHON" ]; then
+            echo "uv selected Python $actual, expected $UV_PYTHON."
+            exit 1
+          fi
+
+      - name: Run tests against built wheel
+        shell: bash
+        run: uv run --no-project --with dist/*.whl python -m unittest discover -s tests
+
+      - name: Smoke test console script
+        shell: bash
+        run: uv run --no-project --with dist/*.whl vibe-loop --help >/dev/null
+
+  publish-testpypi:
+    name: Publish to TestPyPI
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && inputs.target == 'TestPyPI'
+    runs-on: ubuntu-latest
+    environment:
+      name: TestPyPI
+      url: https://test.pypi.org/project/vibe-loop/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distributions to TestPyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          attestations: true
+          print-hash: true
+          skip-existing: true
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: test
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' &&
+      inputs.target == 'PyPI' &&
+      startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    environment:
+      name: PyPI
+      url: https://pypi.org/project/vibe-loop/
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          attestations: true
+          print-hash: true

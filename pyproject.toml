@@ -3,11 +3,32 @@ name = "vibe-loop"
 version = "0.1.0"
 description = "One-slice AI coding loop runner with pluggable task sources"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "Andrew Grigorev", email = "andrew@ei-grad.ru" }
 ]
 requires-python = ">=3.11"
+keywords = ["agents", "automation", "cli", "coding-agents", "task-runner"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+    "Topic :: Utilities",
+]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ei-grad/vibe-loop"
+Repository = "https://github.com/ei-grad/vibe-loop"
+Issues = "https://github.com/ei-grad/vibe-loop/issues"
 
 [project.scripts]
 vibe-loop = "vibe_loop:main"
