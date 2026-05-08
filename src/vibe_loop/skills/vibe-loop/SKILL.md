@@ -1,6 +1,6 @@
 ---
 name: vibe-loop
-description: Use for one-slice non-trivial AI coding work, full-cycle feature implementation, bounded project work, or finite "vibe loop" requests. Guides inspect-plan-edit-test-review-merge iteration, including branch/worktree isolation when appropriate.
+description: Use for one-slice non-trivial AI coding work, full-cycle feature implementation, bounded project work, or finite "vibe loop" requests. Guides inspect-plan-edit-test-review-merge iteration with branch/worktree isolation.
 ---
 
 # Vibe Loop
@@ -14,7 +14,8 @@ summary, then stop so an external loop can invoke the next slice.
 ## Core Loop
 
 1. Inspect the task, code, tests, docs, repo instructions, worktree state, and
-   constraints.
+   constraints; create or choose the slice workspace before implementation
+   edits.
 2. Plan the next coherent slice from repo-local sources first: instructions,
    design docs, roadmaps, issues, TODOs, and existing plans.
 3. Edit in scoped increments and keep the project working.
@@ -60,12 +61,19 @@ missing approval, access, or decision.
 
 ## Worktree And Integration
 
-For full-cycle bounded work, use a branch/worktree when repo/user policy permits;
-keep `main` clean during implementation. When that policy permits local
-full-cycle delivery, this skill includes permission to create the slice
-branch/worktree, commit the slice, fast-forward merge it to `main`, verify on
-`main`, then remove the merged worktree and local branch. Do not push,
-force-push, reset, or bypass repo/user policy.
+For full-cycle bounded work, use a dedicated branch/worktree when repo/user
+policy permits; keep `main` clean during implementation. Create the slice
+branch/worktree before implementation edits begin.
+
+If a dedicated worktree cannot be created, or repo/user policy forbids creating
+one, state the precise blocker and proceed in the primary worktree only after
+inspecting its current state. Do not silently fall back to editing the primary
+worktree.
+
+When repo/user policy permits local full-cycle delivery, this skill includes
+permission to create the slice branch/worktree, commit the slice, fast-forward
+merge it to `main`, verify on `main`, then remove the merged worktree and local
+branch. Do not push, force-push, reset, or bypass repo/user policy.
 
 If repo/user policy forbids local integration or requires missing approval, stop
 with the precise blocker after the reviewed slice is committed.
