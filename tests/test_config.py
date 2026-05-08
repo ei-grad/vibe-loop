@@ -37,6 +37,29 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "agent.forward_stderr"):
                 load_config(repo)
 
+    def test_task_source_plan_paths_can_be_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nplan_paths = ["WORK.md", "docs/BACKLOG.md"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.task_source.plan_paths, ("WORK.md", "docs/BACKLOG.md"))
+
+    def test_task_source_plan_paths_rejects_non_string_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\nplan_paths = [123]\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "task_source.plan_paths"):
+                load_config(repo)
+
 
 if __name__ == "__main__":
     unittest.main()

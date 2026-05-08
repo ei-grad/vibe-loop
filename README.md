@@ -7,11 +7,15 @@ records local run metadata, and can repeat until no runnable tasks remain.
 
 The runner is task-system agnostic. Repositories can expose tasks through a
 Markdown plan table, command adapters, or later tracker-specific adapters. The
-default adapter reads `docs/PLAN.md` tables with these columns:
+default adapter discovers Markdown files with tables using these columns:
 
 ```text
 ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence
 ```
+
+Without explicit configuration, Markdown discovery scores all `.md` files outside
+ignored build/state directories and picks the best unambiguous parseable plan.
+Set `task_source.plan_path` when a repo has multiple plausible plan files.
 
 Runnable statuses default to `Active`, `Next`, and `Planned`. A task is runnable
 when all listed dependencies are `Done` and no local lock exists.
@@ -57,7 +61,9 @@ forward_stderr = false
 
 [task_source]
 type = "markdown-plan"
+# Optional. If omitted, vibe-loop discovers the best Markdown task table.
 plan_path = "docs/PLAN.md"
+plan_paths = ["docs/PLAN.md", "PLAN.md", "ROADMAP.md", "TODO.md"]
 runnable_statuses = ["Active", "Next", "Planned"]
 
 [completion]
@@ -91,5 +97,6 @@ Runner state is intentionally untracked:
   runs.jsonl
 ```
 
-Project worklogs should remain final evidence ledgers. Attempt logs and failed
-runs belong in `.vibe-loop/`, not in project completion records.
+`runs.jsonl` is an append-only stream of versioned run result records. Project
+worklogs should remain final evidence ledgers. Attempt logs and failed runs
+belong in `.vibe-loop/`, not in project completion records.

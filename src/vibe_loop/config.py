@@ -6,6 +6,18 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_PLAN_PATHS = (
+    "docs/PLAN.md",
+    "PLAN.md",
+    "plan.md",
+    "docs/plan.md",
+    "docs/plans.md",
+    "docs/ROADMAP.md",
+    "ROADMAP.md",
+    "TODO.md",
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class AgentConfig:
     command: str = "codex exec '$vibe-loop {task_id}'"
@@ -16,7 +28,8 @@ class AgentConfig:
 @dataclasses.dataclass(frozen=True)
 class TaskSourceConfig:
     type: str = "markdown-plan"
-    plan_path: str = "docs/PLAN.md"
+    plan_path: str | None = None
+    plan_paths: tuple[str, ...] = DEFAULT_PLAN_PATHS
     list_command: str | None = None
     next_command: str | None = None
     probe_command: str | None = None
@@ -90,9 +103,19 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         runnable = tuple(statuses)
     else:
         raise ValueError("task_source.runnable_statuses must be an array of strings")
+    plan_paths = table.get("plan_paths")
+    if plan_paths is None:
+        candidate_paths = DEFAULT_PLAN_PATHS
+    elif isinstance(plan_paths, list) and all(
+        isinstance(item, str) for item in plan_paths
+    ):
+        candidate_paths = tuple(plan_paths)
+    else:
+        raise ValueError("task_source.plan_paths must be an array of strings")
     return TaskSourceConfig(
         type=str(table.get("type") or "markdown-plan"),
-        plan_path=str(table.get("plan_path") or "docs/PLAN.md"),
+        plan_path=optional_string(table.get("plan_path")),
+        plan_paths=candidate_paths,
         list_command=optional_string(table.get("list")),
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),

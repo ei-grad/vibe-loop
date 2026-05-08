@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Protocol
@@ -12,6 +13,35 @@ from vibe_loop.config import TaskSourceConfig
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 STATUS_RANK = {"Active": 0, "Next": 1, "Planned": 2}
+TASK_TABLE_HEADER = [
+    "ID",
+    "Priority",
+    "Status",
+    "Dependencies",
+    "Scope",
+    "Acceptance",
+    "Evidence",
+]
+DISCOVERY_SKIP_DIRS = {
+    ".git",
+    ".vibe-loop",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "node_modules",
+    "target",
+}
+MAX_DISCOVERY_FILE_BYTES = 2 * 1024 * 1024
+PLAN_NAME_TERMS = ("plan", "backlog", "roadmap", "task", "todo", "work")
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanCandidate:
+    path: Path
+    score: int
+    task_count: int
+    reasons: tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +85,10 @@ class TaskSource(Protocol):
 
 def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
     if config.type == "markdown-plan":
-        return MarkdownPlanSource(repo / config.plan_path, config.runnable_statuses)
+        return MarkdownPlanSource(
+            discover_markdown_plan(repo, config),
+            config.runnable_statuses,
+        )
     if config.type == "command":
         return CommandTaskSource(repo, config)
     raise ValueError(f"unsupported task source type: {config.type}")
@@ -105,19 +138,13 @@ class MarkdownPlanSource:
         section = ""
         in_table = False
         saw_separator = False
-        for line in self.path.read_text(encoding="utf-8").splitlines():
+        for line in self.path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
             if line.startswith("### "):
                 section = line.removeprefix("### ").strip()
             cells = split_markdown_row(line)
-            if cells == [
-                "ID",
-                "Priority",
-                "Status",
-                "Dependencies",
-                "Scope",
-                "Acceptance",
-                "Evidence",
-            ]:
+            if cells == TASK_TABLE_HEADER:
                 in_table = True
                 saw_separator = False
                 continue
@@ -152,6 +179,109 @@ class MarkdownPlanSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+
+def discover_markdown_plan(repo: Path, config: TaskSourceConfig) -> Path:
+    if config.plan_path:
+        return repo / config.plan_path
+    candidates = find_markdown_plan_candidates(repo, config)
+    if len(candidates) == 1:
+        return candidates[0].path
+    if len(candidates) > 1:
+        best_score = candidates[0].score
+        best = [candidate for candidate in candidates if candidate.score == best_score]
+        if len(best) == 1:
+            return best[0].path
+        paths = ", ".join(
+            f"{candidate.path.relative_to(repo)} score={candidate.score}"
+            for candidate in best
+        )
+        raise ValueError(
+            f"multiple markdown plan files tied; set task_source.plan_path: {paths}"
+        )
+    searched = ", ".join(config.plan_paths)
+    raise FileNotFoundError(
+        "no markdown plan file found; set task_source.plan_path or add a "
+        f"markdown task table. Candidate paths: {searched}"
+    )
+
+
+def find_markdown_plan_candidates(
+    repo: Path,
+    config: TaskSourceConfig,
+) -> list[PlanCandidate]:
+    configured = {
+        (repo / path).resolve(): len(config.plan_paths) - index
+        for index, path in enumerate(config.plan_paths)
+    }
+    matches: list[PlanCandidate] = []
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = sorted(d for d in dirs if d not in DISCOVERY_SKIP_DIRS)
+        root_path = Path(root)
+        for filename in sorted(files):
+            if filename.lower().endswith(".md"):
+                path = root_path / filename
+                candidate = evaluate_markdown_plan(repo, path, configured)
+                if candidate is not None:
+                    matches.append(candidate)
+    return sorted(
+        matches,
+        key=lambda candidate: (
+            -candidate.score,
+            str(candidate.path),
+        ),
+    )
+
+
+def evaluate_markdown_plan(
+    repo: Path,
+    path: Path,
+    configured: dict[Path, int],
+) -> PlanCandidate | None:
+    if not contains_task_table(path):
+        return None
+    tasks = MarkdownPlanSource(path, ()).list_tasks()
+    if not tasks:
+        return None
+    score = 100
+    reasons = ["task-table"]
+    task_points = min(len(tasks), 20)
+    score += task_points
+    reasons.append(f"tasks={len(tasks)}")
+    name = path.name.lower()
+    if any(term in name for term in PLAN_NAME_TERMS):
+        score += 10
+        reasons.append("plan-like-name")
+    relative_path = path.relative_to(repo)
+    if any(
+        term in str(part).lower()
+        for part in relative_path.parts
+        for term in ("doc", "plan")
+    ):
+        score += 5
+        reasons.append("plan-like-path")
+    configured_bonus = configured.get(path.resolve(), 0)
+    if configured_bonus:
+        score += configured_bonus
+        reasons.append("configured-candidate")
+    return PlanCandidate(
+        path=path,
+        score=score,
+        task_count=len(tasks),
+        reasons=tuple(reasons),
+    )
+
+
+def contains_task_table(path: Path) -> bool:
+    try:
+        if path.stat().st_size > MAX_DISCOVERY_FILE_BYTES:
+            return False
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if split_markdown_row(line) == TASK_TABLE_HEADER:
+                return True
+    except OSError:
+        return False
+    return False
 
 
 class CommandTaskSource:

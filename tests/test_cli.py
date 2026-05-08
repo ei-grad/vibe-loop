@@ -68,6 +68,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual("", stdout.getvalue())
         self.assertIn("no runnable tasks", stderr.getvalue())
 
+    def test_tasks_locks_does_not_require_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["tasks", "locks", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

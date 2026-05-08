@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
 import json
 import shlex
 import subprocess
@@ -13,41 +12,23 @@ from typing import TextIO
 
 from vibe_loop.config import VibeConfig
 from vibe_loop.locks import LockBusy, LockManager
-from vibe_loop.tasks import Task, build_task_source, runnable_tasks
-
-
-@dataclasses.dataclass(frozen=True)
-class RunResult:
-    run_id: str
-    task_id: str
-    classification: str
-    exit_code: int
-    log_path: Path
-    start_main: str
-    end_main: str
-    message: str = ""
-
-    def to_json(self) -> dict[str, object]:
-        return {
-            "run_id": self.run_id,
-            "task_id": self.task_id,
-            "classification": self.classification,
-            "exit_code": self.exit_code,
-            "log": str(self.log_path),
-            "start_main": self.start_main,
-            "end_main": self.end_main,
-            "message": self.message,
-            "finished_at": datetime.now(UTC).isoformat(),
-        }
+from vibe_loop.runs import RunResult, RunStore
+from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 
 
 class VibeRunner:
     def __init__(self, config: VibeConfig):
         self.config = config
-        self.source = build_task_source(config.repo, config.task_source)
+        self._source: TaskSource | None = None
         self.lock_manager = LockManager(config.state_path / "locks")
         self.runs_dir = config.state_path / "runs"
-        self.runs_jsonl = config.state_path / "runs.jsonl"
+        self.run_store = RunStore(config.state_path / "runs.jsonl")
+
+    @property
+    def source(self) -> TaskSource:
+        if self._source is None:
+            self._source = build_task_source(self.config.repo, self.config.task_source)
+        return self._source
 
     def list_candidates(self, exclude: set[str] | None = None) -> list[Task]:
         excluded = exclude or set()
@@ -225,31 +206,10 @@ class VibeRunner:
         return "unknown"
 
     def record_result(self, result: RunResult) -> None:
-        self.config.state_path.mkdir(parents=True, exist_ok=True)
-        with self.runs_jsonl.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(result.to_json(), separators=(",", ":")) + "\n")
+        self.run_store.append_result(result)
 
     def recent_log_context(self, max_runs: int = 5, tail_lines: int = 80) -> str:
-        if not self.runs_jsonl.exists():
-            return "No prior vibe-loop runs recorded."
-        records = []
-        for line in self.runs_jsonl.read_text(encoding="utf-8").splitlines()[
-            -max_runs:
-        ]:
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict):
-                records.append(payload)
-        chunks = ["Recent vibe-loop runs:"]
-        for record in records:
-            chunks.append(json.dumps(record, sort_keys=True))
-            log_path = Path(str(record.get("log") or ""))
-            if log_path.exists():
-                chunks.append(f"Log tail for {log_path}:")
-                chunks.extend(tail(log_path, tail_lines))
-        return "\n".join(chunks)
+        return self.run_store.recent_log_context(max_runs, tail_lines)
 
 
 def build_selection_prompt(candidates: list[Task], recent_log_context: str) -> str:
@@ -367,8 +327,3 @@ def git_rev_parse(repo: Path, rev: str) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
-
-
-def tail(path: Path, line_count: int) -> list[str]:
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return lines[-line_count:]
