@@ -167,7 +167,10 @@ def dispatch(args: argparse.Namespace) -> int:
                     "repo": str(config.repo),
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
-                    "task_source": config.task_source.__dict__,
+                    "task_source": config.task_source.to_json(),
+                    "generated_task_profile": {
+                        "path": str(config.generated_task_profile_path),
+                    },
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                 },

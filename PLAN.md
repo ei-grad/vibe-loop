@@ -22,6 +22,39 @@
 - Generated task discovery: `docs/generated-task-discovery.md`
 - Skill evaluation strategy: `docs/skill-evaluation-strategy.md`
 
+## Generated Discovery Contract
+
+Generated task-source profiles are cached in the configured state directory as
+`generated-task-source.json`. The cache is versioned by `schema_version` and
+`prompt_version`, records source fingerprints, redacted provenance, agent
+identity and selection command source, confidence, skipped or bounded evidence,
+and a degradation status. It does not store raw agent command strings. A cache
+is trusted for runnable task selection only when it is a current `profile`,
+source fingerprints match, confidence is sufficient, stable IDs and status
+mappings are present, and no explicit source-level `.vibe-loop.toml` setting
+overrides it.
+
+Generated profiles are non-executable parser descriptions. They may describe
+Markdown tables, heading/list conventions, field mappings, dependency parsing,
+status normalization, and source paths. Generated cache records must not contain
+command adapters or executable hooks such as `type = "command"`, `list`, `next`,
+`probe`, `command`, `commands`, or `selection_command`; those are valid only in
+user-authored `.vibe-loop.toml` config.
+
+Explicit `[task_source]` keys are tracked separately from defaults. Source-level
+keys such as `type`, `plan_path`, `plan_paths`, `list`, `next`, and `probe` win
+over generated discovery. Defaults do not block generated cache use. Non-source
+settings, currently `runnable_statuses`, override the matching generated field
+without disabling the generated source.
+
+Degraded cache states are visible rather than silently replaced by fixed-table
+discovery: `planning_only` for non-runnable parser sketches, `needs_input` for
+user decisions, `unavailable` for missing or bounded-out evidence, and
+`rejected` for malformed, low-trust, or forbidden generated output. Read-only
+commands report these states and the cache path without launching an agent.
+Users inspect generated behavior through `doctor`, `tasks configure --json`, or
+the cache file, and override it by adding explicit `[task_source]` settings.
+
 ## Planning Analytics Direction
 
 `../lightmetrics` proves a useful local planning loop, but most of its code is
@@ -61,7 +94,7 @@ coverage checks by default.
 | CORE-02 | P0 | Done | none | Replace fixed single-path plan defaults with scored Markdown plan discovery while preserving explicit `task_source.plan_path`. | Any `.md` file outside ignored build/state dirs can be evaluated; the best unambiguous parseable task table is selected, and ambiguous ties require explicit config. | `src/vibe_loop/tasks.py`; `tests/test_tasks.py`; `uv run python -m unittest discover`. |
 | AGENT-01 | P0 | Done | CORE-01 | Analyze and support `claude -p` as a first-class configured worker/selection command on par with `codex exec`, without making either agent mandatory. | Configuration examples and tests prove `agent.command` and `agent.selection_command` can drive a Claude prompt-mode worker while preserving stdout/stderr logging, task id interpolation, and result recording. | `tests/test_cli.py` stub `claude -p` worker and selection tests; `README.md` Claude config example; `uv run python -m unittest discover`. |
 | AGENT-02 | P0 | Done | AGENT-01 | Add automatic agent CLI availability detection and default command resolution for Codex and Claude. Explicit `.vibe-loop.toml` commands remain authoritative; if exactly one supported CLI is available, use it for worker and selection defaults; if neither is available, fail with an actionable diagnostic; if both are available, define and document the policy before implementation rather than silently guessing. Candidate policies include requiring explicit config, deterministic preference, or separate worker/selection defaults. | `doctor`, config loading, `run-next`, `run-until-done`, and `tasks configure` report the detected agent state and resolved command source. Tests cover codex-only, claude-only, both-present, neither-present, explicit override, and unavailable command execution paths. | `src/vibe_loop/config.py`; `src/vibe_loop/runner.py`; `src/vibe_loop/cli.py`; `tests/test_config.py`; `tests/test_cli.py`; `README.md`; `uv run python -m unittest discover`. |
-| DISC-01 | P0 | Planned | CORE-02 | Design the generated task-source profile schema, precedence rules, and degradation states. Cover explicit config overrides, default-versus-user-set config tracking, generated cache location under the configured state dir, schema/prompt versioning, source fingerprints, provenance, confidence, stale-cache behavior, partial profiles, planning-only profiles, unavailable/needs-input results, and the rule that generated profiles are non-executable parser descriptions only. | `PLAN.md` and config docs specify where generated discovery config is stored, when it is trusted, how it is invalidated, how degraded states are represented, which explicit settings override which generated fields, which generated fields are forbidden, and how users can inspect or override them. | Design diff review plus config parsing tests proving defaults do not block generated cache, explicit task-source settings do override it, and generated command adapters are rejected. |
+| DISC-01 | P0 | Done | CORE-02 | Design the generated task-source profile schema, precedence rules, and degradation states. Cover explicit config overrides, default-versus-user-set config tracking, generated cache location under the configured state dir, schema/prompt versioning, source fingerprints, provenance, confidence, stale-cache behavior, partial profiles, planning-only profiles, unavailable/needs-input results, and the rule that generated profiles are non-executable parser descriptions only. | `PLAN.md` and config docs specify where generated discovery config is stored, when it is trusted, how it is invalidated, how degraded states are represented, which explicit settings override which generated fields, which generated fields are forbidden, and how users can inspect or override them. | `PLAN.md`; `README.md`; `docs/generated-task-discovery.md`; `src/vibe_loop/config.py`; `tests/test_config.py`; `uv run python -m unittest discover`. |
 | DISC-08 | P0 | Planned | DISC-01 | Build a deterministic evidence collector for generated discovery. It should enumerate allowed repo-local task evidence, enforce size limits, skip ignored build/state paths, skip secret-like files and credential directories, redact before prompt construction, and record skipped evidence by reason. | The collector produces a bounded evidence bundle and manifest without reading environment variables or sensitive paths; tests cover file type filtering, size caps, ignored directories, `.env`/key-file skips, redaction, and manifest output. | Unit tests for evidence collection and prompt input fixtures with skipped-evidence manifests. |
 | DISC-02 | P0 | Planned | DISC-01, DISC-08, AGENT-02 | Add an explicit agent-driven `tasks configure` flow that uses the bounded evidence collector and asks the resolved configured agent for a strict JSON task-source profile or structured degradation result. Runtime read-only task commands must not launch this agent unless the user passes a clearly named opt-in configuration flag. | With a stub agent, the CLI writes a validated cache for a repo-specific task format; malformed, low-confidence, unsupported, or incomplete profiles become explicit degraded cache records and do not change active runnable task behavior. `tasks list`, `tasks runnable`, `next`, and `doctor` reuse cache and print diagnostics without invoking the agent. | CLI tests with stubbed agent output; fixture repos for accepted, partial, unavailable, rejected, and read-only-no-agent-invocation paths. |
 | DISC-03 | P0 | Planned | DISC-01 | Generalize Markdown parsing behind profile-driven adapters instead of the hard-coded `ID/Priority/Status/Dependencies/Scope/Acceptance/Evidence` header. Keep this repository's table as one supported profile, not the generic requirement. | Nonstandard Markdown tables and heading/list-based task docs can be normalized into `Task` objects from profile configuration; duplicate IDs, missing required fields, and dependency syntax errors fail clearly. | Unit tests for column aliases, reordered columns, heading/list extraction, dependency parsing, and validation failures. |

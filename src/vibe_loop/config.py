@@ -17,6 +17,30 @@ DEFAULT_PLAN_PATHS = (
     "ROADMAP.md",
     "TODO.md",
 )
+DEFAULT_RUNNABLE_STATUSES = ("Active", "Next", "Planned")
+GENERATED_TASK_PROFILE_CACHE_FILE = "generated-task-source.json"
+GENERATED_TASK_PROFILE_SCHEMA_VERSION = 1
+GENERATED_TASK_PROFILE_PROMPT_VERSION = 1
+TASK_SOURCE_SOURCE_KEYS = frozenset(
+    {
+        "type",
+        "plan_path",
+        "plan_paths",
+        "list",
+        "next",
+        "probe",
+    }
+)
+GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
+    {
+        "command",
+        "commands",
+        "list",
+        "next",
+        "probe",
+        "selection_command",
+    }
+)
 
 AGENT_COMMAND_DEFAULTS = {
     "codex": {
@@ -55,9 +79,7 @@ class AgentDetection:
     def summary(self) -> str:
         if not self.available:
             return "none"
-        return ", ".join(
-            f"{name}={self.path_for(name)}" for name in self.available
-        )
+        return ", ".join(f"{name}={self.path_for(name)}" for name in self.available)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -145,7 +167,33 @@ class TaskSourceConfig:
     list_command: str | None = None
     next_command: str | None = None
     probe_command: str | None = None
-    runnable_statuses: tuple[str, ...] = ("Active", "Next", "Planned")
+    runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def explicit_source_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(self.explicit_keys & TASK_SOURCE_SOURCE_KEYS))
+
+    @property
+    def allows_generated_cache(self) -> bool:
+        return not self.explicit_source_keys
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "type": self.type,
+            "plan_path": self.plan_path,
+            "plan_paths": list(self.plan_paths),
+            "list_command": self.list_command,
+            "next_command": self.next_command,
+            "probe_command": self.probe_command,
+            "runnable_statuses": list(self.runnable_statuses),
+            "explicit_keys": sorted(self.explicit_keys),
+            "explicit_source_keys": list(self.explicit_source_keys),
+            "allows_generated_cache": self.allows_generated_cache,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,6 +213,10 @@ class VibeConfig:
     @property
     def state_path(self) -> Path:
         return self.repo / self.state_dir
+
+    @property
+    def generated_task_profile_path(self) -> Path:
+        return self.state_path / GENERATED_TASK_PROFILE_CACHE_FILE
 
 
 def load_config(repo: Path) -> VibeConfig:
@@ -264,9 +316,10 @@ def unresolved_agent_command_message(
 
 def parse_task_source(data: object) -> TaskSourceConfig:
     table = expect_table(data, "task_source")
+    explicit_keys = frozenset(str(key) for key in table)
     statuses = table.get("runnable_statuses")
     if statuses is None:
-        runnable = TaskSourceConfig.runnable_statuses
+        runnable = DEFAULT_RUNNABLE_STATUSES
     elif isinstance(statuses, list) and all(isinstance(item, str) for item in statuses):
         runnable = tuple(statuses)
     else:
@@ -288,7 +341,42 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
         runnable_statuses=runnable,
+        explicit_keys=explicit_keys,
     )
+
+
+def reject_generated_command_adapters(profile: object) -> None:
+    if not isinstance(profile, dict):
+        raise ValueError("generated task-source profile must be a JSON object")
+    forbidden = sorted(find_forbidden_generated_command_keys(profile))
+    if forbidden:
+        fields = ", ".join(forbidden)
+        raise ValueError(
+            "generated task-source profiles cannot define executable command "
+            f"adapters: {fields}"
+        )
+
+
+def find_forbidden_generated_command_keys(
+    value: object,
+    path: str = "profile",
+) -> set[str]:
+    forbidden: set[str] = set()
+    if isinstance(value, dict):
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            child_path = f"{path}.{key}"
+            if key in GENERATED_TASK_PROFILE_FORBIDDEN_KEYS:
+                forbidden.add(child_path)
+            if key == "type" and child == "command":
+                forbidden.add(f"{child_path}=command")
+            forbidden.update(find_forbidden_generated_command_keys(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            forbidden.update(
+                find_forbidden_generated_command_keys(child, f"{path}[{index}]")
+            )
+    return forbidden
 
 
 def parse_completion(data: object, repo: Path) -> CompletionConfig:

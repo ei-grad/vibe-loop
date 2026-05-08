@@ -1,5 +1,100 @@
 # Generated Task Discovery
 
+## Cache Contract
+
+Generated discovery writes one JSON cache file under the configured state
+directory:
+
+```text
+<state_dir>/generated-task-source.json
+```
+
+`state_dir` defaults to `.vibe-loop`, but every reference to the cache path must
+use the loaded configuration rather than a hard-coded directory. The cache is
+repo-local diagnostic state. It may describe how to parse existing task
+artifacts, but it must not contain executable task adapters.
+
+The cache envelope is versioned independently from the package version:
+
+```json
+{
+  "schema_version": 1,
+  "prompt_version": 1,
+  "status": "profile",
+  "generated_at": "2026-05-08T00:00:00Z",
+  "agent": {
+    "name": "codex",
+    "selection_command_source": "explicit"
+  },
+  "confidence": 0.86,
+  "provenance": {
+    "repo": "/path/to/repo",
+    "evidence_limit": {
+      "max_file_bytes": 2097152,
+      "max_total_bytes": 10485760
+    }
+  },
+  "source_fingerprints": [
+    {
+      "path": "PLAN.md",
+      "size": 12345,
+      "sha256": "hex",
+      "mtime_ns": 1770000000000000000
+    }
+  ],
+  "profile": {
+    "kind": "markdown_table",
+    "source_paths": ["PLAN.md"],
+    "stable_ids": true,
+    "fields": {
+      "id": {"column": "ID"},
+      "title": {"column": "Scope", "strategy": "first_sentence"},
+      "status": {"column": "Status"},
+      "dependencies": {"column": "Dependencies", "none_values": ["none"]}
+    },
+    "status_map": {
+      "done": ["Done"],
+      "runnable": ["Active", "Next", "Planned"],
+      "blocked": ["Gated", "Low"]
+    }
+  },
+  "degradation": null
+}
+```
+
+Only `schema_version` values supported by the running CLI may be loaded.
+`prompt_version` is recorded so future refresh logic can invalidate profiles
+when the prompt contract changes. `source_fingerprints` bind the profile to the
+evidence that justified it; a changed fingerprint makes the cache stale unless a
+future profile type explicitly marks that source as optional.
+
+## Profile Status
+
+The cache `status` determines whether read-only task commands may use it:
+
+- `profile`: mechanically valid parser description. It is runnable only when
+  source fingerprints match, confidence meets the configured threshold, stable
+  IDs exist, statuses are mapped, and no explicit source-level config overrides
+  it.
+- `planning_only`: useful diagnostic parser sketch that must not feed runnable
+  task selection. This covers synthetic IDs, missing status policy, ambiguous
+  dependency syntax, or low confidence with enough structure to show likely
+  tasks.
+- `needs_input`: evidence suggests a task source exists, but user input is
+  required, for example choosing between contradictory files or declaring stable
+  ID rules.
+- `unavailable`: bounded evidence did not contain a usable task source, or
+  candidate sources were unreadable, too large, binary, secret-like, or outside
+  evidence limits.
+- `rejected`: an agent returned malformed JSON, unsupported schema, forbidden
+  fields, executable adapter hints, or parser rules that fail deterministic
+  validation.
+
+Read-only commands such as `tasks list`, `tasks runnable`, `next`, and `doctor`
+must never launch an agent to repair these states. They may read a fresh cache,
+report the state, and print the explicit configure or refresh command that would
+update it.
+
 ## Repo-Specific Task Discovery Configuration
 
 The current Markdown discovery model still assumes the repository exposes tasks
@@ -26,18 +121,66 @@ source may only come from user-authored `.vibe-loop.toml`.
 
 Cached configuration should live under the configured state directory, include
 schema and prompt versions, source file fingerprints, provenance, confidence,
-and the agent command used to generate it. Explicit `.vibe-loop.toml` settings
-must override the cache, and `doctor`/task commands should report whether the
-active task source came from user config, generated cache, or command output.
-Default config values must not count as explicit user settings; the config
-loader needs to preserve which `[task_source]` keys were present so generated
-state can fill only unset behavior. Source-defining explicit settings such as
-command adapters, profile paths, or plan paths win at source level. Non-source
-settings such as explicitly configured runnable statuses override the matching
-generated profile fields without disabling the generated source.
+and redacted generator metadata such as agent name and selection command source.
+It must not persist raw agent command strings because configured commands may
+contain local flags, inline environment assignments, or other sensitive material.
+Explicit `.vibe-loop.toml` settings must override the cache, and `doctor`/task
+commands should report whether the active task source came from user config,
+generated cache, or command output. Default config values must not count as
+explicit user settings; the config loader needs to preserve which
+`[task_source]` keys were present so generated state can fill only unset
+behavior. Source-defining explicit settings such as command adapters, profile
+paths, or plan paths win at source level. Non-source settings such as explicitly
+configured runnable statuses override the matching generated profile fields
+without disabling the generated source.
 
 Stale or low-confidence cache should fail with an actionable configure command
 instead of falling back to the fixed table format silently.
+
+## Precedence
+
+Precedence is resolved before cache loading performs parser validation:
+
+1. User-authored command adapters in `.vibe-loop.toml` are authoritative. If
+   `task_source.type = "command"` or any of `task_source.list`,
+   `task_source.next`, or `task_source.probe` is explicitly set, generated
+   discovery is disabled for the active source. Adapter failures are reported as
+   adapter failures, not replaced by generated discovery.
+2. User-authored source paths are authoritative. Explicit `task_source.plan_path`
+   or future committed profile-path settings disable generated discovery for the
+   active source.
+3. Default config values are not explicit. Omitted `task_source.plan_path`,
+   default `plan_paths`, and default runnable statuses do not block a generated
+   cache.
+4. User-authored non-source settings override generated fields without disabling
+   the generated source. The current example is `task_source.runnable_statuses`,
+   which replaces `profile.status_map.runnable` during normalization.
+5. Generated profile fields fill only unset behavior. They never override a
+   present `.vibe-loop.toml` key.
+
+`doctor` should report the active task-source origin as one of explicit config,
+command output, generated cache, planning-only cache, unavailable cache, or no
+usable source. `tasks configure --json` should expose the same origin, cache
+path, schema and prompt versions, confidence, fingerprints, skipped evidence,
+and the next safe action. Users override generated behavior by adding explicit
+`[task_source]` settings to `.vibe-loop.toml`; later refresh and promotion
+commands may help copy a reviewed generated parser description into committed
+configuration.
+
+## Forbidden Generated Fields
+
+Generated profiles are non-executable parser descriptions. The validator must
+reject all executable task-source adapters or raw command fields from the full
+cache envelope, including:
+
+- `type = "command"`
+- `list`, `next`, or `probe`
+- generic command fields such as `command`, `commands`, or `selection_command`
+- shell snippets, Python module/function imports, URLs to execute, or any rule
+  that requires running code to enumerate tasks
+
+Executable task sources are allowed only when a user writes them explicitly in
+`.vibe-loop.toml`.
 
 ## Discovery Degradation Modes
 

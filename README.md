@@ -260,6 +260,33 @@ probe = "my-task-tool show {task_id} --json"
 include `id`, `title`, `status`, `priority`, `dependencies`, `scope`,
 `acceptance`, and `evidence` where available.
 
+Generated task-source discovery is planned as a cache under the configured state
+directory:
+
+```text
+.vibe-loop/generated-task-source.json
+```
+
+The cache path follows `state_dir`; `.vibe-loop/` is only the default. Generated
+profiles are versioned JSON parser descriptions with source fingerprints,
+redacted provenance, confidence, and a degradation status such as `profile`,
+`planning_only`, `needs_input`, `unavailable`, or `rejected`. The cache records
+agent identity and command source, not raw command strings. Read-only commands
+must not launch an agent to create or repair that cache; explicit configure or
+refresh commands own agent invocation.
+
+Explicit `.vibe-loop.toml` task-source settings stay authoritative. User-written
+command adapters and explicit source paths disable generated discovery for the
+active source. Defaults do not count as explicit settings, and non-source
+settings such as `task_source.runnable_statuses` override the matching generated
+field without disabling the generated parser. Generated cache records cannot
+contain executable adapters such as `type = "command"`, `list`, `next`, `probe`,
+or generic command fields. Add explicit `[task_source]` settings to override
+cached generated behavior.
+
+See `docs/generated-task-discovery.md` for the generated profile schema,
+precedence rules, stale-cache behavior, and degradation states.
+
 ## Development
 
 Install the repository tools with `uv`, then run the standard checks:
