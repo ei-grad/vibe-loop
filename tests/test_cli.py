@@ -52,11 +52,16 @@ class CliTests(unittest.TestCase):
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
 
         self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["session_id"], payload["run_id"])
         self.assertEqual(payload["task_id"], "TASK-01")
         self.assertEqual(payload["classification"], "unknown")
         self.assertIn("agent out", stderr.getvalue())
         self.assertNotIn("agent err", stderr.getvalue())
         self.assertIn("[vibe-loop] running TASK-01", stderr.getvalue())
+        self.assertIn(
+            f"[vibe-loop] session_id={payload['session_id']}", stderr.getvalue()
+        )
+        self.assertIn(f"[vibe-loop] session_id={payload['session_id']}", log_text)
         self.assertIn("agent out", log_text)
         self.assertIn("agent err", log_text)
 

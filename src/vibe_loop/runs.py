@@ -30,6 +30,7 @@ class RunResult:
     def to_json(self) -> dict[str, object]:
         return {
             "run_id": self.run_id,
+            "session_id": self.run_id,
             "task_id": self.task_id,
             "classification": self.classification,
             "exit_code": self.exit_code,

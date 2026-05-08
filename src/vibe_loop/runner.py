@@ -94,8 +94,9 @@ class VibeRunner:
         try:
             command = self.config.agent.command.format(task_id=task.task_id)
             with log_path.open("w", encoding="utf-8") as log:
-                write_log_header(log, task, command, start_main)
+                write_log_header(log, task, command, start_main, run_id)
                 report_status(f"running {task.task_id}: {task.title}", log)
+                report_status(f"session_id={run_id}", log)
                 report_status(f"log: {log_path}", log)
                 report_status("agent command started", log)
                 exit_code = run_streaming_command(
@@ -237,7 +238,10 @@ def parse_selected_task_id(output: str) -> str | None:
     return str(task_id) if task_id else None
 
 
-def write_log_header(log, task: Task, command: str, start_main: str) -> None:
+def write_log_header(
+    log, task: Task, command: str, start_main: str, session_id: str
+) -> None:
+    log.write(f"[vibe-loop] session_id={session_id}\n")
     log.write(f"[vibe-loop] task_id={task.task_id}\n")
     log.write(f"[vibe-loop] title={task.title}\n")
     log.write(f"[vibe-loop] command={command}\n")

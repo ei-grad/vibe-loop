@@ -11,6 +11,11 @@ workflow defined by the repository instructions. `vibe-loop` owns task
 discovery, selection, locks, process execution, logs, completion checks, and run
 records.
 
+> [!WARNING]
+> `vibe-loop` is in early development. It is not yet well tested or broadly
+> reviewed, so treat it as experimental automation and run it only where failed
+> commands or incorrect agent behavior cannot damage important work.
+
 The bundled skills are the workflow layer. They can be used directly in Codex or
 Claude without the CLI. When the CLI is used, it is a thin semi-deterministic
 orchestrator above the finite `vibe-loop` skill: the CLI chooses tasks, creates
@@ -176,7 +181,7 @@ and completion checks itself.
 `run-next` and `run-until-done` keep their result JSON on stdout. Run progress
 and mirrored agent stdout are written to stderr, and full stdout/stderr streams
 are captured in `.vibe-loop/runs/<run-id>.log`. Agent stderr is log-only by
-default.
+default. Each run result includes both `session_id` and the legacy `run_id`.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
