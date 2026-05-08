@@ -20,6 +20,86 @@ Set `task_source.plan_path` when a repo has multiple plausible plan files.
 Runnable statuses default to `Active`, `Next`, and `Planned`. A task is runnable
 when all listed dependencies are `Done` and no local lock exists.
 
+## Relationship to ralphex
+
+`vibe-loop` is inspired by
+[umputun/ralphex](https://github.com/umputun/ralphex): the useful core idea is a
+repeatable autonomous loop that gives coding agents bounded tasks, validates the
+result, records progress, and avoids relying on one long interactive chat.
+
+The difference is in the workflow `vibe-loop` is built around:
+
+- `ralphex` is plan-file centered; `vibe-loop` is task-source agnostic. It can
+  discover Markdown task tables, use explicit plan paths, or read tasks through
+  command adapters.
+- `ralphex` conventionally runs a dedicated plan through task and review phases;
+  `vibe-loop` runs one repository backlog slice at a time and is designed to
+  merge reviewed slices back to `main` frequently.
+- `ralphex` has its own plan format under `docs/plans/`; `vibe-loop` is intended
+  to fit existing project planning and worklog conventions instead of requiring a
+  dedicated plan directory.
+- `vibe-loop` treats agent execution as configuration. `codex exec` is the
+  default command, but worker and selection commands are template strings rather
+  than a hard dependency on one agent CLI.
+- `vibe-loop` keeps attempt state, locks, run logs, and recent run metadata under
+  `.vibe-loop/`, leaving project worklogs as final evidence records.
+
+## Installation
+
+`vibe-loop` requires Python 3.11 or newer.
+
+Install it as a standalone CLI with one of these commands:
+
+```bash
+uv tool install vibe-loop
+pipx install vibe-loop
+```
+
+Install it into an existing Python environment with:
+
+```bash
+python -m pip install vibe-loop
+```
+
+For unreleased changes, install the current repository state directly from
+GitHub:
+
+```bash
+uv tool install git+https://github.com/ei-grad/vibe-loop
+```
+
+## Quick Start
+
+Create or point `vibe-loop` at a Markdown task table:
+
+```markdown
+| ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| TASK-01 | P0 | Next | none | Make one scoped change. | Tests pass. | Not run. |
+```
+
+Inspect runnable work:
+
+```bash
+vibe-loop tasks list --repo .
+vibe-loop tasks tree --repo .
+vibe-loop next --repo .
+```
+
+Run one selected task with the configured agent command:
+
+```bash
+vibe-loop run-next --repo .
+```
+
+Use `--ask-agent` when task selection should be delegated to the configured
+selection command after the mechanically safe candidate list is built:
+
+```bash
+vibe-loop run-next --repo . --ask-agent
+vibe-loop run-until-done --repo . --ask-agent
+```
+
 ## Commands
 
 ```bash
@@ -86,6 +166,24 @@ probe = "my-task-tool show {task_id} --json"
 include `id`, `title`, `status`, `priority`, `dependencies`, `scope`,
 `acceptance`, and `evidence` where available.
 
+## Development
+
+Install the repository tools with `uv`, then run the standard checks:
+
+```bash
+uv sync
+uv run python -m unittest discover
+uv build
+uv run --with twine --no-project python -m twine check dist/*
+```
+
+Releases are built by `.github/workflows/release.yml`. The workflow uses PyPI
+trusted publishing with the GitHub environments named `TestPyPI` and `PyPI`.
+Run the workflow manually with target `TestPyPI` for a staging upload. To publish
+to PyPI, push a tag named `v<version>` where `<version>` exactly matches
+`project.version` in `pyproject.toml`, or dispatch the workflow from that tag
+with target `PyPI`.
+
 ## Local State
 
 Runner state is intentionally untracked:
@@ -100,3 +198,7 @@ Runner state is intentionally untracked:
 `runs.jsonl` is an append-only stream of versioned run result records. Project
 worklogs should remain final evidence ledgers. Attempt logs and failed runs
 belong in `.vibe-loop/`, not in project completion records.
+
+## License
+
+`vibe-loop` is licensed under the MIT License. See `LICENSE`.
