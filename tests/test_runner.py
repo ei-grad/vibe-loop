@@ -2,10 +2,16 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from vibe_loop.locks import LockBusy, LockManager
-from vibe_loop.runner import build_selection_prompt, parse_selected_task_id
+from vibe_loop.runner import (
+    build_selection_prompt,
+    parse_selected_task_id,
+    run_streaming_command,
+)
 from vibe_loop.tasks import Task
 
 
@@ -41,6 +47,24 @@ class RunnerTests(unittest.TestCase):
             finally:
                 manager.release(task_lock)
             self.assertFalse(manager.is_locked("LIVE-04"))
+
+    def test_streaming_command_writes_stdout_and_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            stdout = StringIO()
+            with log_path.open("w", encoding="utf-8") as log:
+                with redirect_stdout(stdout):
+                    exit_code = run_streaming_command(
+                        'python -c \'import sys; print("out"); print("err", file=sys.stderr)\'',
+                        Path(directory),
+                        log,
+                    )
+
+            self.assertEqual(exit_code, 0)
+            self.assertIn("out", stdout.getvalue())
+            self.assertIn("err", stdout.getvalue())
+            self.assertIn("out", log_path.read_text(encoding="utf-8"))
+            self.assertIn("err", log_path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

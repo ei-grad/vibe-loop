@@ -4,6 +4,7 @@ import dataclasses
 import json
 import shlex
 import subprocess
+import sys
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,15 +105,7 @@ class VibeRunner:
             command = self.config.agent.command.format(task_id=task.task_id)
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(log, task, command, start_main)
-                process = subprocess.run(
-                    command,
-                    cwd=self.config.repo,
-                    shell=True,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                )
-                exit_code = process.returncode
+                exit_code = run_streaming_command(command, self.config.repo, log)
                 log.write(f"\n[vibe-loop] agent exit_code={exit_code}\n")
                 if exit_code == 0:
                     message = self.run_completion_checks(log)
@@ -264,6 +257,28 @@ def write_log_header(log, task: Task, command: str, start_main: str) -> None:
     log.write(f"[vibe-loop] title={task.title}\n")
     log.write(f"[vibe-loop] command={command}\n")
     log.write(f"[vibe-loop] start_main={start_main}\n\n")
+
+
+def run_streaming_command(command: str, cwd: Path, log) -> int:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert process.stdout is not None
+    try:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log.write(line)
+            log.flush()
+    finally:
+        process.stdout.close()
+    return process.wait()
 
 
 def new_run_id(task_id: str) -> str:
