@@ -142,11 +142,13 @@ The package includes two installable skills:
 
 - `vibe-loop`: one coherent bounded slice. The agent inspects the task, edits,
   verifies, asks for independent review when available, commits, integrates to
-  `main` when policy permits, cleans up, and stops.
-- `infinite-vibe-loop`: unattended continuation across slices. The agent keeps
-  choosing conservative next work, uses the same review and integration
-  discipline, reports blocked paths, and continues until explicitly stopped or
-  the session ends.
+  `main` when policy permits, cleans up, and stops. Once invoked directly or by
+  a CLI worker command, the agent is expected to follow the finite loop rather
+  than treating the skill as optional guidance.
+- `infinite-vibe-loop`: unattended continuation across finite slices. Each
+  slice follows the finite `vibe-loop` discipline; after cleanup/status, the
+  agent chooses conservative next work, reports blocked paths, and continues
+  until explicitly stopped or the session ends.
 
 Install them into Codex and/or Claude with:
 
