@@ -11,6 +11,24 @@ workflow defined by the repository instructions. `vibe-loop` owns task
 discovery, selection, locks, process execution, logs, completion checks, and run
 records.
 
+The bundled skills are the workflow layer. They can be used directly in Codex or
+Claude without the CLI. When the CLI is used, it is a thin semi-deterministic
+orchestrator above the finite `vibe-loop` skill: the CLI chooses tasks, creates
+local locks, starts worker commands, captures logs, and records outcomes; the
+worker agent follows the skill.
+
+> [!NOTE]
+> Direct skill use and `vibe-loop` CLI worker commands work best when routine
+> edits, tests, reviews, and integration steps do not stop on permission prompts.
+> Configure Codex or Claude with a thoroughly scoped allowlist or `dontAsk`
+> policy.
+
+> [!WARNING]
+> Codex or Claude sessions launched directly or by `vibe-loop` CLI worker
+> commands with permission prompts disabled MUST run in isolation, such as a
+> Docker container or VM, with only the required repository, tools, network
+> access, and credentials available.
+
 The runner is task-system agnostic. Repositories can expose tasks through a
 Markdown plan table, command adapters, or later tracker-specific adapters. The
 default adapter discovers Markdown files with tables using these columns:
@@ -47,6 +65,9 @@ The difference is in the workflow `vibe-loop` is built around:
 - `vibe-loop` treats agent execution as configuration. `codex exec` is the
   default command, but worker and selection commands are template strings rather
   than a hard dependency on one agent CLI.
+- `vibe-loop` packages the workflow skills as reusable instructions. They remain
+  useful on their own; the CLI adds task selection, locking, execution, logging,
+  and result-recording around the finite `vibe-loop` skill.
 - `vibe-loop` keeps workers finite and leaves branch/worktree management to the
   agent. The runner/supervisor owns scheduling, locks, logs, and result
   collection; planned parallel mode keeps the same boundary instead of becoming a
@@ -109,6 +130,30 @@ selection command after the mechanically safe candidate list is built:
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent
 ```
+
+## Skills
+
+The package includes two installable skills:
+
+- `vibe-loop`: one coherent bounded slice. The agent inspects the task, edits,
+  verifies, asks for independent review when available, commits, integrates to
+  `main` when policy permits, cleans up, and stops.
+- `infinite-vibe-loop`: unattended continuation across slices. The agent keeps
+  choosing conservative next work, uses the same review and integration
+  discipline, reports blocked paths, and continues until explicitly stopped or
+  the session ends.
+
+Install them into Codex and/or Claude with:
+
+```bash
+vibe-loop install-skills --codex --claude
+```
+
+The skills do not require the CLI. You can invoke them directly in an agent
+session for manual bounded or unattended work. The CLI exists for cases where a
+repository already has a task source and you want repeatable orchestration:
+mechanical candidate discovery, locks, configured worker commands, run logs,
+completion checks, and local run metadata.
 
 ## Commands
 
