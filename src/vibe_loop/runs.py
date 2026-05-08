@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 
-RUN_SCHEMA_VERSION = 1
+RUN_SCHEMA_VERSION = 2
 RUN_RECORD_TYPE = "run_result"
 
 
@@ -25,12 +25,16 @@ class RunResult:
     start_main: str
     end_main: str
     message: str = ""
+    session_id: str | None = None
+    session_id_source: str = "fallback:run_id"
+    agent_command_source: str = ""
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
         return {
             "run_id": self.run_id,
-            "session_id": self.run_id,
+            "session_id": self.session_id or self.run_id,
+            "session_id_source": self.session_id_source,
             "task_id": self.task_id,
             "classification": self.classification,
             "exit_code": self.exit_code,
@@ -38,6 +42,7 @@ class RunResult:
             "start_main": self.start_main,
             "end_main": self.end_main,
             "message": self.message,
+            "agent_command_source": self.agent_command_source,
             "finished_at": self.finished_at,
         }
 

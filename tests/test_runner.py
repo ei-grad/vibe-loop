@@ -10,6 +10,7 @@ from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runner import (
     build_selection_prompt,
     parse_selected_task_id,
+    parse_worker_session_id,
     run_streaming_command,
 )
 from vibe_loop.tasks import Task
@@ -36,6 +37,11 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertIsNone(parse_selected_task_id("not json"))
 
+    def test_parse_worker_session_id_from_codex_style_output(self) -> None:
+        self.assertEqual(parse_worker_session_id("session id: abc-123"), "abc-123")
+        self.assertEqual(parse_worker_session_id("Session_ID = codex.456"), "codex.456")
+        self.assertIsNone(parse_worker_session_id("session started"))
+
     def test_lock_manager_rejects_existing_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manager = LockManager(Path(directory) / "locks")
@@ -57,13 +63,15 @@ class RunnerTests(unittest.TestCase):
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stdout(stdout), redirect_stderr(stderr):
-                    exit_code = run_streaming_command(
+                    result = run_streaming_command(
                         'python -c \'import sys; print("out"); print("err", file=sys.stderr)\'',
                         Path(directory),
                         log,
                     )
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(result.exit_code, 0)
+            self.assertIsNone(result.session_id)
+            self.assertIsNone(result.session_id_source)
             self.assertEqual("", stdout.getvalue())
             self.assertIn("out", stderr.getvalue())
             self.assertNotIn("err", stderr.getvalue())
@@ -77,16 +85,61 @@ class RunnerTests(unittest.TestCase):
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stderr(stderr):
-                    exit_code = run_streaming_command(
+                    result = run_streaming_command(
                         "python -c 'import sys; print(\"err\", file=sys.stderr)'",
                         Path(directory),
                         log,
                         forward_stderr=True,
                     )
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(result.exit_code, 0)
             self.assertIn("err", stderr.getvalue())
             self.assertIn("err", log_path.read_text(encoding="utf-8"))
+
+    def test_streaming_command_captures_stdout_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            stderr = StringIO()
+            with log_path.open("w", encoding="utf-8") as log:
+                with redirect_stderr(stderr):
+                    result = run_streaming_command(
+                        "python -c 'print(\"session id: native-stdout-123\")'",
+                        Path(directory),
+                        log,
+                    )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.session_id, "native-stdout-123")
+            self.assertEqual(result.session_id_source, "native:stdout")
+            self.assertIn("session id: native-stdout-123", stderr.getvalue())
+            self.assertIn(
+                "session id: native-stdout-123",
+                log_path.read_text(encoding="utf-8"),
+            )
+
+    def test_streaming_command_captures_stderr_session_id_without_forwarding(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            stderr = StringIO()
+            with log_path.open("w", encoding="utf-8") as log:
+                with redirect_stderr(stderr):
+                    result = run_streaming_command(
+                        "python -c 'import sys; "
+                        'print("session id: native-stderr-123", file=sys.stderr)\'',
+                        Path(directory),
+                        log,
+                    )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(result.session_id, "native-stderr-123")
+            self.assertEqual(result.session_id_source, "native:stderr")
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertIn(
+                "session id: native-stderr-123",
+                log_path.read_text(encoding="utf-8"),
+            )
 
     def test_streaming_command_replaces_undecodable_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -94,7 +147,7 @@ class RunnerTests(unittest.TestCase):
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stderr(stderr):
-                    exit_code = run_streaming_command(
+                    result = run_streaming_command(
                         'python -c "import sys; '
                         "sys.stdout.buffer.write(b'ok\\\\xff\\\\n'); "
                         "sys.stderr.buffer.write(b'bad\\\\xfe\\\\n')\"",
@@ -102,7 +155,7 @@ class RunnerTests(unittest.TestCase):
                         log,
                     )
 
-            self.assertEqual(exit_code, 0)
+            self.assertEqual(result.exit_code, 0)
             self.assertIn("ok", stderr.getvalue())
             self.assertIn("\ufffd", stderr.getvalue())
             log_text = log_path.read_text(encoding="utf-8")

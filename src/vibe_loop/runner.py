@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import dataclasses
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -14,6 +16,48 @@ from vibe_loop.config import AgentDetection, VibeConfig
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
+
+
+SESSION_ID_RE = re.compile(
+    r"\bsession(?:[_ -]?id)\s*[:=]\s*"
+    r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
+    re.IGNORECASE,
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class SessionIdObservation:
+    session_id: str
+    source: str
+
+
+@dataclasses.dataclass(frozen=True)
+class StreamingCommandResult:
+    exit_code: int
+    session_id: str | None = None
+    session_id_source: str | None = None
+
+
+class SessionIdObserver:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._observation: SessionIdObservation | None = None
+
+    @property
+    def observation(self) -> SessionIdObservation | None:
+        with self._lock:
+            return self._observation
+
+    def observe_line(self, line: str, stream_name: str) -> None:
+        session_id = parse_worker_session_id(line)
+        if session_id is None:
+            return
+        with self._lock:
+            if self._observation is None:
+                self._observation = SessionIdObservation(
+                    session_id=session_id,
+                    source=f"native:{stream_name}",
+                )
 
 
 class VibeRunner:
@@ -104,6 +148,8 @@ class VibeRunner:
         task_lock = self.lock_manager.acquire(task.task_id, run_id)
         exit_code = 1
         message = ""
+        session_id = run_id
+        session_id_source = "fallback:run_id"
         try:
             command = command_template.format(task_id=task.task_id)
             with log_path.open("w", encoding="utf-8") as log:
@@ -117,7 +163,7 @@ class VibeRunner:
                     self.config.agent.detected,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
-                report_status(f"session_id={run_id}", log)
+                report_status(f"run_id={run_id}", log)
                 report_status(f"log: {log_path}", log)
                 report_status(
                     f"agent command source: {self.config.agent.command_source}",
@@ -129,13 +175,18 @@ class VibeRunner:
                     log,
                 )
                 report_status("agent command started", log)
-                exit_code = run_streaming_command(
+                stream_result = run_streaming_command(
                     command,
                     self.config.repo,
                     log,
                     forward_stderr=self.config.agent.forward_stderr,
                 )
+                exit_code = stream_result.exit_code
+                session_id = stream_result.session_id or run_id
+                session_id_source = stream_result.session_id_source or "fallback:run_id"
                 report_status(f"agent command exit_code={exit_code}", log)
+                report_status(f"session_id={session_id}", log)
+                report_status(f"session_id_source={session_id_source}", log)
                 if exit_code == 0:
                     message = self.run_completion_checks(log)
         finally:
@@ -153,6 +204,9 @@ class VibeRunner:
             start_main=start_main,
             end_main=end_main,
             message=message,
+            session_id=session_id,
+            session_id_source=session_id_source,
+            agent_command_source=self.config.agent.command_source,
         )
         self.record_result(result)
         report_status(
@@ -270,16 +324,23 @@ def parse_selected_task_id(output: str) -> str | None:
     return str(task_id) if task_id else None
 
 
+def parse_worker_session_id(line: str) -> str | None:
+    match = SESSION_ID_RE.search(line)
+    if match is None:
+        return None
+    return match.group("session_id")
+
+
 def write_log_header(
     log,
     task: Task,
     command: str,
     start_main: str,
-    session_id: str,
+    run_id: str,
     command_source: str,
     detected: AgentDetection,
 ) -> None:
-    log.write(f"[vibe-loop] session_id={session_id}\n")
+    log.write(f"[vibe-loop] run_id={run_id}\n")
     log.write(f"[vibe-loop] task_id={task.task_id}\n")
     log.write(f"[vibe-loop] title={task.title}\n")
     log.write(f"[vibe-loop] command={command}\n")
@@ -302,7 +363,7 @@ def run_streaming_command(
     log: TextIO,
     *,
     forward_stderr: bool = False,
-) -> int:
+) -> StreamingCommandResult:
     process = subprocess.Popen(
         command,
         cwd=cwd,
@@ -317,20 +378,33 @@ def run_streaming_command(
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()
+    session_observer = SessionIdObserver()
     stdout_thread = threading.Thread(
         target=stream_pipe,
-        args=(process.stdout, log, log_lock, True),
+        args=(process.stdout, log, log_lock, True, session_observer, "stdout"),
     )
     stderr_thread = threading.Thread(
         target=stream_pipe,
-        args=(process.stderr, log, log_lock, forward_stderr),
+        args=(
+            process.stderr,
+            log,
+            log_lock,
+            forward_stderr,
+            session_observer,
+            "stderr",
+        ),
     )
     stdout_thread.start()
     stderr_thread.start()
     exit_code = process.wait()
     stdout_thread.join()
     stderr_thread.join()
-    return exit_code
+    observation = session_observer.observation
+    return StreamingCommandResult(
+        exit_code=exit_code,
+        session_id=observation.session_id if observation else None,
+        session_id_source=observation.source if observation else None,
+    )
 
 
 def stream_pipe(
@@ -338,9 +412,12 @@ def stream_pipe(
     log: TextIO,
     log_lock: threading.Lock,
     forward: bool,
+    session_observer: SessionIdObserver,
+    stream_name: str,
 ) -> None:
     try:
         for line in pipe:
+            session_observer.observe_line(line, stream_name)
             if forward:
                 sys.stderr.write(line)
                 sys.stderr.flush()

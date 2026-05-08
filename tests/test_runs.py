@@ -24,7 +24,29 @@ class RunStoreTests(unittest.TestCase):
         second = result.to_json()
 
         self.assertEqual(first["session_id"], "run-1")
+        self.assertEqual(first["session_id_source"], "fallback:run_id")
         self.assertEqual(first["finished_at"], second["finished_at"])
+
+    def test_run_result_json_can_store_native_session_id(self) -> None:
+        result = RunResult(
+            run_id="run-1",
+            session_id="native-session-1",
+            session_id_source="native:stdout",
+            agent_command_source="auto:codex",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+        )
+
+        payload = result.to_json()
+
+        self.assertEqual(payload["run_id"], "run-1")
+        self.assertEqual(payload["session_id"], "native-session-1")
+        self.assertEqual(payload["session_id_source"], "native:stdout")
+        self.assertEqual(payload["agent_command_source"], "auto:codex")
 
     def test_append_result_writes_versioned_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -48,6 +70,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["record_type"], RUN_RECORD_TYPE)
         self.assertEqual(payload["status"], "completed")
         self.assertEqual(payload["session_id"], "run-1")
+        self.assertEqual(payload["session_id_source"], "fallback:run_id")
         self.assertEqual(payload["task_id"], "TASK-01")
 
     def test_recent_log_context_reads_records_and_log_tail(self) -> None:

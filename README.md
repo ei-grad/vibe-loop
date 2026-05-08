@@ -183,7 +183,12 @@ and completion checks itself.
 `run-next` and `run-until-done` keep their result JSON on stdout. Run progress
 and mirrored agent stdout are written to stderr, and full stdout/stderr streams
 are captured in `.vibe-loop/runs/<run-id>.log`. Agent stderr is log-only by
-default. Each run result includes both `session_id` and the legacy `run_id`.
+default. Each run result includes a `run_id` for vibe-loop locks, logs, and run
+records. If the worker emits a Codex-style `session id: ...` line on stdout or
+stderr, `session_id` stores that native worker id and `session_id_source` is
+`native:stdout` or `native:stderr`. If no native session id is observed,
+`session_id` falls back to `run_id` and `session_id_source` is
+`fallback:run_id`.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
@@ -316,9 +321,11 @@ Runner state is intentionally untracked:
   runs.jsonl
 ```
 
-`runs.jsonl` is an append-only stream of versioned run result records. Project
-worklogs should remain final evidence ledgers. Attempt logs and failed runs
-belong in `.vibe-loop/`, not in project completion records.
+`runs.jsonl` is an append-only stream of versioned run result records. Run
+records include the vibe-loop `run_id`, the resolved worker `session_id`, the
+`session_id_source`, and the `agent_command_source` used for the worker command.
+Project worklogs should remain final evidence ledgers. Attempt logs and failed
+runs belong in `.vibe-loop/`, not in project completion records.
 
 Branches and worktrees created by worker agents are not tracked as runner state.
 The agent workflow that creates them is responsible for refresh, review, merge,

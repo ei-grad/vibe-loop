@@ -53,6 +53,7 @@ class CliTests(unittest.TestCase):
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
+                "print('session id: codex-native-123')\n"
                 "print(f'codex out: {sys.argv[2]}')\n",
             )
             stdout = StringIO()
@@ -65,12 +66,25 @@ class CliTests(unittest.TestCase):
             payload = json.loads(stdout.getvalue())
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
             agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
+            run_records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
+        self.assertNotEqual(payload["session_id"], payload["run_id"])
+        self.assertEqual(payload["session_id"], "codex-native-123")
+        self.assertEqual(payload["session_id_source"], "native:stdout")
+        self.assertEqual(payload["agent_command_source"], "auto:codex")
+        self.assertEqual(run_records[0]["session_id"], "codex-native-123")
+        self.assertEqual(run_records[0]["session_id_source"], "native:stdout")
         self.assertEqual(agent_args, "exec\n$vibe-loop TASK-01")
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
         self.assertIn("agent_command_source=auto:codex", log_text)
+        self.assertIn("session_id_source=native:stdout", log_text)
 
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -211,7 +225,7 @@ class CliTests(unittest.TestCase):
                 bin_dir / "selector",
                 "from pathlib import Path\n"
                 "Path('selector-ran').write_text('ran', encoding='utf-8')\n"
-                "print('{\"task_id\":\"TASK-02\"}')\n",
+                'print(\'{"task_id":"TASK-02"}\')\n',
             )
             stdout = StringIO()
             stderr = StringIO()
@@ -320,6 +334,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(payload["session_id"], payload["run_id"])
+        self.assertEqual(payload["session_id_source"], "fallback:run_id")
         self.assertEqual(payload["task_id"], "TASK-01")
         self.assertEqual(payload["classification"], "unknown")
         self.assertIn("agent out", stderr.getvalue())
@@ -329,8 +344,58 @@ class CliTests(unittest.TestCase):
             f"[vibe-loop] session_id={payload['session_id']}", stderr.getvalue()
         )
         self.assertIn(f"[vibe-loop] session_id={payload['session_id']}", log_text)
+        self.assertIn("[vibe-loop] session_id_source=fallback:run_id", log_text)
         self.assertIn("agent out", log_text)
         self.assertIn("agent err", log_text)
+
+    def test_run_next_captures_explicit_worker_session_id_from_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "print('session id: explicit-native-456', file=sys.stderr)\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "python agent.py"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+            run_records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["session_id"], "explicit-native-456")
+        self.assertEqual(payload["session_id_source"], "native:stderr")
+        self.assertEqual(payload["agent_command_source"], "explicit")
+        self.assertEqual(payload["classification"], "completed")
+        self.assertNotEqual(payload["session_id"], payload["run_id"])
+        self.assertNotIn("session id: explicit-native-456", stderr.getvalue())
+        self.assertIn("[vibe-loop] session_id=explicit-native-456", stderr.getvalue())
+        self.assertIn("session id: explicit-native-456", log_text)
+        self.assertIn("session_id_source=native:stderr", log_text)
+        self.assertEqual(run_records[0]["session_id"], "explicit-native-456")
+        self.assertEqual(run_records[0]["session_id_source"], "native:stderr")
 
     def test_run_next_supports_configured_claude_prompt_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -269,9 +269,7 @@ class ConfigTests(unittest.TestCase):
         ]
         for envelope in envelopes:
             with self.subTest(envelope=envelope):
-                with self.assertRaisesRegex(
-                    ValueError, "executable command adapters"
-                ):
+                with self.assertRaisesRegex(ValueError, "executable command adapters"):
                     reject_generated_command_adapters(
                         {
                             "schema_version": 1,
