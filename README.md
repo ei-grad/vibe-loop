@@ -20,8 +20,8 @@ worker agent follows the skill.
 > [!NOTE]
 > Direct skill use and `vibe-loop` CLI worker commands work best when routine
 > edits, tests, reviews, and integration steps do not stop on permission prompts.
-> Configure Codex or Claude with a thoroughly scoped allowlist or `dontAsk`
-> policy.
+> Configure Codex or Claude with a thoroughly scoped allowlist and `dontAsk`
+> mode.
 
 > [!WARNING]
 > If permission prompts are disabled, any Codex or Claude session launched
