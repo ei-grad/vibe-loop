@@ -54,7 +54,7 @@ ALLOWED_FIELD_MAPPING_KEYS = frozenset(
     {"column", "label", "none_values", "pattern", "prefix", "required", "strategy"}
 )
 ALLOWED_FIELD_STRATEGIES = frozenset(
-    {"first_sentence", "full_text", "heading_text", "label_value", "literal"}
+    {"first_sentence", "full_text", "heading_text", "label_value"}
 )
 ALLOWED_STATUS_MAP_KEYS = frozenset({"blocked", "done", "runnable"})
 
@@ -544,6 +544,13 @@ def validate_field_mapping_values(
                 "invalid_field_mapping_value",
                 f"profile.fields.{field_name}.required must be a boolean",
             )
+    if mapping.get("strategy") == "label_value" and not (
+        isinstance(mapping.get("label"), str) and mapping.get("label", "").strip()
+    ):
+        return (
+            "invalid_field_mapping_value",
+            f"profile.fields.{field_name}.label_value requires label",
+        )
     return None
 
 
@@ -850,7 +857,12 @@ def is_nonempty_string_list(value: object) -> bool:
 
 
 def has_nonempty_mapping_value(mapping: dict[object, object]) -> bool:
-    return any(isinstance(value, str) and value.strip() for value in mapping.values())
+    if mapping.get("strategy") in {"full_text", "heading_text"}:
+        return True
+    return any(
+        isinstance(mapping.get(key), str) and str(mapping[key]).strip()
+        for key in ("column", "label", "pattern", "prefix")
+    )
 
 
 def markdown_table_column_exists(

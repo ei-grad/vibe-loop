@@ -254,6 +254,32 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.task_source.is_explicit("runnable_statuses"))
         self.assertEqual(config.task_source.runnable_statuses, ("Todo", "Doing"))
 
+    def test_explicit_task_source_profile_supplies_runnable_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source.profile]\n"
+                'kind = "markdown_table"\n'
+                'source_paths = ["WORK.md"]\n'
+                "stable_ids = true\n\n"
+                "[task_source.profile.fields.id]\n"
+                'column = "Key"\n\n'
+                "[task_source.profile.fields.title]\n"
+                'column = "Summary"\n\n'
+                "[task_source.profile.fields.status]\n"
+                'column = "State"\n\n'
+                "[task_source.profile.status_map]\n"
+                'done = ["Closed"]\n'
+                'runnable = ["Todo", "Doing"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertFalse(config.task_source.allows_generated_cache)
+        self.assertEqual(config.task_source.explicit_source_keys, ("profile",))
+        self.assertEqual(config.task_source.runnable_statuses, ("Todo", "Doing"))
+
     def test_generated_task_profiles_reject_command_adapters(self) -> None:
         profiles = [
             {"type": "command"},

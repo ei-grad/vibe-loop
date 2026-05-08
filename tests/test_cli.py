@@ -834,6 +834,27 @@ class CliTests(unittest.TestCase):
                 generated_profile_payload("WORK.md", empty_title_column=True),
             ),
             (
+                "invalid_field_mapping_value",
+                {
+                    "status": "profile",
+                    "confidence": 0.86,
+                    "profile": {
+                        "kind": "markdown_headings",
+                        "source_paths": ["WORK.md"],
+                        "stable_ids": True,
+                        "fields": {
+                            "id": {"strategy": "label_value"},
+                            "title": {"strategy": "heading_text"},
+                            "status": {"label": "State"},
+                        },
+                        "status_map": {
+                            "done": ["Done"],
+                            "runnable": ["Todo"],
+                        },
+                    },
+                },
+            ),
+            (
                 "unknown_field_column",
                 generated_profile_payload("WORK.md", title_column="Missing"),
             ),
