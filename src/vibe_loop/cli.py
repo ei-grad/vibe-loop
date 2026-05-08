@@ -20,6 +20,7 @@ from vibe_loop.generated_profiles import (
     runtime_task_source_report,
 )
 from vibe_loop.runner import VibeRunner
+from vibe_loop.runs import RunStore, WorkerReport, WORKER_REPORT_STATUSES
 from vibe_loop.skills import install_skills
 from vibe_loop.task_views import (
     build_task_views,
@@ -112,6 +113,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(workers)
     workers.add_argument("--json", action="store_true")
 
+    report = subparsers.add_parser("report", help="Record a worker result report")
+    add_repo_argument(report)
+    report.add_argument("--run-id", required=True)
+    report.add_argument("--task-id", required=True)
+    report.add_argument("--status", required=True, choices=WORKER_REPORT_STATUSES)
+    report.add_argument("--commit", default="")
+    report.add_argument("--message", default="")
+    report.add_argument(
+        "--metadata-json",
+        help="JSON object with additional structured report metadata",
+    )
+
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
 
@@ -189,6 +202,19 @@ def dispatch(args: argparse.Namespace) -> int:
             output = render_workers(workers)
             if output:
                 print(output)
+        return 0
+
+    if args.command == "report":
+        report = WorkerReport(
+            run_id=args.run_id,
+            task_id=args.task_id,
+            status=args.status,
+            commit=args.commit,
+            message=args.message,
+            metadata=parse_metadata_json(args.metadata_json),
+        )
+        RunStore(config.state_path / "runs.jsonl").append_report(report)
+        print(json.dumps(report.to_json(), indent=2))
         return 0
 
     if args.command == "doctor":
@@ -440,3 +466,15 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tcommand={payload['command']}{stale}"
         )
     return "\n".join(lines)
+
+
+def parse_metadata_json(value: str | None) -> dict[str, object]:
+    if value is None:
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--metadata-json must be a JSON object: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("--metadata-json must be a JSON object")
+    return payload

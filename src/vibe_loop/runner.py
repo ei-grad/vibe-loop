@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -24,7 +25,7 @@ from vibe_loop.generated_profiles import (
     resolve_runtime_task_source,
 )
 from vibe_loop.locks import LockBusy, LockManager
-from vibe_loop.runs import RunResult, RunStore
+from vibe_loop.runs import RunResult, RunStore, WorkerReport
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import ActiveRunState
 
@@ -47,6 +48,12 @@ class StreamingCommandResult:
     exit_code: int
     session_id: str | None = None
     session_id_source: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class ClassificationResult:
+    status: str
+    source: str
 
 
 class SessionIdObserver:
@@ -173,7 +180,14 @@ class VibeRunner:
         message = ""
         session_id = run_id
         session_id_source = "fallback:run_id"
-        command = command_template.format(task_id=task.task_id)
+        command = command_template.format(task_id=task.task_id, run_id=run_id)
+        command_env = worker_command_env(
+            run_id=run_id,
+            task_id=task.task_id,
+            repo=self.config.repo,
+            log_path=log_path,
+        )
+        worker_report: WorkerReport | None = None
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -234,6 +248,7 @@ class VibeRunner:
                     command,
                     self.config.repo,
                     log,
+                    env=command_env,
                     forward_stderr=self.config.agent.forward_stderr,
                     on_start=record_worker_pid,
                 )
@@ -243,16 +258,35 @@ class VibeRunner:
                 report_status(f"agent command exit_code={exit_code}", log)
                 report_status(f"session_id={session_id}", log)
                 report_status(f"session_id_source={session_id_source}", log)
-                if exit_code == 0:
+                worker_report = self.run_store.latest_worker_report(
+                    run_id,
+                    task.task_id,
+                )
+                if worker_report is not None:
+                    report_status(
+                        f"worker report status={worker_report.status}",
+                        log,
+                    )
+                    if worker_report.commit:
+                        report_status(
+                            f"worker report commit={worker_report.commit}",
+                            log,
+                        )
+                elif exit_code == 0:
                     message = self.run_completion_checks(log)
             end_main = git_rev_parse(self.config.repo, "HEAD")
             classification = self.classify(
-                task.task_id, exit_code, start_main, end_main, message
+                task.task_id,
+                exit_code,
+                start_main,
+                end_main,
+                message,
+                worker_report,
             )
             result = RunResult(
                 run_id=run_id,
                 task_id=task.task_id,
-                classification=classification,
+                classification=classification.status,
                 exit_code=exit_code,
                 log_path=log_path,
                 start_main=start_main,
@@ -264,10 +298,15 @@ class VibeRunner:
                 agent_selection_command_source=self.config.agent.selection_command_source,
                 agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
                 agent_default_policy=AGENT_DEFAULT_POLICY,
+                classification_source=classification.source,
+                worker_report=(
+                    worker_report.to_json() if worker_report is not None else None
+                ),
             )
             self.record_result(result)
             report_status(
-                f"recorded {classification} result for {task.task_id}: {log_path}"
+                f"recorded {classification.status} result for {task.task_id}: "
+                f"{log_path}"
             )
             return result
         finally:
@@ -339,17 +378,20 @@ class VibeRunner:
         start_main: str,
         end_main: str,
         message: str,
-    ) -> str:
+        worker_report: WorkerReport | None = None,
+    ) -> ClassificationResult:
+        if worker_report is not None:
+            return ClassificationResult(worker_report.status, "worker_report")
         if exit_code != 0 or message:
-            return "failed"
+            return ClassificationResult("failed", "exit_code_or_completion_check")
         task = self.source.probe(task_id)
         if task and task.status == "Done":
-            return "completed"
+            return ClassificationResult("completed", "task_probe")
         if task and task.status == "Gated":
-            return "blocked"
+            return ClassificationResult("blocked", "task_probe")
         if start_main != end_main and task is None:
-            return "completed"
-        return "unknown"
+            return ClassificationResult("completed", "main_change")
+        return ClassificationResult("unknown", "fallback")
 
     def record_result(self, result: RunResult) -> None:
         self.run_store.append_result(result)
@@ -429,6 +471,7 @@ def run_streaming_command(
     cwd: Path,
     log: TextIO,
     *,
+    env: dict[str, str] | None = None,
     forward_stderr: bool = False,
     on_start: Callable[[int], None] | None = None,
 ) -> StreamingCommandResult:
@@ -442,6 +485,7 @@ def run_streaming_command(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
+        env=env,
     )
     if on_start is not None:
         on_start(process.pid)
@@ -475,6 +519,25 @@ def run_streaming_command(
         session_id=observation.session_id if observation else None,
         session_id_source=observation.source if observation else None,
     )
+
+
+def worker_command_env(
+    *,
+    run_id: str,
+    task_id: str,
+    repo: Path,
+    log_path: Path,
+) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "VIBE_LOOP_RUN_ID": run_id,
+            "VIBE_LOOP_TASK_ID": task_id,
+            "VIBE_LOOP_REPO": str(repo),
+            "VIBE_LOOP_LOG": str(log_path),
+        }
+    )
+    return env
 
 
 def stream_pipe(

@@ -175,6 +175,7 @@ vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent
 vibe-loop workers --repo .
+vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
 vibe-loop install-skills --codex --claude
 ```
 
@@ -191,6 +192,19 @@ stderr, `session_id` stores that native worker id and `session_id_source` is
 `native:stdout` or `native:stderr`. If no native session id is observed,
 `session_id` falls back to `run_id` and `session_id_source` is
 `fallback:run_id`.
+
+Workers can explicitly report their final status while the supervisor run is
+active:
+
+```bash
+vibe-loop report --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" \
+  --task-id "$VIBE_LOOP_TASK_ID" --status blocked --commit HEAD \
+  --message "waiting on reviewer" --metadata-json '{"reason":"review"}'
+```
+
+Report statuses are `completed`, `blocked`, `failed`, and `unknown`. Matching
+report records are authoritative; without a report, the supervisor falls back to
+exit status, completion checks, task probing, and main-branch change heuristics.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
@@ -248,9 +262,12 @@ selection_command = "claude -p {prompt}"
 forward_stderr = false
 ```
 
-`agent.command` receives `{task_id}` for the selected task. `selection_command`
-receives a shell-quoted `{prompt}` containing the dependency-ready candidate
-list and recent run context, and should print JSON containing `task_id`.
+`agent.command` receives `{task_id}` for the selected task and `{run_id}` for
+the supervisor run. Worker commands also receive `VIBE_LOOP_RUN_ID`,
+`VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in their environment.
+`selection_command` receives a shell-quoted `{prompt}` containing the
+dependency-ready candidate list and recent run context, and should print JSON
+containing `task_id`.
 
 For command-backed task sources:
 

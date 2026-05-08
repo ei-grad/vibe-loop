@@ -96,6 +96,69 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent_command_source=auto:codex", log_text)
         self.assertIn("session_id_source=native:stdout", log_text)
 
+    def test_auto_codex_worker_can_report_with_run_id_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            write_fake_git(bin_dir)
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                f"sys.path.insert(0, {str(source_path)!r})\n"
+                "if sys.argv[1] != 'exec':\n"
+                "    raise SystemExit(64)\n"
+                "env_payload = {\n"
+                "    'run_id': os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "    'task_id': os.environ['VIBE_LOOP_TASK_ID'],\n"
+                "    'repo': os.environ['VIBE_LOOP_REPO'],\n"
+                "    'log': os.environ['VIBE_LOOP_LOG'],\n"
+                "}\n"
+                "Path('agent-env.json').write_text(\n"
+                "    json.dumps(env_payload),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main([\n"
+                "        'report',\n"
+                "        '--repo', '.',\n"
+                "        '--run-id', env_payload['run_id'],\n"
+                "        '--task-id', env_payload['task_id'],\n"
+                "        '--status', 'completed',\n"
+                "        '--metadata-json', '{\"via\":\"env\"}',\n"
+                "    ])\n"
+                ")\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            env_payload = json.loads(
+                (repo / "agent-env.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["worker_report"]["metadata"], {"via": "env"})
+        self.assertEqual(env_payload["run_id"], payload["run_id"])
+        self.assertEqual(env_payload["task_id"], "TASK-01")
+        self.assertEqual(env_payload["repo"], str(repo))
+        self.assertEqual(env_payload["log"], payload["log"])
+        self.assertIn("agent command source: auto:codex", stderr.getvalue())
+
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -1781,6 +1844,51 @@ class CliTests(unittest.TestCase):
             payload["task_source_runtime"]["diagnostics"][0],
         )
 
+    def test_report_writes_worker_report_without_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--status",
+                        "blocked",
+                        "--commit",
+                        "abc123",
+                        "--message",
+                        "waiting on dependency",
+                        "--metadata-json",
+                        '{"reason":"external"}',
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["run_id"], "run-1")
+        self.assertEqual(payload["task_id"], "TASK-01")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["commit"], "abc123")
+        self.assertEqual(payload["metadata"], {"reason": "external"})
+        self.assertEqual(records[0]["record_type"], "worker_report")
+        self.assertEqual(records[0]["status"], "blocked")
+
     def test_run_next_keeps_json_stdout_when_agent_streams_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1818,6 +1926,114 @@ class CliTests(unittest.TestCase):
         self.assertIn("[vibe-loop] session_id_source=fallback:run_id", log_text)
         self.assertIn("agent out", log_text)
         self.assertIn("agent err", log_text)
+
+    def test_run_next_prefers_worker_report_over_task_probe_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[3])\n"
+                "from vibe_loop.cli import main\n"
+                "report_exit = main([\n"
+                "        'report',\n"
+                "        '--repo', '.',\n"
+                "        '--run-id', sys.argv[1],\n"
+                "        '--task-id', sys.argv[2],\n"
+                "        '--status', 'completed',\n"
+                "        '--commit', 'reported-commit',\n"
+                "        '--message', 'explicit worker result',\n"
+                "        '--metadata-json', '{\"source\":\"agent\"}',\n"
+                "])\n"
+                "raise SystemExit(7 if report_exit == 0 else report_exit)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{run_id}} {{task_id}} {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(payload["exit_code"], 7)
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["worker_report"]["status"], "completed")
+        self.assertEqual(payload["worker_report"]["commit"], "reported-commit")
+        self.assertEqual(payload["worker_report"]["metadata"], {"source": "agent"})
+        self.assertEqual(records[0]["record_type"], "worker_report")
+        self.assertEqual(records[1]["record_type"], "run_result")
+        self.assertEqual(records[1]["classification_source"], "worker_report")
+        self.assertIn("worker report status=completed", log_text)
+        self.assertIn("reported-commit", log_text)
+
+    def test_run_next_skips_completion_checks_after_worker_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[3])\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main([\n"
+                "        'report',\n"
+                "        '--repo', '.',\n"
+                "        '--run-id', sys.argv[1],\n"
+                "        '--task-id', sys.argv[2],\n"
+                "        '--status', 'blocked',\n"
+                "        '--message', 'blocked by dependency',\n"
+                "    ])\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / "completion.py").write_text(
+                "from pathlib import Path\n"
+                "Path('completion-ran').write_text('ran', encoding='utf-8')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{run_id}} {{task_id}} {source_path}"
+            completion_command = f"{sys.executable} completion.py"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = "
+                + json.dumps(command)
+                + "\n[completion]\ncommands = ["
+                + json.dumps(completion_command)
+                + "]\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["classification"], "blocked")
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["message"], "")
+        self.assertFalse((repo / "completion-ran").exists())
 
     def test_run_next_records_active_worker_metadata_in_task_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

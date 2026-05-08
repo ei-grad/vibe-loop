@@ -6,13 +6,16 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
+from vibe_loop.config import VibeConfig
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runner import (
+    VibeRunner,
     build_selection_prompt,
     parse_selected_task_id,
     parse_worker_session_id,
     run_streaming_command,
 )
+from vibe_loop.runs import WORKER_REPORT_STATUSES, WorkerReport
 from vibe_loop.tasks import Task
 
 
@@ -41,6 +44,37 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(parse_worker_session_id("session id: abc-123"), "abc-123")
         self.assertEqual(parse_worker_session_id("Session_ID = codex.456"), "codex.456")
         self.assertIsNone(parse_worker_session_id("session started"))
+
+    def test_classify_uses_worker_report_statuses_before_task_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+
+            for status in WORKER_REPORT_STATUSES:
+                for exit_code, message in (
+                    (0, ""),
+                    (7, ""),
+                    (0, "completion check failed"),
+                ):
+                    with self.subTest(
+                        status=status,
+                        exit_code=exit_code,
+                        message=message,
+                    ):
+                        result = runner.classify(
+                            "TASK-01",
+                            exit_code,
+                            "aaa",
+                            "aaa",
+                            message,
+                            WorkerReport(
+                                run_id=f"run-{status}",
+                                task_id="TASK-01",
+                                status=status,
+                            ),
+                        )
+
+                        self.assertEqual(result.status, status)
+                        self.assertEqual(result.source, "worker_report")
 
     def test_lock_manager_rejects_existing_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

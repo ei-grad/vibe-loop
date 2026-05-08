@@ -8,7 +8,13 @@ from pathlib import Path
 from typing import Any
 
 from vibe_loop.locks import LockManager
-from vibe_loop.runs import RUN_RECORD_TYPE, RunStore, utc_now_iso
+from vibe_loop.runs import (
+    RUN_RECORD_TYPE,
+    WORKER_REPORT_RECORD_TYPE,
+    RunStore,
+    WorkerReport,
+    utc_now_iso,
+)
 
 
 ACTIVE_RUN_SCHEMA_VERSION = 1
@@ -118,6 +124,8 @@ class WorkerView:
     stale_reason: str | None = None
     result_status: str | None = None
     result_finished_at: str | None = None
+    result_record_type: str | None = None
+    result_metadata: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -139,6 +147,8 @@ class WorkerView:
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
             "result_status": self.result_status,
             "result_finished_at": self.result_finished_at,
+            "result_record_type": self.result_record_type,
+            "result_metadata": self.result_metadata,
         }
 
 
@@ -163,21 +173,32 @@ def build_worker_views(
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
     process_checker = process_exists if process_exists is not None else pid_exists
-    result_by_run_id = latest_result_by_run_id(run_store.read_records())
+    result_by_run_id = latest_worker_status_by_run_id(run_store.read_records())
     views: list[WorkerView] = []
     for active in load_active_run_states(lock_manager):
         result = result_by_run_id.get(active.run_id)
+        if (
+            result is not None
+            and result.get("record_type") == WORKER_REPORT_RECORD_TYPE
+            and result.get("task_id") != active.task_id
+        ):
+            result = None
         process_state = classify_process(active, host, process_checker)
         result_status = result_value(result, "status") or result_value(
             result, "classification"
         )
-        result_finished_at = result_value(result, "finished_at")
+        result_finished_at = result_value(result, "finished_at") or result_value(
+            result,
+            "reported_at",
+        )
+        result_record_type = result_value(result, "record_type")
+        result_metadata = result_metadata_value(result)
         state = "running"
         stale_reason = None
         if not active.run_id:
             state = "stale"
             stale_reason = "missing_run_id"
-        elif result_status:
+        elif result_status and result_record_type != WORKER_REPORT_RECORD_TYPE:
             state = "stale"
             stale_reason = "result_recorded"
         elif process_state == "missing":
@@ -197,6 +218,8 @@ def build_worker_views(
                 stale_reason=stale_reason,
                 result_status=result_status,
                 result_finished_at=result_finished_at,
+                result_record_type=result_record_type,
+                result_metadata=result_metadata,
             )
         )
     return views
@@ -215,17 +238,26 @@ def classify_process(
     return "running" if process_checker(active.worker_pid) else "missing"
 
 
-def latest_result_by_run_id(
+def latest_worker_status_by_run_id(
     records: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     results: dict[str, dict[str, Any]] = {}
     for record in records:
         record_type = record.get("record_type")
-        if record_type not in {None, RUN_RECORD_TYPE}:
-            continue
         run_id = record.get("run_id")
-        if isinstance(run_id, str) and run_id:
+        if not isinstance(run_id, str) or not run_id:
+            continue
+        if record_type in {None, RUN_RECORD_TYPE}:
             results[run_id] = record
+            continue
+        if record_type != WORKER_REPORT_RECORD_TYPE:
+            continue
+        report = WorkerReport.from_record(record)
+        if report is None:
+            continue
+        existing = results.get(run_id)
+        if existing is None or existing.get("record_type") == WORKER_REPORT_RECORD_TYPE:
+            results[run_id] = report.to_record()
     return results
 
 
@@ -263,3 +295,16 @@ def result_value(record: dict[str, Any] | None, key: str) -> str | None:
         return None
     value = record.get(key)
     return value if isinstance(value, str) and value else None
+
+
+def result_metadata_value(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    if record is None:
+        return None
+    metadata = record.get("metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    worker_report = record.get("worker_report")
+    if not isinstance(worker_report, dict):
+        return None
+    metadata = worker_report.get("metadata")
+    return metadata if isinstance(metadata, dict) else None

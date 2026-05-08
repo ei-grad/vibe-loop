@@ -9,6 +9,9 @@ from typing import Any
 
 RUN_SCHEMA_VERSION = 3
 RUN_RECORD_TYPE = "run_result"
+WORKER_REPORT_SCHEMA_VERSION = 1
+WORKER_REPORT_RECORD_TYPE = "worker_report"
+WORKER_REPORT_STATUSES = ("completed", "blocked", "failed", "unknown")
 
 
 def utc_now_iso() -> str:
@@ -31,6 +34,8 @@ class RunResult:
     agent_selection_command_source: str = ""
     agent_default_policy_source: str = ""
     agent_default_policy: str = ""
+    classification_source: str = ""
+    worker_report: dict[str, object] | None = None
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
@@ -49,6 +54,8 @@ class RunResult:
             "agent_selection_command_source": self.agent_selection_command_source,
             "agent_default_policy_source": self.agent_default_policy_source,
             "agent_default_policy": self.agent_default_policy,
+            "classification_source": self.classification_source,
+            "worker_report": self.worker_report,
             "finished_at": self.finished_at,
         }
 
@@ -64,14 +71,87 @@ class RunResult:
         return record
 
 
+@dataclasses.dataclass(frozen=True)
+class WorkerReport:
+    run_id: str
+    task_id: str
+    status: str
+    commit: str = ""
+    message: str = ""
+    metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
+    reported_at: str = dataclasses.field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        if self.status not in WORKER_REPORT_STATUSES:
+            raise ValueError(
+                "worker report status must be one of: "
+                f"{', '.join(WORKER_REPORT_STATUSES)}"
+            )
+        if not self.run_id:
+            raise ValueError("worker report run_id is required")
+        if not self.task_id:
+            raise ValueError("worker report task_id is required")
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "status": self.status,
+            "commit": self.commit,
+            "message": self.message,
+            "metadata": self.metadata,
+            "reported_at": self.reported_at,
+        }
+
+    def to_record(self) -> dict[str, object]:
+        record = self.to_json()
+        record.update(
+            {
+                "schema_version": WORKER_REPORT_SCHEMA_VERSION,
+                "record_type": WORKER_REPORT_RECORD_TYPE,
+            }
+        )
+        return record
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> WorkerReport | None:
+        if record.get("record_type") != WORKER_REPORT_RECORD_TYPE:
+            return None
+        run_id = record.get("run_id")
+        task_id = record.get("task_id")
+        status = record.get("status")
+        if not isinstance(run_id, str) or not run_id:
+            return None
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        if not isinstance(status, str) or status not in WORKER_REPORT_STATUSES:
+            return None
+        metadata = record.get("metadata")
+        return cls(
+            run_id=run_id,
+            task_id=task_id,
+            status=status,
+            commit=string_value(record.get("commit")),
+            message=string_value(record.get("message")),
+            metadata=metadata if isinstance(metadata, dict) else {},
+            reported_at=string_value(record.get("reported_at")),
+        )
+
+
 class RunStore:
     def __init__(self, path: Path):
         self.path = path
 
     def append_result(self, result: RunResult) -> None:
+        self.append_record(result.to_record())
+
+    def append_report(self, report: WorkerReport) -> None:
+        self.append_record(report.to_record())
+
+    def append_record(self, record: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(result.to_record(), separators=(",", ":")) + "\n")
+            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
     def read_records(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -91,8 +171,29 @@ class RunStore:
     def recent_records(self, max_runs: int = 5) -> list[dict[str, Any]]:
         return self.read_records()[-max_runs:]
 
+    def recent_result_records(self, max_runs: int = 5) -> list[dict[str, Any]]:
+        return [
+            record
+            for record in self.read_records()
+            if record.get("record_type") in {None, RUN_RECORD_TYPE}
+        ][-max_runs:]
+
+    def latest_worker_report(
+        self,
+        run_id: str,
+        task_id: str | None = None,
+    ) -> WorkerReport | None:
+        for record in reversed(self.read_records()):
+            report = WorkerReport.from_record(record)
+            if report is None or report.run_id != run_id:
+                continue
+            if task_id is not None and report.task_id != task_id:
+                continue
+            return report
+        return None
+
     def recent_log_context(self, max_runs: int = 5, tail_lines: int = 80) -> str:
-        records = self.recent_records(max_runs)
+        records = self.recent_result_records(max_runs)
         if not records:
             return "No prior vibe-loop runs recorded."
         chunks = ["Recent vibe-loop runs:"]
@@ -124,3 +225,7 @@ def tail(path: Path, line_count: int) -> list[str]:
     except OSError:
         return []
     return lines[-line_count:]
+
+
+def string_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
