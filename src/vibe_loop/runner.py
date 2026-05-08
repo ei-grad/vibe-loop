@@ -5,9 +5,11 @@ import json
 import shlex
 import subprocess
 import sys
+import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 
 from vibe_loop.config import VibeConfig
 from vibe_loop.locks import LockBusy, LockManager
@@ -66,9 +68,14 @@ class VibeRunner:
         if not candidates:
             return None
         if ask_agent and len(candidates) > 1:
+            report_status(
+                f"asking agent to select next task from {len(candidates)} candidates"
+            )
             selected = self.ask_agent_to_select(candidates)
             if selected is not None:
+                report_status(f"agent selected {selected.task_id}: {selected.title}")
                 return selected
+            report_status("agent selection unavailable; using first ready task")
         return candidates[0]
 
     def ask_agent_to_select(self, candidates: list[Task]) -> Task | None:
@@ -82,6 +89,8 @@ class VibeRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=900,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -105,8 +114,16 @@ class VibeRunner:
             command = self.config.agent.command.format(task_id=task.task_id)
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(log, task, command, start_main)
-                exit_code = run_streaming_command(command, self.config.repo, log)
-                log.write(f"\n[vibe-loop] agent exit_code={exit_code}\n")
+                report_status(f"running {task.task_id}: {task.title}", log)
+                report_status(f"log: {log_path}", log)
+                report_status("agent command started", log)
+                exit_code = run_streaming_command(
+                    command,
+                    self.config.repo,
+                    log,
+                    forward_stderr=self.config.agent.forward_stderr,
+                )
+                report_status(f"agent command exit_code={exit_code}", log)
                 if exit_code == 0:
                     message = self.run_completion_checks(log)
         finally:
@@ -126,6 +143,9 @@ class VibeRunner:
             message=message,
         )
         self.record_result(result)
+        report_status(
+            f"recorded {classification} result for {task.task_id}: {log_path}"
+        )
         return result
 
     def run_next(
@@ -137,6 +157,7 @@ class VibeRunner:
         try:
             return self.run_task(task)
         except LockBusy:
+            report_status(f"task locked during acquire, retrying: {task.task_id}")
             excluded = set(exclude or set())
             excluded.add(task.task_id)
             return self.run_next(ask_agent=ask_agent, exclude=excluded)
@@ -166,7 +187,7 @@ class VibeRunner:
 
     def run_completion_checks(self, log) -> str:
         for command in self.config.completion.commands:
-            log.write(f"\n[vibe-loop] completion check: {command}\n")
+            report_status(f"completion check started: {command}", log)
             result = subprocess.run(
                 command,
                 cwd=self.config.repo,
@@ -174,8 +195,12 @@ class VibeRunner:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            log.write(f"[vibe-loop] completion check exit_code={result.returncode}\n")
+            report_status(
+                f"completion check exit_code={result.returncode}: {command}", log
+            )
             if result.returncode != 0:
                 return f"completion check failed: {command}"
         return ""
@@ -259,26 +284,67 @@ def write_log_header(log, task: Task, command: str, start_main: str) -> None:
     log.write(f"[vibe-loop] start_main={start_main}\n\n")
 
 
-def run_streaming_command(command: str, cwd: Path, log) -> int:
+def report_status(message: str, log: TextIO | None = None) -> None:
+    line = f"[vibe-loop] {message}"
+    print(line, file=sys.stderr)
+    if log is not None:
+        log.write(line + "\n")
+        log.flush()
+
+
+def run_streaming_command(
+    command: str,
+    cwd: Path,
+    log: TextIO,
+    *,
+    forward_stderr: bool = False,
+) -> int:
     process = subprocess.Popen(
         command,
         cwd=cwd,
         shell=True,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     assert process.stdout is not None
+    assert process.stderr is not None
+    log_lock = threading.Lock()
+    stdout_thread = threading.Thread(
+        target=stream_pipe,
+        args=(process.stdout, log, log_lock, True),
+    )
+    stderr_thread = threading.Thread(
+        target=stream_pipe,
+        args=(process.stderr, log, log_lock, forward_stderr),
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    exit_code = process.wait()
+    stdout_thread.join()
+    stderr_thread.join()
+    return exit_code
+
+
+def stream_pipe(
+    pipe: TextIO,
+    log: TextIO,
+    log_lock: threading.Lock,
+    forward: bool,
+) -> None:
     try:
-        for line in process.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            log.write(line)
-            log.flush()
+        for line in pipe:
+            if forward:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+            with log_lock:
+                log.write(line)
+                log.flush()
     finally:
-        process.stdout.close()
-    return process.wait()
+        pipe.close()
 
 
 def new_run_id(task_id: str) -> str:

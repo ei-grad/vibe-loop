@@ -34,6 +34,11 @@ vibe-loop install-skills --codex --claude
 `.vibe-loop/runs.jsonl` entries and log tails. The CLI still performs the lock
 and completion checks itself.
 
+`run-next` and `run-until-done` keep their result JSON on stdout. Run progress
+and mirrored agent stdout are written to stderr, and full stdout/stderr streams
+are captured in `.vibe-loop/runs/<run-id>.log`. Agent stderr is log-only by
+default.
+
 `vibe-loop tasks` without a subcommand remains a compatibility alias for
 `vibe-loop tasks runnable`.
 
@@ -48,6 +53,7 @@ state_dir = ".vibe-loop"
 [agent]
 command = "codex exec '$vibe-loop {task_id}'"
 selection_command = "codex exec {prompt}"
+forward_stderr = false
 
 [task_source]
 type = "markdown-plan"

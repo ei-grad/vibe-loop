@@ -10,6 +10,7 @@ from typing import Any
 class AgentConfig:
     command: str = "codex exec '$vibe-loop {task_id}'"
     selection_command: str = "codex exec {prompt}"
+    forward_stderr: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -74,6 +75,9 @@ def parse_agent(data: object) -> AgentConfig:
         selection_command=str(
             table.get("selection_command") or AgentConfig.selection_command
         ),
+        forward_stderr=optional_bool(
+            table.get("forward_stderr"), False, "agent.forward_stderr"
+        ),
     )
 
 
@@ -129,3 +133,11 @@ def optional_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def optional_bool(value: object, default: bool, name: str) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{name} must be a boolean")

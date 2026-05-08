@@ -134,7 +134,7 @@ def dispatch(args: argparse.Namespace) -> int:
         runner = VibeRunner(config)
         result = runner.run_next(ask_agent=args.ask_agent)
         if result is None:
-            print("no runnable tasks")
+            print("no runnable tasks", file=sys.stderr)
             return 2
         print(json.dumps(result.to_json(), indent=2))
         return 0 if result.classification == "completed" else 1
