@@ -12,13 +12,46 @@
    locks.
 5. Add `main-integration` lock support and update bundled skills to use it.
 6. Add worker/runs visibility commands and stale state reporting.
-7. Add agent-assisted batch selection and optional resource/path locks.
+7. Add planning analytics: completed-slice evidence gathering, timeline/Gantt
+   data generation, duration prediction, and benchmarked estimator selection.
+8. Add agent-assisted batch selection and optional resource/path locks.
 
 ## Supporting Design Docs
 
 - Parallel worker orchestration: `docs/parallel-worker-orchestration.md`
 - Generated task discovery: `docs/generated-task-discovery.md`
 - Skill evaluation strategy: `docs/skill-evaluation-strategy.md`
+
+## Planning Analytics Direction
+
+`../lightmetrics` proves a useful local planning loop, but most of its code is
+repository-specific and should not be copied as-is. Its Gantt generator reads a
+fixed `docs/PLAN.md` table, per-task worklog JSONL files, and git author
+history; maps completed work through worklog commits, `Plan-Item:` trailers,
+explicit evidence hashes, and finally warning-marked subject heuristics; infers
+actual spans from commit timestamps with idle-gap clipping; emits coverage
+warnings for unmapped done rows and non-generated commits; and schedules
+unfinished tasks by dependency readiness, an Active-first override, priority
+before remaining status rank, and plan order.
+
+The duration work is the part worth generalizing carefully. Lightmetrics
+benchmarks estimator candidates with stable hash folds, keeps validation tasks
+out of training, uses only pre-task text for prediction features, winsorizes
+duration outliers in log space, and reports error metrics plus worst misses. Its
+initial feature heuristic badly over-predicted small slices, so `vibe-loop`
+should start with conservative robust historical baselines and require benchmark
+evidence before promoting a richer model. The generated estimate code and the
+benchmark-selected model must stay mechanically aligned; naming drift between
+those artifacts should be treated as a test failure.
+
+For `vibe-loop`, this belongs under a planning-analytics boundary rather than in
+task selection. The collector should consume normalized `TaskSource` output,
+`RunStore` records, optional project worklog adapters, and explicit git evidence
+without making read-only commands mutate repository docs. Generated JSON, HTML,
+and benchmark reports should default under the configured state directory, with
+explicit output paths for repositories that want committed artifacts. Subject
+matching may be useful as a diagnostic, but only explicit evidence should satisfy
+coverage checks by default.
 
 ## Task Plan
 
@@ -46,6 +79,13 @@
 | PAR-07 | P1 | Planned | DISC-04, PAR-01, PAR-03 | Add agent-assisted batch selection from mechanically safe candidates, recent logs, active workers, and task metadata. CLI must validate the returned batch. | `--ask-agent --jobs N` can choose a compatible batch, but invalid/locked/duplicate choices are rejected before spawning. | Unit tests for batch validation and fallback to deterministic ordering. |
 | PAR-08 | P1 | Planned | PAR-04, PAR-07 | Add optional resource/path locks for repositories that can declare task conflict domains. Unknown resources remain conservative. | Two tasks with overlapping resources are not scheduled together; tasks with disjoint explicit resources can run concurrently. | Unit tests for resource matching and scheduler exclusion. |
 | PAR-09 | P2 | Planned | PAR-02, PAR-03 | Add watchdog handling for worker crashes, stale locks, interrupted supervisor runs, and orphaned worktrees without deleting user work. | Stale state is reported with precise recovery commands; no automatic destructive cleanup occurs. | Unit tests for stale lock classification and docs for manual recovery. |
+| GANTT-01 | P1 | Planned | CORE-01, DISC-04, PAR-03 | Design the planning analytics contract after the Lightmetrics prototype: normalized task input, completed-slice evidence sources, optional project worklog adapters, git metadata boundaries, generated artifact locations, coverage semantics, projection scheduling policy, privacy limits, and how run attempts differ from final evidence ledgers. | A design note and config docs specify which evidence is authoritative, which heuristics are diagnostic only, how generated files avoid repository churn by default, how explicit output paths work, whether projections follow Lightmetrics parity or current runner parity, and how `doctor` reports analytics readiness. | Design diff review plus config tests proving analytics defaults do not mutate repo docs, explicit artifact paths are opt-in, and the selected projection policy is serialized. |
+| GANTT-02 | P1 | Planned | GANTT-01 | Build a deterministic planning evidence collector that joins `TaskSource` tasks, `RunStore` records, optional worklog-command output, explicit git trailers or commit refs, and bounded git metadata without reading environment variables or secret-like paths. | Collector output includes tasks, completion evidence, run attempts, commit mappings, skipped evidence reasons, and warnings for done tasks or non-generated commits lacking authoritative mapping. Subject matching is emitted only as a diagnostic unless explicitly enabled. | Unit tests with fixture repos for markdown tasks, command tasks, run records, worklog JSONL, `Plan-Item:` trailers, explicit commit refs, unmapped commits, metadata-only commits, and skipped secret-like paths. |
+| GANTT-03 | P1 | Planned | GANTT-02 | Add timeline data generation over the collected evidence. Completed tasks use mapped author-time spans with documented idle-gap clipping; incomplete tasks are scheduled from the latest actual end by dependency readiness and the projection ordering selected in `GANTT-01`, with `schedule_policy` serialized so Lightmetrics parity versus current runner parity is explicit. | `vibe-loop planning timeline --json` emits stable versioned JSON with sections, tasks, actual versus projected fields, warnings, source provenance, estimate reasons, schedule policy, and deterministic ordering. | CLI and unit tests for completed spans, single-commit idle clipping, dependency scheduling, unknown dependency warnings, projection policy ordering, stale run records, and JSON schema stability. |
+| GANTT-04 | P1 | Planned | GANTT-02 | Add duration prediction baselines for projected tasks. Start with robust historical models from completed evidence: global/workstream/priority medians, log-space outlier winsorization, conservative intervals, and leakage-safe pre-task similarity as an optional blend. | Estimates include minutes, low/high interval, model name, training sample counts, outlier handling notes, and feature/evidence reasons; no post-completion evidence is used for predictions. | Unit tests for small-history fallback, priority/workstream fallback, outlier bounds, pre-task token leakage prevention, interval coverage fields, and deterministic estimates. |
+| GANTT-05 | P1 | Planned | GANTT-04 | Add a duration-model benchmark command that evaluates candidate estimators with stable commit/task folds and writes JSON plus Markdown reports. The benchmark must fail if the generator's configured model name/parameters diverge from the benchmark-selected estimator. | `vibe-loop planning benchmark-duration --check` validates committed or state-dir reports, reports MAE/MAPE/log error/coverage/bias/worst misses, and keeps training folds free of validation tasks or shared validation commits. | CLI tests with fixture histories for fold stability, train/validation exclusion, model-selection mismatch failure, report `--check`, and deterministic JSON/Markdown output. |
+| GANTT-06 | P1 | Planned | GANTT-03, GANTT-04 | Add user-facing planning analytics commands and an optional static Gantt renderer. Defaults write generated artifacts under the configured state dir; explicit `--output`/`--html-output` paths allow repo-owned docs workflows. | Users can generate, check, and inspect timeline/Gantt artifacts without changing task selection behavior; `doctor` reports source, freshness, warning counts, and next repair commands. | CLI tests for default state-dir output, explicit output paths, stale artifact checks, warning rendering, and `doctor` diagnostics. |
+| GANTT-07 | P2 | Planned | GANTT-06, PAR-06 | Integrate planning analytics with worker visibility without turning analytics into a scheduler. Worker/runs views can link to timeline evidence, but scheduling remains governed by task readiness and locks. | `workers`, `runs inspect`, and planning timeline output cross-reference run IDs and task IDs while preserving the boundary between attempts, completed evidence, and future projections. | Snapshot-style CLI tests for cross-links and regression tests proving timeline warnings do not change runnable task selection. |
 | EVAL-00 | P0 | Planned | none | Deep-research skill evaluation methodology before building anything. Compare Agent Skills evaluation guidance, SkillsBench, Skill Bench-style YAML evals, Anthropic agent-eval guidance, OpenAI Evals patterns, and relevant coding-agent benchmark practice. | A source-linked research note explains the recommended paired no-skill and with-skill methodology, grader choices, trial counts, trigger-negative cases, artifact model, metrics, known benchmark pitfalls, and open questions for `vibe-loop`. No benchmark execution is required for this task. | `docs/skill-evaluation-strategy.md` or a deeper follow-up eval research doc with links, assumptions, benchmark caveats, and review notes. |
 | EVAL-01 | P0 | Planned | EVAL-00, CORE-01 | Design the bundled skill eval schema and run artifact contract. Cover task metadata, skill condition, agent/model/harness identity, budgets, source fingerprints, run logs, diffs, final repo state, structured results, grader outputs, and reproducibility fields. | Evaluator docs specify the paired no-skill and with-skill matrix, required artifacts, scoring fields, failure taxonomy, and how eval runs avoid reading secrets or reusing contaminated state from earlier trials. | Design diff review plus schema tests for valid run records, stale source fingerprints, missing artifacts, and rejected secret-like evidence paths. |
 | EVAL-08 | P0 | Planned | EVAL-00, CORE-02 | Specify bundled demo/example projects before creating fixtures. Define the project types, task prompts, seeded repository states, deterministic graders, expected workflow-contract evidence, negative trigger cases, and acceptable resource budgets. | The demo-project spec covers finite slice execution, generated task discovery, review loops, branch/worktree handling, worker reporting, locks, and main integration behavior without requiring any benchmark execution. | Source-linked demo spec with grader descriptions, expected artifacts, and trace-envelope rationale for each planned demo task. |
