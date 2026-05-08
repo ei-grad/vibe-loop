@@ -5,6 +5,12 @@ unblocked task from a repository task source, locks it, runs an agent command
 such as `codex exec '$vibe-loop <task_id>'`, captures logs, validates completion,
 records local run metadata, and can repeat until no runnable tasks remain.
 
+The CLI is a supervisor, not a branch or worktree manager. The configured worker
+agent owns branch/worktree setup, implementation, review, and any merge-to-main
+workflow defined by the repository instructions. `vibe-loop` owns task
+discovery, selection, locks, process execution, logs, completion checks, and run
+records.
+
 The runner is task-system agnostic. Repositories can expose tasks through a
 Markdown plan table, command adapters, or later tracker-specific adapters. The
 default adapter discovers Markdown files with tables using these columns:
@@ -41,6 +47,10 @@ The difference is in the workflow `vibe-loop` is built around:
 - `vibe-loop` treats agent execution as configuration. `codex exec` is the
   default command, but worker and selection commands are template strings rather
   than a hard dependency on one agent CLI.
+- `vibe-loop` keeps workers finite and leaves branch/worktree management to the
+  agent. The runner/supervisor owns scheduling, locks, logs, and result
+  collection; planned parallel mode keeps the same boundary instead of becoming a
+  central merge queue.
 - `vibe-loop` keeps attempt state, locks, run logs, and recent run metadata under
   `.vibe-loop/`, leaving project worklogs as final evidence records.
 
@@ -123,6 +133,10 @@ and mirrored agent stdout are written to stderr, and full stdout/stderr streams
 are captured in `.vibe-loop/runs/<run-id>.log`. Agent stderr is log-only by
 default.
 
+Worktree and branch handling are intentionally outside the CLI runtime. Put that
+policy in the repository instructions or in the configured agent command; keep
+`.vibe-loop/` for locks, logs, and run metadata.
+
 `vibe-loop tasks` without a subcommand remains a compatibility alias for
 `vibe-loop tasks runnable`.
 
@@ -198,6 +212,10 @@ Runner state is intentionally untracked:
 `runs.jsonl` is an append-only stream of versioned run result records. Project
 worklogs should remain final evidence ledgers. Attempt logs and failed runs
 belong in `.vibe-loop/`, not in project completion records.
+
+Branches and worktrees created by worker agents are not tracked as runner state.
+The agent workflow that creates them is responsible for refresh, review, merge,
+and cleanup according to repository policy.
 
 ## License
 
