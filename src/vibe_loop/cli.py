@@ -30,6 +30,7 @@ from vibe_loop.task_views import (
     task_tree_json,
 )
 from vibe_loop.tasks import Task
+from vibe_loop.workers import WorkerView, build_worker_views
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,6 +108,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--max-slices", type=int, default=0)
     run_all.add_argument("--continue-on-failure", action="store_true")
 
+    workers = subparsers.add_parser("workers", help="List active worker runs")
+    add_repo_argument(workers)
+    workers.add_argument("--json", action="store_true")
+
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
 
@@ -173,6 +178,17 @@ def dispatch(args: argparse.Namespace) -> int:
             return 0
         if results[-1].classification in {"failed", "unknown"}:
             return 1
+        return 0
+
+    if args.command == "workers":
+        runner = VibeRunner(config)
+        workers = build_worker_views(runner.lock_manager, runner.run_store)
+        if args.json:
+            print(json.dumps([worker.to_json() for worker in workers], indent=2))
+        else:
+            output = render_workers(workers)
+            if output:
+                print(output)
         return 0
 
     if args.command == "doctor":
@@ -408,4 +424,19 @@ def render_task_inspect(view) -> str:
         "evidence:",
         task.evidence or "-",
     ]
+    return "\n".join(lines)
+
+
+def render_workers(workers: list[WorkerView]) -> str:
+    lines: list[str] = []
+    for worker in workers:
+        payload = worker.to_json()
+        pid = payload["pid"] if payload["pid"] is not None else "-"
+        stale = f"\t{payload['stale_reason']}" if payload["stale_reason"] else ""
+        lines.append(
+            f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
+            f"\tprocess={payload['process_state']}\tpid={pid}"
+            f"\tstarted={payload['started_at']}\tlog={payload['log']}"
+            f"\tcommand={payload['command']}{stale}"
+        )
     return "\n".join(lines)

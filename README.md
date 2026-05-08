@@ -174,6 +174,7 @@ vibe-loop tasks configure --repo . --json
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent
+vibe-loop workers --repo .
 vibe-loop install-skills --codex --claude
 ```
 
@@ -330,6 +331,14 @@ Runner state is intentionally untracked:
   runs/
   runs.jsonl
 ```
+
+Active task locks store the worker command `pid`, `task_id`, `run_id`, log path,
+start time, base `main` revision, host, and resolved command. `vibe-loop
+workers` reconstructs the active view from those lock files plus `runs.jsonl`,
+then marks same-host locks with missing worker processes, missing worker PIDs,
+or incomplete metadata as stale without reading raw logs. The PID is the
+immediate configured command process started by the runner; deeper process
+identity checks are left to the later watchdog work.
 
 `runs.jsonl` is an append-only stream of versioned run result records. Run
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the

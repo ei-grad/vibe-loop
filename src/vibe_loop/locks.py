@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import socket
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -27,25 +28,42 @@ class LockManager:
     def __init__(self, lock_root: Path):
         self.lock_root = lock_root
 
-    def acquire(self, task_id: str, run_id: str) -> TaskLock:
+    def acquire(
+        self,
+        task_id: str,
+        run_id: str,
+        metadata: dict[str, object] | None = None,
+    ) -> TaskLock:
         self.lock_root.mkdir(parents=True, exist_ok=True)
-        path = self.lock_root / f"{safe_name(task_id)}.lock"
-        metadata = {
+        lock_name = safe_name(task_id)
+        path = self.lock_root / f"{lock_name}.lock"
+        lock_metadata = {
             "task_id": task_id,
             "run_id": run_id,
             "pid": os.getpid(),
             "host": socket.gethostname(),
             "started_at": datetime.now(UTC).isoformat(),
         }
+        if metadata is not None:
+            lock_metadata.update(metadata)
         try:
             path.mkdir()
         except FileExistsError as exc:
             raise LockBusy(path, read_metadata(path)) from exc
-        (path / "lock.json").write_text(
-            json.dumps(metadata, indent=2) + "\n",
-            encoding="utf-8",
+        try:
+            write_metadata(path, lock_metadata)
+        except OSError:
+            shutil.rmtree(path)
+            raise
+        return TaskLock(task_id=task_id, path=path, metadata=lock_metadata)
+
+    def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
+        write_metadata(task_lock.path, metadata)
+        return TaskLock(
+            task_id=task_lock.task_id,
+            path=task_lock.path,
+            metadata=metadata,
         )
-        return TaskLock(task_id=task_id, path=path, metadata=metadata)
 
     def release(self, task_lock: TaskLock) -> None:
         if task_lock.path.exists():
@@ -60,6 +78,8 @@ class LockManager:
         locks: list[dict[str, object]] = []
         for path in sorted(self.lock_root.glob("*.lock")):
             metadata = read_metadata(path)
+            if not path.exists():
+                continue
             metadata.setdefault("task_id", path.stem)
             metadata["path"] = str(path)
             locks.append(metadata)
@@ -75,7 +95,21 @@ def read_metadata(path: Path) -> dict[str, object]:
     if not metadata_path.exists():
         return {}
     try:
-        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        raw = metadata_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(raw)
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def write_metadata(path: Path, metadata: dict[str, object]) -> None:
+    metadata_path = path / "lock.json"
+    temp_path = path / f".lock.json.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    temp_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    temp_path.replace(metadata_path)

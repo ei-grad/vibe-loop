@@ -54,6 +54,15 @@ class RunnerTests(unittest.TestCase):
                 manager.release(task_lock)
             self.assertFalse(manager.is_locked("LIVE-04"))
 
+    def test_lock_manager_rejects_empty_existing_lock_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock_root = Path(directory) / "locks"
+            (lock_root / "LIVE-04.lock").mkdir(parents=True)
+            manager = LockManager(lock_root)
+
+            with self.assertRaises(LockBusy):
+                manager.acquire("LIVE-04", "run-2")
+
     def test_streaming_command_forwards_stdout_and_logs_stderr_by_default(
         self,
     ) -> None:
@@ -116,6 +125,22 @@ class RunnerTests(unittest.TestCase):
                 "session id: native-stdout-123",
                 log_path.read_text(encoding="utf-8"),
             )
+
+    def test_streaming_command_reports_started_process_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            started_pids: list[int] = []
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    "python -c 'print(\"ok\")'",
+                    Path(directory),
+                    log,
+                    on_start=started_pids.append,
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(started_pids), 1)
+        self.assertGreater(started_pids[0], 0)
 
     def test_streaming_command_captures_stderr_session_id_without_forwarding(
         self,

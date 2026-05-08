@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -1818,6 +1819,64 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent out", log_text)
         self.assertIn("agent err", log_text)
 
+    def test_run_next_records_active_worker_metadata_in_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import time\n"
+                "metadata = {}\n"
+                "for _ in range(100):\n"
+                "    locks = list(Path('.vibe-loop/locks').glob('*.lock/lock.json'))\n"
+                "    if locks:\n"
+                "        metadata = json.loads(locks[0].read_text(encoding='utf-8'))\n"
+                "        if metadata.get('worker_pid'):\n"
+                "            break\n"
+                "    time.sleep(0.01)\n"
+                "Path('active-worker.json').write_text(\n"
+                "    json.dumps(metadata),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "python agent.py"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            metadata = json.loads(
+                (repo / "active-worker.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(metadata["record_type"], "active_run")
+        self.assertEqual(metadata["task_id"], "TASK-01")
+        self.assertEqual(metadata["run_id"], payload["run_id"])
+        self.assertEqual(metadata["log"], payload["log"])
+        self.assertEqual(metadata["command"], "python agent.py")
+        self.assertIsInstance(metadata["worker_pid"], int)
+        self.assertEqual(metadata["pid"], metadata["worker_pid"])
+        self.assertEqual(metadata["pid_source"], "popen")
+        self.assertEqual(metadata["pid_scope"], "configured_command_process")
+        self.assertIsInstance(metadata["supervisor_pid"], int)
+        self.assertIn("base_main", metadata)
+
     def test_run_next_captures_explicit_worker_session_id_from_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1995,6 +2054,90 @@ class CliTests(unittest.TestCase):
 
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 exit_code = main(["tasks", "locks", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
+    def test_workers_reports_running_and_missing_processes_without_plan_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            running_lock = lock_root / "TASK-01.lock"
+            missing_lock = lock_root / "TASK-02.lock"
+            running_lock.mkdir(parents=True)
+            missing_lock.mkdir()
+            (running_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "pid_scope": "configured_command_process",
+                        "supervisor_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "abc123",
+                        "command": "python worker.py",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (missing_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-02",
+                        "run_id": "run-2",
+                        "pid": 999999999,
+                        "worker_pid": 999999999,
+                        "supervisor_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:01:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-2.log"),
+                        "base_main": "abc123",
+                        "command": "python worker.py",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["workers", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload[0]["task_id"], "TASK-01")
+        self.assertEqual(payload[0]["state"], "running")
+        self.assertEqual(payload[0]["process_state"], "running")
+        self.assertEqual(payload[0]["command"], "python worker.py")
+        self.assertEqual(payload[0]["pid_source"], "popen")
+        self.assertEqual(payload[0]["pid_scope"], "configured_command_process")
+        self.assertEqual(payload[1]["task_id"], "TASK-02")
+        self.assertEqual(payload[1]["state"], "stale")
+        self.assertEqual(payload[1]["process_state"], "missing")
+        self.assertEqual(payload[1]["stale_reason"], "missing_process")
+
+    def test_workers_text_does_not_require_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["workers", "--repo", str(repo)])
 
         self.assertEqual(exit_code, 0)
         self.assertEqual("", stdout.getvalue())

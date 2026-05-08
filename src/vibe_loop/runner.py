@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
@@ -25,6 +26,7 @@ from vibe_loop.generated_profiles import (
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
+from vibe_loop.workers import ActiveRunState
 
 
 SESSION_ID_RE = re.compile(
@@ -166,13 +168,25 @@ class VibeRunner:
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
         start_main = git_rev_parse(self.config.repo, "HEAD")
-        task_lock = self.lock_manager.acquire(task.task_id, run_id)
+        base_main = git_rev_parse(self.config.repo, self.config.main_branch)
         exit_code = 1
         message = ""
         session_id = run_id
         session_id_source = "fallback:run_id"
+        command = command_template.format(task_id=task.task_id)
+        active_state = ActiveRunState.new(
+            task_id=task.task_id,
+            run_id=run_id,
+            log_path=log_path,
+            base_main=base_main,
+            command=command,
+        )
+        task_lock = self.lock_manager.acquire(
+            task.task_id,
+            run_id,
+            metadata=active_state.to_lock_metadata(),
+        )
         try:
-            command = command_template.format(task_id=task.task_id)
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(
                     log,
@@ -207,11 +221,21 @@ class VibeRunner:
                     log,
                 )
                 report_status("agent command started", log)
+
+                def record_worker_pid(worker_pid: int) -> None:
+                    nonlocal active_state, task_lock
+                    active_state = active_state.with_worker_pid(worker_pid)
+                    task_lock = self.lock_manager.update(
+                        task_lock,
+                        active_state.to_lock_metadata(),
+                    )
+
                 stream_result = run_streaming_command(
                     command,
                     self.config.repo,
                     log,
                     forward_stderr=self.config.agent.forward_stderr,
+                    on_start=record_worker_pid,
                 )
                 exit_code = stream_result.exit_code
                 session_id = stream_result.session_id or run_id
@@ -221,33 +245,33 @@ class VibeRunner:
                 report_status(f"session_id_source={session_id_source}", log)
                 if exit_code == 0:
                     message = self.run_completion_checks(log)
+            end_main = git_rev_parse(self.config.repo, "HEAD")
+            classification = self.classify(
+                task.task_id, exit_code, start_main, end_main, message
+            )
+            result = RunResult(
+                run_id=run_id,
+                task_id=task.task_id,
+                classification=classification,
+                exit_code=exit_code,
+                log_path=log_path,
+                start_main=start_main,
+                end_main=end_main,
+                message=message,
+                session_id=session_id,
+                session_id_source=session_id_source,
+                agent_command_source=self.config.agent.command_source,
+                agent_selection_command_source=self.config.agent.selection_command_source,
+                agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
+                agent_default_policy=AGENT_DEFAULT_POLICY,
+            )
+            self.record_result(result)
+            report_status(
+                f"recorded {classification} result for {task.task_id}: {log_path}"
+            )
+            return result
         finally:
             self.lock_manager.release(task_lock)
-        end_main = git_rev_parse(self.config.repo, "HEAD")
-        classification = self.classify(
-            task.task_id, exit_code, start_main, end_main, message
-        )
-        result = RunResult(
-            run_id=run_id,
-            task_id=task.task_id,
-            classification=classification,
-            exit_code=exit_code,
-            log_path=log_path,
-            start_main=start_main,
-            end_main=end_main,
-            message=message,
-            session_id=session_id,
-            session_id_source=session_id_source,
-            agent_command_source=self.config.agent.command_source,
-            agent_selection_command_source=self.config.agent.selection_command_source,
-            agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
-            agent_default_policy=AGENT_DEFAULT_POLICY,
-        )
-        self.record_result(result)
-        report_status(
-            f"recorded {classification} result for {task.task_id}: {log_path}"
-        )
-        return result
 
     def run_next(
         self, ask_agent: bool = False, exclude: set[str] | None = None
@@ -406,6 +430,7 @@ def run_streaming_command(
     log: TextIO,
     *,
     forward_stderr: bool = False,
+    on_start: Callable[[int], None] | None = None,
 ) -> StreamingCommandResult:
     process = subprocess.Popen(
         command,
@@ -418,6 +443,8 @@ def run_streaming_command(
         errors="replace",
         bufsize=1,
     )
+    if on_start is not None:
+        on_start(process.pid)
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()
