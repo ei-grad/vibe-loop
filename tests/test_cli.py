@@ -431,6 +431,192 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[0]["agent_default_policy_source"], "codex-first")
         self.assertIn("agent command source: auto:codex:codex-first", stderr.getvalue())
 
+    def test_run_until_done_jobs_runs_independent_tasks_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
+                "log_path = os.environ['VIBE_LOOP_LOG']\n"
+                "started = Path('started')\n"
+                "started.mkdir(exist_ok=True)\n"
+                "(started / task_id).write_text(run_id, encoding='utf-8')\n"
+                "deadline = time.monotonic() + 5\n"
+                "while len(list(started.iterdir())) < 2:\n"
+                "    if time.monotonic() > deadline:\n"
+                "        raise SystemExit('parallel barrier timed out')\n"
+                "    time.sleep(0.02)\n"
+                "lock_paths = sorted(str(path) for path in Path('.vibe-loop/locks').glob('*.lock'))\n"
+                "lock_task_ids = []\n"
+                "for lock_path in Path('.vibe-loop/locks').glob('*.lock'):\n"
+                "    metadata_path = lock_path / 'lock.json'\n"
+                "    if metadata_path.exists():\n"
+                "        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))\n"
+                "        lock_task_ids.append(metadata.get('task_id'))\n"
+                "observed = Path('observed')\n"
+                "observed.mkdir(exist_ok=True)\n"
+                "(observed / f'{task_id}.json').write_text(\n"
+                "    json.dumps(\n"
+                "        {\n"
+                "            'task_id': task_id,\n"
+                "            'run_id': run_id,\n"
+                "            'log': log_path,\n"
+                "            'locks': lock_paths,\n"
+                "            'lock_task_ids': sorted(lock_task_ids),\n"
+                "        },\n"
+                "        sort_keys=True,\n"
+                "    ),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "second_deadline = time.monotonic() + 5\n"
+                "while len(list(observed.glob('*.json'))) < 2:\n"
+                "    if time.monotonic() > second_deadline:\n"
+                "        raise SystemExit('observation barrier timed out')\n"
+                "    time.sleep(0.02)\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', run_id,\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', 'completed',\n"
+                "            '--metadata-json', json.dumps({'lock_count': len(lock_paths)}),\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--jobs",
+                        "2",
+                        "--max-slices",
+                        "2",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            observations = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((repo / "observed").glob("*.json"))
+            ]
+            log_texts = {
+                str(result["task_id"]): Path(str(result["log"])).read_text(
+                    encoding="utf-8"
+                )
+                for result in payload
+                if Path(str(result["log"])).is_file()
+            }
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(payload), 2)
+        self.assertEqual(
+            sorted(result["task_id"] for result in payload),
+            ["TASK-01", "TASK-02"],
+        )
+        self.assertTrue(
+            all(result["classification"] == "completed" for result in payload)
+        )
+        self.assertEqual(len({result["log"] for result in payload}), 2)
+        self.assertEqual(len(observations), 2)
+        self.assertTrue(
+            all(len(observation["locks"]) == 2 for observation in observations)
+        )
+        self.assertTrue(
+            all(
+                observation["lock_task_ids"] == ["TASK-01", "TASK-02"]
+                for observation in observations
+            )
+        )
+        self.assertIn("[vibe-loop] parallel supervisor jobs=2", stderr.getvalue())
+        for result in payload:
+            log_text = log_texts.get(str(result["task_id"]), "")
+            self.assertTrue(log_text)
+            self.assertIn(f"[vibe-loop] task_id={result['task_id']}", log_text)
+            self.assertIn("worker report status=completed", log_text)
+            self.assertIn(f"[vibe-loop] log: {result['log']}", stderr.getvalue())
+
+    def test_run_until_done_continue_on_failure_exits_nonzero_for_any_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import os\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from vibe_loop.cli import main\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "status = 'failed' if task_id == 'TASK-01' else 'completed'\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', status,\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--continue-on-failure",
+                        "--max-slices",
+                        "2",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            [result["classification"] for result in payload],
+            ["failed", "completed"],
+        )
+        self.assertEqual(stderr.getvalue().count("[vibe-loop] running TASK-"), 2)
+
     def test_run_until_done_requires_agent_when_no_supported_cli_is_available(
         self,
     ) -> None:

@@ -2,9 +2,23 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
+import threading
+import time
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None
 
 
 RUN_SCHEMA_VERSION = 3
@@ -12,6 +26,9 @@ RUN_RECORD_TYPE = "run_result"
 WORKER_REPORT_SCHEMA_VERSION = 1
 WORKER_REPORT_RECORD_TYPE = "worker_report"
 WORKER_REPORT_STATUSES = ("completed", "blocked", "failed", "unknown")
+_APPEND_LOCK = threading.Lock()
+LOCK_POLL_SECONDS = 0.05
+LOCK_TIMEOUT_SECONDS = 30.0
 
 
 def utc_now_iso() -> str:
@@ -150,8 +167,11 @@ class RunStore:
 
     def append_record(self, record: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+                    handle.flush()
 
     def read_records(self) -> list[dict[str, Any]]:
         if not self.path.exists():
@@ -229,3 +249,69 @@ def tail(path: Path, line_count: int) -> list[str]:
 
 def string_value(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+@contextmanager
+def append_record_lock(path: Path):
+    if fcntl is None and msvcrt is None:
+        with append_record_directory_lock(path):
+            yield
+        return
+
+    lock_path = path.with_name(f"{path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        ensure_lock_byte(handle)
+        lock_file(handle)
+        try:
+            yield
+        finally:
+            unlock_file(handle)
+
+
+@contextmanager
+def append_record_directory_lock(path: Path):
+    lock_path = path.with_name(f"{path.name}.lockdir")
+    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+    while True:
+        try:
+            lock_path.mkdir()
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out acquiring append lock: {lock_path}")
+            time.sleep(LOCK_POLL_SECONDS)
+        else:
+            break
+    try:
+        yield
+    finally:
+        try:
+            lock_path.rmdir()
+        except OSError:
+            pass
+
+
+def ensure_lock_byte(handle: BinaryIO) -> None:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+
+
+def lock_file(handle: BinaryIO) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+
+
+def unlock_file(handle: BinaryIO) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)

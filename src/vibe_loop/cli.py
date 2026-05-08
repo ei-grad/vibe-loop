@@ -20,7 +20,7 @@ from vibe_loop.generated_profiles import (
     runtime_task_source_report,
 )
 from vibe_loop.runner import VibeRunner
-from vibe_loop.runs import RunStore, WorkerReport, WORKER_REPORT_STATUSES
+from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
 from vibe_loop.skills import install_skills
 from vibe_loop.task_views import (
     build_task_views,
@@ -108,6 +108,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--ask-agent", action="store_true")
     run_all.add_argument("--max-slices", type=int, default=0)
     run_all.add_argument("--continue-on-failure", action="store_true")
+    run_all.add_argument("--jobs", type=int, default=1)
 
     workers = subparsers.add_parser("workers", help="List active worker runs")
     add_repo_argument(workers)
@@ -185,13 +186,10 @@ def dispatch(args: argparse.Namespace) -> int:
             ask_agent=args.ask_agent,
             max_slices=args.max_slices,
             continue_on_failure=args.continue_on_failure,
+            jobs=args.jobs,
         )
         print(json.dumps([result.to_json() for result in results], indent=2))
-        if not results:
-            return 0
-        if results[-1].classification in {"failed", "unknown"}:
-            return 1
-        return 0
+        return run_until_done_exit_code(results)
 
     if args.command == "workers":
         runner = VibeRunner(config)
@@ -478,3 +476,11 @@ def parse_metadata_json(value: str | None) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError("--metadata-json must be a JSON object")
     return payload
+
+
+def run_until_done_exit_code(results: list[RunResult]) -> int:
+    if not results:
+        return 0
+    if any(result.classification in {"failed", "unknown"} for result in results):
+        return 1
+    return 0

@@ -173,7 +173,7 @@ vibe-loop tasks locks --repo .
 vibe-loop tasks configure --repo . --json
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
-vibe-loop run-until-done --repo . --ask-agent
+vibe-loop run-until-done --repo . --ask-agent --jobs 2
 vibe-loop workers --repo .
 vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
 vibe-loop install-skills --codex --claude
@@ -192,6 +192,10 @@ stderr, `session_id` stores that native worker id and `session_id_source` is
 `native:stdout` or `native:stderr`. If no native session id is observed,
 `session_id` falls back to `run_id` and `session_id_source` is
 `fallback:run_id`.
+
+`run-until-done` is serial by default. Pass `--jobs N` to let the supervisor
+keep up to `N` finite worker commands active at once; each worker still gets its
+own task lock, run id, and log path. `run-next` always runs a single worker.
 
 Workers can explicitly report their final status while the supervisor run is
 active:

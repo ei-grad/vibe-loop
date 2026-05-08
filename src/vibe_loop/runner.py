@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -86,6 +87,7 @@ class VibeRunner:
         self.lock_manager = LockManager(config.state_path / "locks")
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
+        self._record_lock = threading.Lock()
 
     @property
     def source_resolution(self) -> RuntimeTaskSourceResolution:
@@ -333,6 +335,28 @@ class VibeRunner:
         ask_agent: bool = False,
         max_slices: int = 0,
         continue_on_failure: bool = False,
+        jobs: int = 1,
+    ) -> list[RunResult]:
+        if jobs < 1:
+            raise ValueError("run-until-done --jobs must be at least 1")
+        if jobs == 1:
+            return self.run_until_done_serial(
+                ask_agent=ask_agent,
+                max_slices=max_slices,
+                continue_on_failure=continue_on_failure,
+            )
+        return self.run_until_done_parallel(
+            ask_agent=ask_agent,
+            max_slices=max_slices,
+            continue_on_failure=continue_on_failure,
+            jobs=jobs,
+        )
+
+    def run_until_done_serial(
+        self,
+        ask_agent: bool = False,
+        max_slices: int = 0,
+        continue_on_failure: bool = False,
     ) -> list[RunResult]:
         results: list[RunResult] = []
         skipped: set[str] = set()
@@ -349,6 +373,74 @@ class VibeRunner:
                 "unknown",
             }:
                 break
+        return results
+
+    def run_until_done_parallel(
+        self,
+        ask_agent: bool,
+        max_slices: int,
+        continue_on_failure: bool,
+        jobs: int,
+    ) -> list[RunResult]:
+        results: list[RunResult] = []
+        skipped: set[str] = set()
+        in_flight: dict[Future[RunResult], str] = {}
+        scheduled: set[str] = set()
+        command_validated = False
+        announced = False
+        stop_after_running = False
+
+        with ThreadPoolExecutor(
+            max_workers=jobs,
+            thread_name_prefix="vibe-loop-worker",
+        ) as executor:
+            while True:
+                while (
+                    not stop_after_running
+                    and len(in_flight) < jobs
+                    and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
+                ):
+                    candidates = self.list_candidates(exclude=skipped | scheduled)
+                    if not candidates:
+                        break
+                    if not command_validated:
+                        self.config.agent.require_command()
+                        command_validated = True
+                    task = self.select_from_candidates(
+                        candidates,
+                        ask_agent=ask_agent,
+                    )
+                    if not announced:
+                        report_status(f"parallel supervisor jobs={jobs}")
+                        announced = True
+                    scheduled.add(task.task_id)
+                    report_status(f"queueing {task.task_id}: {task.title}")
+                    in_flight[executor.submit(self.run_task, task)] = task.task_id
+
+                if not in_flight:
+                    break
+
+                completed, _pending = wait(
+                    in_flight,
+                    return_when=FIRST_COMPLETED,
+                )
+                for future in completed:
+                    task_id = in_flight.pop(future)
+                    scheduled.discard(task_id)
+                    try:
+                        result = future.result()
+                    except LockBusy:
+                        report_status(
+                            f"task locked during acquire, skipping: {task_id}"
+                        )
+                        skipped.add(task_id)
+                        continue
+                    results.append(result)
+                    if result.classification == "completed":
+                        continue
+                    skipped.add(result.task_id)
+                    if result.classification in {"failed", "unknown"}:
+                        stop_after_running = not continue_on_failure
         return results
 
     def run_completion_checks(self, log) -> str:
@@ -394,7 +486,8 @@ class VibeRunner:
         return ClassificationResult("unknown", "fallback")
 
     def record_result(self, result: RunResult) -> None:
-        self.run_store.append_result(result)
+        with self._record_lock:
+            self.run_store.append_result(result)
 
     def recent_log_context(self, max_runs: int = 5, tail_lines: int = 80) -> str:
         return self.run_store.recent_log_context(max_runs, tail_lines)

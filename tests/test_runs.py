@@ -87,6 +87,26 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["session_id_source"], "fallback:run_id")
         self.assertEqual(payload["task_id"], "TASK-01")
 
+    def test_append_result_uses_sidecar_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            result = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="completed",
+                exit_code=0,
+                log_path=Path(directory) / "run.log",
+                start_main="aaa",
+                end_main="bbb",
+            )
+            store = RunStore(path)
+
+            store.append_result(result)
+
+            lock_exists = path.with_name("runs.jsonl.lock").is_file()
+
+        self.assertTrue(lock_exists)
+
     def test_append_report_writes_versioned_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"
