@@ -212,6 +212,21 @@ commands = [
 ]
 ```
 
+The default agent commands target Codex, but they are plain templates rather
+than a required dependency. Configure Claude prompt mode explicitly when that is
+the worker or selector you want to run:
+
+```toml
+[agent]
+command = "claude -p '$vibe-loop {task_id}'"
+selection_command = "claude -p {prompt}"
+forward_stderr = false
+```
+
+`agent.command` receives `{task_id}` for the selected task. `selection_command`
+receives a shell-quoted `{prompt}` containing the dependency-ready candidate
+list and recent run context, and should print JSON containing `task_id`.
+
 For command-backed task sources:
 
 ```toml
