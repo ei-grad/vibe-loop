@@ -1,0 +1,17 @@
+[project]
+name = "vibe-loop"
+version = "0.1.0"
+description = "One-slice AI coding loop runner with pluggable task sources"
+readme = "README.md"
+authors = [
+    { name = "Andrew Grigorev", email = "andrew@ei-grad.ru" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+vibe-loop = "vibe_loop:main"
+
+[build-system]
+requires = ["uv_build>=0.11.3,<0.12.0"]
+build-backend = "uv_build"

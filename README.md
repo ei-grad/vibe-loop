@@ -1,0 +1,82 @@
+# vibe-loop
+
+`vibe-loop` is a small runner for one-slice AI coding loops. It selects one
+unblocked task from a repository task source, locks it, runs an agent command
+such as `codex exec '$vibe-loop <task_id>'`, captures logs, validates completion,
+records local run metadata, and can repeat until no runnable tasks remain.
+
+The runner is task-system agnostic. Repositories can expose tasks through a
+Markdown plan table, command adapters, or later tracker-specific adapters. The
+default adapter reads `docs/PLAN.md` tables with these columns:
+
+```text
+ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence
+```
+
+Runnable statuses default to `Active`, `Next`, and `Planned`. A task is runnable
+when all listed dependencies are `Done` and no local lock exists.
+
+## Commands
+
+```bash
+vibe-loop tasks --repo .
+vibe-loop next --repo .
+vibe-loop run-next --repo . --ask-agent
+vibe-loop run-until-done --repo . --ask-agent
+vibe-loop install-skills --codex --claude
+```
+
+`--ask-agent` gives the agent the mechanically safe candidate list plus recent
+`.vibe-loop/runs.jsonl` entries and log tails. The CLI still performs the lock
+and completion checks itself.
+
+## Configuration
+
+Optional `.vibe-loop.toml`:
+
+```toml
+main_branch = "main"
+state_dir = ".vibe-loop"
+
+[agent]
+command = "codex exec '$vibe-loop {task_id}'"
+selection_command = "codex exec {prompt}"
+
+[task_source]
+type = "markdown-plan"
+plan_path = "docs/PLAN.md"
+runnable_statuses = ["Active", "Next", "Planned"]
+
+[completion]
+commands = [
+  "uv run python scripts/record_worklog.py --validate",
+  "uv run python scripts/generate_gantt.py --coverage-check",
+]
+```
+
+For command-backed task sources:
+
+```toml
+[task_source]
+type = "command"
+list = "my-task-tool list --json"
+probe = "my-task-tool show {task_id} --json"
+```
+
+`list` must return either a JSON array or `{"tasks":[...]}`. Each task should
+include `id`, `title`, `status`, `priority`, `dependencies`, `scope`,
+`acceptance`, and `evidence` where available.
+
+## Local State
+
+Runner state is intentionally untracked:
+
+```text
+.vibe-loop/
+  locks/
+  runs/
+  runs.jsonl
+```
+
+Project worklogs should remain final evidence ledgers. Attempt logs and failed
+runs belong in `.vibe-loop/`, not in project completion records.
