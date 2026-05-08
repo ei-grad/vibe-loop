@@ -61,9 +61,9 @@ missing approval, access, or decision.
 
 ## Worktree And Integration
 
-For full-cycle bounded work, use a dedicated branch/worktree when repo/user
-policy permits; keep `main` clean during implementation. Create the slice
-branch/worktree before implementation edits begin.
+For full-cycle bounded work, use a dedicated branch/worktree; keep `main` clean
+during implementation. Create the slice branch/worktree before implementation
+edits begin.
 
 If a dedicated worktree cannot be created, or repo/user policy forbids creating
 one, state the precise blocker and proceed in the primary worktree only after
