@@ -5,7 +5,11 @@ import json
 import sys
 from pathlib import Path
 
-from vibe_loop.config import load_config
+from vibe_loop.config import (
+    AGENT_DEFAULT_POLICY,
+    AGENT_DEFAULT_POLICY_SOURCE,
+    load_config,
+)
 from vibe_loop.runner import VibeRunner
 from vibe_loop.skills import install_skills
 from vibe_loop.task_views import (
@@ -132,7 +136,7 @@ def dispatch(args: argparse.Namespace) -> int:
         if task is None:
             return 2
         if args.json:
-            print(json.dumps(task.to_json(), indent=2))
+            print(json.dumps(selected_task_json(config, task), indent=2))
         else:
             print(task.task_id)
         return 0
@@ -205,7 +209,7 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
         if task is None:
             return 2
         if args.json:
-            print(json.dumps(task.to_json(), indent=2))
+            print(json.dumps(selected_task_json(config, task), indent=2))
         else:
             print(task.task_id)
         return 0
@@ -238,6 +242,8 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
         else:
             print("tasks configure: not implemented")
             print(f"detected agents: {config.agent.detected.summary()}")
+            print(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
+            print(f"agent default policy: {AGENT_DEFAULT_POLICY}")
             print(f"agent.command source: {config.agent.command_source}")
             print(
                 "agent.selection_command source: "
@@ -312,6 +318,18 @@ def all_task_views(config):
 def task_views_for_tasks(config, tasks: list[Task]):
     ids = {task.task_id for task in tasks}
     return [view for view in all_task_views(config) if view.task.task_id in ids]
+
+
+def selected_task_json(config, task: Task) -> dict[str, object]:
+    payload = task.to_json()
+    payload.update(
+        {
+            "agent_selection_command_source": config.agent.selection_command_source,
+            "agent_default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
+            "agent_default_policy": AGENT_DEFAULT_POLICY,
+        }
+    )
+    return payload
 
 
 def render_task_inspect(view) -> str:

@@ -53,10 +53,14 @@ AGENT_COMMAND_DEFAULTS = {
     },
 }
 SUPPORTED_AGENT_CLIS = tuple(AGENT_COMMAND_DEFAULTS)
+AGENT_PREFERRED_CLI = "codex"
+AGENT_DEFAULT_POLICY_SOURCE = "codex-first"
 AGENT_DEFAULT_POLICY = (
-    "Use the sole available supported CLI for omitted agent commands; require "
-    "explicit .vibe-loop.toml settings when multiple or no supported CLIs are "
-    "available."
+    "Explicit .vibe-loop.toml agent commands win. Omitted commands use Codex "
+    "when Codex is available, including when Claude is also available; otherwise "
+    "they use Claude when it is the sole available supported CLI. If no "
+    "supported CLI is available, configure a command explicitly or install Codex "
+    "or Claude."
 )
 
 
@@ -154,6 +158,7 @@ class AgentConfig:
             "selection_command_source": self.selection_command_source,
             "forward_stderr": self.forward_stderr,
             "detected": self.detected.to_json(),
+            "default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "default_policy": AGENT_DEFAULT_POLICY,
             "diagnostics": self.diagnostics(),
         }
@@ -287,6 +292,11 @@ def resolve_agent_default(
     if configured is not None:
         return configured, "explicit"
     available = detected.available
+    if AGENT_PREFERRED_CLI in available:
+        source = "auto:codex"
+        if len(available) > 1:
+            source = f"auto:codex:{AGENT_DEFAULT_POLICY_SOURCE}"
+        return AGENT_COMMAND_DEFAULTS[AGENT_PREFERRED_CLI][key], source
     if len(available) == 1:
         agent_name = available[0]
         return AGENT_COMMAND_DEFAULTS[agent_name][key], f"auto:{agent_name}"

@@ -12,7 +12,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from vibe_loop.config import AgentDetection, VibeConfig
+from vibe_loop.config import (
+    AGENT_DEFAULT_POLICY,
+    AGENT_DEFAULT_POLICY_SOURCE,
+    AgentDetection,
+    VibeConfig,
+)
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
@@ -117,6 +122,8 @@ class VibeRunner:
             "agent selection command source: "
             f"{self.config.agent.selection_command_source}"
         )
+        report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
+        report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
         command = command_template.format(prompt=shlex.quote(prompt))
         try:
             result = subprocess.run(
@@ -160,6 +167,7 @@ class VibeRunner:
                     start_main,
                     run_id,
                     self.config.agent.command_source,
+                    self.config.agent.selection_command_source,
                     self.config.agent.detected,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
@@ -169,6 +177,16 @@ class VibeRunner:
                     f"agent command source: {self.config.agent.command_source}",
                     log,
                 )
+                report_status(
+                    "agent selection command source: "
+                    f"{self.config.agent.selection_command_source}",
+                    log,
+                )
+                report_status(
+                    f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}",
+                    log,
+                )
+                report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}", log)
                 report_status(
                     "detected agents: "
                     f"{format_detected_agents(self.config.agent.detected)}",
@@ -207,6 +225,9 @@ class VibeRunner:
             session_id=session_id,
             session_id_source=session_id_source,
             agent_command_source=self.config.agent.command_source,
+            agent_selection_command_source=self.config.agent.selection_command_source,
+            agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
+            agent_default_policy=AGENT_DEFAULT_POLICY,
         )
         self.record_result(result)
         report_status(
@@ -338,6 +359,7 @@ def write_log_header(
     start_main: str,
     run_id: str,
     command_source: str,
+    selection_command_source: str,
     detected: AgentDetection,
 ) -> None:
     log.write(f"[vibe-loop] run_id={run_id}\n")
@@ -345,6 +367,13 @@ def write_log_header(
     log.write(f"[vibe-loop] title={task.title}\n")
     log.write(f"[vibe-loop] command={command}\n")
     log.write(f"[vibe-loop] agent_command_source={command_source}\n")
+    log.write(
+        f"[vibe-loop] agent_selection_command_source={selection_command_source}\n"
+    )
+    log.write(
+        f"[vibe-loop] agent_default_policy_source={AGENT_DEFAULT_POLICY_SOURCE}\n"
+    )
+    log.write(f"[vibe-loop] agent_default_policy={AGENT_DEFAULT_POLICY}\n")
     log.write(f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n")
     log.write(f"[vibe-loop] start_main={start_main}\n\n")
 

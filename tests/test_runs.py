@@ -33,6 +33,9 @@ class RunStoreTests(unittest.TestCase):
             session_id="native-session-1",
             session_id_source="native:stdout",
             agent_command_source="auto:codex",
+            agent_selection_command_source="auto:codex",
+            agent_default_policy_source="codex-first",
+            agent_default_policy="Codex first.",
             task_id="TASK-01",
             classification="completed",
             exit_code=0,
@@ -47,6 +50,9 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["session_id"], "native-session-1")
         self.assertEqual(payload["session_id_source"], "native:stdout")
         self.assertEqual(payload["agent_command_source"], "auto:codex")
+        self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
+        self.assertEqual(payload["agent_default_policy_source"], "codex-first")
+        self.assertEqual(payload["agent_default_policy"], "Codex first.")
 
     def test_append_result_writes_versioned_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

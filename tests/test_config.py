@@ -73,7 +73,7 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentResolutionError, "install codex or claude"):
             config.agent.require_command()
 
-    def test_both_agent_clis_require_explicit_default_choice(self) -> None:
+    def test_both_agent_clis_resolve_to_codex_first_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             bin_dir = Path(directory) / "bin"
@@ -85,13 +85,42 @@ class ConfigTests(unittest.TestCase):
             with patch.dict("os.environ", {"PATH": str(bin_dir)}):
                 config = load_config(repo)
 
-        self.assertIsNone(config.agent.command)
+        self.assertEqual(config.agent.command, "codex exec '$vibe-loop {task_id}'")
         self.assertEqual(
             config.agent.command_source,
-            "unresolved:multiple-supported-clis",
+            "auto:codex:codex-first",
         )
-        with self.assertRaisesRegex(AgentResolutionError, "multiple supported"):
-            config.agent.require_command()
+        self.assertEqual(config.agent.selection_command, "codex exec {prompt}")
+        self.assertEqual(
+            config.agent.selection_command_source,
+            "auto:codex:codex-first",
+        )
+        self.assertEqual(config.agent.diagnostics(), [])
+
+    def test_explicit_claude_commands_remain_authoritative_with_both_clis(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "codex")
+            write_executable(bin_dir / "claude")
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                "command = \"claude -p '$vibe-loop {task_id}'\"\n"
+                'selection_command = "claude -p {prompt}"\n',
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        self.assertEqual(config.agent.command, "claude -p '$vibe-loop {task_id}'")
+        self.assertEqual(config.agent.command_source, "explicit")
+        self.assertEqual(config.agent.selection_command, "claude -p {prompt}")
+        self.assertEqual(config.agent.selection_command_source, "explicit")
 
     def test_explicit_agent_commands_remain_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -206,7 +206,7 @@ main_branch = "main"
 state_dir = ".vibe-loop"
 
 [agent]
-# Optional when exactly one supported CLI is available on PATH.
+# Optional when Codex or Claude is available on PATH.
 command = "codex exec '$vibe-loop {task_id}'"
 selection_command = "codex exec {prompt}"
 forward_stderr = false
@@ -226,15 +226,13 @@ commands = [
 ```
 
 Agent commands are resolved independently. Explicit `.vibe-loop.toml` values
-remain authoritative. When exactly one supported CLI is available on `PATH`,
-`vibe-loop` uses that CLI for omitted worker and selection defaults:
+remain authoritative. Omitted worker and selection commands use a deterministic
+Codex-first policy:
 
 - Codex only: `codex exec '$vibe-loop {task_id}'` and `codex exec {prompt}`.
 - Claude only: `claude -p '$vibe-loop {task_id}'` and `claude -p {prompt}`.
+- Codex and Claude: Codex is selected for omitted commands.
 
-When both Codex and Claude are available, omitted commands are unresolved and
-the relevant `agent.command` or `agent.selection_command` must be configured
-explicitly. This avoids changing worker behavior based on `PATH` ordering.
 When neither supported CLI is available, agent-using commands fail with a
 diagnostic that points to installation or explicit config.
 
@@ -323,7 +321,9 @@ Runner state is intentionally untracked:
 
 `runs.jsonl` is an append-only stream of versioned run result records. Run
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the
-`session_id_source`, and the `agent_command_source` used for the worker command.
+`session_id_source`, the `agent_command_source` used for the worker command,
+the `agent_selection_command_source`, and the default agent policy source used
+when commands are auto-resolved.
 Project worklogs should remain final evidence ledgers. Attempt logs and failed
 runs belong in `.vibe-loop/`, not in project completion records.
 
