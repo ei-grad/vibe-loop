@@ -170,6 +170,7 @@ vibe-loop tasks tree --repo .
 vibe-loop tasks inspect QUERY-09 --repo .
 vibe-loop tasks runnable --repo .
 vibe-loop tasks locks --repo .
+vibe-loop tasks configure --repo . --json
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent
@@ -263,8 +264,10 @@ probe = "my-task-tool show {task_id} --json"
 include `id`, `title`, `status`, `priority`, `dependencies`, `scope`,
 `acceptance`, and `evidence` where available.
 
-Generated task-source discovery is planned as a cache under the configured state
-directory:
+Generated task-source discovery is an explicit configuration flow. It uses the
+bounded repo-local evidence collector, asks the resolved `agent.selection_command`
+for strict JSON, validates the result, and writes a cache under the configured
+state directory:
 
 ```text
 .vibe-loop/generated-task-source.json
@@ -277,6 +280,15 @@ redacted provenance, confidence, and a degradation status such as `profile`,
 agent identity and command source, not raw command strings. Read-only commands
 must not launch an agent to create or repair that cache; explicit configure or
 refresh commands own agent invocation.
+
+Create or refresh the cache explicitly:
+
+```bash
+vibe-loop tasks configure --repo . --json
+```
+
+Malformed, low-confidence, unsupported, or incomplete agent output is stored as
+an explicit degraded cache record rather than changing runnable task behavior.
 
 Explicit `.vibe-loop.toml` task-source settings stay authoritative. User-written
 command adapters and explicit source paths disable generated discovery for the

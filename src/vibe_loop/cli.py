@@ -8,7 +8,14 @@ from pathlib import Path
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
+    AgentResolutionError,
     load_config,
+)
+from vibe_loop.generated_profiles import (
+    configure_generated_task_source,
+    generated_task_cache_report,
+    read_only_generated_cache_notice,
+    read_only_generated_cache_message,
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.skills import install_skills
@@ -131,8 +138,10 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_tasks(args, config)
 
     if args.command == "next":
-        runner = VibeRunner(config)
-        task = runner.select_task(ask_agent=args.ask_agent)
+        task = read_only_task_operation(
+            config,
+            lambda: VibeRunner(config).select_task(ask_agent=args.ask_agent),
+        )
         if task is None:
             return 2
         if args.json:
@@ -172,9 +181,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
                     "task_source": config.task_source.to_json(),
-                    "generated_task_profile": {
-                        "path": str(config.generated_task_profile_path),
-                    },
+                    "generated_task_profile": generated_task_cache_report(config),
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                 },
@@ -195,8 +202,10 @@ def dispatch(args: argparse.Namespace) -> int:
 
 def dispatch_tasks(args: argparse.Namespace, config) -> int:
     if args.tasks_command in {None, "runnable"}:
-        runner = VibeRunner(config)
-        tasks = runner.list_candidates()
+        tasks = read_only_task_operation(
+            config,
+            lambda: VibeRunner(config).list_candidates(),
+        )
         if args.json:
             print(json.dumps([task.to_json() for task in tasks], indent=2))
         else:
@@ -204,8 +213,10 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
         return 0
 
     if args.tasks_command == "next":
-        runner = VibeRunner(config)
-        task = runner.select_task(ask_agent=args.ask_agent)
+        task = read_only_task_operation(
+            config,
+            lambda: VibeRunner(config).select_task(ask_agent=args.ask_agent),
+        )
         if task is None:
             return 2
         if args.json:
@@ -228,19 +239,14 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
         return 0
 
     if args.tasks_command == "configure":
-        payload = {
-            "status": "not_implemented",
-            "message": (
-                "tasks configure will generate task-source configuration in "
-                "a later discovery slice; agent command resolution is shown "
-                "for readiness."
-            ),
-            "agent": config.agent.to_json(),
-        }
+        result = configure_generated_task_source(config)
+        payload = result.to_json()
+        payload["agent"] = config.agent.to_json()
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
-            print("tasks configure: not implemented")
+            print(f"tasks configure: cache status={payload['status']}")
+            print(f"cache: {result.cache_path}")
             print(f"detected agents: {config.agent.detected.summary()}")
             print(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
             print(f"agent default policy: {AGENT_DEFAULT_POLICY}")
@@ -249,14 +255,14 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
                 "agent.selection_command source: "
                 f"{config.agent.selection_command_source}"
             )
-            diagnostics = config.agent.diagnostics()
+            diagnostics = list(result.diagnostics) + config.agent.diagnostics()
             if diagnostics:
                 print("diagnostics:")
                 for diagnostic in diagnostics:
                     print(f"- {diagnostic}")
-        return 2
+        return result.exit_code
 
-    views = all_task_views(config)
+    views = read_only_task_operation(config, lambda: all_task_views(config))
     if args.tasks_command == "inspect":
         view = next(
             (
@@ -313,6 +319,20 @@ def all_task_views(config):
         if task_lock.get("task_id")
     }
     return build_task_views(tasks, locked_ids)
+
+
+def read_only_task_operation(config, operation):
+    try:
+        result = operation()
+    except AgentResolutionError:
+        raise
+    except (FileNotFoundError, ValueError) as exc:
+        message = read_only_generated_cache_message(config)
+        raise RuntimeError(f"{exc}; {message}") from exc
+    notice = read_only_generated_cache_notice(config)
+    if notice:
+        print(f"vibe-loop: {notice}", file=sys.stderr)
+    return result
 
 
 def task_views_for_tasks(config, tasks: list[Task]):
