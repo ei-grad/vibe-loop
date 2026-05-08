@@ -35,7 +35,7 @@ implementation, tests, security, performance, UX, maintainability, and repo fit.
 Review may take longer than coding; do not shorten or skip it for speed.
 
 Reviews must use a separate reviewer. Prefer a subagent with clear context, or
-use `codex review "<reviewer-instruction-prompt>" 2>/dev/null` when available.
+use `codex review "<reviewer-instruction-prompt>" 2>/dev/null` as fallback.
 The prompt must include the gate, request/criteria, changed files or diff,
 verification results, evidence, and constraints/open questions. Follow repo
 review policy first: `REVIEW.md`, `AGENTS.md`, `CLAUDE.md`, contribution guides,

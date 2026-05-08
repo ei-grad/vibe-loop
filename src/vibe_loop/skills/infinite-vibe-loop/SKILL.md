@@ -70,7 +70,8 @@ non-fast-forward merge for an infinite-loop slice.
 4. Implement the slice in scoped increments.
 5. Run relevant tests/checks and verify evidence against the requested behavior.
 6. Run independent spec review, then code-quality review. Prefer a subagent with
-   clear context, or use `codex review "<reviewer-instruction-prompt>" 2>/dev/null`.
+   clear context, or use `codex review "<reviewer-instruction-prompt>" 2>/dev/null`
+   as fallback.
 7. Address findings with code, tests, or docs; re-review after material changes.
 8. Merge the slice back to `main` with fast-forward-only integration, remove the
    merged slice worktree and branch, record a concise status summary, select the
