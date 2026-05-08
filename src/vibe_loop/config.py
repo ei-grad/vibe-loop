@@ -7,8 +7,8 @@ from typing import Any
 
 
 DEFAULT_PLAN_PATHS = (
-    "docs/PLAN.md",
     "PLAN.md",
+    "docs/PLAN.md",
     "plan.md",
     "docs/plan.md",
     "docs/plans.md",

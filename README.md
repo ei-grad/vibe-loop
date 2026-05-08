@@ -24,9 +24,9 @@ worker agent follows the skill.
 > policy.
 
 > [!WARNING]
-> Codex or Claude sessions launched directly or by `vibe-loop` CLI worker
-> commands with permission prompts disabled MUST run in isolation, such as a
-> Docker container or VM, with only the required repository, tools, network
+> If permission prompts are disabled, any Codex or Claude session launched
+> directly or by a `vibe-loop` CLI worker command MUST run in isolation, such as
+> a Docker container or VM, with only the required repository, tools, network
 > access, and credentials available.
 
 The runner is task-system agnostic. Repositories can expose tasks through a
@@ -201,8 +201,8 @@ forward_stderr = false
 [task_source]
 type = "markdown-plan"
 # Optional. If omitted, vibe-loop discovers the best Markdown task table.
-plan_path = "docs/PLAN.md"
-plan_paths = ["docs/PLAN.md", "PLAN.md", "ROADMAP.md", "TODO.md"]
+plan_path = "PLAN.md"
+plan_paths = ["PLAN.md", "docs/PLAN.md", "ROADMAP.md", "TODO.md"]
 runnable_statuses = ["Active", "Next", "Planned"]
 
 [completion]
