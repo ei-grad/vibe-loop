@@ -31,6 +31,9 @@ GENERATED_PROFILE_STATUSES = frozenset(
 DEGRADED_PROFILE_STATUSES = frozenset(
     {"planning_only", "needs_input", "unavailable", "rejected"}
 )
+PLANNING_PROFILE_ERROR_REASONS = frozenset(
+    {"missing_stable_ids", "missing_status_map", "incomplete_status_map"}
+)
 SUPPORTED_PROFILE_KINDS = frozenset(
     {"markdown_table", "markdown_headings", "markdown_list"}
 )
@@ -203,6 +206,10 @@ def build_generated_task_source_prompt(bundle: EvidenceBundle) -> str:
                 "reason": "machine-readable reason",
                 "message": "human-readable diagnostic",
                 "next_action": "safe next action",
+                "missing_inputs": "optional array of missing user decisions or source data",
+                "proposed_config": "optional non-executable task_source profile sketch",
+                "candidate_sources": "optional array of candidate source paths or objects",
+                "questions": "optional array of questions for the user",
             },
         },
         "forbidden": [
@@ -280,6 +287,25 @@ def normalize_profile_payload(
     profile = raw_payload.get("profile")
     profile_error = validate_generated_profile(profile, bundle)
     if profile_error is not None:
+        if profile_error[0] in PLANNING_PROFILE_ERROR_REASONS:
+            planning_error = validate_generated_profile(
+                profile,
+                bundle,
+                planning_only=True,
+            )
+            if planning_error is None:
+                return build_cache_envelope(
+                    config,
+                    bundle,
+                    status="planning_only",
+                    confidence=confidence,
+                    profile=profile,
+                    degradation=planning_degradation_for_profile_error(
+                        profile_error[0],
+                        profile_error[1],
+                        profile,
+                    ),
+                )
         return build_degraded_cache(
             config,
             bundle,
@@ -295,14 +321,16 @@ def normalize_profile_payload(
             status="planning_only",
             confidence=confidence,
             profile=profile,
-            degradation={
-                "reason": "low_confidence",
-                "message": (
+            degradation=build_planning_degradation(
+                "low_confidence",
+                (
                     "agent profile confidence is below the runnable threshold "
                     f"of {GENERATED_PROFILE_CONFIDENCE_THRESHOLD}"
                 ),
-                "next_action": "review the cache or rerun tasks configure after clarifying task docs",
-            },
+                "review the cache or rerun tasks configure after clarifying task docs",
+                missing_inputs=("higher-confidence task-source evidence",),
+                proposed_config=proposed_task_source_config(profile),
+            ),
         )
 
     if profile.get("stable_ids") is not True:
@@ -312,11 +340,13 @@ def normalize_profile_payload(
             status="planning_only",
             confidence=confidence,
             profile=profile,
-            degradation={
-                "reason": "unstable_ids",
-                "message": "agent profile did not confirm stable task identifiers",
-                "next_action": "define stable task IDs in the source or promote explicit config",
-            },
+            degradation=build_planning_degradation(
+                "unstable_ids",
+                "agent profile did not confirm stable task identifiers",
+                "define stable task IDs in the source or promote explicit config",
+                missing_inputs=("stable task identifiers",),
+                proposed_config=proposed_task_source_config(profile),
+            ),
         )
 
     return build_cache_envelope(
@@ -337,11 +367,21 @@ def normalize_degraded_agent_payload(
 ) -> dict[str, Any]:
     confidence = parse_confidence(raw_payload.get("confidence"))
     profile = raw_payload.get("profile")
+    profile_error: tuple[str, str] | None = None
     if profile is not None:
         profile_error = validate_generated_profile(profile, bundle, planning_only=True)
         if profile_error is not None:
             profile = None
-    degradation = normalize_degradation(raw_payload.get("degradation"), str(status))
+    degradation = normalize_degradation(
+        raw_payload.get("degradation"),
+        str(status),
+        raw_payload,
+    )
+    if profile_error is not None:
+        degradation["profile_error"] = {
+            "reason": profile_error[0],
+            "message": profile_error[1],
+        }
     return build_cache_envelope(
         config,
         bundle,
@@ -388,16 +428,20 @@ def validate_generated_profile(
                 f"profile.source_paths contains evidence path not collected: {source_path}",
             )
     fields = profile.get("fields")
-    if not isinstance(fields, dict):
+    if fields is None and planning_only:
+        fields = {}
+    elif not isinstance(fields, dict):
         return ("missing_fields", "profile.fields must be an object")
     required_fields = ("id", "title", "status")
     missing_fields = [field for field in required_fields if field not in fields]
-    if missing_fields:
+    if missing_fields and not planning_only:
         return (
             "incomplete_fields",
             f"profile.fields is missing required fields: {', '.join(missing_fields)}",
         )
     for field_name in required_fields:
+        if field_name not in fields and planning_only:
+            continue
         mapping = fields.get(field_name)
         if not isinstance(mapping, dict):
             return (
@@ -437,20 +481,25 @@ def validate_generated_profile(
                     f"profile.fields.{field_name}.column was not found in source evidence: {column}",
                 )
     status_map = profile.get("status_map")
-    if not isinstance(status_map, dict):
+    if status_map is None and planning_only:
+        status_map = {}
+    elif not isinstance(status_map, dict):
         return ("missing_status_map", "profile.status_map must be an object")
     for key, value in status_map.items():
+        if planning_only and key in {"done", "runnable"} and value == []:
+            continue
         if not is_nonempty_string_list(value):
             return (
                 "incomplete_status_map",
                 f"profile.status_map.{key} must be a non-empty array of strings",
             )
-    for key in ("done", "runnable"):
-        if not is_nonempty_string_list(status_map.get(key)):
-            return (
-                "incomplete_status_map",
-                f"profile.status_map.{key} must be a non-empty array of strings",
-            )
+    if not planning_only:
+        for key in ("done", "runnable"):
+            if not is_nonempty_string_list(status_map.get(key)):
+                return (
+                    "incomplete_status_map",
+                    f"profile.status_map.{key} must be a non-empty array of strings",
+                )
     if not planning_only and "stable_ids" not in profile:
         return (
             "missing_stable_ids",
@@ -634,11 +683,12 @@ def build_degraded_cache(
         status=status,
         confidence=None,
         profile=None,
-        degradation={
-            "reason": reason,
-            "message": message,
-            "next_action": "run vibe-loop tasks configure after fixing the diagnostic",
-        },
+        degradation=build_planning_degradation(
+            reason,
+            message,
+            "run vibe-loop tasks configure after fixing the diagnostic",
+            missing_inputs=missing_inputs_for_degraded_cache(reason, bundle),
+        ),
     )
 
 
@@ -707,18 +757,40 @@ def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
         )
         return report
 
-    diagnostics = diagnostics_for_cache_payload(config, payload)
+    stale_reasons = cache_stale_reasons(config, payload)
+    diagnostics = diagnostics_for_cache_payload(
+        config,
+        payload,
+        stale_reasons=stale_reasons,
+    )
+    degradation = payload.get("degradation")
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        provenance = {}
     report.update(
         {
             "status": payload.get("status", "invalid"),
+            "origin": cache_origin(config, payload, stale_reasons),
+            "fresh": not stale_reasons,
+            "stale_reasons": list(stale_reasons),
             "schema_version": payload.get("schema_version"),
             "prompt_version": payload.get("prompt_version"),
             "confidence": payload.get("confidence"),
             "generated_at": payload.get("generated_at"),
             "diagnostics": list(diagnostics),
-            "degradation": payload.get("degradation"),
+            "degradation": degradation,
+            "missing_inputs": degradation_value(degradation, "missing_inputs", []),
+            "proposed_config": degradation_value(degradation, "proposed_config", None),
+            "candidate_sources": degradation_value(
+                degradation,
+                "candidate_sources",
+                [],
+            ),
+            "questions": degradation_value(degradation, "questions", []),
             "source_fingerprints": payload.get("source_fingerprints", []),
-            "next_action": cache_next_action(config, payload),
+            "skipped_evidence": provenance.get("skipped_evidence", []),
+            "evidence_file_count": provenance.get("evidence_file_count"),
+            "next_action": cache_next_action(config, payload, stale_reasons),
         }
     )
     return report
@@ -733,7 +805,9 @@ def read_only_generated_cache_message(config: VibeConfig) -> str:
         f"path={report.get('path')}",
     ]
     if diagnostics:
-        parts.append(f"diagnostic={diagnostics[0]}")
+        parts.append(
+            "diagnostics=" + " | ".join(str(diagnostic) for diagnostic in diagnostics)
+        )
     next_action = report.get("next_action")
     if next_action:
         parts.append(f"next_action={next_action}")
@@ -756,6 +830,8 @@ def read_only_generated_cache_notice(config: VibeConfig) -> str | None:
 def diagnostics_for_cache_payload(
     config: VibeConfig,
     payload: dict[str, Any],
+    *,
+    stale_reasons: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
     diagnostics: list[str] = []
     if payload.get("schema_version") != GENERATED_TASK_PROFILE_SCHEMA_VERSION:
@@ -769,6 +845,13 @@ def diagnostics_for_cache_payload(
         diagnostics.append(
             "explicit task_source source settings disable generated cache as an active source"
         )
+    active_stale_reasons = (
+        stale_reasons
+        if stale_reasons is not None
+        else cache_stale_reasons(config, payload)
+    )
+    for reason in active_stale_reasons:
+        diagnostics.append(f"generated cache is stale: {reason}")
     degradation = payload.get("degradation")
     if status in DEGRADED_PROFILE_STATUSES and isinstance(degradation, dict):
         reason = degradation.get("reason")
@@ -777,6 +860,9 @@ def diagnostics_for_cache_payload(
             diagnostics.append(
                 ": ".join(str(item) for item in (reason, message) if item)
             )
+        missing_inputs = normalize_string_list(degradation.get("missing_inputs"))
+        if missing_inputs:
+            diagnostics.append(f"missing inputs: {', '.join(missing_inputs)}")
     if status == "profile":
         confidence = parse_confidence(payload.get("confidence"))
         if confidence is None:
@@ -786,7 +872,18 @@ def diagnostics_for_cache_payload(
     return tuple(diagnostics)
 
 
-def cache_next_action(config: VibeConfig, payload: dict[str, Any]) -> str:
+def cache_next_action(
+    config: VibeConfig,
+    payload: dict[str, Any],
+    stale_reasons: tuple[str, ...] | None = None,
+) -> str:
+    active_stale_reasons = (
+        stale_reasons
+        if stale_reasons is not None
+        else cache_stale_reasons(config, payload)
+    )
+    if active_stale_reasons:
+        return f"vibe-loop tasks configure --repo {config.repo}"
     degradation = payload.get("degradation")
     if isinstance(degradation, dict) and degradation.get("next_action"):
         return str(degradation["next_action"])
@@ -795,23 +892,249 @@ def cache_next_action(config: VibeConfig, payload: dict[str, Any]) -> str:
     return f"vibe-loop tasks configure --repo {config.repo}"
 
 
-def normalize_degradation(value: object, status: str) -> dict[str, str]:
+def normalize_degradation(
+    value: object,
+    status: str,
+    raw_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    default_message = status
     if not isinstance(value, dict):
-        return {
-            "reason": status,
-            "message": f"agent returned {status} without a degradation object",
-            "next_action": "inspect task docs and rerun tasks configure",
-        }
+        default_message = f"agent returned {status} without a degradation object"
+        value = {}
     reason = str(value.get("reason") or status)
-    message = str(value.get("message") or reason)
+    message = str(value.get("message") or default_message)
     next_action = str(
         value.get("next_action") or "inspect task docs and rerun tasks configure"
     )
-    return {
+    result: dict[str, Any] = {
         "reason": reason,
         "message": message,
         "next_action": next_action,
     }
+    for key in ("missing_inputs", "questions"):
+        items = normalize_string_list(
+            value.get(key) if key in value else (raw_payload or {}).get(key)
+        )
+        if items:
+            result[key] = items
+    proposed_config = normalize_diagnostic_object(
+        value.get("proposed_config")
+        if "proposed_config" in value
+        else (raw_payload or {}).get("proposed_config")
+    )
+    if proposed_config is not None:
+        result["proposed_config"] = proposed_config
+    candidate_sources = normalize_diagnostic_json(
+        value.get("candidate_sources")
+        if "candidate_sources" in value
+        else (raw_payload or {}).get("candidate_sources")
+    )
+    if candidate_sources is not None:
+        result["candidate_sources"] = candidate_sources
+    return result
+
+
+def build_planning_degradation(
+    reason: str,
+    message: str,
+    next_action: str,
+    *,
+    missing_inputs: tuple[str, ...] = (),
+    proposed_config: object = None,
+    candidate_sources: object = None,
+    questions: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    degradation: dict[str, Any] = {
+        "reason": reason,
+        "message": message,
+        "next_action": next_action,
+    }
+    normalized_missing = normalize_string_list(list(missing_inputs))
+    if normalized_missing:
+        degradation["missing_inputs"] = normalized_missing
+    normalized_questions = normalize_string_list(list(questions))
+    if normalized_questions:
+        degradation["questions"] = normalized_questions
+    normalized_config = normalize_diagnostic_object(proposed_config)
+    if normalized_config is not None:
+        degradation["proposed_config"] = normalized_config
+    normalized_sources = normalize_diagnostic_json(candidate_sources)
+    if normalized_sources is not None:
+        degradation["candidate_sources"] = normalized_sources
+    return degradation
+
+
+def planning_degradation_for_profile_error(
+    reason: str,
+    message: str,
+    profile: object,
+) -> dict[str, Any]:
+    normalized_reason = reason
+    missing_inputs: tuple[str, ...]
+    if reason == "missing_stable_ids":
+        normalized_reason = "unstable_ids"
+        missing_inputs = ("stable task identifiers",)
+    elif reason in {"missing_status_map", "incomplete_status_map"}:
+        normalized_reason = "unmapped_statuses"
+        missing_inputs = ("status mapping for runnable and done tasks",)
+    else:
+        missing_inputs = ("runnable task-source profile requirements",)
+    return build_planning_degradation(
+        normalized_reason,
+        message,
+        "review the planning cache, clarify the missing task-source inputs, and rerun tasks configure",
+        missing_inputs=missing_inputs,
+        proposed_config=proposed_task_source_config(profile),
+    )
+
+
+def proposed_task_source_config(profile: object) -> dict[str, object] | None:
+    if not isinstance(profile, dict):
+        return None
+    return {
+        "task_source": {
+            "type": "markdown-profile",
+            "profile": profile,
+        }
+    }
+
+
+def missing_inputs_for_degraded_cache(
+    reason: str,
+    bundle: EvidenceBundle,
+) -> tuple[str, ...]:
+    missing: list[str] = []
+    if reason == "agent_unavailable":
+        missing.append("agent.selection_command")
+    elif reason in {"agent_execution_failed", "agent_exit_code"}:
+        missing.append("successful planning agent run")
+    elif reason in {"malformed_json", "invalid_json_shape", "unsupported_status"}:
+        missing.append("valid strict JSON task-source response")
+    if not bundle.files:
+        missing.append("repo-local task source evidence")
+    return tuple(missing)
+
+
+def cache_origin(
+    config: VibeConfig,
+    payload: dict[str, Any],
+    stale_reasons: tuple[str, ...],
+) -> str:
+    if not config.task_source.allows_generated_cache:
+        return "explicit_config"
+    if stale_reasons:
+        return "stale_generated_cache"
+    status = payload.get("status")
+    if status == "profile":
+        return "generated_cache"
+    if status == "planning_only":
+        return "planning_only_cache"
+    if status == "needs_input":
+        return "needs_input_cache"
+    if status == "unavailable":
+        return "unavailable_cache"
+    if status == "rejected":
+        return "rejected_cache"
+    return "no_usable_source"
+
+
+def cache_stale_reasons(config: VibeConfig, payload: dict[str, Any]) -> tuple[str, ...]:
+    if not config.task_source.allows_generated_cache:
+        return ()
+    status = payload.get("status")
+    if status not in GENERATED_PROFILE_STATUSES:
+        return ()
+    fingerprints = payload.get("source_fingerprints")
+    if not isinstance(fingerprints, list):
+        return ("source_fingerprints is missing or invalid",)
+    bundle = collect_generated_discovery_evidence(
+        config.repo,
+        state_dir=config.state_dir,
+    )
+    current = {file.path: file.fingerprint_json() for file in bundle.files}
+    if not fingerprints:
+        provenance = payload.get("provenance")
+        evidence_count = (
+            provenance.get("evidence_file_count")
+            if isinstance(provenance, dict)
+            else None
+        )
+        if evidence_count == 0 and bundle.files:
+            return (
+                "cache was generated with no evidence, but evidence is now available",
+            )
+        return ()
+    stale: list[str] = []
+    cached_paths: set[str] = set()
+    for raw_fingerprint in fingerprints:
+        if not isinstance(raw_fingerprint, dict):
+            stale.append("source_fingerprints contains a non-object entry")
+            continue
+        path = raw_fingerprint.get("path")
+        if not isinstance(path, str) or not path:
+            stale.append("source_fingerprints contains an entry without path")
+            continue
+        cached_paths.add(path)
+        current_fingerprint = current.get(path)
+        if current_fingerprint is None:
+            stale.append(f"{path} is missing or outside current evidence")
+            continue
+        changed_fields = [
+            field
+            for field in ("size", "sha256", "redacted")
+            if raw_fingerprint.get(field) != current_fingerprint.get(field)
+        ]
+        if changed_fields:
+            stale.append(f"{path} changed ({', '.join(changed_fields)})")
+    if not generated_source_paths(payload.get("profile")):
+        for path in sorted(set(current) - cached_paths):
+            stale.append(f"{path} is new bounded evidence")
+    return tuple(stale)
+
+
+def degradation_value(
+    degradation: object,
+    key: str,
+    default: object,
+) -> object:
+    if not isinstance(degradation, dict):
+        return default
+    return degradation.get(key, default)
+
+
+def normalize_string_list(value: object) -> list[str] | None:
+    if not isinstance(value, list):
+        return None
+    items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    return items or None
+
+
+def normalize_diagnostic_object(value: object) -> dict[str, object] | None:
+    normalized = normalize_diagnostic_json(value)
+    if isinstance(normalized, dict):
+        return normalized
+    return None
+
+
+def normalize_diagnostic_json(value: object) -> object:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        result: dict[str, object] = {}
+        for key, child in value.items():
+            normalized = normalize_diagnostic_json(child)
+            if normalized is not None:
+                result[str(key)] = normalized
+        return result
+    if isinstance(value, list):
+        return [
+            normalized
+            for item in value
+            if (normalized := normalize_diagnostic_json(item)) is not None
+        ]
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def parse_confidence(value: object) -> float | None:

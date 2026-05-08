@@ -817,6 +817,429 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["cache"]["degradation"]["reason"], "low_confidence")
         self.assertEqual(payload["cache"]["profile"]["source_paths"], ["WORK.md"])
 
+    def test_tasks_configure_writes_planning_cache_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            (repo / "script.py").write_text("print('skip me')\n", encoding="utf-8")
+            agent_payload = generated_profile_payload("WORK.md", confidence=0.44)
+            agent_payload["status"] = "planning_only"
+            agent_payload["profile"].pop("status_map")
+            agent_payload["degradation"] = {
+                "reason": "ambiguous_format",
+                "message": "work items exist but status policy is unclear",
+                "next_action": "choose a status policy",
+                "missing_inputs": ["status mapping", "stable done states"],
+                "proposed_config": {
+                    "task_source": {
+                        "type": "markdown-profile",
+                        "profile": agent_payload["profile"],
+                    }
+                },
+                "candidate_sources": [{"path": "WORK.md", "format": "table"}],
+                "questions": ["Which states are runnable?"],
+            }
+            original_work = (repo / "WORK.md").read_text(encoding="utf-8")
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+                doctor_stdout = StringIO()
+                doctor_stderr = StringIO()
+                with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            final_work = (repo / "WORK.md").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(cache["status"], "planning_only")
+        self.assertEqual(cache["profile"]["source_paths"], ["WORK.md"])
+        self.assertEqual(cache["source_fingerprints"][0]["path"], "WORK.md")
+        self.assertEqual(cache["degradation"]["reason"], "ambiguous_format")
+        self.assertEqual(
+            cache["degradation"]["missing_inputs"],
+            ["status mapping", "stable done states"],
+        )
+        self.assertEqual(
+            cache["degradation"]["proposed_config"]["task_source"]["type"],
+            "markdown-profile",
+        )
+        self.assertEqual(
+            cache["degradation"]["candidate_sources"],
+            [{"path": "WORK.md", "format": "table"}],
+        )
+        self.assertEqual(
+            cache["degradation"]["questions"], ["Which states are runnable?"]
+        )
+        self.assertIn(
+            ("script.py", "unsupported_file_type"),
+            {
+                (item["path"], item["reason"])
+                for item in cache["provenance"]["skipped_evidence"]
+            },
+        )
+        self.assertEqual(final_work, original_work)
+        report = doctor_payload["generated_task_profile"]
+        self.assertEqual(report["origin"], "planning_only_cache")
+        self.assertTrue(report["fresh"])
+        self.assertEqual(
+            report["missing_inputs"], ["status mapping", "stable done states"]
+        )
+        self.assertEqual(
+            report["proposed_config"]["task_source"]["type"],
+            "markdown-profile",
+        )
+        self.assertIn(
+            {"path": "script.py", "reason": "unsupported_file_type"},
+            report["skipped_evidence"],
+        )
+
+    def test_tasks_configure_without_agent_writes_unavailable_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            (repo / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(cache["degradation"]["reason"], "agent_unavailable")
+        self.assertEqual(
+            cache["degradation"]["missing_inputs"], ["agent.selection_command"]
+        )
+        self.assertEqual(cache["source_fingerprints"][0]["path"], "WORK.md")
+        self.assertIn(
+            (".env", "secret_path"),
+            {
+                (item["path"], item["reason"])
+                for item in cache["provenance"]["skipped_evidence"]
+            },
+        )
+
+    def test_tasks_configure_without_agent_reports_no_collected_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "TODO.md").write_text(
+                "x" * (2 * 1024 * 1024 + 1),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(cache["source_fingerprints"], [])
+        self.assertEqual(
+            cache["degradation"]["missing_inputs"],
+            ["agent.selection_command", "repo-local task source evidence"],
+        )
+        self.assertIn(
+            ("TODO.md", "file_too_large"),
+            {
+                (item["path"], item["reason"])
+                for item in cache["provenance"]["skipped_evidence"]
+            },
+        )
+
+    def test_read_only_reuses_fresh_unavailable_cache_without_running_agent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(configure_exit, 2)
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "generated task-source cache status=unavailable", stderr.getvalue()
+        )
+        self.assertIn("agent_unavailable", stderr.getvalue())
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_doctor_marks_unavailable_cache_stale_when_new_evidence_appears(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            (repo / "TODO.md").write_text("new task evidence\n", encoding="utf-8")
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(configure_exit, 2)
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        report = payload["generated_task_profile"]
+        self.assertEqual(report["status"], "unavailable")
+        self.assertEqual(report["origin"], "stale_generated_cache")
+        self.assertFalse(report["fresh"])
+        self.assertIn("TODO.md is new bounded evidence", report["stale_reasons"])
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_tasks_configure_profiles_missing_status_map_are_planning_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            agent_payload = generated_profile_payload("WORK.md")
+            agent_payload["profile"].pop("status_map")
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "unmapped_statuses")
+        self.assertEqual(
+            payload["cache"]["degradation"]["missing_inputs"],
+            ["status mapping for runnable and done tasks"],
+        )
+
+    def test_tasks_configure_empty_required_status_maps_are_planning_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            agent_payload = generated_profile_payload(
+                "WORK.md",
+                status_map_extra={"done": [], "runnable": []},
+            )
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "unmapped_statuses")
+        self.assertEqual(payload["cache"]["profile"]["source_paths"], ["WORK.md"])
+
+    def test_tasks_configure_unstable_ids_are_planning_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload(
+                    "WORK.md",
+                    profile_extra={"stable_ids": False},
+                ),
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "unstable_ids")
+        self.assertEqual(
+            payload["cache"]["degradation"]["missing_inputs"],
+            ["stable task identifiers"],
+        )
+
+    def test_tasks_configure_missing_degradation_object_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(bin_dir / "codex", {"status": "needs_input"})
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "needs_input")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "needs_input")
+        self.assertEqual(
+            payload["cache"]["degradation"]["message"],
+            "agent returned needs_input without a degradation object",
+        )
+
+    def test_doctor_reports_stale_generated_cache_without_running_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            work_path = repo / "WORK.md"
+            work_path.write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload("WORK.md"),
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            work_path.write_text(WORK_TABLE + "\nchanged\n", encoding="utf-8")
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        report = payload["generated_task_profile"]
+        self.assertEqual(report["status"], "profile")
+        self.assertEqual(report["origin"], "stale_generated_cache")
+        self.assertFalse(report["fresh"])
+        self.assertIn("WORK.md changed", report["stale_reasons"][0])
+        self.assertIn("generated cache is stale", report["diagnostics"][0])
+        self.assertIn("tasks configure", report["next_action"])
+        self.assertFalse((repo / "should-not-run").exists())
+
     def test_tasks_configure_rejects_unsupported_and_incomplete_profiles(
         self,
     ) -> None:
