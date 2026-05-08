@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TextIO
 
-from vibe_loop.config import VibeConfig
+from vibe_loop.config import AgentDetection, VibeConfig
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
@@ -48,6 +48,13 @@ class VibeRunner:
         candidates = self.list_candidates(exclude=exclude)
         if not candidates:
             return None
+        return self.select_from_candidates(candidates, ask_agent=ask_agent)
+
+    def select_from_candidates(
+        self,
+        candidates: list[Task],
+        ask_agent: bool = False,
+    ) -> Task:
         if ask_agent and len(candidates) > 1:
             report_status(
                 f"asking agent to select next task from {len(candidates)} candidates"
@@ -61,7 +68,12 @@ class VibeRunner:
 
     def ask_agent_to_select(self, candidates: list[Task]) -> Task | None:
         prompt = build_selection_prompt(candidates, self.recent_log_context())
-        command = self.config.agent.selection_command.format(prompt=shlex.quote(prompt))
+        command_template = self.config.agent.require_selection_command()
+        report_status(
+            "agent selection command source: "
+            f"{self.config.agent.selection_command_source}"
+        )
+        command = command_template.format(prompt=shlex.quote(prompt))
         try:
             result = subprocess.run(
                 command,
@@ -84,6 +96,7 @@ class VibeRunner:
         return next((task for task in candidates if task.task_id == task_id), None)
 
     def run_task(self, task: Task) -> RunResult:
+        command_template = self.config.agent.require_command()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
@@ -92,11 +105,27 @@ class VibeRunner:
         exit_code = 1
         message = ""
         try:
-            command = self.config.agent.command.format(task_id=task.task_id)
+            command = command_template.format(task_id=task.task_id)
             with log_path.open("w", encoding="utf-8") as log:
-                write_log_header(log, task, command, start_main)
+                write_log_header(
+                    log,
+                    task,
+                    command,
+                    start_main,
+                    self.config.agent.command_source,
+                    self.config.agent.detected,
+                )
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"log: {log_path}", log)
+                report_status(
+                    f"agent command source: {self.config.agent.command_source}",
+                    log,
+                )
+                report_status(
+                    "detected agents: "
+                    f"{format_detected_agents(self.config.agent.detected)}",
+                    log,
+                )
                 report_status("agent command started", log)
                 exit_code = run_streaming_command(
                     command,
@@ -132,9 +161,11 @@ class VibeRunner:
     def run_next(
         self, ask_agent: bool = False, exclude: set[str] | None = None
     ) -> RunResult | None:
-        task = self.select_task(ask_agent=ask_agent, exclude=exclude)
-        if task is None:
+        candidates = self.list_candidates(exclude=exclude)
+        if not candidates:
             return None
+        self.config.agent.require_command()
+        task = self.select_from_candidates(candidates, ask_agent=ask_agent)
         try:
             return self.run_task(task)
         except LockBusy:
@@ -237,10 +268,19 @@ def parse_selected_task_id(output: str) -> str | None:
     return str(task_id) if task_id else None
 
 
-def write_log_header(log, task: Task, command: str, start_main: str) -> None:
+def write_log_header(
+    log,
+    task: Task,
+    command: str,
+    start_main: str,
+    command_source: str,
+    detected: AgentDetection,
+) -> None:
     log.write(f"[vibe-loop] task_id={task.task_id}\n")
     log.write(f"[vibe-loop] title={task.title}\n")
     log.write(f"[vibe-loop] command={command}\n")
+    log.write(f"[vibe-loop] agent_command_source={command_source}\n")
+    log.write(f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n")
     log.write(f"[vibe-loop] start_main={start_main}\n\n")
 
 
@@ -314,6 +354,10 @@ def new_run_id(task_id: str) -> str:
         char if char.isalnum() or char in "-._" else "_" for char in task_id
     )
     return f"{timestamp}-{safe_task}-{suffix}"
+
+
+def format_detected_agents(detected: AgentDetection) -> str:
+    return detected.summary()
 
 
 def git_rev_parse(repo: Path, rev: str) -> str:

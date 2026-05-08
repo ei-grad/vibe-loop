@@ -69,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(tasks_locks)
     tasks_locks.add_argument("--json", action="store_true")
 
+    tasks_configure = task_subparsers.add_parser(
+        "configure",
+        help="Report task configuration readiness",
+    )
+    add_repo_argument(tasks_configure)
+    tasks_configure.add_argument("--json", action="store_true")
+
     next_parser = subparsers.add_parser("next", help="Print the next runnable task")
     add_repo_argument(next_parser)
     next_parser.add_argument("--ask-agent", action="store_true")
@@ -161,7 +168,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
                     "task_source": config.task_source.__dict__,
-                    "agent": config.agent.__dict__,
+                    "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                 },
                 indent=2,
@@ -212,6 +219,33 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
                     f"{task_lock.get('started_at', '')}\t{task_lock.get('path', '')}"
                 )
         return 0
+
+    if args.tasks_command == "configure":
+        payload = {
+            "status": "not_implemented",
+            "message": (
+                "tasks configure will generate task-source configuration in "
+                "a later discovery slice; agent command resolution is shown "
+                "for readiness."
+            ),
+            "agent": config.agent.to_json(),
+        }
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print("tasks configure: not implemented")
+            print(f"detected agents: {config.agent.detected.summary()}")
+            print(f"agent.command source: {config.agent.command_source}")
+            print(
+                "agent.selection_command source: "
+                f"{config.agent.selection_command_source}"
+            )
+            diagnostics = config.agent.diagnostics()
+            if diagnostics:
+                print("diagnostics:")
+                for diagnostic in diagnostics:
+                    print(f"- {diagnostic}")
+        return 2
 
     views = all_task_views(config)
     if args.tasks_command == "inspect":

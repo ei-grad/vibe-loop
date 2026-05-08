@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import shutil
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -17,12 +18,123 @@ DEFAULT_PLAN_PATHS = (
     "TODO.md",
 )
 
+AGENT_COMMAND_DEFAULTS = {
+    "codex": {
+        "command": "codex exec '$vibe-loop {task_id}'",
+        "selection_command": "codex exec {prompt}",
+    },
+    "claude": {
+        "command": "claude -p '$vibe-loop {task_id}'",
+        "selection_command": "claude -p {prompt}",
+    },
+}
+SUPPORTED_AGENT_CLIS = tuple(AGENT_COMMAND_DEFAULTS)
+AGENT_DEFAULT_POLICY = (
+    "Use the sole available supported CLI for omitted agent commands; require "
+    "explicit .vibe-loop.toml settings when multiple or no supported CLIs are "
+    "available."
+)
+
+
+class AgentResolutionError(ValueError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentDetection:
+    codex: str | None = None
+    claude: str | None = None
+
+    @property
+    def available(self) -> tuple[str, ...]:
+        return tuple(name for name in SUPPORTED_AGENT_CLIS if self.path_for(name))
+
+    def path_for(self, name: str) -> str | None:
+        return getattr(self, name)
+
+    def summary(self) -> str:
+        if not self.available:
+            return "none"
+        return ", ".join(
+            f"{name}={self.path_for(name)}" for name in self.available
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "available": list(self.available),
+            "codex": {
+                "available": self.codex is not None,
+                "path": self.codex,
+            },
+            "claude": {
+                "available": self.claude is not None,
+                "path": self.claude,
+            },
+        }
+
 
 @dataclasses.dataclass(frozen=True)
 class AgentConfig:
-    command: str = "codex exec '$vibe-loop {task_id}'"
-    selection_command: str = "codex exec {prompt}"
+    command: str | None = None
+    selection_command: str | None = None
+    command_source: str = "unresolved:no-supported-cli"
+    selection_command_source: str = "unresolved:no-supported-cli"
+    detected: AgentDetection = dataclasses.field(default_factory=AgentDetection)
     forward_stderr: bool = False
+
+    def require_command(self) -> str:
+        if self.command:
+            return self.command
+        raise AgentResolutionError(
+            unresolved_agent_command_message(
+                "agent.command",
+                self.command_source,
+                self.detected,
+            )
+        )
+
+    def require_selection_command(self) -> str:
+        if self.selection_command:
+            return self.selection_command
+        raise AgentResolutionError(
+            unresolved_agent_command_message(
+                "agent.selection_command",
+                self.selection_command_source,
+                self.detected,
+            )
+        )
+
+    def diagnostics(self) -> list[str]:
+        messages: list[str] = []
+        if not self.command:
+            messages.append(
+                unresolved_agent_command_message(
+                    "agent.command",
+                    self.command_source,
+                    self.detected,
+                )
+            )
+        if not self.selection_command:
+            messages.append(
+                unresolved_agent_command_message(
+                    "agent.selection_command",
+                    self.selection_command_source,
+                    self.detected,
+                )
+            )
+        return messages
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "command": self.command,
+            "command_source": self.command_source,
+            "selection_command": self.selection_command,
+            "selection_command_source": self.selection_command_source,
+            "forward_stderr": self.forward_stderr,
+            "detected": self.detected.to_json(),
+            "default_policy": AGENT_DEFAULT_POLICY,
+            "diagnostics": self.diagnostics(),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -83,14 +195,70 @@ def read_config_file(path: Path) -> dict[str, Any]:
 
 def parse_agent(data: object) -> AgentConfig:
     table = expect_table(data, "agent")
+    detected = detect_agent_clis()
+    configured_command = optional_nonempty_string(table.get("command"))
+    configured_selection = optional_nonempty_string(table.get("selection_command"))
+    command, command_source = resolve_agent_default(
+        "command",
+        configured_command,
+        detected,
+    )
+    selection_command, selection_command_source = resolve_agent_default(
+        "selection_command",
+        configured_selection,
+        detected,
+    )
     return AgentConfig(
-        command=str(table.get("command") or AgentConfig.command),
-        selection_command=str(
-            table.get("selection_command") or AgentConfig.selection_command
-        ),
+        command=command,
+        selection_command=selection_command,
+        command_source=command_source,
+        selection_command_source=selection_command_source,
+        detected=detected,
         forward_stderr=optional_bool(
             table.get("forward_stderr"), False, "agent.forward_stderr"
         ),
+    )
+
+
+def detect_agent_clis(path: str | None = None) -> AgentDetection:
+    return AgentDetection(
+        codex=shutil.which("codex", path=path),
+        claude=shutil.which("claude", path=path),
+    )
+
+
+def resolve_agent_default(
+    key: str,
+    configured: str | None,
+    detected: AgentDetection,
+) -> tuple[str | None, str]:
+    if configured is not None:
+        return configured, "explicit"
+    available = detected.available
+    if len(available) == 1:
+        agent_name = available[0]
+        return AGENT_COMMAND_DEFAULTS[agent_name][key], f"auto:{agent_name}"
+    if not available:
+        return None, "unresolved:no-supported-cli"
+    return None, "unresolved:multiple-supported-clis"
+
+
+def unresolved_agent_command_message(
+    setting: str,
+    source: str,
+    detected: AgentDetection,
+) -> str:
+    if source == "unresolved:multiple-supported-clis":
+        available = ", ".join(detected.available)
+        return (
+            f"{setting} is not configured and multiple supported agent CLIs are "
+            f"available on PATH ({available}); set {setting} in .vibe-loop.toml "
+            "to choose the command explicitly."
+        )
+    return (
+        f"{setting} is not configured and no supported agent CLI was found on "
+        "PATH; install codex or claude, or set the command explicitly in "
+        ".vibe-loop.toml."
     )
 
 
@@ -156,6 +324,13 @@ def optional_string(value: object) -> str | None:
     if value is None:
         return None
     return str(value)
+
+
+def optional_nonempty_string(value: object) -> str | None:
+    text = optional_string(value)
+    if not text:
+        return None
+    return text
 
 
 def optional_bool(value: object, default: bool, name: str) -> bool:

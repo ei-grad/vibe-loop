@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe_loop.cli import main
 
@@ -29,6 +31,271 @@ TWO_TASK_PLAN = """# Plan
 
 
 class CliTests(unittest.TestCase):
+    def test_run_next_uses_codex_default_when_only_codex_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            write_fake_git(bin_dir)
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if sys.argv[1] != 'exec':\n"
+                "    raise SystemExit(64)\n"
+                "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "print(f'codex out: {sys.argv[2]}')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+            agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(agent_args, "exec\n$vibe-loop TASK-01")
+        self.assertIn("agent command source: auto:codex", stderr.getvalue())
+        self.assertIn("agent_command_source=auto:codex", log_text)
+
+    def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            write_fake_git(bin_dir)
+            write_python_executable(
+                bin_dir / "claude",
+                "from pathlib import Path\n"
+                "import sys\n"
+                "if sys.argv[1] != '-p':\n"
+                "    raise SystemExit(64)\n"
+                "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "print(f'claude out: {sys.argv[2]}')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+            agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(agent_args, "-p\n$vibe-loop TASK-01")
+        self.assertIn("agent command source: auto:claude", stderr.getvalue())
+        self.assertIn("agent_command_source=auto:claude", log_text)
+
+    def test_next_uses_codex_default_selection_when_only_codex_is_available(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "import json\n"
+                "import sys\n"
+                "if sys.argv[1] != 'exec':\n"
+                "    raise SystemExit(64)\n"
+                "Path('selection-prompt.txt').write_text(sys.argv[2], encoding='utf-8')\n"
+                "print(json.dumps({'task_id': 'TASK-02', 'reason': 'ready'}))\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["next", "--repo", str(repo), "--ask-agent"])
+
+            prompt = (repo / "selection-prompt.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue().strip(), "TASK-02")
+        self.assertIn("TASK-01", prompt)
+        self.assertIn("agent selection command source: auto:codex", stderr.getvalue())
+
+    def test_run_next_requires_explicit_config_when_both_agents_are_available(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            write_python_executable(bin_dir / "codex", "raise SystemExit(99)\n")
+            write_python_executable(bin_dir / "claude", "raise SystemExit(99)\n")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("multiple supported agent CLIs", stderr.getvalue())
+        self.assertIn("agent.command", stderr.getvalue())
+
+    def test_run_until_done_requires_agent_when_no_supported_cli_is_available(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-until-done", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("no supported agent CLI was found", stderr.getvalue())
+        self.assertIn("agent.command", stderr.getvalue())
+
+    def test_run_next_validates_worker_before_running_explicit_selector(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nselection_command = "selector {prompt}"\n',
+                encoding="utf-8",
+            )
+            write_python_executable(
+                bin_dir / "selector",
+                "from pathlib import Path\n"
+                "Path('selector-ran').write_text('ran', encoding='utf-8')\n"
+                "print('{\"task_id\":\"TASK-02\"}')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo), "--ask-agent"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("agent.command", stderr.getvalue())
+        self.assertFalse((repo / "selector-ran").exists())
+
+    def test_doctor_reports_agent_detection_and_command_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(bin_dir / "codex", "raise SystemExit(0)\n")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["agent"]["command_source"], "auto:codex")
+        self.assertEqual(payload["agent"]["selection_command_source"], "auto:codex")
+        self.assertEqual(payload["agent"]["detected"]["available"], ["codex"])
+
+    def test_tasks_configure_reports_agent_resolution_without_running_agent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "not_implemented")
+        self.assertEqual(payload["agent"]["command_source"], "auto:codex")
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_tasks_configure_text_reports_detected_agent_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(bin_dir / "claude", "raise SystemExit(0)\n")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["tasks", "configure", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertIn("detected agents: claude=", stdout.getvalue())
+        self.assertIn("agent.command source: auto:claude", stdout.getvalue())
+
     def test_run_next_keeps_json_stdout_when_agent_streams_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -192,6 +459,22 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual("", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
+
+
+def write_python_executable(path: Path, body: str) -> None:
+    path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
+    path.chmod(0o755)
+
+
+def write_fake_git(bin_dir: Path) -> None:
+    write_python_executable(
+        bin_dir / "git",
+        "import sys\n"
+        "if sys.argv[1:] == ['rev-parse', '--verify', 'HEAD']:\n"
+        "    print('test-head')\n"
+        "    raise SystemExit(0)\n"
+        "raise SystemExit(1)\n",
+    )
 
 
 if __name__ == "__main__":

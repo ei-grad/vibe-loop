@@ -62,9 +62,9 @@ The difference is in the workflow `vibe-loop` is built around:
 - `ralphex` has its own plan format under `docs/plans/`; `vibe-loop` is intended
   to fit existing project planning and worklog conventions instead of requiring a
   dedicated plan directory.
-- `vibe-loop` treats agent execution as configuration. `codex exec` is the
-  default command, but worker and selection commands are template strings rather
-  than a hard dependency on one agent CLI.
+- `vibe-loop` treats agent execution as configuration. Worker and selection
+  commands are template strings resolved from explicit config or supported CLI
+  detection rather than a hard dependency on one agent CLI.
 - `vibe-loop` packages the workflow skills as reusable instructions. They remain
   useful on their own; the CLI adds task selection, locking, execution, logging,
   and result-recording around the finite `vibe-loop` skill.
@@ -194,6 +194,7 @@ main_branch = "main"
 state_dir = ".vibe-loop"
 
 [agent]
+# Optional when exactly one supported CLI is available on PATH.
 command = "codex exec '$vibe-loop {task_id}'"
 selection_command = "codex exec {prompt}"
 forward_stderr = false
@@ -212,9 +213,21 @@ commands = [
 ]
 ```
 
-The default agent commands target Codex, but they are plain templates rather
-than a required dependency. Configure Claude prompt mode explicitly when that is
-the worker or selector you want to run:
+Agent commands are resolved independently. Explicit `.vibe-loop.toml` values
+remain authoritative. When exactly one supported CLI is available on `PATH`,
+`vibe-loop` uses that CLI for omitted worker and selection defaults:
+
+- Codex only: `codex exec '$vibe-loop {task_id}'` and `codex exec {prompt}`.
+- Claude only: `claude -p '$vibe-loop {task_id}'` and `claude -p {prompt}`.
+
+When both Codex and Claude are available, omitted commands are unresolved and
+the relevant `agent.command` or `agent.selection_command` must be configured
+explicitly. This avoids changing worker behavior based on `PATH` ordering.
+When neither supported CLI is available, agent-using commands fail with a
+diagnostic that points to installation or explicit config.
+
+Configure Claude prompt mode explicitly when that is the worker or selector you
+want to run regardless of what else is installed:
 
 ```toml
 [agent]
