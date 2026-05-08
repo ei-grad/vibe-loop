@@ -11,11 +11,30 @@ bounded requests that explicitly mention "vibe loop". Complete that slice
 through review, integration to `main` when permitted, cleanup, and a final
 summary, then stop so an external loop can invoke the next slice.
 
+## Invocation Contract
+
+If an agent starts using this skill, including through a `$vibe-loop` prompt or
+a `vibe-loop` CLI worker command, it must follow the loop to conform to user
+expectations. Treat the skill as the task contract, not optional background
+guidance.
+
+Carry the selected slice through inspection, implementation, verification,
+review, review remediation, commit, integration when permitted, cleanup, and
+final summary. Stop early only on explicit user redirection, missing access,
+required approval, destructive-action confirmation, or a decision that cannot be
+made safely. Report the precise blocker and any safe completed work.
+
+Keep a compact slice state while working: objective, acceptance criteria,
+workspace/branch, verification evidence, review status, blockers, and
+integration/cleanup status. Update it after implementation, checks, review,
+blockers, integration, and final summary. This is finite slice state, not a
+cross-slice backlog.
+
 ## Core Loop
 
 1. Inspect the task, code, tests, docs, repo instructions, worktree state, and
-   constraints; create or choose the slice workspace before implementation
-   edits.
+   constraints; create or choose the slice workspace and initialize slice state
+   before implementation edits.
 2. Plan the next coherent slice from repo-local sources first: instructions,
    design docs, roadmaps, issues, TODOs, and existing plans.
 3. Edit in scoped increments and keep the project working.
@@ -35,8 +54,9 @@ Spec review checks requested behavior and evidence. Code-quality review checks
 implementation, tests, security, performance, UX, maintainability, and repo fit.
 Review may take longer than coding; do not shorten or skip it for speed.
 
-Reviews must use a separate reviewer. Prefer a subagent with clear context, or
-use `codex review "<reviewer-instruction-prompt>" 2>/dev/null` as fallback.
+Reviews must use a separate reviewer, sub-agent spawning is explicitly
+authorized. Prefer a subagent with clear context, or use `codex review
+"<reviewer-instruction-prompt>" 2>/dev/null` as fallback.
 The prompt must include the gate, request/criteria, changed files or diff,
 verification results, evidence, and constraints/open questions. Follow repo
 review policy first: `REVIEW.md`, `AGENTS.md`, `CLAUDE.md`, contribution guides,
@@ -52,7 +72,8 @@ them unless the user explicitly asks for that exact action.
 
 When priorities are underspecified, choose a conservative in-scope item from the
 objective, backlog, failing checks, review findings, or obvious adjacent broken
-behavior. Avoid unrelated refactors and speculative product changes.
+behavior, or directly adjacent implementation work. Avoid unrelated refactors
+and speculative product changes.
 
 If part of the bounded task needs missing access, credentials, destructive-action
 confirmation, or an unsafe decision, park that part and continue only with
@@ -61,9 +82,9 @@ missing approval, access, or decision.
 
 ## Worktree And Integration
 
-For full-cycle bounded work, use a dedicated branch/worktree when repo/user
-policy permits; keep `main` clean during implementation. Create the slice
-branch/worktree before implementation edits begin.
+For full-cycle bounded work, use a dedicated branch/worktree; keep `main` clean
+during implementation. Create the slice branch/worktree before implementation
+edits begin.
 
 If a dedicated worktree cannot be created, or repo/user policy forbids creating
 one, state the precise blocker and proceed in the primary worktree only after

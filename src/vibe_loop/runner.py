@@ -112,10 +112,12 @@ class VibeRunner:
                     task,
                     command,
                     start_main,
+                    run_id,
                     self.config.agent.command_source,
                     self.config.agent.detected,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
+                report_status(f"session_id={run_id}", log)
                 report_status(f"log: {log_path}", log)
                 report_status(
                     f"agent command source: {self.config.agent.command_source}",
@@ -273,9 +275,11 @@ def write_log_header(
     task: Task,
     command: str,
     start_main: str,
+    session_id: str,
     command_source: str,
     detected: AgentDetection,
 ) -> None:
+    log.write(f"[vibe-loop] session_id={session_id}\n")
     log.write(f"[vibe-loop] task_id={task.task_id}\n")
     log.write(f"[vibe-loop] title={task.title}\n")
     log.write(f"[vibe-loop] command={command}\n")

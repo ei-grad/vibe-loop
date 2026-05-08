@@ -9,6 +9,12 @@ Use for open-ended, unattended software development sessions. It owns
 continuation and integration discipline; use ordinary `vibe-loop` for bounded
 work.
 
+Each infinite-loop slice must satisfy the finite `vibe-loop` slice contract:
+inspect, plan, edit, verify, review, remediate, commit, integrate when
+permitted, clean up, and summarize before selecting the next slice. The
+infinite-loop difference is continuation after each completed, parked, or
+blocked slice.
+
 ## Mandatory Continuation
 
 Assume an unattended session. Never voluntarily stop: continue after clean
@@ -72,14 +78,26 @@ non-fast-forward merge for an infinite-loop slice.
 6. Run independent spec review, then code-quality review. Prefer a subagent with
    clear context, or use `codex review "<reviewer-instruction-prompt>" 2>/dev/null`
    as fallback.
-7. Address findings with code, tests, or docs; re-review after material changes.
+7. Address findings with code, tests, or docs; re-review, preferably with the
+   same reviewer, until no material findings remain or remediation is tracked.
 8. Merge the slice back to `main` with fast-forward-only integration, remove the
    merged slice worktree and branch, record a concise status summary, select the
    next actionable item, and continue.
 
-Review may take longer than coding. The reviewer prompt must include the gate,
-request/criteria, changed files or diff, verification results, evidence, and
-constraints/open questions.
+## Review
+
+Spec review checks requested behavior and evidence. Code-quality review checks
+implementation, tests, security, performance, UX, maintainability, and repo fit.
+Review may take longer than coding; do not shorten or skip it for speed.
+
+Reviews must use a separate reviewer. Prefer a subagent with clear context, or
+use `codex review "<reviewer-instruction-prompt>" 2>/dev/null` as fallback.
+The prompt must include the gate, request/criteria, changed files or diff,
+verification results, evidence, and constraints/open questions. Follow repo
+review policy first: `REVIEW.md`, `AGENTS.md`, `CLAUDE.md`, contribution guides,
+CI docs, security checklists, and task-specific review instructions.
+
+Expect review to take some time, 5-10-15+ minutes are normal.
 
 ## User Contact
 

@@ -23,6 +23,7 @@ class RunStoreTests(unittest.TestCase):
         first = result.to_json()
         second = result.to_json()
 
+        self.assertEqual(first["session_id"], "run-1")
         self.assertEqual(first["finished_at"], second["finished_at"])
 
     def test_append_result_writes_versioned_record(self) -> None:
@@ -46,6 +47,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["schema_version"], RUN_SCHEMA_VERSION)
         self.assertEqual(payload["record_type"], RUN_RECORD_TYPE)
         self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["session_id"], "run-1")
         self.assertEqual(payload["task_id"], "TASK-01")
 
     def test_recent_log_context_reads_records_and_log_tail(self) -> None:
