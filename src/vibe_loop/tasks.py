@@ -114,6 +114,13 @@ class TaskSource(Protocol):
 
 
 def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
+    if (
+        config.type == "command"
+        or config.list_command
+        or config.next_command
+        or config.probe_command
+    ):
+        return CommandTaskSource(repo, config)
     if config.type in {"markdown-plan", "markdown-profile"}:
         if config.profile is not None:
             return MarkdownProfileSource(repo, config.profile)
@@ -125,8 +132,6 @@ def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
             discover_markdown_plan(repo, config),
             config.runnable_statuses,
         )
-    if config.type == "command":
-        return CommandTaskSource(repo, config)
     raise ValueError(f"unsupported task source type: {config.type}")
 
 

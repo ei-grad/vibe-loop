@@ -18,6 +18,10 @@ from vibe_loop.config import (
     AgentDetection,
     VibeConfig,
 )
+from vibe_loop.generated_profiles import (
+    RuntimeTaskSourceResolution,
+    resolve_runtime_task_source,
+)
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
@@ -69,14 +73,24 @@ class VibeRunner:
     def __init__(self, config: VibeConfig):
         self.config = config
         self._source: TaskSource | None = None
+        self._source_resolution: RuntimeTaskSourceResolution | None = None
         self.lock_manager = LockManager(config.state_path / "locks")
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
 
     @property
+    def source_resolution(self) -> RuntimeTaskSourceResolution:
+        if self._source_resolution is None:
+            self._source_resolution = resolve_runtime_task_source(self.config)
+        return self._source_resolution
+
+    @property
     def source(self) -> TaskSource:
         if self._source is None:
-            self._source = build_task_source(self.config.repo, self.config.task_source)
+            self._source = build_task_source(
+                self.config.repo,
+                self.source_resolution.task_source,
+            )
         return self._source
 
     def list_candidates(self, exclude: set[str] | None = None) -> list[Task]:
@@ -85,7 +99,7 @@ class VibeRunner:
             task
             for task in runnable_tasks(
                 self.source,
-                self.config.task_source.runnable_statuses,
+                self.source_resolution.task_source.runnable_statuses,
             )
             if task.task_id not in excluded
             and not self.lock_manager.is_locked(task.task_id)

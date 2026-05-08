@@ -12,10 +12,12 @@ from vibe_loop.config import (
     load_config,
 )
 from vibe_loop.generated_profiles import (
+    GeneratedTaskSourceRuntimeError,
     configure_generated_task_source,
     generated_task_cache_report,
     read_only_generated_cache_notice,
     read_only_generated_cache_message,
+    runtime_task_source_report,
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.skills import install_skills
@@ -181,6 +183,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
                     "task_source": config.task_source.to_json(),
+                    "task_source_runtime": runtime_task_source_report(config),
                     "generated_task_profile": generated_task_cache_report(config),
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
@@ -313,26 +316,59 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
 def all_task_views(config):
     runner = VibeRunner(config)
     tasks = runner.source.list_tasks()
+    runtime_task_source = runner.source_resolution.task_source
     locked_ids = {
         str(task_lock.get("task_id"))
         for task_lock in runner.lock_manager.list_locks()
         if task_lock.get("task_id")
     }
-    return build_task_views(tasks, locked_ids)
+    return build_task_views(
+        tasks,
+        locked_ids,
+        runnable_statuses=runtime_task_source.runnable_statuses,
+    )
 
 
 def read_only_task_operation(config, operation):
     try:
         result = operation()
+    except GeneratedTaskSourceRuntimeError as exc:
+        raise RuntimeError(str(exc)) from exc
     except AgentResolutionError:
         raise
     except (FileNotFoundError, ValueError) as exc:
         message = read_only_generated_cache_message(config)
         raise RuntimeError(f"{exc}; {message}") from exc
-    notice = read_only_generated_cache_notice(config)
+    notice = read_only_task_source_notice(config)
     if notice:
         print(f"vibe-loop: {notice}", file=sys.stderr)
     return result
+
+
+def read_only_task_source_notice(config) -> str | None:
+    cache_notice = read_only_generated_cache_notice(config)
+    report = runtime_task_source_report(config)
+    origin = report.get("origin")
+    if cache_notice:
+        if origin == "default_markdown_discovery":
+            return f"{cache_notice}; task discovery source=default_markdown_discovery"
+        return cache_notice
+    if origin == "generated_cache":
+        return f"task discovery source=generated_cache path={report.get('cache_path')}"
+    if origin == "default_markdown_discovery":
+        return "task discovery source=default_markdown_discovery"
+    if origin == "command_output":
+        return "task discovery source=command_output"
+    if origin == "explicit_config":
+        task_source = report.get("task_source")
+        keys = []
+        if isinstance(task_source, dict):
+            explicit_keys = task_source.get("explicit_source_keys")
+            if isinstance(explicit_keys, list):
+                keys = [str(key) for key in explicit_keys]
+        suffix = f" keys={','.join(keys)}" if keys else ""
+        return f"task discovery source=explicit_config{suffix}"
+    return None
 
 
 def task_views_for_tasks(config, tasks: list[Task]):
@@ -344,6 +380,7 @@ def selected_task_json(config, task: Task) -> dict[str, object]:
     payload = task.to_json()
     payload.update(
         {
+            "task_source_runtime": runtime_task_source_report(config),
             "agent_selection_command_source": config.agent.selection_command_source,
             "agent_default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "agent_default_policy": AGENT_DEFAULT_POLICY,

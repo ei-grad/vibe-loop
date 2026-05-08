@@ -15,6 +15,7 @@ from vibe_loop.config import (
     GENERATED_TASK_PROFILE_PROMPT_VERSION,
     GENERATED_TASK_PROFILE_SCHEMA_VERSION,
     AgentResolutionError,
+    TaskSourceConfig,
     VibeConfig,
     reject_generated_command_adapters,
 )
@@ -77,6 +78,257 @@ class GeneratedTaskConfigureResult:
             "diagnostics": list(self.diagnostics),
             "cache": self.payload,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeTaskSourceResolution:
+    task_source: TaskSourceConfig
+    origin: str
+    diagnostics: tuple[str, ...] = ()
+    cache_path: Path | None = None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "origin": self.origin,
+            "diagnostics": list(self.diagnostics),
+            "cache_path": str(self.cache_path) if self.cache_path else None,
+            "task_source": self.task_source.to_json(),
+        }
+
+
+class GeneratedTaskSourceRuntimeError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        origin: str,
+        diagnostics: tuple[str, ...] = (),
+    ):
+        super().__init__(message)
+        self.origin = origin
+        self.diagnostics = diagnostics
+
+
+def resolve_runtime_task_source(config: VibeConfig) -> RuntimeTaskSourceResolution:
+    if not config.task_source.allows_generated_cache:
+        return RuntimeTaskSourceResolution(
+            task_source=config.task_source,
+            origin=explicit_task_source_origin(config.task_source),
+            diagnostics=(),
+            cache_path=None,
+        )
+
+    report = generated_task_cache_report(config)
+    if not report.get("exists"):
+        return RuntimeTaskSourceResolution(
+            task_source=config.task_source,
+            origin="default_markdown_discovery",
+            diagnostics=tuple(str(item) for item in report.get("diagnostics", [])),
+            cache_path=config.generated_task_profile_path,
+        )
+
+    payload = load_generated_task_cache_payload(config)
+    status = payload.get("status")
+    origin = str(report.get("origin") or cache_origin(config, payload, ()))
+    diagnostics = tuple(str(item) for item in report.get("diagnostics", []))
+    structural_diagnostics = runtime_cache_structural_diagnostics(payload)
+    if structural_diagnostics:
+        raise GeneratedTaskSourceRuntimeError(
+            read_only_generated_cache_message(
+                config,
+                extra_diagnostics=structural_diagnostics,
+                origin="invalid_generated_cache",
+            ),
+            origin="invalid_generated_cache",
+            diagnostics=structural_diagnostics,
+        )
+    if report.get("stale_reasons"):
+        raise GeneratedTaskSourceRuntimeError(
+            read_only_generated_cache_message(config),
+            origin=origin,
+            diagnostics=diagnostics,
+        )
+    if status != "profile":
+        return RuntimeTaskSourceResolution(
+            task_source=config.task_source,
+            origin="default_markdown_discovery",
+            diagnostics=diagnostics,
+            cache_path=config.generated_task_profile_path,
+        )
+
+    profile_diagnostics = runtime_profile_diagnostics(config, payload)
+    if profile_diagnostics:
+        raise GeneratedTaskSourceRuntimeError(
+            read_only_generated_cache_message(
+                config,
+                extra_diagnostics=profile_diagnostics,
+                origin="invalid_generated_cache",
+                next_action=f"vibe-loop tasks configure --repo {config.repo}",
+            ),
+            origin="invalid_generated_cache",
+            diagnostics=profile_diagnostics,
+        )
+
+    profile = payload.get("profile")
+    assert isinstance(profile, dict)
+    return RuntimeTaskSourceResolution(
+        task_source=dataclasses.replace(
+            config.task_source,
+            type="markdown-profile",
+            profile=profile,
+            runnable_statuses=runtime_runnable_statuses(config, profile),
+        ),
+        origin="generated_cache",
+        diagnostics=(),
+        cache_path=config.generated_task_profile_path,
+    )
+
+
+def runtime_task_source_report(config: VibeConfig) -> dict[str, object]:
+    try:
+        resolution = resolve_runtime_task_source(config)
+    except GeneratedTaskSourceRuntimeError as exc:
+        return {
+            "origin": exc.origin,
+            "usable": False,
+            "diagnostics": list(exc.diagnostics) or [str(exc)],
+            "cache_path": str(config.generated_task_profile_path),
+        }
+    validation_diagnostics = runtime_task_source_validation_diagnostics(
+        config,
+        resolution,
+    )
+    return {
+        **resolution.to_json(),
+        "usable": not validation_diagnostics,
+        "diagnostics": [
+            *resolution.diagnostics,
+            *validation_diagnostics,
+        ],
+    }
+
+
+def explicit_task_source_origin(task_source: TaskSourceConfig) -> str:
+    if (
+        task_source.type == "command"
+        or task_source.list_command
+        or task_source.next_command
+        or task_source.probe_command
+    ):
+        return "command_output"
+    return "explicit_config"
+
+
+def runtime_task_source_validation_diagnostics(
+    config: VibeConfig,
+    resolution: RuntimeTaskSourceResolution,
+) -> tuple[str, ...]:
+    try:
+        from vibe_loop.tasks import build_task_source
+
+        source = build_task_source(config.repo, resolution.task_source)
+        if resolution.origin != "command_output":
+            source.list_tasks()
+    except (OSError, ValueError) as exc:
+        return (f"task source is not usable: {exc}",)
+    return ()
+
+
+def load_generated_task_cache_payload(config: VibeConfig) -> dict[str, Any]:
+    path = config.generated_task_profile_path
+    try:
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            parse_constant=reject_json_constant,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        raise GeneratedTaskSourceRuntimeError(
+            read_only_generated_cache_message(config),
+            origin="invalid_generated_cache",
+            diagnostics=(f"generated task-source cache cannot be read: {exc}",),
+        ) from exc
+    if not isinstance(payload, dict):
+        raise GeneratedTaskSourceRuntimeError(
+            read_only_generated_cache_message(config),
+            origin="invalid_generated_cache",
+            diagnostics=("generated task-source cache must contain a JSON object",),
+        )
+    return payload
+
+
+def runtime_cache_structural_diagnostics(
+    payload: dict[str, Any],
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    if payload.get("schema_version") != GENERATED_TASK_PROFILE_SCHEMA_VERSION:
+        diagnostics.append("unsupported generated cache schema_version")
+    if payload.get("prompt_version") != GENERATED_TASK_PROFILE_PROMPT_VERSION:
+        diagnostics.append("unsupported generated cache prompt_version")
+    if payload.get("status") not in GENERATED_PROFILE_STATUSES:
+        diagnostics.append("unsupported generated cache status")
+    try:
+        reject_generated_command_adapters(payload)
+    except ValueError as exc:
+        diagnostics.append(str(exc))
+    return tuple(diagnostics)
+
+
+def runtime_profile_diagnostics(
+    config: VibeConfig,
+    payload: dict[str, Any],
+) -> tuple[str, ...]:
+    diagnostics = [
+        diagnostic
+        for diagnostic in diagnostics_for_cache_payload(config, payload)
+        if diagnostic not in runtime_cache_structural_diagnostics(payload)
+    ]
+    bundle = collect_generated_discovery_evidence(
+        config.repo,
+        state_dir=config.state_dir,
+    )
+    profile_error = validate_generated_profile(payload.get("profile"), bundle)
+    if profile_error is not None:
+        diagnostics.append(": ".join(profile_error))
+        return tuple(diagnostics)
+    profile = payload.get("profile")
+    if isinstance(profile, dict):
+        diagnostics.extend(runtime_profile_parser_diagnostics(config, profile))
+    if payload.get("status") != "profile":
+        diagnostics.append("generated cache status is not runnable profile")
+    return tuple(diagnostics)
+
+
+def runtime_profile_parser_diagnostics(
+    config: VibeConfig,
+    profile: dict[str, Any],
+) -> tuple[str, ...]:
+    try:
+        from vibe_loop.tasks import build_task_source
+
+        task_source = dataclasses.replace(
+            config.task_source,
+            type="markdown-profile",
+            profile=profile,
+            runnable_statuses=runtime_runnable_statuses(config, profile),
+        )
+        build_task_source(config.repo, task_source).list_tasks()
+    except (OSError, ValueError) as exc:
+        return (f"generated profile cannot parse task source: {exc}",)
+    return ()
+
+
+def runtime_runnable_statuses(
+    config: VibeConfig,
+    profile: dict[str, Any],
+) -> tuple[str, ...]:
+    if config.task_source.is_explicit("runnable_statuses"):
+        return config.task_source.runnable_statuses
+    status_map = profile.get("status_map")
+    if isinstance(status_map, dict):
+        runnable = status_map.get("runnable")
+        if is_nonempty_string_list(runnable):
+            return tuple(runnable)
+    return config.task_source.runnable_statuses
 
 
 def configure_generated_task_source(config: VibeConfig) -> GeneratedTaskConfigureResult:
@@ -712,6 +964,7 @@ def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
         report.update(
             {
                 "status": "disabled_by_explicit_task_source",
+                "origin": "explicit_config",
                 "diagnostics": [
                     "explicit task_source source settings disable generated cache as an active source"
                 ],
@@ -726,6 +979,7 @@ def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
         report.update(
             {
                 "status": "missing",
+                "origin": "no_usable_source",
                 "diagnostics": ["generated task-source cache is missing"],
                 "next_action": f"vibe-loop tasks configure --repo {config.repo}",
             }
@@ -740,6 +994,7 @@ def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
         report.update(
             {
                 "status": "invalid",
+                "origin": "invalid_generated_cache",
                 "diagnostics": [f"generated task-source cache cannot be read: {exc}"],
                 "next_action": f"vibe-loop tasks configure --repo {config.repo}",
             }
@@ -749,6 +1004,7 @@ def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
         report.update(
             {
                 "status": "invalid",
+                "origin": "invalid_generated_cache",
                 "diagnostics": [
                     "generated task-source cache must contain a JSON object"
                 ],
@@ -796,21 +1052,29 @@ def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
     return report
 
 
-def read_only_generated_cache_message(config: VibeConfig) -> str:
+def read_only_generated_cache_message(
+    config: VibeConfig,
+    *,
+    extra_diagnostics: tuple[str, ...] = (),
+    origin: str | None = None,
+    next_action: str | None = None,
+) -> str:
     report = generated_task_cache_report(config)
     status = report.get("status")
-    diagnostics = report.get("diagnostics") or []
+    message_origin = origin or report.get("origin")
+    diagnostics = [*(report.get("diagnostics") or []), *extra_diagnostics]
     parts = [
         f"generated task-source cache status={status}",
+        f"origin={message_origin}",
         f"path={report.get('path')}",
     ]
     if diagnostics:
         parts.append(
             "diagnostics=" + " | ".join(str(diagnostic) for diagnostic in diagnostics)
         )
-    next_action = report.get("next_action")
-    if next_action:
-        parts.append(f"next_action={next_action}")
+    action = next_action or report.get("next_action")
+    if action:
+        parts.append(f"next_action={action}")
     return "; ".join(parts)
 
 
@@ -888,7 +1152,7 @@ def cache_next_action(
     if isinstance(degradation, dict) and degradation.get("next_action"):
         return str(degradation["next_action"])
     if payload.get("status") == "profile":
-        return "wait for generated-cache runtime loading or promote explicit task_source config"
+        return "generated cache is active for runtime task discovery"
     return f"vibe-loop tasks configure --repo {config.repo}"
 
 
@@ -1053,6 +1317,8 @@ def cache_stale_reasons(config: VibeConfig, payload: dict[str, Any]) -> tuple[st
     )
     current = {file.path: file.fingerprint_json() for file in bundle.files}
     if not fingerprints:
+        if generated_source_paths(payload.get("profile")):
+            return ("source_fingerprints is empty for generated profile source paths",)
         provenance = payload.get("provenance")
         evidence_count = (
             provenance.get("evidence_file_count")

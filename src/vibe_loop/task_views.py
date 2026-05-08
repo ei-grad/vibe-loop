@@ -3,7 +3,13 @@ from __future__ import annotations
 import dataclasses
 from collections import defaultdict
 
-from vibe_loop.tasks import DONE_STATUS, STATUS_RANK, Task, priority_rank
+from vibe_loop.tasks import (
+    DEFAULT_RUNNABLE_STATUSES,
+    DONE_STATUS,
+    STATUS_RANK,
+    Task,
+    priority_rank,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -19,12 +25,17 @@ class TaskView:
         return payload
 
 
-def build_task_views(tasks: list[Task], locked_ids: set[str]) -> list[TaskView]:
+def build_task_views(
+    tasks: list[Task],
+    locked_ids: set[str],
+    runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES,
+) -> list[TaskView]:
     done = {task.task_id for task in tasks if task.status == DONE_STATUS}
+    runnable = set(runnable_statuses)
     return [
         TaskView(
             task=task,
-            ready=task.status in STATUS_RANK
+            ready=task.status in runnable
             and task.task_id not in locked_ids
             and all(dep in done for dep in task.dependencies),
             locked=task.task_id in locked_ids,
