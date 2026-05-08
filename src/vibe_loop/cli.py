@@ -8,7 +8,15 @@ from pathlib import Path
 from vibe_loop.config import load_config
 from vibe_loop.runner import VibeRunner
 from vibe_loop.skills import install_skills
-from vibe_loop.tasks import build_task_source, runnable_tasks
+from vibe_loop.task_views import (
+    build_task_views,
+    filter_views,
+    parse_status_filter,
+    render_task_list,
+    render_task_tree,
+    task_tree_json,
+)
+from vibe_loop.tasks import Task
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -26,9 +34,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    tasks_parser = subparsers.add_parser("tasks", help="List runnable tasks")
+    tasks_parser = subparsers.add_parser("tasks", help="Inspect task graph")
     add_repo_argument(tasks_parser)
     tasks_parser.add_argument("--json", action="store_true")
+    task_subparsers = tasks_parser.add_subparsers(dest="tasks_command")
+
+    tasks_list = task_subparsers.add_parser("list", help="List tasks")
+    add_repo_argument(tasks_list)
+    add_task_filter_arguments(tasks_list)
+    tasks_list.add_argument("--json", action="store_true")
+
+    tasks_runnable = task_subparsers.add_parser(
+        "runnable", help="List dependency-ready unlocked tasks"
+    )
+    add_repo_argument(tasks_runnable)
+    tasks_runnable.add_argument("--json", action="store_true")
+
+    tasks_next = task_subparsers.add_parser("next", help="Print the next task")
+    add_repo_argument(tasks_next)
+    tasks_next.add_argument("--ask-agent", action="store_true")
+    tasks_next.add_argument("--json", action="store_true")
+
+    tasks_inspect = task_subparsers.add_parser("inspect", help="Show one task")
+    add_repo_argument(tasks_inspect)
+    tasks_inspect.add_argument("task_id")
+    tasks_inspect.add_argument("--json", action="store_true")
+
+    tasks_tree = task_subparsers.add_parser("tree", help="Show dependency tree")
+    add_repo_argument(tasks_tree)
+    add_task_filter_arguments(tasks_tree, default_show_done=False)
+    tasks_tree.add_argument("--json", action="store_true")
+
+    tasks_locks = task_subparsers.add_parser("locks", help="List task locks")
+    add_repo_argument(tasks_locks)
+    tasks_locks.add_argument("--json", action="store_true")
 
     next_parser = subparsers.add_parser("next", help="Print the next runnable task")
     add_repo_argument(next_parser)
@@ -63,17 +102,22 @@ def add_repo_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", type=Path, default=argparse.SUPPRESS)
 
 
+def add_task_filter_arguments(
+    parser: argparse.ArgumentParser,
+    default_show_done: bool = True,
+) -> None:
+    parser.add_argument("--status", help="Comma-separated status filter")
+    parser.add_argument("--ready-only", action="store_true")
+    if default_show_done:
+        parser.add_argument("--hide-done", action="store_true")
+    else:
+        parser.add_argument("--show-done", action="store_true")
+
+
 def dispatch(args: argparse.Namespace) -> int:
     config = load_config(args.repo)
     if args.command == "tasks":
-        source = build_task_source(config.repo, config.task_source)
-        tasks = runnable_tasks(source, config.task_source.runnable_statuses)
-        if args.json:
-            print(json.dumps([task.to_json() for task in tasks], indent=2))
-        else:
-            for task in tasks:
-                print(f"{task.task_id}\t{task.priority}\t{task.status}\t{task.title}")
-        return 0
+        return dispatch_tasks(args, config)
 
     if args.command == "next":
         runner = VibeRunner(config)
@@ -133,3 +177,123 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     raise AssertionError(args.command)
+
+
+def dispatch_tasks(args: argparse.Namespace, config) -> int:
+    if args.tasks_command in {None, "runnable"}:
+        runner = VibeRunner(config)
+        tasks = runner.list_candidates()
+        if args.json:
+            print(json.dumps([task.to_json() for task in tasks], indent=2))
+        else:
+            print(render_task_list(task_views_for_tasks(config, tasks)))
+        return 0
+
+    if args.tasks_command == "next":
+        runner = VibeRunner(config)
+        task = runner.select_task(ask_agent=args.ask_agent)
+        if task is None:
+            return 2
+        if args.json:
+            print(json.dumps(task.to_json(), indent=2))
+        else:
+            print(task.task_id)
+        return 0
+
+    if args.tasks_command == "locks":
+        runner = VibeRunner(config)
+        locks = runner.lock_manager.list_locks()
+        if args.json:
+            print(json.dumps(locks, indent=2))
+        else:
+            for task_lock in locks:
+                print(
+                    f"{task_lock.get('task_id', '')}\t{task_lock.get('run_id', '')}\t"
+                    f"{task_lock.get('started_at', '')}\t{task_lock.get('path', '')}"
+                )
+        return 0
+
+    views = all_task_views(config)
+    if args.tasks_command == "inspect":
+        view = next(
+            (
+                candidate
+                for candidate in views
+                if candidate.task.task_id == args.task_id
+            ),
+            None,
+        )
+        if view is None:
+            print(f"task not found: {args.task_id}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(view.to_json(), indent=2))
+        else:
+            print(render_task_inspect(view))
+        return 0
+
+    if args.tasks_command == "list":
+        selected = filter_views(
+            views,
+            statuses=parse_status_filter(args.status),
+            ready_only=args.ready_only,
+            include_done=not args.hide_done,
+        )
+        if args.json:
+            print(json.dumps([view.to_json() for view in selected], indent=2))
+        else:
+            print(render_task_list(selected))
+        return 0
+
+    if args.tasks_command == "tree":
+        selected = filter_views(
+            views,
+            statuses=parse_status_filter(args.status),
+            ready_only=args.ready_only,
+            include_done=args.show_done,
+        )
+        if args.json:
+            print(json.dumps(task_tree_json(selected), indent=2))
+        else:
+            print(render_task_tree(selected))
+        return 0
+
+    raise AssertionError(args.tasks_command)
+
+
+def all_task_views(config):
+    runner = VibeRunner(config)
+    tasks = runner.source.list_tasks()
+    locked_ids = {
+        str(task_lock.get("task_id"))
+        for task_lock in runner.lock_manager.list_locks()
+        if task_lock.get("task_id")
+    }
+    return build_task_views(tasks, locked_ids)
+
+
+def task_views_for_tasks(config, tasks: list[Task]):
+    ids = {task.task_id for task in tasks}
+    return [view for view in all_task_views(config) if view.task.task_id in ids]
+
+
+def render_task_inspect(view) -> str:
+    task = view.task
+    lines = [
+        f"{task.task_id} [{task.status}/{task.priority}] {task.title}",
+        f"section: {task.section or '-'}",
+        f"ready: {'yes' if view.ready else 'no'}",
+        f"locked: {'yes' if view.locked else 'no'}",
+        f"dependencies: {', '.join(task.dependencies) if task.dependencies else 'none'}",
+        f"source: {task.source or '-'}",
+        "",
+        "scope:",
+        task.scope or "-",
+        "",
+        "acceptance:",
+        task.acceptance or "-",
+        "",
+        "evidence:",
+        task.evidence or "-",
+    ]
+    return "\n".join(lines)

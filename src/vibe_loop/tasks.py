@@ -19,6 +19,7 @@ class Task:
     task_id: str
     title: str
     status: str
+    section: str = ""
     priority: str = ""
     dependencies: tuple[str, ...] = ()
     scope: str = ""
@@ -36,6 +37,7 @@ class Task:
             "id": self.task_id,
             "title": self.title,
             "status": self.status,
+            "section": self.section,
             "priority": self.priority,
             "dependencies": list(self.dependencies),
             "scope": self.scope,
@@ -133,6 +135,7 @@ class MarkdownPlanSource:
                 Task(
                     task_id=task_id,
                     title=first_sentence(cells[4]) or task_id,
+                    section=section,
                     priority=cells[1],
                     status=cells[2],
                     dependencies=parse_dependencies(cells[3]),
@@ -204,6 +207,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         task_id=str(value.get("id") or value.get("task_id") or ""),
         title=str(value.get("title") or value.get("id") or value.get("task_id") or ""),
         status=str(value.get("status") or ""),
+        section=str(value.get("section") or ""),
         priority=str(value.get("priority") or ""),
         dependencies=tuple(str(item) for item in dependencies),
         scope=str(value.get("scope") or ""),

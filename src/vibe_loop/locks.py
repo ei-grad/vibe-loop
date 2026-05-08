@@ -54,6 +54,17 @@ class LockManager:
     def is_locked(self, task_id: str) -> bool:
         return (self.lock_root / f"{safe_name(task_id)}.lock").exists()
 
+    def list_locks(self) -> list[dict[str, object]]:
+        if not self.lock_root.exists():
+            return []
+        locks: list[dict[str, object]] = []
+        for path in sorted(self.lock_root.glob("*.lock")):
+            metadata = read_metadata(path)
+            metadata.setdefault("task_id", path.stem)
+            metadata["path"] = str(path)
+            locks.append(metadata)
+        return locks
+
 
 def safe_name(value: str) -> str:
     return "".join(char if char.isalnum() or char in "-._" else "_" for char in value)

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from vibe_loop.tasks import MarkdownPlanSource, runnable_tasks
+from vibe_loop.task_views import build_task_views, render_task_tree
 
 
 PLAN = """# Plan
@@ -31,6 +32,18 @@ class MarkdownPlanTests(unittest.TestCase):
             tasks = runnable_tasks(source, ("Active", "Next", "Planned"))
 
         self.assertEqual([task.task_id for task in tasks], ["DEMO-02", "DEMO-04"])
+
+    def test_plan_tasks_include_section_for_tree_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "PLAN.md"
+            path.write_text(PLAN, encoding="utf-8")
+            source = MarkdownPlanSource(path, ("Active", "Next", "Planned"))
+            views = build_task_views(source.list_tasks(), locked_ids=set())
+
+            output = render_task_tree(views)
+
+        self.assertIn("Demo", output)
+        self.assertIn("DEMO-02 [Next/P1] Ready task", output)
 
 
 if __name__ == "__main__":

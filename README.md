@@ -19,7 +19,11 @@ when all listed dependencies are `Done` and no local lock exists.
 ## Commands
 
 ```bash
-vibe-loop tasks --repo .
+vibe-loop tasks list --repo .
+vibe-loop tasks tree --repo .
+vibe-loop tasks inspect QUERY-09 --repo .
+vibe-loop tasks runnable --repo .
+vibe-loop tasks locks --repo .
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent
@@ -29,6 +33,9 @@ vibe-loop install-skills --codex --claude
 `--ask-agent` gives the agent the mechanically safe candidate list plus recent
 `.vibe-loop/runs.jsonl` entries and log tails. The CLI still performs the lock
 and completion checks itself.
+
+`vibe-loop tasks` without a subcommand remains a compatibility alias for
+`vibe-loop tasks runnable`.
 
 ## Configuration
 
