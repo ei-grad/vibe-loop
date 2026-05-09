@@ -204,6 +204,8 @@ vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {pro
 vibe-loop workers --repo .
 vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
+vibe-loop planning benchmark-duration --repo .
+vibe-loop planning benchmark-duration --repo . --check
 vibe-loop main-integration status --repo .
 vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
 vibe-loop main-integration release --repo . --run-id ... --task-id ...
@@ -313,6 +315,14 @@ subject_matching = "diagnostic"
 # Optional future collector adapter. Doctor reports whether this is set without
 # printing the command string.
 # worklog_command = "my-worklog export --jsonl"
+
+[planning_analytics.duration_model]
+name = "robust-duration-baseline-v1"
+group_min_sample_count = 2
+similarity_min_score = 0.35
+similarity_max_examples = 3
+similarity_blend_weight = 0.25
+fallback_minutes = 60
 
 [planning_analytics.outputs]
 # Explicit repo artifact paths are opt-in. Omitted paths write under
@@ -484,10 +494,18 @@ actual spans. Each projected task records the selected model, minutes, low/high
 interval, training sample counts, outlier handling notes, and feature/evidence
 reasons.
 
+`vibe-loop planning benchmark-duration --repo .` writes deterministic JSON and
+Markdown reports for duration-estimator candidates under
+`<state_dir>/planning-analytics` by default, or under explicit benchmark output
+paths when configured. `--check` validates those reports and fails when the
+configured generator model name or parameters differ from the estimator selected
+by the benchmark. The benchmark uses stable task/commit folds and excludes
+validation tasks and validation-shared commits from each training fold.
+
 `vibe-loop doctor` reports planning analytics readiness without running a
 collector. It includes the selected schedule policy, subject matching mode,
-worklog adapter presence, coverage tiers, resolved artifact paths, and whether
-repo-artifact outputs are explicitly enabled. See
+worklog adapter presence, duration-model parameters, coverage tiers, resolved
+artifact paths, and whether repo-artifact outputs are explicitly enabled. See
 `docs/planning-analytics.md` for the full contract.
 
 ## Development

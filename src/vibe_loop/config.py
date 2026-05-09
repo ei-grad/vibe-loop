@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 import shutil
 import tomllib
 from pathlib import Path
@@ -34,6 +35,15 @@ PLANNING_ANALYTICS_DEFAULT_OUTPUTS = {
     "benchmark_markdown": "duration-benchmark.md",
 }
 PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES = ("diagnostic", "disabled")
+PLANNING_ANALYTICS_DURATION_MODEL_NAMES = ("robust-duration-baseline-v1",)
+PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL = {
+    "name": "robust-duration-baseline-v1",
+    "group_min_sample_count": 2,
+    "similarity_min_score": 0.35,
+    "similarity_max_examples": 3,
+    "similarity_blend_weight": 0.25,
+    "fallback_minutes": 60,
+}
 TASK_SOURCE_SOURCE_KEYS = frozenset(
     {
         "type",
@@ -238,12 +248,47 @@ class PlanningAnalyticsOutputs:
 
 
 @dataclasses.dataclass(frozen=True)
+class PlanningAnalyticsDurationModelConfig:
+    name: str = str(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["name"])
+    group_min_sample_count: int = int(
+        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["group_min_sample_count"]
+    )
+    similarity_min_score: float = float(
+        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_min_score"]
+    )
+    similarity_max_examples: int = int(
+        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_max_examples"]
+    )
+    similarity_blend_weight: float = float(
+        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_blend_weight"]
+    )
+    fallback_minutes: int = int(
+        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["fallback_minutes"]
+    )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "parameters": {
+                "group_min_sample_count": self.group_min_sample_count,
+                "similarity_min_score": self.similarity_min_score,
+                "similarity_max_examples": self.similarity_max_examples,
+                "similarity_blend_weight": self.similarity_blend_weight,
+                "fallback_minutes": self.fallback_minutes,
+            },
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PlanningAnalyticsConfig:
     schedule_policy: str = PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY
     subject_matching: str = "diagnostic"
     worklog_command: str | None = None
     outputs: PlanningAnalyticsOutputs = dataclasses.field(
         default_factory=PlanningAnalyticsOutputs
+    )
+    duration_model: PlanningAnalyticsDurationModelConfig = dataclasses.field(
+        default_factory=PlanningAnalyticsDurationModelConfig
     )
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
@@ -519,7 +564,64 @@ def parse_planning_analytics(data: object) -> PlanningAnalyticsConfig:
         subject_matching=subject_matching,
         worklog_command=optional_nonempty_string(table.get("worklog_command")),
         outputs=parse_planning_analytics_outputs(table.get("outputs")),
+        duration_model=parse_planning_analytics_duration_model(
+            table.get("duration_model")
+        ),
         explicit_keys=explicit_keys,
+    )
+
+
+def parse_planning_analytics_duration_model(
+    data: object,
+) -> PlanningAnalyticsDurationModelConfig:
+    table = expect_table(data, "planning_analytics.duration_model")
+    supported_keys = set(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL)
+    unknown_keys = sorted(set(str(key) for key in table) - supported_keys)
+    if unknown_keys:
+        raise ValueError(
+            "planning_analytics.duration_model contains unsupported keys: "
+            f"{', '.join(unknown_keys)}"
+        )
+    name = (
+        optional_nonempty_string(table.get("name"))
+        or PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["name"]
+    )
+    if name not in PLANNING_ANALYTICS_DURATION_MODEL_NAMES:
+        allowed = ", ".join(PLANNING_ANALYTICS_DURATION_MODEL_NAMES)
+        raise ValueError(
+            f"planning_analytics.duration_model.name must be one of: {allowed}"
+        )
+    return PlanningAnalyticsDurationModelConfig(
+        name=str(name),
+        group_min_sample_count=positive_int(
+            table.get("group_min_sample_count"),
+            int(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["group_min_sample_count"]),
+            "planning_analytics.duration_model.group_min_sample_count",
+        ),
+        similarity_min_score=bounded_float(
+            table.get("similarity_min_score"),
+            float(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_min_score"]),
+            "planning_analytics.duration_model.similarity_min_score",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        similarity_max_examples=nonnegative_int(
+            table.get("similarity_max_examples"),
+            int(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_max_examples"]),
+            "planning_analytics.duration_model.similarity_max_examples",
+        ),
+        similarity_blend_weight=bounded_float(
+            table.get("similarity_blend_weight"),
+            float(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_blend_weight"]),
+            "planning_analytics.duration_model.similarity_blend_weight",
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        fallback_minutes=positive_int(
+            table.get("fallback_minutes"),
+            int(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["fallback_minutes"]),
+            "planning_analytics.duration_model.fallback_minutes",
+        ),
     )
 
 
@@ -590,6 +692,7 @@ def planning_analytics_report(
                 else "none"
             ),
         },
+        "duration_model": config.planning_analytics.duration_model.to_json(),
         "coverage": {
             "authoritative_evidence": [
                 "task source completion state",
@@ -666,3 +769,46 @@ def optional_bool(value: object, default: bool, name: str) -> bool:
     if isinstance(value, bool):
         return value
     raise ValueError(f"{name} must be a boolean")
+
+
+def positive_int(value: object, default: int, name: str) -> int:
+    parsed = optional_int(value, default, name)
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def nonnegative_int(value: object, default: int, name: str) -> int:
+    parsed = optional_int(value, default, name)
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return parsed
+
+
+def optional_int(value: object, default: int, name: str) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer")
+    return value
+
+
+def bounded_float(
+    value: object,
+    default: float,
+    name: str,
+    *,
+    minimum: float,
+    maximum: float,
+) -> float:
+    if value is None:
+        parsed = default
+    elif isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    else:
+        parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    if parsed < minimum or parsed > maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return parsed

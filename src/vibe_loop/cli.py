@@ -27,6 +27,11 @@ from vibe_loop.generated_profiles import (
     runtime_task_source_report,
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.planning_benchmark import (
+    build_duration_benchmark,
+    check_duration_benchmark_reports,
+    write_duration_benchmark_reports,
+)
 from vibe_loop.planning_evidence import DEFAULT_GIT_COMMIT_LIMIT
 from vibe_loop.planning_timeline import build_planning_timeline
 from vibe_loop.runner import VibeRunner
@@ -165,6 +170,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(planning_timeline)
     planning_timeline.add_argument("--json", action="store_true")
     planning_timeline.add_argument(
+        "--git-commit-limit",
+        type=int,
+        default=DEFAULT_GIT_COMMIT_LIMIT,
+    )
+    planning_benchmark_duration = planning_subparsers.add_parser(
+        "benchmark-duration",
+        help="Benchmark projected duration estimators",
+    )
+    add_repo_argument(planning_benchmark_duration)
+    planning_benchmark_duration.add_argument("--check", action="store_true")
+    planning_benchmark_duration.add_argument("--json", action="store_true")
+    planning_benchmark_duration.add_argument(
         "--git-commit-limit",
         type=int,
         default=DEFAULT_GIT_COMMIT_LIMIT,
@@ -427,6 +444,29 @@ def dispatch_planning(args: argparse.Namespace, config) -> int:
             git_commit_limit=args.git_commit_limit,
         )
         print(json.dumps(timeline, indent=2))
+        return 0
+
+    if args.planning_command == "benchmark-duration":
+        report = build_duration_benchmark(
+            config,
+            git_commit_limit=args.git_commit_limit,
+        )
+        if args.check:
+            errors = check_duration_benchmark_reports(config, report)
+            if args.json:
+                print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
+            elif errors:
+                for error in errors:
+                    print(error, file=sys.stderr)
+            else:
+                print("duration benchmark reports are up to date")
+            return 0 if not errors else 1
+        json_path, markdown_path = write_duration_benchmark_reports(config, report)
+        if args.json:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        else:
+            print(f"duration benchmark JSON: {json_path}")
+            print(f"duration benchmark Markdown: {markdown_path}")
         return 0
 
     raise AssertionError(args.planning_command)

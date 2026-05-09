@@ -437,6 +437,60 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(report["schedule_policy"], "lightmetrics-parity")
         self.assertEqual(report["schedule_policy_source"], "explicit")
 
+    def test_planning_analytics_duration_model_config_is_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[planning_analytics.duration_model]\n"
+                "group_min_sample_count = 3\n"
+                "similarity_min_score = 0.5\n"
+                "similarity_max_examples = 2\n"
+                "similarity_blend_weight = 0.1\n"
+                "fallback_minutes = 90\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+            report = planning_analytics_report(config)
+
+        self.assertEqual(
+            report["duration_model"],
+            {
+                "name": "robust-duration-baseline-v1",
+                "parameters": {
+                    "group_min_sample_count": 3,
+                    "similarity_min_score": 0.5,
+                    "similarity_max_examples": 2,
+                    "similarity_blend_weight": 0.1,
+                    "fallback_minutes": 90,
+                },
+            },
+        )
+
+    def test_planning_analytics_rejects_invalid_duration_model_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[planning_analytics.duration_model]\nsimilarity_blend_weight = 2.0\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "similarity_blend_weight"):
+                load_config(repo)
+
+    def test_planning_analytics_rejects_non_finite_duration_model_float(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[planning_analytics.duration_model]\nsimilarity_min_score = nan\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "similarity_min_score"):
+                load_config(repo)
+
     def test_planning_analytics_rejects_paths_outside_repo(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

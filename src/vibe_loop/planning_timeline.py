@@ -7,7 +7,7 @@ import re
 import statistics
 from datetime import datetime, timedelta, timezone
 
-from vibe_loop.config import VibeConfig
+from vibe_loop.config import PlanningAnalyticsDurationModelConfig, VibeConfig
 from vibe_loop.planning_evidence import (
     DEFAULT_GIT_COMMIT_LIMIT,
     GitCommit,
@@ -131,7 +131,11 @@ class PlanningTimelineBuilder:
         self.add_completed_without_actual_warnings(completed_ids, actual_spans)
         self.add_unknown_dependency_warnings()
         self.add_stale_run_record_warnings()
-        duration_model = DurationBaselineModel(self.tasks, actual_spans)
+        duration_model = DurationBaselineModel(
+            self.tasks,
+            actual_spans,
+            self.config.planning_analytics.duration_model,
+        )
         projections = self.projected_spans(completed_ids, actual_spans, duration_model)
         task_payloads = self.timeline_tasks(actual_spans, projections)
         return {
@@ -472,7 +476,9 @@ class DurationBaselineModel:
         self,
         tasks: list[dict[str, object]],
         actual_spans: dict[str, ActualSpan],
+        model_config: PlanningAnalyticsDurationModelConfig | None = None,
     ):
+        self.model_config = model_config or PlanningAnalyticsDurationModelConfig()
         self.outlier_handling = build_outlier_handling(
             [
                 span.duration_minutes
@@ -494,7 +500,8 @@ class DurationBaselineModel:
 
     def summary(self) -> dict[str, object]:
         return {
-            "model": DURATION_MODEL_NAME,
+            "model": self.model_config.name,
+            "parameters": model_parameters(self.model_config),
             "training_sample_count": len(self.examples),
             "outlier_handling": self.outlier_handling.to_json(),
             "token_fields": list(TOKEN_FIELDS),
@@ -519,18 +526,21 @@ class DurationBaselineModel:
             else None
         )
         minutes = base_minutes
-        model = f"{DURATION_MODEL_NAME}/{group_name}"
+        model = f"{self.model_config.name}/{group_name}"
         evidence_reasons = [
             group_reason,
             outlier_reason(self.outlier_handling),
         ]
-        if similarity_minutes is not None:
+        if (
+            similarity_minutes is not None
+            and self.model_config.similarity_blend_weight > 0
+        ):
             minutes = max(
                 1,
                 int(
                     round(
-                        base_minutes * (1 - SIMILARITY_BLEND_WEIGHT)
-                        + similarity_minutes * SIMILARITY_BLEND_WEIGHT
+                        base_minutes * (1 - self.model_config.similarity_blend_weight)
+                        + similarity_minutes * self.model_config.similarity_blend_weight
                     )
                 ),
             )
@@ -571,7 +581,7 @@ class DurationBaselineModel:
         )
 
     def fallback_estimate(self, task: dict[str, object]) -> DurationEstimate:
-        minutes = DEFAULT_PROJECTED_DURATION_MINUTES
+        minutes = self.model_config.fallback_minutes
         features = task_features(task)
         feature_reasons = feature_reason_payload(features)
         evidence_reasons = ("no completed actual spans; using fixed fallback duration",)
@@ -638,7 +648,7 @@ class DurationBaselineModel:
             ),
         )
         for examples, name, reason in candidates:
-            if len(examples) >= GROUP_MIN_SAMPLE_COUNT:
+            if len(examples) >= self.model_config.group_min_sample_count:
                 return stable_examples(examples), name, reason
         return (
             self.examples,
@@ -651,12 +661,16 @@ class DurationBaselineModel:
         task: dict[str, object],
     ) -> tuple[dict[str, object], ...]:
         target_tokens = pre_task_tokens(task)
-        if not target_tokens:
+        if (
+            not target_tokens
+            or self.model_config.similarity_blend_weight <= 0
+            or self.model_config.similarity_max_examples <= 0
+        ):
             return ()
         scored: list[tuple[float, DurationTrainingExample]] = []
         for example in self.examples:
             score = token_similarity(target_tokens, example.tokens)
-            if score >= SIMILARITY_MIN_SCORE:
+            if score >= self.model_config.similarity_min_score:
                 scored.append((score, example))
         scored.sort(key=lambda item: (-item[0], item[1].task_id))
         return tuple(
@@ -666,7 +680,7 @@ class DurationBaselineModel:
                 "duration_minutes": example.duration_minutes,
                 "adjusted_duration_minutes": example.adjusted_duration_minutes,
             }
-            for score, example in scored[:SIMILARITY_MAX_EXAMPLES]
+            for score, example in scored[: self.model_config.similarity_max_examples]
         )
 
     def training_sample_counts(
@@ -708,6 +722,16 @@ def build_training_example(
         priority=priority_value(task),
         tokens=frozenset(pre_task_tokens(task)),
     )
+
+
+def model_parameters(config: PlanningAnalyticsDurationModelConfig) -> dict[str, object]:
+    return {
+        "group_min_sample_count": config.group_min_sample_count,
+        "similarity_min_score": config.similarity_min_score,
+        "similarity_max_examples": config.similarity_max_examples,
+        "similarity_blend_weight": config.similarity_blend_weight,
+        "fallback_minutes": config.fallback_minutes,
+    }
 
 
 def build_outlier_handling(durations: list[int]) -> OutlierHandling:

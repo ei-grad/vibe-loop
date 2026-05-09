@@ -159,6 +159,28 @@ sample counts, outlier handling, feature reasons, evidence reasons, and any
 leakage-safe similarity examples. Similarity uses only pre-task text fields:
 title, scope, and acceptance.
 
+## Duration Benchmark
+
+`vibe-loop planning benchmark-duration` evaluates duration-estimator candidates
+against completed tasks with authoritative actual spans. It assigns stable
+validation folds from task ids and mapped commit ids, keeps tasks that share a
+validation commit out of that fold's training set, and reports the leakage
+checks in the generated JSON.
+
+The JSON and Markdown reports include MAE, MAPE, mean log error, interval
+coverage, signed bias, and worst misses for each candidate. Reports are written
+to `<state_dir>/planning-analytics/duration-benchmark.{json,md}` by default, or
+to explicit `[planning_analytics.outputs]` benchmark paths. `--check` rebuilds
+the report, compares it with those files, and fails if the configured generator
+model name or parameters differ from the benchmark-selected estimator.
+
+Duration model configuration is explicit under
+`[planning_analytics.duration_model]`: model name, group minimum sample count,
+similarity threshold, maximum similarity examples, similarity blend weight, and
+fallback minutes. The timeline generator and benchmark compare the same
+configuration payload so stale reports and unbenchmarked parameter changes are
+visible.
+
 ## Doctor Readiness
 
 `vibe-loop doctor` reports planning analytics readiness without running a
