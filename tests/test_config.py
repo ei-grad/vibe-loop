@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -194,7 +195,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_task_source_defaults_do_not_block_generated_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory).resolve()
 
             config = load_config(repo)
 
@@ -207,7 +208,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_generated_task_profile_path_uses_configured_state_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory).resolve()
             (repo / ".vibe-loop.toml").write_text(
                 'state_dir = ".state/vibe-loop"\n',
                 encoding="utf-8",
@@ -365,7 +366,7 @@ class ConfigTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory).resolve()
             docs = repo / "docs"
             docs.mkdir()
             plan = docs / "PLAN.md"
@@ -395,7 +396,7 @@ class ConfigTests(unittest.TestCase):
 
     def test_planning_analytics_explicit_artifact_paths_are_opt_in(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory).resolve()
             (repo / ".vibe-loop.toml").write_text(
                 "[planning_analytics.outputs]\n"
                 'timeline_json = "docs/planning/timeline.json"\n'
@@ -512,6 +513,9 @@ class ConfigTests(unittest.TestCase):
 def write_executable(path: Path) -> None:
     path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     path.chmod(0o755)
+    if sys.platform == "win32":
+        cmd = path.with_name(path.name + ".cmd")
+        cmd.write_text("@exit /b 0\r\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

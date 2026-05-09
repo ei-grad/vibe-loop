@@ -1031,6 +1031,9 @@ def stable_aggregate(payload: dict[str, object]) -> dict[str, object]:
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)
+    if sys.platform == "win32":
+        cmd = path.with_name(path.name + ".cmd")
+        cmd.write_text(f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8")
 
 
 def write_negative_agent(path: Path) -> None:

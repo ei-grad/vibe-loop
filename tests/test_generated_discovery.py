@@ -83,7 +83,7 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory).resolve()
             (repo / "PLAN.md").write_text("plan\n", encoding="utf-8")
             (repo / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
             (repo / ".env.production").write_text("TOKEN=secret\n", encoding="utf-8")
@@ -1595,7 +1595,7 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
 
     def test_records_unreadable_directory_walk_errors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory).resolve()
 
             def fake_walk(
                 top: str | bytes | PathLike[str] | PathLike[bytes],

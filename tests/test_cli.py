@@ -112,8 +112,9 @@ class CliTests(unittest.TestCase):
 
     def test_auto_codex_worker_can_report_with_run_id_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
-            bin_dir = Path(directory) / "bin"
+            base = Path(directory).resolve()
+            repo = base / "repo"
+            bin_dir = base / "bin"
             source_path = Path(__file__).resolve().parents[1] / "src"
             repo.mkdir()
             bin_dir.mkdir()
@@ -1021,7 +1022,7 @@ class CliTests(unittest.TestCase):
 
     def test_planning_artifacts_generate_writes_default_state_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
+            repo = Path(directory).resolve() / "repo"
             init_planning_repo(repo, PLAN)
             stdout = StringIO()
             stderr = StringIO()
@@ -1058,7 +1059,7 @@ class CliTests(unittest.TestCase):
 
     def test_planning_artifacts_respects_cli_output_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
+            repo = Path(directory).resolve() / "repo"
             init_planning_repo(repo, PLAN)
             stdout = StringIO()
             stderr = StringIO()
@@ -1305,7 +1306,7 @@ class CliTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "repo"
+            repo = Path(directory).resolve() / "repo"
             init_planning_repo(repo, PLAN)
             with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                 generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
@@ -3953,6 +3954,9 @@ class CliTests(unittest.TestCase):
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)
+    if sys.platform == "win32":
+        cmd = path.with_name(path.name + ".cmd")
+        cmd.write_text(f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8")
 
 
 def init_planning_repo(repo: Path, plan_text: str) -> None:
