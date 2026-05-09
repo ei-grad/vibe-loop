@@ -7,7 +7,7 @@
   "domain": "task_selection",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
-  "conditions": ["no_skill", "vibe_loop"],
+  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli"],
   "budget": {
     "timeout_seconds": 1200,
     "max_commands": 60,

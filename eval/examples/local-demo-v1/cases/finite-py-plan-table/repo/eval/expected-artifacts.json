@@ -17,7 +17,6 @@
   },
   "artifact_contract": {
     "event_order": [
-      "instructions_inspected",
       "worktree_state_inspected",
       "branch_or_worktree_created",
       "verification_ran",

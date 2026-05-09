@@ -1,1 +1,1 @@
-$vibe-loop DMW-01
+DMW-01
