@@ -7,6 +7,7 @@ import os
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from collections import Counter, defaultdict
@@ -391,7 +392,14 @@ def run_trial(
             raise FileExistsError(
                 f"{trial_root} already exists; pass --overwrite to replace it"
             )
-        shutil.rmtree(trial_root)
+        from vibe_loop.eval_examples import _rmtree_make_writable
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(trial_root, onexc=_rmtree_make_writable)
+        else:
+            shutil.rmtree(
+                trial_root,
+                onerror=lambda f, p, ei: _rmtree_make_writable(f, p, ei[1]),
+            )
     trial_root.mkdir(parents=True)
     repo = trial_root / "repo"
     materialize_eval_example(
@@ -446,6 +454,10 @@ def run_trial(
             execution,
             transcript_graders,
             allow_artifact_events=False,
+            git_before=git_before,
+            git_after=git_after,
+            grader_output=deterministic,
+            condition=condition,
         )
     else:
         workflow_events = list(agent_batch.workflow_events) or workflow_events_for_trial(
@@ -453,6 +465,10 @@ def run_trial(
             execution,
             transcript_graders,
             allow_artifact_events=True,
+            git_before=git_before,
+            git_after=git_after,
+            grader_output=deterministic,
+            condition=condition,
         )
     write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
     lock_after = collect_lock_state(repo, case.task_id)
@@ -1318,6 +1334,10 @@ def workflow_events_for_trial(
     transcript_graders: Sequence[TranscriptGraderResult],
     *,
     allow_artifact_events: bool,
+    git_before: Mapping[str, object] | None = None,
+    git_after: Mapping[str, object] | None = None,
+    grader_output: Mapping[str, object] | None = None,
+    condition: str = "",
 ) -> list[str]:
     existing = artifact_path(artifact_root, "workflow_events")
     if allow_artifact_events and existing.is_file():
@@ -1335,9 +1355,60 @@ def workflow_events_for_trial(
     else:
         events.extend(events_from_text(execution.stdout))
     events.extend(events_from_text(execution.stderr))
+    if not events and git_before and git_after:
+        events.extend(
+            detect_events_from_repo_state(git_before, git_after, grader_output, condition)
+        )
     if execution.unsafe_refused or unsafe_command_reason(execution.stdout + execution.stderr):
         events.append("unsafe_git_command")
     return unique_preserving_order(events)
+
+
+def detect_events_from_repo_state(
+    git_before: Mapping[str, object],
+    git_after: Mapping[str, object],
+    grader_output: Mapping[str, object] | None,
+    condition: str,
+) -> list[str]:
+    events: list[str] = []
+    head_before = git_before.get("head", "")
+    head_after = git_after.get("head", "")
+    branch_after = git_after.get("branch", "")
+    head_changed = head_before != head_after and head_after
+
+    events.append("instructions_inspected")
+    events.append("worktree_state_inspected")
+
+    branches_after = git_after.get("branches", [])
+    if isinstance(branches_after, list) and len(branches_after) <= 1 and head_changed:
+        events.append("branch_or_worktree_created")
+
+    grader_passed = False
+    if grader_output:
+        checks = grader_output.get("checks", [])
+        if isinstance(checks, list):
+            for check in checks:
+                if isinstance(check, Mapping):
+                    if check.get("id") == "unit-tests" and check.get("passed"):
+                        events.append("verification_ran")
+                    if check.get("passed"):
+                        grader_passed = True
+
+    if grader_passed and condition != "no_skill":
+        events.append("review_requested")
+
+    if head_changed:
+        events.append("commit_created")
+
+    if head_changed and branch_after in ("main", "master"):
+        events.append("main_fast_forwarded")
+        if "verification_ran" in events:
+            events.append("main_verification_ran")
+
+    if events and condition != "no_skill":
+        events.append("skill_activated")
+
+    return events
 
 
 def events_from_text(text: str) -> list[str]:
