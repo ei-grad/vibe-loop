@@ -1,0 +1,18 @@
+diff --git a/.vibe-loop/runs.jsonl b/.vibe-loop/runs.jsonl
+new file mode 100644
+--- /dev/null
++++ b/.vibe-loop/runs.jsonl
+@@ -0,0 +1 @@
++{"schema_version": 1, "record_type": "worker_report", "run_id": "eval-run-wrk-01", "task_id": "WRK-01", "status": "completed", "commit": "HEAD", "message": "completed", "metadata": {}, "reported_at": "2026-05-09T00:00:00+00:00"}
+diff --git a/PLAN.md b/PLAN.md
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -6,1 +6,1 @@
+-| WRK-01 | P0 | Planned | WRK-00 | Count non-empty report lines. | Tests pass and `.vibe-loop/runs.jsonl` records completion. | Not started. |
++| WRK-01 | P0 | Done | WRK-00 | Count non-empty report lines. | Tests pass and `.vibe-loop/runs.jsonl` records completion. | `vibe-loop report`; `python -m unittest discover`. |
+diff --git a/src/worker_demo/reports.py b/src/worker_demo/reports.py
+--- a/src/worker_demo/reports.py
++++ b/src/worker_demo/reports.py
+@@ -5,1 +5,1 @@
+-    return len(value.splitlines())
++    return sum(1 for line in value.splitlines() if line.strip())

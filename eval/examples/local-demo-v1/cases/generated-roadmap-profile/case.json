@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "generated-roadmap-profile",
+  "title": "Generated roadmap profile fixture",
+  "task_id": "ROAD-02",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop"],
+  "budget": {
+    "timeout_seconds": 1500,
+    "max_commands": 75,
+    "max_output_bytes": 8388608,
+    "network": false
+  },
+  "expected_artifact_roles": [
+    "prompt",
+    "run_log",
+    "transcript",
+    "diff",
+    "final_repo_state",
+    "structured_result",
+    "grader_outputs",
+    "generated_profile",
+    "test_results",
+    "workflow_events"
+  ],
+  "task_source": {
+    "type": "markdown-profile",
+    "profile": {
+      "kind": "markdown_headings",
+      "source_paths": ["docs/roadmap.md"],
+      "stable_ids": true,
+      "fields": {
+        "id": {
+          "pattern": "^(?P<id>[A-Z]+-[0-9]+):",
+          "strategy": "heading_text"
+        },
+        "title": {
+          "pattern": "^[A-Z]+-[0-9]+:\\s*(?P<title>.+)$",
+          "strategy": "heading_text"
+        },
+        "status": {"label": "State"},
+        "dependencies": {"label": "Depends", "none_values": ["none"]},
+        "acceptance": {"label": "Acceptance"}
+      },
+      "status_map": {
+        "done": ["Accepted"],
+        "runnable": ["Ready"],
+        "blocked": ["Blocked"]
+      }
+    },
+    "runnable_statuses": ["Ready"]
+  }
+}

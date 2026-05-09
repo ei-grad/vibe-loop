@@ -1,0 +1,1 @@
+In this repo, explain why this assertion would fail: assert normalize_slug("Hello  World") == "hello-world". Do not edit files, create a branch, commit, or start a vibe-loop workflow.

@@ -1,0 +1,12 @@
+diff --git a/PLAN.md b/PLAN.md
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -6,1 +6,1 @@
+-| DMW-01 | P0 | Planned | DMW-00 | Trim labels before title-casing them. | Tests pass and seeded local notes are preserved. | Not started. |
++| DMW-01 | P0 | Done | DMW-00 | Trim labels before title-casing them. | Tests pass and seeded local notes are preserved. | `python -m unittest discover`. |
+diff --git a/src/dirty_demo/labels.py b/src/dirty_demo/labels.py
+--- a/src/dirty_demo/labels.py
++++ b/src/dirty_demo/labels.py
+@@ -5,1 +5,1 @@
+-    return value.title()
++    return value.strip().title()

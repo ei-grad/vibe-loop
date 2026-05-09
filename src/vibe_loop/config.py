@@ -29,6 +29,7 @@ TASK_SOURCE_SOURCE_KEYS = frozenset(
         "list",
         "next",
         "probe",
+        "profile",
     }
 )
 GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
@@ -169,6 +170,7 @@ class TaskSourceConfig:
     type: str = "markdown-plan"
     plan_path: str | None = None
     plan_paths: tuple[str, ...] = DEFAULT_PLAN_PATHS
+    profile: dict[str, Any] | None = None
     list_command: str | None = None
     next_command: str | None = None
     probe_command: str | None = None
@@ -191,6 +193,7 @@ class TaskSourceConfig:
             "type": self.type,
             "plan_path": self.plan_path,
             "plan_paths": list(self.plan_paths),
+            "profile": self.profile,
             "list_command": self.list_command,
             "next_command": self.next_command,
             "probe_command": self.probe_command,
@@ -327,9 +330,10 @@ def unresolved_agent_command_message(
 def parse_task_source(data: object) -> TaskSourceConfig:
     table = expect_table(data, "task_source")
     explicit_keys = frozenset(str(key) for key in table)
+    profile = optional_profile(table.get("profile"))
     statuses = table.get("runnable_statuses")
     if statuses is None:
-        runnable = DEFAULT_RUNNABLE_STATUSES
+        runnable = profile_runnable_statuses(profile) or DEFAULT_RUNNABLE_STATUSES
     elif isinstance(statuses, list) and all(isinstance(item, str) for item in statuses):
         runnable = tuple(statuses)
     else:
@@ -347,11 +351,40 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         type=str(table.get("type") or "markdown-plan"),
         plan_path=optional_string(table.get("plan_path")),
         plan_paths=candidate_paths,
+        profile=profile,
         list_command=optional_string(table.get("list")),
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
         runnable_statuses=runnable,
         explicit_keys=explicit_keys,
+    )
+
+
+def optional_profile(value: object) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("task_source.profile must be a TOML table")
+    return value
+
+
+def profile_runnable_statuses(profile: dict[str, Any] | None) -> tuple[str, ...] | None:
+    if profile is None:
+        return None
+    status_map = profile.get("status_map")
+    if not isinstance(status_map, dict):
+        return None
+    runnable = status_map.get("runnable")
+    if runnable is None:
+        return None
+    if (
+        isinstance(runnable, list)
+        and runnable
+        and all(isinstance(item, str) for item in runnable)
+    ):
+        return tuple(runnable)
+    raise ValueError(
+        "task_source.profile.status_map.runnable must be an array of strings"
     )
 
 

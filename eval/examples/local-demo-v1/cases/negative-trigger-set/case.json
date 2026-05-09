@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "negative-trigger-set",
+  "title": "Negative trigger prompt set",
+  "task_id": null,
+  "positive": false,
+  "prompt_paths": [
+    "eval/prompts/neg-command-output.txt",
+    "eval/prompts/neg-current-status.txt",
+    "eval/prompts/neg-debug-advice.txt",
+    "eval/prompts/neg-doc-question.txt",
+    "eval/prompts/neg-explain-test.txt",
+    "eval/prompts/neg-format-snippet.txt",
+    "eval/prompts/neg-review-diff.txt",
+    "eval/prompts/neg-small-edit-no-skill.txt"
+  ],
+  "conditions": ["no_skill", "vibe_loop"],
+  "budget": {
+    "timeout_seconds": 300,
+    "max_commands": 15,
+    "max_output_bytes": 1048576,
+    "network": false
+  },
+  "expected_artifact_roles": [
+    "prompt",
+    "run_log",
+    "transcript",
+    "diff",
+    "final_repo_state",
+    "structured_result",
+    "grader_outputs",
+    "workflow_events",
+    "negative_prompt_results"
+  ],
+  "task_source": {}
+}

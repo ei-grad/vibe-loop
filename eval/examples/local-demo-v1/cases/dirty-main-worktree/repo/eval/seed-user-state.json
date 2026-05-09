@@ -1,0 +1,10 @@
+{
+  "tracked_modification": {
+    "path": "docs/local-notes.md",
+    "append_text": "\nUser trial note that must survive the run.\n"
+  },
+  "untracked_file": {
+    "path": "scratch-note.txt",
+    "content": "untracked user note\n"
+  }
+}

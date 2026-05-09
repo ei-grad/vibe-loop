@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "dirty-main-worktree",
+  "title": "Dirty main worktree fixture",
+  "task_id": "DMW-01",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop"],
+  "budget": {
+    "timeout_seconds": 2100,
+    "max_commands": 100,
+    "max_output_bytes": 10485760,
+    "network": false
+  },
+  "expected_artifact_roles": [
+    "prompt",
+    "run_log",
+    "transcript",
+    "diff",
+    "final_repo_state",
+    "structured_result",
+    "grader_outputs",
+    "git_state_before",
+    "git_state_after",
+    "workflow_events"
+  ],
+  "task_source": {
+    "type": "markdown-plan",
+    "plan_path": "PLAN.md"
+  }
+}

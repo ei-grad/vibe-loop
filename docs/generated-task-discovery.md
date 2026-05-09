@@ -32,7 +32,9 @@ The cache envelope is versioned independently from the package version:
     "evidence_limit": {
       "max_file_bytes": 2097152,
       "max_total_bytes": 10485760
-    }
+    },
+    "evidence_file_count": 1,
+    "skipped_evidence": []
   },
   "source_fingerprints": [
     {
@@ -61,6 +63,12 @@ The cache envelope is versioned independently from the package version:
   "degradation": null
 }
 ```
+
+Planning-only, needs-input, unavailable, and rejected cache records use the
+same envelope. Their `degradation` object may include `missing_inputs`,
+`proposed_config`, `candidate_sources`, and `questions` in addition to
+`reason`, `message`, and `next_action`. Proposed configuration is diagnostic
+only; generated records still cannot contain executable command adapters.
 
 Only `schema_version` values supported by the running CLI may be loaded.
 `prompt_version` is recorded so future refresh logic can invalidate profiles
@@ -93,7 +101,8 @@ The cache `status` determines whether read-only task commands may use it:
 Read-only commands such as `tasks list`, `tasks runnable`, `next`, and `doctor`
 must never launch an agent to repair these states. They may read a fresh cache,
 report the state, and print the explicit configure or refresh command that would
-update it.
+update it. If the cached source fingerprints no longer match current bounded
+evidence, diagnostics mark the cache stale and point back to `tasks configure`.
 
 ## Repo-Specific Task Discovery Configuration
 

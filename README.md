@@ -170,9 +170,15 @@ vibe-loop tasks tree --repo .
 vibe-loop tasks inspect QUERY-09 --repo .
 vibe-loop tasks runnable --repo .
 vibe-loop tasks locks --repo .
+vibe-loop tasks configure --repo . --json
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
-vibe-loop run-until-done --repo . --ask-agent
+vibe-loop run-until-done --repo . --ask-agent --jobs 2
+vibe-loop workers --repo .
+vibe-loop main-integration status --repo .
+vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
+vibe-loop main-integration release --repo . --run-id ... --task-id ...
+vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
 vibe-loop install-skills --codex --claude
 ```
 
@@ -189,6 +195,41 @@ stderr, `session_id` stores that native worker id and `session_id_source` is
 `native:stdout` or `native:stderr`. If no native session id is observed,
 `session_id` falls back to `run_id` and `session_id_source` is
 `fallback:run_id`.
+
+`run-until-done` is serial by default. Pass `--jobs N` to let the supervisor
+keep up to `N` finite worker commands active at once; each worker still gets its
+own task lock, run id, and log path. `run-next` always runs a single worker.
+
+Workers can explicitly report their final status while the supervisor run is
+active:
+
+```bash
+vibe-loop report --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" \
+  --task-id "$VIBE_LOOP_TASK_ID" --status blocked --commit HEAD \
+  --message "waiting on reviewer" --metadata-json '{"reason":"review"}'
+```
+
+Report statuses are `completed`, `blocked`, `failed`, and `unknown`. Matching
+report records are authoritative; without a report, the supervisor falls back to
+exit status, completion checks, task probing, and main-branch change heuristics.
+
+Workers that are about to refresh, verify, fast-forward merge to `main`, and
+immediately verify `main` can use the advisory `main-integration` lock to
+serialize that final critical section:
+
+```bash
+vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+vibe-loop main-integration release --repo "$VIBE_LOOP_REPO" \
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+```
+
+`main-integration status` shows the current holder, process state, and stale
+reason when the recorded same-host process is missing. Stale locks are reported
+conservatively; a waiter does not steal them automatically. By default,
+`acquire` records the active task lock's worker process for the same run and
+task. Pass `--pid` only when a wrapper needs to record a different long-lived
+owner process or no active task lock exists.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
@@ -246,9 +287,12 @@ selection_command = "claude -p {prompt}"
 forward_stderr = false
 ```
 
-`agent.command` receives `{task_id}` for the selected task. `selection_command`
-receives a shell-quoted `{prompt}` containing the dependency-ready candidate
-list and recent run context, and should print JSON containing `task_id`.
+`agent.command` receives `{task_id}` for the selected task and `{run_id}` for
+the supervisor run. Worker commands also receive `VIBE_LOOP_RUN_ID`,
+`VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in their environment.
+`selection_command` receives a shell-quoted `{prompt}` containing the
+dependency-ready candidate list and recent run context, and should print JSON
+containing `task_id`.
 
 For command-backed task sources:
 
@@ -263,8 +307,10 @@ probe = "my-task-tool show {task_id} --json"
 include `id`, `title`, `status`, `priority`, `dependencies`, `scope`,
 `acceptance`, and `evidence` where available.
 
-Generated task-source discovery is planned as a cache under the configured state
-directory:
+Generated task-source discovery is an explicit configuration flow. It uses the
+bounded repo-local evidence collector, asks the resolved `agent.selection_command`
+for strict JSON, validates the result, and writes a cache under the configured
+state directory:
 
 ```text
 .vibe-loop/generated-task-source.json
@@ -277,6 +323,15 @@ redacted provenance, confidence, and a degradation status such as `profile`,
 agent identity and command source, not raw command strings. Read-only commands
 must not launch an agent to create or repair that cache; explicit configure or
 refresh commands own agent invocation.
+
+Create or refresh the cache explicitly:
+
+```bash
+vibe-loop tasks configure --repo . --json
+```
+
+Malformed, low-confidence, unsupported, or incomplete agent output is stored as
+an explicit degraded cache record rather than changing runnable task behavior.
 
 Explicit `.vibe-loop.toml` task-source settings stay authoritative. User-written
 command adapters and explicit source paths disable generated discovery for the
@@ -318,6 +373,20 @@ Runner state is intentionally untracked:
   runs/
   runs.jsonl
 ```
+
+Active task locks store the worker command `pid`, `task_id`, `run_id`, log path,
+start time, base `main` revision, host, and resolved command. `vibe-loop
+workers` reconstructs the active view from those lock files plus `runs.jsonl`,
+then marks same-host locks with missing worker processes, missing worker PIDs,
+or incomplete metadata as stale without reading raw logs. The PID is the
+immediate configured command process started by the runner; deeper process
+identity checks are left to the later watchdog work.
+
+The `main-integration.lock` entry is a separate advisory lock for worker-owned
+final integration. Its metadata records the owner task, run id, host, pid, and
+start time. It is visible through `vibe-loop main-integration status` rather
+than `vibe-loop workers`; stale status is diagnostic only and does not grant a
+new holder permission to take over automatically.
 
 `runs.jsonl` is an append-only stream of versioned run result records. Run
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the

@@ -1,0 +1,2 @@
+[agent]
+selection_command = "python eval/stubs/generated_profile_agent.py"

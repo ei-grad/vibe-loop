@@ -11,9 +11,15 @@ work.
 
 Each infinite-loop slice must satisfy the finite `vibe-loop` slice contract:
 inspect, plan, edit, verify, review, remediate, commit, integrate when
-permitted, clean up, and summarize before selecting the next slice. The
-infinite-loop difference is continuation after each completed, parked, or
-blocked slice.
+permitted, clean up, report supervisor status when running under the CLI, and
+summarize before selecting the next slice. The infinite-loop difference is
+continuation after each completed, parked, or blocked slice.
+
+When a slice is launched by the `vibe-loop` CLI, use `VIBE_LOOP_REPO`,
+`VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, and `VIBE_LOOP_LOG` for structured
+worker reports and advisory integration locking. If those variables or the CLI
+are unavailable because the skill is being used directly, keep the same workflow
+discipline and state that no structured supervisor report was sent.
 
 ## Mandatory Continuation
 
@@ -47,8 +53,32 @@ For each coherent work piece:
    review, merge, blocker reports, or moving worktrees; use WIP/checkpoint
    commits when needed.
 3. Verify and independently review the slice.
-4. Merge back to `main` with fast-forward-only integration, then remove the
-   merged worktree and delete the slice branch.
+4. Before the final refresh, verification, fast-forward merge, and immediate
+   `main` verification, acquire the advisory integration lock when running under
+   the `vibe-loop` CLI:
+
+   ```bash
+   vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
+     --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+   ```
+
+5. Merge back to `main` with fast-forward-only integration and run immediate
+   `main` verification.
+6. Release the advisory integration lock after immediate `main` verification,
+   or immediately when integration is parked:
+
+   ```bash
+   vibe-loop main-integration release --repo "$VIBE_LOOP_REPO" \
+     --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+   ```
+
+7. Remove the merged worktree and delete the slice branch.
+
+If the lock is held by another live worker, wait and retry or park the slice as
+blocked; do not enter the final integration section without the lock while under
+CLI supervision. If the lock appears stale, report the precise status and follow
+repo policy rather than stealing it. If release reports an owner mismatch, do not
+remove another worker's lock.
 
 If `main` advanced after a slice passed review:
 
@@ -66,6 +96,30 @@ If `main` advanced after a slice passed review:
 Do not require pre-merge re-review solely because `main` advanced. Never use a
 non-fast-forward merge for an infinite-loop slice.
 
+## Worker Reports
+
+Each CLI-launched slice should explicitly report its final status before moving
+to the next slice:
+
+```bash
+vibe-loop report --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" \
+  --task-id "$VIBE_LOOP_TASK_ID" --status completed --commit HEAD \
+  --message "completed slice"
+```
+
+Use `completed` only after integration is permitted, final `main` verification
+has passed, the integration lock has been released, and cleanup is done. Use
+`blocked` for missing access, required approval, a persistently unavailable
+integration lock, or a decision that cannot be made safely. Use `failed` when an
+attempted slice cannot be left working despite reasonable debugging. Use
+`unknown` only when the worker cannot classify the result. Include the best
+available commit reference and a concise message; use `--metadata-json` only for
+structured facts that help the supervisor or later review.
+
+After reporting a blocked or failed slice, keep the infinite-loop behavior:
+record the blocker in the compact queue, select another independent actionable
+item if one exists, and continue.
+
 ## Working Loop
 
 1. Inspect the objective, repo instructions, current worktree state, tests, docs,
@@ -80,9 +134,11 @@ non-fast-forward merge for an infinite-loop slice.
    context.
 7. Address findings with code, tests, or docs; re-review, preferably with the
    same reviewer, until no material findings remain or remediation is tracked.
-8. Merge the slice back to `main` with fast-forward-only integration, remove the
-   merged slice worktree and branch, record a concise status summary, select the
-   next actionable item, and continue.
+8. Acquire the main-integration lock when under CLI supervision, merge the slice
+   back to `main` with fast-forward-only integration, verify `main`, release the
+   lock, remove the merged slice worktree and branch, submit the worker report,
+   record a concise status summary, select the next actionable item, and
+   continue.
 
 ## Review
 

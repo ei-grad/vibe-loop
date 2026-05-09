@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -27,6 +29,14 @@ TWO_TASK_PLAN = """# Plan
 | --- | --- | --- | --- | --- | --- | --- |
 | TASK-01 | P0 | Next | none | First test task. | Run agent. | Not run. |
 | TASK-02 | P0 | Next | none | Second test task. | Run agent. | Not run. |
+"""
+
+
+WORK_TABLE = """# Work
+
+| Key | State | Summary |
+| --- | --- | --- |
+| DISC-X | Todo | Configure generated discovery. |
 """
 
 
@@ -86,6 +96,98 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
         self.assertIn("agent_command_source=auto:codex", log_text)
         self.assertIn("session_id_source=native:stdout", log_text)
+
+    def test_auto_codex_worker_can_report_with_run_id_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            write_fake_git(bin_dir)
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                f"sys.path.insert(0, {str(source_path)!r})\n"
+                "if sys.argv[1] != 'exec':\n"
+                "    raise SystemExit(64)\n"
+                "env_payload = {\n"
+                "    'run_id': os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "    'task_id': os.environ['VIBE_LOOP_TASK_ID'],\n"
+                "    'repo': os.environ['VIBE_LOOP_REPO'],\n"
+                "    'log': os.environ['VIBE_LOOP_LOG'],\n"
+                "}\n"
+                "Path('agent-env.json').write_text(\n"
+                "    json.dumps(env_payload),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main([\n"
+                "        'report',\n"
+                "        '--repo', '.',\n"
+                "        '--run-id', env_payload['run_id'],\n"
+                "        '--task-id', env_payload['task_id'],\n"
+                "        '--status', 'completed',\n"
+                "        '--metadata-json', '{\"via\":\"env\"}',\n"
+                "    ])\n"
+                ")\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            env_payload = json.loads(
+                (repo / "agent-env.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["worker_report"]["metadata"], {"via": "env"})
+        self.assertEqual(env_payload["run_id"], payload["run_id"])
+        self.assertEqual(env_payload["task_id"], "TASK-01")
+        self.assertEqual(env_payload["repo"], str(repo))
+        self.assertEqual(env_payload["log"], payload["log"])
+        self.assertIn("agent command source: auto:codex", stderr.getvalue())
+
+    def test_install_skills_copies_report_and_integration_lock_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["install-skills", "--codex", "--home", str(home)])
+
+            installed_paths = stdout.getvalue().splitlines()
+            finite = home / ".codex" / "skills" / "vibe-loop" / "SKILL.md"
+            infinite = home / ".codex" / "skills" / "infinite-vibe-loop" / "SKILL.md"
+            finite_text = finite.read_text(encoding="utf-8")
+            infinite_text = infinite.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            installed_paths,
+            [
+                str(home / ".codex" / "skills" / "vibe-loop"),
+                str(home / ".codex" / "skills" / "infinite-vibe-loop"),
+            ],
+        )
+        for text in (finite_text, infinite_text):
+            self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', text)
+            self.assertIn("vibe-loop main-integration acquire", text)
+            self.assertIn("vibe-loop main-integration release", text)
 
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -359,6 +461,192 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[0]["agent_default_policy_source"], "codex-first")
         self.assertIn("agent command source: auto:codex:codex-first", stderr.getvalue())
 
+    def test_run_until_done_jobs_runs_independent_tasks_concurrently(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
+                "log_path = os.environ['VIBE_LOOP_LOG']\n"
+                "started = Path('started')\n"
+                "started.mkdir(exist_ok=True)\n"
+                "(started / task_id).write_text(run_id, encoding='utf-8')\n"
+                "deadline = time.monotonic() + 5\n"
+                "while len(list(started.iterdir())) < 2:\n"
+                "    if time.monotonic() > deadline:\n"
+                "        raise SystemExit('parallel barrier timed out')\n"
+                "    time.sleep(0.02)\n"
+                "lock_paths = sorted(str(path) for path in Path('.vibe-loop/locks').glob('*.lock'))\n"
+                "lock_task_ids = []\n"
+                "for lock_path in Path('.vibe-loop/locks').glob('*.lock'):\n"
+                "    metadata_path = lock_path / 'lock.json'\n"
+                "    if metadata_path.exists():\n"
+                "        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))\n"
+                "        lock_task_ids.append(metadata.get('task_id'))\n"
+                "observed = Path('observed')\n"
+                "observed.mkdir(exist_ok=True)\n"
+                "(observed / f'{task_id}.json').write_text(\n"
+                "    json.dumps(\n"
+                "        {\n"
+                "            'task_id': task_id,\n"
+                "            'run_id': run_id,\n"
+                "            'log': log_path,\n"
+                "            'locks': lock_paths,\n"
+                "            'lock_task_ids': sorted(lock_task_ids),\n"
+                "        },\n"
+                "        sort_keys=True,\n"
+                "    ),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "second_deadline = time.monotonic() + 5\n"
+                "while len(list(observed.glob('*.json'))) < 2:\n"
+                "    if time.monotonic() > second_deadline:\n"
+                "        raise SystemExit('observation barrier timed out')\n"
+                "    time.sleep(0.02)\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', run_id,\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', 'completed',\n"
+                "            '--metadata-json', json.dumps({'lock_count': len(lock_paths)}),\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--jobs",
+                        "2",
+                        "--max-slices",
+                        "2",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            observations = [
+                json.loads(path.read_text(encoding="utf-8"))
+                for path in sorted((repo / "observed").glob("*.json"))
+            ]
+            log_texts = {
+                str(result["task_id"]): Path(str(result["log"])).read_text(
+                    encoding="utf-8"
+                )
+                for result in payload
+                if Path(str(result["log"])).is_file()
+            }
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(payload), 2)
+        self.assertEqual(
+            sorted(result["task_id"] for result in payload),
+            ["TASK-01", "TASK-02"],
+        )
+        self.assertTrue(
+            all(result["classification"] == "completed" for result in payload)
+        )
+        self.assertEqual(len({result["log"] for result in payload}), 2)
+        self.assertEqual(len(observations), 2)
+        self.assertTrue(
+            all(len(observation["locks"]) == 2 for observation in observations)
+        )
+        self.assertTrue(
+            all(
+                observation["lock_task_ids"] == ["TASK-01", "TASK-02"]
+                for observation in observations
+            )
+        )
+        self.assertIn("[vibe-loop] parallel supervisor jobs=2", stderr.getvalue())
+        for result in payload:
+            log_text = log_texts.get(str(result["task_id"]), "")
+            self.assertTrue(log_text)
+            self.assertIn(f"[vibe-loop] task_id={result['task_id']}", log_text)
+            self.assertIn("worker report status=completed", log_text)
+            self.assertIn(f"[vibe-loop] log: {result['log']}", stderr.getvalue())
+
+    def test_run_until_done_continue_on_failure_exits_nonzero_for_any_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import os\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from vibe_loop.cli import main\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "status = 'failed' if task_id == 'TASK-01' else 'completed'\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', status,\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--continue-on-failure",
+                        "--max-slices",
+                        "2",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            [result["classification"] for result in payload],
+            ["failed", "completed"],
+        )
+        self.assertEqual(stderr.getvalue().count("[vibe-loop] running TASK-"), 2)
+
     def test_run_until_done_requires_agent_when_no_supported_cli_is_available(
         self,
     ) -> None:
@@ -463,7 +751,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent"]["default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent"]["default_policy"])
 
-    def test_tasks_configure_reports_agent_resolution_without_running_agent(
+    def test_tasks_configure_writes_validated_profile_cache_with_stub_agent(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -471,10 +759,10 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
-            write_python_executable(
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
                 bin_dir / "codex",
-                "from pathlib import Path\n"
-                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+                generated_profile_payload("WORK.md"),
             )
             stdout = StringIO()
             stderr = StringIO()
@@ -486,14 +774,29 @@ class CliTests(unittest.TestCase):
                     )
 
             payload = json.loads(stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            prompt = json.loads(
+                (repo / "configure-prompt.json").read_text(encoding="utf-8")
+            )
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
-        self.assertEqual(payload["status"], "not_implemented")
+        self.assertEqual(payload["status"], "profile")
+        self.assertEqual(payload["cache"]["status"], "profile")
+        self.assertEqual(cache["status"], "profile")
+        self.assertEqual(cache["profile"]["source_paths"], ["WORK.md"])
+        self.assertEqual(cache["source_fingerprints"][0]["path"], "WORK.md")
+        self.assertEqual(cache["agent"]["name"], "codex")
+        self.assertEqual(cache["agent"]["selection_command_source"], "auto:codex")
         self.assertEqual(payload["agent"]["command_source"], "auto:codex")
-        self.assertFalse((repo / "should-not-run").exists())
+        self.assertNotIn("command", cache["agent"])
+        self.assertEqual(prompt["evidence"]["files"][0]["path"], "WORK.md")
 
-    def test_tasks_configure_reports_codex_first_policy_with_both_agents(
+    def test_tasks_configure_uses_codex_first_policy_with_both_agents(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -501,10 +804,10 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
-            write_python_executable(
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
                 bin_dir / "codex",
-                "from pathlib import Path\n"
-                "Path('codex-should-not-run').write_text('ran', encoding='utf-8')\n",
+                generated_profile_payload("WORK.md"),
             )
             write_python_executable(
                 bin_dir / "claude",
@@ -522,8 +825,9 @@ class CliTests(unittest.TestCase):
 
             payload = json.loads(stdout.getvalue())
 
-        self.assertEqual(exit_code, 2)
+        self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "profile")
         self.assertEqual(payload["agent"]["command_source"], "auto:codex:codex-first")
         self.assertEqual(
             payload["agent"]["selection_command_source"],
@@ -531,7 +835,6 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(payload["agent"]["default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent"]["default_policy"])
-        self.assertFalse((repo / "codex-should-not-run").exists())
         self.assertFalse((repo / "claude-should-not-run").exists())
 
     def test_tasks_configure_text_reports_detected_agent_state(self) -> None:
@@ -540,7 +843,19 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
-            write_python_executable(bin_dir / "claude", "raise SystemExit(0)\n")
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "claude",
+                {
+                    "status": "unavailable",
+                    "confidence": None,
+                    "degradation": {
+                        "reason": "no_tasks",
+                        "message": "no task source found",
+                        "next_action": "add a task source",
+                    },
+                },
+            )
             stdout = StringIO()
             stderr = StringIO()
 
@@ -550,10 +865,1245 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertEqual(stderr.getvalue(), "")
+        self.assertIn("tasks configure: cache status=unavailable", stdout.getvalue())
         self.assertIn("detected agents: claude=", stdout.getvalue())
         self.assertIn("agent default policy source: codex-first", stdout.getvalue())
         self.assertIn("agent default policy:", stdout.getvalue())
         self.assertIn("agent.command source: auto:claude", stdout.getvalue())
+        self.assertIn("no_tasks: no task source found", stdout.getvalue())
+
+    def test_tasks_configure_degrades_malformed_agent_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(bin_dir / "codex", "not-json")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "rejected")
+        self.assertEqual(cache["status"], "rejected")
+        self.assertEqual(cache["degradation"]["reason"], "malformed_json")
+
+    def test_tasks_configure_rejects_non_finite_json_constants(self) -> None:
+        constants = [
+            (
+                "confidence",
+                (
+                    '{"status":"profile","confidence":NaN,'
+                    '"profile":{"kind":"markdown_table","source_paths":["WORK.md"],'
+                    '"stable_ids":true,"fields":{"id":{"column":"Key"},'
+                    '"title":{"column":"Summary"},"status":{"column":"State"}},'
+                    '"status_map":{"done":["Done"],"runnable":["Todo"]}}}'
+                ),
+            ),
+            (
+                "nested_profile",
+                (
+                    '{"status":"profile","confidence":0.9,'
+                    '"profile":{"kind":"markdown_table","source_paths":["WORK.md"],'
+                    '"stable_ids":true,"fields":{"id":{"column":NaN},'
+                    '"title":{"column":"Summary"},"status":{"column":"State"}},'
+                    '"status_map":{"done":["Done"],"runnable":["Todo"]}}}'
+                ),
+            ),
+        ]
+        for name, raw_payload in constants:
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory) / "repo"
+                    bin_dir = Path(directory) / "bin"
+                    repo.mkdir()
+                    bin_dir.mkdir()
+                    (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+                    write_configure_agent(bin_dir / "codex", raw_payload)
+                    stdout = StringIO()
+                    stderr = StringIO()
+
+                    with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            exit_code = main(
+                                [
+                                    "tasks",
+                                    "configure",
+                                    "--repo",
+                                    str(repo),
+                                    "--json",
+                                ]
+                            )
+
+                    payload = json.loads(stdout.getvalue())
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(payload["status"], "rejected")
+                self.assertEqual(
+                    payload["cache"]["degradation"]["reason"], "malformed_json"
+                )
+                self.assertIn("non-finite", payload["cache"]["degradation"]["message"])
+
+    def test_tasks_configure_rejects_executable_profile_directives(self) -> None:
+        cases = [
+            (
+                "unsupported_profile_key",
+                generated_profile_payload(
+                    "WORK.md",
+                    profile_extra={"extractor": "bash -c 'echo task'"},
+                ),
+            ),
+            (
+                "unsupported_field_mapping_key",
+                generated_profile_payload(
+                    "WORK.md",
+                    field_extra={"id": {"run": "python collect_tasks.py"}},
+                ),
+            ),
+            (
+                "invalid_field_mapping_value",
+                generated_profile_payload(
+                    "WORK.md",
+                    field_extra={"id": {"strategy": "python collect_tasks.py"}},
+                ),
+            ),
+        ]
+        for expected_reason, agent_payload in cases:
+            with self.subTest(expected_reason=expected_reason):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory) / "repo"
+                    bin_dir = Path(directory) / "bin"
+                    repo.mkdir()
+                    bin_dir.mkdir()
+                    (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+                    write_configure_agent(bin_dir / "codex", agent_payload)
+                    stdout = StringIO()
+                    stderr = StringIO()
+
+                    with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            exit_code = main(
+                                [
+                                    "tasks",
+                                    "configure",
+                                    "--repo",
+                                    str(repo),
+                                    "--json",
+                                ]
+                            )
+
+                    payload = json.loads(stdout.getvalue())
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(payload["status"], "rejected")
+                self.assertEqual(
+                    payload["cache"]["degradation"]["reason"], expected_reason
+                )
+
+    def test_doctor_reports_generated_cache_disabled_by_explicit_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nplan_path = "PLAN.md"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            payload["generated_task_profile"]["status"],
+            "disabled_by_explicit_task_source",
+        )
+        self.assertEqual(
+            payload["generated_task_profile"]["explicit_source_keys"], ["plan_path"]
+        )
+        self.assertIn(
+            "fix the explicit task_source",
+            payload["generated_task_profile"]["next_action"],
+        )
+
+    def test_read_only_source_errors_report_generated_cache_disabled_by_explicit_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nplan_path = "MISSING.md"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("disabled_by_explicit_task_source", stderr.getvalue())
+        self.assertIn("fix the explicit task_source", stderr.getvalue())
+
+    def test_tasks_configure_degrades_low_confidence_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload("WORK.md", confidence=0.2),
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "low_confidence")
+        self.assertEqual(payload["cache"]["profile"]["source_paths"], ["WORK.md"])
+
+    def test_tasks_configure_writes_planning_cache_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            (repo / "script.py").write_text("print('skip me')\n", encoding="utf-8")
+            agent_payload = generated_profile_payload("WORK.md", confidence=0.44)
+            agent_payload["status"] = "planning_only"
+            agent_payload["profile"].pop("status_map")
+            agent_payload["degradation"] = {
+                "reason": "ambiguous_format",
+                "message": "work items exist but status policy is unclear",
+                "next_action": "choose a status policy",
+                "missing_inputs": ["status mapping", "stable done states"],
+                "proposed_config": {
+                    "task_source": {
+                        "type": "markdown-profile",
+                        "profile": agent_payload["profile"],
+                    }
+                },
+                "candidate_sources": [{"path": "WORK.md", "format": "table"}],
+                "questions": ["Which states are runnable?"],
+            }
+            original_work = (repo / "WORK.md").read_text(encoding="utf-8")
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+                doctor_stdout = StringIO()
+                doctor_stderr = StringIO()
+                with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            final_work = (repo / "WORK.md").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(cache["status"], "planning_only")
+        self.assertEqual(cache["profile"]["source_paths"], ["WORK.md"])
+        self.assertEqual(cache["source_fingerprints"][0]["path"], "WORK.md")
+        self.assertEqual(cache["degradation"]["reason"], "ambiguous_format")
+        self.assertEqual(
+            cache["degradation"]["missing_inputs"],
+            ["status mapping", "stable done states"],
+        )
+        self.assertEqual(
+            cache["degradation"]["proposed_config"]["task_source"]["type"],
+            "markdown-profile",
+        )
+        self.assertEqual(
+            cache["degradation"]["candidate_sources"],
+            [{"path": "WORK.md", "format": "table"}],
+        )
+        self.assertEqual(
+            cache["degradation"]["questions"], ["Which states are runnable?"]
+        )
+        self.assertIn(
+            ("script.py", "unsupported_file_type"),
+            {
+                (item["path"], item["reason"])
+                for item in cache["provenance"]["skipped_evidence"]
+            },
+        )
+        self.assertEqual(final_work, original_work)
+        report = doctor_payload["generated_task_profile"]
+        self.assertEqual(report["origin"], "planning_only_cache")
+        self.assertTrue(report["fresh"])
+        self.assertEqual(
+            report["missing_inputs"], ["status mapping", "stable done states"]
+        )
+        self.assertEqual(
+            report["proposed_config"]["task_source"]["type"],
+            "markdown-profile",
+        )
+        self.assertIn(
+            {"path": "script.py", "reason": "unsupported_file_type"},
+            report["skipped_evidence"],
+        )
+
+    def test_tasks_configure_without_agent_writes_unavailable_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            (repo / ".env").write_text("TOKEN=secret\n", encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(cache["degradation"]["reason"], "agent_unavailable")
+        self.assertEqual(
+            cache["degradation"]["missing_inputs"], ["agent.selection_command"]
+        )
+        self.assertEqual(cache["source_fingerprints"][0]["path"], "WORK.md")
+        self.assertIn(
+            (".env", "secret_path"),
+            {
+                (item["path"], item["reason"])
+                for item in cache["provenance"]["skipped_evidence"]
+            },
+        )
+
+    def test_tasks_configure_without_agent_reports_no_collected_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "TODO.md").write_text(
+                "x" * (2 * 1024 * 1024 + 1),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+            cache = json.loads(
+                (repo / ".vibe-loop" / "generated-task-source.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "unavailable")
+        self.assertEqual(cache["source_fingerprints"], [])
+        self.assertEqual(
+            cache["degradation"]["missing_inputs"],
+            ["agent.selection_command", "repo-local task source evidence"],
+        )
+        self.assertIn(
+            ("TODO.md", "file_too_large"),
+            {
+                (item["path"], item["reason"])
+                for item in cache["provenance"]["skipped_evidence"]
+            },
+        )
+
+    def test_read_only_reuses_fresh_unavailable_cache_without_running_agent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(configure_exit, 2)
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "generated task-source cache status=unavailable", stderr.getvalue()
+        )
+        self.assertIn("agent_unavailable", stderr.getvalue())
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_read_only_no_cache_reports_configure_diagnostic_without_agent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    list_exit = main(["tasks", "list", "--repo", str(repo)])
+                doctor_stdout = StringIO()
+                doctor_stderr = StringIO()
+                with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("generated task-source cache status=missing", stderr.getvalue())
+        self.assertIn("origin=no_usable_source", stderr.getvalue())
+        self.assertIn("tasks configure", stderr.getvalue())
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertFalse(doctor_payload["task_source_runtime"]["usable"])
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_doctor_marks_unavailable_cache_stale_when_new_evidence_appears(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            (repo / "TODO.md").write_text("new task evidence\n", encoding="utf-8")
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(configure_exit, 2)
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        report = payload["generated_task_profile"]
+        self.assertEqual(report["status"], "unavailable")
+        self.assertEqual(report["origin"], "stale_generated_cache")
+        self.assertFalse(report["fresh"])
+        self.assertIn("TODO.md is new bounded evidence", report["stale_reasons"])
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_tasks_configure_profiles_missing_status_map_are_planning_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            agent_payload = generated_profile_payload("WORK.md")
+            agent_payload["profile"].pop("status_map")
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "unmapped_statuses")
+        self.assertEqual(
+            payload["cache"]["degradation"]["missing_inputs"],
+            ["status mapping for runnable and done tasks"],
+        )
+
+    def test_tasks_configure_empty_required_status_maps_are_planning_only(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            agent_payload = generated_profile_payload(
+                "WORK.md",
+                status_map_extra={"done": [], "runnable": []},
+            )
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "unmapped_statuses")
+        self.assertEqual(payload["cache"]["profile"]["source_paths"], ["WORK.md"])
+
+    def test_tasks_configure_unstable_ids_are_planning_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload(
+                    "WORK.md",
+                    profile_extra={"stable_ids": False},
+                ),
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "planning_only")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "unstable_ids")
+        self.assertEqual(
+            payload["cache"]["degradation"]["missing_inputs"],
+            ["stable task identifiers"],
+        )
+
+    def test_tasks_configure_missing_degradation_object_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(bin_dir / "codex", {"status": "needs_input"})
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "needs_input")
+        self.assertEqual(payload["cache"]["degradation"]["reason"], "needs_input")
+        self.assertEqual(
+            payload["cache"]["degradation"]["message"],
+            "agent returned needs_input without a degradation object",
+        )
+
+    def test_doctor_reports_stale_generated_cache_without_running_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            work_path = repo / "WORK.md"
+            work_path.write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload("WORK.md"),
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            work_path.write_text(WORK_TABLE + "\nchanged\n", encoding="utf-8")
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        report = payload["generated_task_profile"]
+        self.assertEqual(report["status"], "profile")
+        self.assertEqual(report["origin"], "stale_generated_cache")
+        self.assertFalse(report["fresh"])
+        self.assertIn("WORK.md changed", report["stale_reasons"][0])
+        self.assertIn("generated cache is stale", report["diagnostics"][0])
+        self.assertIn("tasks configure", report["next_action"])
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_tasks_configure_rejects_unsupported_and_incomplete_profiles(
+        self,
+    ) -> None:
+        cases = [
+            (
+                "unsupported_profile_kind",
+                generated_profile_payload("WORK.md", kind="json_query"),
+            ),
+            (
+                "incomplete_fields",
+                generated_profile_payload("WORK.md", include_title=False),
+            ),
+            (
+                "invalid_field_mapping_value",
+                generated_profile_payload("WORK.md", empty_title_column=True),
+            ),
+            (
+                "invalid_field_mapping_value",
+                {
+                    "status": "profile",
+                    "confidence": 0.86,
+                    "profile": {
+                        "kind": "markdown_headings",
+                        "source_paths": ["WORK.md"],
+                        "stable_ids": True,
+                        "fields": {
+                            "id": {"strategy": "label_value"},
+                            "title": {"strategy": "heading_text"},
+                            "status": {"label": "State"},
+                        },
+                        "status_map": {
+                            "done": ["Done"],
+                            "runnable": ["Todo"],
+                        },
+                    },
+                },
+            ),
+            (
+                "unknown_field_column",
+                generated_profile_payload("WORK.md", title_column="Missing"),
+            ),
+            (
+                "unknown_field_column",
+                generated_profile_payload("WORK.md", title_column="Todo"),
+            ),
+            (
+                "invalid_field_mapping",
+                generated_profile_payload(
+                    "WORK.md",
+                    field_extra={"priority": "Priority"},
+                ),
+            ),
+            (
+                "incomplete_status_map",
+                generated_profile_payload(
+                    "WORK.md", status_map_extra={"blocked": "Blocked"}
+                ),
+            ),
+        ]
+        for expected_reason, agent_payload in cases:
+            with self.subTest(expected_reason=expected_reason):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory) / "repo"
+                    bin_dir = Path(directory) / "bin"
+                    repo.mkdir()
+                    bin_dir.mkdir()
+                    (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+                    write_configure_agent(bin_dir / "codex", agent_payload)
+                    stdout = StringIO()
+                    stderr = StringIO()
+
+                    with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                        with redirect_stdout(stdout), redirect_stderr(stderr):
+                            exit_code = main(
+                                [
+                                    "tasks",
+                                    "configure",
+                                    "--repo",
+                                    str(repo),
+                                    "--json",
+                                ]
+                            )
+
+                    payload = json.loads(stdout.getvalue())
+
+                self.assertEqual(exit_code, 2)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(payload["status"], "rejected")
+                self.assertEqual(
+                    payload["cache"]["degradation"]["reason"], expected_reason
+                )
+
+    def test_read_only_task_commands_report_cache_without_running_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload("WORK.md"),
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+
+            results: dict[str, tuple[int, str, str]] = {}
+            commands = {
+                "tasks-list": ["tasks", "list", "--repo", str(repo)],
+                "tasks-runnable": ["tasks", "runnable", "--repo", str(repo)],
+                "next": ["next", "--repo", str(repo)],
+                "doctor": ["doctor", "--repo", str(repo)],
+            }
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                for name, command in commands.items():
+                    stdout = StringIO()
+                    stderr = StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        exit_code = main(command)
+                    results[name] = (
+                        exit_code,
+                        stdout.getvalue(),
+                        stderr.getvalue(),
+                    )
+
+            doctor_payload = json.loads(results["doctor"][1])
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(results["tasks-list"][0], 0)
+        self.assertIn("DISC-X", results["tasks-list"][1])
+        self.assertIn("task discovery source=generated_cache", results["tasks-list"][2])
+        self.assertEqual(results["tasks-runnable"][0], 0)
+        self.assertIn("DISC-X", results["tasks-runnable"][1])
+        self.assertIn(
+            "task discovery source=generated_cache",
+            results["tasks-runnable"][2],
+        )
+        self.assertEqual(results["next"][0], 0)
+        self.assertEqual(results["next"][1].strip(), "DISC-X")
+        self.assertIn("task discovery source=generated_cache", results["next"][2])
+        self.assertEqual(results["doctor"][0], 0)
+        self.assertEqual(results["doctor"][2], "")
+        self.assertEqual(doctor_payload["generated_task_profile"]["status"], "profile")
+        self.assertEqual(
+            doctor_payload["task_source_runtime"]["origin"], "generated_cache"
+        )
+        self.assertTrue(doctor_payload["task_source_runtime"]["usable"])
+        self.assertEqual(
+            doctor_payload["generated_task_profile"]["next_action"],
+            "generated cache is active for runtime task discovery",
+        )
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_read_only_task_success_reports_degraded_cache_without_running_agent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            agent_payload = generated_profile_payload("WORK.md", confidence=0.44)
+            agent_payload["status"] = "planning_only"
+            agent_payload["degradation"] = {
+                "reason": "low_confidence",
+                "message": "agent was unsure",
+                "next_action": "rerun tasks configure",
+            }
+            write_configure_agent(
+                bin_dir / "codex",
+                agent_payload,
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+
+            results: dict[str, tuple[int, str, str]] = {}
+            commands = {
+                "tasks-list": ["tasks", "list", "--repo", str(repo)],
+                "tasks-runnable": ["tasks", "runnable", "--repo", str(repo)],
+                "next": ["next", "--repo", str(repo)],
+            }
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                for name, command in commands.items():
+                    stdout = StringIO()
+                    stderr = StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        exit_code = main(command)
+                    results[name] = (
+                        exit_code,
+                        stdout.getvalue(),
+                        stderr.getvalue(),
+                    )
+
+        self.assertEqual(configure_exit, 2)
+        self.assertEqual(results["tasks-list"][0], 0)
+        self.assertIn("TASK-01", results["tasks-list"][1])
+        self.assertIn(
+            "generated task-source cache status=planning_only",
+            results["tasks-list"][2],
+        )
+        self.assertIn(
+            "task discovery source=default_markdown_discovery",
+            results["tasks-list"][2],
+        )
+        self.assertEqual(results["tasks-runnable"][0], 0)
+        self.assertIn(
+            "generated task-source cache status=planning_only",
+            results["tasks-runnable"][2],
+        )
+        self.assertEqual(results["next"][0], 0)
+        self.assertEqual(results["next"][1].strip(), "TASK-01")
+        self.assertIn("low_confidence: agent was unsure", results["next"][2])
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_stale_generated_cache_blocks_default_plan_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            work_path = repo / "WORK.md"
+            work_path.write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload("WORK.md"),
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            work_path.write_text(WORK_TABLE + "\nchanged\n", encoding="utf-8")
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('should-not-run').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("stale_generated_cache", stderr.getvalue())
+        self.assertIn("generated cache is stale", stderr.getvalue())
+        self.assertIn("tasks configure", stderr.getvalue())
+        self.assertFalse((repo / "should-not-run").exists())
+
+    def test_invalid_generated_cache_blocks_default_plan_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            state_dir = repo / ".vibe-loop"
+            repo.mkdir()
+            state_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            cache = generated_profile_cache("WORK.md")
+            cache["status"] = "unsupported"
+            (state_dir / "generated-task-source.json").write_text(
+                json.dumps(cache),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("unsupported generated cache status", stderr.getvalue())
+        self.assertIn("origin=invalid_generated_cache", stderr.getvalue())
+
+    def test_generated_cache_with_invalid_parser_profile_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            agent_payload = generated_profile_payload(
+                "WORK.md",
+                field_extra={"id": {"pattern": "["}},
+            )
+            write_configure_agent(bin_dir / "codex", agent_payload)
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("generated profile cannot parse task source", stderr.getvalue())
+        self.assertIn("origin=invalid_generated_cache", stderr.getvalue())
+        self.assertIn("tasks configure", stderr.getvalue())
+        self.assertNotIn(
+            "generated cache is active for runtime task discovery",
+            stderr.getvalue(),
+        )
+
+    def test_generated_cache_rejects_invalid_source_path_before_parser(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            state_dir = repo / ".vibe-loop"
+            outside_dir = Path(directory) / "outside"
+            repo.mkdir()
+            bin_dir.mkdir()
+            outside_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload("WORK.md"),
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            cache_path = state_dir / "generated-task-source.json"
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            profile = cache["profile"]
+            assert isinstance(profile, dict)
+            profile["source_paths"] = [str(outside_dir)]
+            cache_path.write_text(
+                json.dumps(cache),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("invalid_source_path", stderr.getvalue())
+        self.assertNotIn(
+            "generated profile cannot parse task source", stderr.getvalue()
+        )
+
+    def test_empty_generated_source_fingerprints_are_stale_for_profile(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            state_dir = repo / ".vibe-loop"
+            repo.mkdir()
+            state_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "WORK.md").write_text(WORK_TABLE, encoding="utf-8")
+            cache = generated_profile_cache("WORK.md")
+            cache["source_fingerprints"] = []
+            (state_dir / "generated-task-source.json").write_text(
+                json.dumps(cache),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                list_exit = main(["tasks", "list", "--repo", str(repo)])
+
+        self.assertEqual(list_exit, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "source_fingerprints is empty for generated profile source paths",
+            stderr.getvalue(),
+        )
+
+    def test_explicit_task_source_config_ignores_generated_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            state_dir = repo / ".vibe-loop"
+            repo.mkdir()
+            state_dir.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nplan_path = "PLAN.md"\n',
+                encoding="utf-8",
+            )
+            stale_cache = generated_profile_cache("WORK.md")
+            (state_dir / "generated-task-source.json").write_text(
+                json.dumps(stale_cache),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                list_exit = main(["tasks", "list", "--repo", str(repo)])
+            doctor_stdout = StringIO()
+            doctor_stderr = StringIO()
+            with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+
+        self.assertEqual(list_exit, 0)
+        self.assertIn("TASK-01", stdout.getvalue())
+        self.assertIn("task discovery source=explicit_config", stderr.getvalue())
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(
+            doctor_payload["task_source_runtime"]["origin"], "explicit_config"
+        )
+        self.assertTrue(doctor_payload["task_source_runtime"]["usable"])
+
+    def test_command_task_source_reports_command_output_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'CMD-01','title':'Command task',"
+                "'status':'Next','dependencies':[]}]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nlist = "python list_tasks.py"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                list_exit = main(["tasks", "list", "--repo", str(repo)])
+            doctor_stdout = StringIO()
+            doctor_stderr = StringIO()
+            with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+
+        self.assertEqual(list_exit, 0)
+        self.assertIn("CMD-01", stdout.getvalue())
+        self.assertIn("task discovery source=command_output", stderr.getvalue())
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(
+            doctor_payload["task_source_runtime"]["origin"], "command_output"
+        )
+        self.assertTrue(doctor_payload["task_source_runtime"]["usable"])
+
+    def test_doctor_reports_command_adapter_missing_list_as_unusable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nnext = "python next_task.py"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                doctor_exit = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["task_source_runtime"]["origin"], "command_output")
+        self.assertFalse(payload["task_source_runtime"]["usable"])
+        self.assertIn(
+            "command task source requires task_source.list",
+            payload["task_source_runtime"]["diagnostics"][0],
+        )
+
+    def test_report_writes_worker_report_without_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--status",
+                        "blocked",
+                        "--commit",
+                        "abc123",
+                        "--message",
+                        "waiting on dependency",
+                        "--metadata-json",
+                        '{"reason":"external"}',
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["run_id"], "run-1")
+        self.assertEqual(payload["task_id"], "TASK-01")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["commit"], "abc123")
+        self.assertEqual(payload["metadata"], {"reason": "external"})
+        self.assertEqual(records[0]["record_type"], "worker_report")
+        self.assertEqual(records[0]["status"], "blocked")
 
     def test_run_next_keeps_json_stdout_when_agent_streams_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -592,6 +2142,172 @@ class CliTests(unittest.TestCase):
         self.assertIn("[vibe-loop] session_id_source=fallback:run_id", log_text)
         self.assertIn("agent out", log_text)
         self.assertIn("agent err", log_text)
+
+    def test_run_next_prefers_worker_report_over_task_probe_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[3])\n"
+                "from vibe_loop.cli import main\n"
+                "report_exit = main([\n"
+                "        'report',\n"
+                "        '--repo', '.',\n"
+                "        '--run-id', sys.argv[1],\n"
+                "        '--task-id', sys.argv[2],\n"
+                "        '--status', 'completed',\n"
+                "        '--commit', 'reported-commit',\n"
+                "        '--message', 'explicit worker result',\n"
+                "        '--metadata-json', '{\"source\":\"agent\"}',\n"
+                "])\n"
+                "raise SystemExit(7 if report_exit == 0 else report_exit)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{run_id}} {{task_id}} {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(payload["exit_code"], 7)
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["worker_report"]["status"], "completed")
+        self.assertEqual(payload["worker_report"]["commit"], "reported-commit")
+        self.assertEqual(payload["worker_report"]["metadata"], {"source": "agent"})
+        self.assertEqual(records[0]["record_type"], "worker_report")
+        self.assertEqual(records[1]["record_type"], "run_result")
+        self.assertEqual(records[1]["classification_source"], "worker_report")
+        self.assertIn("worker report status=completed", log_text)
+        self.assertIn("reported-commit", log_text)
+
+    def test_run_next_skips_completion_checks_after_worker_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[3])\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main([\n"
+                "        'report',\n"
+                "        '--repo', '.',\n"
+                "        '--run-id', sys.argv[1],\n"
+                "        '--task-id', sys.argv[2],\n"
+                "        '--status', 'blocked',\n"
+                "        '--message', 'blocked by dependency',\n"
+                "    ])\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / "completion.py").write_text(
+                "from pathlib import Path\n"
+                "Path('completion-ran').write_text('ran', encoding='utf-8')\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{run_id}} {{task_id}} {source_path}"
+            completion_command = f"{sys.executable} completion.py"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = "
+                + json.dumps(command)
+                + "\n[completion]\ncommands = ["
+                + json.dumps(completion_command)
+                + "]\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["classification"], "blocked")
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["message"], "")
+        self.assertFalse((repo / "completion-ran").exists())
+
+    def test_run_next_records_active_worker_metadata_in_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import time\n"
+                "metadata = {}\n"
+                "for _ in range(100):\n"
+                "    locks = list(Path('.vibe-loop/locks').glob('*.lock/lock.json'))\n"
+                "    if locks:\n"
+                "        metadata = json.loads(locks[0].read_text(encoding='utf-8'))\n"
+                "        if metadata.get('worker_pid'):\n"
+                "            break\n"
+                "    time.sleep(0.01)\n"
+                "Path('active-worker.json').write_text(\n"
+                "    json.dumps(metadata),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "python agent.py"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            metadata = json.loads(
+                (repo / "active-worker.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(metadata["record_type"], "active_run")
+        self.assertEqual(metadata["task_id"], "TASK-01")
+        self.assertEqual(metadata["run_id"], payload["run_id"])
+        self.assertEqual(metadata["log"], payload["log"])
+        self.assertEqual(metadata["command"], "python agent.py")
+        self.assertIsInstance(metadata["worker_pid"], int)
+        self.assertEqual(metadata["pid"], metadata["worker_pid"])
+        self.assertEqual(metadata["pid_source"], "popen")
+        self.assertEqual(metadata["pid_scope"], "configured_command_process")
+        self.assertIsInstance(metadata["supervisor_pid"], int)
+        self.assertIn("base_main", metadata)
 
     def test_run_next_captures_explicit_worker_session_id_from_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -762,6 +2478,231 @@ class CliTests(unittest.TestCase):
         self.assertEqual("", stdout.getvalue())
         self.assertIn("no runnable tasks", stderr.getvalue())
 
+    def test_main_integration_cli_allows_one_holder_and_blocks_waiter(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-holder",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            holder_stdout = StringIO()
+            holder_stderr = StringIO()
+            waiter_stdout = StringIO()
+            waiter_stderr = StringIO()
+            status_stdout = StringIO()
+            status_stderr = StringIO()
+            release_stdout = StringIO()
+            release_stderr = StringIO()
+
+            with redirect_stdout(holder_stdout), redirect_stderr(holder_stderr):
+                holder_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+            with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
+                waiter_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-waiter",
+                        "--task-id",
+                        "TASK-02",
+                        "--json",
+                    ]
+                )
+            with redirect_stdout(status_stdout), redirect_stderr(status_stderr):
+                status_exit = main(
+                    ["main-integration", "status", "--repo", str(repo), "--json"]
+                )
+            with redirect_stdout(release_stdout), redirect_stderr(release_stderr):
+                release_exit = main(
+                    [
+                        "main-integration",
+                        "release",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            holder = json.loads(holder_stdout.getvalue())
+            waiter = json.loads(waiter_stdout.getvalue())
+            status = json.loads(status_stdout.getvalue())
+            release = json.loads(release_stdout.getvalue())
+
+        self.assertEqual(holder_exit, 0)
+        self.assertEqual(holder_stderr.getvalue(), "")
+        self.assertTrue(holder["acquired"])
+        self.assertEqual(holder["status"]["state"], "held")
+        self.assertEqual(holder["status"]["owner_task_id"], "TASK-01")
+        self.assertEqual(holder["status"]["run_id"], "run-holder")
+        self.assertEqual(holder["status"]["pid"], os.getpid())
+        self.assertEqual(holder["status"]["pid_source"], "active_task_lock:worker_pid")
+        self.assertEqual(waiter_exit, 1)
+        self.assertEqual(waiter_stderr.getvalue(), "")
+        self.assertFalse(waiter["acquired"])
+        self.assertEqual(waiter["status"]["state"], "held")
+        self.assertEqual(waiter["status"]["owner_task_id"], "TASK-01")
+        self.assertEqual(waiter["status"]["run_id"], "run-holder")
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(status_stderr.getvalue(), "")
+        self.assertTrue(status["locked"])
+        self.assertEqual(status["owner_task_id"], "TASK-01")
+        self.assertEqual(release_exit, 0)
+        self.assertEqual(release_stderr.getvalue(), "")
+        self.assertTrue(release["released"])
+        self.assertFalse(release["status"]["locked"])
+
+    def test_main_integration_acquire_requires_pid_or_active_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                    ]
+                )
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("active task lock", stderr.getvalue())
+        self.assertFalse(lock_exists)
+
+    def test_main_integration_parent_json_flag_returns_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    ["main-integration", "--json", "status", "--repo", str(repo)]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["locked"])
+        self.assertEqual(payload["state"], "available")
+
+    def test_main_integration_subprocess_acquire_uses_active_worker_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-holder",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            cli_script = (
+                "import sys; "
+                f"sys.path.insert(0, {str(source_path)!r}); "
+                "from vibe_loop.cli import main; "
+                "raise SystemExit(main(sys.argv[1:]))"
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    cli_script,
+                    "main-integration",
+                    "acquire",
+                    "--repo",
+                    str(repo),
+                    "--run-id",
+                    "run-holder",
+                    "--task-id",
+                    "TASK-01",
+                    "--json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            status_stdout = StringIO()
+            status_stderr = StringIO()
+            with redirect_stdout(status_stdout), redirect_stderr(status_stderr):
+                status_exit = main(
+                    ["main-integration", "status", "--repo", str(repo), "--json"]
+                )
+
+            acquired = json.loads(result.stdout)
+            status = json.loads(status_stdout.getvalue())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(status_stderr.getvalue(), "")
+        self.assertEqual(acquired["status"]["pid"], os.getpid())
+        self.assertEqual(
+            acquired["status"]["pid_source"],
+            "active_task_lock:worker_pid",
+        )
+        self.assertEqual(status["state"], "held")
+        self.assertEqual(status["process_state"], "running")
+        self.assertIsNone(status["stale_reason"])
+
     def test_tasks_locks_does_not_require_plan_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -775,10 +2716,194 @@ class CliTests(unittest.TestCase):
         self.assertEqual("", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
 
+    def test_workers_reports_running_and_missing_processes_without_plan_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            running_lock = lock_root / "TASK-01.lock"
+            missing_lock = lock_root / "TASK-02.lock"
+            running_lock.mkdir(parents=True)
+            missing_lock.mkdir()
+            (running_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "pid_scope": "configured_command_process",
+                        "supervisor_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "abc123",
+                        "command": "python worker.py",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (missing_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-02",
+                        "run_id": "run-2",
+                        "pid": 999999999,
+                        "worker_pid": 999999999,
+                        "supervisor_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:01:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-2.log"),
+                        "base_main": "abc123",
+                        "command": "python worker.py",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["workers", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload[0]["task_id"], "TASK-01")
+        self.assertEqual(payload[0]["state"], "running")
+        self.assertEqual(payload[0]["process_state"], "running")
+        self.assertEqual(payload[0]["command"], "python worker.py")
+        self.assertEqual(payload[0]["pid_source"], "popen")
+        self.assertEqual(payload[0]["pid_scope"], "configured_command_process")
+        self.assertEqual(payload[1]["task_id"], "TASK-02")
+        self.assertEqual(payload[1]["state"], "stale")
+        self.assertEqual(payload[1]["process_state"], "missing")
+        self.assertEqual(payload[1]["stale_reason"], "missing_process")
+
+    def test_workers_text_does_not_require_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["workers", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual("", stdout.getvalue())
+        self.assertEqual("", stderr.getvalue())
+
 
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)
+
+
+def write_configure_agent(path: Path, payload: object) -> None:
+    if isinstance(payload, str):
+        emit = f"print({payload!r})\n"
+    else:
+        emit = f"print(json.dumps({payload!r}))\n"
+    write_python_executable(
+        path,
+        "from pathlib import Path\n"
+        "import json\n"
+        "import sys\n"
+        "if sys.argv[1] not in {'exec', '-p'}:\n"
+        "    raise SystemExit(64)\n"
+        "Path('configure-prompt.json').write_text(sys.argv[2], encoding='utf-8')\n"
+        f"{emit}",
+    )
+
+
+def generated_profile_payload(
+    source_path: str,
+    *,
+    confidence: float = 0.86,
+    kind: str = "markdown_table",
+    include_title: bool = True,
+    title_column: str = "Summary",
+    empty_title_column: bool = False,
+    profile_extra: dict[str, object] | None = None,
+    field_extra: dict[str, object] | None = None,
+    status_map_extra: dict[str, object] | None = None,
+) -> dict[str, object]:
+    fields: dict[str, object] = {
+        "id": {"column": "Key"},
+        "status": {"column": "State"},
+    }
+    if include_title:
+        fields["title"] = {"column": "" if empty_title_column else title_column}
+    for field_name, extra in (field_extra or {}).items():
+        if not isinstance(extra, dict):
+            fields[field_name] = extra
+            continue
+        mapping = fields.setdefault(field_name, {})
+        assert isinstance(mapping, dict)
+        mapping.update(extra)
+    status_map: dict[str, object] = {
+        "done": ["Done"],
+        "runnable": ["Todo"],
+        "blocked": ["Blocked"],
+    }
+    status_map.update(status_map_extra or {})
+    profile = {
+        "kind": kind,
+        "source_paths": [source_path],
+        "stable_ids": True,
+        "fields": fields,
+        "status_map": status_map,
+    }
+    profile.update(profile_extra or {})
+    return {
+        "status": "profile",
+        "confidence": confidence,
+        "profile": profile,
+    }
+
+
+def generated_profile_cache(source_path: str) -> dict[str, object]:
+    payload = generated_profile_payload(source_path)
+    return {
+        "schema_version": 1,
+        "prompt_version": 1,
+        "status": "profile",
+        "generated_at": "2026-05-08T00:00:00Z",
+        "agent": {
+            "name": "codex",
+            "selection_command_source": "auto:codex",
+        },
+        "confidence": payload["confidence"],
+        "provenance": {
+            "repo": ".",
+            "evidence_limit": {
+                "max_file_bytes": 1,
+                "max_total_bytes": 1,
+                "max_files": 1,
+                "max_skipped_entries": 1,
+            },
+            "evidence_file_count": 1,
+            "skipped_evidence": [],
+        },
+        "source_fingerprints": [
+            {
+                "path": source_path,
+                "size": 1,
+                "sha256": "0" * 64,
+                "mtime_ns": 0,
+                "redacted": False,
+            }
+        ],
+        "profile": payload["profile"],
+        "degradation": None,
+    }
 
 
 def write_fake_git(bin_dir: Path) -> None:

@@ -1,0 +1,41 @@
+{
+  "suite_id": "local-demo-v1",
+  "case_id": "locked-task-selection",
+  "workflow_trace": {
+    "required": [
+      "skill_activated",
+      "task_source_inspected",
+      "worktree_state_inspected",
+      "branch_or_worktree_created",
+      "verification_ran",
+      "review_requested",
+      "commit_created"
+    ],
+    "forbidden": ["unsafe_git_command", "unnecessary_user_prompt"]
+  },
+  "checks": [
+    {
+      "id": "unit-tests",
+      "kind": "unittest"
+    },
+    {
+      "id": "locked-task-preserved",
+      "kind": "json_field_equals",
+      "path": ".vibe-loop/locks/SEL-01.lock/lock.json",
+      "field": "task_id",
+      "equals": "SEL-01"
+    },
+    {
+      "id": "selected-plan-row-completed",
+      "kind": "plan_status",
+      "task_id": "SEL-02",
+      "status": "Done"
+    },
+    {
+      "id": "dependent-plan-row-untouched",
+      "kind": "plan_status",
+      "task_id": "SEL-03",
+      "status": "Planned"
+    }
+  ]
+}

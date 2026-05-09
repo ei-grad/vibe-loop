@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "finite-py-plan-table",
+  "title": "Finite Python plan-table slice",
+  "task_id": "FPY-01",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop"],
+  "budget": {
+    "timeout_seconds": 1200,
+    "max_commands": 60,
+    "max_output_bytes": 5242880,
+    "network": false
+  },
+  "expected_artifact_roles": [
+    "prompt",
+    "run_log",
+    "transcript",
+    "diff",
+    "final_repo_state",
+    "structured_result",
+    "grader_outputs",
+    "git_state_before",
+    "git_state_after",
+    "test_results",
+    "workflow_events"
+  ],
+  "task_source": {
+    "type": "markdown-plan",
+    "plan_path": "PLAN.md"
+  }
+}

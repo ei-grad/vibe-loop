@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "description": "Small deterministic repositories for bundled vibe-loop skill evaluations.",
+  "cases": [
+    {
+      "case_id": "dirty-main-worktree",
+      "positive": true,
+      "primary_coverage": ["worktree discipline", "unrelated change preservation"]
+    },
+    {
+      "case_id": "finite-py-plan-table",
+      "positive": true,
+      "primary_coverage": ["finite slice execution", "plan table parsing", "main integration"]
+    },
+    {
+      "case_id": "generated-roadmap-profile",
+      "positive": true,
+      "primary_coverage": ["generated task discovery", "profile cache reuse", "bounded evidence"]
+    },
+    {
+      "case_id": "locked-task-selection",
+      "positive": true,
+      "primary_coverage": ["task locks", "safe task selection"]
+    },
+    {
+      "case_id": "main-advanced-before-merge",
+      "positive": true,
+      "primary_coverage": ["main advancement inspection", "post-merge verification"]
+    },
+    {
+      "case_id": "main-integration-lock",
+      "positive": true,
+      "primary_coverage": ["main-integration lock", "final main verification"]
+    },
+    {
+      "case_id": "negative-trigger-set",
+      "positive": false,
+      "primary_coverage": ["negative skill triggers", "no workflow activation"]
+    },
+    {
+      "case_id": "review-remediation",
+      "positive": true,
+      "primary_coverage": ["independent review", "review remediation", "re-review"]
+    },
+    {
+      "case_id": "supervised-worker-report",
+      "positive": true,
+      "primary_coverage": ["worker reporting", "active task lock preservation"]
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+Fix the typo "teh" to "the" in README.md. This is a direct tiny edit: do not create a branch, commit, run review, or start a vibe-loop workflow.

@@ -1,0 +1,20 @@
+diff --git a/PLAN.md b/PLAN.md
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -6,1 +6,1 @@
+-| MAM-01 | P0 | Planned | MAM-00 | Parse comma-separated integers while ignoring blanks. | Tests pass after merging current main and final main contains harness note. | Not started. |
++| MAM-01 | P0 | Done | MAM-00 | Parse comma-separated integers while ignoring blanks. | Tests pass after merging current main and final main contains harness note. | `python -m unittest discover`. |
+diff --git a/docs/harness-note.md b/docs/harness-note.md
+new file mode 100644
+--- /dev/null
++++ b/docs/harness-note.md
+@@ -0,0 +1,3 @@
++# Harness Note
++
++Main advanced before the worker merged.
+diff --git a/src/main_advanced_demo/parser.py b/src/main_advanced_demo/parser.py
+--- a/src/main_advanced_demo/parser.py
++++ b/src/main_advanced_demo/parser.py
+@@ -5,1 +5,1 @@
+-    return [int(part) for part in value.split(",")]
++    return [int(part) for part in value.split(",") if part.strip()]

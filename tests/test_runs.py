@@ -5,7 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vibe_loop.runs import RUN_RECORD_TYPE, RUN_SCHEMA_VERSION, RunResult, RunStore
+from vibe_loop.runs import (
+    RUN_RECORD_TYPE,
+    RUN_SCHEMA_VERSION,
+    WORKER_REPORT_RECORD_TYPE,
+    WORKER_REPORT_SCHEMA_VERSION,
+    RunResult,
+    RunStore,
+    WorkerReport,
+)
 
 
 class RunStoreTests(unittest.TestCase):
@@ -79,6 +87,86 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["session_id_source"], "fallback:run_id")
         self.assertEqual(payload["task_id"], "TASK-01")
 
+    def test_append_result_uses_sidecar_lock_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            result = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="completed",
+                exit_code=0,
+                log_path=Path(directory) / "run.log",
+                start_main="aaa",
+                end_main="bbb",
+            )
+            store = RunStore(path)
+
+            store.append_result(result)
+
+            lock_exists = path.with_name("runs.jsonl.lock").is_file()
+
+        self.assertTrue(lock_exists)
+
+    def test_append_report_writes_versioned_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            report = WorkerReport(
+                run_id="run-1",
+                task_id="TASK-01",
+                status="blocked",
+                commit="abc123",
+                message="waiting on review",
+                metadata={"reason": "external"},
+            )
+            store = RunStore(path)
+
+            store.append_report(report)
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["schema_version"], WORKER_REPORT_SCHEMA_VERSION)
+        self.assertEqual(payload["record_type"], WORKER_REPORT_RECORD_TYPE)
+        self.assertEqual(payload["run_id"], "run-1")
+        self.assertEqual(payload["task_id"], "TASK-01")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["commit"], "abc123")
+        self.assertEqual(payload["metadata"], {"reason": "external"})
+
+    def test_latest_worker_report_uses_latest_matching_valid_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_report(
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="blocked",
+                    message="first",
+                )
+            )
+            store.append_record(
+                {
+                    "record_type": WORKER_REPORT_RECORD_TYPE,
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "status": "not-a-status",
+                }
+            )
+            store.append_report(
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                    message="second",
+                )
+            )
+
+            report = store.latest_worker_report("run-1", "TASK-01")
+
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertEqual(report.status, "completed")
+        self.assertEqual(report.message, "second")
+
     def test_recent_log_context_reads_records_and_log_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -103,6 +191,42 @@ class RunStoreTests(unittest.TestCase):
         self.assertNotIn("first", context)
         self.assertIn("second", context)
         self.assertIn("third", context)
+
+    def test_recent_log_context_counts_run_results_not_report_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            for index in range(1, 4):
+                task_id = f"TASK-0{index}"
+                run_id = f"run-{index}"
+                log_path = repo / f"{run_id}.log"
+                log_path.write_text(f"log {index}\n", encoding="utf-8")
+                store.append_report(
+                    WorkerReport(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status="completed",
+                    )
+                )
+                store.append_result(
+                    RunResult(
+                        run_id=run_id,
+                        task_id=task_id,
+                        classification="completed",
+                        exit_code=0,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="bbb",
+                    )
+                )
+
+            context = store.recent_log_context(max_runs=2, tail_lines=1)
+
+        self.assertNotIn("TASK-01", context)
+        self.assertIn("TASK-02", context)
+        self.assertIn("TASK-03", context)
+        self.assertIn("log 2", context)
+        self.assertIn("log 3", context)
 
     def test_recent_records_ignore_invalid_json_lines(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -132,7 +256,7 @@ class RunStoreTests(unittest.TestCase):
 
             context = RunStore(path).recent_log_context()
 
-        self.assertIn("TASK-01", context)
+        self.assertNotIn("TASK-01", context)
         self.assertIn("TASK-02", context)
         self.assertIn("TASK-03", context)
         self.assertNotIn("Log tail for", context)

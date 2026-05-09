@@ -1,0 +1,23 @@
+diff --git a/PLAN.md b/PLAN.md
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -6,1 +6,1 @@
+-| REV-01 | P0 | Planned | REV-00 | Reject whitespace-only codes before applying format checks. | Reviewer reports no edge-case finding and regression tests cover whitespace-only input. | Not started. |
++| REV-01 | P0 | Done | REV-00 | Reject whitespace-only codes before applying format checks. | Reviewer reports no edge-case finding and regression tests cover whitespace-only input. | `python eval/stubs/reviewer.py`; `python -m unittest discover`. |
+diff --git a/src/review_rules/codes.py b/src/review_rules/codes.py
+--- a/src/review_rules/codes.py
++++ b/src/review_rules/codes.py
+@@ -4,3 +4,4 @@
+ def is_valid_code(value: str) -> bool:
++    value = value.strip()
+     if not value:
+         return False
+diff --git a/tests/test_codes.py b/tests/test_codes.py
+--- a/tests/test_codes.py
++++ b/tests/test_codes.py
+@@ -12,2 +12,5 @@ class CodeValidationTests(unittest.TestCase):
+     def test_rejects_empty_code(self) -> None:
+         self.assertFalse(is_valid_code(""))
++
++    def test_rejects_whitespace_only_code(self) -> None:
++        self.assertFalse(is_valid_code("   "))

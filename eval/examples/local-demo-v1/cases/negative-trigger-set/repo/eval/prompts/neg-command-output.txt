@@ -1,0 +1,1 @@
+Run git status --short --branch in this repository and report the output exactly. Do not modify files or start a vibe-loop workflow.

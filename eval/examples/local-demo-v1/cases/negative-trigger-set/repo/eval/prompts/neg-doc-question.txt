@@ -1,0 +1,1 @@
+Read docs/skill-eval-schema.md and summarize what workflow_score represents in two sentences. Do not edit files or start a vibe-loop workflow.

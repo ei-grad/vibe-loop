@@ -1,0 +1,83 @@
+{
+  "suite_id": "local-demo-v1",
+  "case_id": "supervised-worker-report",
+  "workflow_trace": {
+    "required": [
+      "skill_activated",
+      "verification_ran",
+      "review_requested",
+      "commit_created",
+      "worker_report_emitted"
+    ],
+    "forbidden": ["unsafe_git_command"]
+  },
+  "artifact_contract": {
+    "artifact_json_fields": [
+      {
+        "role": "report_evidence",
+        "field": "latest.run_id",
+        "equals": "eval-run-wrk-01"
+      },
+      {
+        "role": "report_evidence",
+        "field": "latest.task_id",
+        "equals": "WRK-01"
+      },
+      {
+        "role": "report_evidence",
+        "field": "latest.status",
+        "equals": "completed"
+      },
+      {
+        "role": "report_evidence",
+        "field": "latest.commit",
+        "equals": "HEAD"
+      },
+      {
+        "role": "lock_evidence",
+        "field": "after.task_id",
+        "equals": "WRK-01"
+      },
+      {
+        "role": "structured_result",
+        "field": "run_id",
+        "equals": "eval-run-wrk-01"
+      },
+      {
+        "role": "structured_result",
+        "field": "task_status",
+        "equals": "completed"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "id": "unit-tests",
+      "kind": "unittest"
+    },
+    {
+      "id": "task-lock-owned",
+      "kind": "json_field_equals",
+      "path": ".vibe-loop/locks/WRK-01.lock/lock.json",
+      "field": "task_id",
+      "equals": "WRK-01"
+    },
+    {
+      "id": "worker-report-completed",
+      "kind": "jsonl_record_matches",
+      "path": ".vibe-loop/runs.jsonl",
+      "fields": {
+        "run_id": "eval-run-wrk-01",
+        "task_id": "WRK-01",
+        "status": "completed",
+        "commit": "HEAD"
+      }
+    },
+    {
+      "id": "plan-row-completed",
+      "kind": "plan_status",
+      "task_id": "WRK-01",
+      "status": "Done"
+    }
+  ]
+}

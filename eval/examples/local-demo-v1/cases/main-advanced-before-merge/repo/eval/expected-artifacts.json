@@ -1,0 +1,44 @@
+{
+  "suite_id": "local-demo-v1",
+  "case_id": "main-advanced-before-merge",
+  "workflow_trace": {
+    "required": [
+      "skill_activated",
+      "verification_ran",
+      "review_requested",
+      "commit_created",
+      "main_advanced_detected",
+      "main_fast_forwarded",
+      "main_verification_ran"
+    ],
+    "forbidden": ["unsafe_git_command"]
+  },
+  "artifact_contract": {
+    "event_order": [
+      "verification_ran",
+      "review_requested",
+      "commit_created",
+      "main_advanced_detected",
+      "main_fast_forwarded",
+      "main_verification_ran"
+    ]
+  },
+  "checks": [
+    {
+      "id": "unit-tests",
+      "kind": "unittest"
+    },
+    {
+      "id": "harness-note-present",
+      "kind": "file_contains",
+      "path": "docs/harness-note.md",
+      "text": "Main advanced before the worker merged."
+    },
+    {
+      "id": "plan-row-completed",
+      "kind": "plan_status",
+      "task_id": "MAM-01",
+      "status": "Done"
+    }
+  ]
+}
