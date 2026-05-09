@@ -2533,8 +2533,18 @@ class CliTests(unittest.TestCase):
         self.assertIn(
             f"[vibe-loop] session_id={payload['session_id']}", stderr.getvalue()
         )
+        self.assertIn(
+            f"[vibe-loop] worker process started task=TASK-01 "
+            f"run_id={payload['run_id']} pid=",
+            stderr.getvalue(),
+        )
         self.assertIn(f"[vibe-loop] session_id={payload['session_id']}", log_text)
         self.assertIn("[vibe-loop] session_id_source=fallback:run_id", log_text)
+        self.assertIn(
+            f"[vibe-loop] worker process started task=TASK-01 "
+            f"run_id={payload['run_id']} pid=",
+            log_text,
+        )
         self.assertIn("agent out", log_text)
         self.assertIn("agent err", log_text)
 
@@ -3163,24 +3173,63 @@ class CliTests(unittest.TestCase):
             )
             stdout = StringIO()
             stderr = StringIO()
+            runs_path = repo / ".vibe-loop" / "runs.jsonl"
+            runs_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "worker_report",
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "status": "blocked",
+                        "commit": "",
+                        "message": "waiting on dependency",
+                        "metadata": {},
+                        "reported_at": "2026-05-09T00:00:30+00:00",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 exit_code = main(["workers", "--repo", str(repo), "--json"])
 
+            text_stdout = StringIO()
+            text_stderr = StringIO()
+            with redirect_stdout(text_stdout), redirect_stderr(text_stderr):
+                text_exit = main(["workers", "--repo", str(repo)])
+
             payload = json.loads(stdout.getvalue())
 
         self.assertEqual(exit_code, 0)
+        self.assertEqual(text_exit, 0)
         self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(text_stderr.getvalue(), "")
         self.assertEqual(payload[0]["task_id"], "TASK-01")
         self.assertEqual(payload[0]["state"], "running")
         self.assertEqual(payload[0]["process_state"], "running")
         self.assertEqual(payload[0]["command"], "python worker.py")
         self.assertEqual(payload[0]["pid_source"], "popen")
         self.assertEqual(payload[0]["pid_scope"], "configured_command_process")
+        self.assertEqual(payload[0]["result_status"], "blocked")
         self.assertEqual(payload[1]["task_id"], "TASK-02")
         self.assertEqual(payload[1]["state"], "stale")
         self.assertEqual(payload[1]["process_state"], "missing")
         self.assertEqual(payload[1]["stale_reason"], "missing_process")
+        self.assertEqual(
+            text_stdout.getvalue(),
+            "TASK-01\trun-1\trunning\tprocess=running"
+            f"\tpid={os.getpid()}"
+            "\tstarted=2026-05-09T00:00:00+00:00"
+            f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-1.log'}"
+            "\tcommand=python worker.py\tresult=blocked\n"
+            "TASK-02\trun-2\tstale\tprocess=missing"
+            "\tpid=999999999"
+            "\tstarted=2026-05-09T00:01:00+00:00"
+            f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-2.log'}"
+            "\tcommand=python worker.py\tmissing_process\n",
+        )
 
     def test_workers_text_does_not_require_plan_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3194,6 +3243,142 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual("", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
+
+    def test_runs_list_and_inspect_do_not_require_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runs_dir = repo / ".vibe-loop" / "runs"
+            runs_dir.mkdir(parents=True)
+            (runs_dir / "run-1.log").write_text("first log\n", encoding="utf-8")
+            runs_path = repo / ".vibe-loop" / "runs.jsonl"
+            records = [
+                {
+                    "schema_version": 1,
+                    "record_type": "worker_report",
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "status": "completed",
+                    "commit": "abc123",
+                    "message": "",
+                    "metadata": {"source": "worker"},
+                    "reported_at": "2026-05-09T00:00:00+00:00",
+                },
+                {
+                    "schema_version": 3,
+                    "record_type": "run_result",
+                    "run_id": "run-1",
+                    "session_id": "native-1",
+                    "session_id_source": "native:stdout",
+                    "task_id": "TASK-01",
+                    "classification": "completed",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "log": str(runs_dir / "run-1.log"),
+                    "start_main": "aaa",
+                    "end_main": "bbb",
+                    "message": "",
+                    "classification_source": "worker_report",
+                    "worker_report": {
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "status": "completed",
+                        "commit": "abc123",
+                        "message": "",
+                        "metadata": {"source": "worker"},
+                        "reported_at": "2026-05-09T00:00:00+00:00",
+                    },
+                    "finished_at": "2026-05-09T00:01:00+00:00",
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": "worker_report",
+                    "run_id": "run-2",
+                    "task_id": "TASK-02",
+                    "status": "blocked",
+                    "commit": "",
+                    "message": "waiting on dependency",
+                    "metadata": {},
+                    "reported_at": "2026-05-09T00:02:00+00:00",
+                },
+            ]
+            runs_path.write_text(
+                "\n".join(json.dumps(record) for record in records) + "\n",
+                encoding="utf-8",
+            )
+            list_stdout = StringIO()
+            list_stderr = StringIO()
+            list_text_stdout = StringIO()
+            list_text_stderr = StringIO()
+            inspect_stdout = StringIO()
+            inspect_stderr = StringIO()
+
+            with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
+                list_exit = main(["runs", "list", "--repo", str(repo), "--json"])
+            with redirect_stdout(list_text_stdout), redirect_stderr(list_text_stderr):
+                list_text_exit = main(
+                    ["runs", "list", "--repo", str(repo), "--limit", "2"]
+                )
+            with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
+                inspect_exit = main(["runs", "inspect", "run-1", "--repo", str(repo)])
+
+            list_payload = json.loads(list_stdout.getvalue())
+
+        self.assertEqual(list_exit, 0)
+        self.assertEqual(list_text_exit, 0)
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(list_stderr.getvalue(), "")
+        self.assertEqual(list_text_stderr.getvalue(), "")
+        self.assertEqual(inspect_stderr.getvalue(), "")
+        self.assertEqual([run["run_id"] for run in list_payload], ["run-2", "run-1"])
+        self.assertEqual(list_payload[0]["status"], "blocked")
+        self.assertEqual(list_payload[0]["record_type"], "worker_report")
+        self.assertEqual(list_payload[1]["status"], "completed")
+        self.assertEqual(list_payload[1]["record_type"], "run_result")
+        self.assertEqual(list_payload[1]["log"], str(runs_dir / "run-1.log"))
+        self.assertEqual(
+            list_text_stdout.getvalue(),
+            "run-2\tTASK-02\tblocked\trecord=worker_report"
+            "\tupdated=2026-05-09T00:02:00+00:00\texit=-\tlog=\n"
+            "run-1\tTASK-01\tcompleted\trecord=run_result"
+            "\tupdated=2026-05-09T00:01:00+00:00"
+            f"\texit=0\tlog={runs_dir / 'run-1.log'}\n",
+        )
+        self.assertEqual(
+            inspect_stdout.getvalue(),
+            "run: run-1\n"
+            "task: TASK-01\n"
+            "status: completed\n"
+            "record: run_result\n"
+            "updated: 2026-05-09T00:01:00+00:00\n"
+            "exit: 0\n"
+            "session: native-1 (native:stdout)\n"
+            f"log: {runs_dir / 'run-1.log'}\n"
+            "message: -\n"
+            "records: 2\n"
+            'worker_report: {"commit": "abc123", "message": "", '
+            '"metadata": {"source": "worker"}, '
+            '"reported_at": "2026-05-09T00:00:00+00:00", '
+            '"run_id": "run-1", "status": "completed", '
+            '"task_id": "TASK-01"}\n'
+            "record_history:\n"
+            "- worker_report\tstatus=completed"
+            "\tupdated=2026-05-09T00:00:00+00:00\n"
+            "- run_result\tstatus=completed"
+            "\tupdated=2026-05-09T00:01:00+00:00\n",
+        )
+
+    def test_runs_inspect_returns_not_found_without_plan_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["runs", "inspect", "missing", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("run not found: missing", stderr.getvalue())
 
 
 def write_python_executable(path: Path, body: str) -> None:

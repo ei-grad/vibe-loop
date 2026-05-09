@@ -167,6 +167,154 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(report.status, "completed")
         self.assertEqual(report.message, "second")
 
+    def test_list_runs_groups_records_by_run_and_uses_latest_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_report(
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                    commit="abc123",
+                )
+            )
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                    worker_report={
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "status": "completed",
+                        "commit": "abc123",
+                        "message": "",
+                        "metadata": {},
+                        "reported_at": "2026-05-09T00:00:00+00:00",
+                    },
+                )
+            )
+            store.append_report(
+                WorkerReport(
+                    run_id="run-2",
+                    task_id="TASK-02",
+                    status="blocked",
+                    message="waiting on dependency",
+                )
+            )
+
+            runs = store.list_runs()
+
+        self.assertEqual([run.run_id for run in runs], ["run-2", "run-1"])
+        self.assertEqual(runs[0].status, "blocked")
+        self.assertEqual(runs[0].record_type, "worker_report")
+        self.assertIsNone(runs[0].exit_code)
+        self.assertEqual(runs[1].status, "completed")
+        self.assertEqual(runs[1].record_type, "run_result")
+        self.assertEqual(runs[1].exit_code, 0)
+        self.assertEqual(runs[1].record_count, 2)
+        self.assertEqual(runs[1].worker_report["commit"], "abc123")
+
+    def test_list_runs_limit_zero_returns_no_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_report(
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                )
+            )
+
+            runs = store.list_runs(limit=0)
+
+        self.assertEqual(runs, [])
+
+    def test_list_runs_ignores_invalid_worker_reports_for_latest_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+            )
+            store.append_record(
+                {
+                    "record_type": WORKER_REPORT_RECORD_TYPE,
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "status": "not-valid",
+                    "reported_at": "2026-05-09T00:02:00+00:00",
+                }
+            )
+
+            runs = store.list_runs()
+            inspection = store.inspect_run("run-1")
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0].status, "completed")
+        self.assertEqual(runs[0].record_type, "run_result")
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(inspection.view.status, "completed")
+        self.assertEqual(inspection.view.record_type, "run_result")
+        self.assertEqual(inspection.view.record_count, 2)
+
+    def test_inspect_run_returns_records_for_one_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_report(
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                )
+            )
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+            )
+            store.append_report(
+                WorkerReport(
+                    run_id="run-2",
+                    task_id="TASK-02",
+                    status="blocked",
+                )
+            )
+
+            inspection = store.inspect_run("run-1")
+
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(inspection.view.run_id, "run-1")
+        self.assertEqual(inspection.view.record_count, 2)
+        self.assertEqual(
+            [record["record_type"] for record in inspection.records],
+            ["worker_report", "run_result"],
+        )
+        self.assertIsNone(store.inspect_run("missing-run"))
+
     def test_recent_log_context_reads_records_and_log_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

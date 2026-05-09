@@ -202,6 +202,8 @@ vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop workers --repo .
+vibe-loop runs list --repo .
+vibe-loop runs inspect <run-id> --repo .
 vibe-loop main-integration status --repo .
 vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
 vibe-loop main-integration release --repo . --run-id ... --task-id ...
@@ -462,7 +464,9 @@ new holder permission to take over automatically.
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the
 `session_id_source`, the `agent_command_source` used for the worker command,
 the `agent_selection_command_source`, and the default agent policy source used
-when commands are auto-resolved.
+when commands are auto-resolved. `vibe-loop runs list` groups those records by
+run id and shows the latest structured status plus the log path; `vibe-loop runs
+inspect <run-id>` prints the detailed record history for one run.
 Project worklogs should remain final evidence ledgers. Attempt logs and failed
 runs belong in `.vibe-loop/`, not in project completion records.
 

@@ -137,6 +137,18 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(workers)
     workers.add_argument("--json", action="store_true")
 
+    runs = subparsers.add_parser("runs", help="Inspect recorded run results")
+    add_repo_argument(runs)
+    runs_subparsers = runs.add_subparsers(dest="runs_command", required=True)
+    runs_list = runs_subparsers.add_parser("list", help="List recent run results")
+    add_repo_argument(runs_list)
+    runs_list.add_argument("--json", action="store_true")
+    runs_list.add_argument("--limit", type=int, default=20)
+    runs_inspect = runs_subparsers.add_parser("inspect", help="Show one run result")
+    add_repo_argument(runs_inspect)
+    runs_inspect.add_argument("run_id")
+    runs_inspect.add_argument("--json", action="store_true")
+
     integration = subparsers.add_parser(
         "main-integration",
         help="Manage the advisory main integration lock",
@@ -300,6 +312,9 @@ def dispatch(args: argparse.Namespace) -> int:
                 print(output)
         return 0
 
+    if args.command == "runs":
+        return dispatch_runs(args, config)
+
     if args.command == "main-integration":
         return dispatch_main_integration(args, config)
 
@@ -345,6 +360,35 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     raise AssertionError(args.command)
+
+
+def dispatch_runs(args: argparse.Namespace, config) -> int:
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    if args.runs_command == "list":
+        if args.limit < 0:
+            print("runs list --limit must be non-negative", file=sys.stderr)
+            return 2
+        runs = run_store.list_runs(limit=args.limit)
+        if args.json:
+            print(json.dumps([run.to_json() for run in runs], indent=2))
+        else:
+            output = render_runs(runs)
+            if output:
+                print(output)
+        return 0
+
+    if args.runs_command == "inspect":
+        inspection = run_store.inspect_run(args.run_id)
+        if inspection is None:
+            print(f"run not found: {args.run_id}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(inspection.to_json(), indent=2))
+        else:
+            print(render_run_inspection(inspection))
+        return 0
+
+    raise AssertionError(args.runs_command)
 
 
 def dispatch_eval(args: argparse.Namespace, config) -> int:
@@ -724,12 +768,59 @@ def render_workers(workers: list[WorkerView]) -> str:
         payload = worker.to_json()
         pid = payload["pid"] if payload["pid"] is not None else "-"
         stale = f"\t{payload['stale_reason']}" if payload["stale_reason"] else ""
+        result = (
+            f"\tresult={payload['result_status']}"
+            if payload["result_status"]
+            else ""
+        )
         lines.append(
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
-            f"\tcommand={payload['command']}{stale}"
+            f"\tcommand={payload['command']}{result}{stale}"
         )
+    return "\n".join(lines)
+
+
+def render_runs(runs) -> str:
+    lines: list[str] = []
+    for run in runs:
+        payload = run.to_json()
+        exit_code = payload["exit_code"] if payload["exit_code"] is not None else "-"
+        lines.append(
+            f"{payload['run_id']}\t{payload['task_id']}\t{payload['status']}"
+            f"\trecord={payload['record_type']}\tupdated={payload['updated_at']}"
+            f"\texit={exit_code}\tlog={payload['log']}"
+        )
+    return "\n".join(lines)
+
+
+def render_run_inspection(inspection) -> str:
+    payload = inspection.to_json()
+    exit_code = payload["exit_code"] if payload["exit_code"] is not None else "-"
+    lines = [
+        f"run: {payload['run_id']}",
+        f"task: {payload['task_id'] or '-'}",
+        f"status: {payload['status'] or '-'}",
+        f"record: {payload['record_type']}",
+        f"updated: {payload['updated_at'] or '-'}",
+        f"exit: {exit_code}",
+        f"session: {payload['session_id']} ({payload['session_id_source'] or '-'})",
+        f"log: {payload['log'] or '-'}",
+        f"message: {payload['message'] or '-'}",
+        f"records: {payload['record_count']}",
+    ]
+    if payload["worker_report"]:
+        lines.append(
+            "worker_report: "
+            + json.dumps(payload["worker_report"], sort_keys=True)
+        )
+    lines.append("record_history:")
+    for record in payload["records"]:
+        record_type = record.get("record_type") or "run_result"
+        status = record.get("status") or record.get("classification") or "-"
+        updated = record.get("finished_at") or record.get("reported_at") or "-"
+        lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}")
     return "\n".join(lines)
 
 

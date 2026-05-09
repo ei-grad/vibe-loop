@@ -155,6 +155,78 @@ class WorkerReport:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class RunHistoryView:
+    run_id: str
+    task_id: str
+    status: str
+    record_type: str
+    updated_at: str
+    log_path: Path | None
+    exit_code: int | None
+    session_id: str
+    session_id_source: str
+    message: str
+    classification_source: str
+    worker_report: dict[str, Any] | None
+    record_count: int
+    latest_record: dict[str, Any]
+
+    @classmethod
+    def from_records(
+        cls,
+        run_id: str,
+        records: list[dict[str, Any]],
+    ) -> RunHistoryView:
+        valid_records = run_history_view_records(records)
+        latest = valid_records[-1]
+        return cls(
+            run_id=run_id,
+            task_id=latest_text(valid_records, "task_id"),
+            status=record_status(latest),
+            record_type=record_type_label(latest),
+            updated_at=record_updated_at(latest),
+            log_path=latest_log_path(valid_records),
+            exit_code=record_exit_code(latest),
+            session_id=latest_text(valid_records, "session_id") or run_id,
+            session_id_source=latest_text(valid_records, "session_id_source"),
+            message=latest_text(valid_records, "message"),
+            classification_source=latest_text(valid_records, "classification_source"),
+            worker_report=latest_worker_report_payload(valid_records),
+            record_count=len(records),
+            latest_record=latest,
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "status": self.status,
+            "record_type": self.record_type,
+            "updated_at": self.updated_at,
+            "log": str(self.log_path) if self.log_path is not None else "",
+            "exit_code": self.exit_code,
+            "session_id": self.session_id,
+            "session_id_source": self.session_id_source,
+            "message": self.message,
+            "classification_source": self.classification_source,
+            "worker_report": self.worker_report,
+            "record_count": self.record_count,
+            "latest_record": self.latest_record,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class RunInspection:
+    view: RunHistoryView
+    records: list[dict[str, Any]]
+
+    def to_json(self) -> dict[str, object]:
+        payload = self.view.to_json()
+        payload["records"] = self.records
+        return payload
+
+
 class RunStore:
     def __init__(self, path: Path):
         self.path = path
@@ -212,6 +284,22 @@ class RunStore:
             return report
         return None
 
+    def list_runs(self, limit: int = 20) -> list[RunHistoryView]:
+        return build_run_history_views(self.read_records(), limit=limit)
+
+    def inspect_run(self, run_id: str) -> RunInspection | None:
+        records = [
+            record
+            for record in self.read_records()
+            if string_value(record.get("run_id")) == run_id
+        ]
+        if not run_history_view_records(records):
+            return None
+        return RunInspection(
+            view=RunHistoryView.from_records(run_id, records),
+            records=records,
+        )
+
     def recent_log_context(self, max_runs: int = 5, tail_lines: int = 80) -> str:
         records = self.recent_result_records(max_runs)
         if not records:
@@ -237,6 +325,90 @@ def record_log_path(record: dict[str, Any]) -> Path | None:
     if not path.is_file():
         return None
     return path
+
+
+def build_run_history_views(
+    records: list[dict[str, Any]],
+    *,
+    limit: int = 20,
+) -> list[RunHistoryView]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    last_indices: dict[str, int] = {}
+    for index, record in enumerate(records):
+        run_id = string_value(record.get("run_id"))
+        if not run_id:
+            continue
+        if not is_run_history_view_record(record):
+            continue
+        grouped.setdefault(run_id, []).append(record)
+        last_indices[run_id] = index
+    ordered = sorted(last_indices, key=last_indices.__getitem__, reverse=True)
+    ordered = ordered[:limit]
+    return [RunHistoryView.from_records(run_id, grouped[run_id]) for run_id in ordered]
+
+
+def run_history_view_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [record for record in records if is_run_history_view_record(record)]
+
+
+def is_run_history_view_record(record: dict[str, Any]) -> bool:
+    record_type = record.get("record_type")
+    if record_type in {None, RUN_RECORD_TYPE}:
+        return True
+    if record_type == WORKER_REPORT_RECORD_TYPE:
+        return WorkerReport.from_record(record) is not None
+    return False
+
+
+def record_type_label(record: dict[str, Any]) -> str:
+    record_type = string_value(record.get("record_type"))
+    return record_type or RUN_RECORD_TYPE
+
+
+def record_status(record: dict[str, Any]) -> str:
+    return string_value(record.get("status")) or string_value(record.get("classification"))
+
+
+def record_updated_at(record: dict[str, Any]) -> str:
+    return string_value(record.get("finished_at")) or string_value(
+        record.get("reported_at")
+    )
+
+
+def record_exit_code(record: dict[str, Any]) -> int | None:
+    value = record.get("exit_code")
+    if isinstance(value, bool):
+        return None
+    return value if isinstance(value, int) else None
+
+
+def latest_log_path(records: list[dict[str, Any]]) -> Path | None:
+    for record in reversed(records):
+        log = string_value(record.get("log"))
+        if log:
+            return Path(log)
+    return None
+
+
+def latest_worker_report_payload(
+    records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    for record in reversed(records):
+        worker_report = record.get("worker_report")
+        if isinstance(worker_report, dict):
+            return worker_report
+        report = WorkerReport.from_record(record)
+        if report is not None:
+            return report.to_json()
+    return None
+
+
+def latest_text(records: list[dict[str, Any]], key: str) -> str:
+    for record in reversed(records):
+        value = string_value(record.get(key))
+        if value:
+            return value
+    return ""
 
 
 def tail(path: Path, line_count: int) -> list[str]:

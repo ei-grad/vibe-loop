@@ -245,6 +245,11 @@ class VibeRunner:
                         task_lock,
                         active_state.to_lock_metadata(),
                     )
+                    report_status(
+                        "worker process started "
+                        f"task={task.task_id} run_id={run_id} pid={worker_pid}",
+                        log,
+                    )
 
                 stream_result = run_streaming_command(
                     command,
