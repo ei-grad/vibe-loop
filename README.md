@@ -479,6 +479,10 @@ Projected timelines default to `current-runner-parity`, matching the runner's
 dependency readiness and deterministic task order. `lightmetrics-parity` is
 available as an explicit policy for comparison with the prototype behavior, and
 generated timeline artifacts must serialize the selected `schedule_policy`.
+Projected duration estimates use robust historical baselines from completed
+actual spans. Each projected task records the selected model, minutes, low/high
+interval, training sample counts, outlier handling notes, and feature/evidence
+reasons.
 
 `vibe-loop doctor` reports planning analytics readiness without running a
 collector. It includes the selected schedule policy, subject matching mode,

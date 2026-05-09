@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
+import re
 import statistics
 from datetime import datetime, timedelta, timezone
 
@@ -21,6 +23,31 @@ FIRST_COMMIT_FLOOR_MINUTES = 1
 DEFAULT_PROJECTED_DURATION_MINUTES = 60
 DEFAULT_PROJECTION_ANCHOR = datetime(1970, 1, 1, tzinfo=timezone.utc)
 TIMELINE_COMMAND = "vibe-loop planning timeline"
+DURATION_MODEL_NAME = "robust-duration-baseline-v1"
+GROUP_MIN_SAMPLE_COUNT = 2
+SIMILARITY_MIN_SCORE = 0.35
+SIMILARITY_MAX_EXAMPLES = 3
+SIMILARITY_BLEND_WEIGHT = 0.25
+TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./+-]*")
+TOKEN_FIELDS = ("title", "scope", "acceptance")
+TOKEN_STOPWORDS = {
+    "acceptance",
+    "add",
+    "and",
+    "are",
+    "done",
+    "for",
+    "from",
+    "later",
+    "none",
+    "task",
+    "that",
+    "the",
+    "this",
+    "with",
+    "work",
+    "works",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -104,13 +131,18 @@ class PlanningTimelineBuilder:
         self.add_completed_without_actual_warnings(completed_ids, actual_spans)
         self.add_unknown_dependency_warnings()
         self.add_stale_run_record_warnings()
-        projections = self.projected_spans(completed_ids, actual_spans)
+        duration_model = DurationBaselineModel(self.tasks, actual_spans)
+        projections = self.projected_spans(completed_ids, actual_spans, duration_model)
         task_payloads = self.timeline_tasks(actual_spans, projections)
         return {
             "schema_version": PLANNING_TIMELINE_SCHEMA_VERSION,
             "generated_by": TIMELINE_COMMAND,
             "schedule_policy": self.config.planning_analytics.schedule_policy,
-            "source_provenance": self.source_provenance(actual_spans, projections),
+            "source_provenance": self.source_provenance(
+                actual_spans,
+                projections,
+                duration_model,
+            ),
             "sections": sections_for_tasks(task_payloads),
             "tasks": task_payloads,
             "warnings": dedupe_warning_payloads(self.warnings),
@@ -120,6 +152,7 @@ class PlanningTimelineBuilder:
         self,
         actual_spans: dict[str, ActualSpan],
         projections: dict[str, ProjectedSpan],
+        duration_model: DurationBaselineModel,
     ) -> dict[str, object]:
         projected = [span for span in projections.values() if not span.blocked]
         anchor, anchor_source = projection_anchor_with_default(
@@ -142,6 +175,7 @@ class PlanningTimelineBuilder:
                 "task_count": len(projected),
                 "anchor": format_optional_time(anchor),
                 "anchor_source": anchor_source,
+                "duration_model": duration_model.summary(),
             },
         }
 
@@ -191,6 +225,7 @@ class PlanningTimelineBuilder:
         self,
         completed_ids: set[str],
         actual_spans: dict[str, ActualSpan],
+        duration_model: DurationBaselineModel,
     ) -> dict[str, ProjectedSpan]:
         raw_anchor, _raw_anchor_source = projection_anchor(self.evidence, actual_spans)
         anchor, _anchor_source = projection_anchor_with_default(
@@ -208,7 +243,6 @@ class PlanningTimelineBuilder:
                     "source": "timeline",
                 }
             )
-        estimates = projection_estimates(actual_spans)
         known_end_times = {task: span.end for task, span in actual_spans.items()} | {
             task: anchor for task in completed_ids if task not in actual_spans
         }
@@ -233,7 +267,7 @@ class PlanningTimelineBuilder:
             current_task_id = task_id(task)
             dependency_ready_at = latest_dependency_end(task, known_end_times)
             start = max_datetime(current_time, dependency_ready_at, anchor)
-            estimate = estimates.to_json()
+            estimate = duration_model.estimate(task).to_json()
             end = start + timedelta(minutes=int(estimate["minutes"]))
             sequence += 1
             projections[current_task_id] = ProjectedSpan(
@@ -264,7 +298,7 @@ class PlanningTimelineBuilder:
                 blocked=True,
                 blockers=blockers,
                 policy_order_key=projection_sort_key(task, self.config),
-                estimate=estimates.to_json(),
+                estimate=duration_model.estimate(task).to_json(),
             )
             self.warnings.append(
                 {
@@ -360,40 +394,490 @@ class PlanningTimelineBuilder:
 
 
 @dataclasses.dataclass(frozen=True)
-class ProjectionEstimates:
+class DurationTrainingExample:
+    task_id: str
+    duration_minutes: int
+    adjusted_duration_minutes: int
+    workstream: str
+    priority: str
+    tokens: frozenset[str]
+
+
+@dataclasses.dataclass(frozen=True)
+class OutlierHandling:
+    method: str
+    applied: bool
+    training_sample_count: int
+    clipped_sample_count: int
+    lower_minutes: int | None
+    upper_minutes: int | None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "method": self.method,
+            "applied": self.applied,
+            "training_sample_count": self.training_sample_count,
+            "clipped_sample_count": self.clipped_sample_count,
+            "lower_minutes": self.lower_minutes,
+            "upper_minutes": self.upper_minutes,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class DurationEstimate:
     minutes: int
+    low_minutes: int
+    high_minutes: int
     model: str
     sample_count: int
+    training_sample_counts: dict[str, int]
+    outlier_handling: OutlierHandling
+    outlier_notes: tuple[str, ...]
+    feature_reasons: tuple[str, ...]
+    evidence_reasons: tuple[str, ...]
     reasons: tuple[str, ...]
+    interval_method: str
+    interval_coverage: str
+    interval_sample_count: int
+    features: dict[str, object]
+    similarity_examples: tuple[dict[str, object], ...]
 
     def to_json(self) -> dict[str, object]:
         return {
             "minutes": self.minutes,
+            "low_minutes": self.low_minutes,
+            "high_minutes": self.high_minutes,
+            "interval": {
+                "low_minutes": self.low_minutes,
+                "high_minutes": self.high_minutes,
+                "coverage": self.interval_coverage,
+                "method": self.interval_method,
+                "sample_count": self.interval_sample_count,
+            },
             "model": self.model,
             "sample_count": self.sample_count,
+            "training_sample_counts": self.training_sample_counts,
+            "outlier_handling": self.outlier_handling.to_json(),
+            "outlier_notes": list(self.outlier_notes),
+            "feature_reasons": list(self.feature_reasons),
+            "evidence_reasons": list(self.evidence_reasons),
             "reasons": list(self.reasons),
+            "features": self.features,
+            "similarity_examples": list(self.similarity_examples),
         }
 
 
-def projection_estimates(actual_spans: dict[str, ActualSpan]) -> ProjectionEstimates:
-    durations = sorted(
-        span.duration_minutes
-        for span in actual_spans.values()
-        if span.duration_minutes > 0
-    )
-    if durations:
-        return ProjectionEstimates(
-            minutes=int(round(statistics.median(durations))),
-            model="completed-actual-median-v1",
-            sample_count=len(durations),
-            reasons=("median of completed actual task durations",),
+class DurationBaselineModel:
+    def __init__(
+        self,
+        tasks: list[dict[str, object]],
+        actual_spans: dict[str, ActualSpan],
+    ):
+        self.outlier_handling = build_outlier_handling(
+            [
+                span.duration_minutes
+                for span in actual_spans.values()
+                if span.duration_minutes > 0
+            ]
         )
-    return ProjectionEstimates(
-        minutes=DEFAULT_PROJECTED_DURATION_MINUTES,
-        model="fixed-fallback-v1",
-        sample_count=0,
-        reasons=("no completed actual spans; using fixed fallback duration",),
+        self.examples = tuple(
+            sorted(
+                (
+                    build_training_example(task, actual_spans, self.outlier_handling)
+                    for task in tasks
+                    if task_id(task) in actual_spans
+                    and actual_spans[task_id(task)].duration_minutes > 0
+                ),
+                key=lambda item: item.task_id,
+            )
+        )
+
+    def summary(self) -> dict[str, object]:
+        return {
+            "model": DURATION_MODEL_NAME,
+            "training_sample_count": len(self.examples),
+            "outlier_handling": self.outlier_handling.to_json(),
+            "token_fields": list(TOKEN_FIELDS),
+        }
+
+    def estimate(self, task: dict[str, object]) -> DurationEstimate:
+        if not self.examples:
+            return self.fallback_estimate(task)
+        selected, group_name, group_reason = self.select_group(task)
+        base_minutes = rounded_median(
+            [example.adjusted_duration_minutes for example in selected]
+        )
+        similarity_examples = self.similarity_examples(task)
+        similarity_minutes = (
+            rounded_median(
+                [
+                    int(example["adjusted_duration_minutes"])
+                    for example in similarity_examples
+                ]
+            )
+            if similarity_examples
+            else None
+        )
+        minutes = base_minutes
+        model = f"{DURATION_MODEL_NAME}/{group_name}"
+        evidence_reasons = [
+            group_reason,
+            outlier_reason(self.outlier_handling),
+        ]
+        if similarity_minutes is not None:
+            minutes = max(
+                1,
+                int(
+                    round(
+                        base_minutes * (1 - SIMILARITY_BLEND_WEIGHT)
+                        + similarity_minutes * SIMILARITY_BLEND_WEIGHT
+                    )
+                ),
+            )
+            model = f"{model}+similarity"
+            evidence_reasons.append(
+                (
+                    "blended leakage-safe pre-task similarity median from "
+                    f"{len(similarity_examples)} historical task(s)"
+                )
+            )
+        else:
+            evidence_reasons.append(
+                "similarity blend omitted because pre-task token overlap was insufficient"
+            )
+        low, high, interval_method, interval_coverage, interval_sample_count = (
+            estimate_interval(minutes, selected, self.examples)
+        )
+        training_counts = self.training_sample_counts(task, len(similarity_examples))
+        features = task_features(task)
+        feature_reasons = feature_reason_payload(features)
+        return DurationEstimate(
+            minutes=minutes,
+            low_minutes=low,
+            high_minutes=high,
+            model=model,
+            sample_count=len(selected),
+            training_sample_counts=training_counts,
+            outlier_handling=self.outlier_handling,
+            outlier_notes=(outlier_reason(self.outlier_handling),),
+            feature_reasons=feature_reasons,
+            evidence_reasons=tuple(evidence_reasons),
+            reasons=tuple([*feature_reasons, *evidence_reasons]),
+            interval_method=interval_method,
+            interval_coverage=interval_coverage,
+            interval_sample_count=interval_sample_count,
+            features=features,
+            similarity_examples=similarity_examples,
+        )
+
+    def fallback_estimate(self, task: dict[str, object]) -> DurationEstimate:
+        minutes = DEFAULT_PROJECTED_DURATION_MINUTES
+        features = task_features(task)
+        feature_reasons = feature_reason_payload(features)
+        evidence_reasons = ("no completed actual spans; using fixed fallback duration",)
+        return DurationEstimate(
+            minutes=minutes,
+            low_minutes=max(1, minutes // 2),
+            high_minutes=minutes * 2,
+            model="fixed-fallback-v1",
+            sample_count=0,
+            training_sample_counts={
+                "global": 0,
+                "workstream": 0,
+                "priority": 0,
+                "workstream_priority": 0,
+                "similarity": 0,
+            },
+            outlier_handling=self.outlier_handling,
+            outlier_notes=("outlier handling skipped because no history exists",),
+            feature_reasons=feature_reasons,
+            evidence_reasons=evidence_reasons,
+            reasons=tuple([*feature_reasons, *evidence_reasons]),
+            interval_method="fixed_fallback_multiplier",
+            interval_coverage="conservative_small_history",
+            interval_sample_count=0,
+            features=features,
+            similarity_examples=(),
+        )
+
+    def select_group(
+        self,
+        task: dict[str, object],
+    ) -> tuple[tuple[DurationTrainingExample, ...], str, str]:
+        workstream = workstream_value(task)
+        priority = priority_value(task)
+        workstream_priority = tuple(
+            example
+            for example in self.examples
+            if example.workstream == workstream and example.priority == priority
+        )
+        workstream_examples = tuple(
+            example for example in self.examples if example.workstream == workstream
+        )
+        priority_examples = tuple(
+            example for example in self.examples if example.priority == priority
+        )
+        candidates = (
+            (
+                workstream_priority,
+                "workstream-priority",
+                (
+                    "used workstream+priority median for "
+                    f"workstream={workstream} priority={priority}"
+                ),
+            ),
+            (
+                workstream_examples,
+                "workstream",
+                f"used workstream median for workstream={workstream}",
+            ),
+            (
+                priority_examples,
+                "priority",
+                f"used priority median for priority={priority}",
+            ),
+        )
+        for examples, name, reason in candidates:
+            if len(examples) >= GROUP_MIN_SAMPLE_COUNT:
+                return stable_examples(examples), name, reason
+        return (
+            self.examples,
+            "global",
+            "used global median because specific history was too small",
+        )
+
+    def similarity_examples(
+        self,
+        task: dict[str, object],
+    ) -> tuple[dict[str, object], ...]:
+        target_tokens = pre_task_tokens(task)
+        if not target_tokens:
+            return ()
+        scored: list[tuple[float, DurationTrainingExample]] = []
+        for example in self.examples:
+            score = token_similarity(target_tokens, example.tokens)
+            if score >= SIMILARITY_MIN_SCORE:
+                scored.append((score, example))
+        scored.sort(key=lambda item: (-item[0], item[1].task_id))
+        return tuple(
+            {
+                "task_id": example.task_id,
+                "score": round(score, 6),
+                "duration_minutes": example.duration_minutes,
+                "adjusted_duration_minutes": example.adjusted_duration_minutes,
+            }
+            for score, example in scored[:SIMILARITY_MAX_EXAMPLES]
+        )
+
+    def training_sample_counts(
+        self,
+        task: dict[str, object],
+        similarity_count: int,
+    ) -> dict[str, int]:
+        workstream = workstream_value(task)
+        priority = priority_value(task)
+        return {
+            "global": len(self.examples),
+            "workstream": sum(
+                1 for example in self.examples if example.workstream == workstream
+            ),
+            "priority": sum(
+                1 for example in self.examples if example.priority == priority
+            ),
+            "workstream_priority": sum(
+                1
+                for example in self.examples
+                if example.workstream == workstream and example.priority == priority
+            ),
+            "similarity": similarity_count,
+        }
+
+
+def build_training_example(
+    task: dict[str, object],
+    actual_spans: dict[str, ActualSpan],
+    outlier_handling: OutlierHandling,
+) -> DurationTrainingExample:
+    span = actual_spans[task_id(task)]
+    adjusted = winsorized_minutes(span.duration_minutes, outlier_handling)
+    return DurationTrainingExample(
+        task_id=task_id(task),
+        duration_minutes=span.duration_minutes,
+        adjusted_duration_minutes=adjusted,
+        workstream=workstream_value(task),
+        priority=priority_value(task),
+        tokens=frozenset(pre_task_tokens(task)),
     )
+
+
+def build_outlier_handling(durations: list[int]) -> OutlierHandling:
+    positive = sorted(duration for duration in durations if duration > 0)
+    if not positive:
+        return OutlierHandling(
+            method="none",
+            applied=False,
+            training_sample_count=0,
+            clipped_sample_count=0,
+            lower_minutes=None,
+            upper_minutes=None,
+        )
+    lower, upper, applied = log_space_winsor_bounds(positive)
+    clipped = sum(1 for duration in positive if duration < lower or duration > upper)
+    return OutlierHandling(
+        method="log_space_iqr_winsorization",
+        applied=applied,
+        training_sample_count=len(positive),
+        clipped_sample_count=clipped,
+        lower_minutes=lower,
+        upper_minutes=upper,
+    )
+
+
+def log_space_winsor_bounds(durations: list[int]) -> tuple[int, int, bool]:
+    if len(durations) < 4:
+        return min(durations), max(durations), False
+    logs = sorted(math.log(duration) for duration in durations)
+    first_quartile = percentile(logs, 0.25)
+    third_quartile = percentile(logs, 0.75)
+    iqr = third_quartile - first_quartile
+    if iqr == 0:
+        center = statistics.median(logs)
+        lower_log = center - math.log(4)
+        upper_log = center + math.log(4)
+    else:
+        lower_log = first_quartile - 1.5 * iqr
+        upper_log = third_quartile + 1.5 * iqr
+    lower = max(1, int(round(math.exp(lower_log))))
+    upper = max(lower, int(round(math.exp(upper_log))))
+    return lower, upper, True
+
+
+def winsorized_minutes(duration: int, outlier_handling: OutlierHandling) -> int:
+    if not outlier_handling.applied:
+        return duration
+    lower = outlier_handling.lower_minutes
+    upper = outlier_handling.upper_minutes
+    if lower is None or upper is None:
+        return duration
+    return min(max(duration, lower), upper)
+
+
+def estimate_interval(
+    minutes: int,
+    selected: tuple[DurationTrainingExample, ...],
+    global_examples: tuple[DurationTrainingExample, ...],
+) -> tuple[int, int, str, str, int]:
+    interval_examples = selected if len(selected) >= 3 else global_examples
+    values = sorted(example.adjusted_duration_minutes for example in interval_examples)
+    if len(values) >= 3:
+        low = max(1, int(math.floor(percentile(values, 0.10))))
+        high = max(low, int(math.ceil(percentile(values, 0.90))))
+        return (
+            min(low, minutes),
+            max(high, minutes),
+            "p10_p90_adjusted_history",
+            "conservative_80_percent",
+            len(values),
+        )
+    low = max(1, int(math.floor(minutes * 0.5)))
+    high = max(low, int(math.ceil(minutes * 2)))
+    return (
+        min(low, minutes),
+        max(high, minutes),
+        "small_sample_multiplier",
+        "conservative_small_history",
+        len(values),
+    )
+
+
+def rounded_median(values: list[int]) -> int:
+    if not values:
+        return DEFAULT_PROJECTED_DURATION_MINUTES
+    return max(1, int(round(statistics.median(sorted(values)))))
+
+
+def stable_examples(
+    examples: tuple[DurationTrainingExample, ...],
+) -> tuple[DurationTrainingExample, ...]:
+    return tuple(sorted(examples, key=lambda example: example.task_id))
+
+
+def task_features(task: dict[str, object]) -> dict[str, object]:
+    return {
+        "workstream": workstream_value(task),
+        "priority": priority_value(task),
+        "pre_task_token_count": len(pre_task_tokens(task)),
+        "token_fields": list(TOKEN_FIELDS),
+    }
+
+
+def feature_reason_payload(features: dict[str, object]) -> tuple[str, ...]:
+    return (
+        f"workstream feature={features['workstream']}",
+        f"priority feature={features['priority']}",
+        (
+            "pre-task text features from "
+            + ", ".join(string_list(features.get("token_fields")))
+        ),
+    )
+
+
+def outlier_reason(outlier_handling: OutlierHandling) -> str:
+    if not outlier_handling.applied:
+        return (
+            "log-space winsorization skipped because fewer than four completed "
+            "durations were available"
+        )
+    clipped = outlier_handling.clipped_sample_count
+    return (
+        "log-space winsorization applied to "
+        f"{outlier_handling.training_sample_count} completed duration(s); "
+        f"{clipped} sample(s) clipped"
+    )
+
+
+def workstream_value(task: dict[str, object]) -> str:
+    return string_value(task.get("section")) or "default"
+
+
+def priority_value(task: dict[str, object]) -> str:
+    return string_value(task.get("priority")) or "unprioritized"
+
+
+def pre_task_tokens(task: dict[str, object]) -> set[str]:
+    tokens: set[str] = set()
+    for field in TOKEN_FIELDS:
+        for match in TOKEN_RE.finditer(string_value(task.get(field)).casefold()):
+            token = match.group(0).strip("_./+-")
+            if len(token) < 3 or token in TOKEN_STOPWORDS:
+                continue
+            tokens.add(token)
+    return tokens
+
+
+def token_similarity(
+    left: set[str] | frozenset[str], right: set[str] | frozenset[str]
+) -> float:
+    if not left or not right:
+        return 0.0
+    intersection = len(left & right)
+    if intersection == 0:
+        return 0.0
+    return intersection / len(left | right)
+
+
+def percentile(values: list[float] | list[int], quantile: float) -> float:
+    if not values:
+        raise ValueError("percentile requires at least one value")
+    ordered = sorted(float(value) for value in values)
+    position = (len(ordered) - 1) * quantile
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    lower = ordered[lower_index]
+    upper = ordered[upper_index]
+    return lower + (upper - lower) * (position - lower_index)
 
 
 def authoritative_mappings_by_task(

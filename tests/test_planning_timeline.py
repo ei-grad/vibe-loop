@@ -5,10 +5,15 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from vibe_loop.config import load_config
-from vibe_loop.planning_timeline import build_planning_timeline
+from vibe_loop.planning_timeline import (
+    ActualSpan,
+    DurationBaselineModel,
+    build_planning_timeline,
+)
 from vibe_loop.runs import RunStore, WorkerReport
 
 
@@ -68,7 +73,13 @@ class PlanningTimelineTests(unittest.TestCase):
         self.assertEqual(projected["duration_minutes"], 91)
         self.assertEqual(
             projected["estimate"]["model"],
-            "completed-actual-median-v1",
+            "robust-duration-baseline-v1/global",
+        )
+        self.assertEqual(projected["estimate"]["low_minutes"], 45)
+        self.assertEqual(projected["estimate"]["high_minutes"], 182)
+        self.assertEqual(
+            projected["estimate"]["interval"]["coverage"],
+            "conservative_small_history",
         )
         self.assertEqual(timeline["schedule_policy"], "current-runner-parity")
 
@@ -158,6 +169,181 @@ class PlanningTimelineTests(unittest.TestCase):
         self.assertEqual(by_id["WIP"]["projected"]["estimate"]["sample_count"], 1)
         self.assertEqual(by_id["WIP"]["projected"]["estimate"]["minutes"], 1)
         self.assertEqual(by_id["FUTURE"]["projected"]["estimate"]["sample_count"], 1)
+
+    def test_duration_model_uses_fixed_fallback_without_completed_history(
+        self,
+    ) -> None:
+        target = task_payload(
+            "TARGET",
+            status="Planned",
+            section="API",
+            priority="P1",
+            scope="Build projected API endpoint.",
+        )
+        estimate = DurationBaselineModel([target], {}).estimate(target).to_json()
+
+        self.assertEqual(estimate["minutes"], 60)
+        self.assertEqual(estimate["low_minutes"], 30)
+        self.assertEqual(estimate["high_minutes"], 120)
+        self.assertEqual(estimate["model"], "fixed-fallback-v1")
+        self.assertEqual(estimate["sample_count"], 0)
+        self.assertEqual(
+            estimate["interval"]["coverage"],
+            "conservative_small_history",
+        )
+        self.assertEqual(estimate["training_sample_counts"]["global"], 0)
+
+    def test_duration_model_falls_back_to_workstream_and_priority_history(
+        self,
+    ) -> None:
+        api_a = task_payload("API-A", section="API", priority="P1", scope="api cache")
+        api_b = task_payload("API-B", section="API", priority="P2", scope="api auth")
+        cli_a = task_payload("CLI-A", section="CLI", priority="P1", scope="cli output")
+        infra_a = task_payload(
+            "INFRA-A",
+            section="Infra",
+            priority="P1",
+            scope="infra deploy",
+        )
+        api_future = task_payload(
+            "API-FUTURE",
+            status="Planned",
+            section="API",
+            priority="P9",
+            scope="api future",
+        )
+        docs_future = task_payload(
+            "DOCS-FUTURE",
+            status="Planned",
+            section="Docs",
+            priority="P1",
+            scope="docs future",
+        )
+        model = DurationBaselineModel(
+            [api_a, api_b, cli_a, infra_a, api_future, docs_future],
+            {
+                "API-A": actual_span("API-A", 30),
+                "API-B": actual_span("API-B", 60),
+                "CLI-A": actual_span("CLI-A", 120),
+                "INFRA-A": actual_span("INFRA-A", 180),
+            },
+        )
+
+        workstream = model.estimate(api_future).to_json()
+        priority = model.estimate(docs_future).to_json()
+
+        self.assertEqual(
+            workstream["model"],
+            "robust-duration-baseline-v1/workstream",
+        )
+        self.assertEqual(workstream["minutes"], 45)
+        self.assertEqual(workstream["sample_count"], 2)
+        self.assertEqual(workstream["training_sample_counts"]["workstream"], 2)
+        self.assertEqual(
+            priority["model"],
+            "robust-duration-baseline-v1/priority",
+        )
+        self.assertEqual(priority["minutes"], 120)
+        self.assertEqual(priority["sample_count"], 3)
+        self.assertEqual(priority["training_sample_counts"]["priority"], 3)
+
+    def test_duration_model_clamps_log_space_outliers_for_bounds(self) -> None:
+        tasks = [
+            task_payload(f"DONE-{index}", scope=f"history {index}")
+            for index in range(1, 6)
+        ]
+        target = task_payload("TARGET", status="Planned", scope="future task")
+        actuals = {
+            "DONE-1": actual_span("DONE-1", 60),
+            "DONE-2": actual_span("DONE-2", 60),
+            "DONE-3": actual_span("DONE-3", 60),
+            "DONE-4": actual_span("DONE-4", 60),
+            "DONE-5": actual_span("DONE-5", 960),
+        }
+        estimate = (
+            DurationBaselineModel([*tasks, target], actuals).estimate(target).to_json()
+        )
+
+        self.assertEqual(estimate["minutes"], 60)
+        self.assertEqual(estimate["outlier_handling"]["clipped_sample_count"], 1)
+        self.assertEqual(estimate["outlier_handling"]["upper_minutes"], 240)
+        self.assertLessEqual(estimate["high_minutes"], 240)
+        self.assertEqual(
+            estimate["interval"]["coverage"],
+            "conservative_80_percent",
+        )
+
+    def test_similarity_blend_uses_pre_task_tokens_without_evidence_leakage(
+        self,
+    ) -> None:
+        short = task_payload(
+            "SHORT",
+            title="Calendar grid",
+            scope="render calendar grid",
+            acceptance="snap grid",
+            evidence="unrelated",
+        )
+        long = task_payload(
+            "LONG",
+            title="Migration",
+            scope="database migration",
+            acceptance="migrate tables",
+            evidence="render calendar grid",
+        )
+        target = task_payload(
+            "TARGET",
+            status="Planned",
+            title="Calendar grid",
+            scope="render calendar grid",
+            acceptance="snap grid",
+        )
+        estimate = (
+            DurationBaselineModel(
+                [short, long, target],
+                {
+                    "SHORT": actual_span("SHORT", 40),
+                    "LONG": actual_span("LONG", 240),
+                },
+            )
+            .estimate(target)
+            .to_json()
+        )
+
+        self.assertEqual(
+            estimate["model"],
+            "robust-duration-baseline-v1/workstream-priority+similarity",
+        )
+        self.assertEqual(estimate["similarity_examples"][0]["task_id"], "SHORT")
+        self.assertNotIn(
+            "LONG",
+            [item["task_id"] for item in estimate["similarity_examples"]],
+        )
+        self.assertEqual(
+            estimate["features"]["token_fields"],
+            ["title", "scope", "acceptance"],
+        )
+
+    def test_duration_model_estimates_are_deterministic(self) -> None:
+        a = task_payload("A", section="API", priority="P0", scope="api cache")
+        b = task_payload("B", section="API", priority="P0", scope="api auth")
+        c = task_payload("C", section="CLI", priority="P2", scope="cli output")
+        target = task_payload(
+            "TARGET",
+            status="Planned",
+            section="API",
+            priority="P0",
+            scope="api future",
+        )
+        actuals = {
+            "A": actual_span("A", 50),
+            "B": actual_span("B", 70),
+            "C": actual_span("C", 200),
+        }
+
+        first = DurationBaselineModel([a, b, c, target], actuals).estimate(target)
+        second = DurationBaselineModel([target, c, b, a], actuals).estimate(target)
+
+        self.assertEqual(first.to_json(), second.to_json())
 
     def test_dependency_projection_and_unknown_dependency_warnings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -342,6 +528,51 @@ def projected_order(timeline: dict[str, object]) -> list[str]:
         str(task["id"])
         for task in sorted(projected, key=lambda task: task["projected"]["sequence"])
     ]
+
+
+def task_payload(
+    task_id: str,
+    *,
+    status: str = "Done",
+    section: str = "default",
+    priority: str = "P0",
+    title: str = "",
+    scope: str = "",
+    acceptance: str = "Works.",
+    evidence: str = "",
+) -> dict[str, object]:
+    return {
+        "id": task_id,
+        "title": title or scope or task_id,
+        "section": section,
+        "status": status,
+        "priority": priority,
+        "dependencies": [],
+        "resources": [],
+        "paths": [],
+        "conflict_domains_known": False,
+        "scope": scope,
+        "acceptance": acceptance,
+        "evidence": evidence,
+        "source": "PLAN.md:Test",
+        "order": 0,
+    }
+
+
+def actual_span(task_id: str, duration_minutes: int) -> ActualSpan:
+    end = datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(
+        minutes=duration_minutes
+    )
+    return ActualSpan(
+        task_id=task_id,
+        start=end - timedelta(minutes=duration_minutes),
+        end=end,
+        duration_minutes=duration_minutes,
+        raw_duration_minutes=duration_minutes,
+        idle_gap_clipped_minutes=0,
+        commits=(),
+        mapping_sources=("test",),
+    )
 
 
 def warning_tuples(timeline: dict[str, object]) -> set[tuple[str, str, str]]:

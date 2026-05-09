@@ -146,10 +146,18 @@ visible without inflating projected durations.
 
 Incomplete tasks receive `projected` spans from the latest actual end, or from a
 documented fallback anchor when no actual end exists. Projections are scheduled
-by dependency readiness and the configured projection policy. Until duration
-modeling is added, projected estimates use the median completed actual duration
-when available, otherwise a fixed one-hour fallback with estimate reasons
-serialized on each projected task.
+by dependency readiness and the configured projection policy.
+
+Projected estimates are produced by `robust-duration-baseline-v1`. The model
+trains only on completed tasks with authoritative actual spans, applies
+log-space winsorization before calculating medians, and selects the narrowest
+usable baseline in this order: matching workstream plus priority, matching
+workstream, matching priority, then global history. When no completed actual
+history exists, estimates fall back to one hour. Each estimate serializes the
+chosen minutes, low/high interval, interval coverage, model name, training
+sample counts, outlier handling, feature reasons, evidence reasons, and any
+leakage-safe similarity examples. Similarity uses only pre-task text fields:
+title, scope, and acceptance.
 
 ## Doctor Readiness
 
