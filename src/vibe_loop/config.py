@@ -22,7 +22,7 @@ def prepare_shell_command(
 ) -> tuple[str | list[str], bool]:
     if sys.platform != "win32":
         return command, True
-    parts = shlex.split(command, posix=True)
+    parts = _split_windows_command(command)
     resolved = shutil.which(parts[0])
     if resolved is None:
         return command, True
@@ -32,6 +32,11 @@ def prepare_shell_command(
             return [sys.executable, script, *parts[1:]], False
         return [resolved, *parts[1:]], True
     return [resolved, *parts[1:]], False
+
+
+def _split_windows_command(command: str) -> list[str]:
+    tokens = shlex.split(command, posix=False)
+    return [t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t for t in tokens]
 
 
 def _resolve_cmd_wrapper_target(cmd_path: str) -> str | None:
