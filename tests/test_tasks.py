@@ -10,6 +10,7 @@ from vibe_loop.tasks import (
     MarkdownProfileSource,
     build_task_source,
     runnable_tasks,
+    task_from_mapping,
 )
 from vibe_loop.task_views import build_task_views, render_task_tree
 
@@ -169,6 +170,77 @@ class MarkdownPlanTests(unittest.TestCase):
             candidates = runnable_tasks(source, ("Low",))
 
         self.assertEqual([task.task_id for task in candidates], ["WORK-01"])
+
+    def test_profile_table_extracts_conflict_domains(self) -> None:
+        profile = work_table_profile()
+        fields = profile["fields"]
+        assert isinstance(fields, dict)
+        fields["resources"] = {"column": "Resources"}
+        fields["paths"] = {"column": "Paths"}
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "WORK.md").write_text(
+                "# Work\n\n"
+                "| Key | State | Summary | Resources | Paths |\n"
+                "| --- | --- | --- | --- | --- |\n"
+                "| WORK-01 | Todo | API change. | api, schema | src/api, db/schema.sql |\n"
+                "| WORK-02 | Todo | No writes. | none | none |\n"
+                "| WORK-03 | Todo | Missing declaration. |  |  |\n",
+                encoding="utf-8",
+            )
+            source = MarkdownProfileSource(repo, profile)
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].resources, ("api", "schema"))
+        self.assertEqual(tasks[0].paths, ("src/api", "db/schema.sql"))
+        self.assertTrue(tasks[0].conflict_domains_known)
+        self.assertEqual(tasks[1].resources, ())
+        self.assertEqual(tasks[1].paths, ())
+        self.assertTrue(tasks[1].conflict_domains_known)
+        self.assertEqual(tasks[2].resources, ())
+        self.assertEqual(tasks[2].paths, ())
+        self.assertFalse(tasks[2].conflict_domains_known)
+
+    def test_command_task_source_extracts_conflict_domains(self) -> None:
+        task = task_from_mapping(
+            {
+                "id": "CMD-01",
+                "title": "Command task",
+                "status": "Next",
+                "resources": ["api", "api", "db"],
+                "paths": ["src/api", "src/api/", "db/schema.sql"],
+            },
+            0,
+        )
+
+        self.assertEqual(task.resources, ("api", "db"))
+        self.assertEqual(task.paths, ("src/api", "db/schema.sql"))
+        self.assertTrue(task.conflict_domains_known)
+
+        unknown = task_from_mapping(
+            {
+                "id": "CMD-02",
+                "title": "Unknown domains",
+                "status": "Next",
+                "resources": None,
+                "paths": None,
+            },
+            0,
+        )
+        empty = task_from_mapping(
+            {
+                "id": "CMD-03",
+                "title": "Explicitly empty domains",
+                "status": "Next",
+                "resources": [],
+                "paths": [],
+            },
+            0,
+        )
+
+        self.assertFalse(unknown.conflict_domains_known)
+        self.assertTrue(empty.conflict_domains_known)
 
     def test_profile_heading_docs_extract_tasks_from_heading_and_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

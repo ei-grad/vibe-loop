@@ -123,8 +123,11 @@ mechanically, and cache it as repo-local state.
 The agent-generated profile should describe how to read existing repo artifacts,
 not invent task state. It can map column names, heading/list conventions,
 statuses, dependency syntax, done states, candidate files, and title/acceptance
-extraction rules into the existing normalized `Task` model. The CLI must still
-own validation: required fields, runnable statuses, dependency references,
+extraction rules into the existing normalized `Task` model. Optional
+`resources` and `paths` field mappings declare conflict domains for parallel
+scheduling; if a repository does not provide those fields, the runner treats the
+domains as unknown whenever conflict-domain scheduling is active. The CLI must
+still own validation: required fields, runnable statuses, dependency references,
 duplicate IDs, parser output shape, and cache freshness are deterministic
 checks. Generated profiles must be non-executable parser descriptions over
 bounded repo-local evidence. Command adapters or any other executable task

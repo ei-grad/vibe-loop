@@ -5,7 +5,8 @@ import json
 import os
 import re
 import subprocess
-from pathlib import Path
+from collections.abc import Iterable
+from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from vibe_loop.config import DEFAULT_RUNNABLE_STATUSES, TaskSourceConfig
@@ -31,6 +32,8 @@ MARKDOWN_FIELD_NAMES = {
     "evidence",
     "id",
     "priority",
+    "paths",
+    "resources",
     "scope",
     "section",
     "status",
@@ -82,6 +85,9 @@ class Task:
     section: str = ""
     priority: str = ""
     dependencies: tuple[str, ...] = ()
+    resources: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+    conflict_domains_known: bool = False
     scope: str = ""
     acceptance: str = ""
     evidence: str = ""
@@ -100,6 +106,9 @@ class Task:
             "section": self.section,
             "priority": self.priority,
             "dependencies": list(self.dependencies),
+            "resources": list(self.resources),
+            "paths": list(self.paths),
+            "conflict_domains_known": self.conflict_domains_known,
             "scope": self.scope,
             "acceptance": self.acceptance,
             "evidence": self.evidence,
@@ -366,7 +375,11 @@ def parse_field_mapping(field_name: str, mapping: dict[str, object]) -> FieldMap
         )
     none_values = mapping.get("none_values")
     if none_values is None:
-        none = ("none",) if field_name == "dependencies" else ()
+        none = (
+            ("none",)
+            if field_name in {"dependencies", "resources", "paths"}
+            else ()
+        )
     elif isinstance(none_values, list) and all(
         isinstance(item, str) and item for item in none_values
     ):
@@ -696,6 +709,23 @@ def task_from_markdown_record(
         )
     except ValueError as exc:
         raise ValueError(f"{record.source}: {exc}") from exc
+    resources_mapping = profile.fields.get("resources")
+    paths_mapping = profile.fields.get("paths")
+    resources_value = extract_profile_value(profile, record, "resources")
+    paths_value = extract_profile_value(profile, record, "paths")
+    try:
+        resources = parse_resource_list(
+            resources_value,
+            none_values=resources_mapping.none_values
+            if resources_mapping
+            else ("none",),
+        )
+        paths = parse_path_list(
+            paths_value,
+            none_values=paths_mapping.none_values if paths_mapping else ("none",),
+        )
+    except ValueError as exc:
+        raise ValueError(f"{record.source}: {exc}") from exc
     return Task(
         task_id=task_id,
         title=title,
@@ -703,6 +733,12 @@ def task_from_markdown_record(
         section=section,
         priority=extract_profile_value(profile, record, "priority"),
         dependencies=dependencies,
+        resources=resources,
+        paths=paths,
+        conflict_domains_known=(
+            resource_declaration_present(resources_mapping, resources_value)
+            or resource_declaration_present(paths_mapping, paths_value)
+        ),
         scope=extract_profile_value(profile, record, "scope"),
         acceptance=extract_profile_value(profile, record, "acceptance"),
         evidence=extract_profile_value(profile, record, "evidence"),
@@ -1002,6 +1038,13 @@ def task_from_mapping(value: object, order: int) -> Task:
     dependencies = value.get("dependencies") or []
     if not isinstance(dependencies, list):
         raise ValueError("task dependencies must be an array")
+    resources_present = "resources" in value and value.get("resources") is not None
+    paths_present = "paths" in value and value.get("paths") is not None
+    resources = parse_task_string_array(value.get("resources"), "resources")
+    paths = tuple(
+        normalize_path_lock(path)
+        for path in parse_task_string_array(value.get("paths"), "paths")
+    )
     return Task(
         task_id=str(value.get("id") or value.get("task_id") or ""),
         title=str(value.get("title") or value.get("id") or value.get("task_id") or ""),
@@ -1009,6 +1052,13 @@ def task_from_mapping(value: object, order: int) -> Task:
         section=str(value.get("section") or ""),
         priority=str(value.get("priority") or ""),
         dependencies=tuple(str(item) for item in dependencies),
+        resources=dedupe_preserving_order(
+            normalize_resource(resource) for resource in resources
+        ),
+        paths=dedupe_preserving_order(paths),
+        conflict_domains_known=bool(value.get("conflict_domains_known"))
+        or resources_present
+        or paths_present,
         scope=str(value.get("scope") or ""),
         acceptance=str(value.get("acceptance") or ""),
         evidence=str(value.get("evidence") or ""),
@@ -1054,6 +1104,104 @@ def parse_dependencies(
             f"{', '.join(invalid)} must be comma-separated task IDs"
         )
     return tuple(parts)
+
+
+def parse_resource_list(
+    value: str,
+    *,
+    none_values: tuple[str, ...] = ("none",),
+) -> tuple[str, ...]:
+    return dedupe_preserving_order(
+        normalize_resource(part)
+        for part in parse_comma_separated_values(
+            value,
+            none_values=none_values,
+            value_name="resource",
+        )
+    )
+
+
+def resource_declaration_present(
+    mapping: FieldMapping | None,
+    value: str,
+) -> bool:
+    return mapping is not None and bool(value.strip())
+
+
+def parse_path_list(
+    value: str,
+    *,
+    none_values: tuple[str, ...] = ("none",),
+) -> tuple[str, ...]:
+    return dedupe_preserving_order(
+        normalize_path_lock(part)
+        for part in parse_comma_separated_values(
+            value,
+            none_values=none_values,
+            value_name="path",
+        )
+    )
+
+
+def parse_comma_separated_values(
+    value: str,
+    *,
+    none_values: tuple[str, ...],
+    value_name: str,
+) -> tuple[str, ...]:
+    text = value.strip()
+    if not text:
+        return ()
+    if text.casefold() in {none.casefold() for none in none_values}:
+        return ()
+    if ";" in text:
+        raise ValueError(f"invalid {value_name} syntax: use comma-separated values")
+    parts = [part.strip() for part in text.replace("\n", ",").split(",")]
+    if any(not part for part in parts):
+        raise ValueError(f"invalid {value_name} syntax: empty {value_name}")
+    return tuple(parts)
+
+
+def parse_task_string_array(value: object, name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f"task {name} must be an array of strings")
+    return tuple(value)
+
+
+def normalize_resource(value: str) -> str:
+    resource = value.strip()
+    if (
+        not resource
+        or not DEPENDENCY_ID_RE.fullmatch(resource)
+        or any(char.isspace() for char in resource)
+    ):
+        raise ValueError(f"invalid resource syntax: {value}")
+    return resource
+
+
+def normalize_path_lock(value: str) -> str:
+    path = value.strip().replace("\\", "/")
+    pure = PurePosixPath(path)
+    if (
+        not path
+        or pure.is_absolute()
+        or any(part in {"", ".", ".."} for part in pure.parts)
+    ):
+        raise ValueError(f"invalid path lock syntax: {value}")
+    return pure.as_posix().rstrip("/")
+
+
+def dedupe_preserving_order(values: Iterable[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return tuple(deduped)
 
 
 def first_sentence(value: str) -> str:

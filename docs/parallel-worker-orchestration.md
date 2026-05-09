@@ -13,7 +13,7 @@ while making `vibe-loop run-until-done --jobs N` useful for unattended work.
 ## Operating Model
 
 1. The supervisor reads the task graph and recent run logs.
-2. It selects up to `N` ready, unlocked tasks.
+2. It selects up to `N` ready, unlocked, mutually compatible tasks.
 3. It locks each task and spawns one finite worker per task with the configured
    `agent.command`, defaulting to `codex exec '$vibe-loop <task_id>'`.
 4. Each worker writes to its own run log and performs the full slice lifecycle.
@@ -35,6 +35,10 @@ results are missing or ambiguous.
 - Task discovery is explicit-first. User-authored `.vibe-loop.toml` and command
   adapters win over generated state. Generic Markdown discovery must not require
   repositories to adopt vibe-loop's local planning table shape.
+- Resource/path conflict domains are optional task metadata. When present, the
+  supervisor rejects overlapping resources or path ancestry before spawning a
+  batch; undeclared domains are treated conservatively once conflict-domain
+  scheduling is active.
 - Agent execution is configurable. `codex exec` is the default worker command,
   not a required runtime dependency; other prompt-mode agents such as
   `claude -p` should be supported as first-class configured commands.

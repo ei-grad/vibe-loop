@@ -29,6 +29,9 @@ class ActiveRunState:
     started_at: str
     base_main: str
     command: str
+    resources: tuple[str, ...] = ()
+    paths: tuple[str, ...] = ()
+    conflict_domains_known: bool = False
     worker_pid: int | None = None
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
@@ -45,6 +48,9 @@ class ActiveRunState:
         log_path: Path,
         base_main: str,
         command: str,
+        resources: tuple[str, ...] = (),
+        paths: tuple[str, ...] = (),
+        conflict_domains_known: bool = False,
     ) -> ActiveRunState:
         return cls(
             task_id=task_id,
@@ -53,6 +59,9 @@ class ActiveRunState:
             started_at=utc_now_iso(),
             base_main=base_main,
             command=command,
+            resources=resources,
+            paths=paths,
+            conflict_domains_known=conflict_domains_known,
             supervisor_pid=os.getpid(),
         )
 
@@ -85,6 +94,11 @@ class ActiveRunState:
                 or ""
             ),
             command=optional_string(metadata.get("command")) or "",
+            resources=optional_string_tuple(metadata.get("resources")),
+            paths=optional_string_tuple(metadata.get("paths")),
+            conflict_domains_known=optional_bool(
+                metadata.get("conflict_domains_known")
+            ),
             worker_pid=worker_pid,
             pid_source=pid_source,
             pid_scope=(
@@ -116,6 +130,9 @@ class ActiveRunState:
             "base_main": self.base_main,
             "start_main": self.base_main,
             "command": self.command,
+            "resources": list(self.resources),
+            "paths": list(self.paths),
+            "conflict_domains_known": self.conflict_domains_known,
         }
 
 
@@ -147,6 +164,9 @@ class WorkerView:
             "log": str(self.active.log_path),
             "base_main": self.active.base_main,
             "command": self.active.command,
+            "resources": list(self.active.resources),
+            "paths": list(self.active.paths),
+            "conflict_domains_known": self.active.conflict_domains_known,
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
             "result_status": self.result_status,
             "result_finished_at": self.result_finished_at,
@@ -291,6 +311,16 @@ def optional_int(value: object) -> int | None:
     if isinstance(value, int):
         return value
     return None
+
+
+def optional_bool(value: object) -> bool:
+    return value if isinstance(value, bool) else False
+
+
+def optional_string_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
 
 
 def result_value(record: dict[str, Any] | None, key: str) -> str | None:

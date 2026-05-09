@@ -15,6 +15,7 @@ from vibe_loop.runner import (
     VibeRunner,
     build_batch_selection_prompt,
     build_selection_prompt,
+    deterministic_task_batch,
     parse_selected_task_id,
     parse_selected_task_ids,
     parse_worker_session_id,
@@ -23,6 +24,7 @@ from vibe_loop.runner import (
 )
 from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
 from vibe_loop.tasks import Task
+from vibe_loop.workers import ActiveRunState
 
 
 class MutableTaskSource:
@@ -141,6 +143,152 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(too_many.error, "too many task_ids")
         self.assertFalse(locked.valid)
         self.assertEqual(locked.error, "locked task_id: TASK-02")
+
+    def test_validate_selected_task_batch_rejects_resource_conflicts(self) -> None:
+        candidates = [
+            Task(
+                task_id="TASK-01",
+                title="Task 1",
+                status="Next",
+                resources=("api",),
+                conflict_domains_known=True,
+                order=1,
+            ),
+            Task(
+                task_id="TASK-02",
+                title="Task 2",
+                status="Next",
+                resources=("api",),
+                conflict_domains_known=True,
+                order=2,
+            ),
+            Task(
+                task_id="TASK-03",
+                title="Task 3",
+                status="Next",
+                resources=("docs",),
+                conflict_domains_known=True,
+                order=3,
+            ),
+        ]
+
+        conflicting = validate_selected_task_batch(
+            ["TASK-01", "TASK-02"],
+            candidates,
+            limit=2,
+        )
+        disjoint = validate_selected_task_batch(
+            ["TASK-01", "TASK-03"],
+            candidates,
+            limit=2,
+        )
+
+        self.assertFalse(conflicting.valid)
+        self.assertEqual(conflicting.error, "conflicting task_ids: TASK-01, TASK-02")
+        self.assertTrue(disjoint.valid)
+
+    def test_validate_selected_task_batch_rejects_overlapping_paths(self) -> None:
+        candidates = [
+            Task(
+                task_id="TASK-01",
+                title="Task 1",
+                status="Next",
+                paths=("src/api",),
+                conflict_domains_known=True,
+            ),
+            Task(
+                task_id="TASK-02",
+                title="Task 2",
+                status="Next",
+                paths=("src/api/models",),
+                conflict_domains_known=True,
+            ),
+            Task(
+                task_id="TASK-03",
+                title="Task 3",
+                status="Next",
+                paths=("src/web",),
+                conflict_domains_known=True,
+            ),
+            Task(
+                task_id="TASK-04",
+                title="Task 4",
+                status="Next",
+                paths=(".",),
+                conflict_domains_known=True,
+            ),
+        ]
+
+        conflicting = validate_selected_task_batch(
+            ["TASK-01", "TASK-02"],
+            candidates,
+            limit=2,
+        )
+        disjoint = validate_selected_task_batch(
+            ["TASK-01", "TASK-03"],
+            candidates,
+            limit=2,
+        )
+        root = validate_selected_task_batch(
+            ["TASK-03", "TASK-04"],
+            candidates,
+            limit=2,
+        )
+
+        self.assertFalse(conflicting.valid)
+        self.assertTrue(disjoint.valid)
+        self.assertFalse(root.valid)
+
+    def test_deterministic_task_batch_keeps_legacy_no_domain_behavior(self) -> None:
+        candidates = [
+            Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+            Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+        ]
+
+        selected = deterministic_task_batch(candidates, 2)
+
+        self.assertEqual(
+            [task.task_id for task in selected],
+            ["TASK-01", "TASK-02"],
+        )
+
+    def test_deterministic_task_batch_skips_conflicts_and_unknown_domains(
+        self,
+    ) -> None:
+        candidates = [
+            Task(
+                task_id="TASK-01",
+                title="Task 1",
+                status="Next",
+                resources=("api",),
+                conflict_domains_known=True,
+                order=1,
+            ),
+            Task(
+                task_id="TASK-02",
+                title="Task 2",
+                status="Next",
+                resources=("api",),
+                conflict_domains_known=True,
+                order=2,
+            ),
+            Task(task_id="TASK-03", title="Task 3", status="Next", order=3),
+            Task(
+                task_id="TASK-04",
+                title="Task 4",
+                status="Next",
+                resources=("docs",),
+                conflict_domains_known=True,
+                order=4,
+            ),
+        ]
+
+        selected = deterministic_task_batch(candidates, 3)
+
+        self.assertEqual(
+            [task.task_id for task in selected],
+            ["TASK-01", "TASK-04"],
+        )
 
     def test_parse_worker_session_id_from_codex_style_output(self) -> None:
         self.assertEqual(parse_worker_session_id("session id: abc-123"), "abc-123")
@@ -398,6 +546,287 @@ class RunnerTests(unittest.TestCase):
                 runner.lock_manager.release(held_lock)
 
         self.assertEqual([result.task_id for result in results], ["TASK-02"])
+
+    def test_run_until_done_parallel_excludes_resource_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-01",
+                        title="Task 1",
+                        status="Next",
+                        resources=("api",),
+                        conflict_domains_known=True,
+                        order=1,
+                    ),
+                    Task(
+                        task_id="TASK-02",
+                        title="Task 2",
+                        status="Next",
+                        resources=("api",),
+                        conflict_domains_known=True,
+                        order=2,
+                    ),
+                    Task(
+                        task_id="TASK-03",
+                        title="Task 3",
+                        status="Next",
+                        resources=("docs",),
+                        conflict_domains_known=True,
+                        order=3,
+                    ),
+                ]
+            )
+            runner._source = source
+            active = 0
+            max_active = 0
+            active_lock = threading.Lock()
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                source.mark_done(task.task_id)
+                with active_lock:
+                    active -= 1
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done(jobs=2, max_slices=2)
+
+        self.assertEqual(max_active, 2)
+        self.assertEqual(
+            sorted(result.task_id for result in results),
+            ["TASK-01", "TASK-03"],
+        )
+
+    def test_parallel_refill_honors_scheduled_resource_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-01",
+                        title="Task 1",
+                        status="Next",
+                        resources=("api",),
+                        conflict_domains_known=True,
+                        order=1,
+                    ),
+                    Task(
+                        task_id="TASK-02",
+                        title="Task 2",
+                        status="Next",
+                        resources=("api",),
+                        conflict_domains_known=True,
+                        order=2,
+                    ),
+                ]
+            )
+            runner._source = source
+            active = 0
+            max_active = 0
+            active_lock = threading.Lock()
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                source.mark_done(task.task_id)
+                with active_lock:
+                    active -= 1
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done(jobs=2, max_slices=2)
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(
+            [result.task_id for result in results],
+            ["TASK-01", "TASK-02"],
+        )
+
+    def test_list_candidates_excludes_active_resource_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            runner._source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-01",
+                        title="Task 1",
+                        status="Next",
+                        resources=("api",),
+                        conflict_domains_known=True,
+                        order=1,
+                    ),
+                    Task(
+                        task_id="TASK-02",
+                        title="Task 2",
+                        status="Next",
+                        resources=("docs",),
+                        conflict_domains_known=True,
+                        order=2,
+                    ),
+                ]
+            )
+            held_lock = runner.lock_manager.acquire(
+                "EXTERNAL-01",
+                "external-run",
+                metadata={
+                    "record_type": "active_run",
+                    "resources": ["api"],
+                    "paths": [],
+                    "conflict_domains_known": True,
+                },
+            )
+            try:
+                candidates = runner.list_candidates()
+            finally:
+                runner.lock_manager.release(held_lock)
+
+        self.assertEqual([task.task_id for task in candidates], ["TASK-02"])
+
+    def test_task_lock_acquire_rechecks_active_resource_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            task = Task(
+                task_id="TASK-01",
+                title="Task 1",
+                status="Next",
+                resources=("api",),
+                conflict_domains_known=True,
+            )
+            active_state = ActiveRunState.new(
+                task_id=task.task_id,
+                run_id="run-task",
+                log_path=repo / "run.log",
+                base_main="aaa",
+                command="worker",
+                resources=task.resources,
+                paths=task.paths,
+                conflict_domains_known=task.conflict_domains_known,
+            )
+            held_lock = runner.lock_manager.acquire(
+                "EXTERNAL-01",
+                "external-run",
+                metadata={
+                    "record_type": "active_run",
+                    "resources": ["api"],
+                    "paths": [],
+                    "conflict_domains_known": True,
+                },
+            )
+            try:
+                with self.assertRaises(LockBusy) as busy:
+                    runner.acquire_scheduled_task_lock(
+                        task,
+                        "run-task",
+                        active_state,
+                    )
+            finally:
+                runner.lock_manager.release(held_lock)
+
+        self.assertEqual(busy.exception.metadata["reason"], "resource_conflict")
+        self.assertFalse(runner.lock_manager.is_locked("TASK-01"))
+
+    def test_scheduler_lock_does_not_reserve_matching_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            task = Task(
+                task_id="resource-scheduler",
+                title="Task with internal lock name",
+                status="Next",
+            )
+            active_state = ActiveRunState.new(
+                task_id=task.task_id,
+                run_id="run-task",
+                log_path=repo / "run.log",
+                base_main="aaa",
+                command="worker",
+            )
+
+            task_lock = runner.acquire_scheduled_task_lock(
+                task,
+                "run-task",
+                active_state,
+            )
+            try:
+                self.assertTrue(runner.lock_manager.is_locked("resource-scheduler"))
+            finally:
+                runner.lock_manager.release(task_lock)
+
+    def test_leftover_scheduler_lock_file_does_not_block_task_acquire(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            internal_dir = repo / ".vibe-loop" / "internal-locks"
+            internal_dir.mkdir(parents=True)
+            (internal_dir / "resource-scheduler.lock").write_text(
+                '{"pid": 1, "owner_task_id": "old"}\n',
+                encoding="utf-8",
+            )
+            task = Task(
+                task_id="TASK-01",
+                title="Task 1",
+                status="Next",
+            )
+            active_state = ActiveRunState.new(
+                task_id=task.task_id,
+                run_id="run-task",
+                log_path=repo / "run.log",
+                base_main="aaa",
+                command="worker",
+            )
+
+            task_lock = runner.acquire_scheduled_task_lock(
+                task,
+                "run-task",
+                active_state,
+            )
+            try:
+                self.assertTrue(runner.lock_manager.is_locked("TASK-01"))
+            finally:
+                runner.lock_manager.release(task_lock)
 
     def test_run_until_done_parallel_skips_task_lock_races(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

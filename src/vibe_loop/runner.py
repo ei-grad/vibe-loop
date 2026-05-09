@@ -8,12 +8,13 @@ import shlex
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO
+from typing import BinaryIO, TextIO
 
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
@@ -25,10 +26,20 @@ from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
     resolve_runtime_task_source,
 )
-from vibe_loop.locks import LockBusy, LockManager
+from vibe_loop.locks import LockBusy, LockManager, TaskLock
 from vibe_loop.runs import RunResult, RunStore, WorkerReport
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None
 
 
 SESSION_ID_RE = re.compile(
@@ -36,6 +47,9 @@ SESSION_ID_RE = re.compile(
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
+RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
+RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS = 5.0
+RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,6 +79,25 @@ class BatchSelectionValidation:
     @property
     def valid(self) -> bool:
         return not self.error
+
+
+@dataclasses.dataclass(frozen=True)
+class ConflictDomains:
+    known: bool
+    resources: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    paths: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class SchedulerLock:
+    path: Path
+    handle: BinaryIO
+
+
+class SchedulerLockBusy(RuntimeError):
+    def __init__(self, path: Path):
+        self.path = path
+        super().__init__(f"resource scheduler lock is busy: {path}")
 
 
 class SessionIdObserver:
@@ -116,14 +149,21 @@ class VibeRunner:
 
     def list_candidates(self, exclude: set[str] | None = None) -> list[Task]:
         excluded = exclude or set()
+        tasks = runnable_tasks(
+            self.source,
+            self.source_resolution.task_source.runnable_statuses,
+        )
+        active_domains = active_lock_conflict_domains(self.lock_manager)
+        enforce_conflicts = resource_conflicts_enabled(tasks, active_domains)
         return [
             task
-            for task in runnable_tasks(
-                self.source,
-                self.source_resolution.task_source.runnable_statuses,
-            )
+            for task in tasks
             if task.task_id not in excluded
             and not self.lock_manager.is_locked(task.task_id)
+            and (
+                not enforce_conflicts
+                or not task_conflicts_with_domains(task, active_domains)
+            )
         ]
 
     def select_task(
@@ -251,6 +291,7 @@ class VibeRunner:
             candidates,
             limit=limit,
             is_locked=self.lock_manager.is_locked,
+            enforce_resource_conflicts=resource_conflicts_enabled(candidates, ()),
         )
         if not validation.valid:
             report_status(f"agent batch selection rejected: {validation.error}")
@@ -291,11 +332,14 @@ class VibeRunner:
             log_path=log_path,
             base_main=base_main,
             command=command,
+            resources=task.resources,
+            paths=task.paths,
+            conflict_domains_known=task.conflict_domains_known,
         )
-        task_lock = self.lock_manager.acquire(
-            task.task_id,
+        task_lock = self.acquire_scheduled_task_lock(
+            task,
             run_id,
-            metadata=active_state.to_lock_metadata(),
+            active_state,
         )
         try:
             with log_path.open("w", encoding="utf-8") as log:
@@ -414,6 +458,77 @@ class VibeRunner:
         finally:
             self.lock_manager.release(task_lock)
 
+    def acquire_scheduled_task_lock(
+        self,
+        task: Task,
+        run_id: str,
+        active_state: ActiveRunState,
+    ) -> TaskLock:
+        scheduler_lock = self.acquire_scheduler_lock(
+            run_id,
+            task.task_id,
+        )
+        try:
+            active_domains = active_lock_conflict_domains(self.lock_manager)
+            if resource_conflicts_enabled([task], active_domains) and (
+                task_conflicts_with_domains(task, active_domains)
+            ):
+                raise LockBusy(
+                    scheduler_lock.path,
+                    {
+                        "reason": "resource_conflict",
+                        "task_id": task.task_id,
+                        "resources": list(task.resources),
+                        "paths": list(task.paths),
+                        "conflict_domains_known": task.conflict_domains_known,
+                    },
+                )
+            return self.lock_manager.acquire(
+                task.task_id,
+                run_id,
+                metadata=active_state.to_lock_metadata(),
+            )
+        finally:
+            self.release_scheduler_lock(scheduler_lock)
+
+    def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
+        lock_path = (
+            self.config.state_path
+            / "internal-locks"
+            / f"{RESOURCE_SCHEDULER_LOCK_NAME}.lock"
+        )
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        deadline = time.monotonic() + RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS
+        while True:
+            if not try_lock_scheduler_file(handle):
+                if time.monotonic() >= deadline:
+                    handle.close()
+                    raise SchedulerLockBusy(lock_path)
+                time.sleep(RESOURCE_SCHEDULER_LOCK_POLL_SECONDS)
+                continue
+            handle.seek(0)
+            handle.truncate()
+            payload = {
+                "record_type": "resource_scheduler_lock",
+                "run_id": run_id,
+                "owner_task_id": task_id,
+                "pid": os.getpid(),
+                "started_at": datetime.now(UTC).isoformat(),
+            }
+            handle.write(
+                (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+            return SchedulerLock(path=lock_path, handle=handle)
+
+    def release_scheduler_lock(self, scheduler_lock: SchedulerLock) -> None:
+        try:
+            unlock_scheduler_file(scheduler_lock.handle)
+        finally:
+            scheduler_lock.handle.close()
+
     def run_next(
         self, ask_agent: bool = False, exclude: set[str] | None = None
     ) -> RunResult | None:
@@ -485,7 +600,7 @@ class VibeRunner:
         results: list[RunResult] = []
         skipped: set[str] = set()
         in_flight: dict[Future[RunResult], str] = {}
-        scheduled: set[str] = set()
+        scheduled: dict[str, Task] = {}
         command_validated = False
         announced = False
         stop_after_running = False
@@ -500,7 +615,13 @@ class VibeRunner:
                     and len(in_flight) < jobs
                     and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
                 ):
-                    candidates = self.list_candidates(exclude=skipped | scheduled)
+                    candidates = self.list_candidates(
+                        exclude=skipped | set(scheduled)
+                    )
+                    candidates = filter_scheduled_conflicts(
+                        candidates,
+                        list(scheduled.values()),
+                    )
                     if not candidates:
                         break
                     if not command_validated:
@@ -523,7 +644,7 @@ class VibeRunner:
                         report_status(f"parallel supervisor jobs={jobs}")
                         announced = True
                     for task in tasks:
-                        scheduled.add(task.task_id)
+                        scheduled[task.task_id] = task
                         report_status(f"queueing {task.task_id}: {task.title}")
                         in_flight[executor.submit(self.run_task, task)] = task.task_id
                     if ask_agent and len(candidates) > 1 and len(tasks) < open_slots:
@@ -538,7 +659,7 @@ class VibeRunner:
                 )
                 for future in completed:
                     task_id = in_flight.pop(future)
-                    scheduled.discard(task_id)
+                    scheduled.pop(task_id, None)
                     try:
                         result = future.result()
                     except LockBusy:
@@ -631,6 +752,8 @@ def build_batch_selection_prompt(
             "choose between 1 and max_batch_size task IDs",
             "choose only IDs from candidates",
             "do not return duplicate IDs",
+            "do not combine overlapping declared resources or paths",
+            "do not combine undeclared conflict domains with declared ones",
             "avoid tasks blocked by recent run evidence",
             "consider active workers when choosing compatible work",
         ],
@@ -661,6 +784,9 @@ def selection_worker_json(worker: WorkerView) -> dict[str, object]:
         "result_status": payload["result_status"],
         "started_at": payload["started_at"],
         "log": payload["log"],
+        "resources": payload["resources"],
+        "paths": payload["paths"],
+        "conflict_domains_known": payload["conflict_domains_known"],
     }
 
 
@@ -710,6 +836,7 @@ def validate_selected_task_batch(
     *,
     limit: int,
     is_locked: Callable[[str], bool] | None = None,
+    enforce_resource_conflicts: bool | None = None,
 ) -> BatchSelectionValidation:
     if selected_task_ids is None:
         return BatchSelectionValidation(error="missing task_ids")
@@ -732,6 +859,17 @@ def validate_selected_task_batch(
             return BatchSelectionValidation(error=f"locked task_id: {task_id}")
         seen.add(task_id)
         tasks.append(task)
+    if should_enforce_resource_conflicts(
+        tasks,
+        candidates,
+        enforce_resource_conflicts,
+    ):
+        conflict = first_task_conflict(tasks)
+        if conflict is not None:
+            left, right = conflict
+            return BatchSelectionValidation(
+                error=f"conflicting task_ids: {left.task_id}, {right.task_id}"
+            )
     return BatchSelectionValidation(tasks=tuple(tasks))
 
 
@@ -740,15 +878,163 @@ def deterministic_task_batch(
     limit: int,
     *,
     is_locked: Callable[[str], bool] | None = None,
+    enforce_resource_conflicts: bool | None = None,
 ) -> list[Task]:
     selected: list[Task] = []
+    enforce_conflicts = should_enforce_resource_conflicts(
+        selected,
+        candidates,
+        enforce_resource_conflicts,
+    )
     for task in candidates:
         if len(selected) >= limit:
             break
         if is_locked is not None and is_locked(task.task_id):
             continue
+        if enforce_conflicts and task_conflicts_with_tasks(task, selected):
+            continue
         selected.append(task)
     return selected
+
+
+def should_enforce_resource_conflicts(
+    selected: list[Task],
+    candidates: list[Task],
+    override: bool | None,
+) -> bool:
+    if override is not None:
+        return override
+    return resource_conflicts_enabled([*selected, *candidates], ())
+
+
+def filter_scheduled_conflicts(
+    candidates: list[Task],
+    scheduled: list[Task],
+) -> list[Task]:
+    if not scheduled:
+        return candidates
+    if not resource_conflicts_enabled([*candidates, *scheduled], ()):
+        return candidates
+    return [
+        candidate
+        for candidate in candidates
+        if not task_conflicts_with_tasks(candidate, scheduled)
+    ]
+
+
+def resource_conflicts_enabled(
+    tasks: list[Task],
+    active_domains: tuple[ConflictDomains, ...],
+) -> bool:
+    return any(task.conflict_domains_known for task in tasks) or any(
+        domain.known for domain in active_domains
+    )
+
+
+def active_lock_conflict_domains(lock_manager: LockManager) -> tuple[ConflictDomains, ...]:
+    domains: list[ConflictDomains] = []
+    for metadata in lock_manager.list_locks():
+        active = ActiveRunState.from_lock_metadata(metadata)
+        if active is None:
+            continue
+        domains.append(conflict_domains_from_task_like(active))
+    return tuple(domains)
+
+
+def first_task_conflict(tasks: list[Task]) -> tuple[Task, Task] | None:
+    for index, task in enumerate(tasks):
+        for other in tasks[index + 1 :]:
+            if task_conflicts_with_task(task, other):
+                return task, other
+    return None
+
+
+def task_conflicts_with_domains(
+    task: Task,
+    active_domains: tuple[ConflictDomains, ...],
+) -> bool:
+    task_domains = conflict_domains_from_task_like(task)
+    return any(conflict_domains_overlap(task_domains, domain) for domain in active_domains)
+
+
+def task_conflicts_with_tasks(task: Task, selected: list[Task]) -> bool:
+    return any(task_conflicts_with_task(task, other) for other in selected)
+
+
+def task_conflicts_with_task(left: Task, right: Task) -> bool:
+    return conflict_domains_overlap(
+        conflict_domains_from_task_like(left),
+        conflict_domains_from_task_like(right),
+    )
+
+
+def conflict_domains_from_task_like(task: Task | ActiveRunState) -> ConflictDomains:
+    return ConflictDomains(
+        known=task.conflict_domains_known,
+        resources=frozenset(task.resources),
+        paths=task.paths,
+    )
+
+
+def conflict_domains_overlap(left: ConflictDomains, right: ConflictDomains) -> bool:
+    if not left.known or not right.known:
+        return True
+    if left.resources & right.resources:
+        return True
+    return path_domains_overlap(left.paths, right.paths)
+
+
+def path_domains_overlap(left_paths: tuple[str, ...], right_paths: tuple[str, ...]) -> bool:
+    for left in left_paths:
+        for right in right_paths:
+            if path_domain_overlaps(left, right):
+                return True
+    return False
+
+
+def path_domain_overlaps(left: str, right: str) -> bool:
+    return (
+        left == "."
+        or right == "."
+        or left == right
+        or left.startswith(f"{right}/")
+        or right.startswith(f"{left}/")
+    )
+
+
+def try_lock_scheduler_file(handle: BinaryIO) -> bool:
+    ensure_scheduler_lock_byte(handle)
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        return True
+    if msvcrt is not None:
+        handle.seek(0)
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    raise SchedulerLockBusy(Path("<unsupported-platform>"))
+
+
+def unlock_scheduler_file(handle: BinaryIO) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def ensure_scheduler_lock_byte(handle: BinaryIO) -> None:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
 
 
 def parse_worker_session_id(line: str) -> str | None:

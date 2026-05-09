@@ -217,6 +217,11 @@ the selection prompt asks for a batch and includes active worker state so the
 selector can avoid work that is already in progress. The CLI validates returned
 IDs against the current unlocked candidates, rejects duplicates and unknown or
 locked tasks, and falls back to deterministic ready order before spawning.
+When task sources declare `resources` or `paths`, the scheduler also rejects
+overlapping conflict domains before spawning. Tasks without declarations are
+treated as unknown and are not paired once conflict-domain scheduling is active;
+repositories that do not declare any domains keep the legacy ready-order
+parallel behavior.
 
 `run-next` and `run-until-done` keep their result JSON on stdout. Run progress
 and mirrored agent stdout are written to stderr, and full stdout/stderr streams
@@ -350,7 +355,27 @@ probe = "my-task-tool show {task_id} --json"
 
 `list` must return either a JSON array or `{"tasks":[...]}`. Each task should
 include `id`, `title`, `status`, `priority`, `dependencies`, `scope`,
-`acceptance`, and `evidence` where available.
+`acceptance`, and `evidence` where available. Optional `resources` and `paths`
+arrays declare conflict domains for parallel scheduling. Resource names match
+exactly; path locks use repo-relative paths and conflict when one path is the
+same as, or an ancestor of, another. Omitted or `null` arrays are undeclared;
+empty arrays explicitly declare no conflict domains for that task.
+
+Markdown profiles can expose the same domains with optional `resources` and
+`paths` field mappings:
+
+```toml
+[task_source.profile.fields.resources]
+column = "Resources"
+none_values = ["none"]
+
+[task_source.profile.fields.paths]
+column = "Paths"
+none_values = ["none"]
+```
+
+For Markdown profiles, blank mapped cells are undeclared. A configured
+`none_values` marker such as `none` explicitly declares an empty domain.
 
 Generated task-source discovery is an explicit configuration flow. It uses the
 bounded repo-local evidence collector, asks the resolved `agent.selection_command`
