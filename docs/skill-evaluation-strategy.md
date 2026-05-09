@@ -22,7 +22,9 @@ The recommended path is:
    graders, and diagnose regressions.
 
 No public benchmark run is required before the local methodology, artifact
-schema, and demo-project specifications exist.
+schema, and demo-project specifications exist. The initial bundled-skill run
+record and artifact contract is specified in
+[`docs/skill-eval-schema.md`](skill-eval-schema.md).
 
 ## Source Comparison
 
