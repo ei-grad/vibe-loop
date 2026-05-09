@@ -160,6 +160,35 @@ class CliTests(unittest.TestCase):
         self.assertEqual(env_payload["log"], payload["log"])
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
 
+    def test_install_skills_copies_report_and_integration_lock_guidance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["install-skills", "--codex", "--home", str(home)])
+
+            installed_paths = stdout.getvalue().splitlines()
+            finite = home / ".codex" / "skills" / "vibe-loop" / "SKILL.md"
+            infinite = home / ".codex" / "skills" / "infinite-vibe-loop" / "SKILL.md"
+            finite_text = finite.read_text(encoding="utf-8")
+            infinite_text = infinite.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(
+            installed_paths,
+            [
+                str(home / ".codex" / "skills" / "vibe-loop"),
+                str(home / ".codex" / "skills" / "infinite-vibe-loop"),
+            ],
+        )
+        for text in (finite_text, infinite_text):
+            self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', text)
+            self.assertIn("vibe-loop main-integration acquire", text)
+            self.assertIn("vibe-loop main-integration release", text)
+
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
