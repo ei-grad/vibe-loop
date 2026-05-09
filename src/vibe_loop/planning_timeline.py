@@ -1,0 +1,778 @@
+from __future__ import annotations
+
+import dataclasses
+import json
+import statistics
+from datetime import datetime, timedelta, timezone
+
+from vibe_loop.config import VibeConfig
+from vibe_loop.planning_evidence import (
+    DEFAULT_GIT_COMMIT_LIMIT,
+    GitCommit,
+    PlanningEvidence,
+    collect_planning_evidence,
+)
+from vibe_loop.tasks import DONE_STATUS, STATUS_RANK, priority_rank
+
+
+PLANNING_TIMELINE_SCHEMA_VERSION = 1
+ACTUAL_IDLE_GAP_CLIP_MINUTES = 8 * 60
+FIRST_COMMIT_FLOOR_MINUTES = 1
+DEFAULT_PROJECTED_DURATION_MINUTES = 60
+DEFAULT_PROJECTION_ANCHOR = datetime(1970, 1, 1, tzinfo=timezone.utc)
+TIMELINE_COMMAND = "vibe-loop planning timeline"
+
+
+@dataclasses.dataclass(frozen=True)
+class ActualSpan:
+    task_id: str
+    start: datetime
+    end: datetime
+    duration_minutes: int
+    raw_duration_minutes: int
+    idle_gap_clipped_minutes: int
+    commits: tuple[dict[str, object], ...]
+    mapping_sources: tuple[str, ...]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "start": format_time(self.start),
+            "end": format_time(self.end),
+            "duration_minutes": self.duration_minutes,
+            "raw_duration_minutes": self.raw_duration_minutes,
+            "idle_gap_clip_minutes": ACTUAL_IDLE_GAP_CLIP_MINUTES,
+            "idle_gap_clipped_minutes": self.idle_gap_clipped_minutes,
+            "commit_count": len(self.commits),
+            "commits": list(self.commits),
+            "mapping_sources": list(self.mapping_sources),
+            "provenance": "authoritative_commit_mappings",
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectedSpan:
+    task_id: str
+    start: datetime | None
+    end: datetime | None
+    duration_minutes: int | None
+    sequence: int | None
+    ready_at: datetime | None
+    blocked: bool
+    blockers: tuple[str, ...]
+    policy_order_key: tuple[object, ...]
+    estimate: dict[str, object]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "start": format_optional_time(self.start),
+            "end": format_optional_time(self.end),
+            "duration_minutes": self.duration_minutes,
+            "sequence": self.sequence,
+            "ready_at": format_optional_time(self.ready_at),
+            "blocked": self.blocked,
+            "blockers": list(self.blockers),
+            "policy_order_key": list(self.policy_order_key),
+            "estimate": self.estimate,
+        }
+
+
+def build_planning_timeline(
+    config: VibeConfig,
+    *,
+    evidence: PlanningEvidence | None = None,
+    git_commit_limit: int = DEFAULT_GIT_COMMIT_LIMIT,
+) -> dict[str, object]:
+    if evidence is None:
+        evidence = collect_planning_evidence(config, git_commit_limit=git_commit_limit)
+    return PlanningTimelineBuilder(config, evidence).build()
+
+
+class PlanningTimelineBuilder:
+    def __init__(self, config: VibeConfig, evidence: PlanningEvidence):
+        self.config = config
+        self.evidence = evidence
+        self.tasks = list(evidence.tasks)
+        self.task_ids = {task_id(task) for task in self.tasks}
+        self.commits = {commit.commit: commit for commit in evidence.commits}
+        self.warnings: list[dict[str, object]] = [
+            warning.to_json() for warning in evidence.warnings
+        ]
+
+    def build(self) -> dict[str, object]:
+        completed_ids = self.completed_task_ids()
+        actual_spans = self.actual_spans(completed_ids)
+        self.add_completed_without_actual_warnings(completed_ids, actual_spans)
+        self.add_unknown_dependency_warnings()
+        self.add_stale_run_record_warnings()
+        projections = self.projected_spans(completed_ids, actual_spans)
+        task_payloads = self.timeline_tasks(actual_spans, projections)
+        return {
+            "schema_version": PLANNING_TIMELINE_SCHEMA_VERSION,
+            "generated_by": TIMELINE_COMMAND,
+            "schedule_policy": self.config.planning_analytics.schedule_policy,
+            "source_provenance": self.source_provenance(actual_spans, projections),
+            "sections": sections_for_tasks(task_payloads),
+            "tasks": task_payloads,
+            "warnings": dedupe_warning_payloads(self.warnings),
+        }
+
+    def source_provenance(
+        self,
+        actual_spans: dict[str, ActualSpan],
+        projections: dict[str, ProjectedSpan],
+    ) -> dict[str, object]:
+        projected = [span for span in projections.values() if not span.blocked]
+        anchor, anchor_source = projection_anchor_with_default(
+            self.evidence,
+            actual_spans,
+        )
+        return {
+            "task_source_origin": self.evidence.task_source_origin,
+            "git": {
+                "commit_limit": self.evidence.git_commit_limit,
+                "commits_collected": len(self.evidence.commits),
+            },
+            "worklog": {"configured": self.evidence.worklog_configured},
+            "actual": {
+                "task_count": len(actual_spans),
+                "idle_gap_clip_minutes": ACTUAL_IDLE_GAP_CLIP_MINUTES,
+                "first_commit_floor_minutes": FIRST_COMMIT_FLOOR_MINUTES,
+            },
+            "projection": {
+                "task_count": len(projected),
+                "anchor": format_optional_time(anchor),
+                "anchor_source": anchor_source,
+            },
+        }
+
+    def completed_task_ids(self) -> set[str]:
+        completed = {
+            task_id(task)
+            for task in self.tasks
+            if string_value(task.get("status")) == DONE_STATUS
+        }
+        for item in self.evidence.completion_evidence:
+            if item.get("authoritative") is True:
+                completed.add(string_value(item.get("task_id")))
+        completed.discard("")
+        return completed
+
+    def actual_spans(self, completed_ids: set[str]) -> dict[str, ActualSpan]:
+        mappings = {
+            current_task_id: task_mappings
+            for current_task_id, task_mappings in authoritative_mappings_by_task(
+                self.evidence,
+                self.commits,
+            ).items()
+            if current_task_id in completed_ids
+        }
+        previous_time_by_commit = previous_author_time_by_commit(
+            self.evidence,
+            mappings,
+        )
+        spans: dict[str, ActualSpan] = {}
+        for item in self.tasks:
+            current_task_id = task_id(item)
+            task_mappings = mappings.get(current_task_id, ())
+            if not task_mappings:
+                continue
+            commits = unique_commits_for_mappings(task_mappings, self.commits)
+            if not commits:
+                continue
+            spans[current_task_id] = build_actual_span(
+                current_task_id,
+                task_mappings,
+                commits,
+                previous_time_by_commit,
+            )
+        return spans
+
+    def projected_spans(
+        self,
+        completed_ids: set[str],
+        actual_spans: dict[str, ActualSpan],
+    ) -> dict[str, ProjectedSpan]:
+        raw_anchor, _raw_anchor_source = projection_anchor(self.evidence, actual_spans)
+        anchor, _anchor_source = projection_anchor_with_default(
+            self.evidence,
+            actual_spans,
+        )
+        if raw_anchor is None:
+            self.warnings.append(
+                {
+                    "code": "projection_anchor_missing",
+                    "message": (
+                        "projection anchor defaulted because no actual span or "
+                        "git author time was available"
+                    ),
+                    "source": "timeline",
+                }
+            )
+        estimates = projection_estimates(actual_spans)
+        known_end_times = {task: span.end for task, span in actual_spans.items()} | {
+            task: anchor for task in completed_ids if task not in actual_spans
+        }
+        remaining = [
+            task
+            for task in self.tasks
+            if task_id(task) not in completed_ids and string_value(task.get("status"))
+        ]
+        projections: dict[str, ProjectedSpan] = {}
+        sequence = 0
+        current_time = anchor
+        while remaining:
+            ready = [
+                task
+                for task in remaining
+                if dependencies_ready(task, self.task_ids, known_end_times)
+            ]
+            if not ready:
+                break
+            ready.sort(key=lambda task: projection_sort_key(task, self.config))
+            task = ready[0]
+            current_task_id = task_id(task)
+            dependency_ready_at = latest_dependency_end(task, known_end_times)
+            start = max_datetime(current_time, dependency_ready_at, anchor)
+            estimate = estimates.to_json()
+            end = start + timedelta(minutes=int(estimate["minutes"]))
+            sequence += 1
+            projections[current_task_id] = ProjectedSpan(
+                task_id=current_task_id,
+                start=start,
+                end=end,
+                duration_minutes=int(estimate["minutes"]),
+                sequence=sequence,
+                ready_at=dependency_ready_at or anchor,
+                blocked=False,
+                blockers=(),
+                policy_order_key=projection_sort_key(task, self.config),
+                estimate=estimate,
+            )
+            known_end_times[current_task_id] = end
+            current_time = end
+            remaining = [item for item in remaining if task_id(item) != current_task_id]
+        for task in remaining:
+            current_task_id = task_id(task)
+            blockers = blockers_for_task(task, self.task_ids, known_end_times)
+            projections[current_task_id] = ProjectedSpan(
+                task_id=current_task_id,
+                start=None,
+                end=None,
+                duration_minutes=None,
+                sequence=None,
+                ready_at=None,
+                blocked=True,
+                blockers=blockers,
+                policy_order_key=projection_sort_key(task, self.config),
+                estimate=estimates.to_json(),
+            )
+            self.warnings.append(
+                {
+                    "code": "projected_task_blocked",
+                    "message": "task could not be projected from known dependencies",
+                    "task_id": current_task_id,
+                    "source": "timeline",
+                }
+            )
+        return projections
+
+    def timeline_tasks(
+        self,
+        actual_spans: dict[str, ActualSpan],
+        projections: dict[str, ProjectedSpan],
+    ) -> list[dict[str, object]]:
+        payloads = []
+        for task in self.tasks:
+            current_task_id = task_id(task)
+            actual = actual_spans.get(current_task_id)
+            projected = projections.get(current_task_id)
+            payloads.append(
+                {
+                    "id": current_task_id,
+                    "title": string_value(task.get("title")),
+                    "section": string_value(task.get("section")),
+                    "status": string_value(task.get("status")),
+                    "priority": string_value(task.get("priority")),
+                    "dependencies": string_list(task.get("dependencies")),
+                    "source": {
+                        "path": string_value(task.get("source")),
+                        "order": int_value(task.get("order")),
+                    },
+                    "actual": actual.to_json() if actual else None,
+                    "projected": projected.to_json() if projected else None,
+                    "timeline_order": timeline_order(task, actual, projected),
+                }
+            )
+        payloads.sort(key=timeline_payload_sort_key)
+        return payloads
+
+    def add_completed_without_actual_warnings(
+        self,
+        completed_ids: set[str],
+        actual_spans: dict[str, ActualSpan],
+    ) -> None:
+        for current_task_id in sorted(completed_ids - set(actual_spans)):
+            if current_task_id not in self.task_ids:
+                continue
+            self.warnings.append(
+                {
+                    "code": "completed_task_without_actual_span",
+                    "message": "completed task has no authoritative mapped commit span",
+                    "task_id": current_task_id,
+                    "source": "timeline",
+                }
+            )
+
+    def add_unknown_dependency_warnings(self) -> None:
+        for task in self.tasks:
+            current_task_id = task_id(task)
+            for dependency in string_list(task.get("dependencies")):
+                if dependency in self.task_ids:
+                    continue
+                self.warnings.append(
+                    {
+                        "code": "unknown_dependency",
+                        "message": (
+                            f"task {current_task_id} depends on unknown task "
+                            f"{dependency}"
+                        ),
+                        "task_id": current_task_id,
+                        "dependency": dependency,
+                        "source": "timeline",
+                    }
+                )
+
+    def add_stale_run_record_warnings(self) -> None:
+        for attempt in self.evidence.run_attempts:
+            current_task_id = string_value(attempt.get("task_id"))
+            if not current_task_id or current_task_id in self.task_ids:
+                continue
+            payload = {
+                "code": "stale_run_record",
+                "message": "run record references a task absent from the task source",
+                "task_id": current_task_id,
+                "source": "run_attempt",
+            }
+            run_id = string_value(attempt.get("run_id"))
+            if run_id:
+                payload["run_id"] = run_id
+            self.warnings.append(payload)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectionEstimates:
+    minutes: int
+    model: str
+    sample_count: int
+    reasons: tuple[str, ...]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "minutes": self.minutes,
+            "model": self.model,
+            "sample_count": self.sample_count,
+            "reasons": list(self.reasons),
+        }
+
+
+def projection_estimates(actual_spans: dict[str, ActualSpan]) -> ProjectionEstimates:
+    durations = sorted(
+        span.duration_minutes
+        for span in actual_spans.values()
+        if span.duration_minutes > 0
+    )
+    if durations:
+        return ProjectionEstimates(
+            minutes=int(round(statistics.median(durations))),
+            model="completed-actual-median-v1",
+            sample_count=len(durations),
+            reasons=("median of completed actual task durations",),
+        )
+    return ProjectionEstimates(
+        minutes=DEFAULT_PROJECTED_DURATION_MINUTES,
+        model="fixed-fallback-v1",
+        sample_count=0,
+        reasons=("no completed actual spans; using fixed fallback duration",),
+    )
+
+
+def authoritative_mappings_by_task(
+    evidence: PlanningEvidence,
+    commits: dict[str, GitCommit],
+) -> dict[str, tuple[dict[str, object], ...]]:
+    by_task: dict[str, list[dict[str, object]]] = {}
+    for mapping in evidence.commit_mappings:
+        if mapping.get("authoritative") is not True:
+            continue
+        commit = string_value(mapping.get("commit"))
+        current_task_id = string_value(mapping.get("task_id"))
+        if not commit or commit not in commits or not current_task_id:
+            continue
+        by_task.setdefault(current_task_id, []).append(mapping)
+    return {task: tuple(mappings) for task, mappings in by_task.items()}
+
+
+def previous_author_time_by_commit(
+    evidence: PlanningEvidence,
+    mappings: dict[str, tuple[dict[str, object], ...]],
+) -> dict[str, datetime | None]:
+    mapped_commits = {
+        string_value(mapping.get("commit"))
+        for task_mappings in mappings.values()
+        for mapping in task_mappings
+    }
+    ordered = sorted(
+        (
+            (commit.commit, parse_time(commit.author_time))
+            for commit in evidence.commits
+            if commit.commit in mapped_commits
+            and parse_time_or_none(commit.author_time) is not None
+        ),
+        key=lambda item: (item[1], item[0]),
+    )
+    previous: dict[str, datetime | None] = {}
+    last_time: datetime | None = None
+    for commit, author_time in ordered:
+        previous[commit] = last_time
+        last_time = author_time
+    return previous
+
+
+def unique_commits_for_mappings(
+    mappings: tuple[dict[str, object], ...],
+    commits: dict[str, GitCommit],
+) -> tuple[GitCommit, ...]:
+    selected = {
+        string_value(mapping.get("commit")): commits[
+            string_value(mapping.get("commit"))
+        ]
+        for mapping in mappings
+        if string_value(mapping.get("commit")) in commits
+    }
+    return tuple(
+        sorted(
+            selected.values(),
+            key=lambda commit: (parse_time(commit.author_time), commit.commit),
+        )
+    )
+
+
+def build_actual_span(
+    current_task_id: str,
+    mappings: tuple[dict[str, object], ...],
+    commits: tuple[GitCommit, ...],
+    previous_time_by_commit: dict[str, datetime | None],
+) -> ActualSpan:
+    start_candidates: list[datetime] = []
+    raw_duration = 0
+    duration = 0
+    clipped_total = 0
+    commit_payloads: list[dict[str, object]] = []
+    sources_by_commit = mapping_sources_by_commit(mappings)
+    for commit in commits:
+        author_time = parse_time(commit.author_time)
+        previous = previous_time_by_commit.get(commit.commit)
+        if previous is None:
+            raw_gap = FIRST_COMMIT_FLOOR_MINUTES
+            clipped_gap = FIRST_COMMIT_FLOOR_MINUTES
+        else:
+            raw_gap = max(0, round_minutes(author_time - previous))
+            clipped_gap = min(raw_gap, ACTUAL_IDLE_GAP_CLIP_MINUTES)
+        raw_duration += raw_gap
+        duration += clipped_gap
+        clipped_total += raw_gap - clipped_gap
+        start_candidates.append(author_time - timedelta(minutes=clipped_gap))
+        commit_payloads.append(
+            {
+                "commit": commit.commit,
+                "author_time": format_time(author_time),
+                "sources": list(sources_by_commit.get(commit.commit, ())),
+            }
+        )
+    start = min(start_candidates)
+    end = max(parse_time(commit.author_time) for commit in commits)
+    return ActualSpan(
+        task_id=current_task_id,
+        start=start,
+        end=end,
+        duration_minutes=duration,
+        raw_duration_minutes=raw_duration,
+        idle_gap_clipped_minutes=clipped_total,
+        commits=tuple(commit_payloads),
+        mapping_sources=tuple(
+            sorted(
+                {
+                    source
+                    for sources in sources_by_commit.values()
+                    for source in sources
+                    if source
+                }
+            )
+        ),
+    )
+
+
+def mapping_sources_by_commit(
+    mappings: tuple[dict[str, object], ...],
+) -> dict[str, tuple[str, ...]]:
+    sources: dict[str, list[str]] = {}
+    for mapping in mappings:
+        commit = string_value(mapping.get("commit"))
+        source = string_value(mapping.get("source"))
+        if not commit or not source:
+            continue
+        sources.setdefault(commit, []).append(source)
+    return {
+        commit: tuple(sorted(dict.fromkeys(commit_sources)))
+        for commit, commit_sources in sources.items()
+    }
+
+
+def projection_anchor(
+    evidence: PlanningEvidence,
+    actual_spans: dict[str, ActualSpan],
+) -> tuple[datetime | None, str]:
+    if actual_spans:
+        return max(span.end for span in actual_spans.values()), "latest_actual_end"
+    commit_times = [
+        parse_time(commit.author_time)
+        for commit in evidence.commits
+        if parse_time_or_none(commit.author_time) is not None
+    ]
+    if commit_times:
+        return max(commit_times), "latest_git_author_time"
+    return None, "missing"
+
+
+def projection_anchor_with_default(
+    evidence: PlanningEvidence,
+    actual_spans: dict[str, ActualSpan],
+) -> tuple[datetime, str]:
+    anchor, anchor_source = projection_anchor(evidence, actual_spans)
+    if anchor is not None:
+        return anchor, anchor_source
+    return DEFAULT_PROJECTION_ANCHOR, "default_epoch_no_actual_or_git_evidence"
+
+
+def dependencies_ready(
+    task: dict[str, object],
+    task_ids: set[str],
+    known_end_times: dict[str, datetime],
+) -> bool:
+    for dependency in string_list(task.get("dependencies")):
+        if dependency not in task_ids:
+            return False
+        if dependency not in known_end_times:
+            return False
+    return True
+
+
+def latest_dependency_end(
+    task: dict[str, object],
+    known_end_times: dict[str, datetime],
+) -> datetime | None:
+    end_times = [
+        known_end_times[dependency]
+        for dependency in string_list(task.get("dependencies"))
+        if dependency in known_end_times
+    ]
+    if not end_times:
+        return None
+    return max(end_times)
+
+
+def blockers_for_task(
+    task: dict[str, object],
+    task_ids: set[str],
+    known_end_times: dict[str, datetime],
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    for dependency in string_list(task.get("dependencies")):
+        if dependency not in task_ids:
+            blockers.append(f"unknown_dependency:{dependency}")
+        elif dependency not in known_end_times:
+            blockers.append(f"unscheduled_dependency:{dependency}")
+    return tuple(blockers or ("unscheduled_dependency_cycle",))
+
+
+def projection_sort_key(
+    task: dict[str, object],
+    config: VibeConfig,
+) -> tuple[object, ...]:
+    status = string_value(task.get("status"))
+    priority = string_value(task.get("priority"))
+    order = int_value(task.get("order"))
+    if config.planning_analytics.schedule_policy == "lightmetrics-parity":
+        return (
+            0 if status == "Active" else 1,
+            priority_rank(priority),
+            STATUS_RANK.get(status, 9),
+            order,
+            task_id(task),
+        )
+    return (
+        STATUS_RANK.get(status, 9),
+        priority_rank(priority),
+        order,
+        task_id(task),
+    )
+
+
+def timeline_order(
+    task: dict[str, object],
+    actual: ActualSpan | None,
+    projected: ProjectedSpan | None,
+) -> dict[str, object]:
+    if actual is not None:
+        return {
+            "kind": "actual",
+            "start": format_time(actual.start),
+            "sequence": None,
+        }
+    if projected is not None and projected.sequence is not None:
+        return {
+            "kind": "projected",
+            "start": format_optional_time(projected.start),
+            "sequence": projected.sequence,
+        }
+    return {
+        "kind": "unscheduled",
+        "start": None,
+        "sequence": None,
+        "source_order": int_value(task.get("order")),
+    }
+
+
+def timeline_payload_sort_key(payload: dict[str, object]) -> tuple[object, ...]:
+    order = payload.get("timeline_order")
+    order_payload = order if isinstance(order, dict) else {}
+    kind = string_value(order_payload.get("kind"))
+    kind_rank = {"actual": 0, "projected": 1, "unscheduled": 2}.get(kind, 9)
+    start = string_value(order_payload.get("start"))
+    sequence = int_value(order_payload.get("sequence"))
+    source = payload.get("source")
+    source_order = int_value(source.get("order")) if isinstance(source, dict) else 0
+    return (kind_rank, start, sequence, source_order, string_value(payload.get("id")))
+
+
+def sections_for_tasks(tasks: list[dict[str, object]]) -> list[dict[str, object]]:
+    sections: dict[str, dict[str, object]] = {}
+    for task in tasks:
+        name = string_value(task.get("section"))
+        section_id = name or "default"
+        section = sections.setdefault(
+            section_id,
+            {
+                "id": section_id,
+                "title": name or "Tasks",
+                "order": int_value(
+                    task.get("source", {}).get("order")
+                    if isinstance(task.get("source"), dict)
+                    else 0
+                ),
+                "task_ids": [],
+            },
+        )
+        task_ids = section["task_ids"]
+        assert isinstance(task_ids, list)
+        task_ids.append(string_value(task.get("id")))
+    for section in sections.values():
+        task_ids = section["task_ids"]
+        assert isinstance(task_ids, list)
+        section["task_ids"] = sorted(task_ids, key=task_position(tasks))
+    return sorted(
+        sections.values(),
+        key=lambda item: (int_value(item["order"]), item["id"]),
+    )
+
+
+def task_position(tasks: list[dict[str, object]]):
+    positions = {
+        string_value(task.get("id")): index for index, task in enumerate(tasks)
+    }
+    return lambda task: positions.get(task, 0)
+
+
+def max_datetime(*values: datetime | None) -> datetime:
+    concrete = [value for value in values if value is not None]
+    if not concrete:
+        raise ValueError("max_datetime requires at least one datetime")
+    return max(concrete)
+
+
+def parse_time(value: str) -> datetime:
+    parsed = parse_time_or_none(value)
+    if parsed is None:
+        raise ValueError(f"invalid timestamp: {value}")
+    return parsed
+
+
+def parse_time_or_none(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def format_time(value: datetime) -> str:
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def format_optional_time(value: datetime | None) -> str | None:
+    if value is None:
+        return None
+    return format_time(value)
+
+
+def round_minutes(delta: timedelta) -> int:
+    return int(round(delta.total_seconds() / 60))
+
+
+def task_id(task: dict[str, object]) -> str:
+    return string_value(task.get("id"))
+
+
+def string_value(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
+
+
+def int_value(value: object) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    return 0
+
+
+def dedupe_warning_payloads(
+    warnings: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, object]] = []
+    for warning in warnings:
+        key = json.dumps(warning, sort_keys=True, separators=(",", ":"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(warning)
+    return sorted(
+        deduped,
+        key=lambda item: (
+            string_value(item.get("code")),
+            string_value(item.get("task_id")),
+            string_value(item.get("commit")),
+            string_value(item.get("dependency")),
+            string_value(item.get("run_id")),
+        ),
+    )

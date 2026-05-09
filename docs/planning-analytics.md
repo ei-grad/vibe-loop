@@ -133,6 +133,24 @@ readiness, Active-first behavior, priority-before-remaining-status ordering, and
 plan order. Generated timeline JSON must serialize the selected
 `schedule_policy` so readers can tell which policy produced projections.
 
+## Timeline JSON
+
+`vibe-loop planning timeline --json` emits a versioned JSON document with
+source provenance, sections, task rows, schedule policy, and warnings. Completed
+tasks with authoritative commit mappings receive an `actual` span built from
+mapped commit author times. The elapsed gap assigned to each mapped commit is
+clipped to eight hours; the first mapped commit uses a one-minute floor because
+there is no prior mapped author time. The output preserves both
+`raw_duration_minutes` and `idle_gap_clipped_minutes` so long idle periods are
+visible without inflating projected durations.
+
+Incomplete tasks receive `projected` spans from the latest actual end, or from a
+documented fallback anchor when no actual end exists. Projections are scheduled
+by dependency readiness and the configured projection policy. Until duration
+modeling is added, projected estimates use the median completed actual duration
+when available, otherwise a fixed one-hour fallback with estimate reasons
+serialized on each projected task.
+
 ## Doctor Readiness
 
 `vibe-loop doctor` reports planning analytics readiness without running a

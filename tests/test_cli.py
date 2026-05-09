@@ -975,6 +975,32 @@ class CliTests(unittest.TestCase):
             "default_state_dir",
         )
 
+    def test_planning_timeline_json_command_emits_versioned_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    ["planning", "timeline", "--repo", str(repo), "--json"]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["generated_by"], "vibe-loop planning timeline")
+        self.assertEqual(payload["tasks"][0]["id"], "TASK-01")
+        self.assertEqual(payload["tasks"][0]["projected"]["estimate"]["minutes"], 60)
+        self.assertEqual(
+            payload["source_provenance"]["projection"]["anchor_source"],
+            "default_epoch_no_actual_or_git_evidence",
+        )
+
     def test_tasks_configure_writes_validated_profile_cache_with_stub_agent(
         self,
     ) -> None:

@@ -27,6 +27,8 @@ from vibe_loop.generated_profiles import (
     runtime_task_source_report,
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.planning_evidence import DEFAULT_GIT_COMMIT_LIMIT
+from vibe_loop.planning_timeline import build_planning_timeline
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
 from vibe_loop.skills import install_skills
@@ -149,6 +151,24 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(runs_inspect)
     runs_inspect.add_argument("run_id")
     runs_inspect.add_argument("--json", action="store_true")
+
+    planning = subparsers.add_parser("planning", help="Generate planning analytics")
+    add_repo_argument(planning)
+    planning_subparsers = planning.add_subparsers(
+        dest="planning_command",
+        required=True,
+    )
+    planning_timeline = planning_subparsers.add_parser(
+        "timeline",
+        help="Generate planning timeline JSON",
+    )
+    add_repo_argument(planning_timeline)
+    planning_timeline.add_argument("--json", action="store_true")
+    planning_timeline.add_argument(
+        "--git-commit-limit",
+        type=int,
+        default=DEFAULT_GIT_COMMIT_LIMIT,
+    )
 
     integration = subparsers.add_parser(
         "main-integration",
@@ -316,6 +336,9 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "runs":
         return dispatch_runs(args, config)
 
+    if args.command == "planning":
+        return dispatch_planning(args, config)
+
     if args.command == "main-integration":
         return dispatch_main_integration(args, config)
 
@@ -395,6 +418,18 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
         return 0
 
     raise AssertionError(args.runs_command)
+
+
+def dispatch_planning(args: argparse.Namespace, config) -> int:
+    if args.planning_command == "timeline":
+        timeline = build_planning_timeline(
+            config,
+            git_commit_limit=args.git_commit_limit,
+        )
+        print(json.dumps(timeline, indent=2))
+        return 0
+
+    raise AssertionError(args.planning_command)
 
 
 def dispatch_eval(args: argparse.Namespace, config) -> int:
@@ -775,9 +810,7 @@ def render_workers(workers: list[WorkerView]) -> str:
         pid = payload["pid"] if payload["pid"] is not None else "-"
         stale = f"\t{payload['stale_reason']}" if payload["stale_reason"] else ""
         result = (
-            f"\tresult={payload['result_status']}"
-            if payload["result_status"]
-            else ""
+            f"\tresult={payload['result_status']}" if payload["result_status"] else ""
         )
         lines.append(
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
@@ -818,8 +851,7 @@ def render_run_inspection(inspection) -> str:
     ]
     if payload["worker_report"]:
         lines.append(
-            "worker_report: "
-            + json.dumps(payload["worker_report"], sort_keys=True)
+            "worker_report: " + json.dumps(payload["worker_report"], sort_keys=True)
         )
     lines.append("record_history:")
     for record in payload["records"]:
