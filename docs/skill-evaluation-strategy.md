@@ -99,6 +99,9 @@ target behavior public benchmarks miss:
 - negative trigger prompts that ask ordinary coding questions and should not
   load the skill.
 
+The concrete EVAL-08 fixture plan is specified in
+[`docs/skill-eval-demo-projects.md`](skill-eval-demo-projects.md).
+
 Each task case should include:
 
 - a human-written prompt that resembles an actual user or supervisor request;
@@ -262,8 +265,8 @@ the bundled skills.
 
 - What exact JSON schema should EVAL-01 use for run records, grader records,
   source fingerprints, and artifact references?
-- Which demo repositories in EVAL-08 best cover the workflow contract without
-  creating slow or fragile fixtures?
+- After EVAL-02 fixture implementation, which EVAL-08 cases should be combined
+  or split based on measured maintenance cost and grader brittleness?
 - Should the first runner implement YAML case authoring directly, or should YAML
   compile into a stricter internal JSON schema?
 - Which transcript fields can be stored safely without retaining secret-like
