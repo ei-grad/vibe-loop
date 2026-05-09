@@ -4,6 +4,7 @@
   "case_id": "negative-trigger-set",
   "title": "Negative trigger prompt set",
   "task_id": null,
+  "domain": "skill_triggering",
   "positive": false,
   "prompt_paths": [
     "eval/prompts/neg-command-output.txt",

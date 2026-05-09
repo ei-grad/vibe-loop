@@ -4,6 +4,7 @@
   "case_id": "supervised-worker-report",
   "title": "Supervised worker reporting fixture",
   "task_id": "WRK-01",
+  "domain": "worker_reporting",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

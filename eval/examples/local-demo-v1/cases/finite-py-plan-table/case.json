@@ -4,6 +4,7 @@
   "case_id": "finite-py-plan-table",
   "title": "Finite Python plan-table slice",
   "task_id": "FPY-01",
+  "domain": "finite_slice",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

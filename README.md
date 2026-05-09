@@ -245,7 +245,12 @@ own task lock, run id, and log path. `run-next` always runs a single worker.
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill
 conditions and agent commands, writes per-trial artifacts, and emits
-`aggregate.json` plus `aggregate.md` summaries.
+`aggregate.json` plus `aggregate.md` summaries. The aggregate includes a
+`skill_quality` section that separates task failures from workflow-contract
+failures, reports per-task and per-domain uplift, flags trigger, review,
+integration, git, prompt, budget, and cost issues, compares against any previous
+aggregate in the same output directory, and links each reported count or delta
+back to the contributing trial artifact roots.
 
 Workers can explicitly report their final status while the supervisor run is
 active:

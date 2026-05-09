@@ -4,6 +4,7 @@
   "case_id": "review-remediation",
   "title": "Review remediation fixture",
   "task_id": "REV-01",
+  "domain": "review_discipline",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

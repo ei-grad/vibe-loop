@@ -4,6 +4,7 @@
   "case_id": "locked-task-selection",
   "title": "Locked task selection fixture",
   "task_id": "SEL-02",
+  "domain": "task_selection",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

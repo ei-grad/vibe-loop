@@ -4,6 +4,7 @@
   "case_id": "generated-roadmap-profile",
   "title": "Generated roadmap profile fixture",
   "task_id": "ROAD-02",
+  "domain": "task_discovery",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

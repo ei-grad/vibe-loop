@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,13 @@ from io import StringIO
 from pathlib import Path
 
 from vibe_loop.cli import main
+from vibe_loop.eval_runner import (
+    TrialResult,
+    build_aggregate,
+    render_aggregate_markdown,
+    workflow_taxonomy_labels,
+)
+from vibe_loop.evals import EVAL_FAILURE_TAXONOMY
 
 
 class EvalRunnerCliTests(unittest.TestCase):
@@ -355,6 +363,172 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(condition["flaky_case_ids"], ["finite-py-plan-table"])
         self.assertEqual(condition["failure_taxonomy"]["flaky"], 1)
 
+    def test_skill_quality_report_matches_snapshots_and_covers_taxonomy(self) -> None:
+        records = load_skill_quality_records()
+        aggregate = build_aggregate(
+            [
+                TrialResult(record=record, artifact_root=Path("."), repo=Path("."))
+                for record in records
+            ],
+            output_root=Path("/tmp/eval-runs/local-demo-v1"),
+            previous_aggregate=PRIOR_RUN_SNAPSHOT,
+        )
+        markdown = render_aggregate_markdown(aggregate)
+        skill_quality_markdown = markdown[markdown.index("## Skill Quality") :]
+
+        observed_labels = {
+            label
+            for record in records
+            for label in record.get("failure_taxonomy", [])
+        }
+
+        self.assertEqual(observed_labels, EVAL_FAILURE_TAXONOMY)
+        self.assertEqual(stable_quality_snapshot(aggregate["skill_quality"]), QUALITY_JSON_SNAPSHOT)
+        self.assertEqual(skill_quality_markdown, QUALITY_MARKDOWN_SNAPSHOT)
+
+    def test_overwrite_rerun_archives_prior_artifacts_for_regression_refs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "negative_agent.py"
+            write_negative_agent(agent)
+
+            run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--agent-command",
+                f"no_skill={agent}",
+            )
+            external_secret = root / "outside-secret.txt"
+            external_secret.write_text("do not archive this target\n", encoding="utf-8")
+            prior_trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "negative-trigger-set"
+                / "no_skill"
+                / "trial-1"
+            )
+            symlink_path = prior_trial_root / "repo" / "archive-leak.txt"
+            try:
+                os.symlink(external_secret, symlink_path)
+            except OSError as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+            payload = run_eval(
+                root,
+                "--case",
+                "negative-trigger-set",
+                "--condition",
+                "no_skill",
+                "--overwrite",
+                "--agent-command",
+                "no_skill=git reset --hard",
+            )
+            regressions = payload["skill_quality"]["prior_run_regressions"]
+            previous_root = regressions[0]["previous_records"][0]["artifact_root"]
+            current_root = regressions[0]["records"][0]["artifact_root"]
+            archived_log = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / previous_root
+                / "logs"
+                / "run.log"
+            )
+            archived_symlink = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / previous_root
+                / "repo"
+                / "archive-leak.txt"
+            )
+            archived_log_exists = archived_log.is_file()
+            archived_symlink_exists = archived_symlink.exists()
+
+        self.assertTrue(previous_root.startswith("history/previous-"))
+        self.assertTrue(archived_log_exists)
+        self.assertFalse(archived_symlink_exists)
+        self.assertEqual(current_root, "cases/negative-trigger-set/no_skill/trial-1")
+        self.assertIn("pass_rate_regression", regressions[0]["regression_flags"])
+
+    def test_legacy_prior_aggregate_metrics_and_records_are_normalized(self) -> None:
+        records = load_skill_quality_records()
+        legacy_previous = {
+            "generated_at": "2026-05-08T00:00:00+00:00",
+            "conditions": {
+                "vibe_loop": {
+                    "trials": 4,
+                    "pass_rate": 0.5,
+                    "latency_seconds": {"mean": 20.0},
+                    "command_count": {"mean": 10.0},
+                    "token_total": 320.0,
+                    "cost_total": 0.4,
+                }
+            },
+            "records": [
+                {
+                    "run_id": "legacy-skill-1",
+                    "case_id": "finite-py-plan-table",
+                    "condition": "vibe_loop",
+                    "trial": 1,
+                    "artifact_root": "cases/finite-py-plan-table/vibe_loop/trial-0",
+                    "failure_taxonomy": [],
+                }
+            ],
+        }
+        aggregate = build_aggregate(
+            [
+                TrialResult(record=record, artifact_root=Path("."), repo=Path("."))
+                for record in records
+            ],
+            output_root=Path("/tmp/eval-runs/local-demo-v1"),
+            previous_aggregate=legacy_previous,
+        )
+        regression = aggregate["skill_quality"]["prior_run_regressions"][0]
+
+        self.assertEqual(regression["deltas"]["cost_per_trial"], 0.13)
+        self.assertEqual(regression["deltas"]["token_per_trial"], 17.5)
+        self.assertEqual(
+            regression["previous_records"][0]["artifact_root"],
+            "cases/finite-py-plan-table/vibe_loop/trial-0",
+        )
+
+    def test_workflow_taxonomy_labels_are_derived_from_artifact_messages(self) -> None:
+        self.assertEqual(
+            workflow_taxonomy_labels(
+                "missing events: review_requested, rereview_requested"
+            ),
+            {"review_missing"},
+        )
+        self.assertEqual(
+            workflow_taxonomy_labels(
+                "missing events: main_integration_lock_acquired, "
+                "main_verification_ran"
+            ),
+            {"integration_missing"},
+        )
+        self.assertEqual(
+            workflow_taxonomy_labels("forbidden events: unnecessary_user_prompt"),
+            {"unnecessary_user_prompt"},
+        )
+        self.assertEqual(
+            workflow_taxonomy_labels(
+                "forbidden events: review_requested, main_fast_forwarded"
+            ),
+            set(),
+        )
+        self.assertEqual(
+            workflow_taxonomy_labels(
+                "workflow event order missing: instructions_inspected -> "
+                "review_requested -> main_fast_forwarded"
+            ),
+            set(),
+        )
+
 
 def run_eval(root: Path, *args: str) -> dict[str, object]:
     stdout = StringIO()
@@ -373,6 +547,448 @@ def run_eval(root: Path, *args: str) -> dict[str, object]:
     if exit_code != 0:
         raise AssertionError(stderr.getvalue() + stdout.getvalue())
     return json.loads(stdout.getvalue())
+
+
+def load_skill_quality_records() -> list[dict[str, object]]:
+    return json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "eval"
+            / "skill-quality-records.json"
+        ).read_text(encoding="utf-8")
+    )
+
+
+def stable_quality_snapshot(payload: dict[str, object]) -> dict[str, object]:
+    comparisons = payload["condition_comparisons"]
+    categories = payload["failure_categories"]
+    return {
+        "condition_comparisons": {
+            condition: {
+                "deltas": comparison["deltas"],
+                "regression_flags": comparison["regression_flags"],
+                "baseline_records": record_locations(comparison["baseline_records"]),
+                "condition_records": record_locations(comparison["condition_records"]),
+            }
+            for condition, comparison in comparisons.items()
+        },
+        "failure_categories": {
+            category: {
+                "count": summary["count"],
+                "records": record_locations(summary["records"]),
+            }
+            for category, summary in categories.items()
+            if summary["count"]
+        },
+        "overlong_trajectories": {
+            "count": payload["overlong_trajectories"]["count"],
+            "records": record_locations(payload["overlong_trajectories"]["records"]),
+        },
+        "cost_regressions": [
+            {
+                "condition": regression["condition"],
+                "delta": regression["delta"],
+                "baseline_records": record_locations(regression["baseline_records"]),
+                "records": record_locations(regression["records"]),
+            }
+            for regression in payload["cost_regressions"]
+        ],
+        "prior_run_regressions": [
+            {
+                "condition": regression["condition"],
+                "deltas": regression["deltas"],
+                "regression_flags": regression["regression_flags"],
+                "previous_records": record_locations(regression["previous_records"]),
+                "records": record_locations(regression["records"]),
+            }
+            for regression in payload["prior_run_regressions"]
+        ],
+        "per_task_uplift": stable_uplift(payload["per_task_uplift"]),
+        "per_domain_uplift": stable_uplift(payload["per_domain_uplift"]),
+    }
+
+
+def stable_uplift(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        group: {
+            condition: {
+                "baseline_pass_rate": summary["baseline_pass_rate"],
+                "pass_rate": summary["pass_rate"],
+                "absolute_uplift": summary["absolute_uplift"],
+                "normalized_gain": summary["normalized_gain"],
+                "baseline_records": record_locations(summary["baseline_records"]),
+                "condition_records": record_locations(summary["condition_records"]),
+            }
+            for condition, summary in conditions.items()
+        }
+        for group, conditions in payload.items()
+    }
+
+
+def record_locations(records: list[dict[str, object]]) -> list[str]:
+    return [
+        f"{record['run_id']}@{record['artifact_root']}"
+        for record in records
+    ]
+
+
+PRIOR_RUN_SNAPSHOT = {
+    "generated_at": "2026-05-08T00:00:00+00:00",
+    "skill_quality": {
+        "conditions": {
+            "vibe_loop": {
+                "pass_rate": 0.5,
+                "task_score_mean": 0.8,
+                "workflow_score_mean": 0.8,
+                "trigger_score_mean": 0.8,
+                "workflow_violation_rate": 0.1,
+                "trigger_miss_rate": 0.0,
+                "latency_seconds_mean": 20.0,
+                "command_count_mean": 10.0,
+                "token_per_trial": 80.0,
+                "cost_per_trial": 0.1,
+                "records": [
+                    {
+                        "run_id": "prior-skill-1",
+                        "artifact_root": "cases/finite-py-plan-table/vibe_loop/trial-0",
+                    }
+                ],
+            }
+        }
+    },
+}
+
+
+QUALITY_JSON_SNAPSHOT = {
+    "condition_comparisons": {
+        "vibe_loop": {
+            "baseline_records": [
+                "base-finite-1@cases/finite-py-plan-table/no_skill/trial-1",
+                "base-negative-1@cases/negative-trigger-set/no_skill/trial-1",
+                "base-main-1@cases/main-integration-lock/no_skill/trial-1",
+                "base-discovery-1@cases/generated-roadmap-profile/no_skill/trial-1",
+            ],
+            "condition_records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+            "deltas": {
+                "command_count_mean": 21.75,
+                "cost_per_trial": 0.1475,
+                "latency_seconds_mean": 24.5,
+                "pass_rate": -0.75,
+                "task_score_mean": 0.0,
+                "token_per_trial": 32.5,
+                "trigger_miss_rate": 0.5,
+                "trigger_score_mean": -0.5,
+                "workflow_score_mean": -1.0,
+                "workflow_violation_rate": 1.0,
+            },
+            "regression_flags": [
+                "pass_rate_regression",
+                "workflow_contract_regression",
+                "skill_trigger_regression",
+                "trajectory_length_regression",
+                "cost_regression",
+            ],
+        }
+    },
+    "cost_regressions": [
+        {
+            "condition": "vibe_loop",
+            "delta": 0.1475,
+            "baseline_records": [
+                "base-finite-1@cases/finite-py-plan-table/no_skill/trial-1",
+                "base-negative-1@cases/negative-trigger-set/no_skill/trial-1",
+                "base-main-1@cases/main-integration-lock/no_skill/trial-1",
+                "base-discovery-1@cases/generated-roadmap-profile/no_skill/trial-1",
+            ],
+            "records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+        }
+    ],
+    "prior_run_regressions": [
+        {
+            "condition": "vibe_loop",
+            "deltas": {
+                "command_count_mean": 19.25,
+                "cost_per_trial": 0.13,
+                "latency_seconds_mean": 19.5,
+                "pass_rate": -0.5,
+                "task_score_mean": -0.05,
+                "token_per_trial": 17.5,
+                "trigger_miss_rate": 0.5,
+                "trigger_score_mean": -0.3,
+                "workflow_score_mean": -0.8,
+                "workflow_violation_rate": 0.9,
+            },
+            "records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+            "previous_records": [
+                "prior-skill-1@cases/finite-py-plan-table/vibe_loop/trial-0",
+            ],
+            "regression_flags": [
+                "pass_rate_regression",
+                "task_outcome_regression",
+                "workflow_contract_regression",
+                "skill_trigger_regression",
+                "trajectory_length_regression",
+                "cost_regression",
+            ],
+        }
+    ],
+    "failure_categories": {
+        "flaky_trials": {
+            "count": 1,
+            "records": [
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+        },
+        "infrastructure_failures": {
+            "count": 1,
+            "records": [
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+        },
+        "integration_discipline_failures": {
+            "count": 1,
+            "records": [
+                "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+            ],
+        },
+        "review_discipline_failures": {
+            "count": 1,
+            "records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+            ],
+        },
+        "secret_or_state_leaks": {
+            "count": 1,
+            "records": [
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+        },
+        "skill_trigger_misses": {
+            "count": 2,
+            "records": [
+                "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+        },
+        "task_outcome_failures": {
+            "count": 2,
+            "records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                "base-main-1@cases/main-integration-lock/no_skill/trial-1",
+            ],
+        },
+        "unnecessary_user_prompts": {
+            "count": 1,
+            "records": [
+                "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+            ],
+        },
+        "unsafe_git_behavior": {
+            "count": 1,
+            "records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+            ],
+        },
+        "workflow_contract_failures": {
+            "count": 4,
+            "records": [
+                "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+                "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+            ],
+        },
+    },
+    "overlong_trajectories": {
+        "count": 2,
+        "records": [
+            "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+            "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+        ],
+    },
+    "per_domain_uplift": {
+        "finite_slice": {
+            "vibe_loop": {
+                "absolute_uplift": -1.0,
+                "baseline_pass_rate": 1.0,
+                "baseline_records": [
+                    "base-finite-1@cases/finite-py-plan-table/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                ],
+                "normalized_gain": -1.0,
+                "pass_rate": 0.0,
+            }
+        },
+        "main_integration": {
+            "vibe_loop": {
+                "absolute_uplift": 0.0,
+                "baseline_pass_rate": 0.0,
+                "baseline_records": [
+                    "base-main-1@cases/main-integration-lock/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+                ],
+                "normalized_gain": 0.0,
+                "pass_rate": 0.0,
+            }
+        },
+        "skill_triggering": {
+            "vibe_loop": {
+                "absolute_uplift": -1.0,
+                "baseline_pass_rate": 1.0,
+                "baseline_records": [
+                    "base-negative-1@cases/negative-trigger-set/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                ],
+                "normalized_gain": -1.0,
+                "pass_rate": 0.0,
+            }
+        },
+        "task_discovery": {
+            "vibe_loop": {
+                "absolute_uplift": -1.0,
+                "baseline_pass_rate": 1.0,
+                "baseline_records": [
+                    "base-discovery-1@cases/generated-roadmap-profile/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+                ],
+                "normalized_gain": -1.0,
+                "pass_rate": 0.0,
+            }
+        },
+    },
+    "per_task_uplift": {
+        "finite-py-plan-table": {
+            "vibe_loop": {
+                "absolute_uplift": -1.0,
+                "baseline_pass_rate": 1.0,
+                "baseline_records": [
+                    "base-finite-1@cases/finite-py-plan-table/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-finite-1@cases/finite-py-plan-table/vibe_loop/trial-1",
+                ],
+                "normalized_gain": -1.0,
+                "pass_rate": 0.0,
+            }
+        },
+        "generated-roadmap-profile": {
+            "vibe_loop": {
+                "absolute_uplift": -1.0,
+                "baseline_pass_rate": 1.0,
+                "baseline_records": [
+                    "base-discovery-1@cases/generated-roadmap-profile/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-discovery-1@cases/generated-roadmap-profile/vibe_loop/trial-1",
+                ],
+                "normalized_gain": -1.0,
+                "pass_rate": 0.0,
+            }
+        },
+        "main-integration-lock": {
+            "vibe_loop": {
+                "absolute_uplift": 0.0,
+                "baseline_pass_rate": 0.0,
+                "baseline_records": [
+                    "base-main-1@cases/main-integration-lock/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-main-1@cases/main-integration-lock/vibe_loop/trial-1",
+                ],
+                "normalized_gain": 0.0,
+                "pass_rate": 0.0,
+            }
+        },
+        "negative-trigger-set": {
+            "vibe_loop": {
+                "absolute_uplift": -1.0,
+                "baseline_pass_rate": 1.0,
+                "baseline_records": [
+                    "base-negative-1@cases/negative-trigger-set/no_skill/trial-1",
+                ],
+                "condition_records": [
+                    "skill-negative-1@cases/negative-trigger-set/vibe_loop/trial-1",
+                ],
+                "normalized_gain": -1.0,
+                "pass_rate": 0.0,
+            }
+        },
+    },
+}
+
+
+QUALITY_MARKDOWN_SNAPSHOT = """## Skill Quality
+
+Baseline condition: `no_skill`
+
+| Condition | Pass delta | Task delta | Workflow delta | Trigger delta | Cost delta | Flags | Baseline records | Current records |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| vibe_loop | -0.75 | +0 | -1 | -0.5 | +0.1475 | pass_rate_regression, workflow_contract_regression, skill_trigger_regression, trajectory_length_regression, cost_regression | base-finite-1 (cases/finite-py-plan-table/no_skill/trial-1), base-negative-1 (cases/negative-trigger-set/no_skill/trial-1), base-main-1 (cases/main-integration-lock/no_skill/trial-1), base-discovery-1 (cases/generated-roadmap-profile/no_skill/trial-1) | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1), skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1), skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1), skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+
+### Prior Run Regressions
+
+| Condition | Previous generated at | Flags | Previous records | Current records |
+| --- | --- | --- | --- | --- |
+| vibe_loop | 2026-05-08T00:00:00+00:00 | pass_rate_regression, task_outcome_regression, workflow_contract_regression, skill_trigger_regression, trajectory_length_regression, cost_regression | prior-skill-1 (cases/finite-py-plan-table/vibe_loop/trial-0) | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1), skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1), skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1), skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+
+### Failure Categories
+
+| Category | Count | Conditions | Records |
+| --- | ---: | --- | --- |
+| task_outcome_failures | 2 | no_skill=1, vibe_loop=1 | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1), base-main-1 (cases/main-integration-lock/no_skill/trial-1) |
+| workflow_contract_failures | 4 | vibe_loop=4 | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1), skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1), skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1), skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+| skill_trigger_misses | 2 | vibe_loop=2 | skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1), skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+| review_discipline_failures | 1 | vibe_loop=1 | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1) |
+| integration_discipline_failures | 1 | vibe_loop=1 | skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1) |
+| unsafe_git_behavior | 1 | vibe_loop=1 | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1) |
+| unnecessary_user_prompts | 1 | vibe_loop=1 | skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1) |
+| secret_or_state_leaks | 1 | vibe_loop=1 | skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+| infrastructure_failures | 1 | vibe_loop=1 | skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+| flaky_trials | 1 | vibe_loop=1 | skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+| overlong_trajectories | 2 | vibe_loop=2 | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1), skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1) |
+
+### Per Task Uplift
+
+| Task | Condition | Baseline pass | Pass rate | Uplift | Baseline records | Current records |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| finite-py-plan-table | vibe_loop | 1 | 0 | -1 | base-finite-1 (cases/finite-py-plan-table/no_skill/trial-1) | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1) |
+| generated-roadmap-profile | vibe_loop | 1 | 0 | -1 | base-discovery-1 (cases/generated-roadmap-profile/no_skill/trial-1) | skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+| main-integration-lock | vibe_loop | 0 | 0 | +0 | base-main-1 (cases/main-integration-lock/no_skill/trial-1) | skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1) |
+| negative-trigger-set | vibe_loop | 1 | 0 | -1 | base-negative-1 (cases/negative-trigger-set/no_skill/trial-1) | skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1) |
+
+### Per Domain Uplift
+
+| Domain | Condition | Baseline pass | Pass rate | Uplift | Baseline records | Current records |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| finite_slice | vibe_loop | 1 | 0 | -1 | base-finite-1 (cases/finite-py-plan-table/no_skill/trial-1) | skill-finite-1 (cases/finite-py-plan-table/vibe_loop/trial-1) |
+| main_integration | vibe_loop | 0 | 0 | +0 | base-main-1 (cases/main-integration-lock/no_skill/trial-1) | skill-main-1 (cases/main-integration-lock/vibe_loop/trial-1) |
+| skill_triggering | vibe_loop | 1 | 0 | -1 | base-negative-1 (cases/negative-trigger-set/no_skill/trial-1) | skill-negative-1 (cases/negative-trigger-set/vibe_loop/trial-1) |
+| task_discovery | vibe_loop | 1 | 0 | -1 | base-discovery-1 (cases/generated-roadmap-profile/no_skill/trial-1) | skill-discovery-1 (cases/generated-roadmap-profile/vibe_loop/trial-1) |
+"""
 
 
 def stable_aggregate(payload: dict[str, object]) -> dict[str, object]:

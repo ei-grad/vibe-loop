@@ -4,6 +4,7 @@
   "case_id": "main-advanced-before-merge",
   "title": "Main advanced before merge fixture",
   "task_id": "MAM-01",
+  "domain": "main_integration",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

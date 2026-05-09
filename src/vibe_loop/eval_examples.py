@@ -30,6 +30,7 @@ class EvalExampleCase:
     case_id: str
     title: str
     task_id: str | None
+    domain: str
     positive: bool
     repo_path: Path
     prompt_paths: tuple[str, ...]
@@ -91,6 +92,7 @@ def load_eval_example_case(
         case_id=payload["case_id"],
         title=payload["title"],
         task_id=payload.get("task_id"),
+        domain=str(payload.get("domain") or payload["case_id"]),
         positive=payload["positive"],
         repo_path=repo_path,
         prompt_paths=tuple(payload["prompt_paths"]),
@@ -138,6 +140,7 @@ def copy_case_metadata(case: EvalExampleCase, target: Path) -> None:
                 "case_id": case.case_id,
                 "title": case.title,
                 "task_id": case.task_id,
+                "domain": case.domain,
                 "positive": case.positive,
                 "prompt_paths": list(case.prompt_paths),
                 "conditions": list(case.conditions),

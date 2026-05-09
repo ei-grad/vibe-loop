@@ -155,6 +155,18 @@ violation rate, trigger false-positive/false-negative rate, latency, command
 count, token usage and cost when available, plus confidence intervals once
 repeated trials exist.
 
+Aggregate JSON also includes `skill_quality`, a diagnostic report for bundled
+skill behavior. It keeps task outcome and workflow-contract failures separate,
+groups trigger misses, review/integration discipline failures, unsafe git
+behavior, unnecessary prompts, overlong trajectories, infrastructure failures,
+and cost regressions, and attaches every count or delta to the contributing
+trial records by run id and artifact root. Per-task and per-domain uplift are
+computed against the `no_skill` baseline when present. When an existing
+`aggregate.json` is present before a run, the new report compares matching
+condition metrics against that prior run and emits `prior_run_regressions` for
+pass-rate, task-score, workflow-score, trigger-score, trajectory length, and
+cost regressions while preserving token deltas for audit.
+
 ## Failure Taxonomy
 
 Allowed labels:

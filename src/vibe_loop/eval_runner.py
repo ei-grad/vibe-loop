@@ -23,6 +23,10 @@ from vibe_loop.eval_examples import (
     materialize_eval_example,
     run_eval_example_grader,
 )
+from vibe_loop.eval_reporting import (
+    build_skill_quality_report,
+    render_skill_quality_markdown,
+)
 from vibe_loop.evals import (
     EVAL_CONDITIONS,
     EvalArtifactRef,
@@ -178,6 +182,14 @@ def run_local_demo_eval(config: LocalSkillEvalConfig) -> dict[str, object]:
     output_root = config.output_root.resolve()
     suite_root = output_root / EXAMPLE_SUITE_ID
     suite_root.mkdir(parents=True, exist_ok=True)
+    previous_aggregate = load_json(suite_root / "aggregate.json")
+    if not isinstance(previous_aggregate, Mapping):
+        previous_aggregate = None
+    elif config.overwrite:
+        previous_aggregate = archive_previous_aggregate_artifacts(
+            suite_root,
+            previous_aggregate,
+        )
 
     trial_results: list[TrialResult] = []
     run_order = 0
@@ -199,7 +211,11 @@ def run_local_demo_eval(config: LocalSkillEvalConfig) -> dict[str, object]:
                     )
                 )
 
-    aggregate = build_aggregate(trial_results, output_root=suite_root)
+    aggregate = build_aggregate(
+        trial_results,
+        output_root=suite_root,
+        previous_aggregate=previous_aggregate,
+    )
     write_json(suite_root / "aggregate.json", aggregate)
     (suite_root / "aggregate.md").write_text(
         render_aggregate_markdown(aggregate),
@@ -222,6 +238,99 @@ def run_local_demo_eval(config: LocalSkillEvalConfig) -> dict[str, object]:
         },
     )
     return aggregate
+
+
+def archive_previous_aggregate_artifacts(
+    suite_root: Path,
+    previous_aggregate: Mapping[str, object],
+) -> Mapping[str, object]:
+    aggregate_text = json.dumps(previous_aggregate, sort_keys=True)
+    snapshot_id = "previous-" + hash_text(aggregate_text)[:12]
+    snapshot_root = suite_root / "history" / snapshot_id
+    snapshot_root.mkdir(parents=True, exist_ok=True)
+    write_json(snapshot_root / "aggregate.json", previous_aggregate)
+
+    copied_roots: set[str] = set()
+    for relative_root in sorted(active_artifact_roots(previous_aggregate)):
+        source = suite_root / relative_root
+        if not source.exists():
+            continue
+        destination = snapshot_root / relative_root
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        copy_archive_path(source, destination)
+        copied_roots.add(relative_root)
+    return rewrite_archived_artifact_roots(
+        previous_aggregate,
+        copied_roots=copied_roots,
+        archive_prefix=f"history/{snapshot_id}",
+    )
+
+
+def copy_archive_path(source: Path, destination: Path) -> None:
+    if source.is_symlink():
+        return
+    if source.is_dir():
+        destination.mkdir(parents=True, exist_ok=True)
+        for child in source.iterdir():
+            copy_archive_path(child, destination / child.name)
+        return
+    if source.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def active_artifact_roots(value: object) -> set[str]:
+    roots: set[str] = set()
+    if isinstance(value, Mapping):
+        artifact_root = value.get("artifact_root")
+        if is_active_artifact_root(artifact_root):
+            assert isinstance(artifact_root, str)
+            roots.add(artifact_root)
+        for item in value.values():
+            roots.update(active_artifact_roots(item))
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        for item in value:
+            roots.update(active_artifact_roots(item))
+    return roots
+
+
+def rewrite_archived_artifact_roots(
+    value: object,
+    *,
+    copied_roots: set[str],
+    archive_prefix: str,
+) -> object:
+    if isinstance(value, Mapping):
+        rewritten: dict[str, object] = {}
+        for key, item in value.items():
+            if key == "artifact_root" and item in copied_roots:
+                assert isinstance(item, str)
+                rewritten[str(key)] = f"{archive_prefix}/{item}"
+            else:
+                rewritten[str(key)] = rewrite_archived_artifact_roots(
+                    item,
+                    copied_roots=copied_roots,
+                    archive_prefix=archive_prefix,
+                )
+        return rewritten
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [
+            rewrite_archived_artifact_roots(
+                item,
+                copied_roots=copied_roots,
+                archive_prefix=archive_prefix,
+            )
+            for item in value
+        ]
+    return value
+
+
+def is_active_artifact_root(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("cases/")
+        and not path_diagnostics("artifact root", value)
+    )
 
 
 def selected_cases(config: LocalSkillEvalConfig) -> list[EvalExampleCase]:
@@ -1491,6 +1600,7 @@ def artifact_failure_labels(
         message = str(check.get("message", ""))
         if check_id.startswith("artifact"):
             labels.add("workflow_contract")
+        labels.update(workflow_taxonomy_labels(message))
         if "unsafe_git_command" in message:
             labels.add("unsafe_git")
         if condition != "no_skill" and case.positive and "skill_activated" in message:
@@ -1498,6 +1608,54 @@ def artifact_failure_labels(
         if condition != "no_skill" and not case.positive and "skill_activated" in message:
             labels.add("trigger_false_positive")
     return labels or {"task_outcome"}
+
+
+def workflow_taxonomy_labels(message: str) -> set[str]:
+    labels: set[str] = set()
+    if "unsafe_git_command" in message:
+        labels.add("unsafe_git")
+    if "unnecessary_user_prompt" in message:
+        labels.add("unnecessary_user_prompt")
+    missing_events = missing_workflow_event_text(message)
+    if any(
+        event in message
+        for event in ("review_evidence",)
+    ) or any(
+        event in missing_events
+        for event in (
+            "review_requested",
+            "review_finding_received",
+            "review_finding_addressed",
+            "rereview_requested",
+        )
+    ):
+        labels.add("review_missing")
+    if any(
+        event in message
+        for event in ("lock_evidence",)
+    ) or any(
+        event in missing_events
+        for event in (
+            "main_integration_lock_acquired",
+            "main_integration_lock_released",
+            "main_fast_forwarded",
+            "main_verification_ran",
+            "main_advanced_detected",
+        )
+    ):
+        labels.add("integration_missing")
+    return labels
+
+
+def missing_workflow_event_text(message: str) -> str:
+    return diagnostic_segment(message, "missing events:")
+
+
+def diagnostic_segment(message: str, prefix: str) -> str:
+    if prefix not in message:
+        return ""
+    after_prefix = message.split(prefix, 1)[1]
+    return after_prefix.split(";", 1)[0]
 
 
 def structured_trial_result(
@@ -1573,6 +1731,7 @@ def build_run_record(
             "id": case.task_id or case.case_id,
             "prompt_sha256": hash_text(prompt_text),
             "expected_skill": "vibe-loop",
+            "domain": case.domain,
             "should_trigger": case.positive,
         },
         skill_condition=skill_condition(condition, command),
@@ -1865,6 +2024,7 @@ def build_aggregate(
     trial_results: Sequence[TrialResult],
     *,
     output_root: Path,
+    previous_aggregate: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     records = [result.record for result in trial_results]
     by_condition: dict[str, list[Mapping[str, object]]] = defaultdict(list)
@@ -1903,6 +2063,10 @@ def build_aggregate(
         "total_trials": len(records),
         "conditions": conditions,
         "cases": case_summaries(by_case_condition),
+        "skill_quality": build_skill_quality_report(
+            records,
+            previous_aggregate=previous_aggregate,
+        ),
         "records": [
             {
                 "case_id": record.get("case_id"),
@@ -2090,6 +2254,9 @@ def render_aggregate_markdown(aggregate: Mapping[str, object]) -> str:
                 )
                 + " |"
             )
+    quality = aggregate.get("skill_quality")
+    if isinstance(quality, Mapping):
+        lines.extend(["", render_skill_quality_markdown(quality).rstrip()])
     return "\n".join(lines) + "\n"
 
 

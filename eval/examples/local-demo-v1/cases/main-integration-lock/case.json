@@ -4,6 +4,7 @@
   "case_id": "main-integration-lock",
   "title": "Main integration lock fixture",
   "task_id": "MIL-01",
+  "domain": "main_integration",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],

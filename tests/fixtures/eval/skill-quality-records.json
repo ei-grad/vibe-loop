@@ -1,0 +1,310 @@
+[
+  {
+    "case_id": "finite-py-plan-table",
+    "condition": "no_skill",
+    "trial": 1,
+    "run_id": "base-finite-1",
+    "status": "passed",
+    "task": {
+      "id": "FPY-01",
+      "domain": "finite_slice"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 20,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 20,
+      "command_count": 10,
+      "output_bytes": 400,
+      "usage": {
+        "tokens": 100,
+        "cost_usd": 0.1
+      }
+    },
+    "scoring": {
+      "passed": true,
+      "task_score": 1.0,
+      "workflow_score": 1.0,
+      "trigger_score": 1.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [],
+    "reproducibility": {
+      "artifact_root": "cases/finite-py-plan-table/no_skill/trial-1"
+    }
+  },
+  {
+    "case_id": "finite-py-plan-table",
+    "condition": "vibe_loop",
+    "trial": 1,
+    "run_id": "skill-finite-1",
+    "status": "failed",
+    "task": {
+      "id": "FPY-01",
+      "domain": "finite_slice"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 20,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 40,
+      "command_count": 25,
+      "output_bytes": 650,
+      "usage": {
+        "tokens": 130,
+        "cost_usd": 0.25
+      }
+    },
+    "scoring": {
+      "passed": false,
+      "task_score": 0.0,
+      "workflow_score": 0.0,
+      "trigger_score": 1.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [
+      "task_outcome",
+      "workflow_contract",
+      "review_missing",
+      "unsafe_git"
+    ],
+    "reproducibility": {
+      "artifact_root": "cases/finite-py-plan-table/vibe_loop/trial-1"
+    }
+  },
+  {
+    "case_id": "negative-trigger-set",
+    "condition": "no_skill",
+    "trial": 1,
+    "run_id": "base-negative-1",
+    "status": "passed",
+    "task": {
+      "id": "negative-trigger-set",
+      "domain": "skill_triggering"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 20,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 8,
+      "command_count": 2,
+      "output_bytes": 200,
+      "usage": {
+        "tokens": 30,
+        "cost_usd": 0.05
+      }
+    },
+    "scoring": {
+      "passed": true,
+      "task_score": 1.0,
+      "workflow_score": 1.0,
+      "trigger_score": 1.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [],
+    "reproducibility": {
+      "artifact_root": "cases/negative-trigger-set/no_skill/trial-1"
+    }
+  },
+  {
+    "case_id": "negative-trigger-set",
+    "condition": "vibe_loop",
+    "trial": 1,
+    "run_id": "skill-negative-1",
+    "status": "failed",
+    "task": {
+      "id": "negative-trigger-set",
+      "domain": "skill_triggering"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 20,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 12,
+      "command_count": 5,
+      "output_bytes": 250,
+      "usage": {
+        "tokens": 40,
+        "cost_usd": 0.07
+      }
+    },
+    "scoring": {
+      "passed": false,
+      "task_score": 1.0,
+      "workflow_score": 0.0,
+      "trigger_score": 0.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [
+      "trigger_false_positive",
+      "unnecessary_user_prompt"
+    ],
+    "reproducibility": {
+      "artifact_root": "cases/negative-trigger-set/vibe_loop/trial-1"
+    }
+  },
+  {
+    "case_id": "main-integration-lock",
+    "condition": "no_skill",
+    "trial": 1,
+    "run_id": "base-main-1",
+    "status": "failed",
+    "task": {
+      "id": "MIL-01",
+      "domain": "main_integration"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 60,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 18,
+      "command_count": 12,
+      "output_bytes": 300,
+      "usage": {
+        "tokens": 80,
+        "cost_usd": 0.1
+      }
+    },
+    "scoring": {
+      "passed": false,
+      "task_score": 0.0,
+      "workflow_score": 1.0,
+      "trigger_score": 1.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [
+      "task_outcome"
+    ],
+    "reproducibility": {
+      "artifact_root": "cases/main-integration-lock/no_skill/trial-1"
+    }
+  },
+  {
+    "case_id": "main-integration-lock",
+    "condition": "vibe_loop",
+    "trial": 1,
+    "run_id": "skill-main-1",
+    "status": "timeout",
+    "task": {
+      "id": "MIL-01",
+      "domain": "main_integration"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 60,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 90,
+      "command_count": 80,
+      "output_bytes": 700,
+      "usage": {
+        "tokens": 160,
+        "cost_usd": 0.4
+      }
+    },
+    "scoring": {
+      "passed": false,
+      "task_score": 1.0,
+      "workflow_score": 0.0,
+      "trigger_score": 1.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [
+      "integration_missing",
+      "timeout"
+    ],
+    "reproducibility": {
+      "artifact_root": "cases/main-integration-lock/vibe_loop/trial-1"
+    }
+  },
+  {
+    "case_id": "generated-roadmap-profile",
+    "condition": "no_skill",
+    "trial": 1,
+    "run_id": "base-discovery-1",
+    "status": "passed",
+    "task": {
+      "id": "ROAD-02",
+      "domain": "task_discovery"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 30,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 14,
+      "command_count": 6,
+      "output_bytes": 280,
+      "usage": {
+        "tokens": 50,
+        "cost_usd": 0.08
+      }
+    },
+    "scoring": {
+      "passed": true,
+      "task_score": 1.0,
+      "workflow_score": 1.0,
+      "trigger_score": 1.0,
+      "excluded_from_primary": false
+    },
+    "failure_taxonomy": [],
+    "reproducibility": {
+      "artifact_root": "cases/generated-roadmap-profile/no_skill/trial-1"
+    }
+  },
+  {
+    "case_id": "generated-roadmap-profile",
+    "condition": "vibe_loop",
+    "trial": 1,
+    "run_id": "skill-discovery-1",
+    "status": "infrastructure_error",
+    "task": {
+      "id": "ROAD-02",
+      "domain": "task_discovery"
+    },
+    "budget": {
+      "timeout_seconds": 60,
+      "max_commands": 30,
+      "max_output_bytes": 1000
+    },
+    "structured_result": {
+      "latency_seconds": 16,
+      "command_count": 7,
+      "output_bytes": 290,
+      "usage": {
+        "tokens": 60,
+        "cost_usd": 0.2
+      }
+    },
+    "scoring": {
+      "passed": false,
+      "task_score": 1.0,
+      "workflow_score": 0.0,
+      "trigger_score": 0.0,
+      "excluded_from_primary": true
+    },
+    "failure_taxonomy": [
+      "trigger_false_negative",
+      "secret_access",
+      "state_contamination",
+      "harness_error",
+      "grader_error",
+      "flaky"
+    ],
+    "reproducibility": {
+      "artifact_root": "cases/generated-roadmap-profile/vibe_loop/trial-1"
+    }
+  }
+]

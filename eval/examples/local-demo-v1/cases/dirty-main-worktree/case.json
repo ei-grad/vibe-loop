@@ -4,6 +4,7 @@
   "case_id": "dirty-main-worktree",
   "title": "Dirty main worktree fixture",
   "task_id": "DMW-01",
+  "domain": "worktree_discipline",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
   "conditions": ["no_skill", "vibe_loop"],
