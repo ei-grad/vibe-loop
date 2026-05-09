@@ -170,7 +170,9 @@ vibe-loop tasks tree --repo .
 vibe-loop tasks inspect QUERY-09 --repo .
 vibe-loop tasks runnable --repo .
 vibe-loop tasks locks --repo .
-vibe-loop tasks configure --repo . --json
+vibe-loop tasks configure --repo . --dry-run --json
+vibe-loop tasks configure --repo . --force-refresh --json
+vibe-loop tasks configure --repo . --promotion-toml
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
@@ -330,14 +332,31 @@ agent identity and command source, not raw command strings. Read-only commands
 must not launch an agent to create or repair that cache; explicit configure or
 refresh commands own agent invocation.
 
-Create or refresh the cache explicitly:
+Review a generated candidate without activating it:
+
+```bash
+vibe-loop tasks configure --repo . --dry-run --json
+```
+
+`--dry-run` invokes the configured selection agent, validates the returned
+profile, and prints the candidate cache envelope without writing
+`generated-task-source.json`. This is the review path for checking the proposed
+profile before it can affect task selection.
+
+Create or refresh the active cache explicitly:
 
 ```bash
 vibe-loop tasks configure --repo . --json
+vibe-loop tasks configure --repo . --force-refresh --json
 ```
 
-Malformed, low-confidence, unsupported, or incomplete agent output is stored as
-an explicit degraded cache record rather than changing runnable task behavior.
+`tasks configure` creates a missing cache, repairs stale or degraded cache
+records, and reuses a fresh runnable cache without launching the agent again.
+Use `--force-refresh` when a repository wants to regenerate the profile even
+though the current cache is still fresh, for example after planning docs move or
+their format changes in a way the old fingerprints cannot explain. Malformed,
+low-confidence, unsupported, or incomplete agent output is stored as an explicit
+degraded cache record rather than changing runnable task behavior.
 
 Explicit `.vibe-loop.toml` task-source settings stay authoritative. User-written
 command adapters and explicit source paths disable generated discovery for the
@@ -347,6 +366,19 @@ field without disabling the generated parser. Generated cache records cannot
 contain executable adapters such as `type = "command"`, `list`, `next`, `probe`,
 or generic command fields. Add explicit `[task_source]` settings to override
 cached generated behavior.
+
+Promote a reviewed generated profile into committed configuration when a repo
+wants task discovery to be explicit instead of cache-backed:
+
+```bash
+vibe-loop tasks configure --repo . --promotion-toml
+```
+
+The command prints a non-executable `[task_source]` TOML snippet using
+`type = "markdown-profile"` and the validated parser profile. It omits agent
+metadata, provenance, fingerprints, and degradation state. If
+`task_source.runnable_statuses` was already explicitly configured, the snippet
+includes that override so promotion preserves the active task semantics.
 
 See `docs/generated-task-discovery.md` for the generated profile schema,
 precedence rules, stale-cache behavior, and degradation states.

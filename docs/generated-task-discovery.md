@@ -103,6 +103,9 @@ must never launch an agent to repair these states. They may read a fresh cache,
 report the state, and print the explicit configure or refresh command that would
 update it. If the cached source fingerprints no longer match current bounded
 evidence, diagnostics mark the cache stale and point back to `tasks configure`.
+`tasks configure --dry-run` validates a candidate without writing the cache, and
+`tasks configure --force-refresh` regenerates the cache even when the current
+profile is still fresh.
 
 ## Repo-Specific Task Discovery Configuration
 
@@ -172,9 +175,10 @@ command output, generated cache, planning-only cache, unavailable cache, or no
 usable source. `tasks configure --json` should expose the same origin, cache
 path, schema and prompt versions, confidence, fingerprints, skipped evidence,
 and the next safe action. Users override generated behavior by adding explicit
-`[task_source]` settings to `.vibe-loop.toml`; later refresh and promotion
-commands may help copy a reviewed generated parser description into committed
-configuration.
+`[task_source]` settings to `.vibe-loop.toml`. Promotion must copy only the
+non-executable parser profile into explicit configuration. Agent metadata,
+fingerprints, provenance, and degradation state remain cache diagnostics and do
+not belong in committed config.
 
 ## Forbidden Generated Fields
 
@@ -222,6 +226,11 @@ configuration commands such as `tasks configure`, refresh, or a clearly named
 opt-in flag. Read-only commands such as `tasks list`, `tasks runnable`, `next`,
 and `doctor` should never launch an agent as a side effect. They may read fresh
 cache and report the command that would refresh it.
+
+Fresh runnable profiles are reused by `tasks configure` so repeated diagnostics
+do not spend agent calls unnecessarily. Passing `--force-refresh` bypasses that
+reuse. Passing `--dry-run` always keeps the current cache untouched and prints
+the validated candidate for review.
 
 The planning agent should inspect the same bounded evidence set, write a
 structured planning result under the configured state directory, and classify

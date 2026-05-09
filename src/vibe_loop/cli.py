@@ -96,7 +96,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Report task configuration readiness",
     )
     add_repo_argument(tasks_configure)
-    tasks_configure.add_argument("--json", action="store_true")
+    tasks_configure_output = tasks_configure.add_mutually_exclusive_group()
+    tasks_configure_output.add_argument("--json", action="store_true")
+    tasks_configure_output.add_argument(
+        "--promotion-toml",
+        action="store_true",
+        help="Print a .vibe-loop.toml task_source snippet for a valid profile",
+    )
+    tasks_configure.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate and validate a candidate profile without writing the cache",
+    )
+    tasks_configure.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Regenerate the profile even when the current cache is fresh",
+    )
 
     next_parser = subparsers.add_parser("next", help="Print the next runnable task")
     add_repo_argument(next_parser)
@@ -514,14 +530,33 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
         return 0
 
     if args.tasks_command == "configure":
-        result = configure_generated_task_source(config)
+        result = configure_generated_task_source(
+            config,
+            dry_run=args.dry_run,
+            force_refresh=args.force_refresh,
+            write_cache=not args.dry_run and not args.promotion_toml,
+        )
         payload = result.to_json()
         payload["agent"] = config.agent.to_json()
+        if args.promotion_toml:
+            if result.promotion_toml is None:
+                diagnostics = (
+                    result.promotion_diagnostics
+                    or result.diagnostics
+                    or ("no valid generated profile is available for promotion",)
+                )
+                for diagnostic in diagnostics:
+                    print(diagnostic, file=sys.stderr)
+                return 2
+            print(result.promotion_toml, end="")
+            return result.exit_code
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
-            print(f"tasks configure: cache status={payload['status']}")
+            label = "candidate" if result.dry_run else "cache"
+            print(f"tasks configure: {label} status={payload['status']}")
             print(f"cache: {result.cache_path}")
+            print(f"cache action: {result.cache_action}")
             print(f"detected agents: {config.agent.detected.summary()}")
             print(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
             print(f"agent default policy: {AGENT_DEFAULT_POLICY}")

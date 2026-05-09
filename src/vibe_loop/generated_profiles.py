@@ -61,6 +61,18 @@ ALLOWED_FIELD_STRATEGIES = frozenset(
     {"first_sentence", "full_text", "heading_text", "label_value"}
 )
 ALLOWED_STATUS_MAP_KEYS = frozenset({"blocked", "done", "runnable"})
+PROFILE_FIELD_TOML_ORDER = (
+    "id",
+    "title",
+    "status",
+    "priority",
+    "dependencies",
+    "scope",
+    "acceptance",
+    "evidence",
+    "section",
+)
+PROFILE_STATUS_MAP_TOML_ORDER = ("done", "runnable", "blocked")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,13 +81,23 @@ class GeneratedTaskConfigureResult:
     cache_path: Path
     diagnostics: tuple[str, ...]
     exit_code: int
+    cache_action: str = "wrote"
+    dry_run: bool = False
+    wrote_cache: bool = True
+    promotion_toml: str | None = None
+    promotion_diagnostics: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
             "status": self.payload.get("status"),
             "cache_path": str(self.cache_path),
             "exit_code": self.exit_code,
+            "cache_action": self.cache_action,
+            "dry_run": self.dry_run,
+            "wrote_cache": self.wrote_cache,
             "diagnostics": list(self.diagnostics),
+            "promotion_toml": self.promotion_toml,
+            "promotion_diagnostics": list(self.promotion_diagnostics),
             "cache": self.payload,
         }
 
@@ -331,15 +353,28 @@ def runtime_runnable_statuses(
     return config.task_source.runnable_statuses
 
 
-def configure_generated_task_source(config: VibeConfig) -> GeneratedTaskConfigureResult:
+def configure_generated_task_source(
+    config: VibeConfig,
+    *,
+    dry_run: bool = False,
+    force_refresh: bool = False,
+    write_cache: bool = True,
+) -> GeneratedTaskConfigureResult:
     if not config.task_source.allows_generated_cache:
         payload = build_config_disabled_cache(config)
-        return GeneratedTaskConfigureResult(
+        return build_configure_result(
+            config,
             payload=payload,
-            cache_path=config.generated_task_profile_path,
-            diagnostics=diagnostics_for_cache_payload(config, payload),
             exit_code=2,
+            cache_action="disabled",
+            dry_run=dry_run,
+            wrote_cache=False,
         )
+
+    if not dry_run and not force_refresh:
+        reusable = reusable_generated_profile_cache(config)
+        if reusable is not None:
+            return reusable
 
     bundle = collect_generated_discovery_evidence(
         config.repo,
@@ -355,12 +390,11 @@ def configure_generated_task_source(config: VibeConfig) -> GeneratedTaskConfigur
             "agent_unavailable",
             str(exc),
         )
-        write_generated_task_cache(config.generated_task_profile_path, payload)
-        return GeneratedTaskConfigureResult(
-            payload=payload,
-            cache_path=config.generated_task_profile_path,
-            diagnostics=diagnostics_for_cache_payload(config, payload),
-            exit_code=2,
+        return finish_configure_result(
+            config,
+            payload,
+            dry_run=dry_run,
+            write_cache=write_cache,
         )
 
     prompt = build_generated_task_source_prompt(bundle)
@@ -385,12 +419,11 @@ def configure_generated_task_source(config: VibeConfig) -> GeneratedTaskConfigur
             "agent_execution_failed",
             exc.__class__.__name__,
         )
-        write_generated_task_cache(config.generated_task_profile_path, payload)
-        return GeneratedTaskConfigureResult(
-            payload=payload,
-            cache_path=config.generated_task_profile_path,
-            diagnostics=diagnostics_for_cache_payload(config, payload),
-            exit_code=2,
+        return finish_configure_result(
+            config,
+            payload,
+            dry_run=dry_run,
+            write_cache=write_cache,
         )
 
     if result.returncode != 0:
@@ -401,12 +434,11 @@ def configure_generated_task_source(config: VibeConfig) -> GeneratedTaskConfigur
             "agent_exit_code",
             f"agent exited with code {result.returncode}",
         )
-        write_generated_task_cache(config.generated_task_profile_path, payload)
-        return GeneratedTaskConfigureResult(
-            payload=payload,
-            cache_path=config.generated_task_profile_path,
-            diagnostics=diagnostics_for_cache_payload(config, payload),
-            exit_code=2,
+        return finish_configure_result(
+            config,
+            payload,
+            dry_run=dry_run,
+            write_cache=write_cache,
         )
 
     try:
@@ -426,14 +458,103 @@ def configure_generated_task_source(config: VibeConfig) -> GeneratedTaskConfigur
     else:
         payload = normalize_agent_generated_payload(config, bundle, raw_payload)
 
-    write_generated_task_cache(config.generated_task_profile_path, payload)
+    return finish_configure_result(
+        config,
+        payload,
+        dry_run=dry_run,
+        write_cache=write_cache,
+    )
+
+
+def reusable_generated_profile_cache(
+    config: VibeConfig,
+) -> GeneratedTaskConfigureResult | None:
+    report = generated_task_cache_report(config)
+    if not report.get("exists"):
+        return None
+    if report.get("status") != "profile" or not report.get("fresh"):
+        return None
+    if report.get("diagnostics"):
+        return None
+    try:
+        payload = load_generated_task_cache_payload(config)
+    except GeneratedTaskSourceRuntimeError:
+        return None
+    diagnostics = (
+        *runtime_cache_structural_diagnostics(payload),
+        *runtime_profile_diagnostics(config, payload),
+    )
+    if diagnostics:
+        return None
+    return build_configure_result(
+        config,
+        payload=payload,
+        diagnostics=diagnostics,
+        exit_code=0,
+        cache_action="reused",
+        dry_run=False,
+        wrote_cache=False,
+    )
+
+
+def finish_configure_result(
+    config: VibeConfig,
+    payload: dict[str, Any],
+    *,
+    dry_run: bool,
+    write_cache: bool,
+) -> GeneratedTaskConfigureResult:
+    if write_cache and not dry_run:
+        write_generated_task_cache(config.generated_task_profile_path, payload)
     diagnostics = diagnostics_for_cache_payload(config, payload)
     exit_code = 0 if payload.get("status") == "profile" else 2
+    if dry_run:
+        cache_action = "dry_run"
+    elif write_cache:
+        cache_action = "wrote"
+    else:
+        cache_action = "preview"
+    return build_configure_result(
+        config,
+        payload=payload,
+        diagnostics=diagnostics,
+        exit_code=exit_code,
+        cache_action=cache_action,
+        dry_run=dry_run,
+        wrote_cache=write_cache and not dry_run,
+    )
+
+
+def build_configure_result(
+    config: VibeConfig,
+    *,
+    payload: dict[str, Any],
+    diagnostics: tuple[str, ...] | None = None,
+    exit_code: int | None = None,
+    cache_action: str,
+    dry_run: bool,
+    wrote_cache: bool,
+) -> GeneratedTaskConfigureResult:
+    if diagnostics is None:
+        diagnostics = diagnostics_for_cache_payload(config, payload)
+    if exit_code is None:
+        exit_code = 0 if payload.get("status") == "profile" else 2
+    promotion_diagnostics = generated_profile_promotion_diagnostics(config, payload)
+    promotion_toml = (
+        None
+        if promotion_diagnostics
+        else generated_profile_promotion_toml(config, payload)
+    )
     return GeneratedTaskConfigureResult(
         payload=payload,
         cache_path=config.generated_task_profile_path,
         diagnostics=diagnostics,
         exit_code=exit_code,
+        cache_action=cache_action,
+        dry_run=dry_run,
+        wrote_cache=wrote_cache,
+        promotion_toml=promotion_toml,
+        promotion_diagnostics=promotion_diagnostics,
     )
 
 
@@ -950,6 +1071,107 @@ def write_generated_task_cache(path: Path, payload: dict[str, Any]) -> None:
         json.dumps(payload, allow_nan=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+
+
+def generated_profile_promotion_diagnostics(
+    config: VibeConfig,
+    payload: dict[str, Any],
+) -> tuple[str, ...]:
+    if payload.get("status") != "profile":
+        return ("generated cache status is not a promotable profile",)
+    diagnostics = (
+        *runtime_cache_structural_diagnostics(payload),
+        *runtime_profile_diagnostics(config, payload),
+    )
+    return diagnostics
+
+
+def generated_profile_promotion_toml(
+    config: VibeConfig,
+    payload: dict[str, Any],
+) -> str | None:
+    if payload.get("status") != "profile":
+        return None
+    profile = payload.get("profile")
+    if not isinstance(profile, dict):
+        return None
+    lines = [
+        "[task_source]",
+        'type = "markdown-profile"',
+    ]
+    if config.task_source.is_explicit("runnable_statuses"):
+        lines.append(
+            f"runnable_statuses = {toml_string_array(config.task_source.runnable_statuses)}"
+        )
+    lines.extend(
+        [
+            "",
+            "[task_source.profile]",
+            f"kind = {toml_value(profile.get('kind'))}",
+            f"source_paths = {toml_string_array(profile.get('source_paths'))}",
+        ]
+    )
+    if "stable_ids" in profile:
+        lines.append(f"stable_ids = {toml_value(profile.get('stable_ids'))}")
+
+    fields = profile.get("fields")
+    if isinstance(fields, dict):
+        for field_name in ordered_profile_keys(fields, PROFILE_FIELD_TOML_ORDER):
+            mapping = fields.get(field_name)
+            if not isinstance(mapping, dict):
+                continue
+            lines.extend(["", f"[task_source.profile.fields.{field_name}]"])
+            for key in ordered_profile_keys(
+                mapping,
+                (
+                    "column",
+                    "label",
+                    "pattern",
+                    "prefix",
+                    "strategy",
+                    "required",
+                    "none_values",
+                ),
+            ):
+                if key == "none_values":
+                    lines.append(f"{key} = {toml_string_array(mapping[key])}")
+                    continue
+                lines.append(f"{key} = {toml_value(mapping[key])}")
+
+    status_map = profile.get("status_map")
+    if isinstance(status_map, dict):
+        lines.extend(["", "[task_source.profile.status_map]"])
+        for key in ordered_profile_keys(status_map, PROFILE_STATUS_MAP_TOML_ORDER):
+            lines.append(f"{key} = {toml_string_array(status_map[key])}")
+
+    return "\n".join(lines) + "\n"
+
+
+def ordered_profile_keys(
+    value: dict[str, Any],
+    preferred: tuple[str, ...],
+) -> tuple[str, ...]:
+    preferred_keys = [key for key in preferred if key in value]
+    extra_keys = sorted(str(key) for key in value if str(key) not in preferred)
+    return tuple(preferred_keys + extra_keys)
+
+
+def toml_string_array(value: object) -> str:
+    if not (
+        isinstance(value, (list, tuple))
+        and bool(value)
+        and all(isinstance(item, str) and item for item in value)
+    ):
+        raise ValueError("promotion TOML expected a non-empty string array")
+    return "[" + ", ".join(toml_value(item) for item in value) + "]"
+
+
+def toml_value(value: object) -> str:
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    raise ValueError(f"promotion TOML cannot represent value: {value!r}")
 
 
 def generated_task_cache_report(config: VibeConfig) -> dict[str, object]:
