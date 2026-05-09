@@ -13,10 +13,13 @@ from vibe_loop.config import AgentConfig, VibeConfig
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
     VibeRunner,
+    build_batch_selection_prompt,
     build_selection_prompt,
     parse_selected_task_id,
+    parse_selected_task_ids,
     parse_worker_session_id,
     run_streaming_command,
+    validate_selected_task_batch,
 )
 from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
 from vibe_loop.tasks import Task
@@ -59,6 +62,22 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("recent log tail", prompt)
         self.assertIn("blocked or just failed", prompt)
 
+    def test_batch_selection_prompt_includes_context(self) -> None:
+        task = Task(task_id="LIVE-04", title="Realtime reconcile", status="Next")
+
+        prompt = build_batch_selection_prompt(
+            [task],
+            max_tasks=2,
+            recent_log_context="recent log tail: timeout on WEB-01",
+            active_worker_context="Active vibe-loop workers: []",
+        )
+
+        self.assertIn('"max_batch_size": 2', prompt)
+        self.assertIn('"task_ids"', prompt)
+        self.assertIn("LIVE-04", prompt)
+        self.assertIn("recent log tail", prompt)
+        self.assertIn("Active vibe-loop workers", prompt)
+
     def test_parse_selected_task_id_from_json_only_or_wrapped_output(self) -> None:
         self.assertEqual(
             parse_selected_task_id('{"task_id":"LIVE-04","reason":"ready"}'),
@@ -69,6 +88,59 @@ class RunnerTests(unittest.TestCase):
             "WEB-01",
         )
         self.assertIsNone(parse_selected_task_id("not json"))
+
+    def test_parse_selected_task_ids_from_batch_output(self) -> None:
+        self.assertEqual(
+            parse_selected_task_ids('{"task_ids":["LIVE-04","WEB-01"]}'),
+            ["LIVE-04", "WEB-01"],
+        )
+        self.assertEqual(
+            parse_selected_task_ids('text\n{"task_id":"WEB-01"}\nmore'),
+            ["WEB-01"],
+        )
+        self.assertIsNone(parse_selected_task_ids('{"task_ids":["WEB-01", 2]}'))
+        self.assertIsNone(parse_selected_task_ids('{"task_ids":[]}'))
+
+    def test_validate_selected_task_batch_rejects_unsafe_ids(self) -> None:
+        candidates = [
+            Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+            Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+        ]
+
+        valid = validate_selected_task_batch(
+            ["TASK-02", "TASK-01"],
+            candidates,
+            limit=2,
+            is_locked=lambda _task_id: False,
+        )
+        duplicate = validate_selected_task_batch(
+            ["TASK-01", "TASK-01"],
+            candidates,
+            limit=2,
+        )
+        unknown = validate_selected_task_batch(["TASK-99"], candidates, limit=2)
+        too_many = validate_selected_task_batch(
+            ["TASK-01", "TASK-02"],
+            candidates,
+            limit=1,
+        )
+        locked = validate_selected_task_batch(
+            ["TASK-02"],
+            candidates,
+            limit=2,
+            is_locked=lambda task_id: task_id == "TASK-02",
+        )
+
+        self.assertTrue(valid.valid)
+        self.assertEqual([task.task_id for task in valid.tasks], ["TASK-02", "TASK-01"])
+        self.assertFalse(duplicate.valid)
+        self.assertEqual(duplicate.error, "duplicate task_id: TASK-01")
+        self.assertFalse(unknown.valid)
+        self.assertEqual(unknown.error, "unknown task_id: TASK-99")
+        self.assertFalse(too_many.valid)
+        self.assertEqual(too_many.error, "too many task_ids")
+        self.assertFalse(locked.valid)
+        self.assertEqual(locked.error, "locked task_id: TASK-02")
 
     def test_parse_worker_session_id_from_codex_style_output(self) -> None:
         self.assertEqual(parse_worker_session_id("session id: abc-123"), "abc-123")
@@ -200,6 +272,96 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(
             [result.task_id for result in results],
             ["TASK-01", "TASK-02"],
+        )
+
+    def test_parallel_batch_selection_falls_back_to_deterministic_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker", selection_command="selector"),
+                )
+            )
+            tasks = [
+                Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                Task(task_id="TASK-03", title="Task 3", status="Next", order=3),
+            ]
+            runner.ask_agent_to_select_batch = lambda _candidates, _limit: None
+
+            selected = runner.select_batch_from_candidates(
+                tasks,
+                limit=2,
+                ask_agent=True,
+            )
+
+        self.assertEqual(
+            [task.task_id for task in selected],
+            ["TASK-01", "TASK-02"],
+        )
+
+    def test_parallel_undersized_agent_batch_waits_before_refill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker", selection_command="selector"),
+                )
+            )
+            source = MutableTaskSource(
+                [
+                    Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                    Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                    Task(task_id="TASK-03", title="Task 3", status="Next", order=3),
+                ]
+            )
+            runner._source = source
+            active = 0
+            max_active = 0
+            active_lock = threading.Lock()
+            selected_batches: list[list[str]] = []
+
+            def select_one_task(candidates: list[Task], _limit: int) -> list[Task]:
+                selected_batches.append([task.task_id for task in candidates])
+                return [candidates[0]]
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.05)
+                source.mark_done(task.task_id)
+                with active_lock:
+                    active -= 1
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.ask_agent_to_select_batch = select_one_task
+            runner.run_task = run_task
+
+            results = runner.run_until_done(ask_agent=True, jobs=2, max_slices=2)
+
+        self.assertEqual(max_active, 1)
+        self.assertEqual(
+            [result.task_id for result in results],
+            ["TASK-01", "TASK-02"],
+        )
+        self.assertEqual(
+            selected_batches,
+            [
+                ["TASK-01", "TASK-02", "TASK-03"],
+                ["TASK-02", "TASK-03"],
+            ],
         )
 
     def test_run_until_done_parallel_excludes_task_locks(self) -> None:

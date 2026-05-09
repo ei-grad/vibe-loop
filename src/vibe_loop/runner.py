@@ -28,7 +28,7 @@ from vibe_loop.generated_profiles import (
 from vibe_loop.locks import LockBusy, LockManager
 from vibe_loop.runs import RunResult, RunStore, WorkerReport
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
-from vibe_loop.workers import ActiveRunState
+from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
 
 
 SESSION_ID_RE = re.compile(
@@ -55,6 +55,16 @@ class StreamingCommandResult:
 class ClassificationResult:
     status: str
     source: str
+
+
+@dataclasses.dataclass(frozen=True)
+class BatchSelectionValidation:
+    tasks: tuple[Task, ...] = ()
+    error: str = ""
+
+    @property
+    def valid(self) -> bool:
+        return not self.error
 
 
 class SessionIdObserver:
@@ -140,6 +150,36 @@ class VibeRunner:
             report_status("agent selection unavailable; using first ready task")
         return candidates[0]
 
+    def select_batch_from_candidates(
+        self,
+        candidates: list[Task],
+        *,
+        limit: int,
+        ask_agent: bool = False,
+    ) -> list[Task]:
+        batch_limit = min(max(limit, 0), len(candidates))
+        if batch_limit == 0:
+            return []
+        if ask_agent and len(candidates) > 1:
+            report_status(
+                "asking agent to select batch of up to "
+                f"{batch_limit} tasks from {len(candidates)} candidates"
+            )
+            selected = self.ask_agent_to_select_batch(candidates, batch_limit)
+            if selected:
+                task_ids = ", ".join(task.task_id for task in selected)
+                report_status(f"agent selected batch: {task_ids}")
+                return selected
+            report_status(
+                "agent batch selection unavailable or invalid; "
+                "using deterministic ready order"
+            )
+        return deterministic_task_batch(
+            candidates,
+            batch_limit,
+            is_locked=self.lock_manager.is_locked,
+        )
+
     def ask_agent_to_select(self, candidates: list[Task]) -> Task | None:
         prompt = build_selection_prompt(candidates, self.recent_log_context())
         command_template = self.config.agent.require_selection_command()
@@ -170,6 +210,61 @@ class VibeRunner:
         if task_id is None:
             return None
         return next((task for task in candidates if task.task_id == task_id), None)
+
+    def ask_agent_to_select_batch(
+        self,
+        candidates: list[Task],
+        limit: int,
+    ) -> list[Task] | None:
+        prompt = build_batch_selection_prompt(
+            candidates,
+            max_tasks=limit,
+            recent_log_context=self.recent_log_context(),
+            active_worker_context=self.active_worker_context(),
+        )
+        command_template = self.config.agent.require_selection_command()
+        report_status(
+            "agent selection command source: "
+            f"{self.config.agent.selection_command_source}"
+        )
+        report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
+        report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
+        command = command_template.format(prompt=shlex.quote(prompt))
+        try:
+            result = subprocess.run(
+                command,
+                cwd=self.config.repo,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        validation = validate_selected_task_batch(
+            parse_selected_task_ids(result.stdout),
+            candidates,
+            limit=limit,
+            is_locked=self.lock_manager.is_locked,
+        )
+        if not validation.valid:
+            report_status(f"agent batch selection rejected: {validation.error}")
+            return None
+        return list(validation.tasks)
+
+    def active_worker_context(self) -> str:
+        workers = [
+            selection_worker_json(worker)
+            for worker in build_worker_views(self.lock_manager, self.run_store)
+        ]
+        if not workers:
+            return "No active vibe-loop workers recorded."
+        return "Active vibe-loop workers:\n" + json.dumps(workers, indent=2)
 
     def run_task(self, task: Task) -> RunResult:
         command_template = self.config.agent.require_command()
@@ -411,16 +506,28 @@ class VibeRunner:
                     if not command_validated:
                         self.config.agent.require_command()
                         command_validated = True
-                    task = self.select_from_candidates(
+                    open_slots = jobs - len(in_flight)
+                    if max_slices > 0:
+                        open_slots = min(
+                            open_slots,
+                            max_slices - len(results) - len(in_flight),
+                        )
+                    tasks = self.select_batch_from_candidates(
                         candidates,
+                        limit=open_slots,
                         ask_agent=ask_agent,
                     )
+                    if not tasks:
+                        break
                     if not announced:
                         report_status(f"parallel supervisor jobs={jobs}")
                         announced = True
-                    scheduled.add(task.task_id)
-                    report_status(f"queueing {task.task_id}: {task.title}")
-                    in_flight[executor.submit(self.run_task, task)] = task.task_id
+                    for task in tasks:
+                        scheduled.add(task.task_id)
+                        report_status(f"queueing {task.task_id}: {task.title}")
+                        in_flight[executor.submit(self.run_task, task)] = task.task_id
+                    if ask_agent and len(candidates) > 1 and len(tasks) < open_slots:
+                        break
 
                 if not in_flight:
                     break
@@ -510,7 +617,82 @@ def build_selection_prompt(candidates: list[Task], recent_log_context: str) -> s
     )
 
 
+def build_batch_selection_prompt(
+    candidates: list[Task],
+    *,
+    max_tasks: int,
+    recent_log_context: str,
+    active_worker_context: str,
+) -> str:
+    metadata = {
+        "max_batch_size": max_tasks,
+        "candidate_count": len(candidates),
+        "selection_rules": [
+            "choose between 1 and max_batch_size task IDs",
+            "choose only IDs from candidates",
+            "do not return duplicate IDs",
+            "avoid tasks blocked by recent run evidence",
+            "consider active workers when choosing compatible work",
+        ],
+    }
+    return (
+        "Choose a compatible batch from the dependency-ready, unlocked "
+        "candidates. Use recent run logs to avoid retrying a task that is "
+        "blocked or just failed for a persistent reason. Use active worker "
+        "state to avoid conflicting with work already in progress. Return "
+        'JSON only: {"task_ids":["..."],"reason":"..."}\n\n'
+        "Batch metadata:\n"
+        f"{json.dumps(metadata, indent=2)}\n\n"
+        "Candidates:\n"
+        f"{json.dumps([task.to_json() for task in candidates], indent=2)}\n\n"
+        f"{active_worker_context}\n\n"
+        f"{recent_log_context}\n"
+    )
+
+
+def selection_worker_json(worker: WorkerView) -> dict[str, object]:
+    payload = worker.to_json()
+    return {
+        "task_id": payload["task_id"],
+        "run_id": payload["run_id"],
+        "state": payload["state"],
+        "process_state": payload["process_state"],
+        "stale_reason": payload["stale_reason"],
+        "result_status": payload["result_status"],
+        "started_at": payload["started_at"],
+        "log": payload["log"],
+    }
+
+
 def parse_selected_task_id(output: str) -> str | None:
+    payload = selection_payload_from_output(output)
+    if not isinstance(payload, dict):
+        return None
+    task_id = payload.get("task_id")
+    return str(task_id) if task_id else None
+
+
+def parse_selected_task_ids(output: str) -> list[str] | None:
+    payload = selection_payload_from_output(output)
+    if not isinstance(payload, dict):
+        return None
+    task_ids = payload.get("task_ids")
+    if task_ids is None:
+        task_id = payload.get("task_id")
+        if isinstance(task_id, str) and task_id:
+            return [task_id]
+        return None
+    if not isinstance(task_ids, list) or not task_ids:
+        return None
+    selected: list[str] = []
+    for task_id in task_ids:
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        selected.append(task_id)
+    return selected
+
+
+def selection_payload_from_output(output: str) -> object | None:
     start = output.find("{")
     end = output.rfind("}")
     if start == -1 or end == -1 or end < start:
@@ -519,8 +701,54 @@ def parse_selected_task_id(output: str) -> str | None:
         payload = json.loads(output[start : end + 1])
     except json.JSONDecodeError:
         return None
-    task_id = payload.get("task_id") if isinstance(payload, dict) else None
-    return str(task_id) if task_id else None
+    return payload
+
+
+def validate_selected_task_batch(
+    selected_task_ids: list[str] | None,
+    candidates: list[Task],
+    *,
+    limit: int,
+    is_locked: Callable[[str], bool] | None = None,
+) -> BatchSelectionValidation:
+    if selected_task_ids is None:
+        return BatchSelectionValidation(error="missing task_ids")
+    if not selected_task_ids:
+        return BatchSelectionValidation(error="empty task_ids")
+    if limit < 1:
+        return BatchSelectionValidation(error="batch limit must be at least 1")
+    if len(selected_task_ids) > limit:
+        return BatchSelectionValidation(error="too many task_ids")
+    candidate_by_id = {task.task_id: task for task in candidates}
+    seen: set[str] = set()
+    tasks: list[Task] = []
+    for task_id in selected_task_ids:
+        if task_id in seen:
+            return BatchSelectionValidation(error=f"duplicate task_id: {task_id}")
+        task = candidate_by_id.get(task_id)
+        if task is None:
+            return BatchSelectionValidation(error=f"unknown task_id: {task_id}")
+        if is_locked is not None and is_locked(task_id):
+            return BatchSelectionValidation(error=f"locked task_id: {task_id}")
+        seen.add(task_id)
+        tasks.append(task)
+    return BatchSelectionValidation(tasks=tuple(tasks))
+
+
+def deterministic_task_batch(
+    candidates: list[Task],
+    limit: int,
+    *,
+    is_locked: Callable[[str], bool] | None = None,
+) -> list[Task]:
+    selected: list[Task] = []
+    for task in candidates:
+        if len(selected) >= limit:
+            break
+        if is_locked is not None and is_locked(task.task_id):
+            continue
+        selected.append(task)
+    return selected
 
 
 def parse_worker_session_id(line: str) -> str | None:

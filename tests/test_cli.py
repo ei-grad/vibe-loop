@@ -32,6 +32,15 @@ TWO_TASK_PLAN = """# Plan
 | TASK-02 | P0 | Next | none | Second test task. | Run agent. | Not run. |
 """
 
+THREE_TASK_PLAN = """# Plan
+
+| ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| TASK-01 | P0 | Next | none | First test task. | Run agent. | Not run. |
+| TASK-02 | P0 | Next | none | Second test task. | Run agent. | Not run. |
+| TASK-03 | P0 | Next | none | Third test task. | Run agent. | Not run. |
+"""
+
 
 WORK_TABLE = """# Work
 
@@ -590,6 +599,193 @@ class CliTests(unittest.TestCase):
             self.assertIn(f"[vibe-loop] task_id={result['task_id']}", log_text)
             self.assertIn("worker report status=completed", log_text)
             self.assertIn(f"[vibe-loop] log: {result['log']}", stderr.getvalue())
+
+    def test_run_until_done_jobs_uses_agent_batch_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(THREE_TASK_PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import os\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "started = Path('started')\n"
+                "started.mkdir(exist_ok=True)\n"
+                "(started / task_id).write_text('ran', encoding='utf-8')\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', 'completed',\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / "selector.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import sys\n"
+                "Path('batch-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
+                "print(json.dumps({'task_ids': ['TASK-03', 'TASK-01']}))\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            selector = f"{sys.executable} selector.py {{prompt}}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                "command = "
+                + json.dumps(command)
+                + "\nselection_command = "
+                + json.dumps(selector)
+                + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--ask-agent",
+                        "--jobs",
+                        "2",
+                        "--max-slices",
+                        "2",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            prompt = (repo / "batch-prompt.txt").read_text(encoding="utf-8")
+            started = sorted(path.name for path in (repo / "started").iterdir())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            sorted(result["task_id"] for result in payload),
+            ["TASK-01", "TASK-03"],
+        )
+        self.assertEqual(started, ["TASK-01", "TASK-03"])
+        self.assertIn('"max_batch_size": 2', prompt)
+        self.assertIn("No active vibe-loop workers recorded.", prompt)
+        self.assertIn("agent selected batch: TASK-03, TASK-01", stderr.getvalue())
+
+    def test_run_until_done_jobs_rejects_invalid_agent_batch_before_spawning(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(THREE_TASK_PLAN, encoding="utf-8")
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-02.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-02",
+                        "run_id": "external-run",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import os\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "started = Path('started')\n"
+                "started.mkdir(exist_ok=True)\n"
+                "(started / task_id).write_text('ran', encoding='utf-8')\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', 'completed',\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            (repo / "selector.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import sys\n"
+                "Path('batch-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
+                "print(json.dumps({'task_ids': ['TASK-02', 'TASK-02']}))\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            selector = f"{sys.executable} selector.py {{prompt}}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                "command = "
+                + json.dumps(command)
+                + "\nselection_command = "
+                + json.dumps(selector)
+                + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--ask-agent",
+                        "--jobs",
+                        "2",
+                        "--max-slices",
+                        "2",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            prompt = (repo / "batch-prompt.txt").read_text(encoding="utf-8")
+            started = sorted(path.name for path in (repo / "started").iterdir())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            sorted(result["task_id"] for result in payload),
+            ["TASK-01", "TASK-03"],
+        )
+        self.assertEqual(started, ["TASK-01", "TASK-03"])
+        self.assertIn("TASK-02", prompt)
+        self.assertIn(
+            "agent batch selection rejected: unknown task_id: TASK-02",
+            stderr.getvalue(),
+        )
+        self.assertIn(
+            "agent batch selection unavailable or invalid; "
+            "using deterministic ready order",
+            stderr.getvalue(),
+        )
 
     def test_run_until_done_continue_on_failure_exits_nonzero_for_any_failure(
         self,

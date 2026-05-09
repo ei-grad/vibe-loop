@@ -212,8 +212,11 @@ vibe-loop install-skills --codex --claude
 ```
 
 `--ask-agent` gives the agent the mechanically safe candidate list plus recent
-`.vibe-loop/runs.jsonl` entries and log tails. The CLI still performs the lock
-and completion checks itself.
+`.vibe-loop/runs.jsonl` entries and log tails. With `run-until-done --jobs N`,
+the selection prompt asks for a batch and includes active worker state so the
+selector can avoid work that is already in progress. The CLI validates returned
+IDs against the current unlocked candidates, rejects duplicates and unknown or
+locked tasks, and falls back to deterministic ready order before spawning.
 
 `run-next` and `run-until-done` keep their result JSON on stdout. Run progress
 and mirrored agent stdout are written to stderr, and full stdout/stderr streams
@@ -332,8 +335,9 @@ forward_stderr = false
 the supervisor run. Worker commands also receive `VIBE_LOOP_RUN_ID`,
 `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in their environment.
 `selection_command` receives a shell-quoted `{prompt}` containing the
-dependency-ready candidate list and recent run context, and should print JSON
-containing `task_id`.
+dependency-ready candidate list and recent run context. Single-task selection
+should print JSON containing `task_id`; parallel batch selection should print
+JSON containing `task_ids`.
 
 For command-backed task sources:
 
