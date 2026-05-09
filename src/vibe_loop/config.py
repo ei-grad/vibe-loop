@@ -35,8 +35,19 @@ def prepare_shell_command(
 
 
 def _split_windows_command(command: str) -> list[str]:
-    tokens = shlex.split(command, posix=False)
-    return [t[1:-1] if len(t) >= 2 and t[0] == '"' and t[-1] == '"' else t for t in tokens]
+    import ctypes
+    from ctypes import wintypes
+    shell32 = ctypes.windll.shell32
+    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
+    argc = ctypes.c_int(0)
+    argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+    if not argv:
+        return [command]
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
 
 
 def _resolve_cmd_wrapper_target(cmd_path: str) -> str | None:
