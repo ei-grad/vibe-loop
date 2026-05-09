@@ -328,7 +328,7 @@ def write_required_artifacts(root: Path) -> list[EvalArtifactRef]:
     for role, (relative_path, content) in files.items():
         path = root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        path.write_bytes(content.encode("utf-8"))
         artifacts.append(
             EvalArtifactRef(
                 role=role,

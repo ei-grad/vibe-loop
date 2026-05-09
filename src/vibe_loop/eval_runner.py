@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import signal
-import shlex
 import shutil
 import subprocess
 import threading
@@ -15,6 +14,8 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from vibe_loop.config import shell_quote
 
 from vibe_loop.eval_examples import (
     EXAMPLE_SUITE_ID,
@@ -834,15 +835,15 @@ def format_agent_command(
     task_id: str,
 ) -> str:
     values = {
-        "prompt": shlex.quote(prompt),
-        "prompt_path": shlex.quote(prompt_path),
-        "repo": shlex.quote(str(repo)),
-        "artifact_dir": shlex.quote(str(artifact_dir)),
-        "case_id": shlex.quote(case_id),
-        "condition": shlex.quote(condition),
+        "prompt": shell_quote(prompt),
+        "prompt_path": shell_quote(prompt_path),
+        "repo": shell_quote(str(repo)),
+        "artifact_dir": shell_quote(str(artifact_dir)),
+        "case_id": shell_quote(case_id),
+        "condition": shell_quote(condition),
         "trial": str(trial),
-        "run_id": shlex.quote(run_id),
-        "task_id": shlex.quote(task_id),
+        "run_id": shell_quote(run_id),
+        "task_id": shell_quote(task_id),
     }
     return template.format(**values)
 

@@ -16,6 +16,8 @@ from vibe_loop.planning_timeline import (
 )
 from vibe_loop.runs import RunStore, WorkerReport
 
+PYTHON = sys.executable.replace("\\", "/")
+
 
 def plan_table(rows: list[str]) -> str:
     return (
@@ -158,7 +160,7 @@ class PlanningTimelineTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[planning_analytics]\n"
-                f'worklog_command = "{sys.executable} worklog.py"\n',
+                f'worklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 

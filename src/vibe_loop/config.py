@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import shlex
 import shutil
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
+
+
+def shell_quote(s: str) -> str:
+    if sys.platform == "win32":
+        return subprocess.list2cmdline([s])
+    return shlex.quote(s)
 
 
 DEFAULT_PLAN_PATHS = (

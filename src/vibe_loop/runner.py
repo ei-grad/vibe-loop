@@ -4,7 +4,6 @@ import dataclasses
 import json
 import os
 import re
-import shlex
 import subprocess
 import sys
 import threading
@@ -22,6 +21,7 @@ from vibe_loop.config import (
     AgentDetection,
     VibeConfig,
     AGENT_SKILL_REF_PREFIX,
+    shell_quote,
 )
 from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
@@ -300,7 +300,7 @@ class VibeRunner:
         )
         report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
         report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
-        command = command_template.format(prompt=shlex.quote(prompt))
+        command = command_template.format(prompt=shell_quote(prompt))
         try:
             result = subprocess.run(
                 command,
@@ -340,7 +340,7 @@ class VibeRunner:
         )
         report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
         report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
-        command = command_template.format(prompt=shlex.quote(prompt))
+        command = command_template.format(prompt=shell_quote(prompt))
         try:
             result = subprocess.run(
                 command,
@@ -395,7 +395,7 @@ class VibeRunner:
             f"{CLI_WORKER_ADDENDUM}"
         )
         command = command_template.format(
-            prompt=shlex.quote(worker_prompt),
+            prompt=shell_quote(worker_prompt),
             task_id=task.task_id,
             run_id=run_id,
         )

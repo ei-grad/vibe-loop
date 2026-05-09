@@ -12,6 +12,8 @@ from vibe_loop.config import load_config
 from vibe_loop.planning_evidence import collect_planning_evidence, run_worklog_command
 from vibe_loop.runs import RunStore, WorkerReport
 
+PYTHON = sys.executable.replace("\\", "/")
+
 
 PLAN_TEMPLATE = """# Plan
 
@@ -132,9 +134,9 @@ class PlanningEvidenceTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
-                f'list = "{sys.executable} list_tasks.py"\n\n'
+                f'list = "{PYTHON} list_tasks.py"\n\n'
                 "[planning_analytics]\n"
-                f'worklog_command = "{sys.executable} worklog.py"\n',
+                f'worklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -186,7 +188,7 @@ class PlanningEvidenceTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[planning_analytics]\n"
-                f'worklog_command = "{sys.executable} worklog.py"\n',
+                f'worklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -309,7 +311,7 @@ class PlanningEvidenceTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[planning_analytics]\n"
-                f'worklog_command = "{sys.executable} worklog.py"\n',
+                f'worklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -347,7 +349,7 @@ class PlanningEvidenceTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[planning_analytics]\n"
-                f'worklog_command = "{sys.executable} worklog.py"\n',
+                f'worklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -415,7 +417,7 @@ class PlanningEvidenceTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[planning_analytics]\n"
-                f'worklog_command = "{sys.executable} worklog.py"\n',
+                f'worklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 

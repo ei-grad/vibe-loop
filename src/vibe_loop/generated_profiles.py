@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
-import shlex
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -18,6 +17,7 @@ from vibe_loop.config import (
     TaskSourceConfig,
     VibeConfig,
     reject_generated_command_adapters,
+    shell_quote,
 )
 from vibe_loop.generated_discovery import (
     EvidenceBundle,
@@ -402,7 +402,7 @@ def configure_generated_task_source(
         )
 
     prompt = build_generated_task_source_prompt(bundle)
-    command = command_template.format(prompt=shlex.quote(prompt))
+    command = command_template.format(prompt=shell_quote(prompt))
     try:
         result = subprocess.run(
             command,

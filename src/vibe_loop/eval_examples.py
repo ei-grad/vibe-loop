@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import sysconfig
@@ -306,11 +307,22 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _rmtree_make_writable(func: Any, path: str, _exc: Any) -> None:
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def teardown_eval_example(path: Path) -> None:
     target = Path(path)
     if not is_materialized_eval_example(target):
         raise ValueError(f"refusing to remove non-eval-example path: {target}")
-    shutil.rmtree(target)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target, onexc=_rmtree_make_writable)
+    else:
+        shutil.rmtree(
+            target,
+            onerror=lambda f, p, ei: _rmtree_make_writable(f, p, ei[1]),
+        )
 
 
 def is_materialized_eval_example(path: Path) -> bool:

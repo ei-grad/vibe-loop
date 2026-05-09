@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import tempfile
 import unittest
 from collections.abc import Iterator
@@ -287,47 +288,48 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
                 "mixed encoded webhook path material\n",
                 encoding="utf-8",
             )
-            escaped_slack_hook_dir = (
-                repo / "hooks.slack.com\\" / "services\\" / "T000\\" / "B000\\"
+            if sys.platform != "win32":
+                escaped_slack_hook_dir = (
+                    repo / "hooks.slack.com\\" / "services\\" / "T000\\" / "B000\\"
+                )
+                escaped_slack_hook_dir.mkdir(parents=True)
+                (escaped_slack_hook_dir / "XYZ123.md").write_text(
+                    "escaped webhook path material\n",
+                    encoding="utf-8",
+                )
+                escaped_dot_slack_hook_dir = (
+                    repo / "hooks\\.slack\\.com" / "services" / "T000" / "B000"
+                )
+                escaped_dot_slack_hook_dir.mkdir(parents=True)
+                (escaped_dot_slack_hook_dir / "README.md").write_text(
+                    "escaped dot webhook path material\n",
+                    encoding="utf-8",
+                )
+                escaped_encoded_host_slack_hook_dir = (
+                    repo / "hooks%2Eslack%2Ecom\\" / "services\\" / "T333\\" / "B444\\"
+                )
+                escaped_encoded_host_slack_hook_dir.mkdir(parents=True)
+                (escaped_encoded_host_slack_hook_dir / "MIXED.md").write_text(
+                    "escaped encoded host webhook path material\n",
+                    encoding="utf-8",
+                )
+                escaped_dotted_slack_hook_dir = (
+                    repo / "hooks%2Eslack%2Ecom\\" / "services\\" / "T000\\" / "B000\\"
+                )
+                escaped_dotted_slack_hook_dir.mkdir(parents=True)
+                (escaped_dotted_slack_hook_dir / "abc.def.md").write_text(
+                    "escaped dotted webhook path material\n",
+                    encoding="utf-8",
+                )
+                escaped_double_encoded_host_slack_hook_dir = (
+                    repo / "hooks%252Eslack%252Ecom\\" / "services\\" / "T555\\" / "B666\\"
+                )
+                escaped_double_encoded_host_slack_hook_dir.mkdir(parents=True)
+                (escaped_double_encoded_host_slack_hook_dir / "DOUBLE.md").write_text(
+                    "escaped double encoded host webhook path material\n",
+                    encoding="utf-8",
             )
-            escaped_slack_hook_dir.mkdir(parents=True)
-            (escaped_slack_hook_dir / "XYZ123.md").write_text(
-                "escaped webhook path material\n",
-                encoding="utf-8",
-            )
-            escaped_dot_slack_hook_dir = (
-                repo / "hooks\\.slack\\.com" / "services" / "T000" / "B000"
-            )
-            escaped_dot_slack_hook_dir.mkdir(parents=True)
-            (escaped_dot_slack_hook_dir / "README.md").write_text(
-                "escaped dot webhook path material\n",
-                encoding="utf-8",
-            )
-            escaped_encoded_host_slack_hook_dir = (
-                repo / "hooks%2Eslack%2Ecom\\" / "services\\" / "T333\\" / "B444\\"
-            )
-            escaped_encoded_host_slack_hook_dir.mkdir(parents=True)
-            (escaped_encoded_host_slack_hook_dir / "MIXED.md").write_text(
-                "escaped encoded host webhook path material\n",
-                encoding="utf-8",
-            )
-            escaped_dotted_slack_hook_dir = (
-                repo / "hooks%2Eslack%2Ecom\\" / "services\\" / "T000\\" / "B000\\"
-            )
-            escaped_dotted_slack_hook_dir.mkdir(parents=True)
-            (escaped_dotted_slack_hook_dir / "abc.def.md").write_text(
-                "escaped dotted webhook path material\n",
-                encoding="utf-8",
-            )
-            escaped_double_encoded_host_slack_hook_dir = (
-                repo / "hooks%252Eslack%252Ecom\\" / "services\\" / "T555\\" / "B666\\"
-            )
-            escaped_double_encoded_host_slack_hook_dir.mkdir(parents=True)
-            (escaped_double_encoded_host_slack_hook_dir / "DOUBLE.md").write_text(
-                "escaped double encoded host webhook path material\n",
-                encoding="utf-8",
-            )
-            for filename in (
+            secret_filenames = [
                 "credential.json",
                 "creds.json",
                 "github_pat.txt",
@@ -384,8 +386,6 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
                 "evidence-hooks.slack.com-services-T000-B000-XYZ123.md",
                 "evidence-hooks.slack.com%2Fservices%2FT000%2FB000%2FXYZ123.md",
                 "discord.com-api-webhooks-123-abc.def.md",
-                "hooks\\\\u002eslack\\\\u002ecom\\\\u002fservices\\\\u002fT000\\\\u002fB000\\\\u002fDOUBLEUNICODE.md",
-                "hooks\\u002eslack\\u002ecom\\u002fservices\\u002fT000\\u002fB000\\u002fUNICODE.md",
                 "hooks%2Eslack%2Ecom-services-T000-B000-XYZ123.md",
                 "hooks%252Eslack%252Ecom-services-T000-B000-XYZ123.md",
                 "hooks%2Eslack%2Ecom%2Fservices%2FT000%2FB000%2FXYZ123.md",
@@ -404,7 +404,13 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
                 "webhook-url-T000-B000-XYZ123.yaml",
                 "AKIAIOSFODNN7EXAMPLE.md",
                 "ASIAIOSFODNN7EXAMPLE.md",
-            ):
+            ]
+            if sys.platform != "win32":
+                secret_filenames.extend([
+                    "hooks\\\\u002eslack\\\\u002ecom\\\\u002fservices\\\\u002fT000\\\\u002fB000\\\\u002fDOUBLEUNICODE.md",
+                    "hooks\\u002eslack\\u002ecom\\u002fservices\\u002fT000\\u002fB000\\u002fUNICODE.md",
+                ])
+            for filename in secret_filenames:
                 (repo / filename).write_text("secret\n", encoding="utf-8")
 
             bundle = collect_generated_discovery_evidence(repo)
@@ -554,11 +560,10 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
                 task_dir = repo / dirname
                 task_dir.mkdir()
                 (task_dir / "PLAN.md").write_text("task docs\n", encoding="utf-8")
-            for dirname in (
-                ".api-key-rotation",
-                ".password-reset",
-                "api-key-rotation.",
-            ):
+            secret_dirs = [".api-key-rotation", ".password-reset"]
+            if sys.platform != "win32":
+                secret_dirs.append("api-key-rotation.")
+            for dirname in secret_dirs:
                 secret_dir = repo / dirname
                 secret_dir.mkdir()
                 (secret_dir / "PLAN.md").write_text(
