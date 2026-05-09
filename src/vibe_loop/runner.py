@@ -21,6 +21,7 @@ from vibe_loop.config import (
     AGENT_DEFAULT_POLICY_SOURCE,
     AgentDetection,
     VibeConfig,
+    AGENT_SKILL_REF_PREFIX,
 )
 from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
@@ -48,6 +49,76 @@ SESSION_ID_RE = re.compile(
     re.IGNORECASE,
 )
 RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
+
+CLI_WORKER_ADDENDUM = """\
+
+## vibe-loop CLI Coordination
+
+You are running as a worker launched by the vibe-loop CLI. The following
+environment variables identify this run:
+- VIBE_LOOP_REPO - path to the repository
+- VIBE_LOOP_RUN_ID - unique run identifier
+- VIBE_LOOP_TASK_ID - task being worked on
+- VIBE_LOOP_LOG - path to the run log file
+
+### Worker Reports
+
+Report your final status before exiting:
+
+```bash
+vibe-loop report --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" \\
+  --task-id "$VIBE_LOOP_TASK_ID" --status completed --commit HEAD \\
+  --message "completed $VIBE_LOOP_TASK_ID"
+```
+
+Use "completed" only after the reviewed slice has been integrated when
+integration is permitted, verified on main, and cleaned up. Use "blocked" for
+missing access, required approval, an unavailable integration lock, or a
+decision that cannot be made safely. Use "failed" when an attempted slice
+cannot be left working despite reasonable debugging. Use "unknown" only when
+you cannot classify the result. Include the best available commit reference
+and a concise message; include --metadata-json only for structured facts that
+help the supervisor or later review.
+
+When a blocker or failure occurs after code was changed, commit or otherwise
+stabilize the slice before reporting unless doing so would be unsafe. Do not
+let the report replace the final user-facing summary; the report is supervisor
+state, while the summary explains what happened.
+
+### Integration Locking
+
+Before the final fast-forward merge to main, acquire the advisory
+main-integration lock:
+
+```bash
+vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \\
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+```
+
+If the lock is held by another live worker, wait and retry or park the slice
+as blocked; do not enter the final integration section without the lock. If
+the lock appears stale, report the precise status and follow repo policy
+rather than stealing it.
+
+Release the lock after main verification or immediately when integration is
+parked:
+
+```bash
+vibe-loop main-integration release --repo "$VIBE_LOOP_REPO" \\
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+```
+
+If release reports an owner mismatch, do not remove another worker's lock;
+report the mismatch in the final summary and in the worker report.
+
+### Task Source Context
+
+Treat the task details as normalized work from the repository's active task
+source. That source may be explicit configuration, a generated profile cache,
+command-backed adapters, issue trackers, or Markdown planning docs. If task
+details are insufficient, inspect repo-local sources and the vibe-loop task
+CLI output before making assumptions.
+"""
 RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS = 5.0
 RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
 
@@ -318,7 +389,16 @@ class VibeRunner:
         message = ""
         session_id = run_id
         session_id_source = "fallback:run_id"
-        command = command_template.format(task_id=task.task_id, run_id=run_id)
+        skill_prefix = self.config.agent.skill_ref_prefix
+        worker_prompt = (
+            f"{skill_prefix}vibe-loop {task.task_id}"
+            f"{CLI_WORKER_ADDENDUM}"
+        )
+        command = command_template.format(
+            prompt=shlex.quote(worker_prompt),
+            task_id=task.task_id,
+            run_id=run_id,
+        )
         command_env = worker_command_env(
             run_id=run_id,
             task_id=task.task_id,

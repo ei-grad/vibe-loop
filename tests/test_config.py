@@ -39,10 +39,12 @@ class ConfigTests(unittest.TestCase):
             with patch.dict("os.environ", {"PATH": str(bin_dir)}):
                 config = load_config(repo)
 
-        self.assertEqual(config.agent.command, "codex exec '$vibe-loop {task_id}'")
+        self.assertEqual(config.agent.command, "codex exec {prompt}")
         self.assertEqual(config.agent.command_source, "auto:codex")
         self.assertEqual(config.agent.selection_command, "codex exec {prompt}")
         self.assertEqual(config.agent.selection_command_source, "auto:codex")
+        self.assertEqual(config.agent.resolved_cli, "codex")
+        self.assertEqual(config.agent.skill_ref_prefix, "$")
 
     def test_claude_only_path_resolves_default_agent_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -55,10 +57,12 @@ class ConfigTests(unittest.TestCase):
             with patch.dict("os.environ", {"PATH": str(bin_dir)}):
                 config = load_config(repo)
 
-        self.assertEqual(config.agent.command, "claude -p '$vibe-loop {task_id}'")
+        self.assertEqual(config.agent.command, "claude -p {prompt}")
         self.assertEqual(config.agent.command_source, "auto:claude")
         self.assertEqual(config.agent.selection_command, "claude -p {prompt}")
         self.assertEqual(config.agent.selection_command_source, "auto:claude")
+        self.assertEqual(config.agent.resolved_cli, "claude")
+        self.assertEqual(config.agent.skill_ref_prefix, "/")
 
     def test_missing_agent_cli_leaves_defaults_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -87,7 +91,7 @@ class ConfigTests(unittest.TestCase):
             with patch.dict("os.environ", {"PATH": str(bin_dir)}):
                 config = load_config(repo)
 
-        self.assertEqual(config.agent.command, "codex exec '$vibe-loop {task_id}'")
+        self.assertEqual(config.agent.command, "codex exec {prompt}")
         self.assertEqual(
             config.agent.command_source,
             "auto:codex:codex-first",
@@ -97,6 +101,7 @@ class ConfigTests(unittest.TestCase):
             config.agent.selection_command_source,
             "auto:codex:codex-first",
         )
+        self.assertEqual(config.agent.resolved_cli, "codex")
         self.assertEqual(config.agent.diagnostics(), [])
 
     def test_explicit_claude_commands_remain_authoritative_with_both_clis(
@@ -121,6 +126,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.agent.command, "claude -p '$vibe-loop {task_id}'")
         self.assertEqual(config.agent.command_source, "explicit")
+        self.assertIsNone(config.agent.resolved_cli)
         self.assertEqual(config.agent.selection_command, "claude -p {prompt}")
         self.assertEqual(config.agent.selection_command_source, "explicit")
 

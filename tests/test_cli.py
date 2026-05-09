@@ -102,7 +102,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
         self.assertEqual(run_records[0]["session_id"], "codex-native-123")
         self.assertEqual(run_records[0]["session_id_source"], "native:stdout")
-        self.assertEqual(agent_args, "exec\n$vibe-loop TASK-01")
+        agent_lines = agent_args.split("\n")
+        self.assertEqual(agent_lines[0], "exec")
+        self.assertIn("$vibe-loop TASK-01", agent_lines[1])
+        self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
         self.assertIn("agent_command_source=auto:codex", log_text)
         self.assertIn("session_id_source=native:stdout", log_text)
@@ -170,7 +173,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(env_payload["log"], payload["log"])
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
 
-    def test_install_skills_copies_report_and_integration_lock_guidance(self) -> None:
+    def test_install_skills_are_cli_agnostic(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
             stdout = StringIO()
@@ -195,9 +198,18 @@ class CliTests(unittest.TestCase):
             ],
         )
         for text in (finite_text, infinite_text):
-            self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', text)
-            self.assertIn("vibe-loop main-integration acquire", text)
-            self.assertIn("vibe-loop main-integration release", text)
+            self.assertNotIn("VIBE_LOOP_REPO", text)
+            self.assertNotIn("vibe-loop report", text)
+            self.assertNotIn("vibe-loop main-integration", text)
+
+    def test_cli_worker_addendum_contains_coordination(self) -> None:
+        from vibe_loop.runner import CLI_WORKER_ADDENDUM
+
+        self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', CLI_WORKER_ADDENDUM)
+        self.assertIn("vibe-loop main-integration acquire", CLI_WORKER_ADDENDUM)
+        self.assertIn("vibe-loop main-integration release", CLI_WORKER_ADDENDUM)
+        self.assertIn("VIBE_LOOP_RUN_ID", CLI_WORKER_ADDENDUM)
+        self.assertIn("VIBE_LOOP_TASK_ID", CLI_WORKER_ADDENDUM)
 
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -236,7 +248,10 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
-        self.assertEqual(agent_args, "-p\n$vibe-loop TASK-01")
+        agent_lines = agent_args.split("\n")
+        self.assertEqual(agent_lines[0], "-p")
+        self.assertIn("/vibe-loop TASK-01", agent_lines[1])
+        self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:claude", stderr.getvalue())
         self.assertIn("agent_command_source=auto:claude", log_text)
 
@@ -413,7 +428,10 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(payload["agent_default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent_default_policy"])
-        self.assertEqual(agent_args, "exec\n$vibe-loop TASK-01")
+        agent_lines = agent_args.split("\n")
+        self.assertEqual(agent_lines[0], "exec")
+        self.assertIn("$vibe-loop TASK-01", agent_lines[1])
+        self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex:codex-first", stderr.getvalue())
         self.assertIn(
             "agent selection command source: auto:codex:codex-first",

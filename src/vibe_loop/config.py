@@ -66,13 +66,17 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
     }
 )
 
+AGENT_SKILL_REF_PREFIX = {
+    "codex": "$",
+    "claude": "/",
+}
 AGENT_COMMAND_DEFAULTS = {
     "codex": {
-        "command": "codex exec '$vibe-loop {task_id}'",
+        "command": "codex exec {prompt}",
         "selection_command": "codex exec {prompt}",
     },
     "claude": {
-        "command": "claude -p '$vibe-loop {task_id}'",
+        "command": "claude -p {prompt}",
         "selection_command": "claude -p {prompt}",
     },
 }
@@ -131,6 +135,13 @@ class AgentConfig:
     selection_command_source: str = "unresolved:no-supported-cli"
     detected: AgentDetection = dataclasses.field(default_factory=AgentDetection)
     forward_stderr: bool = False
+    resolved_cli: str | None = None
+
+    @property
+    def skill_ref_prefix(self) -> str:
+        if self.resolved_cli:
+            return AGENT_SKILL_REF_PREFIX.get(self.resolved_cli, "$")
+        return "$"
 
     def require_command(self) -> str:
         if self.command:
@@ -181,6 +192,8 @@ class AgentConfig:
             "selection_command": self.selection_command,
             "selection_command_source": self.selection_command_source,
             "forward_stderr": self.forward_stderr,
+            "resolved_cli": self.resolved_cli,
+            "skill_ref_prefix": self.skill_ref_prefix,
             "detected": self.detected.to_json(),
             "default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "default_policy": AGENT_DEFAULT_POLICY,
@@ -354,12 +367,12 @@ def parse_agent(data: object) -> AgentConfig:
     detected = detect_agent_clis()
     configured_command = optional_nonempty_string(table.get("command"))
     configured_selection = optional_nonempty_string(table.get("selection_command"))
-    command, command_source = resolve_agent_default(
+    command, command_source, resolved_cli = resolve_agent_default(
         "command",
         configured_command,
         detected,
     )
-    selection_command, selection_command_source = resolve_agent_default(
+    selection_command, selection_command_source, _ = resolve_agent_default(
         "selection_command",
         configured_selection,
         detected,
@@ -373,6 +386,7 @@ def parse_agent(data: object) -> AgentConfig:
         forward_stderr=optional_bool(
             table.get("forward_stderr"), False, "agent.forward_stderr"
         ),
+        resolved_cli=resolved_cli,
     )
 
 
@@ -387,21 +401,21 @@ def resolve_agent_default(
     key: str,
     configured: str | None,
     detected: AgentDetection,
-) -> tuple[str | None, str]:
+) -> tuple[str | None, str, str | None]:
     if configured is not None:
-        return configured, "explicit"
+        return configured, "explicit", None
     available = detected.available
     if AGENT_PREFERRED_CLI in available:
         source = "auto:codex"
         if len(available) > 1:
             source = f"auto:codex:{AGENT_DEFAULT_POLICY_SOURCE}"
-        return AGENT_COMMAND_DEFAULTS[AGENT_PREFERRED_CLI][key], source
+        return AGENT_COMMAND_DEFAULTS[AGENT_PREFERRED_CLI][key], source, AGENT_PREFERRED_CLI
     if len(available) == 1:
         agent_name = available[0]
-        return AGENT_COMMAND_DEFAULTS[agent_name][key], f"auto:{agent_name}"
+        return AGENT_COMMAND_DEFAULTS[agent_name][key], f"auto:{agent_name}", agent_name
     if not available:
-        return None, "unresolved:no-supported-cli"
-    return None, "unresolved:multiple-supported-clis"
+        return None, "unresolved:no-supported-cli", None
+    return None, "unresolved:multiple-supported-clis", None
 
 
 def unresolved_agent_command_message(
