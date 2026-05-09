@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.config import shell_quote
+from vibe_loop.config import prepare_shell_command, shell_quote
 
 from vibe_loop.eval_examples import (
     EXAMPLE_SUITE_ID,
@@ -979,10 +979,11 @@ def run_process_with_budgets(
     popen_kwargs: dict[str, object] = {}
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
+    cmd, use_shell = prepare_shell_command(command)
     process = subprocess.Popen(
-        command,
+        cmd,
         cwd=cwd,
-        shell=True,
+        shell=use_shell,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=dict(env),

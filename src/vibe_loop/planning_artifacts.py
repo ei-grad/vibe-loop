@@ -625,9 +625,9 @@ def planning_artifacts_command(
         str(config.repo),
     ]
     if output is not None:
-        parts.extend(["--output", str(output)])
+        parts.extend(["--output", output.as_posix()])
     if html_output is not None:
-        parts.extend(["--html-output", str(html_output)])
+        parts.extend(["--html-output", html_output.as_posix()])
     return " ".join(shlex.quote(part) for part in parts)
 
 

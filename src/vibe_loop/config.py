@@ -17,6 +17,18 @@ def shell_quote(s: str) -> str:
     return shlex.quote(s)
 
 
+def prepare_shell_command(
+    command: str,
+) -> tuple[str | list[str], bool]:
+    if sys.platform != "win32":
+        return command, True
+    parts = shlex.split(command, posix=True)
+    resolved = shutil.which(parts[0])
+    if resolved is None:
+        return command, True
+    return [resolved, *parts[1:]], False
+
+
 DEFAULT_PLAN_PATHS = (
     "PLAN.md",
     "docs/PLAN.md",

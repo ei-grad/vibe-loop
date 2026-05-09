@@ -18,6 +18,7 @@ from vibe_loop.config import (
     VibeConfig,
     reject_generated_command_adapters,
     shell_quote,
+    prepare_shell_command,
 )
 from vibe_loop.generated_discovery import (
     EvidenceBundle,
@@ -402,12 +403,13 @@ def configure_generated_task_source(
         )
 
     prompt = build_generated_task_source_prompt(bundle)
-    command = command_template.format(prompt=shell_quote(prompt))
+    command_str = command_template.format(prompt=shell_quote(prompt))
+    cmd, use_shell = prepare_shell_command(command_str)
     try:
         result = subprocess.run(
-            command,
+            cmd,
             cwd=config.repo,
-            shell=True,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

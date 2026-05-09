@@ -22,6 +22,7 @@ from vibe_loop.config import (
     VibeConfig,
     AGENT_SKILL_REF_PREFIX,
     shell_quote,
+    prepare_shell_command,
 )
 from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
@@ -300,12 +301,13 @@ class VibeRunner:
         )
         report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
         report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
-        command = command_template.format(prompt=shell_quote(prompt))
+        command_str = command_template.format(prompt=shell_quote(prompt))
+        cmd, use_shell = prepare_shell_command(command_str)
         try:
             result = subprocess.run(
-                command,
+                cmd,
                 cwd=self.config.repo,
-                shell=True,
+                shell=use_shell,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -340,12 +342,13 @@ class VibeRunner:
         )
         report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
         report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
-        command = command_template.format(prompt=shell_quote(prompt))
+        command_str = command_template.format(prompt=shell_quote(prompt))
+        cmd, use_shell = prepare_shell_command(command_str)
         try:
             result = subprocess.run(
-                command,
+                cmd,
                 cwd=self.config.repo,
-                shell=True,
+                shell=use_shell,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -1167,10 +1170,11 @@ def run_streaming_command(
     forward_stderr: bool = False,
     on_start: Callable[[int], None] | None = None,
 ) -> StreamingCommandResult:
+    cmd, use_shell = prepare_shell_command(command)
     process = subprocess.Popen(
-        command,
+        cmd,
         cwd=cwd,
-        shell=True,
+        shell=use_shell,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,

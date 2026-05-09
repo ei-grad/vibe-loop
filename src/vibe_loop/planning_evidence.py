@@ -10,7 +10,9 @@ import threading
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from vibe_loop.config import VibeConfig, planning_analytics_output_report
+import sys
+
+from vibe_loop.config import VibeConfig, planning_analytics_output_report, prepare_shell_command
 from vibe_loop.generated_discovery import (
     SkippedEvidence,
     is_secret_like_directory_name,
@@ -404,15 +406,21 @@ def run_worklog_command(
     timeout_seconds: int,
     max_stdout_bytes: int,
 ) -> WorklogCommandResult:
+    cmd, use_shell = prepare_shell_command(command)
+    popen_kwargs: dict[str, object] = {}
+    if sys.platform != "win32":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = subprocess.Popen(
-            command,
+            cmd,
             cwd=repo,
-            shell=True,
+            shell=use_shell,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,
+            **popen_kwargs,
         )
     except OSError as exc:
         return WorklogCommandResult(127, "", error=exc.__class__.__name__)
@@ -464,10 +472,11 @@ def run_worklog_command(
 
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return
-    except OSError:
+        if sys.platform == "win32":
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, OSError):
         try:
             process.kill()
         except OSError:

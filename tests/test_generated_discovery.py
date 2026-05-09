@@ -22,9 +22,9 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             (repo / "docs").mkdir()
-            (repo / "docs" / "ROADMAP.md").write_text("roadmap\n", encoding="utf-8")
-            (repo / "PLAN.md").write_text("plan\n", encoding="utf-8")
-            (repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            (repo / "docs" / "ROADMAP.md").write_bytes(b"roadmap\n")
+            (repo / "PLAN.md").write_bytes(b"plan\n")
+            (repo / "pyproject.toml").write_bytes(b"[project]\n")
 
             bundle = collect_generated_discovery_evidence(repo)
 
@@ -1613,13 +1613,15 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
             with patch("vibe_loop.generated_discovery.os.walk", fake_walk):
                 bundle = collect_generated_discovery_evidence(repo)
 
+        sep = "\\" if sys.platform == "win32" else "/"
+        expected_detail = f"[Errno 13] Permission denied: '.{sep}x'"
         self.assertEqual(
             bundle.manifest_json()["skipped"],
             [
                 {
                     "path": "x",
                     "reason": "unreadable_directory",
-                    "detail": "[Errno 13] Permission denied: './x'",
+                    "detail": expected_detail,
                 }
             ],
         )
