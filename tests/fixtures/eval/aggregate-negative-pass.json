@@ -1,0 +1,40 @@
+{
+  "cases": {
+    "negative-trigger-set": {
+      "no_skill": {
+        "failure_taxonomy": {},
+        "pass_count": 1,
+        "pass_rate": 1.0,
+        "trials": 1
+      }
+    }
+  },
+  "conditions": {
+    "no_skill": {
+      "absolute_uplift": 0.0,
+      "confidence_interval_95": {
+        "lower": 0.206549,
+        "method": "wilson",
+        "upper": 1.0
+      },
+      "failure_taxonomy": {},
+      "normalized_gain": 0.0,
+      "pass_count": 1,
+      "pass_rate": 1.0,
+      "primary_trials": 1,
+      "trials": 1
+    }
+  },
+  "records": [
+    {
+      "case_id": "negative-trigger-set",
+      "condition": "no_skill",
+      "failure_taxonomy": [],
+      "status": "passed",
+      "trial": 1
+    }
+  ],
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "total_trials": 1
+}

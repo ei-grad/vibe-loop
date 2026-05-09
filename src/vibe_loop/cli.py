@@ -12,6 +12,11 @@ from vibe_loop.config import (
     AgentResolutionError,
     load_config,
 )
+from vibe_loop.eval_runner import (
+    LocalSkillEvalConfig,
+    parse_agent_command_specs,
+    run_local_demo_eval,
+)
 from vibe_loop.generated_profiles import (
     GeneratedTaskSourceRuntimeError,
     configure_generated_task_source,
@@ -168,6 +173,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON object with additional structured report metadata",
     )
 
+    eval_parser = subparsers.add_parser("eval", help="Run local skill evaluations")
+    add_repo_argument(eval_parser)
+    eval_subparsers = eval_parser.add_subparsers(
+        dest="eval_command",
+        required=True,
+    )
+    local_demo = eval_subparsers.add_parser(
+        "local-demo",
+        help="Run the bundled local demo skill eval suite",
+    )
+    add_repo_argument(local_demo)
+    local_demo.add_argument("--output", type=Path)
+    local_demo.add_argument("--case", action="append", default=[])
+    local_demo.add_argument("--condition", action="append", default=[])
+    local_demo.add_argument("--trials", type=int, default=1)
+    local_demo.add_argument(
+        "--agent-command",
+        action="append",
+        default=[],
+        help=(
+            "Agent command template. Use CONDITION=COMMAND for per-condition "
+            "commands or *=COMMAND/default COMMAND for all conditions."
+        ),
+    )
+    local_demo.add_argument("--transcript-grader", action="append", default=[])
+    local_demo.add_argument("--timeout-seconds", type=int)
+    local_demo.add_argument("--max-commands", type=int)
+    local_demo.add_argument("--max-output-bytes", type=int)
+    local_demo.add_argument("--overwrite", action="store_true")
+    local_demo.add_argument("--agent-name", default="configured-agent")
+    local_demo.add_argument("--model-provider", default="unknown")
+    local_demo.add_argument("--model-id", default="unknown")
+    local_demo.add_argument("--reasoning-effort", default="")
+    local_demo.add_argument("--json", action="store_true")
+
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
 
@@ -260,6 +300,9 @@ def dispatch(args: argparse.Namespace) -> int:
         print(json.dumps(report.to_json(), indent=2))
         return 0
 
+    if args.command == "eval":
+        return dispatch_eval(args, config)
+
     if args.command == "doctor":
         print(
             json.dumps(
@@ -286,6 +329,48 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     raise AssertionError(args.command)
+
+
+def dispatch_eval(args: argparse.Namespace, config) -> int:
+    if args.eval_command == "local-demo":
+        agent_commands, default_agent_command = parse_agent_command_specs(
+            args.agent_command
+        )
+        if not agent_commands and default_agent_command is None:
+            default_agent_command = config.agent.require_selection_command()
+        output_root = args.output or (config.state_path / "eval-runs")
+        aggregate = run_local_demo_eval(
+            LocalSkillEvalConfig(
+                output_root=output_root,
+                agent_commands=agent_commands,
+                default_agent_command=default_agent_command,
+                cases=tuple(args.case),
+                conditions=tuple(args.condition),
+                trials=args.trials,
+                transcript_graders=tuple(args.transcript_grader),
+                timeout_seconds=args.timeout_seconds,
+                max_commands=args.max_commands,
+                max_output_bytes=args.max_output_bytes,
+                overwrite=args.overwrite,
+                agent_name=args.agent_name,
+                model_provider=args.model_provider,
+                model_id=args.model_id,
+                reasoning_effort=args.reasoning_effort,
+            )
+        )
+        if args.json:
+            print(json.dumps(aggregate, indent=2, sort_keys=True))
+        else:
+            print(f"aggregate: {output_root / 'local-demo-v1' / 'aggregate.json'}")
+            for condition, payload in aggregate.get("conditions", {}).items():
+                if isinstance(payload, dict):
+                    print(
+                        f"{condition}: pass_rate={payload.get('pass_rate')} "
+                        f"trials={payload.get('trials')}"
+                    )
+        return 0
+
+    raise AssertionError(args.eval_command)
 
 
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:

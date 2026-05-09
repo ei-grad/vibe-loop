@@ -174,6 +174,7 @@ vibe-loop tasks configure --repo . --json
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
+vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop workers --repo .
 vibe-loop main-integration status --repo .
 vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
@@ -199,6 +200,11 @@ stderr, `session_id` stores that native worker id and `session_id_source` is
 `run-until-done` is serial by default. Pass `--jobs N` to let the supervisor
 keep up to `N` finite worker commands active at once; each worker still gets its
 own task lock, run id, and log path. `run-next` always runs a single worker.
+
+`eval local-demo` materializes fresh bundled fixture repositories under the
+configured output directory, runs the same prompt across selected skill
+conditions and agent commands, writes per-trial artifacts, and emits
+`aggregate.json` plus `aggregate.md` summaries.
 
 Workers can explicitly report their final status while the supervisor run is
 active:
