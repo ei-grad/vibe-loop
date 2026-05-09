@@ -396,7 +396,7 @@ class RunStoreTests(unittest.TestCase):
                     [
                         '{"record_type":"active","task_id":"TASK-01"}',
                         '{"record_type":"run_result","task_id":"TASK-02","log":""}',
-                        f'{{"task_id":"TASK-03","log":"{directory}"}}',
+                        json.dumps({"task_id": "TASK-03", "log": directory}),
                     ]
                 ),
                 encoding="utf-8",

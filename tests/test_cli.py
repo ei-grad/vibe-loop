@@ -3357,18 +3357,12 @@ class CliTests(unittest.TestCase):
             repo = Path(directory)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
-            bin_dir = repo / "bin"
-            bin_dir.mkdir()
-            claude = bin_dir / "claude"
-            claude.write_text(
-                "#!/usr/bin/env python3\n"
+            (repo / "worker.py").write_text(
                 "from pathlib import Path\n"
                 "import sys\n"
-                "if sys.argv[1] != '-p':\n"
-                "    raise SystemExit(64)\n"
-                "prompt = sys.argv[2]\n"
-                "print(f'claude out: {prompt}')\n"
-                "print(f'claude err: {prompt}', file=sys.stderr)\n"
+                "task_id = sys.argv[1]\n"
+                "print(f'claude out: $vibe-loop {task_id}')\n"
+                "print(f'claude err: $vibe-loop {task_id}', file=sys.stderr)\n"
                 "plan = Path('docs/PLAN.md')\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
@@ -3377,20 +3371,16 @@ class CliTests(unittest.TestCase):
                 ")\n",
                 encoding="utf-8",
             )
-            claude.chmod(0o755)
+            command = f"{sys.executable} worker.py {{task_id}}"
             (repo / ".vibe-loop.toml").write_text(
-                "[agent]\ncommand = \"claude -p '$vibe-loop {task_id}'\"\n",
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
             stdout = StringIO()
             stderr = StringIO()
-            original_path = os.environ.get("PATH", "")
-            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{original_path}"
-            try:
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    exit_code = main(["run-next", "--repo", str(repo)])
-            finally:
-                os.environ["PATH"] = original_path
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
 
             payload = json.loads(stdout.getvalue())
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
@@ -3416,34 +3406,24 @@ class CliTests(unittest.TestCase):
             repo = Path(directory)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
-            bin_dir = repo / "bin"
-            bin_dir.mkdir()
-            claude = bin_dir / "claude"
-            claude.write_text(
-                "#!/usr/bin/env python3\n"
+            (repo / "selector.py").write_text(
                 "from pathlib import Path\n"
                 "import json\n"
                 "import sys\n"
-                "if sys.argv[1] != '-p':\n"
-                "    raise SystemExit(64)\n"
-                "Path('selection-prompt.txt').write_text(sys.argv[2], encoding='utf-8')\n"
+                "Path('selection-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
                 "print(json.dumps({'task_id': 'TASK-02', 'reason': 'ready'}))\n",
                 encoding="utf-8",
             )
-            claude.chmod(0o755)
+            selector_cmd = f"{sys.executable} selector.py {{prompt}}"
             (repo / ".vibe-loop.toml").write_text(
-                '[agent]\nselection_command = "claude -p {prompt}"\n',
+                "[agent]\nselection_command = " + json.dumps(selector_cmd) + "\n",
                 encoding="utf-8",
             )
             stdout = StringIO()
             stderr = StringIO()
-            original_path = os.environ.get("PATH", "")
-            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{original_path}"
-            try:
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    exit_code = main(["next", "--repo", str(repo), "--ask-agent"])
-            finally:
-                os.environ["PATH"] = original_path
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["next", "--repo", str(repo), "--ask-agent"])
 
             prompt = (repo / "selection-prompt.txt").read_text(encoding="utf-8")
 

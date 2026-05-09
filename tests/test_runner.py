@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import sys
 import tempfile
 import threading
 import time
@@ -952,13 +953,18 @@ class RunnerTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import sys\nprint('out')\nprint('err', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
             log_path = Path(directory) / "run.log"
             stdout = StringIO()
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     result = run_streaming_command(
-                        'python -c \'import sys; print("out"); print("err", file=sys.stderr)\'',
+                        f"{sys.executable} cmd.py",
                         Path(directory),
                         log,
                     )
@@ -975,12 +981,17 @@ class RunnerTests(unittest.TestCase):
 
     def test_streaming_command_can_forward_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import sys\nprint('err', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
             log_path = Path(directory) / "run.log"
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stderr(stderr):
                     result = run_streaming_command(
-                        "python -c 'import sys; print(\"err\", file=sys.stderr)'",
+                        f"{sys.executable} cmd.py",
                         Path(directory),
                         log,
                         forward_stderr=True,
@@ -992,12 +1003,17 @@ class RunnerTests(unittest.TestCase):
 
     def test_streaming_command_captures_stdout_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "print('session id: native-stdout-123')\n",
+                encoding="utf-8",
+            )
             log_path = Path(directory) / "run.log"
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stderr(stderr):
                     result = run_streaming_command(
-                        "python -c 'print(\"session id: native-stdout-123\")'",
+                        f"{sys.executable} cmd.py",
                         Path(directory),
                         log,
                     )
@@ -1013,11 +1029,13 @@ class RunnerTests(unittest.TestCase):
 
     def test_streaming_command_reports_started_process_pid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text("print('ok')\n", encoding="utf-8")
             log_path = Path(directory) / "run.log"
             started_pids: list[int] = []
             with log_path.open("w", encoding="utf-8") as log:
                 result = run_streaming_command(
-                    "python -c 'print(\"ok\")'",
+                    f"{sys.executable} cmd.py",
                     Path(directory),
                     log,
                     on_start=started_pids.append,
@@ -1031,13 +1049,17 @@ class RunnerTests(unittest.TestCase):
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import sys\nprint('session id: native-stderr-123', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
             log_path = Path(directory) / "run.log"
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stderr(stderr):
                     result = run_streaming_command(
-                        "python -c 'import sys; "
-                        'print("session id: native-stderr-123", file=sys.stderr)\'',
+                        f"{sys.executable} cmd.py",
                         Path(directory),
                         log,
                     )
@@ -1053,14 +1075,19 @@ class RunnerTests(unittest.TestCase):
 
     def test_streaming_command_replaces_undecodable_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import sys\n"
+                "sys.stdout.buffer.write(b'ok\\xff\\n')\n"
+                "sys.stderr.buffer.write(b'bad\\xfe\\n')\n",
+                encoding="utf-8",
+            )
             log_path = Path(directory) / "run.log"
             stderr = StringIO()
             with log_path.open("w", encoding="utf-8") as log:
                 with redirect_stderr(stderr):
                     result = run_streaming_command(
-                        'python -c "import sys; '
-                        "sys.stdout.buffer.write(b'ok\\\\xff\\\\n'); "
-                        "sys.stderr.buffer.write(b'bad\\\\xfe\\\\n')\"",
+                        f"{sys.executable} cmd.py",
                         Path(directory),
                         log,
                     )
