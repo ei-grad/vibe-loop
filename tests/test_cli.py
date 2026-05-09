@@ -948,6 +948,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent"]["default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent"]["default_policy"])
 
+    def test_doctor_reports_planning_analytics_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(payload["task_source_runtime"]["usable"])
+        self.assertEqual(payload["planning_analytics"]["status"], "ready")
+        self.assertEqual(
+            payload["planning_analytics"]["schedule_policy"],
+            "current-runner-parity",
+        )
+        self.assertFalse(payload["planning_analytics"]["repo_artifact_outputs_enabled"])
+        self.assertEqual(
+            payload["planning_analytics"]["outputs"]["timeline_json"]["source"],
+            "default_state_dir",
+        )
+
     def test_tasks_configure_writes_validated_profile_cache_with_stub_agent(
         self,
     ) -> None:

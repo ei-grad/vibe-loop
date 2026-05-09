@@ -306,6 +306,21 @@ commands = [
   "uv run python scripts/record_worklog.py --validate",
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
+
+[planning_analytics]
+schedule_policy = "current-runner-parity"
+subject_matching = "diagnostic"
+# Optional future collector adapter. Doctor reports whether this is set without
+# printing the command string.
+# worklog_command = "my-worklog export --jsonl"
+
+[planning_analytics.outputs]
+# Explicit repo artifact paths are opt-in. Omitted paths write under
+# <state_dir>/planning-analytics when analytics commands are added.
+# timeline_json = "docs/planning/timeline.json"
+# gantt_html = "docs/planning/gantt.html"
+# benchmark_json = "docs/planning/duration-benchmark.json"
+# benchmark_markdown = "docs/planning/duration-benchmark.md"
 ```
 
 Omit `[task_source]` source keys to allow generated cache use before Markdown
@@ -445,6 +460,31 @@ includes that override so promotion preserves the active task semantics.
 
 See `docs/generated-task-discovery.md` for the generated profile schema,
 precedence rules, stale-cache behavior, and degradation states.
+
+## Planning Analytics
+
+Planning analytics is a reporting boundary over normalized tasks, run records,
+optional project worklogs, and bounded git metadata. It does not affect task
+selection, worker locks, or completion classification. The default generated
+artifact location is `<state_dir>/planning-analytics`, so analytics defaults do
+not mutate repository docs. Repositories that want committed reports must opt in
+with explicit output paths or future command flags.
+
+Coverage checks use authoritative mappings only: task-source completion state,
+structured worker reports, optional project worklog records, explicit commit
+references, and `Plan-Item:` commit trailers. Subject matching, branch names,
+and raw logs are diagnostic by default and do not satisfy coverage.
+
+Projected timelines default to `current-runner-parity`, matching the runner's
+dependency readiness and deterministic task order. `lightmetrics-parity` is
+available as an explicit policy for comparison with the prototype behavior, and
+generated timeline artifacts must serialize the selected `schedule_policy`.
+
+`vibe-loop doctor` reports planning analytics readiness without running a
+collector. It includes the selected schedule policy, subject matching mode,
+worklog adapter presence, coverage tiers, resolved artifact paths, and whether
+repo-artifact outputs are explicitly enabled. See
+`docs/planning-analytics.md` for the full contract.
 
 ## Development
 

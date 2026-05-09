@@ -21,6 +21,19 @@ DEFAULT_RUNNABLE_STATUSES = ("Active", "Next", "Planned")
 GENERATED_TASK_PROFILE_CACHE_FILE = "generated-task-source.json"
 GENERATED_TASK_PROFILE_SCHEMA_VERSION = 1
 GENERATED_TASK_PROFILE_PROMPT_VERSION = 1
+PLANNING_ANALYTICS_ARTIFACT_DIR = "planning-analytics"
+PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY = "current-runner-parity"
+PLANNING_ANALYTICS_SCHEDULE_POLICIES = (
+    "current-runner-parity",
+    "lightmetrics-parity",
+)
+PLANNING_ANALYTICS_DEFAULT_OUTPUTS = {
+    "timeline_json": "timeline.json",
+    "gantt_html": "gantt.html",
+    "benchmark_json": "duration-benchmark.json",
+    "benchmark_markdown": "duration-benchmark.md",
+}
+PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES = ("diagnostic", "disabled")
 TASK_SOURCE_SOURCE_KEYS = frozenset(
     {
         "type",
@@ -210,6 +223,35 @@ class CompletionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class PlanningAnalyticsOutputs:
+    timeline_json: str | None = None
+    gantt_html: str | None = None
+    benchmark_json: str | None = None
+    benchmark_markdown: str | None = None
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def has_explicit_paths(self) -> bool:
+        return any(
+            getattr(self, key) is not None for key in PLANNING_ANALYTICS_DEFAULT_OUTPUTS
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanningAnalyticsConfig:
+    schedule_policy: str = PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY
+    subject_matching: str = "diagnostic"
+    worklog_command: str | None = None
+    outputs: PlanningAnalyticsOutputs = dataclasses.field(
+        default_factory=PlanningAnalyticsOutputs
+    )
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+
+@dataclasses.dataclass(frozen=True)
 class VibeConfig:
     repo: Path
     main_branch: str = "main"
@@ -217,6 +259,9 @@ class VibeConfig:
     agent: AgentConfig = dataclasses.field(default_factory=AgentConfig)
     task_source: TaskSourceConfig = dataclasses.field(default_factory=TaskSourceConfig)
     completion: CompletionConfig = dataclasses.field(default_factory=CompletionConfig)
+    planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
+        default_factory=PlanningAnalyticsConfig
+    )
 
     @property
     def state_path(self) -> Path:
@@ -226,6 +271,10 @@ class VibeConfig:
     def generated_task_profile_path(self) -> Path:
         return self.state_path / GENERATED_TASK_PROFILE_CACHE_FILE
 
+    @property
+    def planning_analytics_state_path(self) -> Path:
+        return self.state_path / PLANNING_ANALYTICS_ARTIFACT_DIR
+
 
 def load_config(repo: Path) -> VibeConfig:
     repo = repo.resolve()
@@ -233,6 +282,7 @@ def load_config(repo: Path) -> VibeConfig:
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
     agent = parse_agent(data.get("agent", {}))
+    planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
     return VibeConfig(
         repo=repo,
         main_branch=str(data.get("main_branch") or "main"),
@@ -240,6 +290,7 @@ def load_config(repo: Path) -> VibeConfig:
         agent=agent,
         task_source=task_source,
         completion=completion,
+        planning_analytics=planning_analytics,
     )
 
 
@@ -443,6 +494,141 @@ def default_completion_commands(repo: Path) -> tuple[str, ...]:
     return ()
 
 
+def parse_planning_analytics(data: object) -> PlanningAnalyticsConfig:
+    table = expect_table(data, "planning_analytics")
+    explicit_keys = frozenset(str(key) for key in table)
+    schedule_policy = (
+        optional_nonempty_string(table.get("schedule_policy"))
+        or PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY
+    )
+    if schedule_policy not in PLANNING_ANALYTICS_SCHEDULE_POLICIES:
+        allowed = ", ".join(PLANNING_ANALYTICS_SCHEDULE_POLICIES)
+        raise ValueError(
+            f"planning_analytics.schedule_policy must be one of: {allowed}"
+        )
+    subject_matching = (
+        optional_nonempty_string(table.get("subject_matching")) or "diagnostic"
+    )
+    if subject_matching not in PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES:
+        allowed = ", ".join(PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES)
+        raise ValueError(
+            f"planning_analytics.subject_matching must be one of: {allowed}"
+        )
+    return PlanningAnalyticsConfig(
+        schedule_policy=schedule_policy,
+        subject_matching=subject_matching,
+        worklog_command=optional_nonempty_string(table.get("worklog_command")),
+        outputs=parse_planning_analytics_outputs(table.get("outputs")),
+        explicit_keys=explicit_keys,
+    )
+
+
+def parse_planning_analytics_outputs(data: object) -> PlanningAnalyticsOutputs:
+    table = expect_table(data, "planning_analytics.outputs")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(set(explicit_keys) - set(PLANNING_ANALYTICS_DEFAULT_OUTPUTS))
+    if unknown_keys:
+        raise ValueError(
+            "planning_analytics.outputs contains unsupported keys: "
+            f"{', '.join(unknown_keys)}"
+        )
+    return PlanningAnalyticsOutputs(
+        timeline_json=optional_repo_relative_path(
+            table.get("timeline_json"),
+            "planning_analytics.outputs.timeline_json",
+        ),
+        gantt_html=optional_repo_relative_path(
+            table.get("gantt_html"),
+            "planning_analytics.outputs.gantt_html",
+        ),
+        benchmark_json=optional_repo_relative_path(
+            table.get("benchmark_json"),
+            "planning_analytics.outputs.benchmark_json",
+        ),
+        benchmark_markdown=optional_repo_relative_path(
+            table.get("benchmark_markdown"),
+            "planning_analytics.outputs.benchmark_markdown",
+        ),
+        explicit_keys=explicit_keys,
+    )
+
+
+def planning_analytics_report(
+    config: VibeConfig,
+    task_source_runtime: dict[str, object] | None = None,
+) -> dict[str, object]:
+    diagnostics: list[str] = []
+    status = "ready"
+    if task_source_runtime is not None and not task_source_runtime.get("usable"):
+        status = "task_source_unusable"
+        diagnostics.append("planning analytics requires a usable task source")
+    if config.planning_analytics.worklog_command is None:
+        diagnostics.append(
+            "project worklog adapter is not configured; authoritative evidence "
+            "will come from task source state, run reports, explicit commit "
+            "mapping, and bounded git metadata"
+        )
+    return {
+        "status": status,
+        "schedule_policy": config.planning_analytics.schedule_policy,
+        "schedule_policy_source": (
+            "explicit"
+            if config.planning_analytics.is_explicit("schedule_policy")
+            else "default"
+        ),
+        "subject_matching": config.planning_analytics.subject_matching,
+        "subject_matching_source": (
+            "explicit"
+            if config.planning_analytics.is_explicit("subject_matching")
+            else "default"
+        ),
+        "worklog_adapter": {
+            "configured": config.planning_analytics.worklog_command is not None,
+            "source": (
+                "explicit"
+                if config.planning_analytics.worklog_command is not None
+                else "none"
+            ),
+        },
+        "coverage": {
+            "authoritative_evidence": [
+                "task source completion state",
+                "worker reports with explicit task ids",
+                "project worklog adapter records",
+                "explicit commit refs or Plan-Item trailers",
+            ],
+            "diagnostic_only": [
+                "subject matching",
+                "branch names",
+                "raw run log text",
+            ],
+        },
+        "outputs": planning_analytics_output_report(config),
+        "repo_artifact_outputs_enabled": (
+            config.planning_analytics.outputs.has_explicit_paths
+        ),
+        "diagnostics": diagnostics,
+    }
+
+
+def planning_analytics_output_report(config: VibeConfig) -> dict[str, object]:
+    outputs = config.planning_analytics.outputs
+    report: dict[str, object] = {}
+    for key, default_name in PLANNING_ANALYTICS_DEFAULT_OUTPUTS.items():
+        explicit_path = getattr(outputs, key)
+        if explicit_path is None:
+            path = config.planning_analytics_state_path / default_name
+            source = "default_state_dir"
+        else:
+            path = config.repo / explicit_path
+            source = "explicit"
+        report[key] = {
+            "path": str(path),
+            "source": source,
+        }
+    return report
+
+
 def expect_table(value: object, name: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -461,6 +647,16 @@ def optional_nonempty_string(value: object) -> str | None:
     text = optional_string(value)
     if not text:
         return None
+    return text
+
+
+def optional_repo_relative_path(value: object, name: str) -> str | None:
+    text = optional_nonempty_string(value)
+    if text is None:
+        return None
+    path = Path(text)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{name} must be a repo-relative path")
     return text
 
 

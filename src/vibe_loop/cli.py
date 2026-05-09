@@ -11,6 +11,7 @@ from vibe_loop.config import (
     AGENT_DEFAULT_POLICY_SOURCE,
     AgentResolutionError,
     load_config,
+    planning_analytics_report,
 )
 from vibe_loop.eval_runner import (
     LocalSkillEvalConfig,
@@ -335,6 +336,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_eval(args, config)
 
     if args.command == "doctor":
+        task_source_runtime = runtime_task_source_report(config)
         print(
             json.dumps(
                 {
@@ -342,8 +344,12 @@ def dispatch(args: argparse.Namespace) -> int:
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
                     "task_source": config.task_source.to_json(),
-                    "task_source_runtime": runtime_task_source_report(config),
+                    "task_source_runtime": task_source_runtime,
                     "generated_task_profile": generated_task_cache_report(config),
+                    "planning_analytics": planning_analytics_report(
+                        config,
+                        task_source_runtime=task_source_runtime,
+                    ),
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                 },
