@@ -33,6 +33,9 @@ Issues = "https://github.com/ei-grad/vibe-loop/issues"
 [project.scripts]
 vibe-loop = "vibe_loop:main"
 
+[tool.uv.build-backend]
+data = { data = "eval" }
+
 [build-system]
 requires = ["uv_build>=0.11.3,<0.12.0"]
 build-backend = "uv_build"

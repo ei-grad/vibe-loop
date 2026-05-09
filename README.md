@@ -201,6 +201,7 @@ vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
+vibe-loop eval release-gate --repo . --trials 3 --overwrite --record-output .vibe-loop/release-readiness.json
 vibe-loop workers --repo .
 vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
@@ -251,6 +252,18 @@ failures, reports per-task and per-domain uplift, flags trigger, review,
 integration, git, prompt, budget, and cost issues, compares against any previous
 aggregate in the same output directory, and links each reported count or delta
 back to the contributing trial artifact roots.
+
+`eval release-gate` is the bundled skill release-readiness check. Without
+`--aggregate` or `--dry-run`, it runs the local demo suite with a release default
+of 3 trials per case and condition, then writes or prints a
+`skill_release_readiness` record. The gate requires full local-demo coverage and
+requires `skill_quality` comparison evidence before it can pass. It blocks
+unresolved `workflow_contract_regression` findings from the aggregate's
+`skill_quality` section. A regression can be accepted only when it is parked with
+a task id, for example
+`--parked-regression condition_comparison:vibe_loop=EVAL-99`. External benchmark
+smoke evidence can be attached with `--external-benchmark-json`; it is recorded
+as optional context and is not required for every bundled skill change.
 
 Workers can explicitly report their final status while the supervisor run is
 active:
@@ -543,6 +556,16 @@ Run the workflow manually with target `TestPyPI` for a staging upload. To publis
 to PyPI, push a tag named `v<version>` where `<version>` exactly matches
 `project.version` in `pyproject.toml`, or dispatch the workflow from that tag
 with target `PyPI`.
+
+Before publishing bundled skill changes, run the release-readiness gate and put
+the resulting record path or artifact link in the release notes:
+
+```bash
+uv run vibe-loop eval release-gate --repo . --trials 3 --overwrite \
+  --record-output .vibe-loop/release-readiness.json
+```
+
+See `docs/release-checklist.md` for the checklist and dry-run record format.
 
 ## Local State
 

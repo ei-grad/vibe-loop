@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import sysconfig
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -52,8 +53,21 @@ class EvalExampleGraderResult:
 
 
 def default_eval_examples_root() -> Path:
-    repo_root = Path(__file__).resolve().parents[2]
-    return repo_root / EXAMPLES_RELATIVE_ROOT
+    module_path = Path(__file__).resolve()
+    repo_root = module_path.parents[2]
+    source_root = repo_root / EXAMPLES_RELATIVE_ROOT
+    candidates = [
+        source_root,
+        Path(sysconfig.get_path("data")) / EXAMPLES_RELATIVE_ROOT,
+        Path(sysconfig.get_path("data")) / "examples" / EXAMPLE_SUITE_ID,
+    ]
+    for parent in module_path.parents:
+        candidates.append(parent / EXAMPLES_RELATIVE_ROOT)
+        candidates.append(parent / "examples" / EXAMPLE_SUITE_ID)
+    for candidate in candidates:
+        if (candidate / "manifest.json").is_file():
+            return candidate
+    return source_root
 
 
 def load_eval_example_manifest(examples_root: Path | None = None) -> dict[str, Any]:

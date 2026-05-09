@@ -266,13 +266,32 @@ Self-generated skills are not a substitute for curated skills. SkillsBench's
 results make this a separate research condition, not a release replacement for
 the bundled skills.
 
+## Release Readiness Gate
+
+Bundled skill changes should pass `vibe-loop eval release-gate` before
+publishing. The gate runs the local demo suite with 3 trials per case and
+condition by default, then emits a `skill_release_readiness` record. That record
+links to the aggregate, records local-suite coverage, lists workflow-contract
+regressions, and stores optional external benchmark smoke summaries.
+
+The blocking threshold is intentionally narrow for the first release gate:
+incomplete local-demo coverage or unresolved `workflow_contract_regression`
+findings block publishing, and an aggregate without `skill_quality` comparison
+evidence is not valid release evidence. Other regressions such as cost, latency,
+task outcome, or trigger movement remain visible in `aggregate.json` and release
+notes, but they are not first-pass hard blockers unless the maintainer chooses a
+stricter release policy for that change. A workflow-contract regression can be
+parked only with an explicit task id, and release notes should cite both the
+readiness record and any parked task ids.
+
+External benchmark smoke results are optional context. They must not replace the
+local release gate, and missing external results do not block ordinary bundled
+skill changes.
+
 ## Remaining Questions
 
 - Which transcript fields can be stored safely without retaining secret-like
   command output?
-- What threshold should block bundled skill releases: absolute pass-rate
-  regression, workflow-contract regression, trigger regression, or a combined
-  gate?
 - How should `vibe-loop` normalize costs and token counts across Codex, Claude,
   and other future harnesses when their telemetry differs?
 - Which deferred comparators, if any, become worth adapting after the first

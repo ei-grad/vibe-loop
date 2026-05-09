@@ -18,6 +18,14 @@ from vibe_loop.eval_runner import (
     parse_agent_command_specs,
     run_local_demo_eval,
 )
+from vibe_loop.eval_release import (
+    build_release_readiness_record,
+    load_external_benchmark_evidence,
+    load_json_mapping,
+    parse_parked_regression_specs,
+    render_release_readiness_summary,
+    write_release_readiness_record,
+)
 from vibe_loop.generated_profiles import (
     GeneratedTaskSourceRuntimeError,
     configure_generated_task_source,
@@ -273,28 +281,61 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_repo_argument(local_demo)
     local_demo.add_argument("--output", type=Path)
-    local_demo.add_argument("--case", action="append", default=[])
-    local_demo.add_argument("--condition", action="append", default=[])
-    local_demo.add_argument("--trials", type=int, default=1)
-    local_demo.add_argument(
-        "--agent-command",
+    add_local_demo_eval_arguments(local_demo, default_trials=1)
+    local_demo.add_argument("--json", action="store_true")
+
+    release_gate = eval_subparsers.add_parser(
+        "release-gate",
+        help="Run or check release readiness for bundled skill changes",
+    )
+    add_repo_argument(release_gate)
+    release_gate.add_argument(
+        "--aggregate",
+        type=Path,
+        help="Existing local-demo aggregate.json to check instead of running evals",
+    )
+    release_gate.add_argument(
+        "--eval-output",
+        type=Path,
+        help="Output root for a local demo suite run",
+    )
+    release_gate.add_argument(
+        "--record-output",
+        type=Path,
+        help="Write the release-readiness JSON record to this path",
+    )
+    release_gate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Do not run evals; check an existing aggregate and mark the record dry-run",
+    )
+    release_gate.add_argument(
+        "--minimum-trials",
+        type=int,
+        default=3,
+        help="Required trials per local-demo case and condition",
+    )
+    release_gate.add_argument(
+        "--parked-regression",
         action="append",
         default=[],
-        help=(
-            "Agent command template. Use CONDITION=COMMAND for per-condition "
-            "commands or *=COMMAND/default COMMAND for all conditions."
-        ),
+        help="Park one regression with REGRESSION_ID=TASK_ID",
     )
-    local_demo.add_argument("--transcript-grader", action="append", default=[])
-    local_demo.add_argument("--timeout-seconds", type=int)
-    local_demo.add_argument("--max-commands", type=int)
-    local_demo.add_argument("--max-output-bytes", type=int)
-    local_demo.add_argument("--overwrite", action="store_true")
-    local_demo.add_argument("--agent-name", default="configured-agent")
-    local_demo.add_argument("--model-provider", default="unknown")
-    local_demo.add_argument("--model-id", default="unknown")
-    local_demo.add_argument("--reasoning-effort", default="")
-    local_demo.add_argument("--json", action="store_true")
+    release_gate.add_argument(
+        "--parked-workflow-regression",
+        action="append",
+        default=[],
+        help="Park every current workflow-contract regression under TASK_ID",
+    )
+    release_gate.add_argument(
+        "--external-benchmark-json",
+        type=Path,
+        action="append",
+        default=[],
+        help="Optional external benchmark smoke summary JSON",
+    )
+    add_local_demo_eval_arguments(release_gate, default_trials=3)
+    release_gate.add_argument("--json", action="store_true")
 
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
@@ -305,6 +346,34 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--claude", action="store_true")
     install.add_argument("--home", type=Path, default=Path.home())
     return parser
+
+
+def add_local_demo_eval_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    default_trials: int,
+) -> None:
+    parser.add_argument("--case", action="append", default=[])
+    parser.add_argument("--condition", action="append", default=[])
+    parser.add_argument("--trials", type=int, default=default_trials)
+    parser.add_argument(
+        "--agent-command",
+        action="append",
+        default=[],
+        help=(
+            "Agent command template. Use CONDITION=COMMAND for per-condition "
+            "commands or *=COMMAND/default COMMAND for all conditions."
+        ),
+    )
+    parser.add_argument("--transcript-grader", action="append", default=[])
+    parser.add_argument("--timeout-seconds", type=int)
+    parser.add_argument("--max-commands", type=int)
+    parser.add_argument("--max-output-bytes", type=int)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--agent-name", default="configured-agent")
+    parser.add_argument("--model-provider", default="unknown")
+    parser.add_argument("--model-id", default="unknown")
+    parser.add_argument("--reasoning-effort", default="")
 
 
 def add_repo_argument(parser: argparse.ArgumentParser) -> None:
@@ -557,30 +626,9 @@ def dispatch_planning_artifacts(args: argparse.Namespace, config) -> int:
 
 def dispatch_eval(args: argparse.Namespace, config) -> int:
     if args.eval_command == "local-demo":
-        agent_commands, default_agent_command = parse_agent_command_specs(
-            args.agent_command
-        )
-        if not agent_commands and default_agent_command is None:
-            default_agent_command = config.agent.require_selection_command()
         output_root = args.output or (config.state_path / "eval-runs")
         aggregate = run_local_demo_eval(
-            LocalSkillEvalConfig(
-                output_root=output_root,
-                agent_commands=agent_commands,
-                default_agent_command=default_agent_command,
-                cases=tuple(args.case),
-                conditions=tuple(args.condition),
-                trials=args.trials,
-                transcript_graders=tuple(args.transcript_grader),
-                timeout_seconds=args.timeout_seconds,
-                max_commands=args.max_commands,
-                max_output_bytes=args.max_output_bytes,
-                overwrite=args.overwrite,
-                agent_name=args.agent_name,
-                model_provider=args.model_provider,
-                model_id=args.model_id,
-                reasoning_effort=args.reasoning_effort,
-            )
+            local_demo_config_from_args(args, config, output_root=output_root)
         )
         if args.json:
             print(json.dumps(aggregate, indent=2, sort_keys=True))
@@ -594,7 +642,73 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                     )
         return 0
 
+    if args.eval_command == "release-gate":
+        output_root = args.eval_output or (config.state_path / "eval-runs")
+        aggregate_path = args.aggregate or (
+            output_root / "local-demo-v1" / "aggregate.json"
+        )
+        local_suite_mode = "existing_aggregate"
+        if not args.dry_run and args.aggregate is None:
+            aggregate = run_local_demo_eval(
+                local_demo_config_from_args(args, config, output_root=output_root)
+            )
+            aggregate_path = output_root / "local-demo-v1" / "aggregate.json"
+            local_suite_mode = "executed"
+        else:
+            aggregate = load_json_mapping(aggregate_path)
+        record = build_release_readiness_record(
+            aggregate,
+            aggregate_path=aggregate_path,
+            dry_run=args.dry_run,
+            minimum_trials=args.minimum_trials,
+            local_suite_mode=local_suite_mode,
+            parked_regressions=parse_parked_regression_specs(args.parked_regression),
+            parked_workflow_regression_task_ids=tuple(args.parked_workflow_regression),
+            external_benchmarks=load_external_benchmark_evidence(
+                args.external_benchmark_json
+            ),
+        )
+        if args.record_output:
+            write_release_readiness_record(args.record_output, record)
+        if args.json:
+            print(json.dumps(record, indent=2, sort_keys=True))
+        else:
+            print(render_release_readiness_summary(record), end="")
+            if args.record_output:
+                print(f"record: {args.record_output}")
+        return 0 if record.get("status") == "passed" else 1
+
     raise AssertionError(args.eval_command)
+
+
+def local_demo_config_from_args(
+    args: argparse.Namespace,
+    config,
+    *,
+    output_root: Path,
+) -> LocalSkillEvalConfig:
+    agent_commands, default_agent_command = parse_agent_command_specs(
+        args.agent_command
+    )
+    if not agent_commands and default_agent_command is None:
+        default_agent_command = config.agent.require_selection_command()
+    return LocalSkillEvalConfig(
+        output_root=output_root,
+        agent_commands=agent_commands,
+        default_agent_command=default_agent_command,
+        cases=tuple(args.case),
+        conditions=tuple(args.condition),
+        trials=args.trials,
+        transcript_graders=tuple(args.transcript_grader),
+        timeout_seconds=args.timeout_seconds,
+        max_commands=args.max_commands,
+        max_output_bytes=args.max_output_bytes,
+        overwrite=args.overwrite,
+        agent_name=args.agent_name,
+        model_provider=args.model_provider,
+        model_id=args.model_id,
+        reasoning_effort=args.reasoning_effort,
+    )
 
 
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:
@@ -1018,8 +1132,7 @@ def render_planning_artifact_inspection(report: dict[str, object]) -> str:
                 task_id = warning.get("task_id")
                 task_text = f" task={task_id}" if task_id else ""
                 lines.append(
-                    f"- {warning.get('code')}{task_text}: "
-                    f"{warning.get('message')}"
+                    f"- {warning.get('code')}{task_text}: {warning.get('message')}"
                 )
     commands = report.get("next_repair_commands", [])
     if isinstance(commands, list) and commands:

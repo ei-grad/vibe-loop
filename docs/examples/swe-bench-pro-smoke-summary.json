@@ -1,0 +1,9 @@
+{
+  "benchmark": "swe-bench-pro-public-smoke",
+  "sample_size": 10,
+  "status": "recorded",
+  "summary": {
+    "resolved": 7,
+    "workflow_contract_regressions": 0
+  }
+}
