@@ -290,6 +290,26 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(views[0].process_state, "unknown_pid")
         self.assertEqual(views[0].stale_reason, "missing_worker_pid")
 
+    def test_worker_views_ignore_main_integration_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": 100, "host": "test-host"},
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        self.assertEqual(views, [])
+
 
 if __name__ == "__main__":
     unittest.main()

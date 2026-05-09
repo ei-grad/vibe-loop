@@ -58,6 +58,9 @@ class ActiveRunState:
 
     @classmethod
     def from_lock_metadata(cls, metadata: dict[str, object]) -> ActiveRunState | None:
+        record_type = optional_string(metadata.get("record_type"))
+        if record_type not in {None, ACTIVE_RUN_RECORD_TYPE}:
+            return None
         task_id = optional_string(metadata.get("task_id"))
         if not task_id:
             return None

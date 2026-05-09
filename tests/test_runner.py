@@ -10,7 +10,7 @@ from io import StringIO
 from pathlib import Path
 
 from vibe_loop.config import AgentConfig, VibeConfig
-from vibe_loop.locks import LockBusy, LockManager
+from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
     VibeRunner,
     build_selection_prompt,
@@ -291,6 +291,71 @@ class RunnerTests(unittest.TestCase):
 
             with self.assertRaises(LockBusy):
                 manager.acquire("LIVE-04", "run-2")
+
+    def test_main_integration_lock_serializes_holder_and_waiter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            holder = manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+            try:
+                status = manager.main_integration_status(
+                    process_exists=lambda pid: True,
+                )
+
+                self.assertTrue(status.locked)
+                self.assertEqual(status.state, "held")
+                self.assertEqual(status.process_state, "running")
+                self.assertEqual(status.metadata["task_id"], "main-integration")
+                self.assertEqual(status.metadata["owner_task_id"], "TASK-01")
+                self.assertEqual(status.metadata["run_id"], "run-holder")
+                with self.assertRaises(LockBusy) as busy:
+                    manager.acquire_main_integration(
+                        task_id="TASK-02",
+                        run_id="run-waiter",
+                    )
+                self.assertEqual(busy.exception.metadata["owner_task_id"], "TASK-01")
+                with self.assertRaises(LockOwnerMismatch):
+                    manager.release_main_integration(
+                        task_id="TASK-02",
+                        run_id="run-waiter",
+                    )
+                self.assertTrue(
+                    manager.release_main_integration(
+                        task_id="TASK-01",
+                        run_id="run-holder",
+                    )
+                )
+                self.assertFalse(manager.main_integration_status().locked)
+            finally:
+                manager.release(holder)
+
+    def test_main_integration_stale_lock_is_visible_but_not_stolen(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            held_lock = manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+                metadata={"pid": 999999999, "host": "test-host"},
+            )
+            try:
+                status = manager.main_integration_status(
+                    current_host="test-host",
+                    process_exists=lambda pid: False,
+                )
+
+                self.assertTrue(status.locked)
+                self.assertEqual(status.state, "stale")
+                self.assertEqual(status.process_state, "missing")
+                self.assertEqual(status.stale_reason, "missing_process")
+                with self.assertRaises(LockBusy):
+                    manager.acquire_main_integration(
+                        task_id="TASK-02",
+                        run_id="run-waiter",
+                    )
+            finally:
+                manager.release(held_lock)
 
     def test_streaming_command_forwards_stdout_and_logs_stderr_by_default(
         self,

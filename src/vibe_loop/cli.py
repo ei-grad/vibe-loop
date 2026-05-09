@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from vibe_loop.generated_profiles import (
     read_only_generated_cache_message,
     runtime_task_source_report,
 )
+from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
 from vibe_loop.skills import install_skills
@@ -114,6 +116,46 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(workers)
     workers.add_argument("--json", action="store_true")
 
+    integration = subparsers.add_parser(
+        "main-integration",
+        help="Manage the advisory main integration lock",
+    )
+    add_repo_argument(integration)
+    integration.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    integration_subparsers = integration.add_subparsers(
+        dest="main_integration_command",
+        required=True,
+    )
+    integration_status = integration_subparsers.add_parser(
+        "status",
+        help="Show the main integration lock",
+    )
+    add_repo_argument(integration_status)
+    integration_status.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS
+    )
+    integration_acquire = integration_subparsers.add_parser(
+        "acquire",
+        help="Acquire the main integration lock",
+    )
+    add_repo_argument(integration_acquire)
+    integration_acquire.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS
+    )
+    integration_acquire.add_argument("--run-id", default="")
+    integration_acquire.add_argument("--task-id", default="")
+    integration_acquire.add_argument("--pid", type=int, default=0)
+    integration_release = integration_subparsers.add_parser(
+        "release",
+        help="Release the main integration lock",
+    )
+    add_repo_argument(integration_release)
+    integration_release.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS
+    )
+    integration_release.add_argument("--run-id", default="")
+    integration_release.add_argument("--task-id", default="")
+
     report = subparsers.add_parser("report", help="Record a worker result report")
     add_repo_argument(report)
     report.add_argument("--run-id", required=True)
@@ -202,6 +244,9 @@ def dispatch(args: argparse.Namespace) -> int:
                 print(output)
         return 0
 
+    if args.command == "main-integration":
+        return dispatch_main_integration(args, config)
+
     if args.command == "report":
         report = WorkerReport(
             run_id=args.run_id,
@@ -241,6 +286,108 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     raise AssertionError(args.command)
+
+
+def dispatch_main_integration(args: argparse.Namespace, config) -> int:
+    manager = LockManager(config.state_path / "locks")
+    if args.main_integration_command == "status":
+        status = manager.main_integration_status()
+        if json_requested(args):
+            print(json.dumps(status.to_json(), indent=2))
+        else:
+            output = render_main_integration_status(status.to_json())
+            if output:
+                print(output)
+        return 0
+
+    run_id, task_id = worker_identity_from_args(args)
+    if not run_id or not task_id:
+        print(
+            "main-integration requires --run-id and --task-id "
+            "or VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID",
+            file=sys.stderr,
+        )
+        return 2
+
+    if args.main_integration_command == "acquire":
+        owner_metadata = main_integration_owner_metadata(
+            args,
+            manager,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if owner_metadata is None:
+            status = manager.main_integration_status()
+            if status.locked:
+                payload = {"acquired": False, "status": status.to_json()}
+                if json_requested(args):
+                    print(json.dumps(payload, indent=2))
+                else:
+                    print(
+                        render_main_integration_busy(payload["status"]),
+                        file=sys.stderr,
+                    )
+                return 1
+            print(
+                "main-integration acquire requires an active task lock with "
+                "matching run_id/task_id or an explicit --pid",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            manager.acquire_main_integration(
+                task_id=task_id,
+                run_id=run_id,
+                metadata=owner_metadata,
+            )
+        except LockBusy:
+            status = manager.main_integration_status()
+            payload = {"acquired": False, "status": status.to_json()}
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(render_main_integration_busy(payload["status"]), file=sys.stderr)
+            return 1
+        status = manager.main_integration_status()
+        payload = {"acquired": True, "status": status.to_json()}
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_main_integration_acquired(payload["status"]))
+        return 0
+
+    if args.main_integration_command == "release":
+        try:
+            released = manager.release_main_integration(task_id=task_id, run_id=run_id)
+        except LockOwnerMismatch as exc:
+            status = manager.main_integration_status()
+            payload = {
+                "released": False,
+                "error": "owner_mismatch",
+                "expected": {"run_id": exc.run_id, "task_id": exc.task_id},
+                "status": status.to_json(),
+            }
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    "main-integration release refused: owner_mismatch "
+                    f"holder_run={status.to_json()['run_id']} "
+                    f"holder_task={status.to_json()['owner_task_id']}",
+                    file=sys.stderr,
+                )
+            return 1
+        status = manager.main_integration_status()
+        payload = {"released": released, "status": status.to_json()}
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        elif released:
+            print("main-integration released")
+        else:
+            print("main-integration lock not found", file=sys.stderr)
+        return 0 if released else 1
+
+    raise AssertionError(args.main_integration_command)
 
 
 def dispatch_tasks(args: argparse.Namespace, config) -> int:
@@ -464,6 +611,83 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tcommand={payload['command']}{stale}"
         )
     return "\n".join(lines)
+
+
+def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:
+    run_id = args.run_id or os.environ.get("VIBE_LOOP_RUN_ID", "")
+    task_id = args.task_id or os.environ.get("VIBE_LOOP_TASK_ID", "")
+    return run_id, task_id
+
+
+def main_integration_owner_metadata(
+    args: argparse.Namespace,
+    manager: LockManager,
+    *,
+    run_id: str,
+    task_id: str,
+) -> dict[str, object] | None:
+    if args.pid > 0:
+        return {"pid": args.pid, "pid_source": "explicit_cli"}
+    for lock_metadata in manager.list_locks():
+        if lock_metadata.get("task_id") != task_id:
+            continue
+        if lock_metadata.get("run_id") != run_id:
+            continue
+        worker_pid = positive_int(lock_metadata.get("worker_pid"))
+        if worker_pid is not None:
+            return {
+                "pid": worker_pid,
+                "pid_source": "active_task_lock:worker_pid",
+            }
+        legacy_pid = positive_int(lock_metadata.get("pid"))
+        if legacy_pid is not None:
+            return {"pid": legacy_pid, "pid_source": "active_task_lock:pid"}
+    return None
+
+
+def json_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "json", False))
+
+
+def positive_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def render_main_integration_status(payload: dict[str, object]) -> str:
+    if not payload["locked"]:
+        return f"main-integration\t{payload['state']}\tpath={payload['path']}"
+    stale = f"\t{payload['stale_reason']}" if payload["stale_reason"] else ""
+    return (
+        f"main-integration\t{payload['state']}"
+        f"\tprocess={payload['process_state']}"
+        f"\trun={payload['run_id']}"
+        f"\ttask={payload['owner_task_id']}"
+        f"\tpid={payload['pid'] if payload['pid'] is not None else '-'}"
+        f"\tpid_source={payload['pid_source']}"
+        f"\tstarted={payload['started_at']}"
+        f"\tpath={payload['path']}{stale}"
+    )
+
+
+def render_main_integration_acquired(payload: dict[str, object]) -> str:
+    return (
+        "main-integration acquired "
+        f"run={payload['run_id']} task={payload['owner_task_id']} "
+        f"path={payload['path']}"
+    )
+
+
+def render_main_integration_busy(payload: dict[str, object]) -> str:
+    return (
+        "main-integration busy "
+        f"state={payload['state']} process={payload['process_state']} "
+        f"run={payload['run_id']} task={payload['owner_task_id']} "
+        f"path={payload['path']}"
+    )
 
 
 def parse_metadata_json(value: str | None) -> dict[str, object]:

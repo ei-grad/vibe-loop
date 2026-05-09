@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -2447,6 +2448,231 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 2)
         self.assertEqual("", stdout.getvalue())
         self.assertIn("no runnable tasks", stderr.getvalue())
+
+    def test_main_integration_cli_allows_one_holder_and_blocks_waiter(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-holder",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            holder_stdout = StringIO()
+            holder_stderr = StringIO()
+            waiter_stdout = StringIO()
+            waiter_stderr = StringIO()
+            status_stdout = StringIO()
+            status_stderr = StringIO()
+            release_stdout = StringIO()
+            release_stderr = StringIO()
+
+            with redirect_stdout(holder_stdout), redirect_stderr(holder_stderr):
+                holder_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+            with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
+                waiter_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-waiter",
+                        "--task-id",
+                        "TASK-02",
+                        "--json",
+                    ]
+                )
+            with redirect_stdout(status_stdout), redirect_stderr(status_stderr):
+                status_exit = main(
+                    ["main-integration", "status", "--repo", str(repo), "--json"]
+                )
+            with redirect_stdout(release_stdout), redirect_stderr(release_stderr):
+                release_exit = main(
+                    [
+                        "main-integration",
+                        "release",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            holder = json.loads(holder_stdout.getvalue())
+            waiter = json.loads(waiter_stdout.getvalue())
+            status = json.loads(status_stdout.getvalue())
+            release = json.loads(release_stdout.getvalue())
+
+        self.assertEqual(holder_exit, 0)
+        self.assertEqual(holder_stderr.getvalue(), "")
+        self.assertTrue(holder["acquired"])
+        self.assertEqual(holder["status"]["state"], "held")
+        self.assertEqual(holder["status"]["owner_task_id"], "TASK-01")
+        self.assertEqual(holder["status"]["run_id"], "run-holder")
+        self.assertEqual(holder["status"]["pid"], os.getpid())
+        self.assertEqual(holder["status"]["pid_source"], "active_task_lock:worker_pid")
+        self.assertEqual(waiter_exit, 1)
+        self.assertEqual(waiter_stderr.getvalue(), "")
+        self.assertFalse(waiter["acquired"])
+        self.assertEqual(waiter["status"]["state"], "held")
+        self.assertEqual(waiter["status"]["owner_task_id"], "TASK-01")
+        self.assertEqual(waiter["status"]["run_id"], "run-holder")
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(status_stderr.getvalue(), "")
+        self.assertTrue(status["locked"])
+        self.assertEqual(status["owner_task_id"], "TASK-01")
+        self.assertEqual(release_exit, 0)
+        self.assertEqual(release_stderr.getvalue(), "")
+        self.assertTrue(release["released"])
+        self.assertFalse(release["status"]["locked"])
+
+    def test_main_integration_acquire_requires_pid_or_active_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                    ]
+                )
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("active task lock", stderr.getvalue())
+        self.assertFalse(lock_exists)
+
+    def test_main_integration_parent_json_flag_returns_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    ["main-integration", "--json", "status", "--repo", str(repo)]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["locked"])
+        self.assertEqual(payload["state"], "available")
+
+    def test_main_integration_subprocess_acquire_uses_active_worker_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-holder",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            cli_script = (
+                "import sys; "
+                f"sys.path.insert(0, {str(source_path)!r}); "
+                "from vibe_loop.cli import main; "
+                "raise SystemExit(main(sys.argv[1:]))"
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    cli_script,
+                    "main-integration",
+                    "acquire",
+                    "--repo",
+                    str(repo),
+                    "--run-id",
+                    "run-holder",
+                    "--task-id",
+                    "TASK-01",
+                    "--json",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            )
+            status_stdout = StringIO()
+            status_stderr = StringIO()
+            with redirect_stdout(status_stdout), redirect_stderr(status_stderr):
+                status_exit = main(
+                    ["main-integration", "status", "--repo", str(repo), "--json"]
+                )
+
+            acquired = json.loads(result.stdout)
+            status = json.loads(status_stdout.getvalue())
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(status_stderr.getvalue(), "")
+        self.assertEqual(acquired["status"]["pid"], os.getpid())
+        self.assertEqual(
+            acquired["status"]["pid_source"],
+            "active_task_lock:worker_pid",
+        )
+        self.assertEqual(status["state"], "held")
+        self.assertEqual(status["process_state"], "running")
+        self.assertIsNone(status["stale_reason"])
 
     def test_tasks_locks_does_not_require_plan_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
