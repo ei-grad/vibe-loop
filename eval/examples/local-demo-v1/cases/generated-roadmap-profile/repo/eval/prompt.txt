@@ -1,1 +1,1 @@
-$vibe-loop ROAD-02
+ROAD-02

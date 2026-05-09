@@ -50,7 +50,10 @@ class EvalExampleTests(unittest.TestCase):
         self.assertEqual({case.case_id for case in cases}, EXPECTED_CASE_IDS)
         for case in cases:
             with self.subTest(case=case.case_id):
-                self.assertEqual(case.conditions, ("no_skill", "vibe_loop"))
+                self.assertEqual(
+                    case.conditions,
+                    ("no_skill", "vibe_loop", "vibe_loop_cli"),
+                )
                 self.assertIs(case.budget["network"], False)
                 self.assertGreater(case.budget["timeout_seconds"], 0)
                 self.assertGreater(case.budget["max_commands"], 0)

@@ -28,7 +28,9 @@ from vibe_loop.eval_reporting import (
     render_skill_quality_markdown,
 )
 from vibe_loop.evals import (
+    CLI_CONDITIONS,
     EVAL_CONDITIONS,
+    SKILL_CONDITIONS,
     EvalArtifactRef,
     EvalSourceFingerprint,
     SkillEvalRunRecord,
@@ -609,6 +611,36 @@ def combined_prompt(repo: Path, case: EvalExampleCase) -> str:
     return "\n\n".join(chunks)
 
 
+def build_eval_prompt(
+    raw_prompt: str,
+    condition: str,
+    skill_ref_prefix: str = "$",
+) -> str:
+    from vibe_loop.runner import CLI_WORKER_ADDENDUM
+
+    if condition == "no_skill":
+        return raw_prompt
+    skill_id = skill_id_for_condition(condition)
+    skill_ref = f"{skill_ref_prefix}{skill_id} {raw_prompt.strip()}"
+    if condition in CLI_CONDITIONS:
+        return skill_ref + CLI_WORKER_ADDENDUM
+    return skill_ref
+
+
+def detect_eval_skill_ref_prefix(command_template: str) -> str:
+    if "claude" in command_template:
+        return "/"
+    return "$"
+
+
+def ensure_stream_json_format(command_template: str) -> str:
+    if "claude" not in command_template:
+        return command_template
+    if "--output-format" in command_template:
+        return command_template
+    return command_template.replace("claude -p", "claude -p --output-format stream-json", 1)
+
+
 def execute_trial_agent_commands(
     case: EvalExampleCase,
     *,
@@ -633,9 +665,14 @@ def execute_trial_agent_commands(
             budgets=budgets,
             examples_root=examples_root,
         )
+    effective_template = ensure_stream_json_format(command_template)
+    skill_ref_prefix = detect_eval_skill_ref_prefix(effective_template)
+    effective_prompt = build_eval_prompt(
+        prompt_text, condition, skill_ref_prefix=skill_ref_prefix,
+    )
     command = format_agent_command(
-        command_template,
-        prompt=prompt_text,
+        effective_template,
+        prompt=effective_prompt,
         prompt_path=case.prompt_paths[0] if case.prompt_paths else "",
         repo=repo,
         artifact_dir=trial_root,
@@ -653,13 +690,23 @@ def execute_trial_agent_commands(
         condition=condition,
         trial=trial,
         run_id=run_id,
-        prompt_text=prompt_text,
+        prompt_text=effective_prompt,
         prompt_paths=case.prompt_paths,
         budgets=budgets,
     )
+    stream_events: tuple[str, ...] = ()
+    if is_stream_json(execution.stdout):
+        raw_stream = execution.stdout
+        result_text, parsed_events = parse_stream_json(raw_stream)
+        stream_events = tuple(parsed_events)
+        transcript_path = artifact_path(trial_root, "transcript")
+        transcript_path.parent.mkdir(parents=True, exist_ok=True)
+        transcript_path.write_text(raw_stream, encoding="utf-8")
+        execution = dataclasses.replace(execution, stdout=result_text)
     return AgentCommandBatch(
         execution=execution,
         command_results=({"type": "agent", **execution.to_json()},),
+        workflow_events=stream_events,
     )
 
 
@@ -891,7 +938,7 @@ def execute_agent_command(
             "VIBE_LOOP_EVAL_PROMPT_PATHS": json.dumps(list(prompt_paths)),
             "VIBE_LOOP_EVAL_TASK_ID": case.task_id or "",
             "VIBE_LOOP_EVAL_SKILLS_AVAILABLE": (
-                "0" if condition == "no_skill" else "1"
+                "1" if condition in SKILL_CONDITIONS else "0"
             ),
             "VIBE_LOOP_EVAL_SKILL_ID": skill_id_for_condition(condition),
             "VIBE_LOOP_RUN_ID": run_id,
@@ -1280,7 +1327,11 @@ def workflow_events_for_trial(
     events: list[str] = []
     for result in transcript_graders:
         events.extend(result.workflow_events)
-    events.extend(events_from_text(execution.stdout))
+    if is_stream_json(execution.stdout):
+        _, stream_events = parse_stream_json(execution.stdout)
+        events.extend(stream_events)
+    else:
+        events.extend(events_from_text(execution.stdout))
     events.extend(events_from_text(execution.stderr))
     if execution.unsafe_refused or unsafe_command_reason(execution.stdout + execution.stderr):
         events.append("unsafe_git_command")
@@ -1296,6 +1347,127 @@ def events_from_text(text: str) -> list[str]:
             if event:
                 events.append(event)
     return events
+
+
+def is_stream_json(text: str) -> bool:
+    first_line = text.lstrip().split("\n", 1)[0]
+    if not first_line.startswith("{"):
+        return False
+    try:
+        obj = json.loads(first_line)
+        return isinstance(obj, dict) and "type" in obj
+    except (json.JSONDecodeError, ValueError):
+        return False
+
+
+def _events_for_tool_use(
+    name: str,
+    inp: dict[str, object],
+    saw_merge: bool,
+) -> tuple[list[str], bool, bool]:
+    events: list[str] = []
+    is_test = False
+    is_merge = False
+
+    if name in ("Bash", "bash"):
+        cmd = str(inp.get("command", ""))
+        cmd_lower = cmd.lower()
+        if ("git status" in cmd or "git worktree list" in cmd
+                or "git diff" in cmd_lower or "git log" in cmd
+                or cmd.startswith("ls")):
+            events.append("worktree_state_inspected")
+        if "git worktree add" in cmd or "git checkout -b" in cmd:
+            events.append("branch_or_worktree_created")
+        if ("pytest" in cmd or "python -m pytest" in cmd
+                or "uv run -m pytest" in cmd or "unittest" in cmd
+                or "python -m unittest" in cmd):
+            is_test = True
+            if saw_merge:
+                events.append("main_verification_ran")
+            else:
+                events.append("verification_ran")
+        if "git commit" in cmd:
+            events.append("commit_created")
+        if "git merge --ff-only" in cmd or "merge --ff-only" in cmd:
+            events.append("main_fast_forwarded")
+            is_merge = True
+        if "vibe-loop report" in cmd:
+            events.append("worker_report_emitted")
+        if "vibe-loop main-integration acquire" in cmd:
+            events.append("main_integration_lock_acquired")
+        if "vibe-loop main-integration release" in cmd:
+            events.append("main_integration_lock_released")
+    elif name in ("Read", "Grep", "Glob"):
+        events.append("instructions_inspected")
+    elif name in ("EnterWorktree", "enterWorktree"):
+        events.append("branch_or_worktree_created")
+    elif name == "Agent":
+        desc = (str(inp.get("description", "")) + " " + str(inp.get("prompt", ""))).lower()
+        if "review" in desc:
+            events.append("review_requested")
+
+    return events, is_test, is_merge
+
+
+def parse_stream_json(text: str) -> tuple[str, list[str]]:
+    result_text = ""
+    events: list[str] = []
+    has_tools = False
+    skill_triggered = False
+    saw_merge = False
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+
+        obj_type = obj.get("type")
+
+        if obj_type == "result":
+            result_text = obj.get("result", "") or ""
+            continue
+
+        if obj_type != "assistant":
+            continue
+        message = obj.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "tool_use":
+                continue
+            name = block.get("name", "")
+            has_tools = True
+            inp = block.get("input", {})
+            if not isinstance(inp, dict):
+                inp = {}
+
+            if name == "Skill":
+                skill_name = inp.get("skill", "")
+                if "vibe-loop" in str(skill_name) or "vibe_loop" in str(skill_name):
+                    skill_triggered = True
+                continue
+
+            tool_events, _, is_merge = _events_for_tool_use(name, inp, saw_merge)
+            events.extend(tool_events)
+            if is_merge:
+                saw_merge = True
+
+    if skill_triggered or (has_tools and events):
+        events.append("skill_activated")
+
+    return result_text, unique_preserving_order(events)
 
 
 def normalize_events(value: object) -> list[str]:
@@ -1872,9 +2044,9 @@ def skill_condition(condition: str, command: str) -> dict[str, object]:
 
 
 def skill_id_for_condition(condition: str) -> str:
-    if condition == "vibe_loop":
+    if condition in ("vibe_loop", "vibe_loop_cli"):
         return "vibe-loop"
-    if condition == "infinite_vibe_loop":
+    if condition in ("infinite_vibe_loop", "infinite_vibe_loop_cli"):
         return "infinite-vibe-loop"
     return condition.replace("_", "-")
 

@@ -77,7 +77,10 @@ class EvalReleaseTests(unittest.TestCase):
                 aggregate_path=aggregate_path,
                 dry_run=True,
                 parked_regressions=parse_parked_regression_specs(
-                    ["condition_comparison:vibe_loop=EVAL-99"]
+                    [
+                        "condition_comparison:vibe_loop=EVAL-99",
+                        "condition_comparison:vibe_loop_cli=EVAL-99",
+                    ]
                 ),
                 generated_at="2026-05-09T00:00:00+00:00",
             )
@@ -330,7 +333,7 @@ def passing_release_aggregate(
             for payload in cases.values()
             if condition in payload
         )
-        for condition in ("no_skill", "vibe_loop")
+        for condition in ("no_skill", "vibe_loop", "vibe_loop_cli")
     }
     regression_flags = ["workflow_contract_regression"] if workflow_regression else []
     workflow_delta = -1.0 if workflow_regression else 0.0
@@ -362,7 +365,16 @@ def passing_release_aggregate(
                     },
                     "baseline_records": [],
                     "condition_records": [],
-                }
+                },
+                "vibe_loop_cli": {
+                    "regression_flags": regression_flags,
+                    "deltas": {
+                        "workflow_score_mean": workflow_delta,
+                        "workflow_violation_rate": workflow_violation_delta,
+                    },
+                    "baseline_records": [],
+                    "condition_records": [],
+                },
             },
             "prior_run_regressions": [],
             "failure_categories": {

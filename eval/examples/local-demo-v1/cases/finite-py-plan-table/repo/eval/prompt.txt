@@ -1,1 +1,1 @@
-$vibe-loop FPY-01
+FPY-01

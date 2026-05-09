@@ -1,1 +1,1 @@
-$vibe-loop REV-01
+REV-01
