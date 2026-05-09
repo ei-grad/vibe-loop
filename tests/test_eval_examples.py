@@ -549,12 +549,13 @@ def write_artifact_bundle(
         relative_path = artifact_path(role)
         path = root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        content_bytes = content.encode("utf-8")
+        path.write_bytes(content_bytes)
         artifacts.append(
             EvalArtifactRef(
                 role=role,
                 path=relative_path,
-                sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                sha256=hashlib.sha256(content_bytes).hexdigest(),
             )
         )
     record = SkillEvalRunRecord(

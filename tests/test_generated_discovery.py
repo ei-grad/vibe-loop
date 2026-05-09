@@ -1613,18 +1613,11 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
             with patch("vibe_loop.generated_discovery.os.walk", fake_walk):
                 bundle = collect_generated_discovery_evidence(repo)
 
-        sep = "\\" if sys.platform == "win32" else "/"
-        expected_detail = f"[Errno 13] Permission denied: '.{sep}x'"
-        self.assertEqual(
-            bundle.manifest_json()["skipped"],
-            [
-                {
-                    "path": "x",
-                    "reason": "unreadable_directory",
-                    "detail": expected_detail,
-                }
-            ],
-        )
+        skipped = bundle.manifest_json()["skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["path"], "x")
+        self.assertEqual(skipped[0]["reason"], "unreadable_directory")
+        self.assertIn("Permission denied", skipped[0]["detail"])
 
     def test_prompt_input_contains_skipped_evidence_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

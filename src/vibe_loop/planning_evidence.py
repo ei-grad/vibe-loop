@@ -473,7 +473,11 @@ def run_worklog_command(
 def terminate_process_group(process: subprocess.Popen[bytes]) -> None:
     try:
         if sys.platform == "win32":
-            process.kill()
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         else:
             os.killpg(process.pid, signal.SIGKILL)
     except (ProcessLookupError, OSError):

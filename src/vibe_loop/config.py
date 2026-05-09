@@ -26,7 +26,26 @@ def prepare_shell_command(
     resolved = shutil.which(parts[0])
     if resolved is None:
         return command, True
+    if resolved.lower().endswith((".cmd", ".bat")):
+        script = _resolve_cmd_wrapper_target(resolved)
+        if script is not None:
+            return [sys.executable, script, *parts[1:]], False
+        return [resolved, *parts[1:]], True
     return [resolved, *parts[1:]], False
+
+
+def _resolve_cmd_wrapper_target(cmd_path: str) -> str | None:
+    try:
+        content = Path(cmd_path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in content.splitlines():
+        line = line.lstrip("@").strip()
+        if line.startswith('"') and "%~dp0" in line:
+            after = line.split("%~dp0", 1)[1]
+            script_name = after.split('"')[0]
+            return str(Path(cmd_path).parent / script_name)
+    return None
 
 
 DEFAULT_PLAN_PATHS = (
