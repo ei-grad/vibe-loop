@@ -1,0 +1,8 @@
+Review this diff for correctness risks. Do not modify the repository.
+
+```diff
+diff --git a/src/demo_math.py b/src/demo_math.py
+@@
+-    return "-".join(value.lower().split())
++    return value.lower().replace(" ", "-")
+```

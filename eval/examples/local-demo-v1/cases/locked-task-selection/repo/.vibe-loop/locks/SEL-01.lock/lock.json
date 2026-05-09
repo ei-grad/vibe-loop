@@ -1,0 +1,13 @@
+{
+  "record_type": "active_run",
+  "schema_version": 1,
+  "task_id": "SEL-01",
+  "run_id": "eval-run-sel-locked",
+  "pid": 0,
+  "worker_pid": 0,
+  "pid_source": "fixture-template",
+  "host": "local-demo-v1",
+  "started_at": "2026-05-09T00:00:00+00:00",
+  "log": ".vibe-loop/runs/eval-run-sel-locked.log",
+  "command": "codex exec '$vibe-loop SEL-01'"
+}

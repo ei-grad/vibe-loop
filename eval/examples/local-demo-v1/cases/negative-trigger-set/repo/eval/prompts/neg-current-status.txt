@@ -1,0 +1,1 @@
+Show the current git status only by running git status --short --branch. Do not modify files or start a vibe-loop workflow.

@@ -1,0 +1,12 @@
+diff --git a/PLAN.md b/PLAN.md
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -6,1 +6,1 @@
+-| FPY-01 | P0 | Planned | FPY-00 | Fix the loyalty discount for member purchases. | `python -m unittest discover` passes and the task row is marked Done. | Not started. |
++| FPY-01 | P0 | Done | FPY-00 | Fix the loyalty discount for member purchases. | `python -m unittest discover` passes and the task row is marked Done. | `python -m unittest discover`. |
+diff --git a/src/finite_math/calculator.py b/src/finite_math/calculator.py
+--- a/src/finite_math/calculator.py
++++ b/src/finite_math/calculator.py
+@@ -5,1 +5,1 @@
+-    discount = 5 if member else 0
++    discount = 10 if member else 0

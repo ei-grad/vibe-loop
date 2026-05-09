@@ -1,0 +1,12 @@
+diff --git a/PLAN.md b/PLAN.md
+--- a/PLAN.md
++++ b/PLAN.md
+@@ -6,1 +6,1 @@
+-| MIL-01 | P0 | Planned | MIL-00 | Clamp progress percentages between 0 and 100. | Tests pass, integration lock is acquired and released, and `MIL-02` remains untouched. | Not started. |
++| MIL-01 | P0 | Done | MIL-00 | Clamp progress percentages between 0 and 100. | Tests pass, integration lock is acquired and released, and `MIL-02` remains untouched. | `python -m unittest discover`. |
+diff --git a/src/mil_demo/progress.py b/src/mil_demo/progress.py
+--- a/src/mil_demo/progress.py
++++ b/src/mil_demo/progress.py
+@@ -5,1 +5,1 @@
+-    return value
++    return max(0, min(100, value))

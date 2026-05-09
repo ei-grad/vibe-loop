@@ -3,5 +3,7 @@
 __pycache__/
 *.pyc
 .vibe-loop/
+!eval/examples/**/.vibe-loop/
+!eval/examples/**/.vibe-loop/**
 dist/
 *.egg-info/

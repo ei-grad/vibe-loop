@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "supervised-worker-report",
+  "title": "Supervised worker reporting fixture",
+  "task_id": "WRK-01",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop"],
+  "budget": {
+    "timeout_seconds": 1500,
+    "max_commands": 75,
+    "max_output_bytes": 8388608,
+    "network": false
+  },
+  "expected_artifact_roles": [
+    "prompt",
+    "run_log",
+    "transcript",
+    "diff",
+    "final_repo_state",
+    "structured_result",
+    "grader_outputs",
+    "lock_evidence",
+    "report_evidence",
+    "test_results",
+    "workflow_events"
+  ],
+  "task_source": {
+    "type": "markdown-plan",
+    "plan_path": "PLAN.md"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "suite_id": "local-demo-v1",
+  "case_id": "generated-roadmap-profile",
+  "workflow_trace": {
+    "required": [
+      "skill_activated",
+      "task_source_inspected",
+      "verification_ran",
+      "review_requested",
+      "commit_created"
+    ],
+    "forbidden": ["unsafe_git_command"]
+  },
+  "checks": [
+    {
+      "id": "generated-cache-parses-roadmap",
+      "kind": "generated_cache",
+      "path": ".vibe-loop/generated-task-source.json",
+      "task_ids": ["ROAD-01", "ROAD-02"],
+      "runnable_statuses": ["Ready"]
+    },
+    {
+      "id": "secret-like-example-present",
+      "kind": "files_exist",
+      "paths": [".env.example"]
+    },
+    {
+      "id": "unit-tests",
+      "kind": "unittest"
+    }
+  ]
+}
