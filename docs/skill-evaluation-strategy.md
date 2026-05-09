@@ -25,6 +25,8 @@ No public benchmark run is required before the local methodology, artifact
 schema, and demo-project specifications exist. The initial bundled-skill run
 record and artifact contract is specified in
 [`docs/skill-eval-schema.md`](skill-eval-schema.md).
+External benchmark fit and sampling recommendations are specified in
+[`docs/external-benchmark-fit.md`](external-benchmark-fit.md).
 
 ## Source Comparison
 
@@ -40,7 +42,7 @@ inspect failures. They differ mostly in packaging and emphasis.
 | [SkillsBench paper](https://arxiv.org/abs/2602.12670) and [project](https://github.com/benchflow-ai/skillsbench) | Treats skills as the experimental variable across no-skill, curated-skill, and self-generated-skill conditions; uses deterministic verifiers, oracle solutions, isolation, full trajectory logging, leakage audits, five trials per task, pass-rate deltas, normalized gain, cost analysis, and failure taxonomy. | Adopt the paired design, deterministic verifiers, leakage checks, and normalized-gain reporting. Do not copy the scale; `vibe-loop` needs representative workflow tasks before broad domain coverage. |
 | [Anthropic, Demystifying evals for AI agents](https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents) | Defines tasks, trials, graders, transcripts, outcomes, harnesses, repeated trials, pass@k versus pass^k, transcript review, human calibration, and the need to audit ambiguous tasks and brittle graders. | Outcome graders should lead, but transcripts are required for review discipline, unsafe operations, and unnecessary user prompts. Report both average success and consistency where reliability matters. |
 | [OpenAI grader guidance](https://developers.openai.com/api/docs/guides/graders) and [openai/evals custom eval docs](https://github.com/openai/evals/blob/main/docs/custom-eval.md) | Separates data items from sampled outputs, supports string, similarity, model, Python, and combined graders, and warns that model graders need their own calibration set to avoid reward hacking. | Represent grader inputs and outputs explicitly. Prefer code graders for file and repository state. If LLM graders are used, evaluate the grader itself against expert-labeled examples and keep human spot checks. |
-| Coding-agent benchmarks: [SWE-bench datasets](https://www.swebench.com/SWE-bench/guides/datasets/), [SWE-bench Verified](https://openai.com/index/introducing-swe-bench-verified/), [OpenAI's 2026 SWE-bench Verified deprecation note](https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/), [SWE-bench Live](https://github.com/microsoft/SWE-bench-Live), [SWE-rebench V2](https://arxiv.org/abs/2602.23866), [Terminal-Bench](https://github.com/harbor-framework/terminal-bench), and [tau-bench](https://arxiv.org/abs/2406.12045) | Mature agent benchmarks use real environments, hidden or held-out tests, Docker/sandbox isolation, oracle/reference solutions, multiple trials, live or refreshed datasets, and state-based scoring for tool-user workflows. They also expose recurring pitfalls: underspecified tasks, brittle tests, contamination, infrastructure failures, and plausible-but-wrong patches. | Use public benchmarks as later smoke or stress adapters, not as the local release gate. Treat SWE-bench Verified as historical context, not a current frontier-coding signal; EVAL-04 should include SWE-bench Pro or any newer uncontaminated successor when comparing external adapters. Local demo tasks need clear specs, reference solutions, deterministic checks, and workflow-specific invariants that public benchmarks do not measure. |
+| Coding-agent benchmarks: [SWE-bench datasets](https://www.swebench.com/SWE-bench/guides/datasets/), [SWE-bench Verified](https://openai.com/index/introducing-swe-bench-verified/), [OpenAI's 2026 SWE-bench Verified deprecation note](https://openai.com/index/why-we-no-longer-evaluate-swe-bench-verified/), [SWE-bench Live](https://github.com/microsoft/SWE-bench-Live), [SWE-rebench V2](https://arxiv.org/abs/2602.23866), [Terminal-Bench](https://github.com/harbor-framework/terminal-bench), and [tau-bench](https://arxiv.org/abs/2406.12045) | Mature agent benchmarks use real environments, hidden or held-out tests, Docker/sandbox isolation, oracle/reference solutions, multiple trials, live or refreshed datasets, and state-based scoring for tool-user workflows. They also expose recurring pitfalls: underspecified tasks, brittle tests, contamination, infrastructure failures, and plausible-but-wrong patches. | Use public benchmarks as later smoke or stress adapters, not as the local release gate. Treat SWE-bench Verified as historical context, not a current frontier-coding signal; EVAL-04 records the current fit matrix and includes SWE-bench Pro as the preferred SWE-style smoke adapter. Local demo tasks need clear specs, reference solutions, deterministic checks, and workflow-specific invariants that public benchmarks do not measure. |
 
 ## Evaluation Questions
 
@@ -164,9 +166,10 @@ Recommended trial policy:
 - local smoke suite: 1 trial per condition for quick developer feedback;
 - release gate for bundled skill changes: 3 trials per task per condition;
 - high-risk changes or flaky cases: 5 trials per task per condition;
-- public benchmark adapters: sample sizes decided per benchmark after EVAL-04,
-  with results labeled as non-leaderboard unless the official harness and
-  reporting rules are followed.
+- public benchmark adapters: sample sizes follow
+  [`docs/external-benchmark-fit.md`](external-benchmark-fit.md), with results
+  labeled as non-leaderboard unless the official harness, scaffold, sample,
+  budget, and reporting rules are followed.
 
 Report these metrics:
 
@@ -246,7 +249,9 @@ after finding both flawed residual tests and training-data exposure, and
 recommended SWE-bench Pro for current reporting. SWE-bench Live and SWE-rebench
 V2 address freshness by refreshing or scaling datasets, but that also increases
 harness, Docker, storage, and resource cost. Treat external benchmark adapters
-as optional context after the local suite is stable.
+as optional context after the local suite is stable. The current adapter
+recommendations and caveats are recorded in
+[`docs/external-benchmark-fit.md`](external-benchmark-fit.md).
 
 Exact trajectory matching is too brittle. Graders should check required
 invariants and outcomes, not force a single action sequence when multiple valid
@@ -261,14 +266,8 @@ Self-generated skills are not a substitute for curated skills. SkillsBench's
 results make this a separate research condition, not a release replacement for
 the bundled skills.
 
-## Open Questions
+## Remaining Questions
 
-- What exact JSON schema should EVAL-01 use for run records, grader records,
-  source fingerprints, and artifact references?
-- After EVAL-02 fixture implementation, which EVAL-08 cases should be combined
-  or split based on measured maintenance cost and grader brittleness?
-- Should the first runner implement YAML case authoring directly, or should YAML
-  compile into a stricter internal JSON schema?
 - Which transcript fields can be stored safely without retaining secret-like
   command output?
 - What threshold should block bundled skill releases: absolute pass-rate
@@ -276,7 +275,5 @@ the bundled skills.
   gate?
 - How should `vibe-loop` normalize costs and token counts across Codex, Claude,
   and other future harnesses when their telemetry differs?
-- Which external benchmarks are worth adapting first once local evals exist:
-  SWE-bench Pro or another uncontaminated SWE-bench successor, SWE-rebench V2
-  samples, Terminal-Bench tasks, or none until there is a clear product
-  question?
+- Which deferred comparators, if any, become worth adapting after the first
+  SWE-style and terminal-workflow adapters produce stable evidence?
