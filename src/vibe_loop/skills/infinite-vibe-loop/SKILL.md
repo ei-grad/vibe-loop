@@ -38,6 +38,19 @@ and the reason for the current next item. Update it after review, merge,
 correction, blocker, and summary. Plan from repo-local sources first:
 instructions, design docs, roadmaps, issues, TODOs, and existing plans.
 
+## Task Source Context
+
+Select and inspect work from the repository's active task source. That source
+may be explicit configuration, a generated profile cache at
+`<state_dir>/generated-task-source.json`, command-backed adapters, issue
+trackers, or Markdown planning docs. Treat this repository's Markdown table as
+one supported example, not a required format for other repositories.
+
+If task details are insufficient, inspect repo-local sources and task CLI output
+before making assumptions. Generated profiles and command adapters describe how
+to discover work; they do not replace acceptance evidence, verification, or
+review for each selected slice.
+
 ## Worktree Discipline
 
 Do not assume you are working alone. Other agents or the user may be working on

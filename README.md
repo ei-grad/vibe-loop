@@ -34,17 +34,32 @@ worker agent follows the skill.
 > a Docker container or VM, with only the required repository, tools, network
 > access, and credentials available.
 
-The runner is task-system agnostic. Repositories can expose tasks through a
-Markdown plan table, command adapters, or later tracker-specific adapters. The
-default adapter discovers Markdown files with tables using these columns:
+The runner is task-system agnostic. Repositories can expose tasks through
+explicit Markdown configuration, repo-specific generated profiles, command
+adapters, or later tracker-specific adapters. The generated profile path lets a
+repository keep its existing planning format: an explicit configuration command
+collects bounded repo-local evidence, asks the configured selection agent for a
+non-executable parser profile, validates it mechanically, and caches it under
+the configured state directory.
+
+This repository's own plan uses a Markdown table. That fixed table is an
+example of a supported shape, not the generic task-source contract:
 
 ```text
 ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence
 ```
 
-Without explicit configuration, Markdown discovery scores all `.md` files outside
-ignored build/state directories and picks the best unambiguous parseable plan.
-Set `task_source.plan_path` when a repo has multiple plausible plan files.
+Without explicit source configuration, read-only task commands inspect
+`<state_dir>/generated-task-source.json`. A fresh `profile` cache becomes the
+active task source. A fresh degraded cache such as `planning_only`,
+`needs_input`, `unavailable`, or `rejected` is diagnostic only; read-only
+commands report it and may continue to built-in Markdown fallback discovery. A
+stale or invalid cache blocks fallback and points to `tasks configure`. If no
+generated cache exists, the Markdown fallback scores `.md` files outside ignored
+build/state directories and picks the best unambiguous parseable table matching
+the example shape. Set `task_source.plan_path` when a repo wants to pin a
+specific Markdown source, or use command-backed task sources for issue trackers
+and custom task tools.
 
 Runnable statuses default to `Active`, `Next`, and `Planned`. A task is runnable
 when all listed dependencies are `Done` and no local lock exists.
@@ -59,8 +74,8 @@ result, records progress, and avoids relying on one long interactive chat.
 The difference is in the workflow `vibe-loop` is built around:
 
 - `ralphex` is plan-file centered; `vibe-loop` is task-source agnostic. It can
-  discover Markdown task tables, use explicit plan paths, or read tasks through
-  command adapters.
+  use generated profiles, discover Markdown task tables, use explicit plan
+  paths, or read tasks through command adapters.
 - `ralphex` conventionally runs a dedicated plan through task and review phases;
   `vibe-loop` runs one repository backlog slice at a time and is designed to
   merge reviewed slices back to `main` frequently.
@@ -106,12 +121,21 @@ uv tool install git+https://github.com/ei-grad/vibe-loop
 
 ## Quick Start
 
-Create or point `vibe-loop` at a Markdown task table:
+Point `vibe-loop` at a supported task source. For a small repository, this
+example Markdown table is enough:
 
 ```markdown
 | ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence |
 | --- | --- | --- | --- | --- | --- | --- |
 | TASK-01 | P0 | Next | none | Make one scoped change. | Tests pass. | Not run. |
+```
+
+For an existing planning format, review and write a repo-specific generated
+profile instead:
+
+```bash
+vibe-loop tasks configure --repo . --dry-run --json
+vibe-loop tasks configure --repo . --json
 ```
 
 Inspect runnable work:
@@ -262,7 +286,7 @@ forward_stderr = false
 
 [task_source]
 type = "markdown-plan"
-# Optional. If omitted, vibe-loop discovers the best Markdown task table.
+# Set source keys only when you want to pin Markdown discovery.
 plan_path = "PLAN.md"
 plan_paths = ["PLAN.md", "docs/PLAN.md", "ROADMAP.md", "TODO.md"]
 runnable_statuses = ["Active", "Next", "Planned"]
@@ -273,6 +297,13 @@ commands = [
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
 ```
+
+Omit `[task_source]` source keys to allow generated cache use before Markdown
+fallback discovery. The explicit source keys are `type`, `plan_path`,
+`plan_paths`, `profile`, `list`, `next`, and `probe`; setting any of them
+disables generated cache as the active task source. Non-source settings such as
+`runnable_statuses` can still override matching generated fields without
+disabling the generated parser.
 
 Agent commands are resolved independently. Explicit `.vibe-loop.toml` values
 remain authoritative. Omitted worker and selection commands use a deterministic
@@ -359,13 +390,14 @@ low-confidence, unsupported, or incomplete agent output is stored as an explicit
 degraded cache record rather than changing runnable task behavior.
 
 Explicit `.vibe-loop.toml` task-source settings stay authoritative. User-written
-command adapters and explicit source paths disable generated discovery for the
-active source. Defaults do not count as explicit settings, and non-source
-settings such as `task_source.runnable_statuses` override the matching generated
-field without disabling the generated parser. Generated cache records cannot
-contain executable adapters such as `type = "command"`, `list`, `next`, `probe`,
-or generic command fields. Add explicit `[task_source]` settings to override
-cached generated behavior.
+source keys disable generated discovery for the active source: `type`,
+`plan_path`, `plan_paths`, `profile`, `list`, `next`, and `probe`. Defaults do
+not count as explicit settings, and non-source settings such as
+`task_source.runnable_statuses` override the matching generated field without
+disabling the generated parser. Generated cache records cannot contain
+executable adapters such as `type = "command"`, `list`, `next`, `probe`, or
+generic command fields. Add explicit `[task_source]` settings to override cached
+generated behavior.
 
 Promote a reviewed generated profile into committed configuration when a repo
 wants task discovery to be explicit instead of cache-backed:

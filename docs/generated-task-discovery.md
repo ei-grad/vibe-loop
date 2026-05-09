@@ -109,17 +109,16 @@ profile is still fresh.
 
 ## Repo-Specific Task Discovery Configuration
 
-The current Markdown discovery model still assumes the repository exposes tasks
-through a specific table:
+This repository's built-in Markdown fallback recognizes a specific table shape:
 
 `ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence`
 
-That is acceptable for this repository's own plan, but it is the wrong generic
-contract. A task-system-agnostic runner should not ask every repository to
-reshape planning docs before it can discover work. The generic path should ask a
-configured agent to analyze bounded repository evidence, generate a normalized
-task-source profile, validate that profile mechanically, and cache it as
-repo-local state.
+That is acceptable as this repository's own plan format and as a small example,
+but it is not the generic task-source contract. A task-system-agnostic runner
+should not ask every repository to reshape planning docs before it can discover
+work. The generic path asks a configured agent to analyze bounded repository
+evidence, generate a normalized task-source profile, validate that profile
+mechanically, and cache it as repo-local state.
 
 The agent-generated profile should describe how to read existing repo artifacts,
 not invent task state. It can map column names, heading/list conventions,
@@ -146,8 +145,13 @@ paths, or plan paths win at source level. Non-source settings such as explicitly
 configured runnable statuses override the matching generated profile fields
 without disabling the generated source.
 
-Stale or low-confidence cache should fail with an actionable configure command
-instead of falling back to the fixed table format silently.
+Stale, structurally invalid, or otherwise non-runnable `profile` cache records
+should fail with an actionable configure command instead of silently treating
+this repository's example table shape as a requirement. Fresh degraded cache
+records such as `planning_only`, `needs_input`, `unavailable`, or `rejected` are
+diagnostic only; read-only commands should report their diagnostics and may
+continue to default Markdown fallback discovery when no explicit source
+configuration is active.
 
 ## Precedence
 
@@ -158,9 +162,9 @@ Precedence is resolved before cache loading performs parser validation:
    `task_source.next`, or `task_source.probe` is explicitly set, generated
    discovery is disabled for the active source. Adapter failures are reported as
    adapter failures, not replaced by generated discovery.
-2. User-authored source paths are authoritative. Explicit `task_source.plan_path`
-   or future committed profile-path settings disable generated discovery for the
-   active source.
+2. User-authored non-command source selectors are authoritative. Explicit
+   `task_source.type`, `task_source.plan_path`, `task_source.plan_paths`, or
+   `task_source.profile` disable generated discovery for the active source.
 3. Default config values are not explicit. Omitted `task_source.plan_path`,
    default `plan_paths`, and default runnable statuses do not block a generated
    cache.

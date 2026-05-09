@@ -36,6 +36,20 @@ integration/cleanup/report status. Update it after implementation, checks,
 review, blockers, integration, worker report submission, and final summary. This
 is finite slice state, not a cross-slice backlog.
 
+## Task Source Context
+
+When invoked with a task id, treat the task details as normalized work from the
+repository's active task source. That source may be explicit configuration,
+a generated profile cache at `<state_dir>/generated-task-source.json`,
+command-backed adapters, issue trackers, or Markdown planning docs. Do not
+require repositories to reshape their docs into this repository's example
+Markdown table before doing the slice.
+
+If task details are insufficient, inspect repo-local sources and task CLI output
+before making assumptions. Generated profiles and command adapters describe how
+to discover work; they do not replace acceptance evidence, verification, or
+review for the selected slice.
+
 ## Core Loop
 
 1. Inspect the task, code, tests, docs, repo instructions, worktree state, and
