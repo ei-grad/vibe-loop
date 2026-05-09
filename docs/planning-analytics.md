@@ -97,8 +97,8 @@ Generated analytics artifacts default under the configured state directory:
 
 `state_dir` defaults to `.vibe-loop`, so these defaults do not mutate repository
 docs or create committed artifacts. Explicit output paths are opt-in through
-future command flags or `[planning_analytics.outputs]` config when a repository
-wants generated reports in a tracked docs workflow.
+command flags or `[planning_analytics.outputs]` config when a repository wants
+generated reports in a tracked docs workflow.
 
 Explicit output paths must be repo-relative and cannot contain `..`. `doctor`
 serializes every resolved output path and marks each source as
@@ -159,6 +159,23 @@ sample counts, outlier handling, feature reasons, evidence reasons, and any
 leakage-safe similarity examples. Similarity uses only pre-task text fields:
 title, scope, and acceptance.
 
+## Timeline And Gantt Artifacts
+
+`vibe-loop planning artifacts` writes the timeline JSON plus a static Gantt HTML
+report. Defaults use `<state_dir>/planning-analytics/timeline.json` and
+`<state_dir>/planning-analytics/gantt.html`. `--output` and `--html-output`
+accept repo-relative paths for repositories that intentionally commit generated
+planning docs.
+
+`--check` rebuilds the same deterministic JSON and HTML and fails if either
+artifact is missing or stale. `--inspect` reads existing artifacts without
+running collection, reports their source, freshness state, schema status,
+warning counts, and timeline warning details, and prints repair commands. It
+reports `freshness = "not_checked"` for readable current-schema artifacts; use
+`--check` when actual staleness must be computed. The HTML report embeds a small
+generated metadata marker so `doctor` and `--inspect` can read the schema
+version and warning count without executing analytics.
+
 ## Duration Benchmark
 
 `vibe-loop planning benchmark-duration` evaluates duration-estimator candidates
@@ -186,7 +203,8 @@ visible.
 `vibe-loop doctor` reports planning analytics readiness without running a
 collector. The report includes the selected schedule policy, subject matching
 mode, worklog adapter presence, coverage tiers, resolved artifact paths, whether
-repo-artifact outputs are explicitly enabled, and diagnostics.
+repo-artifact outputs are explicitly enabled, artifact freshness state, schema
+status, warning counts, next repair commands, and diagnostics.
 
 Planning analytics is `ready` when the active task source is usable. If task
 discovery is unavailable, stale, invalid, or disabled by broken explicit config,

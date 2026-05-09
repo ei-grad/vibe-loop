@@ -582,21 +582,22 @@ def collect_git_commits(
             raw_paths,
             changed_paths,
         )
-        commits.append(
-            GitCommit(
-                commit=metadata[0],
-                author_name=metadata[1],
-                author_email=metadata[2],
-                author_time=metadata[3],
-                committer_time=metadata[4],
-                parents=tuple(parent for parent in metadata[5].split() if parent),
-                subject=metadata[6],
-                plan_items=parse_plan_item_values(metadata[7]),
-                changed_paths=changed_paths,
-                skipped_path_count=skipped_count,
-                coverage_exempt_reason=coverage_exempt_reason,
-            )
+        commit = GitCommit(
+            commit=metadata[0],
+            author_name=metadata[1],
+            author_email=metadata[2],
+            author_time=metadata[3],
+            committer_time=metadata[4],
+            parents=tuple(parent for parent in metadata[5].split() if parent),
+            subject=metadata[6],
+            plan_items=parse_plan_item_values(metadata[7]),
+            changed_paths=changed_paths,
+            skipped_path_count=skipped_count,
+            coverage_exempt_reason=coverage_exempt_reason,
         )
+        if commit.coverage_exempt_reason == "generated_artifact":
+            continue
+        commits.append(commit)
     if len(commits) > git_commit_limit:
         commits = commits[:git_commit_limit]
         warnings.append(

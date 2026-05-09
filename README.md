@@ -204,6 +204,9 @@ vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {pro
 vibe-loop workers --repo .
 vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
+vibe-loop planning artifacts --repo .
+vibe-loop planning artifacts --repo . --check
+vibe-loop planning artifacts --repo . --inspect
 vibe-loop planning benchmark-duration --repo .
 vibe-loop planning benchmark-duration --repo . --check
 vibe-loop main-integration status --repo .
@@ -326,7 +329,7 @@ fallback_minutes = 60
 
 [planning_analytics.outputs]
 # Explicit repo artifact paths are opt-in. Omitted paths write under
-# <state_dir>/planning-analytics when analytics commands are added.
+# <state_dir>/planning-analytics.
 # timeline_json = "docs/planning/timeline.json"
 # gantt_html = "docs/planning/gantt.html"
 # benchmark_json = "docs/planning/duration-benchmark.json"
@@ -494,6 +497,15 @@ actual spans. Each projected task records the selected model, minutes, low/high
 interval, training sample counts, outlier handling notes, and feature/evidence
 reasons.
 
+`vibe-loop planning artifacts --repo .` writes deterministic timeline JSON and
+a static Gantt HTML report under `<state_dir>/planning-analytics` by default.
+Use `--output docs/planning/timeline.json` and
+`--html-output docs/planning/gantt.html` for repo-owned docs workflows.
+`--check` rebuilds both artifacts and fails if either file is missing or stale;
+`--inspect` reports artifact freshness state, schema status, warning counts, and
+rendered timeline warnings without regenerating files. Use `--check` when actual
+staleness must be computed.
+
 `vibe-loop planning benchmark-duration --repo .` writes deterministic JSON and
 Markdown reports for duration-estimator candidates under
 `<state_dir>/planning-analytics` by default, or under explicit benchmark output
@@ -505,7 +517,8 @@ validation tasks and validation-shared commits from each training fold.
 `vibe-loop doctor` reports planning analytics readiness without running a
 collector. It includes the selected schedule policy, subject matching mode,
 worklog adapter presence, duration-model parameters, coverage tiers, resolved
-artifact paths, and whether repo-artifact outputs are explicitly enabled. See
+artifact paths, artifact freshness, warning counts, next repair commands, and
+whether repo-artifact outputs are explicitly enabled. See
 `docs/planning-analytics.md` for the full contract.
 
 ## Development

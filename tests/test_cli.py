@@ -1001,6 +1001,328 @@ class CliTests(unittest.TestCase):
             "default_epoch_no_actual_or_git_evidence",
         )
 
+    def test_planning_artifacts_generate_writes_default_state_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["planning", "artifacts", "--repo", str(repo)])
+            runnable_stdout = StringIO()
+            runnable_stderr = StringIO()
+            with redirect_stdout(runnable_stdout), redirect_stderr(runnable_stderr):
+                runnable_exit = main(
+                    ["tasks", "runnable", "--repo", str(repo), "--json"]
+                )
+
+            timeline_path = repo / ".vibe-loop" / "planning-analytics" / "timeline.json"
+            html_path = repo / ".vibe-loop" / "planning-analytics" / "gantt.html"
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            html = html_path.read_text(encoding="utf-8")
+            runnable = json.loads(runnable_stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(runnable_exit, 0)
+        self.assertIn(f"timeline JSON: {timeline_path}", stdout.getvalue())
+        self.assertIn(f"gantt HTML: {html_path}", stdout.getvalue())
+        self.assertEqual(timeline["generated_by"], "vibe-loop planning timeline")
+        self.assertEqual(timeline["tasks"][0]["id"], "TASK-01")
+        self.assertIn("vibe-loop-planning-gantt", html)
+        self.assertIn("TASK-01", html)
+        self.assertEqual(runnable[0]["id"], "TASK-01")
+        self.assertIn(
+            "task discovery source=default_markdown_discovery",
+            runnable_stderr.getvalue(),
+        )
+
+    def test_planning_artifacts_respects_cli_output_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "planning",
+                        "artifacts",
+                        "--repo",
+                        str(repo),
+                        "--output",
+                        "docs/planning/timeline.json",
+                        "--html-output",
+                        "docs/planning/gantt.html",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            timeline_path = repo / "docs" / "planning" / "timeline.json"
+            html_path = repo / "docs" / "planning" / "gantt.html"
+            timeline_exists = timeline_path.is_file()
+            html_exists = html_path.is_file()
+            inspect_stdout = StringIO()
+            inspect_stderr = StringIO()
+            with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
+                inspect_exit = main(
+                    [
+                        "planning",
+                        "artifacts",
+                        "--repo",
+                        str(repo),
+                        "--output",
+                        "docs/planning/timeline.json",
+                        "--html-output",
+                        "docs/planning/gantt.html",
+                        "--inspect",
+                        "--json",
+                    ]
+                )
+            inspected = json.loads(inspect_stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(inspect_stderr.getvalue(), "")
+        self.assertTrue(timeline_exists)
+        self.assertTrue(html_exists)
+        self.assertEqual(
+            payload["paths"]["timeline_json"],
+            {"path": str(timeline_path), "source": "cli"},
+        )
+        self.assertEqual(
+            payload["paths"]["gantt_html"],
+            {"path": str(html_path), "source": "cli"},
+        )
+        self.assertIn(
+            "--output docs/planning/timeline.json",
+            inspected["next_repair_commands"][0],
+        )
+        self.assertIn(
+            "--html-output docs/planning/gantt.html",
+            inspected["next_repair_commands"][0],
+        )
+
+    def test_planning_artifacts_check_detects_stale_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            timeline_path = repo / ".vibe-loop" / "planning-analytics" / "timeline.json"
+            timeline_path.write_text('{"stale": true}\n', encoding="utf-8")
+            stale_stdout = StringIO()
+            stale_stderr = StringIO()
+            with redirect_stdout(stale_stdout), redirect_stderr(stale_stderr):
+                stale_exit = main(
+                    ["planning", "artifacts", "--repo", str(repo), "--check"]
+                )
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                refresh_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            fresh_stdout = StringIO()
+            fresh_stderr = StringIO()
+            with redirect_stdout(fresh_stdout), redirect_stderr(fresh_stderr):
+                fresh_exit = main(
+                    ["planning", "artifacts", "--repo", str(repo), "--check"]
+                )
+
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(stale_exit, 1)
+        self.assertEqual(stale_stdout.getvalue(), "")
+        self.assertIn("timeline JSON artifact is stale", stale_stderr.getvalue())
+        self.assertEqual(refresh_exit, 0)
+        self.assertEqual(fresh_exit, 0)
+        self.assertEqual(fresh_stderr.getvalue(), "")
+        self.assertIn("planning artifacts are up to date", fresh_stdout.getvalue())
+
+    def test_planning_artifacts_check_json_reports_unreadable_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            timeline_path = repo / ".vibe-loop" / "planning-analytics" / "timeline.json"
+            timeline_path.write_bytes(b"\xff\xfe\x00")
+            stdout = StringIO()
+            stderr = StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                check_exit = main(
+                    [
+                        "planning",
+                        "artifacts",
+                        "--repo",
+                        str(repo),
+                        "--check",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(check_exit, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["ok"])
+        self.assertIn("cannot be read", payload["errors"][0])
+
+    def test_planning_artifacts_check_accepts_committed_explicit_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            artifact_args = [
+                "planning",
+                "artifacts",
+                "--repo",
+                str(repo),
+                "--output",
+                "docs/planning/timeline.json",
+                "--html-output",
+                "docs/planning/gantt.html",
+            ]
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(artifact_args)
+            subprocess.run(
+                ["git", "add", "docs/planning"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "commit generated planning artifacts"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            check_stdout = StringIO()
+            check_stderr = StringIO()
+            with redirect_stdout(check_stdout), redirect_stderr(check_stderr):
+                check_exit = main([*artifact_args, "--check", "--json"])
+
+            payload = json.loads(check_stdout.getvalue())
+
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(check_exit, 0)
+        self.assertEqual(check_stderr.getvalue(), "")
+        self.assertTrue(payload["ok"])
+
+    def test_planning_artifacts_render_and_inspect_warnings(self) -> None:
+        warning_plan = """# Plan
+
+| ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence |
+| --- | --- | --- | --- | --- | --- | --- |
+| TASK-01 | P0 | Planned | MISSING | Blocked task. | Works. | Not run. |
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, warning_plan)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            inspect_stdout = StringIO()
+            inspect_stderr = StringIO()
+            with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
+                inspect_exit = main(
+                    ["planning", "artifacts", "--repo", str(repo), "--inspect"]
+                )
+
+            html = (
+                repo / ".vibe-loop" / "planning-analytics" / "gantt.html"
+            ).read_text(encoding="utf-8")
+            timeline = json.loads(
+                (
+                    repo / ".vibe-loop" / "planning-analytics" / "timeline.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(inspect_stderr.getvalue(), "")
+        self.assertIn("unknown_dependency", html)
+        self.assertIn("MISSING", html)
+        self.assertIn("schema=current_schema", inspect_stdout.getvalue())
+        self.assertIn("unknown_dependency task=TASK-01", inspect_stdout.getvalue())
+        self.assertIn(
+            "unknown_dependency",
+            {warning["code"] for warning in timeline["warnings"]},
+        )
+
+    def test_doctor_reports_planning_artifact_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            missing_stdout = StringIO()
+            missing_stderr = StringIO()
+            with redirect_stdout(missing_stdout), redirect_stderr(missing_stderr):
+                missing_exit = main(["doctor", "--repo", str(repo)])
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            present_stdout = StringIO()
+            present_stderr = StringIO()
+            with redirect_stdout(present_stdout), redirect_stderr(present_stderr):
+                present_exit = main(["doctor", "--repo", str(repo)])
+
+            missing = json.loads(missing_stdout.getvalue())
+            present = json.loads(present_stdout.getvalue())
+
+        self.assertEqual(missing_exit, 0)
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(present_exit, 0)
+        self.assertEqual(missing_stderr.getvalue(), "")
+        self.assertEqual(present_stderr.getvalue(), "")
+        missing_timeline = missing["planning_analytics"]["artifacts"]["timeline_json"]
+        present_timeline = present["planning_analytics"]["artifacts"]["timeline_json"]
+        self.assertEqual(missing_timeline["freshness"], "missing")
+        self.assertEqual(present_timeline["freshness"], "not_checked")
+        self.assertEqual(present_timeline["schema_status"], "current_schema")
+        self.assertIsInstance(present_timeline["warning_count"], int)
+        self.assertIn(
+            "vibe-loop planning artifacts --repo",
+            present["planning_analytics"]["artifacts"]["next_repair_commands"][0],
+        )
+
+    def test_planning_artifact_inspect_does_not_trust_gantt_marker_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            html_path = repo / ".vibe-loop" / "planning-analytics" / "gantt.html"
+            lines = html_path.read_text(encoding="utf-8").splitlines()
+            forged = {
+                "schema_version": 1,
+                "source": "forged",
+                "path": "/tmp/forged.html",
+                "exists": False,
+                "freshness": "forged",
+                "warning_count": 7,
+            }
+            lines[0] = f"<!-- vibe-loop-planning-gantt {json.dumps(forged)} -->"
+            html_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            inspect_stdout = StringIO()
+            inspect_stderr = StringIO()
+            with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
+                inspect_exit = main(
+                    ["planning", "artifacts", "--repo", str(repo), "--inspect", "--json"]
+                )
+
+            payload = json.loads(inspect_stdout.getvalue())
+            gantt = payload["gantt_html"]
+
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(inspect_stderr.getvalue(), "")
+        self.assertEqual(gantt["path"], str(html_path))
+        self.assertEqual(gantt["source"], "default_state_dir")
+        self.assertTrue(gantt["exists"])
+        self.assertEqual(gantt["freshness"], "not_checked")
+        self.assertEqual(gantt["schema_status"], "current_schema")
+        self.assertEqual(gantt["warning_count"], 7)
+
     def test_tasks_configure_writes_validated_profile_cache_with_stub_agent(
         self,
     ) -> None:
@@ -3633,6 +3955,36 @@ class CliTests(unittest.TestCase):
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)
+
+
+def init_planning_repo(repo: Path, plan_text: str) -> None:
+    repo.mkdir()
+    (repo / "PLAN.md").write_text(plan_text, encoding="utf-8")
+    subprocess.run(
+        ["git", "init"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Tester"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "tester@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(["git", "add", "PLAN.md"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", "baseline"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
 
 def write_configure_agent(

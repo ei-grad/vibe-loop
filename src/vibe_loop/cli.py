@@ -27,6 +27,12 @@ from vibe_loop.generated_profiles import (
     runtime_task_source_report,
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.planning_artifacts import (
+    build_planning_artifact_bundle,
+    check_planning_artifacts,
+    inspect_planning_artifacts,
+    write_planning_artifacts,
+)
 from vibe_loop.planning_benchmark import (
     build_duration_benchmark,
     check_duration_benchmark_reports,
@@ -170,6 +176,22 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(planning_timeline)
     planning_timeline.add_argument("--json", action="store_true")
     planning_timeline.add_argument(
+        "--git-commit-limit",
+        type=int,
+        default=DEFAULT_GIT_COMMIT_LIMIT,
+    )
+    planning_artifacts = planning_subparsers.add_parser(
+        "artifacts",
+        help="Generate timeline JSON and static Gantt artifacts",
+    )
+    add_repo_argument(planning_artifacts)
+    planning_artifacts_mode = planning_artifacts.add_mutually_exclusive_group()
+    planning_artifacts_mode.add_argument("--check", action="store_true")
+    planning_artifacts_mode.add_argument("--inspect", action="store_true")
+    planning_artifacts.add_argument("--json", action="store_true")
+    planning_artifacts.add_argument("--output", type=Path)
+    planning_artifacts.add_argument("--html-output", type=Path)
+    planning_artifacts.add_argument(
         "--git-commit-limit",
         type=int,
         default=DEFAULT_GIT_COMMIT_LIMIT,
@@ -377,6 +399,11 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if args.command == "doctor":
         task_source_runtime = runtime_task_source_report(config)
+        analytics_report = planning_analytics_report(
+            config,
+            task_source_runtime=task_source_runtime,
+        )
+        analytics_report["artifacts"] = inspect_planning_artifacts(config)
         print(
             json.dumps(
                 {
@@ -386,10 +413,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "task_source": config.task_source.to_json(),
                     "task_source_runtime": task_source_runtime,
                     "generated_task_profile": generated_task_cache_report(config),
-                    "planning_analytics": planning_analytics_report(
-                        config,
-                        task_source_runtime=task_source_runtime,
-                    ),
+                    "planning_analytics": analytics_report,
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                 },
@@ -446,6 +470,9 @@ def dispatch_planning(args: argparse.Namespace, config) -> int:
         print(json.dumps(timeline, indent=2))
         return 0
 
+    if args.planning_command == "artifacts":
+        return dispatch_planning_artifacts(args, config)
+
     if args.planning_command == "benchmark-duration":
         report = build_duration_benchmark(
             config,
@@ -470,6 +497,62 @@ def dispatch_planning(args: argparse.Namespace, config) -> int:
         return 0
 
     raise AssertionError(args.planning_command)
+
+
+def dispatch_planning_artifacts(args: argparse.Namespace, config) -> int:
+    if args.inspect:
+        report = inspect_planning_artifacts(
+            config,
+            output=args.output,
+            html_output=args.html_output,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(render_planning_artifact_inspection(report))
+        return 0
+
+    bundle = build_planning_artifact_bundle(
+        config,
+        output=args.output,
+        html_output=args.html_output,
+        git_commit_limit=args.git_commit_limit,
+    )
+    if args.check:
+        errors = check_planning_artifacts(bundle)
+        report = {
+            "ok": not errors,
+            "errors": errors,
+            "paths": bundle.paths.to_json(),
+            "warning_count": bundle.warning_count,
+        }
+        if args.json:
+            print(json.dumps(report, indent=2))
+        elif errors:
+            for error in errors:
+                print(error, file=sys.stderr)
+        else:
+            print("planning artifacts are up to date")
+        return 0 if not errors else 1
+
+    write_planning_artifacts(bundle)
+    report = {
+        "action": "generated",
+        "paths": bundle.paths.to_json(),
+        "warning_count": bundle.warning_count,
+        "artifacts": inspect_planning_artifacts(
+            config,
+            output=args.output,
+            html_output=args.html_output,
+        ),
+    }
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"timeline JSON: {bundle.paths.timeline_json}")
+        print(f"gantt HTML: {bundle.paths.gantt_html}")
+        print(f"warnings: {bundle.warning_count}")
+    return 0
 
 
 def dispatch_eval(args: argparse.Namespace, config) -> int:
@@ -899,6 +982,50 @@ def render_run_inspection(inspection) -> str:
         status = record.get("status") or record.get("classification") or "-"
         updated = record.get("finished_at") or record.get("reported_at") or "-"
         lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}")
+    return "\n".join(lines)
+
+
+def render_planning_artifact_inspection(report: dict[str, object]) -> str:
+    lines: list[str] = []
+    for key, label in (
+        ("timeline_json", "timeline JSON"),
+        ("gantt_html", "gantt HTML"),
+    ):
+        artifact = report.get(key, {})
+        if not isinstance(artifact, dict):
+            continue
+        warning_count = artifact.get("warning_count")
+        warning_text = "-" if warning_count is None else str(warning_count)
+        schema_status = artifact.get("schema_status") or "-"
+        lines.append(
+            f"{label}: {artifact.get('path')}"
+            f"\tsource={artifact.get('source')}"
+            f"\tfreshness={artifact.get('freshness')}"
+            f"\tschema={schema_status}"
+            f"\twarnings={warning_text}"
+        )
+        error = artifact.get("error")
+        if error:
+            lines.append(f"{label} error: {error}")
+    timeline = report.get("timeline_json", {})
+    if isinstance(timeline, dict):
+        warnings = timeline.get("warnings", [])
+        if isinstance(warnings, list) and warnings:
+            lines.append("warnings:")
+            for warning in warnings:
+                if not isinstance(warning, dict):
+                    continue
+                task_id = warning.get("task_id")
+                task_text = f" task={task_id}" if task_id else ""
+                lines.append(
+                    f"- {warning.get('code')}{task_text}: "
+                    f"{warning.get('message')}"
+                )
+    commands = report.get("next_repair_commands", [])
+    if isinstance(commands, list) and commands:
+        lines.append("next repair commands:")
+        for command in commands:
+            lines.append(f"- {command}")
     return "\n".join(lines)
 
 
