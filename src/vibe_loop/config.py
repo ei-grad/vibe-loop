@@ -31,6 +31,8 @@ def prepare_shell_command(
         if script is not None:
             return [sys.executable, script, *parts[1:]], False
         return [resolved, *parts[1:]], True
+    if resolved.lower().endswith(".py"):
+        return [sys.executable, resolved, *parts[1:]], False
     return [resolved, *parts[1:]], False
 
 
