@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
+import shlex
 import shutil
 import socket
 from collections.abc import Callable
@@ -390,7 +392,7 @@ def collect_stale_locks(
                 lock_path=lock_path,
                 stale_reason=view.stale_reason or "unknown",
                 kind="task",
-                recovery_command=f"rm -rf {lock_path}",
+                recovery_command=f"rm -rf {shlex.quote(str(lock_path))}",
             )
         )
 
@@ -408,18 +410,52 @@ def collect_stale_locks(
                 lock_path=integration_status.path,
                 stale_reason=integration_status.stale_reason or "unknown",
                 kind="integration",
-                recovery_command=f"rm -rf {integration_status.path}",
+                recovery_command=(
+                    f"rm -rf {shlex.quote(str(integration_status.path))}"
+                ),
             )
         )
     return stale
 
 
+@dataclasses.dataclass(frozen=True)
+class CleanResult:
+    cleaned: list[StaleLock]
+    errors: list[tuple[StaleLock, str]]
+
+
 def clean_stale_locks(
     stale_locks: list[StaleLock],
-) -> list[StaleLock]:
+) -> CleanResult:
     cleaned: list[StaleLock] = []
+    errors: list[tuple[StaleLock, str]] = []
     for lock in stale_locks:
-        if lock.lock_path.exists():
+        if not lock.lock_path.exists():
+            continue
+        if not _lock_metadata_matches(lock):
+            errors.append((lock, "lock metadata changed since collection"))
+            continue
+        try:
             shutil.rmtree(lock.lock_path)
-            cleaned.append(lock)
-    return cleaned
+        except OSError as exc:
+            errors.append((lock, str(exc)))
+            continue
+        cleaned.append(lock)
+    return CleanResult(cleaned=cleaned, errors=errors)
+
+
+def _lock_metadata_matches(lock: StaleLock) -> bool:
+    metadata_path = lock.lock_path / "lock.json"
+    if not metadata_path.exists():
+        return True
+    try:
+        raw = metadata_path.read_text(encoding="utf-8")
+        payload = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    current_run_id = payload.get("run_id")
+    if not isinstance(current_run_id, str):
+        return True
+    return current_run_id == lock.run_id

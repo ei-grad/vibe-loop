@@ -1109,30 +1109,47 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
     stale = collect_stale_locks(runner.lock_manager, runner.run_store)
     if not stale:
         if args.json:
-            print(json.dumps({"stale_locks": [], "cleaned": []}, indent=2))
+            print(
+                json.dumps(
+                    {"stale_locks": [], "cleaned": [], "errors": []}, indent=2
+                )
+            )
         else:
             print("No stale locks found.")
         return 0
     if args.force:
-        cleaned = clean_stale_locks(stale)
+        result = clean_stale_locks(stale)
         if args.json:
             print(
                 json.dumps(
                     {
                         "stale_locks": [s.to_json() for s in stale],
-                        "cleaned": [s.to_json() for s in cleaned],
+                        "cleaned": [s.to_json() for s in result.cleaned],
+                        "errors": [
+                            {"lock": s.to_json(), "error": msg}
+                            for s, msg in result.errors
+                        ],
                     },
                     indent=2,
                 )
             )
         else:
-            print(f"Removed {len(cleaned)} stale lock(s):")
-            print(render_stale_locks(cleaned))
-        return 0
+            if result.cleaned:
+                print(f"Removed {len(result.cleaned)} stale lock(s):")
+                print(render_stale_locks(result.cleaned))
+            for lock, msg in result.errors:
+                print(f"error: {lock.task_id}: {msg}", file=sys.stderr)
+            if not result.cleaned and result.errors:
+                print("No locks were removed due to errors.", file=sys.stderr)
+        return 1 if result.errors and not result.cleaned else 0
     if args.json:
         print(
             json.dumps(
-                {"stale_locks": [s.to_json() for s in stale], "cleaned": []},
+                {
+                    "stale_locks": [s.to_json() for s in stale],
+                    "cleaned": [],
+                    "errors": [],
+                },
                 indent=2,
             )
         )

@@ -460,10 +460,11 @@ class StaleLockTests(unittest.TestCase):
             lock_path = stale[0].lock_path
             self.assertTrue(lock_path.exists())
 
-            cleaned = clean_stale_locks(stale)
+            result = clean_stale_locks(stale)
 
-        self.assertEqual(len(cleaned), 1)
-        self.assertEqual(cleaned[0].task_id, "TASK-01")
+        self.assertEqual(len(result.cleaned), 1)
+        self.assertEqual(result.cleaned[0].task_id, "TASK-01")
+        self.assertEqual(result.errors, [])
         self.assertFalse(lock_path.exists())
 
     def test_clean_handles_already_removed_locks(self) -> None:
@@ -475,8 +476,9 @@ class StaleLockTests(unittest.TestCase):
             kind="task",
             recovery_command="rm -rf /tmp/nonexistent-lock-dir",
         )
-        cleaned = clean_stale_locks([lock])
-        self.assertEqual(cleaned, [])
+        result = clean_stale_locks([lock])
+        self.assertEqual(result.cleaned, [])
+        self.assertEqual(result.errors, [])
 
     def test_stale_lock_to_json(self) -> None:
         lock = StaleLock(
@@ -526,6 +528,74 @@ class StaleLockTests(unittest.TestCase):
         kinds = {s.kind for s in stale}
         self.assertEqual(kinds, {"task", "integration"})
         self.assertEqual(len(stale), 2)
+
+    def test_clean_refuses_if_run_id_changed_since_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            lock_path = stale[0].lock_path
+            (lock_path / "lock.json").write_text(
+                '{"run_id": "run-2-new", "task_id": "TASK-01"}',
+                encoding="utf-8",
+            )
+
+            result = clean_stale_locks(stale)
+            lock_still_exists = lock_path.exists()
+
+        self.assertEqual(result.cleaned, [])
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("changed since collection", result.errors[0][1])
+        self.assertTrue(lock_still_exists)
+
+    def test_recovery_command_quotes_paths_with_spaces(self) -> None:
+        import shlex
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_dir = repo / ".vibe-loop" / "locks"
+            lock_dir.mkdir(parents=True)
+            spaced_lock = lock_dir / "my task.lock"
+            spaced_lock.mkdir()
+            (spaced_lock / "lock.json").write_text(
+                '{"run_id": "r-1", "task_id": "my task", "pid": 999999999,'
+                ' "host": "test-host", "record_type": "active_run"}',
+                encoding="utf-8",
+            )
+            manager = LockManager(lock_dir)
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        self.assertEqual(len(stale), 1)
+        cmd = stale[0].recovery_command
+        parts = shlex.split(cmd)
+        self.assertEqual(parts[0], "rm")
+        self.assertEqual(parts[1], "-rf")
+        self.assertEqual(parts[2], str(spaced_lock))
 
 
 if __name__ == "__main__":
