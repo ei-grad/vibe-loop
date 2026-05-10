@@ -33,9 +33,7 @@ class StubBenchmarkAdapter:
             ),
         ]
 
-    def setup_instance(
-        self, instance: BenchmarkInstance, workdir: Path
-    ) -> None:
+    def setup_instance(self, instance: BenchmarkInstance, workdir: Path) -> None:
         (workdir / "task.txt").write_text(
             f"Implement feature for {instance.instance_id}\n",
             encoding="utf-8",
@@ -54,7 +52,5 @@ class StubBenchmarkAdapter:
             failure_reason="" if passed else "stub failure",
         )
 
-    def teardown_instance(
-        self, instance: BenchmarkInstance, workdir: Path
-    ) -> None:
+    def teardown_instance(self, instance: BenchmarkInstance, workdir: Path) -> None:
         pass

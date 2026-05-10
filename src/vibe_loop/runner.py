@@ -392,10 +392,7 @@ class VibeRunner:
         session_id = run_id
         session_id_source = "fallback:run_id"
         skill_prefix = self.config.agent.skill_ref_prefix
-        worker_prompt = (
-            f"{skill_prefix}vibe-loop {task.task_id}"
-            f"{CLI_WORKER_ADDENDUM}"
-        )
+        worker_prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
         command = command_template.format(
             prompt=shell_quote(worker_prompt),
             task_id=task.task_id,
@@ -598,9 +595,7 @@ class VibeRunner:
                 "pid": os.getpid(),
                 "started_at": datetime.now(UTC).isoformat(),
             }
-            handle.write(
-                (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
-            )
+            handle.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
             return SchedulerLock(path=lock_path, handle=handle)
@@ -697,9 +692,7 @@ class VibeRunner:
                     and len(in_flight) < jobs
                     and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
                 ):
-                    candidates = self.list_candidates(
-                        exclude=skipped | set(scheduled)
-                    )
+                    candidates = self.list_candidates(exclude=skipped | set(scheduled))
                     candidates = filter_scheduled_conflicts(
                         candidates,
                         list(scheduled.values()),
@@ -1013,7 +1006,9 @@ def resource_conflicts_enabled(
     )
 
 
-def active_lock_conflict_domains(lock_manager: LockManager) -> tuple[ConflictDomains, ...]:
+def active_lock_conflict_domains(
+    lock_manager: LockManager,
+) -> tuple[ConflictDomains, ...]:
     domains: list[ConflictDomains] = []
     for metadata in lock_manager.list_locks():
         active = ActiveRunState.from_lock_metadata(metadata)
@@ -1036,7 +1031,9 @@ def task_conflicts_with_domains(
     active_domains: tuple[ConflictDomains, ...],
 ) -> bool:
     task_domains = conflict_domains_from_task_like(task)
-    return any(conflict_domains_overlap(task_domains, domain) for domain in active_domains)
+    return any(
+        conflict_domains_overlap(task_domains, domain) for domain in active_domains
+    )
 
 
 def task_conflicts_with_tasks(task: Task, selected: list[Task]) -> bool:
@@ -1066,7 +1063,9 @@ def conflict_domains_overlap(left: ConflictDomains, right: ConflictDomains) -> b
     return path_domains_overlap(left.paths, right.paths)
 
 
-def path_domains_overlap(left_paths: tuple[str, ...], right_paths: tuple[str, ...]) -> bool:
+def path_domains_overlap(
+    left_paths: tuple[str, ...], right_paths: tuple[str, ...]
+) -> bool:
     for left in left_paths:
         for right in right_paths:
             if path_domain_overlaps(left, right):

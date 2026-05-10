@@ -260,7 +260,9 @@ class EvalReleaseTests(unittest.TestCase):
         self.assertNotIn("SECRET VALUE", rendered)
         self.assertIn('"stdout": {"omitted": "sensitive_key"}', rendered)
         self.assertIn('"details": {"omitted": "nested_mapping"}', rendered)
-        self.assertIn('"long_text": {"length": 300, "omitted": "long_string"}', rendered)
+        self.assertIn(
+            '"long_text": {"length": 300, "omitted": "long_string"}', rendered
+        )
 
     def test_cli_dry_run_checks_existing_aggregate_and_writes_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

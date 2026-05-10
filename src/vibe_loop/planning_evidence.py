@@ -12,7 +12,11 @@ from typing import Any
 
 import sys
 
-from vibe_loop.config import VibeConfig, planning_analytics_output_report, prepare_shell_command
+from vibe_loop.config import (
+    VibeConfig,
+    planning_analytics_output_report,
+    prepare_shell_command,
+)
 from vibe_loop.generated_discovery import (
     SkippedEvidence,
     is_secret_like_directory_name,

@@ -404,9 +404,7 @@ def collect_stale_locks(
         stale.append(
             StaleLock(
                 task_id=MAIN_INTEGRATION_LOCK_NAME,
-                run_id=optional_string(
-                    integration_status.metadata.get("run_id")
-                ) or "",
+                run_id=optional_string(integration_status.metadata.get("run_id")) or "",
                 lock_path=integration_status.path,
                 stale_reason=integration_status.stale_reason or "unknown",
                 kind="integration",

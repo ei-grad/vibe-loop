@@ -37,8 +37,12 @@ def prepare_shell_command(
 def _split_windows_command(command: str) -> list[str]:
     import ctypes
     from ctypes import wintypes
+
     shell32 = ctypes.windll.shell32
-    shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    shell32.CommandLineToArgvW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_int),
+    ]
     shell32.CommandLineToArgvW.restype = ctypes.POINTER(wintypes.LPWSTR)
     argc = ctypes.c_int(0)
     argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
@@ -465,7 +469,11 @@ def resolve_agent_default(
         source = "auto:codex"
         if len(available) > 1:
             source = f"auto:codex:{AGENT_DEFAULT_POLICY_SOURCE}"
-        return AGENT_COMMAND_DEFAULTS[AGENT_PREFERRED_CLI][key], source, AGENT_PREFERRED_CLI
+        return (
+            AGENT_COMMAND_DEFAULTS[AGENT_PREFERRED_CLI][key],
+            source,
+            AGENT_PREFERRED_CLI,
+        )
     if len(available) == 1:
         agent_name = available[0]
         return AGENT_COMMAND_DEFAULTS[agent_name][key], f"auto:{agent_name}", agent_name

@@ -97,17 +97,13 @@ class BenchmarkAdapter(Protocol):
 
     def list_instances(self) -> Sequence[BenchmarkInstance]: ...
 
-    def setup_instance(
-        self, instance: BenchmarkInstance, workdir: Path
-    ) -> None: ...
+    def setup_instance(self, instance: BenchmarkInstance, workdir: Path) -> None: ...
 
     def grade_instance(
         self, instance: BenchmarkInstance, workdir: Path
     ) -> BenchmarkGraderResult: ...
 
-    def teardown_instance(
-        self, instance: BenchmarkInstance, workdir: Path
-    ) -> None: ...
+    def teardown_instance(self, instance: BenchmarkInstance, workdir: Path) -> None: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,9 +137,7 @@ def run_benchmark_eval(config: BenchmarkEvalConfig) -> dict[str, object]:
 
         for instance in instances:
             for trial in range(1, config.trials + 1):
-                trial_result = _run_trial(
-                    config, instance, condition, command, trial
-                )
+                trial_result = _run_trial(config, instance, condition, command, trial)
                 condition_results.append(trial_result)
                 results.append(trial_result.to_json())
 
@@ -201,7 +195,12 @@ def _run_trial(
         config.adapter.setup_instance(instance, workdir)
     except Exception as exc:
         return _error_trial(
-            instance, condition, trial, command, started_at, start_time,
+            instance,
+            condition,
+            trial,
+            command,
+            started_at,
+            start_time,
             f"setup failed: {exc}",
         )
 
@@ -225,7 +224,12 @@ def _run_trial(
         agent_result = None
     except OSError as exc:
         return _error_trial(
-            instance, condition, trial, command, started_at, start_time,
+            instance,
+            condition,
+            trial,
+            command,
+            started_at,
+            start_time,
             f"agent command failed: {exc}",
         )
 

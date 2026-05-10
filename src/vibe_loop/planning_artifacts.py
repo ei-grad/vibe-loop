@@ -307,9 +307,7 @@ def render_static_gantt_html(timeline: dict[str, object]) -> str:
         "warning_count": len(warnings),
     }
     marker = (
-        GANTT_MARKER_PREFIX
-        + json.dumps(metadata, sort_keys=True)
-        + GANTT_MARKER_SUFFIX
+        GANTT_MARKER_PREFIX + json.dumps(metadata, sort_keys=True) + GANTT_MARKER_SUFFIX
     )
     min_start, max_end = chart_bounds(bars)
     summary = gantt_summary(tasks)
@@ -482,7 +480,8 @@ def gantt_bars(tasks: list[dict[str, object]]) -> list[dict[str, object]]:
         bars.append(
             {
                 "id": string_value(task.get("id")),
-                "title": string_value(task.get("title")) or string_value(task.get("id")),
+                "title": string_value(task.get("title"))
+                or string_value(task.get("id")),
                 "status": string_value(task.get("status")),
                 "kind": span["kind"],
                 "start": span["start_dt"],

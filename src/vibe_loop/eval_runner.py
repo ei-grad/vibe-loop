@@ -393,6 +393,7 @@ def run_trial(
                 f"{trial_root} already exists; pass --overwrite to replace it"
             )
         from vibe_loop.eval_examples import _rmtree_make_writable
+
         if sys.version_info >= (3, 12):
             shutil.rmtree(trial_root, onexc=_rmtree_make_writable)
         else:
@@ -460,7 +461,9 @@ def run_trial(
             condition=condition,
         )
     else:
-        workflow_events = list(agent_batch.workflow_events) or workflow_events_for_trial(
+        workflow_events = list(
+            agent_batch.workflow_events
+        ) or workflow_events_for_trial(
             trial_root,
             execution,
             transcript_graders,
@@ -655,7 +658,9 @@ def ensure_stream_json_format(command_template: str) -> str:
         return command_template
     if "--output-format" in command_template:
         return command_template
-    return command_template.replace("claude -p", "claude -p --output-format stream-json", 1)
+    return command_template.replace(
+        "claude -p", "claude -p --output-format stream-json", 1
+    )
 
 
 def execute_trial_agent_commands(
@@ -685,7 +690,9 @@ def execute_trial_agent_commands(
     effective_template = ensure_stream_json_format(command_template)
     skill_ref_prefix = detect_eval_skill_ref_prefix(effective_template)
     effective_prompt = build_eval_prompt(
-        prompt_text, condition, skill_ref_prefix=skill_ref_prefix,
+        prompt_text,
+        condition,
+        skill_ref_prefix=skill_ref_prefix,
     )
     command = format_agent_command(
         effective_template,
@@ -788,9 +795,12 @@ def execute_negative_prompt_set(
         )
         write_run_log(prompt_artifact_root, case, condition, run_id, execution)
         write_transcript_if_missing(prompt_artifact_root, execution)
-        prompt_command_count = command_count_from_transcript(
-            artifact_path(prompt_artifact_root, "transcript")
-        ) or 1
+        prompt_command_count = (
+            command_count_from_transcript(
+                artifact_path(prompt_artifact_root, "transcript")
+            )
+            or 1
+        )
         prompt_usage = usage_metrics((), prompt_artifact_root, ())
         prompt_after = collect_git_state(prompt_repo)
         prompt_events = workflow_events_for_trial(
@@ -1127,7 +1137,10 @@ def write_transcript_if_missing(
     if path.exists():
         return
     records = []
-    for stream_name, text in (("stdout", execution.stdout), ("stderr", execution.stderr)):
+    for stream_name, text in (
+        ("stdout", execution.stdout),
+        ("stderr", execution.stderr),
+    ):
         for line in text.splitlines():
             records.append({"stream": stream_name, "text": line})
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1289,7 +1302,10 @@ def usage_metrics(
     command_results: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
     usage: dict[str, object] = {}
-    for path in (artifact_path(artifact_root, "structured_result"), artifact_root / "agent-result.json"):
+    for path in (
+        artifact_path(artifact_root, "structured_result"),
+        artifact_root / "agent-result.json",
+    ):
         payload = load_json(path)
         if isinstance(payload, Mapping):
             merge_usage(usage, payload)
@@ -1357,9 +1373,13 @@ def workflow_events_for_trial(
     events.extend(events_from_text(execution.stderr))
     if not events and git_before and git_after:
         events.extend(
-            detect_events_from_repo_state(git_before, git_after, grader_output, condition)
+            detect_events_from_repo_state(
+                git_before, git_after, grader_output, condition
+            )
         )
-    if execution.unsafe_refused or unsafe_command_reason(execution.stdout + execution.stderr):
+    if execution.unsafe_refused or unsafe_command_reason(
+        execution.stdout + execution.stderr
+    ):
         events.append("unsafe_git_command")
     return unique_preserving_order(events)
 
@@ -1445,15 +1465,23 @@ def _events_for_tool_use(
     if name in ("Bash", "bash"):
         cmd = str(inp.get("command", ""))
         cmd_lower = cmd.lower()
-        if ("git status" in cmd or "git worktree list" in cmd
-                or "git diff" in cmd_lower or "git log" in cmd
-                or cmd.startswith("ls")):
+        if (
+            "git status" in cmd
+            or "git worktree list" in cmd
+            or "git diff" in cmd_lower
+            or "git log" in cmd
+            or cmd.startswith("ls")
+        ):
             events.append("worktree_state_inspected")
         if "git worktree add" in cmd or "git checkout -b" in cmd:
             events.append("branch_or_worktree_created")
-        if ("pytest" in cmd or "python -m pytest" in cmd
-                or "uv run -m pytest" in cmd or "unittest" in cmd
-                or "python -m unittest" in cmd):
+        if (
+            "pytest" in cmd
+            or "python -m pytest" in cmd
+            or "uv run -m pytest" in cmd
+            or "unittest" in cmd
+            or "python -m unittest" in cmd
+        ):
             is_test = True
             if saw_merge:
                 events.append("main_verification_ran")
@@ -1475,7 +1503,9 @@ def _events_for_tool_use(
     elif name in ("EnterWorktree", "enterWorktree"):
         events.append("branch_or_worktree_created")
     elif name == "Agent":
-        desc = (str(inp.get("description", "")) + " " + str(inp.get("prompt", ""))).lower()
+        desc = (
+            str(inp.get("description", "")) + " " + str(inp.get("prompt", ""))
+        ).lower()
         if "review" in desc:
             events.append("review_requested")
 
@@ -1654,7 +1684,9 @@ def score_trial(
 ) -> dict[str, object]:
     deterministic_passed = deterministic.get("passed") is True
     transcript_passed = all(result.passed for result in transcript_graders)
-    artifact_passed = True if artifact_result is None else artifact_result.get("passed") is True
+    artifact_passed = (
+        True if artifact_result is None else artifact_result.get("passed") is True
+    )
     failure_taxonomy = failure_taxonomy_for_trial(
         case,
         condition,
@@ -1705,7 +1737,9 @@ def observed_command_count(
 ) -> int:
     prompt_counts = prompt_command_counts(command_results)
     counts = [sum(prompt_counts) if prompt_counts else len(command_results)]
-    transcript_count = command_count_from_transcript(artifact_path(artifact_root, "transcript"))
+    transcript_count = command_count_from_transcript(
+        artifact_path(artifact_root, "transcript")
+    )
     if transcript_count is not None:
         counts.append(transcript_count)
     for result in transcript_graders:
@@ -1723,7 +1757,11 @@ def budgeted_command_count(
     prompt_counts = prompt_command_counts(command_results)
     if prompt_counts:
         grader_count = len(
-            [result for result in command_results if result.get("type") == "transcript_grader"]
+            [
+                result
+                for result in command_results
+                if result.get("type") == "transcript_grader"
+            ]
         )
         return max(prompt_counts) + grader_count
     return observed_command_count(command_results, transcript_graders, artifact_root)
@@ -1806,11 +1844,17 @@ def failure_taxonomy_for_trial(
     labels: set[str] = set()
     if execution.timeout:
         labels.add("timeout")
-    if execution.unsafe_refused or unsafe_command_reason(execution.stdout + execution.stderr):
+    if execution.unsafe_refused or unsafe_command_reason(
+        execution.stdout + execution.stderr
+    ):
         labels.add("unsafe_git")
     if execution.output_truncated:
         labels.add("workflow_contract")
-    if execution.exit_code != 0 and not execution.timeout and not execution.unsafe_refused:
+    if (
+        execution.exit_code != 0
+        and not execution.timeout
+        and not execution.unsafe_refused
+    ):
         labels.add("task_outcome")
     if deterministic.get("passed") is not True:
         labels.add("task_outcome")
@@ -1850,7 +1894,11 @@ def artifact_failure_labels(
             labels.add("unsafe_git")
         if condition != "no_skill" and case.positive and "skill_activated" in message:
             labels.add("trigger_false_negative")
-        if condition != "no_skill" and not case.positive and "skill_activated" in message:
+        if (
+            condition != "no_skill"
+            and not case.positive
+            and "skill_activated" in message
+        ):
             labels.add("trigger_false_positive")
     return labels or {"task_outcome"}
 
@@ -1862,10 +1910,7 @@ def workflow_taxonomy_labels(message: str) -> set[str]:
     if "unnecessary_user_prompt" in message:
         labels.add("unnecessary_user_prompt")
     missing_events = missing_workflow_event_text(message)
-    if any(
-        event in message
-        for event in ("review_evidence",)
-    ) or any(
+    if any(event in message for event in ("review_evidence",)) or any(
         event in missing_events
         for event in (
             "review_requested",
@@ -1875,10 +1920,7 @@ def workflow_taxonomy_labels(message: str) -> set[str]:
         )
     ):
         labels.add("review_missing")
-    if any(
-        event in message
-        for event in ("lock_evidence",)
-    ) or any(
+    if any(event in message for event in ("lock_evidence",)) or any(
         event in missing_events
         for event in (
             "main_integration_lock_acquired",
@@ -2006,7 +2048,9 @@ def build_run_record(
             "run_order": run_order,
             "fresh_workspace": True,
             "state_reused": False,
-            "artifact_root": str(Path("cases") / case.case_id / condition / f"trial-{trial}"),
+            "artifact_root": str(
+                Path("cases") / case.case_id / condition / f"trial-{trial}"
+            ),
         },
         status=status,
         started_at=execution.started_at,
@@ -2104,7 +2148,11 @@ def skill_condition(condition: str, command: str) -> dict[str, object]:
     if condition == "no_skill":
         return {"id": condition, "skills_available": False}
     skill_path = skill_file_path(condition)
-    skill_sha = sha256_file(skill_path) if skill_path and skill_path.is_file() else hash_text(command)
+    skill_sha = (
+        sha256_file(skill_path)
+        if skill_path and skill_path.is_file()
+        else hash_text(command)
+    )
     payload: dict[str, object] = {
         "id": condition,
         "skills_available": True,
@@ -2139,7 +2187,9 @@ def collect_git_state(repo: Path) -> dict[str, object]:
         "branch": git_output(repo, "branch", "--show-current") or "HEAD",
         "dirty": bool(status.strip()),
         "status_short": status.splitlines(),
-        "branches": git_output(repo, "branch", "--format=%(refname:short)").splitlines(),
+        "branches": git_output(
+            repo, "branch", "--format=%(refname:short)"
+        ).splitlines(),
         "worktrees": git_output(repo, "worktree", "list", "--porcelain").splitlines(),
     }
 
@@ -2254,7 +2304,9 @@ def write_json_artifact(
 
 def write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes((json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+    path.write_bytes(
+        (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
 
 
 def load_json(path: Path) -> object:
@@ -2273,7 +2325,9 @@ def build_aggregate(
 ) -> dict[str, object]:
     records = [result.record for result in trial_results]
     by_condition: dict[str, list[Mapping[str, object]]] = defaultdict(list)
-    by_case_condition: dict[tuple[str, str], list[Mapping[str, object]]] = defaultdict(list)
+    by_case_condition: dict[tuple[str, str], list[Mapping[str, object]]] = defaultdict(
+        list
+    )
     for record in records:
         condition = str(record.get("condition", ""))
         case_id = str(record.get("case_id", ""))
@@ -2333,11 +2387,7 @@ def condition_summary(
     condition: str,
     records: Sequence[Mapping[str, object]],
 ) -> dict[str, object]:
-    included = [
-        record
-        for record in records
-        if not excluded_from_primary(record)
-    ]
+    included = [record for record in records if not excluded_from_primary(record)]
     pass_count = sum(1 for record in included if record_passed(record))
     primary_total = len(included)
     pass_rate = pass_count / primary_total if primary_total else 0.0
@@ -2382,7 +2432,9 @@ def wilson_interval(successes: int, total: int) -> tuple[float, float]:
     phat = successes / total
     denominator = 1 + z * z / total
     center = (phat + z * z / (2 * total)) / denominator
-    margin = z * ((phat * (1 - phat) + z * z / (4 * total)) / total) ** 0.5 / denominator
+    margin = (
+        z * ((phat * (1 - phat) + z * z / (4 * total)) / total) ** 0.5 / denominator
+    )
     return max(0.0, center - margin), min(1.0, center + margin)
 
 

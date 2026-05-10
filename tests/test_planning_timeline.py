@@ -162,8 +162,7 @@ class PlanningTimelineTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics]\n"
-                f'worklog_command = "{PYTHON} worklog.py"\n',
+                f'[planning_analytics]\nworklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -768,14 +767,10 @@ class TimelineCrossReferenceTests(unittest.TestCase):
                 repo / "PLAN.md",
                 config.task_source.runnable_statuses,
             )
-            runnable = runnable_tasks(
-                source, config.task_source.runnable_statuses
-            )
+            runnable = runnable_tasks(source, config.task_source.runnable_statuses)
 
         warnings = timeline["warnings"]
-        stale_warnings = [
-            w for w in warnings if w.get("code") == "stale_run_record"
-        ]
+        stale_warnings = [w for w in warnings if w.get("code") == "stale_run_record"]
         self.assertTrue(len(stale_warnings) > 0)
         runnable_ids = [t.task_id for t in runnable]
         self.assertEqual(runnable_ids, ["T-02"])

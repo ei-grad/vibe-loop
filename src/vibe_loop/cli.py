@@ -591,9 +591,7 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
             print(f"run not found: {args.run_id}", file=sys.stderr)
             return 2
         payload = inspection.to_json()
-        timeline_ref = _timeline_ref_for_task(
-            config, str(payload.get("task_id") or "")
-        )
+        timeline_ref = _timeline_ref_for_task(config, str(payload.get("task_id") or ""))
         if timeline_ref is not None:
             payload["timeline_task"] = timeline_ref
         if args.json:
@@ -764,9 +762,7 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
 
         adapter = resolve_benchmark_adapter(args.adapter)
         if adapter is None:
-            print(
-                f"unknown benchmark adapter: {args.adapter}", file=sys.stderr
-            )
+            print(f"unknown benchmark adapter: {args.adapter}", file=sys.stderr)
             return 2
         agent_commands = _parse_benchmark_agent_commands(args.agent_command)
         if not agent_commands:
@@ -787,9 +783,7 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
         payload = run_benchmark_eval(bench_config)
         output_path = args.output / f"{adapter.name}-results.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-        )
+        output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(json.dumps(payload, indent=2))
         return 0
 
@@ -1216,9 +1210,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
     if not stale:
         if args.json:
             print(
-                json.dumps(
-                    {"stale_locks": [], "cleaned": [], "errors": []}, indent=2
-                )
+                json.dumps({"stale_locks": [], "cleaned": [], "errors": []}, indent=2)
             )
         else:
             print("No stale locks found.")
@@ -1349,9 +1341,7 @@ def render_planning_artifact_inspection(report: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _timeline_ref_for_task(
-    config, target_task_id: str
-) -> dict[str, object] | None:
+def _timeline_ref_for_task(config, target_task_id: str) -> dict[str, object] | None:
     if not target_task_id:
         return None
     try:

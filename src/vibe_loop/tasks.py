@@ -375,11 +375,7 @@ def parse_field_mapping(field_name: str, mapping: dict[str, object]) -> FieldMap
         )
     none_values = mapping.get("none_values")
     if none_values is None:
-        none = (
-            ("none",)
-            if field_name in {"dependencies", "resources", "paths"}
-            else ()
-        )
+        none = ("none",) if field_name in {"dependencies", "resources", "paths"} else ()
     elif isinstance(none_values, list) and all(
         isinstance(item, str) and item for item in none_values
     ):

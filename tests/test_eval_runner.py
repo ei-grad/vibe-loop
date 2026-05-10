@@ -86,8 +86,7 @@ class EvalRunnerCliTests(unittest.TestCase):
             agent = root / "sleep_agent.py"
             write_python_executable(
                 agent,
-                "import time\n"
-                "time.sleep(2)\n",
+                "import time\ntime.sleep(2)\n",
             )
 
             payload = run_eval(
@@ -145,7 +144,9 @@ class EvalRunnerCliTests(unittest.TestCase):
 
         self.assertIn("refused unsafe command", log)
         self.assertIn("unsafe_git", record["failure_taxonomy"])
-        self.assertEqual(payload["conditions"]["no_skill"]["failure_taxonomy"]["unsafe_git"], 1)
+        self.assertEqual(
+            payload["conditions"]["no_skill"]["failure_taxonomy"]["unsafe_git"], 1
+        )
 
     def test_output_budget_failure_remains_in_primary_rate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -334,7 +335,9 @@ class EvalRunnerCliTests(unittest.TestCase):
             )
 
         self.assertIn("unsafe_git", record["failure_taxonomy"])
-        self.assertEqual(payload["conditions"]["no_skill"]["failure_taxonomy"]["unsafe_git"], 1)
+        self.assertEqual(
+            payload["conditions"]["no_skill"]["failure_taxonomy"]["unsafe_git"], 1
+        )
         self.assertEqual(payload["conditions"]["no_skill"]["token_total"], 42.0)
         self.assertEqual(payload["conditions"]["no_skill"]["cost_total"], 0.25)
         self.assertIn("unsafe-scan", json.dumps(graders))
@@ -377,13 +380,13 @@ class EvalRunnerCliTests(unittest.TestCase):
         skill_quality_markdown = markdown[markdown.index("## Skill Quality") :]
 
         observed_labels = {
-            label
-            for record in records
-            for label in record.get("failure_taxonomy", [])
+            label for record in records for label in record.get("failure_taxonomy", [])
         }
 
         self.assertEqual(observed_labels, EVAL_FAILURE_TAXONOMY)
-        self.assertEqual(stable_quality_snapshot(aggregate["skill_quality"]), QUALITY_JSON_SNAPSHOT)
+        self.assertEqual(
+            stable_quality_snapshot(aggregate["skill_quality"]), QUALITY_JSON_SNAPSHOT
+        )
         self.assertEqual(skill_quality_markdown, QUALITY_MARKDOWN_SNAPSHOT)
 
     def test_overwrite_rerun_archives_prior_artifacts_for_regression_refs(self) -> None:
@@ -506,8 +509,7 @@ class EvalRunnerCliTests(unittest.TestCase):
         )
         self.assertEqual(
             workflow_taxonomy_labels(
-                "missing events: main_integration_lock_acquired, "
-                "main_verification_ran"
+                "missing events: main_integration_lock_acquired, main_verification_ran"
             ),
             {"integration_missing"},
         )
@@ -552,10 +554,7 @@ def run_eval(root: Path, *args: str) -> dict[str, object]:
 def load_skill_quality_records() -> list[dict[str, object]]:
     return json.loads(
         (
-            Path(__file__).parent
-            / "fixtures"
-            / "eval"
-            / "skill-quality-records.json"
+            Path(__file__).parent / "fixtures" / "eval" / "skill-quality-records.json"
         ).read_text(encoding="utf-8")
     )
 
@@ -627,10 +626,7 @@ def stable_uplift(payload: dict[str, object]) -> dict[str, object]:
 
 
 def record_locations(records: list[dict[str, object]]) -> list[str]:
-    return [
-        f"{record['run_id']}@{record['artifact_root']}"
-        for record in records
-    ]
+    return [f"{record['run_id']}@{record['artifact_root']}" for record in records]
 
 
 PRIOR_RUN_SNAPSHOT = {
@@ -1033,7 +1029,9 @@ def write_python_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
     if sys.platform == "win32":
         cmd = path.with_name(path.name + ".cmd")
-        cmd.write_text(f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8")
+        cmd.write_text(
+            f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8"
+        )
 
 
 def write_negative_agent(path: Path) -> None:

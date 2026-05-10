@@ -36,9 +36,7 @@ class StubAdapter:
     def list_instances(self) -> Sequence[BenchmarkInstance]:
         return list(self._instances)
 
-    def setup_instance(
-        self, instance: BenchmarkInstance, workdir: Path
-    ) -> None:
+    def setup_instance(self, instance: BenchmarkInstance, workdir: Path) -> None:
         self.setup_calls.append(instance.instance_id)
         (workdir / "setup.txt").write_text("ready\n", encoding="utf-8")
 
@@ -55,9 +53,7 @@ class StubAdapter:
             duration_seconds=0.01,
         )
 
-    def teardown_instance(
-        self, instance: BenchmarkInstance, workdir: Path
-    ) -> None:
+    def teardown_instance(self, instance: BenchmarkInstance, workdir: Path) -> None:
         self.teardown_calls.append(instance.instance_id)
 
 
@@ -79,9 +75,7 @@ class BenchmarkEvalTests(unittest.TestCase):
                 language="python",
             ),
         ]
-        adapter = StubAdapter(
-            instances, {"test-001": True, "test-002": False}
-        )
+        adapter = StubAdapter(instances, {"test-001": True, "test-002": False})
         with tempfile.TemporaryDirectory() as directory:
             config = BenchmarkEvalConfig(
                 adapter=adapter,
@@ -115,12 +109,8 @@ class BenchmarkEvalTests(unittest.TestCase):
 
     def test_filters_instances_and_conditions(self) -> None:
         instances = [
-            BenchmarkInstance(
-                instance_id="inc", dataset="d", split="s"
-            ),
-            BenchmarkInstance(
-                instance_id="exc", dataset="d", split="s"
-            ),
+            BenchmarkInstance(instance_id="inc", dataset="d", split="s"),
+            BenchmarkInstance(instance_id="exc", dataset="d", split="s"),
         ]
         adapter = StubAdapter(instances, {"inc": True})
         with tempfile.TemporaryDirectory() as directory:
@@ -177,9 +167,7 @@ class BenchmarkEvalTests(unittest.TestCase):
 
     def test_setup_failure_produces_error_result(self) -> None:
         instances = [
-            BenchmarkInstance(
-                instance_id="broken", dataset="d", split="s"
-            ),
+            BenchmarkInstance(instance_id="broken", dataset="d", split="s"),
         ]
 
         class FailingAdapter(StubAdapter):
@@ -203,9 +191,7 @@ class BenchmarkEvalTests(unittest.TestCase):
 
     def test_multiple_trials(self) -> None:
         instances = [
-            BenchmarkInstance(
-                instance_id="t1", dataset="d", split="s"
-            ),
+            BenchmarkInstance(instance_id="t1", dataset="d", split="s"),
         ]
         adapter = StubAdapter(instances, {"t1": True})
         with tempfile.TemporaryDirectory() as directory:
@@ -263,12 +249,9 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(payload["conditions"]["test"]["trials"], 0)
         self.assertEqual(payload["conditions"]["test"]["pass_rate"], 0.0)
 
-
     def test_agent_timeout_produces_graded_result_with_timeout_flag(self) -> None:
         instances = [
-            BenchmarkInstance(
-                instance_id="slow", dataset="d", split="s"
-            ),
+            BenchmarkInstance(instance_id="slow", dataset="d", split="s"),
         ]
         adapter = StubAdapter(instances, {"slow": False})
         with tempfile.TemporaryDirectory() as directory:

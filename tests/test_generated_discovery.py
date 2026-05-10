@@ -322,13 +322,17 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 escaped_double_encoded_host_slack_hook_dir = (
-                    repo / "hooks%252Eslack%252Ecom\\" / "services\\" / "T555\\" / "B666\\"
+                    repo
+                    / "hooks%252Eslack%252Ecom\\"
+                    / "services\\"
+                    / "T555\\"
+                    / "B666\\"
                 )
                 escaped_double_encoded_host_slack_hook_dir.mkdir(parents=True)
                 (escaped_double_encoded_host_slack_hook_dir / "DOUBLE.md").write_text(
                     "escaped double encoded host webhook path material\n",
                     encoding="utf-8",
-            )
+                )
             secret_filenames = [
                 "credential.json",
                 "creds.json",
@@ -406,10 +410,12 @@ class GeneratedDiscoveryEvidenceTests(unittest.TestCase):
                 "ASIAIOSFODNN7EXAMPLE.md",
             ]
             if sys.platform != "win32":
-                secret_filenames.extend([
-                    "hooks\\\\u002eslack\\\\u002ecom\\\\u002fservices\\\\u002fT000\\\\u002fB000\\\\u002fDOUBLEUNICODE.md",
-                    "hooks\\u002eslack\\u002ecom\\u002fservices\\u002fT000\\u002fB000\\u002fUNICODE.md",
-                ])
+                secret_filenames.extend(
+                    [
+                        "hooks\\\\u002eslack\\\\u002ecom\\\\u002fservices\\\\u002fT000\\\\u002fB000\\\\u002fDOUBLEUNICODE.md",
+                        "hooks\\u002eslack\\u002ecom\\u002fservices\\u002fT000\\u002fB000\\u002fUNICODE.md",
+                    ]
+                )
             for filename in secret_filenames:
                 (repo / filename).write_text("secret\n", encoding="utf-8")
 

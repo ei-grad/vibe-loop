@@ -1326,7 +1326,14 @@ class CliTests(unittest.TestCase):
             inspect_stderr = StringIO()
             with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
                 inspect_exit = main(
-                    ["planning", "artifacts", "--repo", str(repo), "--inspect", "--json"]
+                    [
+                        "planning",
+                        "artifacts",
+                        "--repo",
+                        str(repo),
+                        "--inspect",
+                        "--json",
+                    ]
                 )
 
             payload = json.loads(inspect_stdout.getvalue())
@@ -3880,9 +3887,7 @@ class CliTests(unittest.TestCase):
             )
             stdout = StringIO()
             with redirect_stdout(stdout):
-                exit_code = main(
-                    ["workers", "--repo", str(repo), "clean", "--force"]
-                )
+                exit_code = main(["workers", "--repo", str(repo), "clean", "--force"])
             lock_still_exists = stale_lock.exists()
 
         self.assertEqual(exit_code, 0)
@@ -3915,9 +3920,7 @@ class CliTests(unittest.TestCase):
             )
             stdout = StringIO()
             with redirect_stdout(stdout):
-                exit_code = main(
-                    ["workers", "--repo", str(repo), "clean", "--json"]
-                )
+                exit_code = main(["workers", "--repo", str(repo), "clean", "--json"])
 
         self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
@@ -4077,7 +4080,9 @@ def write_python_executable(path: Path, body: str) -> None:
     path.chmod(0o755)
     if sys.platform == "win32":
         cmd = path.with_name(path.name + ".cmd")
-        cmd.write_text(f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8")
+        cmd.write_text(
+            f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8"
+        )
 
 
 def init_planning_repo(repo: Path, plan_text: str) -> None:

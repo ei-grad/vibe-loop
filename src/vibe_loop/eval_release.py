@@ -199,7 +199,8 @@ def render_release_readiness_summary(record: Mapping[str, object]) -> str:
     lines.extend(render_evidence_gap_summary(regressions.get("evidence_gaps")))
     lines.extend(render_unresolved_regression_summary(regressions.get("unresolved")))
     invalid_parked_ids = [
-        item for item in sequence_value(regressions.get("invalid_parked_ids"))
+        item
+        for item in sequence_value(regressions.get("invalid_parked_ids"))
         if isinstance(item, str)
     ]
     if invalid_parked_ids:
@@ -322,7 +323,9 @@ def workflow_contract_regressions(
     return regressions
 
 
-def skill_quality_evidence_gaps(aggregate: Mapping[str, object]) -> list[dict[str, object]]:
+def skill_quality_evidence_gaps(
+    aggregate: Mapping[str, object],
+) -> list[dict[str, object]]:
     quality = aggregate.get("skill_quality")
     if not isinstance(quality, Mapping):
         return [
@@ -615,7 +618,9 @@ def sanitize_external_summary_value(
     depth: int,
 ) -> object:
     key_text = str(key).lower()
-    if any(fragment in key_text for fragment in SENSITIVE_EXTERNAL_SUMMARY_KEY_FRAGMENTS):
+    if any(
+        fragment in key_text for fragment in SENSITIVE_EXTERNAL_SUMMARY_KEY_FRAGMENTS
+    ):
         return {"omitted": "sensitive_key"}
     if isinstance(value, bool | int | float) or value is None:
         return value
@@ -646,7 +651,10 @@ def sanitize_external_summary_value(
         for index, item in enumerate(value):
             if index >= EXTERNAL_SUMMARY_ITEM_LIMIT:
                 sanitized_items.append(
-                    {"omitted": "extra_items", "count": len(value) - EXTERNAL_SUMMARY_ITEM_LIMIT}
+                    {
+                        "omitted": "extra_items",
+                        "count": len(value) - EXTERNAL_SUMMARY_ITEM_LIMIT,
+                    }
                 )
                 break
             sanitized_items.append(
@@ -695,7 +703,8 @@ def render_evidence_gap_summary(value: object) -> list[str]:
 
 def render_unresolved_regression_summary(value: object) -> list[str]:
     regressions = [
-        regression for regression in sequence_value(value)
+        regression
+        for regression in sequence_value(value)
         if isinstance(regression, Mapping)
     ]
     if not regressions:
@@ -703,7 +712,9 @@ def render_unresolved_regression_summary(value: object) -> list[str]:
     lines = ["unresolved workflow regressions:"]
     for regression in regressions[:5]:
         regression_id = regression.get("id", "unknown")
-        lines.append(f"- {regression_id} (park with --parked-regression {regression_id}=TASK-ID)")
+        lines.append(
+            f"- {regression_id} (park with --parked-regression {regression_id}=TASK-ID)"
+        )
     if len(regressions) > 5:
         lines.append(f"- ... {len(regressions) - 5} more")
     return lines

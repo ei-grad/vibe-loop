@@ -187,8 +187,7 @@ class PlanningEvidenceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics]\n"
-                f'worklog_command = "{PYTHON} worklog.py"\n',
+                f'[planning_analytics]\nworklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -310,8 +309,7 @@ class PlanningEvidenceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics]\n"
-                f'worklog_command = "{PYTHON} worklog.py"\n',
+                f'[planning_analytics]\nworklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -348,8 +346,7 @@ class PlanningEvidenceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics]\n"
-                f'worklog_command = "{PYTHON} worklog.py"\n',
+                f'[planning_analytics]\nworklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 
@@ -416,8 +413,7 @@ class PlanningEvidenceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics]\n"
-                f'worklog_command = "{PYTHON} worklog.py"\n',
+                f'[planning_analytics]\nworklog_command = "{PYTHON} worklog.py"\n',
                 encoding="utf-8",
             )
 

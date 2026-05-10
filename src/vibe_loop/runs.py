@@ -366,7 +366,9 @@ def record_type_label(record: dict[str, Any]) -> str:
 
 
 def record_status(record: dict[str, Any]) -> str:
-    return string_value(record.get("status")) or string_value(record.get("classification"))
+    return string_value(record.get("status")) or string_value(
+        record.get("classification")
+    )
 
 
 def record_updated_at(record: dict[str, Any]) -> str:

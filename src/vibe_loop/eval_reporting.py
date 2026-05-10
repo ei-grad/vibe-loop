@@ -26,9 +26,17 @@ FAILURE_CATEGORIES: tuple[
     ...,
 ] = (
     ("task_outcome_failures", TASK_OUTCOME_LABELS, "Task outcome failures"),
-    ("workflow_contract_failures", WORKFLOW_CONTRACT_LABELS, "Workflow contract failures"),
+    (
+        "workflow_contract_failures",
+        WORKFLOW_CONTRACT_LABELS,
+        "Workflow contract failures",
+    ),
     ("skill_trigger_misses", TRIGGER_MISS_LABELS, "Skill trigger misses"),
-    ("review_discipline_failures", frozenset({"review_missing"}), "Review discipline failures"),
+    (
+        "review_discipline_failures",
+        frozenset({"review_missing"}),
+        "Review discipline failures",
+    ),
     (
         "integration_discipline_failures",
         frozenset({"integration_missing"}),
@@ -40,7 +48,11 @@ FAILURE_CATEGORIES: tuple[
         frozenset({"unnecessary_user_prompt"}),
         "Unnecessary user prompts",
     ),
-    ("secret_or_state_leaks", frozenset({"secret_access", "state_contamination"}), "Secret/state leaks"),
+    (
+        "secret_or_state_leaks",
+        frozenset({"secret_access", "state_contamination"}),
+        "Secret/state leaks",
+    ),
     ("infrastructure_failures", INFRASTRUCTURE_LABELS, "Infrastructure failures"),
     ("flaky_trials", frozenset({"flaky"}), "Flaky trials"),
 )
@@ -52,7 +64,9 @@ def build_skill_quality_report(
     baseline_condition: str = "no_skill",
     previous_aggregate: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    by_condition = group_records(records, lambda record: string_value(record.get("condition")))
+    by_condition = group_records(
+        records, lambda record: string_value(record.get("condition"))
+    )
     baseline_records = tuple(by_condition.get(baseline_condition, ()))
     quality_by_condition = {
         condition: condition_quality_summary(condition_records)
@@ -342,7 +356,9 @@ def grouped_uplift(
     baseline_records: Sequence[Mapping[str, object]],
     baseline_condition: str,
 ) -> dict[str, object]:
-    by_group_condition: dict[tuple[str, str], list[Mapping[str, object]]] = defaultdict(list)
+    by_group_condition: dict[tuple[str, str], list[Mapping[str, object]]] = defaultdict(
+        list
+    )
     groups = sorted({key_fn(record) for record in records if key_fn(record)})
     for record in records:
         group = key_fn(record)
@@ -389,7 +405,9 @@ def grouped_uplift(
                     current_summary.get("trigger_score_mean"),
                     baseline_summary.get("trigger_score_mean"),
                 ),
-                "baseline_records": [record_ref(record) for record in baseline_group_records],
+                "baseline_records": [
+                    record_ref(record) for record in baseline_group_records
+                ],
                 "condition_records": [record_ref(record) for record in current_records],
             }
         if group_payload:
@@ -424,8 +442,12 @@ def render_skill_quality_markdown(report: Mapping[str, object]) -> str:
                         format_delta(mapping_get_number(deltas, "trigger_score_mean")),
                         format_delta(mapping_get_number(deltas, "cost_per_trial")),
                         markdown_cell(", ".join(string_list(flags)) if flags else ""),
-                        markdown_cell(render_record_refs(payload.get("baseline_records"))),
-                        markdown_cell(render_record_refs(payload.get("condition_records"))),
+                        markdown_cell(
+                            render_record_refs(payload.get("baseline_records"))
+                        ),
+                        markdown_cell(
+                            render_record_refs(payload.get("condition_records"))
+                        ),
                     ]
                 )
                 + " |"
@@ -463,7 +485,9 @@ def render_skill_quality_markdown(report: Mapping[str, object]) -> str:
                             markdown_cell(
                                 render_record_refs(regression.get("previous_records"))
                             ),
-                            markdown_cell(render_record_refs(regression.get("records"))),
+                            markdown_cell(
+                                render_record_refs(regression.get("records"))
+                            ),
                         ]
                     )
                     + " |"
@@ -489,7 +513,9 @@ def render_skill_quality_markdown(report: Mapping[str, object]) -> str:
                     [
                         markdown_cell(str(category)),
                         str(count),
-                        markdown_cell(render_count_mapping(payload.get("by_condition"))),
+                        markdown_cell(
+                            render_count_mapping(payload.get("by_condition"))
+                        ),
                         markdown_cell(render_record_refs(payload.get("records"))),
                     ]
                 )
@@ -538,8 +564,12 @@ def render_uplift_table(value: object, label: str) -> list[str]:
                         format_number(payload.get("baseline_pass_rate")),
                         format_number(payload.get("pass_rate")),
                         format_delta(numeric_value(payload.get("absolute_uplift"))),
-                        markdown_cell(render_record_refs(payload.get("baseline_records"))),
-                        markdown_cell(render_record_refs(payload.get("condition_records"))),
+                        markdown_cell(
+                            render_record_refs(payload.get("baseline_records"))
+                        ),
+                        markdown_cell(
+                            render_record_refs(payload.get("condition_records"))
+                        ),
                     ]
                 )
                 + " |"
@@ -593,7 +623,9 @@ def record_ref(record: Mapping[str, object]) -> dict[str, object]:
     artifact_root = string_value(record.get("artifact_root"))
     reproducibility = record.get("reproducibility")
     if isinstance(reproducibility, Mapping):
-        artifact_root = string_value(reproducibility.get("artifact_root")) or artifact_root
+        artifact_root = (
+            string_value(reproducibility.get("artifact_root")) or artifact_root
+        )
     return {
         "run_id": record.get("run_id"),
         "case_id": record.get("case_id"),
