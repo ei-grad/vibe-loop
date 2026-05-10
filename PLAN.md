@@ -22,9 +22,49 @@
 
 ## Supporting Design Docs
 
+- Level 1 seed prompt: `PROMPT.md`
+- PRD index and contracts: `docs/prd/README.md`, `docs/prd/cli-runtime.md`,
+  `docs/prd/task-discovery.md`, `docs/prd/worker-supervision.md`,
+  `docs/prd/skills.md`, `docs/prd/planning-analytics.md`,
+  `docs/prd/evals-release.md`, `docs/prd/spec-driven-execution.md`
 - Parallel worker orchestration: `docs/parallel-worker-orchestration.md`
 - Generated task discovery: `docs/generated-task-discovery.md`
 - Skill evaluation strategy: `docs/skill-evaluation-strategy.md`
+
+## Spec Hierarchy
+
+`vibe-loop` uses a three-level spec and planning model:
+
+1. Level 1: `PROMPT.md` is the seed for product philosophy, architecture
+   boundaries, stack choices, and PRD-writing rules.
+2. Level 2: `docs/prd/` contains product and component PRDs with stable
+   `PRD-*` contract IDs.
+3. Level 3: this file is the runnable implementation plan consumed by agents
+   and `vibe-loop`.
+
+Existing plan IDs are stable implementation-slice identifiers. Keep them stable
+when adding PRD coverage. New or updated plan rows should cite relevant
+`PRD-*` IDs. A plan row may satisfy many PRD IDs, and a PRD ID may require many
+plan rows.
+
+Current prefix mapping for implementation traceability:
+
+| Plan prefixes | Primary PRD namespace |
+| --- | --- |
+| `CORE-*`, `AGENT-*` | `PRD-CLI-*` |
+| `DISC-*` | `PRD-TSK-*` |
+| `PAR-*`, `SKILL-*` | `PRD-WRK-*`, `PRD-SKL-*` |
+| `GANTT-*` | `PRD-ANL-*` |
+| `EVAL-*` | `PRD-EVL-*` |
+| `SDD-*` | `PRD-SDE-*` |
+
+Existing rows may rely on this prefix mapping until explicit PRD IDs are
+backfilled into each row.
+
+Semi-autonomous agents may decompose PRDs into plan rows, implement plan rows,
+verify them, and propose spec changes. They must not silently edit a PRD to make
+an incomplete implementation look compliant. Run spec-compliance review before
+code-quality review for non-trivial slices.
 
 ## Generated Discovery Contract
 
@@ -127,6 +167,15 @@ supervisor into a central merge queue.
 | DISC-06 | P1 | Done | DISC-04 | Update README and bundled skills so generic task discovery no longer documents the fixed table as a required format. Explain repo-specific generated profiles, validation boundaries, and command-backed task sources. | Docs present the fixed table only as an example, describe the agent-generated cache path, and preserve command-adapter guidance for issue trackers or custom task tools. | `README.md`; `docs/generated-task-discovery.md`; `src/vibe_loop/skills/vibe-loop/SKILL.md`; `src/vibe_loop/skills/infinite-vibe-loop/SKILL.md`; `uv run --with ruff ruff check src tests`; `uv run python -m unittest discover`; independent spec/code-quality review. |
 | DISC-09 | P1 | Planned | DISC-03, PAR-08 | Add generic ralphex-style task-source support for Markdown plans that use `### Task N:` headings, checkbox completion state, validation-command sections, and conflict-surface/resource/path metadata instead of a single fixed table. | A repository can expose heading-based plan files without a custom command adapter; normalized tasks have stable IDs, status, source path, acceptance/evidence text, and optional resources/paths from conflict-surface declarations. Existing table/profile behavior remains unchanged. | `src/vibe_loop/tasks.py`; `src/vibe_loop/config.py`; `tests/test_tasks.py`; `tests/test_config.py`; `README.md`; `docs/generated-task-discovery.md`; bundled fixture modeled on ralphex-style plans; `uv run --with ruff ruff check src tests`; `uv run python -m unittest discover`; independent spec/code-quality reviews. |
 | DOC-01 | P1 | Done | none | Refine `README.md` positioning: mention that vibe-loop is inspired by umputun/ralphex and document the approach differences. | README explains the ralphex inspiration and contrasts vibe-loop's agent-agnostic commands, flexible task discovery/adapters, finite worker plus supervisor model, merge-to-main-after-each-slice flow, local locks/logs, and non-dedicated-plan workflow. | README section: `Relationship to ralphex`. |
+| DOC-02 | P1 | Done | DOC-01 | Introduce the PROMPT/PRD/PLAN hierarchy and README positioning for `vibe-loop` as an execution engine beneath spec-driven workflows. | README explains the authoring-versus-execution boundary; Level 1 and Level 2 docs exist; Level 3 plan rows keep existing task IDs stable and cite future `PRD-SDE-*` contracts. | `README.md`; `PROMPT.md`; `docs/prd/README.md`; `docs/prd/spec-driven-execution.md`; `PLAN.md`; `git diff --check`. |
+| DOC-03 | P1 | Done | DOC-02 | Reverse-engineer existing `vibe-loop` design into Level 2 PRDs covering CLI/runtime, task discovery, worker supervision, bundled skills, planning analytics, eval/release readiness, and spec-driven execution. | PRD files define stable `PRD-*` contract IDs for current shipped/planned behavior; the PRD index maps existing plan prefixes to PRD namespaces; a subagent reviewed the intended PRD coverage and the gaps were incorporated. | `PROMPT.md`; `docs/prd/README.md`; `docs/prd/cli-runtime.md`; `docs/prd/task-discovery.md`; `docs/prd/worker-supervision.md`; `docs/prd/skills.md`; `docs/prd/planning-analytics.md`; `docs/prd/evals-release.md`; `docs/prd/spec-driven-execution.md`; `PLAN.md`; subagent coverage review; `git diff --check`; `uv run vibe-loop tasks list --repo .`. |
+| DOC-04 | P2 | Planned | DOC-03 | Backfill explicit `PRD-*` references into earlier Level 3 plan rows so traceability works from `PLAN.md` as well as from PRD related-implementation lists. | Existing completed and planned rows cite relevant PRD IDs without changing task IDs; tooling and reviewers can start from either `PLAN.md` or `docs/prd/` and recover the same contract mapping. | `PLAN.md`; `uv run vibe-loop tasks list --repo .`; independent spec review. |
+| SDD-01 | P1 | Planned | DISC-03, DISC-05, DOC-02 | Add non-executable parser profiles or presets for task artifacts produced by Spec Kit, Kiro, OpenSpec, and similar PRD/plan workflows. Covers `PRD-SDE-002`. | Repositories can expose common spec-driven task files without custom command adapters; normalized tasks preserve stable IDs, status, dependencies, acceptance text, and source provenance; unsupported or ambiguous sources degrade visibly. | `src/vibe_loop/tasks.py`; `src/vibe_loop/generated_profiles.py`; `docs/generated-task-discovery.md`; `README.md`; fixtures for Spec Kit/Kiro/OpenSpec-style task files; unit tests; independent spec/code-quality reviews. |
+| SDD-02 | P1 | Planned | SDD-01, GANTT-02 | Extend the normalized task model with optional spec traceability fields: requirement IDs, spec paths, design refs, approval state, and source fingerprints. Covers `PRD-SDE-003`. | JSON output, command task sources, Markdown profiles, generated profiles, planning analytics, and worker prompts preserve traceability when present and remain backward compatible when absent. | `src/vibe_loop/tasks.py`; `src/vibe_loop/generated_profiles.py`; `src/vibe_loop/planning_evidence.py`; `tests/test_tasks.py`; `tests/test_generated_discovery.py`; `tests/test_planning_evidence.py`. |
+| SDD-03 | P1 | Planned | SDD-02 | Add read-only spec coverage and drift diagnostics, with opt-in execution gates for repositories that require approved current specs. Covers `PRD-SDE-004`. | `doctor` or a dedicated specs check reports stale spec fingerprints, missing requirement coverage, tasks from unapproved specs, completed tasks without evidence, and override commands without launching agents as a side effect. | `src/vibe_loop/cli.py`; `src/vibe_loop/config.py`; `docs/prd/spec-driven-execution.md`; `README.md`; tests for diagnostics, stale sources, and gate behavior. |
+| SDD-04 | P1 | Planned | SDD-02, PAR-03 | Pass bounded spec-aware context to launched workers when linked requirement and design artifacts are available. Covers `PRD-SDE-005`. | Worker prompts include relevant requirement text, acceptance criteria, design references, source fingerprints, and required verification gates while respecting size limits and secret-like evidence exclusions. | `src/vibe_loop/runner.py`; `src/vibe_loop/generated_discovery.py`; `src/vibe_loop/skills/vibe-loop/SKILL.md`; CLI/runner tests with bounded prompt assertions. |
+| SDD-05 | P1 | Planned | SDD-02, GANTT-06 | Add completion evidence mapping from requirements to plan rows, worker reports, commit trailers, reviews, tests, and planning analytics output. Covers `PRD-SDE-006`. | Planning analytics can report which requirements are satisfied, attempted, unmapped, or missing evidence; commit trailers and worker-report metadata can cite both plan IDs and requirement IDs. | `src/vibe_loop/planning_evidence.py`; `src/vibe_loop/runs.py`; `docs/planning-analytics.md`; tests for requirement-to-commit/report mappings. |
+| SDD-06 | P2 | Planned | SDD-01, PAR-08, PAR-12 | Document and harden parallel execution waves for spec-driven task graphs with dependency and conflict-domain metadata. Covers `PRD-SDE-007`. | `run-until-done --jobs N` can execute independent spec-derived tasks concurrently while honoring task locks, resource/path conflicts, worker reports, and the main-integration lock. | `src/vibe_loop/runner.py`; `docs/parallel-worker-orchestration.md`; `README.md`; tests for spec-derived dependency waves and conflict behavior. |
 | PAR-02 | P0 | Done | CORE-01 | Add active run state for worker pid, task id, run id, log path, start time, base `main`, and command. State must be reconstructable from lock files plus run records. | `vibe-loop workers` shows running workers and stale/missing process state without reading raw logs. | `src/vibe_loop/workers.py`; `src/vibe_loop/runner.py`; `src/vibe_loop/locks.py`; `src/vibe_loop/cli.py`; `tests/test_workers.py`; `tests/test_cli.py`; `tests/test_runner.py`; `uv run --with ruff ruff check src tests`; `uv run python -m unittest discover`; independent spec and code-quality reviews. |
 | PAR-03 | P0 | Done | CORE-01 | Add explicit worker result reporting, for example `vibe-loop report --run-id ... --task-id ... --status ... --commit ...`. Keep log/task probing as fallback only. | A worker can mark completed, blocked, failed, or unknown with structured metadata; supervisor prefers the report over heuristics. | `src/vibe_loop/runs.py`; `src/vibe_loop/cli.py`; `src/vibe_loop/runner.py`; `src/vibe_loop/workers.py`; `tests/test_runs.py`; `tests/test_runner.py`; `tests/test_cli.py`; `tests/test_workers.py`; `README.md`; `uv run --with ruff ruff check --fix src tests`; `uv run --with ruff ruff format src tests`; `uv run python -m unittest discover`; independent spec and code-quality reviews. |
 | PAR-01 | P0 | Done | DISC-04, PAR-02, PAR-03 | Add `run-until-done --jobs N` supervisor mode that starts multiple finite `$vibe-loop <task_id>` workers and keeps `run-next` single-worker. | With `--jobs 2`, two independent ready tasks can run concurrently, each with a task lock and separate log; with default settings behavior remains serial. | `src/vibe_loop/runner.py`; `src/vibe_loop/cli.py`; `src/vibe_loop/runs.py`; `tests/test_runner.py`; `tests/test_cli.py`; `tests/test_runs.py`; `README.md`; `uv run --with ruff ruff format src tests`; `uv run --with ruff ruff check src tests`; `uv run python -m unittest discover`; independent spec and code-quality reviews. |

@@ -1,9 +1,13 @@
 # vibe-loop
 
-`vibe-loop` is a small runner for one-slice AI coding loops. It selects one
-unblocked task from a repository task source, locks it, runs an agent command
-such as `codex exec '$vibe-loop <task_id>'`, captures logs, validates completion,
-records local run metadata, and can repeat until no runnable tasks remain.
+`vibe-loop` is a small execution engine for one-slice AI coding loops. It
+selects one unblocked task from a repository task source, locks it, runs an
+agent command such as `codex exec '$vibe-loop <task_id>'`, captures logs,
+validates completion, records local run metadata, and can repeat until no
+runnable tasks remain. The runtime is built around the bundled finite
+[`vibe-loop`](src/vibe_loop/skills/vibe-loop/SKILL.md) skill, with unattended
+continuation handled by
+[`infinite-vibe-loop`](src/vibe_loop/skills/infinite-vibe-loop/SKILL.md).
 
 The CLI is a supervisor, not a branch or worktree manager. The configured worker
 agent owns branch/worktree setup, implementation, review, and any merge-to-main
@@ -63,6 +67,52 @@ and custom task tools.
 
 Runnable statuses default to `Active`, `Next`, and `Planned`. A task is runnable
 when all listed dependencies are `Done` and no local lock exists.
+
+## Spec-Driven Workflow Execution
+
+`vibe-loop` can sit underneath spec-driven development tools as the task
+execution layer. Tools such as
+[Spec Kit](https://github.com/github/spec-kit),
+[Kiro](https://kiro.dev/docs/specs/), and
+[OpenSpec](https://openspec.dev/) focus on authoring requirements, design
+documents, proposals, task lists, and approvals. `vibe-loop` consumes the task
+layer, schedules bounded runnable slices, launches finite worker agents,
+captures logs, enforces local locks, records completion reports, and keeps the
+execution trace inspectable.
+
+The boundary is intentional. Spec tools own intent; `vibe-loop` owns repeatable
+execution. A spec or PRD is not treated as proof of implementation unless a task
+row, worker report, commit reference, test, review, or other explicit evidence
+links the contract to completed work.
+
+This repository uses a three-level planning model:
+
+1. Level 1: `PROMPT.md` records project philosophy, architecture boundaries,
+   stack choices, and PRD-writing rules.
+2. Level 2: `docs/prd/` records stable product and workflow contracts with
+   `PRD-*` IDs.
+3. Level 3: `PLAN.md` records runnable implementation slices with permanent
+   task IDs consumed by agents and `vibe-loop`.
+
+## Future Plans
+
+The current implementation already supports generated task-source profiles,
+command-backed task sources, dependencies, resource/path conflict domains,
+finite workers, run logs, structured reports, planning analytics, and skill
+evals. The next spec-driven additions should stay below the authoring layer:
+
+- parser profiles or presets for task artifacts produced by Spec Kit, Kiro,
+  OpenSpec, and similar PRD/plan workflows;
+- optional traceability fields on normalized tasks, including requirement IDs,
+  spec paths, design references, approval state, and source fingerprints;
+- read-only spec coverage and drift checks that report stale specs, missing
+  task coverage, and completed tasks without evidence;
+- opt-in execution gates for repositories that require approved and current
+  spec artifacts before `run-next` or `run-until-done`;
+- spec-aware worker prompt context that passes only bounded requirement,
+  acceptance, design, and verification context to the worker;
+- completion evidence that maps requirements to plan rows, worker reports,
+  commit trailers, tests, reviews, and planning analytics output.
 
 ## Relationship to ralphex
 
@@ -210,6 +260,8 @@ vibe-loop planning artifacts --repo . --check
 vibe-loop planning artifacts --repo . --inspect
 vibe-loop planning benchmark-duration --repo .
 vibe-loop planning benchmark-duration --repo . --check
+vibe-loop doctor --repo .
+vibe-loop doctor --repo . --json
 vibe-loop main-integration status --repo .
 vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
 vibe-loop main-integration release --repo . --run-id ... --task-id ...
