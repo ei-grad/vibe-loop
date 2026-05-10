@@ -9,7 +9,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
+import vibe_loop.runner as runner_module
 from vibe_loop.config import AgentConfig, VibeConfig
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
@@ -863,6 +865,63 @@ class RunnerTests(unittest.TestCase):
             results = runner.run_until_done(jobs=2, max_slices=1)
 
         self.assertEqual([result.task_id for result in results], ["TASK-02"])
+
+    def test_msvcrt_scheduler_lock_permission_error_reports_busy(self) -> None:
+        class PermissionHandle:
+            def seek(self, *args) -> int:
+                raise PermissionError(13, "Permission denied")
+
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def locking(self, *args) -> None:
+                self.calls += 1
+
+        fake_msvcrt = FakeMsvcrt()
+        original_fcntl = runner_module.fcntl
+        original_msvcrt = runner_module.msvcrt
+        try:
+            runner_module.fcntl = None
+            runner_module.msvcrt = fake_msvcrt
+
+            locked = runner_module.try_lock_scheduler_file(PermissionHandle())
+        finally:
+            runner_module.fcntl = original_fcntl
+            runner_module.msvcrt = original_msvcrt
+
+        self.assertFalse(locked)
+        self.assertEqual(fake_msvcrt.calls, 0)
+
+    def test_acquire_scheduler_lock_closes_handle_on_lock_error(self) -> None:
+        class FakeHandle:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            handle = FakeHandle()
+
+            with (
+                patch.object(Path, "open", return_value=handle),
+                patch.object(
+                    runner_module,
+                    "try_lock_scheduler_file",
+                    side_effect=PermissionError(13, "Permission denied"),
+                ),
+            ):
+                with self.assertRaises(PermissionError):
+                    runner.acquire_scheduler_lock("run-task", "TASK-01")
+
+        self.assertTrue(handle.closed)
 
     def test_run_until_done_parallel_skips_scheduler_lock_timeouts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

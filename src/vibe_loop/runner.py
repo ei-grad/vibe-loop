@@ -579,26 +579,31 @@ class VibeRunner:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         handle = lock_path.open("a+b")
         deadline = time.monotonic() + RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS
-        while True:
-            if not try_lock_scheduler_file(handle):
-                if time.monotonic() >= deadline:
-                    handle.close()
-                    raise SchedulerLockBusy(lock_path)
-                time.sleep(RESOURCE_SCHEDULER_LOCK_POLL_SECONDS)
-                continue
-            handle.seek(0)
-            handle.truncate()
-            payload = {
-                "record_type": "resource_scheduler_lock",
-                "run_id": run_id,
-                "owner_task_id": task_id,
-                "pid": os.getpid(),
-                "started_at": datetime.now(UTC).isoformat(),
-            }
-            handle.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
-            handle.flush()
-            os.fsync(handle.fileno())
-            return SchedulerLock(path=lock_path, handle=handle)
+        try:
+            while True:
+                if not try_lock_scheduler_file(handle):
+                    if time.monotonic() >= deadline:
+                        raise SchedulerLockBusy(lock_path)
+                    time.sleep(RESOURCE_SCHEDULER_LOCK_POLL_SECONDS)
+                    continue
+                handle.seek(0)
+                handle.truncate()
+                payload = {
+                    "record_type": "resource_scheduler_lock",
+                    "run_id": run_id,
+                    "owner_task_id": task_id,
+                    "pid": os.getpid(),
+                    "started_at": datetime.now(UTC).isoformat(),
+                }
+                handle.write(
+                    (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+                return SchedulerLock(path=lock_path, handle=handle)
+        except BaseException:
+            handle.close()
+            raise
 
     def release_scheduler_lock(self, scheduler_lock: SchedulerLock) -> None:
         try:
@@ -1092,16 +1097,17 @@ def path_domain_overlaps(left: str, right: str) -> bool:
 
 
 def try_lock_scheduler_file(handle: BinaryIO) -> bool:
-    ensure_scheduler_lock_byte(handle)
     if fcntl is not None:
+        ensure_scheduler_lock_byte(handle)
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return False
         return True
     if msvcrt is not None:
-        handle.seek(0)
         try:
+            ensure_scheduler_lock_byte(handle)
+            handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         except OSError:
             return False
