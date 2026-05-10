@@ -10,6 +10,7 @@ import tempfile
 import time
 import tomllib
 import unittest
+import warnings
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -24,15 +25,27 @@ def temporary_directory_with_cleanup_retry():
     try:
         yield str(directory)
     finally:
-        remove_tree_with_windows_retries(directory)
+        active_exception = sys.exc_info()[0] is not None
+        try:
+            remove_tree_with_windows_retries(directory)
+        except PermissionError:
+            if not active_exception:
+                raise
+            warnings.warn(
+                f"skipped temporary directory cleanup after test failure: {directory}",
+                ResourceWarning,
+                stacklevel=2,
+            )
 
 
 def remove_tree_with_windows_retries(path: Path) -> None:
-    attempts = 20 if sys.platform == "win32" else 1
+    attempts = 100 if sys.platform == "win32" else 1
     delay = 0.05
     for attempt in range(attempts):
         try:
             shutil.rmtree(path)
+            return
+        except FileNotFoundError:
             return
         except PermissionError:
             if attempt == attempts - 1:
@@ -617,7 +630,7 @@ class CliTests(unittest.TestCase):
                     ]
                 )
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             observations = [
                 json.loads(path.read_text(encoding="utf-8"))
                 for path in sorted((repo / "observed").glob("*.json"))
@@ -724,7 +737,7 @@ class CliTests(unittest.TestCase):
                     ]
                 )
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             prompt = (repo / "batch-prompt.txt").read_text(encoding="utf-8")
             started = sorted(path.name for path in (repo / "started").iterdir())
 
@@ -824,7 +837,7 @@ class CliTests(unittest.TestCase):
                     ]
                 )
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             prompt = (repo / "batch-prompt.txt").read_text(encoding="utf-8")
             started = sorted(path.name for path in (repo / "started").iterdir())
 

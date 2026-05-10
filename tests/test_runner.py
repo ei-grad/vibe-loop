@@ -13,6 +13,7 @@ from pathlib import Path
 from vibe_loop.config import AgentConfig, VibeConfig
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
+    SchedulerLockBusy,
     VibeRunner,
     build_batch_selection_prompt,
     build_selection_prompt,
@@ -846,6 +847,42 @@ class RunnerTests(unittest.TestCase):
             def run_task(task: Task) -> RunResult:
                 if task.task_id == "TASK-01":
                     raise LockBusy(repo / ".vibe-loop" / "locks" / "TASK-01.lock", {})
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done(jobs=2, max_slices=1)
+
+        self.assertEqual([result.task_id for result in results], ["TASK-02"])
+
+    def test_run_until_done_parallel_skips_scheduler_lock_timeouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                    Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                ]
+            )
+            runner._source = source
+
+            def run_task(task: Task) -> RunResult:
+                if task.task_id == "TASK-01":
+                    raise SchedulerLockBusy(
+                        repo / ".vibe-loop" / "internal-locks" / "resource.lock"
+                    )
                 source.mark_done(task.task_id)
                 return RunResult(
                     run_id=f"run-{task.task_id}",

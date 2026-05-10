@@ -737,6 +737,13 @@ class VibeRunner:
                     scheduled.pop(task_id, None)
                     try:
                         result = future.result()
+                    except SchedulerLockBusy as exc:
+                        report_status(
+                            "scheduler lock busy during acquire, skipping: "
+                            f"{task_id} path={exc.path}"
+                        )
+                        skipped.add(task_id)
+                        continue
                     except LockBusy:
                         report_status(
                             f"task locked during acquire, skipping: {task_id}"
