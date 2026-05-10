@@ -7,7 +7,7 @@
   "domain": "main_integration",
   "positive": true,
   "prompt_paths": ["eval/prompt.txt"],
-  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli"],
+  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli", "orchestrated_vibe_loop"],
   "budget": {
     "timeout_seconds": 1500,
     "max_commands": 75,

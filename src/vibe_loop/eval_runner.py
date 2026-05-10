@@ -63,6 +63,7 @@ ROLE_PATHS = {
     "review_evidence": "review-evidence.json",
     "lock_evidence": "lock-evidence.json",
     "report_evidence": "report-evidence.json",
+    "delegation_evidence": "delegation-evidence.json",
     "generated_profile": "generated-profile.json",
     "budget_evidence": "budget-evidence.json",
     "negative_prompt_results": "negative-prompt-results.json",
@@ -2017,7 +2018,7 @@ def build_run_record(
         task={
             "id": case.task_id or case.case_id,
             "prompt_sha256": hash_text(prompt_text),
-            "expected_skill": "vibe-loop",
+            "expected_skill": expected_skill_for_run(condition),
             "domain": case.domain,
             "should_trigger": case.positive,
         },
@@ -2058,6 +2059,12 @@ def build_run_record(
     return record.to_json()
 
 
+def expected_skill_for_run(condition: str) -> str:
+    if condition == "no_skill":
+        return "vibe-loop"
+    return skill_id_for_condition(condition)
+
+
 def eval_status(scoring: Mapping[str, object], execution: CommandExecution) -> str:
     if execution.timeout:
         return "timeout"
@@ -2073,7 +2080,11 @@ def collect_artifacts(
     artifact_root: Path,
     case: EvalExampleCase,
 ) -> list[EvalArtifactRef]:
-    roles = list(dict.fromkeys([*case.expected_artifact_roles, "command_results"]))
+    roles = list(
+        dict.fromkeys(
+            [*case.expected_artifact_roles, "delegation_evidence", "command_results"]
+        )
+    )
     artifacts = []
     for role in roles:
         relative_path = ROLE_PATHS.get(role, f"{role}.json")
@@ -2167,6 +2178,8 @@ def skill_id_for_condition(condition: str) -> str:
         return "vibe-loop"
     if condition in ("infinite_vibe_loop", "infinite_vibe_loop_cli"):
         return "infinite-vibe-loop"
+    if condition == "orchestrated_vibe_loop":
+        return "orchestrated-vibe-loop"
     return condition.replace("_", "-")
 
 

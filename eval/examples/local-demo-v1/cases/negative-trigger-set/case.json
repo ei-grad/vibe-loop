@@ -16,7 +16,7 @@
     "eval/prompts/neg-review-diff.txt",
     "eval/prompts/neg-small-edit-no-skill.txt"
   ],
-  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli"],
+  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli", "orchestrated_vibe_loop"],
   "budget": {
     "timeout_seconds": 300,
     "max_commands": 15,

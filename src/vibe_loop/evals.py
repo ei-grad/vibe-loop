@@ -22,6 +22,7 @@ EVAL_CONDITIONS = frozenset(
         "vibe_loop_cli",
         "infinite_vibe_loop",
         "infinite_vibe_loop_cli",
+        "orchestrated_vibe_loop",
         "candidate_skill",
         "self_generated_skill",
     }
@@ -33,6 +34,7 @@ SKILL_CONDITIONS = frozenset(
         "vibe_loop_cli",
         "infinite_vibe_loop",
         "infinite_vibe_loop_cli",
+        "orchestrated_vibe_loop",
         "candidate_skill",
         "self_generated_skill",
     }
@@ -437,6 +439,8 @@ def expected_skill_for_condition(condition: str) -> str | None:
         return "vibe-loop"
     if condition in ("infinite_vibe_loop", "infinite_vibe_loop_cli"):
         return "infinite-vibe-loop"
+    if condition == "orchestrated_vibe_loop":
+        return "orchestrated-vibe-loop"
     return None
 
 

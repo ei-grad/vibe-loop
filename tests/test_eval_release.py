@@ -80,6 +80,7 @@ class EvalReleaseTests(unittest.TestCase):
                     [
                         "condition_comparison:vibe_loop=EVAL-99",
                         "condition_comparison:vibe_loop_cli=EVAL-99",
+                        "condition_comparison:orchestrated_vibe_loop=EVAL-99",
                     ]
                 ),
                 generated_at="2026-05-09T00:00:00+00:00",
@@ -88,7 +89,7 @@ class EvalReleaseTests(unittest.TestCase):
         self.assertEqual(blocked["status"], "blocked")
         self.assertEqual(
             blocked["workflow_contract_regressions"]["unresolved"][0]["id"],
-            "condition_comparison:vibe_loop",
+            "condition_comparison:orchestrated_vibe_loop",
         )
         self.assertEqual(parked["status"], "passed")
         self.assertEqual(
@@ -157,8 +158,10 @@ class EvalReleaseTests(unittest.TestCase):
             record["workflow_contract_regressions"]["evidence_gaps"][0],
             {
                 "id": "missing_condition_comparison",
-                "condition": "vibe_loop",
-                "message": "skill_quality is missing comparison for vibe_loop",
+                "condition": "orchestrated_vibe_loop",
+                "message": (
+                    "skill_quality is missing comparison for orchestrated_vibe_loop"
+                ),
             },
         )
 
@@ -335,7 +338,12 @@ def passing_release_aggregate(
             for payload in cases.values()
             if condition in payload
         )
-        for condition in ("no_skill", "vibe_loop", "vibe_loop_cli")
+        for condition in (
+            "no_skill",
+            "vibe_loop",
+            "vibe_loop_cli",
+            "orchestrated_vibe_loop",
+        )
     }
     regression_flags = ["workflow_contract_regression"] if workflow_regression else []
     workflow_delta = -1.0 if workflow_regression else 0.0
@@ -369,6 +377,15 @@ def passing_release_aggregate(
                     "condition_records": [],
                 },
                 "vibe_loop_cli": {
+                    "regression_flags": regression_flags,
+                    "deltas": {
+                        "workflow_score_mean": workflow_delta,
+                        "workflow_violation_rate": workflow_violation_delta,
+                    },
+                    "baseline_records": [],
+                    "condition_records": [],
+                },
+                "orchestrated_vibe_loop": {
                     "regression_flags": regression_flags,
                     "deltas": {
                         "workflow_score_mean": workflow_delta,

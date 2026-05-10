@@ -8,6 +8,10 @@ runnable tasks remain. The runtime is built around the bundled finite
 [`vibe-loop`](src/vibe_loop/skills/vibe-loop/SKILL.md) skill, with unattended
 continuation handled by
 [`infinite-vibe-loop`](src/vibe_loop/skills/infinite-vibe-loop/SKILL.md).
+The package also includes
+[`orchestrated-vibe-loop`](src/vibe_loop/skills/orchestrated-vibe-loop/SKILL.md)
+for runs where the main agent only coordinates explorer, implementation, and
+review agents.
 
 The CLI is a supervisor, not a branch or worktree manager. The configured worker
 agent owns branch/worktree setup, implementation, review, and any merge-to-main
@@ -212,7 +216,7 @@ vibe-loop run-until-done --repo . --ask-agent
 
 ## Skills
 
-The package includes two installable skills:
+The package includes three installable skills:
 
 - `vibe-loop`: one coherent bounded slice. The agent inspects the task, edits,
   verifies, asks for independent review when available, commits, integrates to
@@ -223,6 +227,10 @@ The package includes two installable skills:
   slice follows the finite `vibe-loop` discipline; after cleanup/status, the
   agent chooses conservative next work, reports blocked paths, and continues
   until explicitly stopped or the session ends.
+- `orchestrated-vibe-loop`: multi-agent execution where the main agent keeps
+  orchestration state, delegates read-only exploration, delegates scoped
+  implementation/remediation, runs independent review gates, and reports the
+  result without doing the code or review work itself.
 
 Install them into Codex and/or Claude with:
 

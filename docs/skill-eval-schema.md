@@ -21,6 +21,8 @@ Optional conditions:
 
 - `infinite_vibe_loop`: continuation or backlog tasks where the infinite skill
   should activate.
+- `orchestrated_vibe_loop`: multi-agent tasks where the main agent should only
+  coordinate explorer, implementation/remediation, and review agents.
 - `candidate_skill`: a proposed revision of a bundled skill.
 - `self_generated_skill`: research-only comparison, reported separately from
   curated bundled skills.
@@ -122,8 +124,9 @@ The first schema version validates a minimum nested contract:
   available, `skill_id` plus `skill_sha256`.
   `condition = "no_skill"` requires `skills_available = false` and no
   `skill_id`; bundled-skill conditions require `skills_available = true`.
-  `vibe_loop` exposes `skill_id = "vibe-loop"`, and `infinite_vibe_loop`
-  exposes `skill_id = "infinite-vibe-loop"`.
+  `vibe_loop` exposes `skill_id = "vibe-loop"`, `infinite_vibe_loop` exposes
+  `skill_id = "infinite-vibe-loop"`, and `orchestrated_vibe_loop` exposes
+  `skill_id = "orchestrated-vibe-loop"`.
 - `agent`: `name` and `command_source`.
 - `model`: `provider` and `id`.
 - `harness`: `name`, `version`, and `command`.

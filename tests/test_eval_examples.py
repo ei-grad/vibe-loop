@@ -52,7 +52,12 @@ class EvalExampleTests(unittest.TestCase):
             with self.subTest(case=case.case_id):
                 self.assertEqual(
                     case.conditions,
-                    ("no_skill", "vibe_loop", "vibe_loop_cli"),
+                    (
+                        "no_skill",
+                        "vibe_loop",
+                        "vibe_loop_cli",
+                        "orchestrated_vibe_loop",
+                    ),
                 )
                 self.assertIs(case.budget["network"], False)
                 self.assertGreater(case.budget["timeout_seconds"], 0)

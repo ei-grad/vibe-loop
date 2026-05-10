@@ -161,6 +161,31 @@ class SkillEvalSchemaTests(unittest.TestCase):
             with_skill_diagnostics,
         )
 
+    def test_orchestrated_condition_must_match_skill_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact_root = Path(directory)
+            artifacts = write_required_artifacts(artifact_root)
+            record = valid_record(artifacts=artifacts).to_json()
+            record["condition"] = "orchestrated_vibe_loop"
+            record["skill_condition"] = {
+                "id": "orchestrated_vibe_loop",
+                "skills_available": True,
+                "skill_id": "vibe-loop",
+                "skill_sha256": "3" * 64,
+            }
+
+            diagnostics = validate_skill_eval_run_record(record, artifact_root)
+
+            record["skill_condition"]["skill_id"] = "orchestrated-vibe-loop"
+            fixed_diagnostics = validate_skill_eval_run_record(record, artifact_root)
+
+        self.assertIn(
+            "orchestrated_vibe_loop condition must expose "
+            "skill_id=orchestrated-vibe-loop",
+            diagnostics,
+        )
+        self.assertEqual(fixed_diagnostics, ())
+
     def test_symlinked_artifacts_are_rejected_before_target_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact_root = Path(directory)

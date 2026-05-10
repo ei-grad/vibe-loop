@@ -238,8 +238,16 @@ class CliTests(unittest.TestCase):
             installed_paths = stdout.getvalue().splitlines()
             finite = home / ".codex" / "skills" / "vibe-loop" / "SKILL.md"
             infinite = home / ".codex" / "skills" / "infinite-vibe-loop" / "SKILL.md"
+            orchestrated = (
+                home
+                / ".codex"
+                / "skills"
+                / "orchestrated-vibe-loop"
+                / "SKILL.md"
+            )
             finite_text = finite.read_text(encoding="utf-8")
             infinite_text = infinite.read_text(encoding="utf-8")
+            orchestrated_text = orchestrated.read_text(encoding="utf-8")
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
@@ -248,9 +256,10 @@ class CliTests(unittest.TestCase):
             [
                 str(home / ".codex" / "skills" / "vibe-loop"),
                 str(home / ".codex" / "skills" / "infinite-vibe-loop"),
+                str(home / ".codex" / "skills" / "orchestrated-vibe-loop"),
             ],
         )
-        for text in (finite_text, infinite_text):
+        for text in (finite_text, infinite_text, orchestrated_text):
             self.assertNotIn("VIBE_LOOP_REPO", text)
             self.assertNotIn("vibe-loop report", text)
             self.assertNotIn("vibe-loop main-integration", text)

@@ -13,6 +13,7 @@ from vibe_loop.cli import main
 from vibe_loop.eval_runner import (
     TrialResult,
     build_aggregate,
+    build_eval_prompt,
     render_aggregate_markdown,
     workflow_taxonomy_labels,
 )
@@ -79,6 +80,136 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(record["scoring"]["workflow_score"], 1.0)
         self.assertTrue(run_log_exists)
         self.assertTrue(diff_exists)
+
+    def test_orchestrated_condition_rejects_labels_without_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "orchestrated_labels_only_agent.py"
+            write_orchestrated_agent(agent, include_evidence=False)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "finite-py-plan-table",
+                "--condition",
+                "orchestrated_vibe_loop",
+                "--agent-command",
+                f"orchestrated_vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "finite-py-plan-table"
+                / "orchestrated_vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+            prompt = (trial_root / "eval-prompt.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            payload["conditions"]["orchestrated_vibe_loop"]["pass_rate"],
+            0.0,
+        )
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+        self.assertEqual(
+            record["skill_condition"]["skill_id"],
+            "orchestrated-vibe-loop",
+        )
+        self.assertEqual(record["task"]["expected_skill"], "orchestrated-vibe-loop")
+        self.assertTrue(prompt.startswith("$orchestrated-vibe-loop "))
+
+    def test_orchestrated_condition_rejects_wrong_delegation_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "orchestrated_wrong_order_agent.py"
+            write_orchestrated_agent(agent, wrong_order=True)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "finite-py-plan-table",
+                "--condition",
+                "orchestrated_vibe_loop",
+                "--agent-command",
+                f"orchestrated_vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "finite-py-plan-table"
+                / "orchestrated_vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            payload["conditions"]["orchestrated_vibe_loop"]["pass_rate"],
+            0.0,
+        )
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+
+    def test_orchestrated_condition_passes_with_delegation_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "orchestrated_agent.py"
+            write_orchestrated_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "finite-py-plan-table",
+                "--condition",
+                "orchestrated_vibe_loop",
+                "--agent-command",
+                f"orchestrated_vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "finite-py-plan-table"
+                / "orchestrated_vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            payload["conditions"]["orchestrated_vibe_loop"]["pass_rate"],
+            1.0,
+        )
+        self.assertEqual(record["task"]["expected_skill"], "orchestrated-vibe-loop")
+
+    def test_orchestrated_review_remediation_requires_remediator_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "orchestrated_review_agent.py"
+            write_orchestrated_review_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "review-remediation",
+                "--condition",
+                "orchestrated_vibe_loop",
+                "--agent-command",
+                f"orchestrated_vibe_loop={agent}",
+            )
+
+        self.assertEqual(
+            payload["conditions"]["orchestrated_vibe_loop"]["pass_rate"],
+            1.0,
+        )
+
+    def test_orchestrated_prompt_builder_uses_skill_reference(self) -> None:
+        self.assertEqual(
+            build_eval_prompt("Do the task", "orchestrated_vibe_loop"),
+            "$orchestrated-vibe-loop Do the task",
+        )
 
     def test_timeout_keeps_failed_trial_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1091,6 +1222,9 @@ def write_finite_agent(path: Path, *, pass_trial: bool) -> None:
         "from pathlib import Path\n"
         "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
         "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "(artifact / 'eval-prompt.txt').write_text(\n"
+        "    os.environ['VIBE_LOOP_EVAL_PROMPT'], encoding='utf-8'\n"
+        ")\n"
         f"if {guard}:\n"
         "    (repo / 'src' / 'finite_math' / 'calculator.py').write_text(\n"
         "        'from __future__ import annotations\\n\\n\\n'\n"
@@ -1121,6 +1255,212 @@ def write_finite_agent(path: Path, *, pass_trial: bool) -> None:
         "        json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
         "    )\n"
         "print('finite agent finished')\n",
+    )
+
+
+def write_orchestrated_agent(
+    path: Path,
+    *,
+    include_evidence: bool = True,
+    wrong_order: bool = False,
+) -> None:
+    events = [
+        "skill_activated",
+        "instructions_inspected",
+        "worktree_state_inspected",
+        "exploration_delegated",
+        "branch_or_worktree_created",
+        "implementation_delegated",
+        "verification_ran",
+        "review_requested",
+        "review_delegated",
+        "commit_created",
+        "main_fast_forwarded",
+        "main_verification_ran",
+    ]
+    if wrong_order:
+        events = [
+            "skill_activated",
+            "instructions_inspected",
+            "worktree_state_inspected",
+            "exploration_delegated",
+            "branch_or_worktree_created",
+            "implementation_delegated",
+            "verification_ran",
+            "review_requested",
+            "commit_created",
+            "review_delegated",
+            "main_fast_forwarded",
+            "main_verification_ran",
+        ]
+    evidence = {
+        "agents": [
+            {
+                "role": "explorer",
+                "agent_id": "explorer-1",
+                "prompt": "Inspect FPY-01 scope and tests.",
+                "result": "identified calculator and plan row scope",
+            },
+            {
+                "role": "implementer",
+                "agent_id": "implementer-1",
+                "prompt": "Implement FPY-01 in assigned files.",
+                "changed_paths": [
+                    "src/finite_math/calculator.py",
+                    "PLAN.md",
+                ],
+                "result": "implemented loyalty discount",
+            },
+            {
+                "role": "reviewer",
+                "agent_id": "reviewer-1",
+                "prompt": "Review FPY-01 diff and verification evidence.",
+                "result": "no material findings",
+            },
+        ]
+    }
+    evidence_write = ""
+    if include_evidence:
+        evidence_write = (
+            "(artifact / 'delegation-evidence.json').write_text("
+            f"{(json.dumps(evidence, sort_keys=True) + chr(10))!r}, "
+            "encoding='utf-8')\n"
+        )
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "(artifact / 'eval-prompt.txt').write_text(\n"
+        "    os.environ['VIBE_LOOP_EVAL_PROMPT'], encoding='utf-8'\n"
+        ")\n"
+        "(repo / 'src' / 'finite_math' / 'calculator.py').write_text(\n"
+        "    'from __future__ import annotations\\n\\n\\n'\n"
+        "    'def loyalty_total(subtotal: int, *, member: bool) -> int:\\n'\n"
+        "    '    discount = 10 if member else 0\\n'\n"
+        "    '    return subtotal - discount\\n',\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        "plan = repo / 'PLAN.md'\n"
+        "plan.write_text(\n"
+        "    plan.read_text(encoding='utf-8').replace(\n"
+        "        '| FPY-01 | P0 | Planned |', '| FPY-01 | P0 | Done |'\n"
+        "    ),\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        f"events = {events!r}\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        f"{evidence_write}"
+        "print('orchestrated agent finished')\n",
+    )
+
+
+def write_orchestrated_review_agent(path: Path) -> None:
+    evidence = {
+        "agents": [
+            {
+                "role": "explorer",
+                "agent_id": "explorer-1",
+                "prompt": "Inspect REV-01 scope, tests, and review expectations.",
+                "result": "identified whitespace-only validation gap",
+            },
+            {
+                "role": "implementer",
+                "agent_id": "implementer-1",
+                "prompt": "Implement initial REV-01 fix in assigned files.",
+                "changed_paths": ["src/review_rules/codes.py"],
+                "result": "added input normalization",
+            },
+            {
+                "role": "reviewer",
+                "agent_id": "reviewer-1",
+                "prompt": "Review REV-01 diff and test evidence.",
+                "result": "reported missing whitespace-only regression test",
+            },
+            {
+                "role": "remediator",
+                "agent_id": "implementer-1",
+                "prompt": "Address review finding by adding regression coverage.",
+                "changed_paths": ["tests/test_codes.py"],
+                "result": "added whitespace-only regression test",
+            },
+        ]
+    }
+    review_evidence = {
+        "initial": {"material_findings_count": 1},
+        "rereview": {"material_findings_count": 0},
+    }
+    events = [
+        "skill_activated",
+        "instructions_inspected",
+        "worktree_state_inspected",
+        "exploration_delegated",
+        "branch_or_worktree_created",
+        "implementation_delegated",
+        "verification_ran",
+        "review_requested",
+        "review_delegated",
+        "review_finding_received",
+        "remediation_delegated",
+        "review_finding_addressed",
+        "rereview_requested",
+        "commit_created",
+        "main_fast_forwarded",
+    ]
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "(artifact / 'eval-prompt.txt').write_text(\n"
+        "    os.environ['VIBE_LOOP_EVAL_PROMPT'], encoding='utf-8'\n"
+        ")\n"
+        "(repo / 'src' / 'review_rules' / 'codes.py').write_text(\n"
+        "    'from __future__ import annotations\\n\\n\\n'\n"
+        "    'def is_valid_code(value: str) -> bool:\\n'\n"
+        "    '    value = value.strip()\\n'\n"
+        "    '    if not value:\\n'\n"
+        "    '        return False\\n'\n"
+        "    '    return value.replace(\"-\", \"\").isalnum() and \"-\" in value\\n',\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        "tests = repo / 'tests' / 'test_codes.py'\n"
+        "tests.write_text(\n"
+        "    tests.read_text(encoding='utf-8').replace(\n"
+        "        '    def test_rejects_empty_code(self) -> None:\\n'\n"
+        "        '        self.assertFalse(is_valid_code(\"\"))\\n',\n"
+        "        '    def test_rejects_empty_code(self) -> None:\\n'\n"
+        "        '        self.assertFalse(is_valid_code(\"\"))\\n\\n'\n"
+        "        '    def test_rejects_whitespace_only_code(self) -> None:\\n'\n"
+        "        '        self.assertFalse(is_valid_code(\"   \"))\\n',\n"
+        "    ),\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        "plan = repo / 'PLAN.md'\n"
+        "plan.write_text(\n"
+        "    plan.read_text(encoding='utf-8').replace(\n"
+        "        '| REV-01 | P0 | Planned |', '| REV-01 | P0 | Done |'\n"
+        "    ).replace('Not started.', '`python eval/stubs/reviewer.py`; '\n"
+        "              '`python -m unittest discover`.'),\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        f"events = {events!r}\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "(artifact / 'delegation-evidence.json').write_text("
+        f"{(json.dumps(evidence, sort_keys=True) + chr(10))!r}, "
+        "encoding='utf-8')\n"
+        "(artifact / 'review-evidence.json').write_text("
+        f"{(json.dumps(review_evidence, sort_keys=True) + chr(10))!r}, "
+        "encoding='utf-8')\n"
+        "print('orchestrated review agent finished')\n",
     )
 
 

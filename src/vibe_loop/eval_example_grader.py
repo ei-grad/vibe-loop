@@ -342,6 +342,7 @@ def run_artifact_checks(
         artifact_required_roles(record, case),
         artifact_budget(record, case),
         artifact_workflow_trace(artifact_root, record, spec),
+        artifact_orchestrated_delegation(artifact_root, record, spec),
         artifact_case_contract(repo, artifact_root, spec),
     ]
     if spec.get("negative_prompts") is not None:
@@ -421,19 +422,144 @@ def artifact_workflow_trace(
     expectations = spec.get("workflow_trace")
     if not isinstance(expectations, Mapping):
         return passed("artifact-workflow-trace")
-    events = load_workflow_events(artifact_root, record)
+    ordered_events = load_ordered_workflow_events(artifact_root, record)
+    events = set(ordered_events)
     required = set(string_list(expectations.get("required")))
+    required.update(orchestrated_required_events(record, required))
     forbidden = set(string_list(expectations.get("forbidden")))
     missing = sorted(required - events)
     present_forbidden = sorted(forbidden & events)
-    if missing or present_forbidden:
-        messages = []
-        if missing:
-            messages.append("missing events: " + ", ".join(missing))
-        if present_forbidden:
-            messages.append("forbidden events: " + ", ".join(present_forbidden))
+    messages = []
+    if missing:
+        messages.append("missing events: " + ", ".join(missing))
+    if present_forbidden:
+        messages.append("forbidden events: " + ", ".join(present_forbidden))
+    messages.extend(orchestrated_order_diagnostics(record, ordered_events, required))
+    if messages:
         return failed("artifact-workflow-trace", "; ".join(messages))
     return passed("artifact-workflow-trace")
+
+
+def orchestrated_required_events(
+    record: Mapping[str, Any],
+    base_required: set[str],
+) -> set[str]:
+    task = record.get("task")
+    if (
+        record.get("condition") != "orchestrated_vibe_loop"
+        or not isinstance(task, Mapping)
+        or task.get("should_trigger") is not True
+    ):
+        return set()
+    required = {
+        "exploration_delegated",
+        "implementation_delegated",
+        "review_delegated",
+    }
+    if (
+        "review_finding_addressed" in base_required
+        or "rereview_requested" in base_required
+    ):
+        required.add("remediation_delegated")
+    return required
+
+
+def artifact_orchestrated_delegation(
+    artifact_root: Path,
+    record: Mapping[str, Any],
+    spec: Mapping[str, Any],
+) -> dict[str, object]:
+    expectations = spec.get("workflow_trace")
+    base_required = (
+        set(string_list(expectations.get("required")))
+        if isinstance(expectations, Mapping)
+        else set()
+    )
+    required_roles = orchestrated_required_roles(record, base_required)
+    if not required_roles:
+        return passed("artifact-orchestrated-delegation")
+    path = artifact_path_for_role(artifact_root, record, "delegation_evidence")
+    if path is None or not path.is_file():
+        return failed(
+            "artifact-orchestrated-delegation",
+            "delegation_evidence missing",
+        )
+    payload = safe_load_json(path)
+    if not isinstance(payload, Mapping):
+        return failed(
+            "artifact-orchestrated-delegation",
+            "delegation_evidence must be an object",
+        )
+    agents = list_of_mappings(payload.get("agents"))
+    diagnostics: list[str] = []
+    for role in sorted(required_roles):
+        matches = [agent for agent in agents if agent.get("role") == role]
+        if not matches:
+            diagnostics.append(f"delegation role missing: {role}")
+            continue
+        agent = matches[0]
+        for field in ("agent_id", "prompt", "result"):
+            if not isinstance(agent.get(field), str) or not agent[field]:
+                diagnostics.append(f"{role}.{field} is required")
+        if role in {"implementer", "remediator"} and not string_list(
+            agent.get("changed_paths")
+        ):
+            diagnostics.append(f"{role}.changed_paths is required")
+    if diagnostics:
+        return failed("artifact-orchestrated-delegation", "; ".join(diagnostics))
+    return passed("artifact-orchestrated-delegation")
+
+
+def orchestrated_required_roles(
+    record: Mapping[str, Any],
+    base_required: set[str],
+) -> set[str]:
+    if not is_positive_orchestrated_record(record):
+        return set()
+    required = {"explorer", "implementer", "reviewer"}
+    if (
+        "review_finding_addressed" in base_required
+        or "rereview_requested" in base_required
+    ):
+        required.add("remediator")
+    return required
+
+
+def orchestrated_order_diagnostics(
+    record: Mapping[str, Any],
+    events: list[str],
+    required: set[str],
+) -> list[str]:
+    if not is_positive_orchestrated_record(record):
+        return []
+    sequences = [
+        ("exploration_delegated", "implementation_delegated"),
+        ("implementation_delegated", "verification_ran"),
+        ("verification_ran", "review_delegated"),
+        ("review_delegated", "commit_created"),
+    ]
+    if "remediation_delegated" in required:
+        sequences.extend(
+            [
+                ("review_finding_received", "remediation_delegated"),
+                ("remediation_delegated", "review_finding_addressed"),
+                ("review_finding_addressed", "rereview_requested"),
+            ]
+        )
+    diagnostics = []
+    for before, after in sequences:
+        if before in events and after in events and events.index(before) > events.index(after):
+            diagnostics.append(f"workflow event order missing: {before} -> {after}")
+    return diagnostics
+
+
+def is_positive_orchestrated_record(record: Mapping[str, Any]) -> bool:
+    task = record.get("task")
+    return (
+        record.get("condition") == "orchestrated_vibe_loop"
+        and isinstance(task, Mapping)
+        and task.get("should_trigger") is True
+    )
 
 
 def artifact_case_contract(
