@@ -862,6 +862,7 @@ def selection_worker_json(worker: WorkerView) -> dict[str, object]:
         "resources": payload["resources"],
         "paths": payload["paths"],
         "conflict_domains_known": payload["conflict_domains_known"],
+        "workspace": payload["workspace"],
     }
 
 

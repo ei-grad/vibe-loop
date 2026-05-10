@@ -68,7 +68,9 @@ from vibe_loop.tasks import Task
 from vibe_loop.workers import (
     StaleLock,
     WorkerView,
+    WorkspaceClaimError,
     build_worker_views,
+    claim_worker_workspace,
     clean_stale_locks,
     collect_stale_locks,
 )
@@ -165,6 +167,24 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--max-slices", type=int, default=0)
     run_all.add_argument("--continue-on-failure", action="store_true")
     run_all.add_argument("--jobs", type=int, default=1)
+
+    worker = subparsers.add_parser("worker", help="Update current worker state")
+    add_repo_argument(worker)
+    worker.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    worker_subparsers = worker.add_subparsers(dest="worker_command", required=True)
+    claim_workspace = worker_subparsers.add_parser(
+        "claim-workspace",
+        help="Attach branch/worktree metadata to an active task lock",
+    )
+    add_repo_argument(claim_workspace)
+    claim_workspace.add_argument(
+        "--json", action="store_true", default=argparse.SUPPRESS
+    )
+    claim_workspace.add_argument("--run-id", default="")
+    claim_workspace.add_argument("--task-id", default="")
+    claim_workspace.add_argument("--branch", required=True)
+    claim_workspace.add_argument("--worktree", type=Path, required=True)
+    claim_workspace.add_argument("--base-commit", default="")
 
     workers = subparsers.add_parser("workers", help="List active worker runs")
     add_repo_argument(workers)
@@ -473,6 +493,9 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         print(json.dumps([result.to_json() for result in results], indent=2))
         return run_until_done_exit_code(results)
+
+    if args.command == "worker":
+        return dispatch_worker(args, config)
 
     if args.command == "workers":
         if getattr(args, "workers_command", None) == "clean":
@@ -846,6 +869,58 @@ def local_demo_config_from_args(
     )
 
 
+def dispatch_worker(args: argparse.Namespace, config) -> int:
+    if args.worker_command == "claim-workspace":
+        run_id, task_id = worker_identity_from_args(args)
+        if not run_id or not task_id:
+            print(
+                "worker claim-workspace requires --run-id and --task-id "
+                "or VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID",
+                file=sys.stderr,
+            )
+            return 2
+        manager = LockManager(config.state_path / "locks")
+        run_store = RunStore(config.state_path / "runs.jsonl")
+        try:
+            claim = claim_worker_workspace(
+                manager,
+                run_store,
+                task_id=task_id,
+                run_id=run_id,
+                branch=args.branch,
+                worktree=args.worktree,
+                repo=config.repo,
+                base_commit=args.base_commit,
+            )
+        except WorkspaceClaimError as exc:
+            payload = {
+                "claimed": False,
+                "error": exc.code,
+                "message": str(exc),
+                "details": exc.details,
+            }
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    f"worker claim-workspace refused: {exc.code}: {exc}",
+                    file=sys.stderr,
+                )
+            return 1
+        payload = {"claimed": True, "workspace": claim.to_json()}
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                "worker workspace claimed "
+                f"task={task_id} run={run_id} branch={claim.branch} "
+                f"worktree={claim.worktree}"
+            )
+        return 0
+
+    raise AssertionError(args.worker_command)
+
+
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:
     manager = LockManager(config.state_path / "locks")
     if args.main_integration_command == "status":
@@ -1184,11 +1259,18 @@ def render_workers(workers: list[WorkerView]) -> str:
         result = (
             f"\tresult={payload['result_status']}" if payload["result_status"] else ""
         )
+        workspace = ""
+        if isinstance(payload["workspace"], dict):
+            dirty = "dirty" if payload["workspace"].get("dirty") else "clean"
+            workspace = (
+                f"\tworkspace={payload['workspace'].get('branch')}"
+                f"@{payload['workspace'].get('worktree')}:{dirty}"
+            )
         lines.append(
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
-            f"\tcommand={payload['command']}{result}{stale}"
+            f"\tcommand={payload['command']}{workspace}{result}{stale}"
         )
     return "\n".join(lines)
 

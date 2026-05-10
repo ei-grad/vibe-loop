@@ -9,6 +9,7 @@ from vibe_loop.runs import RunResult, RunStore, WorkerReport
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
+    WorkspaceClaim,
     build_worker_views,
     classify_process,
     clean_stale_locks,
@@ -33,6 +34,18 @@ class WorkerStateTests(unittest.TestCase):
                 log_path=log_path,
                 base_main="abc123",
                 command="codex exec '$vibe-loop PAR-02'",
+                workspace=WorkspaceClaim(
+                    task_id="PAR-02",
+                    run_id="run-1",
+                    branch="codex/PAR-02",
+                    worktree=repo,
+                    base_commit="abc123",
+                    head_commit="def456",
+                    current_branch="codex/PAR-02",
+                    dirty=True,
+                    dirty_summary=(" M src/example.py",),
+                    claimed_at="2026-05-09T00:01:00+00:00",
+                ),
             )
             task_lock = manager.acquire(
                 "PAR-02",
@@ -55,6 +68,14 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].base_main, "abc123")
         self.assertEqual(loaded[0].command, "codex exec '$vibe-loop PAR-02'")
         self.assertEqual(loaded[0].lock_path, task_lock.path)
+        workspace = loaded[0].workspace
+        self.assertIsNotNone(workspace)
+        if workspace is None:
+            self.fail("workspace claim did not round-trip")
+        self.assertEqual(workspace.branch, "codex/PAR-02")
+        self.assertEqual(workspace.worktree, repo)
+        self.assertTrue(workspace.dirty)
+        self.assertEqual(workspace.dirty_summary, (" M src/example.py",))
 
     def test_process_classification_detects_running_and_missing_pid(self) -> None:
         state = ActiveRunState(

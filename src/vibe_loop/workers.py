@@ -6,11 +6,12 @@ import os
 import shlex
 import shutil
 import socket
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.locks import MAIN_INTEGRATION_LOCK_NAME, LockManager
+from vibe_loop.locks import MAIN_INTEGRATION_LOCK_NAME, LockManager, TaskLock
 from vibe_loop.runs import (
     RUN_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
@@ -22,6 +23,75 @@ from vibe_loop.runs import (
 
 ACTIVE_RUN_SCHEMA_VERSION = 1
 ACTIVE_RUN_RECORD_TYPE = "active_run"
+WORKSPACE_CLAIM_SCHEMA_VERSION = 1
+WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
+DIRTY_SUMMARY_LIMIT = 200
+
+
+class WorkspaceClaimError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: dict[str, object] | None = None,
+    ):
+        self.code = code
+        self.details = details or {}
+        super().__init__(message)
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspaceClaim:
+    task_id: str
+    run_id: str
+    branch: str
+    worktree: Path
+    base_commit: str
+    head_commit: str
+    current_branch: str
+    dirty: bool
+    dirty_summary: tuple[str, ...]
+    claimed_at: str = dataclasses.field(default_factory=utc_now_iso)
+
+    @classmethod
+    def from_json(cls, payload: object) -> WorkspaceClaim | None:
+        if not isinstance(payload, dict):
+            return None
+        task_id = optional_string(payload.get("task_id"))
+        run_id = optional_string(payload.get("run_id"))
+        branch = optional_string(payload.get("branch"))
+        worktree = optional_path(payload.get("worktree"))
+        if not task_id or not run_id or not branch or worktree is None:
+            return None
+        return cls(
+            task_id=task_id,
+            run_id=run_id,
+            branch=branch,
+            worktree=worktree,
+            base_commit=optional_string(payload.get("base_commit")) or "",
+            head_commit=optional_string(payload.get("head_commit")) or "",
+            current_branch=optional_string(payload.get("current_branch")) or "",
+            dirty=optional_bool(payload.get("dirty")),
+            dirty_summary=optional_string_tuple(payload.get("dirty_summary")),
+            claimed_at=optional_string(payload.get("claimed_at")) or "",
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schema_version": WORKSPACE_CLAIM_SCHEMA_VERSION,
+            "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "branch": self.branch,
+            "worktree": str(self.worktree),
+            "base_commit": self.base_commit,
+            "head_commit": self.head_commit,
+            "current_branch": self.current_branch,
+            "dirty": self.dirty,
+            "dirty_summary": list(self.dirty_summary),
+            "claimed_at": self.claimed_at,
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,6 +111,7 @@ class ActiveRunState:
     supervisor_pid: int | None = None
     host: str = dataclasses.field(default_factory=socket.gethostname)
     lock_path: Path | None = None
+    workspace: WorkspaceClaim | None = None
 
     @classmethod
     def new(
@@ -111,13 +182,14 @@ class ActiveRunState:
             supervisor_pid=optional_int(metadata.get("supervisor_pid")),
             host=optional_string(metadata.get("host")) or "",
             lock_path=optional_path(metadata.get("path")),
+            workspace=WorkspaceClaim.from_json(metadata.get("workspace")),
         )
 
     def with_worker_pid(self, worker_pid: int) -> ActiveRunState:
         return dataclasses.replace(self, worker_pid=worker_pid)
 
     def to_lock_metadata(self) -> dict[str, object]:
-        return {
+        metadata: dict[str, object] = {
             "schema_version": ACTIVE_RUN_SCHEMA_VERSION,
             "record_type": ACTIVE_RUN_RECORD_TYPE,
             "task_id": self.task_id,
@@ -137,6 +209,9 @@ class ActiveRunState:
             "paths": list(self.paths),
             "conflict_domains_known": self.conflict_domains_known,
         }
+        if self.workspace is not None:
+            metadata["workspace"] = self.workspace.to_json()
+        return metadata
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,6 +246,11 @@ class WorkerView:
             "paths": list(self.active.paths),
             "conflict_domains_known": self.active.conflict_domains_known,
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
+            "workspace": (
+                self.active.workspace.to_json()
+                if self.active.workspace is not None
+                else None
+            ),
             "result_status": self.result_status,
             "result_finished_at": self.result_finished_at,
             "result_record_type": self.result_record_type,
@@ -188,6 +268,164 @@ def load_active_run_states(lock_manager: LockManager) -> list[ActiveRunState]:
         if state is not None:
             states.append(state)
     return states
+
+
+def claim_worker_workspace(
+    lock_manager: LockManager,
+    run_store: RunStore,
+    *,
+    task_id: str,
+    run_id: str,
+    branch: str,
+    worktree: Path,
+    repo: Path,
+    base_commit: str = "",
+) -> WorkspaceClaim:
+    if not branch:
+        raise WorkspaceClaimError(
+            "missing_branch",
+            "workspace claim requires a branch",
+        )
+    lock = active_task_lock_for_claim(lock_manager, task_id=task_id, run_id=run_id)
+    worktree_path = resolve_claim_worktree(repo, worktree)
+    claim = inspect_workspace_claim(
+        task_id=task_id,
+        run_id=run_id,
+        branch=branch,
+        worktree=worktree_path,
+        base_commit=base_commit
+        or optional_string(lock.metadata.get("base_main"))
+        or "",
+    )
+    updated_metadata = dict(lock.metadata)
+    updated_metadata["workspace"] = claim.to_json()
+    lock_manager.update(lock, updated_metadata)
+    run_store.append_record(claim.to_json())
+    return claim
+
+
+def active_task_lock_for_claim(
+    lock_manager: LockManager,
+    *,
+    task_id: str,
+    run_id: str,
+) -> TaskLock:
+    matching_task: list[dict[str, object]] = []
+    for metadata in lock_manager.list_locks():
+        if metadata.get("task_id") != task_id:
+            continue
+        matching_task.append(metadata)
+        if metadata.get("run_id") != run_id:
+            continue
+        path = optional_path(metadata.get("path"))
+        if path is not None:
+            return TaskLock(task_id=task_id, path=path, metadata=metadata)
+    if matching_task:
+        raise WorkspaceClaimError(
+            "owner_mismatch",
+            "workspace claim refused: active task lock owner does not match",
+            details={
+                "task_id": task_id,
+                "run_id": run_id,
+                "active_run_ids": [
+                    value
+                    for value in (
+                        optional_string(item.get("run_id")) for item in matching_task
+                    )
+                    if value
+                ],
+            },
+        )
+    raise WorkspaceClaimError(
+        "missing_active_task_lock",
+        "workspace claim requires an active task lock",
+        details={"task_id": task_id, "run_id": run_id},
+    )
+
+
+def inspect_workspace_claim(
+    *,
+    task_id: str,
+    run_id: str,
+    branch: str,
+    worktree: Path,
+    base_commit: str,
+) -> WorkspaceClaim:
+    if not worktree.exists() or not worktree.is_dir():
+        raise WorkspaceClaimError(
+            "missing_worktree",
+            f"workspace claim refused: worktree does not exist: {worktree}",
+            details={"worktree": str(worktree)},
+        )
+    current_branch = git_text(worktree, "branch", "--show-current")
+    if current_branch != branch:
+        raise WorkspaceClaimError(
+            "branch_worktree_mismatch",
+            "workspace claim refused: worktree branch does not match claim",
+            details={
+                "branch": branch,
+                "current_branch": current_branch,
+                "worktree": str(worktree),
+            },
+        )
+    head_commit = git_text(worktree, "rev-parse", "--verify", "HEAD")
+    status_lines = git_lines(worktree, "status", "--short")
+    return WorkspaceClaim(
+        task_id=task_id,
+        run_id=run_id,
+        branch=branch,
+        worktree=worktree,
+        base_commit=base_commit,
+        head_commit=head_commit,
+        current_branch=current_branch,
+        dirty=bool(status_lines),
+        dirty_summary=tuple(status_lines[:DIRTY_SUMMARY_LIMIT]),
+    )
+
+
+def resolve_claim_worktree(repo: Path, worktree: Path) -> Path:
+    if not worktree.is_absolute():
+        worktree = repo / worktree
+    return worktree.resolve()
+
+
+def git_text(repo: Path, *args: str) -> str:
+    result = run_git(repo, *args)
+    if result.returncode != 0:
+        raise WorkspaceClaimError(
+            "git_state_unavailable",
+            "workspace claim refused: git state is unavailable",
+            details={
+                "worktree": str(repo),
+                "git_args": list(args),
+                "stderr": result.stderr.strip(),
+            },
+        )
+    return result.stdout.strip()
+
+
+def git_lines(repo: Path, *args: str) -> list[str]:
+    text = git_text(repo, *args)
+    return [line for line in text.splitlines() if line]
+
+
+def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise WorkspaceClaimError(
+            "git_state_unavailable",
+            "workspace claim refused: git could not be executed",
+            details={"worktree": str(repo), "error": str(exc)},
+        ) from exc
 
 
 def build_worker_views(

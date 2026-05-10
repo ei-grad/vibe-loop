@@ -213,6 +213,7 @@ vibe-loop planning benchmark-duration --repo . --check
 vibe-loop main-integration status --repo .
 vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
 vibe-loop main-integration release --repo . --run-id ... --task-id ...
+vibe-loop worker claim-workspace --repo . --run-id ... --task-id ... --branch ... --worktree ...
 vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
 vibe-loop install-skills --codex --claude
 ```
@@ -278,6 +279,21 @@ Report statuses are `completed`, `blocked`, `failed`, and `unknown`. Matching
 report records are authoritative; without a report, the supervisor falls back to
 exit status, completion checks, task probing, and main-branch change heuristics.
 
+Workers that create or adopt their own branch/worktree can make that ownership
+visible without transferring control to the supervisor:
+
+```bash
+vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
+  --branch "$BRANCH" --worktree "$WORKTREE"
+```
+
+The claim requires a matching active task lock and verifies that the worktree is
+currently on the requested branch. It records the claimed branch, worktree path,
+active-lock base commit, current HEAD, and dirty-at-claim status in the task
+lock and appends a `workspace_claim` run record. It never creates, deletes,
+resets, merges, or cleans up branches/worktrees.
+
 Workers that are about to refresh, verify, fast-forward merge to `main`, and
 immediately verify `main` can use the advisory `main-integration` lock to
 serialize that final critical section:
@@ -298,7 +314,8 @@ owner process or no active task lock exists.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
-`.vibe-loop/` for locks, logs, and run metadata.
+`.vibe-loop/` for locks, logs, and run metadata. Workspace claims are advisory
+visibility metadata only.
 
 `vibe-loop tasks` without a subcommand remains a compatibility alias for
 `vibe-loop tasks runnable`.
@@ -585,6 +602,12 @@ then marks same-host locks with missing worker processes, missing worker PIDs,
 or incomplete metadata as stale without reading raw logs. The PID is the
 immediate configured command process started by the runner; deeper process
 identity checks are left to the later watchdog work.
+
+When a worker claims its workspace, the active task lock also stores a
+`workspace` object with the branch, worktree path, base commit, current HEAD,
+current branch, and dirty-at-claim summary. `workers --json` includes this
+object, and text output shows the claimed branch/worktree plus clean or dirty
+state.
 
 The `main-integration.lock` entry is a separate advisory lock for worker-owned
 final integration. Its metadata records the owner task, run id, host, pid, and

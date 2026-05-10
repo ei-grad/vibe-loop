@@ -2,18 +2,42 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
 from vibe_loop.cli import main
+
+
+@contextmanager
+def temporary_directory_with_cleanup_retry():
+    directory = Path(tempfile.mkdtemp())
+    try:
+        yield str(directory)
+    finally:
+        remove_tree_with_windows_retries(directory)
+
+
+def remove_tree_with_windows_retries(path: Path) -> None:
+    attempts = 20 if sys.platform == "win32" else 1
+    delay = 0.05
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def parse_run_result(
@@ -506,7 +530,7 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent command source: auto:codex:codex-first", stderr.getvalue())
 
     def test_run_until_done_jobs_runs_independent_tasks_concurrently(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_with_cleanup_retry() as directory:
             repo = Path(directory) / "repo"
             source_path = Path(__file__).resolve().parents[1] / "src"
             repo.mkdir()
@@ -635,7 +659,7 @@ class CliTests(unittest.TestCase):
             self.assertIn(f"[vibe-loop] log: {result['log']}", stderr.getvalue())
 
     def test_run_until_done_jobs_uses_agent_batch_selection(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_with_cleanup_retry() as directory:
             repo = Path(directory) / "repo"
             source_path = Path(__file__).resolve().parents[1] / "src"
             repo.mkdir()
@@ -717,7 +741,7 @@ class CliTests(unittest.TestCase):
     def test_run_until_done_jobs_rejects_invalid_agent_batch_before_spawning(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory_with_cleanup_retry() as directory:
             repo = Path(directory) / "repo"
             source_path = Path(__file__).resolve().parents[1] / "src"
             repo.mkdir()
@@ -3111,6 +3135,228 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["metadata"], {"reason": "external"})
         self.assertEqual(records[0]["record_type"], "worker_report")
         self.assertEqual(records[0]["status"], "blocked")
+
+    def test_worker_claim_workspace_updates_lock_and_run_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            subprocess.run(
+                ["git", "checkout", "-b", "worker/TASK-01"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            (repo / "notes.txt").write_text("dirty at claim\n", encoding="utf-8")
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "base-main",
+                        "command": "agent TASK-01",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "worker",
+                        "claim-workspace",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--branch",
+                        "worker/TASK-01",
+                        "--worktree",
+                        str(repo),
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            metadata = json.loads((active_lock / "lock.json").read_text("utf-8"))
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            workers_stdout = StringIO()
+            workers_stderr = StringIO()
+            with redirect_stdout(workers_stdout), redirect_stderr(workers_stderr):
+                workers_exit = main(["workers", "--repo", str(repo), "--json"])
+            workers_payload = json.loads(workers_stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(payload["claimed"])
+        workspace = payload["workspace"]
+        self.assertEqual(workspace["task_id"], "TASK-01")
+        self.assertEqual(workspace["run_id"], "run-1")
+        self.assertEqual(workspace["branch"], "worker/TASK-01")
+        self.assertEqual(workspace["current_branch"], "worker/TASK-01")
+        self.assertEqual(workspace["worktree"], str(repo.resolve()))
+        self.assertEqual(workspace["base_commit"], "base-main")
+        self.assertTrue(workspace["head_commit"])
+        self.assertTrue(workspace["dirty"])
+        self.assertTrue(
+            any("notes.txt" in line for line in workspace["dirty_summary"])
+        )
+        self.assertEqual(metadata["workspace"], workspace)
+        self.assertEqual(records[0]["record_type"], "workspace_claim")
+        self.assertEqual(records[0]["branch"], "worker/TASK-01")
+        self.assertEqual(workers_exit, 0)
+        self.assertEqual(workers_stderr.getvalue(), "")
+        self.assertEqual(workers_payload[0]["workspace"], workspace)
+
+    def test_worker_claim_workspace_rejects_owner_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-other",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "worker",
+                        "claim-workspace",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--branch",
+                        "worker/TASK-01",
+                        "--worktree",
+                        str(repo),
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["claimed"])
+        self.assertEqual(payload["error"], "owner_mismatch")
+        self.assertEqual(payload["details"]["active_run_ids"], ["run-other"])
+
+    def test_worker_claim_workspace_requires_active_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "worker",
+                        "claim-workspace",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--branch",
+                        "worker/TASK-01",
+                        "--worktree",
+                        str(repo),
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["claimed"])
+        self.assertEqual(payload["error"], "missing_active_task_lock")
+
+    def test_worker_claim_workspace_rejects_branch_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            subprocess.run(
+                ["git", "checkout", "-b", "worker/TASK-01"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "worker",
+                        "claim-workspace",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--branch",
+                        "worker/OTHER",
+                        "--worktree",
+                        str(repo),
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["claimed"])
+        self.assertEqual(payload["error"], "branch_worktree_mismatch")
+        self.assertEqual(payload["details"]["current_branch"], "worker/TASK-01")
 
     def test_run_next_keeps_json_stdout_when_agent_streams_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

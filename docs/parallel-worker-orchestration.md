@@ -55,6 +55,11 @@ results are missing or ambiguous.
   worktrees, already-merged active branches, and dirty foreign-owned workspaces.
   It does not authorize the supervisor to create, delete, reset, or merge those
   branches/worktrees.
+- Workers publish that metadata with
+  `vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" --branch "$BRANCH" --worktree "$WORKTREE"`.
+  The command requires a matching active task lock, verifies that the worktree
+  is currently on the claimed branch, updates the active lock, and appends a
+  `workspace_claim` run record.
 
 ## Non-Goals
 
