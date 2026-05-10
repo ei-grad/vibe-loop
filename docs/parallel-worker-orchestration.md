@@ -17,9 +17,12 @@ while making `vibe-loop run-until-done --jobs N` useful for unattended work.
 3. It locks each task and spawns one finite worker per task with the configured
    `agent.command`, defaulting to `codex exec '$vibe-loop <task_id>'`.
 4. Each worker writes to its own run log and performs the full slice lifecycle.
-5. Workers use an advisory `main-integration` lock around the final refresh,
+5. Workers may claim their branch/worktree in the active task lock after they
+   create or adopt that workspace, making workspace ownership visible without
+   transferring workspace management to the supervisor.
+6. Workers use an advisory `main-integration` lock around the final refresh,
    verification, fast-forward merge, and immediate `main` verification.
-6. The supervisor watches worker exits, re-reads task state, records results,
+7. The supervisor watches worker exits, re-reads task state, records results,
    and fills open worker slots until no runnable tasks remain.
 
 The supervisor must not resolve merge conflicts, run reviews for workers, or
@@ -46,6 +49,12 @@ results are missing or ambiguous.
   continuation; workers own their slice lifecycle and integration attempt.
 - `main-integration` is an advisory lock for the final refresh/verify/merge
   window, not a central merge queue.
+- Workspace ownership is advisory metadata on the task lock. It records the
+  claimed branch, worktree path, base commit, and current git state so
+  `workers` and `doctor` can report missing worktrees, duplicate branch
+  worktrees, already-merged active branches, and dirty foreign-owned workspaces.
+  It does not authorize the supervisor to create, delete, reset, or merge those
+  branches/worktrees.
 
 ## Non-Goals
 
@@ -55,3 +64,5 @@ results are missing or ambiguous.
   and children run finite `$vibe-loop <task_id>` slices.
 - No forced cleanup of worktrees, branches, or locks without explicit evidence
   that they are safe to remove.
+- No treating a stale or mismatched workspace claim as permission to steal
+  another worker's branch, dirty worktree, or integration lock.
