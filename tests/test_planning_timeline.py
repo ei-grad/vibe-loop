@@ -13,8 +13,11 @@ from vibe_loop.planning_timeline import (
     ActualSpan,
     DurationBaselineModel,
     build_planning_timeline,
+    lookup_timeline_task,
+    read_timeline_file,
 )
 from vibe_loop.runs import RunStore, WorkerReport
+from vibe_loop.tasks import MarkdownPlanSource, runnable_tasks
 
 PYTHON = sys.executable.replace("\\", "/")
 
@@ -688,8 +691,6 @@ class TimelineCrossReferenceTests(unittest.TestCase):
         self.assertIsNone(t02["latest_run"])
 
     def test_lookup_timeline_task_returns_summary(self) -> None:
-        from vibe_loop.planning_timeline import lookup_timeline_task
-
         timeline = {
             "tasks": [
                 {
@@ -763,8 +764,6 @@ class TimelineCrossReferenceTests(unittest.TestCase):
 
             config = load_config(repo)
             timeline = build_planning_timeline(config)
-            from vibe_loop.tasks import MarkdownPlanSource, runnable_tasks
-
             source = MarkdownPlanSource(
                 repo / "PLAN.md",
                 config.task_source.runnable_statuses,
@@ -780,6 +779,34 @@ class TimelineCrossReferenceTests(unittest.TestCase):
         self.assertTrue(len(stale_warnings) > 0)
         runnable_ids = [t.task_id for t in runnable]
         self.assertEqual(runnable_ids, ["T-02"])
+
+
+class ReadTimelineFileTests(unittest.TestCase):
+    def test_returns_none_for_missing_file(self) -> None:
+        result = read_timeline_file(Path("/tmp/nonexistent-timeline.json"))
+        self.assertIsNone(result)
+
+    def test_returns_none_for_corrupt_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "timeline.json"
+            path.write_text("{not valid json", encoding="utf-8")
+            result = read_timeline_file(path)
+        self.assertIsNone(result)
+
+    def test_returns_none_for_non_dict_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "timeline.json"
+            path.write_text("[1, 2, 3]", encoding="utf-8")
+            result = read_timeline_file(path)
+        self.assertIsNone(result)
+
+    def test_returns_dict_for_valid_timeline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "timeline.json"
+            path.write_text('{"tasks": [], "schema_version": 1}', encoding="utf-8")
+            result = read_timeline_file(path)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["schema_version"], 1)
 
 
 if __name__ == "__main__":

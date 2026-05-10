@@ -325,8 +325,8 @@ class PlanningTimelineBuilder:
             if existing is None:
                 latest[tid] = dict(attempt)
             else:
-                existing_index = int_value(existing.get("record_index")) or -1
-                current_index = int_value(attempt.get("record_index")) or -1
+                existing_index = int_value(existing.get("record_index"))
+                current_index = int_value(attempt.get("record_index"))
                 if current_index > existing_index:
                     latest[tid] = dict(attempt)
         return latest
@@ -1286,8 +1286,6 @@ def lookup_timeline_task(
 
 
 def read_timeline_file(path: Path) -> dict[str, object] | None:
-    if not path.exists():
-        return None
     try:
         raw = path.read_text(encoding="utf-8")
         data = json.loads(raw)

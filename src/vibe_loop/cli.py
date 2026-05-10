@@ -458,7 +458,14 @@ def dispatch(args: argparse.Namespace) -> int:
         runner = VibeRunner(config)
         workers = build_worker_views(runner.lock_manager, runner.run_store)
         if args.json:
-            print(json.dumps([worker.to_json() for worker in workers], indent=2))
+            payloads = []
+            for worker in workers:
+                payload = worker.to_json()
+                ref = _timeline_ref_for_task(config, worker.active.task_id)
+                if ref is not None:
+                    payload["timeline_task"] = ref
+                payloads.append(payload)
+            print(json.dumps(payloads, indent=2))
         else:
             output = render_workers(workers)
             if output:
@@ -1265,7 +1272,10 @@ def _timeline_ref_for_task(
 ) -> dict[str, object] | None:
     if not target_task_id:
         return None
-    paths = planning_artifact_paths(config)
+    try:
+        paths = planning_artifact_paths(config)
+    except (ValueError, OSError):
+        return None
     timeline = read_timeline_file(paths.timeline_json)
     if timeline is None:
         return None
