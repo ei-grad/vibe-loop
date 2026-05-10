@@ -495,6 +495,7 @@ class PlanningTimelineTests(unittest.TestCase):
                 "actual",
                 "projected",
                 "timeline_order",
+                "latest_run",
             ],
         )
         self.assertEqual(
@@ -635,6 +636,150 @@ def git_commit(
             "GIT_COMMITTER_DATE": timestamp,
         },
     )
+
+
+class TimelineCrossReferenceTests(unittest.TestCase):
+    def test_timeline_tasks_include_latest_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "PLAN.md").write_text(
+                plan_table(
+                    [
+                        "| T-01 | P0 | Done | none | Do A | Done | - |",
+                        "| T-02 | P1 | Planned | T-01 | Do B | Ready | - |",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            init_git_repo(repo)
+            (repo / "f.txt").write_text("x\n", encoding="utf-8")
+            git(repo, "add", "PLAN.md", "f.txt")
+            git_commit(
+                repo,
+                "feat: finish T-01",
+                "2026-05-09T10:00:00+00:00",
+                plan_item="T-01",
+            )
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": 3,
+                    "record_type": "run_result",
+                    "run_id": "run-abc",
+                    "task_id": "T-01",
+                    "classification": "completed",
+                    "status": "completed",
+                    "exit_code": 0,
+                    "log": ".vibe-loop/runs/run-abc.log",
+                    "start_main": "aaa",
+                    "end_main": "bbb",
+                    "finished_at": "2026-05-09T10:05:00+00:00",
+                }
+            )
+            config = load_config(repo)
+            timeline = build_planning_timeline(config)
+
+        tasks = timeline["tasks"]
+        t01 = next(t for t in tasks if t["id"] == "T-01")
+        t02 = next(t for t in tasks if t["id"] == "T-02")
+        self.assertIsNotNone(t01["latest_run"])
+        self.assertEqual(t01["latest_run"]["run_id"], "run-abc")
+        self.assertEqual(t01["latest_run"]["status"], "completed")
+        self.assertIsNone(t02["latest_run"])
+
+    def test_lookup_timeline_task_returns_summary(self) -> None:
+        from vibe_loop.planning_timeline import lookup_timeline_task
+
+        timeline = {
+            "tasks": [
+                {
+                    "id": "CORE-01",
+                    "status": "Done",
+                    "actual": {"start": "2026-05-01"},
+                    "projected": None,
+                    "latest_run": {"run_id": "r-1", "status": "completed"},
+                },
+                {
+                    "id": "CORE-02",
+                    "status": "Planned",
+                    "actual": None,
+                    "projected": {"start": "2026-05-10"},
+                    "latest_run": None,
+                },
+            ]
+        }
+        result = lookup_timeline_task(timeline, "CORE-01")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["task_id"], "CORE-01")
+        self.assertTrue(result["has_actual"])
+        self.assertFalse(result["has_projected"])
+
+        result2 = lookup_timeline_task(timeline, "CORE-02")
+        self.assertIsNotNone(result2)
+        self.assertFalse(result2["has_actual"])
+        self.assertTrue(result2["has_projected"])
+
+        missing = lookup_timeline_task(timeline, "MISSING")
+        self.assertIsNone(missing)
+
+    def test_timeline_warnings_do_not_change_runnable_task_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "PLAN.md").write_text(
+                plan_table(
+                    [
+                        "| T-01 | P0 | Done | none | Do A | Done | - |",
+                        "| T-02 | P1 | Planned | T-01 | Do B | Ready | - |",
+                        "| T-03 | P2 | Planned | T-02 | Do C | Ready | - |",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            init_git_repo(repo)
+            (repo / "f.txt").write_text("x\n", encoding="utf-8")
+            git(repo, "add", "PLAN.md", "f.txt")
+            git_commit(
+                repo,
+                "feat: finish T-01",
+                "2026-05-09T10:00:00+00:00",
+                plan_item="T-01",
+            )
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": 3,
+                    "record_type": "run_result",
+                    "run_id": "run-stale",
+                    "task_id": "DELETED-TASK",
+                    "classification": "failed",
+                    "status": "failed",
+                    "exit_code": 1,
+                    "log": ".vibe-loop/runs/run-stale.log",
+                    "start_main": "a",
+                    "end_main": "a",
+                    "finished_at": "2026-05-08T10:00:00+00:00",
+                }
+            )
+
+            config = load_config(repo)
+            timeline = build_planning_timeline(config)
+            from vibe_loop.tasks import MarkdownPlanSource, runnable_tasks
+
+            source = MarkdownPlanSource(
+                repo / "PLAN.md",
+                config.task_source.runnable_statuses,
+            )
+            runnable = runnable_tasks(
+                source, config.task_source.runnable_statuses
+            )
+
+        warnings = timeline["warnings"]
+        stale_warnings = [
+            w for w in warnings if w.get("code") == "stale_run_record"
+        ]
+        self.assertTrue(len(stale_warnings) > 0)
+        runnable_ids = [t.task_id for t in runnable]
+        self.assertEqual(runnable_ids, ["T-02"])
 
 
 if __name__ == "__main__":

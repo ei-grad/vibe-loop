@@ -39,6 +39,7 @@ from vibe_loop.planning_artifacts import (
     build_planning_artifact_bundle,
     check_planning_artifacts,
     inspect_planning_artifacts,
+    planning_artifact_paths,
     write_planning_artifacts,
 )
 from vibe_loop.planning_benchmark import (
@@ -47,7 +48,11 @@ from vibe_loop.planning_benchmark import (
     write_duration_benchmark_reports,
 )
 from vibe_loop.planning_evidence import DEFAULT_GIT_COMMIT_LIMIT
-from vibe_loop.planning_timeline import build_planning_timeline
+from vibe_loop.planning_timeline import (
+    build_planning_timeline,
+    lookup_timeline_task,
+    read_timeline_file,
+)
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
 from vibe_loop.skills import install_skills
@@ -556,10 +561,22 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
         if inspection is None:
             print(f"run not found: {args.run_id}", file=sys.stderr)
             return 2
+        payload = inspection.to_json()
+        timeline_ref = _timeline_ref_for_task(
+            config, str(payload.get("task_id") or "")
+        )
+        if timeline_ref is not None:
+            payload["timeline_task"] = timeline_ref
         if args.json:
-            print(json.dumps(inspection.to_json(), indent=2))
+            print(json.dumps(payload, indent=2))
         else:
             print(render_run_inspection(inspection))
+            if timeline_ref:
+                print(
+                    f"timeline: status={timeline_ref.get('status', '-')}"
+                    f" actual={'yes' if timeline_ref.get('has_actual') else 'no'}"
+                    f" projected={'yes' if timeline_ref.get('has_projected') else 'no'}"
+                )
         return 0
 
     raise AssertionError(args.runs_command)
@@ -1241,6 +1258,18 @@ def render_planning_artifact_inspection(report: dict[str, object]) -> str:
         for command in commands:
             lines.append(f"- {command}")
     return "\n".join(lines)
+
+
+def _timeline_ref_for_task(
+    config, target_task_id: str
+) -> dict[str, object] | None:
+    if not target_task_id:
+        return None
+    paths = planning_artifact_paths(config)
+    timeline = read_timeline_file(paths.timeline_json)
+    if timeline is None:
+        return None
+    return lookup_timeline_task(timeline, target_task_id)
 
 
 def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:

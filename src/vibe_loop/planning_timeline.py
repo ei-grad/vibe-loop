@@ -6,6 +6,7 @@ import math
 import re
 import statistics
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from vibe_loop.config import PlanningAnalyticsDurationModelConfig, VibeConfig
 from vibe_loop.planning_evidence import (
@@ -314,33 +315,51 @@ class PlanningTimelineBuilder:
             )
         return projections
 
+    def latest_runs_by_task(self) -> dict[str, dict[str, object]]:
+        latest: dict[str, dict[str, object]] = {}
+        for attempt in self.evidence.run_attempts:
+            tid = string_value(attempt.get("task_id"))
+            if not tid:
+                continue
+            existing = latest.get(tid)
+            if existing is None:
+                latest[tid] = dict(attempt)
+            else:
+                existing_index = int_value(existing.get("record_index")) or -1
+                current_index = int_value(attempt.get("record_index")) or -1
+                if current_index > existing_index:
+                    latest[tid] = dict(attempt)
+        return latest
+
     def timeline_tasks(
         self,
         actual_spans: dict[str, ActualSpan],
         projections: dict[str, ProjectedSpan],
     ) -> list[dict[str, object]]:
+        latest_runs = self.latest_runs_by_task()
         payloads = []
         for task in self.tasks:
             current_task_id = task_id(task)
             actual = actual_spans.get(current_task_id)
             projected = projections.get(current_task_id)
-            payloads.append(
-                {
-                    "id": current_task_id,
-                    "title": string_value(task.get("title")),
-                    "section": string_value(task.get("section")),
-                    "status": string_value(task.get("status")),
-                    "priority": string_value(task.get("priority")),
-                    "dependencies": string_list(task.get("dependencies")),
-                    "source": {
-                        "path": string_value(task.get("source")),
-                        "order": int_value(task.get("order")),
-                    },
-                    "actual": actual.to_json() if actual else None,
-                    "projected": projected.to_json() if projected else None,
-                    "timeline_order": timeline_order(task, actual, projected),
-                }
-            )
+            latest_run = latest_runs.get(current_task_id)
+            payload: dict[str, object] = {
+                "id": current_task_id,
+                "title": string_value(task.get("title")),
+                "section": string_value(task.get("section")),
+                "status": string_value(task.get("status")),
+                "priority": string_value(task.get("priority")),
+                "dependencies": string_list(task.get("dependencies")),
+                "source": {
+                    "path": string_value(task.get("source")),
+                    "order": int_value(task.get("order")),
+                },
+                "actual": actual.to_json() if actual else None,
+                "projected": projected.to_json() if projected else None,
+                "timeline_order": timeline_order(task, actual, projected),
+                "latest_run": _latest_run_summary(latest_run),
+            }
+            payloads.append(payload)
         payloads.sort(key=timeline_payload_sort_key)
         return payloads
 
@@ -1243,6 +1262,57 @@ def round_minutes(delta: timedelta) -> int:
 
 def task_id(task: dict[str, object]) -> str:
     return string_value(task.get("id"))
+
+
+def lookup_timeline_task(
+    timeline: dict[str, object],
+    target_task_id: str,
+) -> dict[str, object] | None:
+    tasks = timeline.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    for task_payload in tasks:
+        if not isinstance(task_payload, dict):
+            continue
+        if string_value(task_payload.get("id")) == target_task_id:
+            return {
+                "task_id": target_task_id,
+                "status": string_value(task_payload.get("status")),
+                "has_actual": task_payload.get("actual") is not None,
+                "has_projected": task_payload.get("projected") is not None,
+                "latest_run": task_payload.get("latest_run"),
+            }
+    return None
+
+
+def read_timeline_file(path: Path) -> dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _latest_run_summary(
+    attempt: dict[str, object] | None,
+) -> dict[str, object] | None:
+    if attempt is None:
+        return None
+    run_id = string_value(attempt.get("run_id"))
+    if not run_id:
+        return None
+    return {
+        "run_id": run_id,
+        "status": string_value(attempt.get("status")),
+        "finished_at": (
+            string_value(attempt.get("finished_at"))
+            or string_value(attempt.get("reported_at"))
+        ),
+        "log": string_value(attempt.get("log")),
+    }
 
 
 def string_value(value: object) -> str:
