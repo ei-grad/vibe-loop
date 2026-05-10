@@ -296,6 +296,10 @@ def pid_exists(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    except OSError:
+        # Windows raises OSError(winerror=87, ERROR_INVALID_PARAMETER) for
+        # non-existent PIDs instead of ProcessLookupError.
+        return False
     return True
 
 

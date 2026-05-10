@@ -1269,13 +1269,16 @@ def format_detected_agents(detected: AgentDetection) -> str:
 
 
 def git_rev_parse(repo: Path, rev: str) -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "--verify", rev],
-        cwd=repo,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", rev],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except FileNotFoundError:
+        return ""
     if result.returncode != 0:
         return ""
     return result.stdout.strip()

@@ -2048,9 +2048,7 @@ def build_run_record(
             "run_order": run_order,
             "fresh_workspace": True,
             "state_reused": False,
-            "artifact_root": str(
-                Path("cases") / case.case_id / condition / f"trial-{trial}"
-            ),
+            "artifact_root": f"cases/{case.case_id}/{condition}/trial-{trial}",
         },
         status=status,
         started_at=execution.started_at,
