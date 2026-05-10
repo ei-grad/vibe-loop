@@ -403,6 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
+    doctor.add_argument("--json", action="store_true")
 
     install = subparsers.add_parser("install-skills", help="Install bundled skills")
     add_repo_argument(install)
@@ -501,7 +502,12 @@ def dispatch(args: argparse.Namespace) -> int:
         if getattr(args, "workers_command", None) == "clean":
             return dispatch_workers_clean(args, config)
         runner = VibeRunner(config)
-        workers = build_worker_views(runner.lock_manager, runner.run_store)
+        workers = build_worker_views(
+            runner.lock_manager,
+            runner.run_store,
+            repo=config.repo,
+            main_branch=config.main_branch,
+        )
         if args.json:
             payloads = []
             for worker in workers:
@@ -557,7 +563,18 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         analytics_report["artifacts"] = inspect_planning_artifacts(config)
         runner = VibeRunner(config)
-        stale = collect_stale_locks(runner.lock_manager, runner.run_store)
+        workers = build_worker_views(
+            runner.lock_manager,
+            runner.run_store,
+            repo=config.repo,
+            main_branch=config.main_branch,
+        )
+        stale = collect_stale_locks(
+            runner.lock_manager,
+            runner.run_store,
+            repo=config.repo,
+            main_branch=config.main_branch,
+        )
         stale_report = {
             "count": len(stale),
             "locks": [s.to_json() for s in stale],
@@ -577,6 +594,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                     "stale_locks": stale_report,
+                    "workspace_diagnostics": workspace_diagnostics_report(workers),
                 },
                 indent=2,
                 default=list,
@@ -1266,13 +1284,34 @@ def render_workers(workers: list[WorkerView]) -> str:
                 f"\tworkspace={payload['workspace'].get('branch')}"
                 f"@{payload['workspace'].get('worktree')}:{dirty}"
             )
+        diagnostics = ""
+        if payload["workspace_diagnostics"]:
+            diagnostics = f"\tworkspace_diagnostics={len(payload['workspace_diagnostics'])}"
         lines.append(
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
-            f"\tcommand={payload['command']}{workspace}{result}{stale}"
+            f"\tcommand={payload['command']}{workspace}{result}{diagnostics}{stale}"
         )
     return "\n".join(lines)
+
+
+def workspace_diagnostics_report(workers: list[WorkerView]) -> dict[str, object]:
+    diagnostics: list[dict[str, object]] = []
+    for worker in workers:
+        workspace = worker.active.workspace
+        for diagnostic in worker.workspace_diagnostics:
+            payload = diagnostic.to_json()
+            payload.update(
+                {
+                    "task_id": worker.active.task_id,
+                    "run_id": worker.active.run_id,
+                    "branch": workspace.branch if workspace else "",
+                    "worktree": str(workspace.worktree) if workspace else "",
+                }
+            )
+            diagnostics.append(payload)
+    return {"count": len(diagnostics), "diagnostics": diagnostics}
 
 
 def render_stale_locks(stale_locks: list[StaleLock]) -> str:
@@ -1288,7 +1327,12 @@ def render_stale_locks(stale_locks: list[StaleLock]) -> str:
 
 def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
     runner = VibeRunner(config)
-    stale = collect_stale_locks(runner.lock_manager, runner.run_store)
+    stale = collect_stale_locks(
+        runner.lock_manager,
+        runner.run_store,
+        repo=config.repo,
+        main_branch=config.main_branch,
+    )
     if not stale:
         if args.json:
             print(

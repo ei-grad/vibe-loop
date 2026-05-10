@@ -253,6 +253,7 @@ vibe-loop run-until-done --repo . --ask-agent --jobs 2
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --trials 3 --overwrite --record-output .vibe-loop/release-readiness.json
 vibe-loop workers --repo .
+vibe-loop workers --repo . --json
 vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
 vibe-loop planning artifacts --repo .
@@ -659,7 +660,14 @@ When a worker claims its workspace, the active task lock also stores a
 `workspace` object with the branch, worktree path, base commit, current HEAD,
 current branch, and dirty-at-claim summary. `workers --json` includes this
 object, and text output shows the claimed branch/worktree plus clean or dirty
-state.
+state. The JSON view also includes read-only `workspace_git_state` and
+`workspace_diagnostics` fields built from `git worktree list`, current
+worktree status, and branch containment in `main` or `origin/main`. These
+diagnostics report missing claimed worktrees, duplicate worktrees for a branch,
+already-merged active branches, dirty claimed worktrees, and stale
+lock-to-worktree mismatches with manual recovery hints. `doctor --json`
+summarizes the same diagnostics; neither command deletes locks, branches, or
+worktrees.
 
 The `main-integration.lock` entry is a separate advisory lock for worker-owned
 final integration. Its metadata records the owner task, run id, host, pid, and

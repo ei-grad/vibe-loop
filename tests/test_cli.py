@@ -3369,6 +3369,76 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["error"], "branch_worktree_mismatch")
         self.assertEqual(payload["details"]["current_branch"], "worker/TASK-01")
 
+    def test_workers_and_doctor_json_report_workspace_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            missing_worktree = repo.parent / "missing-worktree"
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "base-main",
+                        "command": "agent TASK-01",
+                        "workspace": {
+                            "record_type": "workspace_claim",
+                            "schema_version": 1,
+                            "task_id": "TASK-01",
+                            "run_id": "run-1",
+                            "branch": "worker/TASK-01",
+                            "worktree": str(missing_worktree),
+                            "base_commit": "base-main",
+                            "head_commit": "",
+                            "current_branch": "worker/TASK-01",
+                            "dirty": False,
+                            "dirty_summary": [],
+                            "claimed_at": "2026-05-09T00:01:00+00:00",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workers_stdout = StringIO()
+            workers_stderr = StringIO()
+            with redirect_stdout(workers_stdout), redirect_stderr(workers_stderr):
+                workers_exit = main(["workers", "--repo", str(repo), "--json"])
+            doctor_stdout = StringIO()
+            doctor_stderr = StringIO()
+            with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                doctor_exit = main(["doctor", "--repo", str(repo), "--json"])
+
+            workers_payload = json.loads(workers_stdout.getvalue())
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+
+        worker_codes = {
+            diagnostic["code"]
+            for diagnostic in workers_payload[0]["workspace_diagnostics"]
+        }
+        doctor_codes = {
+            diagnostic["code"]
+            for diagnostic in doctor_payload["workspace_diagnostics"]["diagnostics"]
+        }
+        self.assertEqual(workers_exit, 0)
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(workers_stderr.getvalue(), "")
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertIn("missing_claimed_worktree", worker_codes)
+        self.assertIn("missing_claimed_worktree", doctor_codes)
+        self.assertGreaterEqual(
+            doctor_payload["workspace_diagnostics"]["count"],
+            1,
+        )
+
     def test_run_next_keeps_json_stdout_when_agent_streams_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

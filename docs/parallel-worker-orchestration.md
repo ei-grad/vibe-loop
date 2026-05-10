@@ -60,6 +60,12 @@ results are missing or ambiguous.
   The command requires a matching active task lock, verifies that the worktree
   is currently on the claimed branch, updates the active lock, and appends a
   `workspace_claim` run record.
+- `workers --json` and `doctor --json` cross-check claimed workspace metadata
+  against `git worktree list`, the current claimed worktree status, and branch
+  containment in `main` or `origin/main`. They emit diagnostic codes and manual
+  recovery hints for missing claimed worktrees, duplicate branch worktrees,
+  already-merged active branches, dirty worker-owned worktrees, and stale
+  lock-to-worktree mismatches. These diagnostics are read-only.
 
 ## Non-Goals
 

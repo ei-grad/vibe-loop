@@ -25,6 +25,7 @@ ACTIVE_RUN_SCHEMA_VERSION = 1
 ACTIVE_RUN_RECORD_TYPE = "active_run"
 WORKSPACE_CLAIM_SCHEMA_VERSION = 1
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
+WORKSPACE_DIAGNOSTIC_SCHEMA_VERSION = 1
 DIRTY_SUMMARY_LIMIT = 200
 
 
@@ -215,6 +216,81 @@ class ActiveRunState:
 
 
 @dataclasses.dataclass(frozen=True)
+class GitWorktreeEntry:
+    path: Path
+    head: str = ""
+    branch: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "head": self.head,
+            "branch": self.branch,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspaceGitContext:
+    repo: Path
+    main_branch: str
+    worktrees: tuple[GitWorktreeEntry, ...] = ()
+    worktree_list_error: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspaceDiagnostic:
+    code: str
+    severity: str
+    message: str
+    recovery_hint: str
+    recovery_commands: tuple[str, ...] = ()
+    details: dict[str, object] = dataclasses.field(default_factory=dict)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schema_version": WORKSPACE_DIAGNOSTIC_SCHEMA_VERSION,
+            "code": self.code,
+            "severity": self.severity,
+            "message": self.message,
+            "recovery_hint": self.recovery_hint,
+            "recovery_commands": list(self.recovery_commands),
+            "details": self.details,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkspaceGitState:
+    status: str
+    worktree_exists: bool
+    worktree_listed: bool
+    current_branch: str = ""
+    head_commit: str = ""
+    dirty: bool = False
+    dirty_summary: tuple[str, ...] = ()
+    duplicate_worktrees: tuple[GitWorktreeEntry, ...] = ()
+    merged_into: tuple[str, ...] = ()
+    diagnostics: tuple[WorkspaceDiagnostic, ...] = ()
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "worktree_exists": self.worktree_exists,
+            "worktree_listed": self.worktree_listed,
+            "current_branch": self.current_branch,
+            "head_commit": self.head_commit,
+            "dirty": self.dirty,
+            "dirty_summary": list(self.dirty_summary),
+            "duplicate_worktrees": [
+                worktree.to_json() for worktree in self.duplicate_worktrees
+            ],
+            "merged_into": list(self.merged_into),
+            "diagnostics": [
+                diagnostic.to_json() for diagnostic in self.diagnostics
+            ],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class WorkerView:
     active: ActiveRunState
     state: str
@@ -224,6 +300,8 @@ class WorkerView:
     result_finished_at: str | None = None
     result_record_type: str | None = None
     result_metadata: dict[str, Any] | None = None
+    workspace_git_state: WorkspaceGitState | None = None
+    workspace_diagnostics: tuple[WorkspaceDiagnostic, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -251,6 +329,14 @@ class WorkerView:
                 if self.active.workspace is not None
                 else None
             ),
+            "workspace_git_state": (
+                self.workspace_git_state.to_json()
+                if self.workspace_git_state is not None
+                else None
+            ),
+            "workspace_diagnostics": [
+                diagnostic.to_json() for diagnostic in self.workspace_diagnostics
+            ],
             "result_status": self.result_status,
             "result_finished_at": self.result_finished_at,
             "result_record_type": self.result_record_type,
@@ -428,16 +514,424 @@ def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
         ) from exc
 
 
+def build_workspace_git_context(
+    repo: Path,
+    *,
+    main_branch: str = "main",
+) -> WorkspaceGitContext:
+    result = run_git_result(repo, "worktree", "list", "--porcelain")
+    if result is None:
+        return WorkspaceGitContext(
+            repo=repo,
+            main_branch=main_branch,
+            worktree_list_error="git could not be executed",
+        )
+    if result.returncode != 0:
+        return WorkspaceGitContext(
+            repo=repo,
+            main_branch=main_branch,
+            worktree_list_error=git_error_text(result),
+        )
+    return WorkspaceGitContext(
+        repo=repo,
+        main_branch=main_branch,
+        worktrees=parse_git_worktree_list(result.stdout),
+    )
+
+
+def parse_git_worktree_list(output: str) -> tuple[GitWorktreeEntry, ...]:
+    entries: list[GitWorktreeEntry] = []
+    path: Path | None = None
+    head = ""
+    branch = ""
+
+    def flush() -> None:
+        nonlocal path, head, branch
+        if path is not None:
+            entries.append(GitWorktreeEntry(path=path, head=head, branch=branch))
+        path = None
+        head = ""
+        branch = ""
+
+    for line in output.splitlines():
+        if not line:
+            flush()
+            continue
+        key, separator, value = line.partition(" ")
+        if key == "worktree" and separator:
+            flush()
+            path = Path(value).resolve()
+        elif key == "HEAD" and separator:
+            head = value
+        elif key == "branch" and separator:
+            branch = short_git_ref(value)
+    flush()
+    return tuple(entries)
+
+
+def short_git_ref(value: str) -> str:
+    prefix = "refs/heads/"
+    if value.startswith(prefix):
+        return value[len(prefix) :]
+    return value
+
+
+def inspect_workspace_git_state(
+    active: ActiveRunState,
+    context: WorkspaceGitContext,
+) -> WorkspaceGitState | None:
+    claim = active.workspace
+    if claim is None:
+        return None
+
+    diagnostics: list[WorkspaceDiagnostic] = []
+    if context.worktree_list_error:
+        diagnostics.append(
+            WorkspaceDiagnostic(
+                code="git_worktree_list_unavailable",
+                severity="warning",
+                message="git worktree list could not be read for workspace diagnostics",
+                recovery_hint="Run git worktree list in the repository and inspect active worker locks manually.",
+                recovery_commands=(git_command(context.repo, "worktree", "list"),),
+                details={"error": context.worktree_list_error},
+            )
+        )
+
+    branch_worktrees = worktrees_for_branch(context, claim.branch)
+    path_worktrees = worktrees_for_path(context, claim.worktree)
+    duplicate_worktrees = tuple(branch_worktrees) if len(branch_worktrees) > 1 else ()
+    worktree_exists = claim.worktree.exists() and claim.worktree.is_dir()
+    worktree_listed = bool(path_worktrees)
+    current_branch = ""
+    head_commit = ""
+    dirty_summary: tuple[str, ...] = ()
+    dirty = False
+
+    if not worktree_exists:
+        diagnostics.append(
+            WorkspaceDiagnostic(
+                code="missing_claimed_worktree",
+                severity="stale",
+                message="active worker lock points at a claimed worktree that is missing",
+                recovery_hint="Confirm the worker is no longer using the workspace, then recreate the worktree or remove the stale lock manually.",
+                recovery_commands=(
+                    git_command(context.repo, "worktree", "list"),
+                    git_command(context.repo, "branch", "--list", claim.branch),
+                ),
+                details={"worktree": str(claim.worktree), "branch": claim.branch},
+            )
+        )
+    else:
+        current_branch, branch_error = git_optional_text(
+            claim.worktree,
+            "branch",
+            "--show-current",
+        )
+        head_commit, head_error = git_optional_text(
+            claim.worktree,
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        )
+        status_text, status_error = git_optional_text(
+            claim.worktree,
+            "status",
+            "--short",
+        )
+        git_state_error = branch_error or head_error or status_error
+        if git_state_error:
+            diagnostics.append(
+                WorkspaceDiagnostic(
+                    code="claimed_worktree_git_unavailable",
+                    severity="stale",
+                    message="claimed worktree exists but current git state could not be read",
+                    recovery_hint="Inspect the claimed path manually before removing any lock or worktree.",
+                    recovery_commands=(git_command(claim.worktree, "status"),),
+                    details={
+                        "worktree": str(claim.worktree),
+                        "error": git_state_error,
+                    },
+                )
+            )
+        else:
+            dirty_summary = tuple(
+                line
+                for line in status_text.splitlines()[:DIRTY_SUMMARY_LIMIT]
+                if line
+            )
+            dirty = bool(dirty_summary)
+            if current_branch and current_branch != claim.branch:
+                diagnostics.append(
+                    stale_lock_worktree_mismatch(
+                        context,
+                        claim,
+                        message="claimed worktree is currently on a different branch",
+                        details={
+                            "claimed_branch": claim.branch,
+                            "current_branch": current_branch,
+                        },
+                    )
+                )
+            if dirty:
+                diagnostics.append(
+                    WorkspaceDiagnostic(
+                        code="foreign_dirty_claimed_worktree",
+                        severity="warning",
+                        message="claimed worker worktree has uncommitted changes",
+                        recovery_hint="Treat the worktree as worker-owned; inspect or preserve changes before cleanup.",
+                        recovery_commands=(git_command(claim.worktree, "status", "--short"),),
+                        details={
+                            "worktree": str(claim.worktree),
+                            "dirty_summary": list(dirty_summary),
+                        },
+                    )
+                )
+
+    if worktree_exists and not worktree_listed and not context.worktree_list_error:
+        diagnostics.append(
+            stale_lock_worktree_mismatch(
+                context,
+                claim,
+                message="claimed worktree is not present in git worktree list",
+                details={"worktree": str(claim.worktree), "branch": claim.branch},
+            )
+        )
+
+    if path_worktrees and all(entry.branch != claim.branch for entry in path_worktrees):
+        diagnostics.append(
+            stale_lock_worktree_mismatch(
+                context,
+                claim,
+                message="claimed worktree list entry is associated with a different branch",
+                details={
+                    "claimed_branch": claim.branch,
+                    "listed_branches": [entry.branch for entry in path_worktrees],
+                },
+            )
+        )
+
+    if branch_worktrees and all(
+        entry.path != claim.worktree.resolve() for entry in branch_worktrees
+    ):
+        diagnostics.append(
+            stale_lock_worktree_mismatch(
+                context,
+                claim,
+                message="claimed branch is checked out at a different worktree path",
+                details={
+                    "claimed_worktree": str(claim.worktree),
+                    "listed_worktrees": [str(entry.path) for entry in branch_worktrees],
+                },
+            )
+        )
+
+    if duplicate_worktrees:
+        diagnostics.append(
+            WorkspaceDiagnostic(
+                code="duplicate_branch_worktrees",
+                severity="warning",
+                message="more than one git worktree is checked out for the claimed branch",
+                recovery_hint="Inspect duplicate worktrees and preserve any local changes before removing one manually.",
+                recovery_commands=(git_command(context.repo, "worktree", "list"),),
+                details={
+                    "branch": claim.branch,
+                    "worktrees": [str(entry.path) for entry in duplicate_worktrees],
+                },
+            )
+        )
+
+    branch_ref = local_branch_ref(claim.branch)
+    branch_head = git_ref_commit(context.repo, branch_ref)
+    branch_has_worker_commits = bool(branch_head) and (
+        not claim.base_commit or branch_head != claim.base_commit
+    )
+    merged_into = (
+        merged_branch_targets(context.repo, claim.branch, context.main_branch)
+        if branch_has_worker_commits
+        else ()
+    )
+    if merged_into:
+        diagnostics.append(
+            WorkspaceDiagnostic(
+                code="branch_already_merged",
+                severity="warning",
+                message="active worker branch is already contained in mainline history",
+                recovery_hint="Confirm the worker result is recorded before manually cleaning the lock, branch, or worktree.",
+                recovery_commands=(
+                    git_command(context.repo, "branch", "--contains", claim.branch),
+                    git_command(context.repo, "worktree", "list"),
+                ),
+                details={"branch": claim.branch, "merged_into": list(merged_into)},
+            )
+        )
+    elif not git_ref_exists(context.repo, branch_ref):
+        diagnostics.append(
+            WorkspaceDiagnostic(
+                code="claimed_branch_missing",
+                severity="stale",
+                message="active worker lock claims a branch that is not available",
+                recovery_hint="Inspect the lock and worktree manually before removing the lock or recreating the branch.",
+                recovery_commands=(
+                    git_command(context.repo, "branch", "--list", claim.branch),
+                    git_command(context.repo, "worktree", "list"),
+                ),
+                details={"branch": claim.branch},
+            )
+        )
+
+    status = workspace_status(tuple(diagnostics))
+    return WorkspaceGitState(
+        status=status,
+        worktree_exists=worktree_exists,
+        worktree_listed=worktree_listed,
+        current_branch=current_branch,
+        head_commit=head_commit,
+        dirty=dirty,
+        dirty_summary=dirty_summary,
+        duplicate_worktrees=duplicate_worktrees,
+        merged_into=merged_into,
+        diagnostics=tuple(diagnostics),
+    )
+
+
+def stale_lock_worktree_mismatch(
+    context: WorkspaceGitContext,
+    claim: WorkspaceClaim,
+    *,
+    message: str,
+    details: dict[str, object],
+) -> WorkspaceDiagnostic:
+    return WorkspaceDiagnostic(
+        code="stale_lock_worktree_mismatch",
+        severity="stale",
+        message=message,
+        recovery_hint="Refresh the worker's workspace claim or clean the stale lock only after confirming ownership.",
+        recovery_commands=(
+            git_command(context.repo, "worktree", "list"),
+            git_command(claim.worktree, "status", "--short"),
+        ),
+        details=details,
+    )
+
+
+def workspace_status(diagnostics: tuple[WorkspaceDiagnostic, ...]) -> str:
+    if any(diagnostic.severity == "stale" for diagnostic in diagnostics):
+        return "stale"
+    if diagnostics:
+        return "warning"
+    return "ok"
+
+
+def worktrees_for_branch(
+    context: WorkspaceGitContext,
+    branch: str,
+) -> tuple[GitWorktreeEntry, ...]:
+    return tuple(entry for entry in context.worktrees if entry.branch == branch)
+
+
+def worktrees_for_path(
+    context: WorkspaceGitContext,
+    path: Path,
+) -> tuple[GitWorktreeEntry, ...]:
+    resolved = path.resolve()
+    return tuple(entry for entry in context.worktrees if entry.path == resolved)
+
+
+def git_optional_text(repo: Path, *args: str) -> tuple[str, str]:
+    result = run_git_result(repo, *args)
+    if result is None:
+        return "", "git could not be executed"
+    if result.returncode != 0:
+        return "", git_error_text(result)
+    return result.stdout.strip(), ""
+
+
+def run_git_result(repo: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return run_git(repo, *args)
+    except WorkspaceClaimError:
+        return None
+
+
+def git_error_text(result: subprocess.CompletedProcess[str]) -> str:
+    return result.stderr.strip() or result.stdout.strip() or f"git exited {result.returncode}"
+
+
+def git_ref_exists(repo: Path, ref: str) -> bool:
+    result = run_git_result(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    return result is not None and result.returncode == 0
+
+
+def git_ref_commit(repo: Path, ref: str) -> str:
+    result = run_git_result(repo, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    if result is None or result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def merged_branch_targets(
+    repo: Path,
+    branch: str,
+    main_branch: str,
+) -> tuple[str, ...]:
+    branch_ref = local_branch_ref(branch)
+    if not git_ref_exists(repo, branch_ref):
+        return ()
+    targets = [
+        (main_branch, local_branch_ref(main_branch)),
+        (f"origin/{main_branch}", remote_main_ref(main_branch)),
+    ]
+    merged: list[str] = []
+    for target_name, target_ref in targets:
+        if target_name in merged or not git_ref_exists(repo, target_ref):
+            continue
+        result = run_git_result(
+            repo,
+            "merge-base",
+            "--is-ancestor",
+            branch_ref,
+            target_ref,
+        )
+        if result is not None and result.returncode == 0:
+            merged.append(target_name)
+    return tuple(merged)
+
+
+def local_branch_ref(branch: str) -> str:
+    if branch.startswith("refs/"):
+        return branch
+    return f"refs/heads/{branch}"
+
+
+def remote_main_ref(main_branch: str) -> str:
+    branch = short_git_ref(main_branch)
+    if branch.startswith("origin/"):
+        branch = branch.removeprefix("origin/")
+    return f"refs/remotes/origin/{branch}"
+
+
+def git_command(repo: Path, *args: str) -> str:
+    parts = ["git", "-C", str(repo), *args]
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 def build_worker_views(
     lock_manager: LockManager,
     run_store: RunStore,
     *,
+    repo: Path | None = None,
+    main_branch: str = "main",
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
     process_checker = process_exists if process_exists is not None else pid_exists
     result_by_run_id = latest_worker_status_by_run_id(run_store.read_records())
+    workspace_context = (
+        build_workspace_git_context(repo, main_branch=main_branch)
+        if repo is not None
+        else None
+    )
     views: list[WorkerView] = []
     for active in load_active_run_states(lock_manager):
         result = result_by_run_id.get(active.run_id)
@@ -474,6 +968,16 @@ def build_worker_views(
         elif process_state != "running":
             state = "unknown"
             stale_reason = process_state
+        workspace_git_state = (
+            inspect_workspace_git_state(active, workspace_context)
+            if workspace_context is not None
+            else None
+        )
+        workspace_diagnostics = (
+            workspace_git_state.diagnostics
+            if workspace_git_state is not None
+            else ()
+        )
         views.append(
             WorkerView(
                 active=active,
@@ -484,6 +988,8 @@ def build_worker_views(
                 result_finished_at=result_finished_at,
                 result_record_type=result_record_type,
                 result_metadata=result_metadata,
+                workspace_git_state=workspace_git_state,
+                workspace_diagnostics=workspace_diagnostics,
             )
         )
     return views
@@ -612,6 +1118,8 @@ def collect_stale_locks(
     lock_manager: LockManager,
     run_store: RunStore,
     *,
+    repo: Path | None = None,
+    main_branch: str = "main",
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
 ) -> list[StaleLock]:
@@ -619,6 +1127,8 @@ def collect_stale_locks(
     for view in build_worker_views(
         lock_manager,
         run_store,
+        repo=repo,
+        main_branch=main_branch,
         current_host=current_host,
         process_exists=process_exists,
     ):

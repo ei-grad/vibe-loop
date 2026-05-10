@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,7 @@ from vibe_loop.workers import (
     clean_stale_locks,
     collect_stale_locks,
     load_active_run_states,
+    parse_git_worktree_list,
 )
 
 
@@ -333,6 +335,398 @@ class WorkerStateTests(unittest.TestCase):
             )
 
         self.assertEqual(views, [])
+
+
+class WorkspaceGitDiagnosticsTests(unittest.TestCase):
+    def test_worker_view_reports_missing_claimed_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            missing = base / "missing-worktree"
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=missing,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        codes = diagnostic_codes(views[0])
+        self.assertIn("missing_claimed_worktree", codes)
+        self.assertIn("claimed_branch_missing", codes)
+        self.assertEqual(views[0].workspace_git_state.status, "stale")
+
+    def test_worker_view_reports_claimed_branch_at_different_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            actual = base / "actual-worker"
+            missing = base / "missing-worker"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(actual), "main")
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=missing,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        codes = diagnostic_codes(views[0])
+        self.assertIn("missing_claimed_worktree", codes)
+        self.assertIn("stale_lock_worktree_mismatch", codes)
+
+    def test_worker_view_reports_duplicate_worktrees_for_claimed_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            first = base / "worker-one"
+            second = base / "worker-two"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(first), "main")
+            git(repo, "worktree", "add", "--force", str(second), "worker/TASK-01")
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=first,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        state = views[0].workspace_git_state
+        self.assertIsNotNone(state)
+        if state is None:
+            self.fail("workspace git state missing")
+        self.assertIn("duplicate_branch_worktrees", diagnostic_codes(views[0]))
+        self.assertEqual(len(state.duplicate_worktrees), 2)
+
+    def test_worker_view_reports_active_branch_already_merged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            base_commit = git(repo, "rev-parse", "--verify", "HEAD").stdout.strip()
+            worktree = base / "worker"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(worktree), "main")
+            (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", "feature.txt")
+            git(worktree, "commit", "-m", "branch work")
+            git(repo, "merge", "--ff-only", "worker/TASK-01")
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=worktree,
+                base_commit=base_commit,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        state = views[0].workspace_git_state
+        self.assertIsNotNone(state)
+        if state is None:
+            self.fail("workspace git state missing")
+        self.assertIn("branch_already_merged", diagnostic_codes(views[0]))
+        self.assertEqual(state.merged_into, ("main",))
+
+    def test_worker_view_reports_active_branch_contained_in_origin_main(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            base_commit = git(repo, "rev-parse", "--verify", "HEAD").stdout.strip()
+            worktree = base / "worker"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(worktree), "main")
+            (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", "feature.txt")
+            git(worktree, "commit", "-m", "branch work")
+            branch_head = git(
+                repo,
+                "rev-parse",
+                "--verify",
+                "worker/TASK-01",
+            ).stdout.strip()
+            git(repo, "update-ref", "refs/remotes/origin/main", branch_head)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=worktree,
+                base_commit=base_commit,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        state = views[0].workspace_git_state
+        self.assertIsNotNone(state)
+        if state is None:
+            self.fail("workspace git state missing")
+        self.assertIn("branch_already_merged", diagnostic_codes(views[0]))
+        self.assertEqual(state.merged_into, ("origin/main",))
+
+    def test_branch_containment_uses_branch_ref_when_tag_name_collides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            base_commit = git(repo, "rev-parse", "--verify", "HEAD").stdout.strip()
+            worktree = base / "worker"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(worktree), "main")
+            (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", "feature.txt")
+            git(worktree, "commit", "-m", "branch work")
+            git(repo, "tag", "worker/TASK-01", base_commit)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=worktree,
+                base_commit=base_commit,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        state = views[0].workspace_git_state
+        self.assertIsNotNone(state)
+        if state is None:
+            self.fail("workspace git state missing")
+        self.assertNotIn("branch_already_merged", diagnostic_codes(views[0]))
+        self.assertEqual(state.merged_into, ())
+        self.assertEqual(state.status, "ok")
+
+    def test_worker_view_reports_dirty_claimed_worktree_as_foreign_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            worktree = base / "worker"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(worktree), "main")
+            (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", "feature.txt")
+            git(worktree, "commit", "-m", "branch work")
+            (worktree / "notes.txt").write_text("not committed\n", encoding="utf-8")
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/TASK-01",
+                worktree=worktree,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        state = views[0].workspace_git_state
+        self.assertIsNotNone(state)
+        if state is None:
+            self.fail("workspace git state missing")
+        self.assertIn("foreign_dirty_claimed_worktree", diagnostic_codes(views[0]))
+        self.assertTrue(state.dirty)
+        self.assertTrue(any("notes.txt" in line for line in state.dirty_summary))
+
+    def test_worker_view_reports_stale_lock_to_worktree_branch_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            worktree = base / "worker"
+            git(repo, "worktree", "add", "-b", "worker/TASK-01", str(worktree), "main")
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch="worker/OTHER",
+                worktree=worktree,
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        codes = diagnostic_codes(views[0])
+        self.assertIn("stale_lock_worktree_mismatch", codes)
+        self.assertIn("claimed_branch_missing", codes)
+        self.assertEqual(views[0].workspace_git_state.status, "stale")
+
+    def test_worktree_porcelain_parser_uses_short_branch_names(self) -> None:
+        entries = parse_git_worktree_list(
+            "worktree /tmp/repo\n"
+            "HEAD abc123\n"
+            "branch refs/heads/worker/TASK-01\n"
+            "\n"
+        )
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].branch, "worker/TASK-01")
+
+
+def init_git_repo(repo: Path) -> None:
+    repo.mkdir()
+    git(repo, "init")
+    git(repo, "checkout", "-B", "main")
+    git(repo, "config", "user.name", "Tester")
+    git(repo, "config", "user.email", "tester@example.com")
+    (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "baseline")
+
+
+def acquire_worker_lock(
+    manager: LockManager,
+    *,
+    repo: Path,
+    task_id: str,
+    run_id: str,
+    branch: str,
+    worktree: Path,
+    base_commit: str = "",
+) -> None:
+    claim_base = base_commit or git(repo, "rev-parse", "--verify", "HEAD").stdout.strip()
+    state = ActiveRunState(
+        task_id=task_id,
+        run_id=run_id,
+        worker_pid=100,
+        supervisor_pid=200,
+        host="test-host",
+        started_at="2026-05-09T00:00:00+00:00",
+        log_path=repo / ".vibe-loop" / "runs" / f"{run_id}.log",
+        base_main=claim_base,
+        command=f"agent {task_id}",
+        workspace=WorkspaceClaim(
+            task_id=task_id,
+            run_id=run_id,
+            branch=branch,
+            worktree=worktree.resolve(),
+            base_commit=claim_base,
+            head_commit=head_commit_for_claim(worktree),
+            current_branch=branch,
+            dirty=False,
+            dirty_summary=(),
+            claimed_at="2026-05-09T00:01:00+00:00",
+        ),
+    )
+    manager.acquire(task_id, run_id, metadata=state.to_lock_metadata())
+
+
+def head_commit_for_claim(worktree: Path) -> str:
+    if not worktree.exists():
+        return ""
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=worktree,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def diagnostic_codes(view) -> set[str]:
+    return {diagnostic.code for diagnostic in view.workspace_diagnostics}
+
+
+def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 class StaleLockTests(unittest.TestCase):
