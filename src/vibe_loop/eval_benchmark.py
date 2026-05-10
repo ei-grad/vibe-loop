@@ -163,6 +163,10 @@ def run_benchmark_eval(config: BenchmarkEvalConfig) -> dict[str, object]:
         "adapter_version": config.adapter.version,
         "generated_at": datetime.now(UTC).isoformat(),
         "instances_total": len(instances),
+        "resource_budget": {
+            "timeout_seconds": config.timeout_seconds,
+            "trials": config.trials,
+        },
         "conditions": condition_summaries,
         "results": results,
     }
@@ -190,6 +194,9 @@ def _run_trial(
     start_time = time.monotonic()
     timeout = False
 
+    # Adapter protocol methods can raise arbitrary exceptions from external
+    # harnesses (Docker failures, network errors, harness bugs). Catching
+    # broadly ensures one broken instance doesn't abort the entire eval run.
     try:
         config.adapter.setup_instance(instance, workdir)
     except Exception as exc:
@@ -198,6 +205,9 @@ def _run_trial(
             f"setup failed: {exc}",
         )
 
+    # shell=True is intentional: agent commands are user-supplied CLI strings
+    # that may contain pipes, redirects, or env vars. This is a local eval
+    # tool, not a production service.
     try:
         agent_result = subprocess.run(
             command,
@@ -241,6 +251,7 @@ def _run_trial(
             encoding="utf-8",
         )
 
+    # Teardown errors should not fail the trial — the result is already graded.
     try:
         config.adapter.teardown_instance(instance, workdir)
     except Exception:

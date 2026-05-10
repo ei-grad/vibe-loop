@@ -99,6 +99,8 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(payload["adapter"], "stub-benchmark")
         self.assertEqual(payload["adapter_version"], "1.0.0")
         self.assertEqual(payload["instances_total"], 2)
+        self.assertEqual(payload["resource_budget"]["timeout_seconds"], 30)
+        self.assertEqual(payload["resource_budget"]["trials"], 1)
         self.assertEqual(len(payload["results"]), 4)
         self.assertEqual(
             set(payload["conditions"]),
@@ -260,6 +262,29 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(payload["results"], [])
         self.assertEqual(payload["conditions"]["test"]["trials"], 0)
         self.assertEqual(payload["conditions"]["test"]["pass_rate"], 0.0)
+
+
+    def test_agent_timeout_produces_graded_result_with_timeout_flag(self) -> None:
+        instances = [
+            BenchmarkInstance(
+                instance_id="slow", dataset="d", split="s"
+            ),
+        ]
+        adapter = StubAdapter(instances, {"slow": False})
+        with tempfile.TemporaryDirectory() as directory:
+            config = BenchmarkEvalConfig(
+                adapter=adapter,
+                output_root=Path(directory),
+                agent_commands={"test": "sleep 60"},
+                trials=1,
+                timeout_seconds=1,
+            )
+            payload = run_benchmark_eval(config)
+
+        result = payload["results"][0]
+        self.assertTrue(result["timeout"])
+        self.assertIn("grader_result", result)
+        self.assertFalse(result["grader_result"]["passed"])
 
 
 if __name__ == "__main__":

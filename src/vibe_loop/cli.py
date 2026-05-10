@@ -768,9 +768,12 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                 f"unknown benchmark adapter: {args.adapter}", file=sys.stderr
             )
             return 2
-        agent_commands = parse_agent_command_specs(args.agent_command)
+        agent_commands = _parse_benchmark_agent_commands(args.agent_command)
         if not agent_commands:
-            print("at least one --agent-command is required", file=sys.stderr)
+            print(
+                "at least one --agent-command CONDITION=COMMAND is required",
+                file=sys.stderr,
+            )
             return 2
         bench_config = BenchmarkEvalConfig(
             adapter=adapter,
@@ -793,8 +796,19 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
     raise AssertionError(args.eval_command)
 
 
-def resolve_benchmark_adapter(name: str):
+def _parse_benchmark_agent_commands(
+    specs: list[str],
+) -> dict[str, str]:
+    commands: dict[str, str] = {}
+    for spec in specs:
+        key, separator, value = spec.partition("=")
+        if not separator or not key or not value:
+            continue
+        commands[key] = value
+    return commands
 
+
+def resolve_benchmark_adapter(name: str) -> object | None:
     adapters: dict[str, type] = {}
     try:
         from vibe_loop.eval_benchmark_stub import StubBenchmarkAdapter
