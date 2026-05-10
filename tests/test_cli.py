@@ -16,6 +16,21 @@ from unittest.mock import patch
 from vibe_loop.cli import main
 
 
+def parse_run_result(
+    test: unittest.TestCase,
+    stdout: StringIO,
+    stderr: StringIO,
+    exit_code: int,
+) -> dict[str, object]:
+    raw = stdout.getvalue()
+    if not raw.strip():
+        test.fail(
+            f"run produced no stdout (exit_code={exit_code})\nstderr:\n"
+            + stderr.getvalue()
+        )
+    return json.loads(raw)
+
+
 PLAN = """# Plan
 
 | ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence |
@@ -83,7 +98,7 @@ class CliTests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exit_code = main(["run-next", "--repo", str(repo)])
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
             agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
             run_records = [
@@ -159,7 +174,7 @@ class CliTests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exit_code = main(["run-next", "--repo", str(repo)])
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             env_payload = json.loads(
                 (repo / "agent-env.json").read_text(encoding="utf-8")
             )
@@ -243,7 +258,7 @@ class CliTests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exit_code = main(["run-next", "--repo", str(repo)])
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
             agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
 
@@ -417,7 +432,7 @@ class CliTests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exit_code = main(["run-next", "--repo", str(repo)])
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
             agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
 
@@ -477,7 +492,7 @@ class CliTests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     exit_code = main(["run-until-done", "--repo", str(repo)])
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(payload), 1)
@@ -3777,7 +3792,7 @@ class CliTests(unittest.TestCase):
             with redirect_stdout(text_stdout), redirect_stderr(text_stderr):
                 text_exit = main(["workers", "--repo", str(repo)])
 
-            payload = json.loads(stdout.getvalue())
+            payload = parse_run_result(self, stdout, stderr, exit_code)
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(text_exit, 0)

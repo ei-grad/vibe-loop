@@ -452,7 +452,10 @@ class EvalRunnerCliTests(unittest.TestCase):
             archived_log_exists = archived_log.is_file()
             archived_symlink_exists = archived_symlink.exists()
 
-        self.assertTrue(previous_root.startswith("history/previous-"))
+        self.assertTrue(
+            previous_root.startswith("history/previous-"),
+            f"expected history/previous-... but got: {previous_root!r}",
+        )
         self.assertTrue(archived_log_exists)
         self.assertFalse(archived_symlink_exists)
         self.assertEqual(current_root, "cases/negative-trigger-set/no_skill/trial-1")
