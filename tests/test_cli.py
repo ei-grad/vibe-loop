@@ -3787,19 +3787,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[1]["state"], "stale")
         self.assertEqual(payload[1]["process_state"], "missing")
         self.assertEqual(payload[1]["stale_reason"], "missing_process")
-        self.assertEqual(
-            text_stdout.getvalue(),
+        text_output = text_stdout.getvalue()
+        self.assertIn(
             "TASK-01\trun-1\trunning\tprocess=running"
             f"\tpid={os.getpid()}"
             "\tstarted=2026-05-09T00:00:00+00:00"
             f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-1.log'}"
-            "\tcommand=python worker.py\tresult=blocked\n"
+            "\tcommand=python worker.py\tresult=blocked\n",
+            text_output,
+        )
+        self.assertIn(
             "TASK-02\trun-2\tstale\tprocess=missing"
             "\tpid=999999999"
             "\tstarted=2026-05-09T00:01:00+00:00"
             f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-2.log'}"
             "\tcommand=python worker.py\tmissing_process\n",
+            text_output,
         )
+        self.assertIn("1 stale lock(s) found.", text_output)
+        self.assertIn("vibe-loop workers clean", text_output)
 
     def test_workers_text_does_not_require_plan_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3813,6 +3819,121 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual("", stdout.getvalue())
         self.assertEqual("", stderr.getvalue())
+
+    def test_workers_clean_dry_run_lists_stale_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            stale_lock = lock_root / "STALE-01.lock"
+            stale_lock.mkdir(parents=True)
+            (stale_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "STALE-01",
+                        "run_id": "run-1",
+                        "pid": 999999999,
+                        "worker_pid": 999999999,
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "abc123",
+                        "command": "agent STALE-01",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(["workers", "--repo", str(repo), "clean"])
+            lock_still_exists = stale_lock.exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(lock_still_exists)
+        self.assertIn("1 stale lock(s) found (dry-run", stdout.getvalue())
+        self.assertIn("STALE-01", stdout.getvalue())
+
+    def test_workers_clean_force_removes_stale_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            stale_lock = lock_root / "STALE-01.lock"
+            stale_lock.mkdir(parents=True)
+            (stale_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "STALE-01",
+                        "run_id": "run-1",
+                        "pid": 999999999,
+                        "worker_pid": 999999999,
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "abc123",
+                        "command": "agent STALE-01",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    ["workers", "--repo", str(repo), "clean", "--force"]
+                )
+            lock_still_exists = stale_lock.exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(lock_still_exists)
+        self.assertIn("Removed 1 stale lock(s)", stdout.getvalue())
+
+    def test_workers_clean_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            stale_lock = lock_root / "STALE-01.lock"
+            stale_lock.mkdir(parents=True)
+            (stale_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "STALE-01",
+                        "run_id": "run-1",
+                        "pid": 999999999,
+                        "worker_pid": 999999999,
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "abc123",
+                        "command": "agent STALE-01",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(
+                    ["workers", "--repo", str(repo), "clean", "--json"]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(len(payload["stale_locks"]), 1)
+        self.assertEqual(payload["stale_locks"][0]["task_id"], "STALE-01")
+        self.assertEqual(payload["cleaned"], [])
+
+    def test_workers_clean_no_stale_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(["workers", "--repo", str(repo), "clean"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("No stale locks found", stdout.getvalue())
 
     def test_runs_list_and_inspect_do_not_require_plan_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

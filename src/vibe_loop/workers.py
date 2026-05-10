@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import shutil
 import socket
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.locks import LockManager
+from vibe_loop.locks import MAIN_INTEGRATION_LOCK_NAME, LockManager
 from vibe_loop.runs import (
     RUN_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
@@ -341,3 +342,84 @@ def result_metadata_value(record: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
     metadata = worker_report.get("metadata")
     return metadata if isinstance(metadata, dict) else None
+
+
+@dataclasses.dataclass(frozen=True)
+class StaleLock:
+    task_id: str
+    run_id: str
+    lock_path: Path
+    stale_reason: str
+    kind: str
+    recovery_command: str
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "lock_path": str(self.lock_path),
+            "stale_reason": self.stale_reason,
+            "kind": self.kind,
+            "recovery_command": self.recovery_command,
+        }
+
+
+def collect_stale_locks(
+    lock_manager: LockManager,
+    run_store: RunStore,
+    *,
+    current_host: str | None = None,
+    process_exists: ProcessExists | None = None,
+) -> list[StaleLock]:
+    stale: list[StaleLock] = []
+    for view in build_worker_views(
+        lock_manager,
+        run_store,
+        current_host=current_host,
+        process_exists=process_exists,
+    ):
+        if view.state != "stale":
+            continue
+        lock_path = view.active.lock_path
+        if lock_path is None:
+            continue
+        stale.append(
+            StaleLock(
+                task_id=view.active.task_id,
+                run_id=view.active.run_id,
+                lock_path=lock_path,
+                stale_reason=view.stale_reason or "unknown",
+                kind="task",
+                recovery_command=f"rm -rf {lock_path}",
+            )
+        )
+
+    integration_status = lock_manager.main_integration_status(
+        current_host=current_host,
+        process_exists=process_exists,
+    )
+    if integration_status.locked and integration_status.state == "stale":
+        stale.append(
+            StaleLock(
+                task_id=MAIN_INTEGRATION_LOCK_NAME,
+                run_id=optional_string(
+                    integration_status.metadata.get("run_id")
+                ) or "",
+                lock_path=integration_status.path,
+                stale_reason=integration_status.stale_reason or "unknown",
+                kind="integration",
+                recovery_command=f"rm -rf {integration_status.path}",
+            )
+        )
+    return stale
+
+
+def clean_stale_locks(
+    stale_locks: list[StaleLock],
+) -> list[StaleLock]:
+    cleaned: list[StaleLock] = []
+    for lock in stale_locks:
+        if lock.lock_path.exists():
+            shutil.rmtree(lock.lock_path)
+            cleaned.append(lock)
+    return cleaned

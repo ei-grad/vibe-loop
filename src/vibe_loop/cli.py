@@ -60,7 +60,13 @@ from vibe_loop.task_views import (
     task_tree_json,
 )
 from vibe_loop.tasks import Task
-from vibe_loop.workers import WorkerView, build_worker_views
+from vibe_loop.workers import (
+    StaleLock,
+    WorkerView,
+    build_worker_views,
+    clean_stale_locks,
+    collect_stale_locks,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -158,6 +164,17 @@ def build_parser() -> argparse.ArgumentParser:
     workers = subparsers.add_parser("workers", help="List active worker runs")
     add_repo_argument(workers)
     workers.add_argument("--json", action="store_true")
+    workers_subparsers = workers.add_subparsers(dest="workers_command")
+    workers_clean = workers_subparsers.add_parser(
+        "clean", help="Remove stale task and integration locks"
+    )
+    add_repo_argument(workers_clean)
+    workers_clean.add_argument("--json", action="store_true")
+    workers_clean.add_argument(
+        "--force",
+        action="store_true",
+        help="Actually remove stale locks (default is dry-run)",
+    )
 
     runs = subparsers.add_parser("runs", help="Inspect recorded run results")
     add_repo_argument(runs)
@@ -431,6 +448,8 @@ def dispatch(args: argparse.Namespace) -> int:
         return run_until_done_exit_code(results)
 
     if args.command == "workers":
+        if getattr(args, "workers_command", None) == "clean":
+            return dispatch_workers_clean(args, config)
         runner = VibeRunner(config)
         workers = build_worker_views(runner.lock_manager, runner.run_store)
         if args.json:
@@ -439,6 +458,13 @@ def dispatch(args: argparse.Namespace) -> int:
             output = render_workers(workers)
             if output:
                 print(output)
+            stale = [w for w in workers if w.state == "stale"]
+            if stale:
+                print(
+                    f"\n{len(stale)} stale lock(s) found."
+                    " Run 'vibe-loop workers clean' to review,"
+                    " 'vibe-loop workers clean --force' to remove."
+                )
         return 0
 
     if args.command == "runs":
@@ -473,6 +499,14 @@ def dispatch(args: argparse.Namespace) -> int:
             task_source_runtime=task_source_runtime,
         )
         analytics_report["artifacts"] = inspect_planning_artifacts(config)
+        runner = VibeRunner(config)
+        stale = collect_stale_locks(runner.lock_manager, runner.run_store)
+        stale_report = {
+            "count": len(stale),
+            "locks": [s.to_json() for s in stale],
+        }
+        if stale:
+            stale_report["next_command"] = "vibe-loop workers clean --force"
         print(
             json.dumps(
                 {
@@ -485,6 +519,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "planning_analytics": analytics_report,
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
+                    "stale_locks": stale_report,
                 },
                 indent=2,
                 default=list,
@@ -1056,6 +1091,55 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tcommand={payload['command']}{result}{stale}"
         )
     return "\n".join(lines)
+
+
+def render_stale_locks(stale_locks: list[StaleLock]) -> str:
+    lines: list[str] = []
+    for lock in stale_locks:
+        lines.append(
+            f"{lock.task_id}\t{lock.kind}\treason={lock.stale_reason}"
+            f"\trun_id={lock.run_id}\tpath={lock.lock_path}"
+        )
+        lines.append(f"  recovery: {lock.recovery_command}")
+    return "\n".join(lines)
+
+
+def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
+    runner = VibeRunner(config)
+    stale = collect_stale_locks(runner.lock_manager, runner.run_store)
+    if not stale:
+        if args.json:
+            print(json.dumps({"stale_locks": [], "cleaned": []}, indent=2))
+        else:
+            print("No stale locks found.")
+        return 0
+    if args.force:
+        cleaned = clean_stale_locks(stale)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "stale_locks": [s.to_json() for s in stale],
+                        "cleaned": [s.to_json() for s in cleaned],
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            print(f"Removed {len(cleaned)} stale lock(s):")
+            print(render_stale_locks(cleaned))
+        return 0
+    if args.json:
+        print(
+            json.dumps(
+                {"stale_locks": [s.to_json() for s in stale], "cleaned": []},
+                indent=2,
+            )
+        )
+    else:
+        print(f"{len(stale)} stale lock(s) found (dry-run, use --force to remove):")
+        print(render_stale_locks(stale))
+    return 0
 
 
 def render_runs(runs) -> str:

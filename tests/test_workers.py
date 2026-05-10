@@ -8,8 +8,11 @@ from vibe_loop.locks import LockManager
 from vibe_loop.runs import RunResult, RunStore, WorkerReport
 from vibe_loop.workers import (
     ActiveRunState,
+    StaleLock,
     build_worker_views,
     classify_process,
+    clean_stale_locks,
+    collect_stale_locks,
     load_active_run_states,
 )
 
@@ -309,6 +312,220 @@ class WorkerStateTests(unittest.TestCase):
             )
 
         self.assertEqual(views, [])
+
+
+class StaleLockTests(unittest.TestCase):
+    def test_collect_stale_task_lock_with_missing_process(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].task_id, "TASK-01")
+        self.assertEqual(stale[0].run_id, "run-1")
+        self.assertEqual(stale[0].stale_reason, "missing_process")
+        self.assertEqual(stale[0].kind, "task")
+        self.assertIn("rm -rf", stale[0].recovery_command)
+
+    def test_collect_stale_integration_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": 999999999, "host": "test-host"},
+            )
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].task_id, "main-integration")
+        self.assertEqual(stale[0].kind, "integration")
+        self.assertEqual(stale[0].stale_reason, "missing_process")
+        self.assertIn("rm -rf", stale[0].recovery_command)
+
+    def test_collect_skips_running_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        self.assertEqual(stale, [])
+
+    def test_collect_stale_lock_with_result_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            run_store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                    start_main="abc123",
+                    end_main="def456",
+                )
+            )
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].stale_reason, "result_recorded")
+
+    def test_clean_removes_stale_lock_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            lock_path = stale[0].lock_path
+            self.assertTrue(lock_path.exists())
+
+            cleaned = clean_stale_locks(stale)
+
+        self.assertEqual(len(cleaned), 1)
+        self.assertEqual(cleaned[0].task_id, "TASK-01")
+        self.assertFalse(lock_path.exists())
+
+    def test_clean_handles_already_removed_locks(self) -> None:
+        lock = StaleLock(
+            task_id="GONE",
+            run_id="run-x",
+            lock_path=Path("/tmp/nonexistent-lock-dir"),
+            stale_reason="missing_process",
+            kind="task",
+            recovery_command="rm -rf /tmp/nonexistent-lock-dir",
+        )
+        cleaned = clean_stale_locks([lock])
+        self.assertEqual(cleaned, [])
+
+    def test_stale_lock_to_json(self) -> None:
+        lock = StaleLock(
+            task_id="T-01",
+            run_id="r-1",
+            lock_path=Path("/state/locks/T-01.lock"),
+            stale_reason="missing_process",
+            kind="task",
+            recovery_command="rm -rf /state/locks/T-01.lock",
+        )
+        payload = lock.to_json()
+        self.assertEqual(payload["task_id"], "T-01")
+        self.assertEqual(payload["run_id"], "r-1")
+        self.assertEqual(payload["stale_reason"], "missing_process")
+        self.assertEqual(payload["kind"], "task")
+        self.assertIn("rm -rf", payload["recovery_command"])
+
+    def test_collect_both_task_and_integration_stale_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": 999999999, "host": "test-host"},
+            )
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        kinds = {s.kind for s in stale}
+        self.assertEqual(kinds, {"task", "integration"})
+        self.assertEqual(len(stale), 2)
 
 
 if __name__ == "__main__":
