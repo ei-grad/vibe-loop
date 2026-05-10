@@ -359,6 +359,28 @@ def build_parser() -> argparse.ArgumentParser:
     add_local_demo_eval_arguments(release_gate, default_trials=3)
     release_gate.add_argument("--json", action="store_true")
 
+    benchmark = eval_subparsers.add_parser(
+        "benchmark",
+        help="Run external benchmark adapter eval",
+    )
+    add_repo_argument(benchmark)
+    benchmark.add_argument("--output", type=Path, required=True)
+    benchmark.add_argument(
+        "--adapter",
+        required=True,
+        help="Adapter name (registered adapters: stub)",
+    )
+    benchmark.add_argument(
+        "--agent-command",
+        action="append",
+        default=[],
+        help="CONDITION=COMMAND pairs",
+    )
+    benchmark.add_argument("--instance", action="append", default=[])
+    benchmark.add_argument("--condition", action="append", default=[])
+    benchmark.add_argument("--trials", type=int, default=1)
+    benchmark.add_argument("--timeout", type=int, default=600)
+
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
 
@@ -737,7 +759,53 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
                 print(f"record: {args.record_output}")
         return 0 if record.get("status") == "passed" else 1
 
+    if args.eval_command == "benchmark":
+        from vibe_loop.eval_benchmark import BenchmarkEvalConfig, run_benchmark_eval
+
+        adapter = resolve_benchmark_adapter(args.adapter)
+        if adapter is None:
+            print(
+                f"unknown benchmark adapter: {args.adapter}", file=sys.stderr
+            )
+            return 2
+        agent_commands = parse_agent_command_specs(args.agent_command)
+        if not agent_commands:
+            print("at least one --agent-command is required", file=sys.stderr)
+            return 2
+        bench_config = BenchmarkEvalConfig(
+            adapter=adapter,
+            output_root=args.output,
+            agent_commands=agent_commands,
+            instances=tuple(args.instance),
+            conditions=tuple(args.condition),
+            trials=args.trials,
+            timeout_seconds=args.timeout,
+        )
+        payload = run_benchmark_eval(bench_config)
+        output_path = args.output / f"{adapter.name}-results.json"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(payload, indent=2))
+        return 0
+
     raise AssertionError(args.eval_command)
+
+
+def resolve_benchmark_adapter(name: str):
+
+    adapters: dict[str, type] = {}
+    try:
+        from vibe_loop.eval_benchmark_stub import StubBenchmarkAdapter
+
+        adapters["stub"] = StubBenchmarkAdapter
+    except ImportError:
+        pass
+    cls = adapters.get(name)
+    if cls is None:
+        return None
+    return cls()
 
 
 def local_demo_config_from_args(
