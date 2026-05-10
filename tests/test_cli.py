@@ -3229,9 +3229,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(workspace["base_commit"], "base-main")
         self.assertTrue(workspace["head_commit"])
         self.assertTrue(workspace["dirty"])
-        self.assertTrue(
-            any("notes.txt" in line for line in workspace["dirty_summary"])
-        )
+        self.assertTrue(any("notes.txt" in line for line in workspace["dirty_summary"]))
         self.assertEqual(metadata["workspace"], workspace)
         self.assertEqual(records[0]["record_type"], "workspace_claim")
         self.assertEqual(records[0]["branch"], "worker/TASK-01")
