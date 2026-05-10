@@ -20,7 +20,6 @@ from vibe_loop.config import (
     AGENT_DEFAULT_POLICY_SOURCE,
     AgentDetection,
     VibeConfig,
-    AGENT_SKILL_REF_PREFIX,
     shell_quote,
     prepare_shell_command,
 )
