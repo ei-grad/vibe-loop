@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  pull_request:
   push:
     branches:
       - main
@@ -54,6 +53,16 @@ jobs:
           !startsWith(github.ref, 'refs/tags/v')
         run: |
           echo "PyPI publishing requires running this workflow from a v* tag."
+          exit 1
+
+      - name: Reject TestPyPI dispatch outside main or release tags
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.target == 'TestPyPI' &&
+          github.ref != 'refs/heads/main' &&
+          !startsWith(github.ref, 'refs/tags/v')
+        run: |
+          echo "TestPyPI publishing requires running this workflow from main or a v* tag."
           exit 1
 
       - name: Validate release tag version
