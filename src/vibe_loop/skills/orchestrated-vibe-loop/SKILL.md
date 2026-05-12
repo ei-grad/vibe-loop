@@ -69,6 +69,11 @@ Use the same reviewer for re-review when practical. Re-review must receive the
 original findings, remediation report, updated diff, and updated verification
 evidence.
 
+Model and reasoning-effort guidance in this section is coordinator-local. Do
+not pass model/effort selection policy, cost tradeoffs, or the reason a
+particular model was chosen to subagents unless the task is explicitly about
+agent configuration.
+
 ## Core Loop
 
 1. Inspect the user request, repo instructions, existing worktree state, and
@@ -147,19 +152,23 @@ place and report the reason.
 
 ## Prompt Requirements
 
-Every delegated prompt should include:
+Delegated prompts should be lean, role-scoped handoffs. Do not paste this skill,
+the full orchestration ledger, model/effort selection policy, or internal
+coordination rationale into subagent prompts. Include broader workflow context
+only when it changes that agent's allowed actions or output requirements.
 
-- the user request and current slice objective;
-- the broader flow: exploration feeds implementation, implementation evidence
-  feeds orchestrator-managed review, findings return to the original worker,
-  and the main orchestrator owns integration;
-- applicable repo/user instructions and safety constraints;
+Every delegated prompt should include only the task-local context needed for the
+role:
+
+- the user request or current slice objective;
+- role-specific scope and relevant acceptance criteria;
+- applicable repo/user instructions and safety constraints that affect the role;
 - allowed and forbidden actions for the role;
 - exact role instructions, including whether the agent is exploring,
   implementing, remediating, or reviewing;
 - exact output required from the agent;
 - file, module, branch, or worktree ownership where relevant;
-- semantic conflict domains and known dependencies;
+- semantic conflict domains and known dependencies relevant to the scope;
 - how to handle blockers and unexpected external changes.
 
 Implementation prompts must include: "You are not alone in the codebase; do not
@@ -174,8 +183,9 @@ commands and results, evidence paths or snippets, caveats, blockers, and whether
 the agent should remain available.
 
 Review prompts must avoid leaking the main agent's desired conclusion. Pass raw
-artifacts, the diff, acceptance criteria, and verification evidence. Do not ask
-for a rubber stamp.
+artifacts, the diff, acceptance criteria, and verification evidence. Do not
+include model/effort selection, unrelated ledger entries, or merge plans unless
+they are directly relevant to the review scope. Do not ask for a rubber stamp.
 
 ## Coordination Rules
 
