@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import distribution as metadata_distribution
+from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 from vibe_loop.config import (
@@ -75,10 +79,17 @@ from vibe_loop.workers import (
     collect_stale_locks,
 )
 
+PACKAGE_NAME = "vibe-loop"
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.version:
+        print(f"{PACKAGE_NAME} {package_version()}")
+        return 0
+    if args.command is None:
+        parser.error("the following arguments are required: command")
     try:
         return dispatch(args)
     except Exception as exc:
@@ -86,10 +97,111 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
 
+def package_version() -> str:
+    try:
+        version = metadata_version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        version = "0+unknown"
+    git_sha = package_git_commit_sha(version)
+    if git_sha:
+        return f"{version} (git {git_sha})"
+    return version
+
+
+def package_git_commit_sha(version: str) -> str:
+    direct_url = package_direct_url()
+    if direct_url is None:
+        return source_tree_git_commit_sha(version)
+    vcs_info = direct_url.get("vcs_info")
+    if isinstance(vcs_info, dict) and vcs_info.get("vcs") == "git":
+        requested_revision = str(vcs_info.get("requested_revision") or "")
+        if requested_revision_is_release_tag(requested_revision, version):
+            return ""
+        return short_git_sha(str(vcs_info.get("commit_id") or ""))
+    dir_info = direct_url.get("dir_info")
+    if isinstance(dir_info, dict) and dir_info.get("editable") is True:
+        return source_tree_git_commit_sha(version)
+    return ""
+
+
+def package_direct_url() -> dict[str, object] | None:
+    try:
+        raw = metadata_distribution(PACKAGE_NAME).read_text("direct_url.json")
+    except PackageNotFoundError:
+        return None
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def requested_revision_is_release_tag(revision: str, version: str) -> bool:
+    normalized = revision.strip().removeprefix("refs/tags/")
+    return normalized in {version, f"v{version}"}
+
+
+def source_tree_git_commit_sha(version: str) -> str:
+    git_root = find_source_git_root(Path(__file__).resolve())
+    if git_root is None or source_tree_has_release_tag(git_root, version):
+        return ""
+    return git_short_commit_sha(git_root)
+
+
+def find_source_git_root(path: Path) -> Path | None:
+    for parent in (path.parent, *path.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def source_tree_has_release_tag(git_root: Path, version: str) -> bool:
+    result = run_git(git_root, "tag", "--points-at", "HEAD")
+    if result is None or result.returncode != 0:
+        return False
+    release_tags = {version, f"v{version}"}
+    return any(tag.strip() in release_tags for tag in result.stdout.splitlines())
+
+
+def git_short_commit_sha(git_root: Path) -> str:
+    result = run_git(git_root, "rev-parse", "--short=12", "HEAD")
+    if result is None or result.returncode != 0:
+        return ""
+    return short_git_sha(result.stdout.strip())
+
+
+def run_git(git_root: Path, *args: str) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(
+            ("git", "-C", str(git_root), *args),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def short_git_sha(commit: str) -> str:
+    value = commit.strip().lower()
+    if len(value) < 7 or any(char not in "0123456789abcdef" for char in value):
+        return ""
+    return value[:12]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="vibe-loop")
     parser.add_argument("--repo", type=Path, default=Path.cwd())
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument(
+        "--version",
+        action="store_true",
+        help="Print the installed vibe-loop version and exit",
+    )
+    subparsers = parser.add_subparsers(dest="command")
 
     tasks_parser = subparsers.add_parser("tasks", help="Inspect task graph")
     add_repo_argument(tasks_parser)
@@ -1286,7 +1398,9 @@ def render_workers(workers: list[WorkerView]) -> str:
             )
         diagnostics = ""
         if payload["workspace_diagnostics"]:
-            diagnostics = f"\tworkspace_diagnostics={len(payload['workspace_diagnostics'])}"
+            diagnostics = (
+                f"\tworkspace_diagnostics={len(payload['workspace_diagnostics'])}"
+            )
         lines.append(
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
             f"\tprocess={payload['process_state']}\tpid={pid}"

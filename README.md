@@ -247,6 +247,7 @@ completion checks, and local run metadata.
 ## Commands
 
 ```bash
+vibe-loop --version
 vibe-loop tasks list --repo .
 vibe-loop tasks tree --repo .
 vibe-loop tasks inspect QUERY-09 --repo .
@@ -278,6 +279,10 @@ vibe-loop worker claim-workspace --repo . --run-id ... --task-id ... --branch ..
 vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
 vibe-loop install-skills --codex --claude
 ```
+
+`vibe-loop --version` prints the installed package version. Editable source-tree
+installs and non-tag Git installs append `(git <short-sha>)`; release-tag
+installs print only the package version.
 
 `--ask-agent` gives the agent the mechanically safe candidate list plus recent
 `.vibe-loop/runs.jsonl` entries and log tails. With `run-until-done --jobs N`,

@@ -16,6 +16,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import vibe_loop.cli as cli_module
 from vibe_loop.cli import main
 
 
@@ -102,7 +103,115 @@ WORK_TABLE = """# Work
 """
 
 
+class DirectUrlDistribution:
+    def __init__(self, payload: dict[str, object] | None) -> None:
+        self.payload = payload
+
+    def read_text(self, name: str) -> str | None:
+        if name != "direct_url.json" or self.payload is None:
+            return None
+        return json.dumps(self.payload)
+
+
 class CliTests(unittest.TestCase):
+    def test_version_flag_prints_package_version_without_loading_config(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+
+        with (
+            patch("vibe_loop.cli.package_version", return_value="9.8.7"),
+            patch("vibe_loop.cli.load_config", side_effect=AssertionError),
+        ):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["--version"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue(), "vibe-loop 9.8.7\n")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_package_version_includes_git_direct_url_commit_for_branch_install(
+        self,
+    ) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "git+ssh://git@github.com/ei-grad/vibe-loop.git",
+                "vcs_info": {
+                    "vcs": "git",
+                    "requested_revision": "main",
+                    "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
+                },
+            }
+        )
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch("vibe_loop.cli.source_tree_git_commit_sha", return_value=""),
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(version, "1.2.3 (git abcdef123456)")
+
+    def test_package_version_omits_git_commit_for_matching_tag_install(self) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "https://github.com/ei-grad/vibe-loop.git",
+                "vcs_info": {
+                    "vcs": "git",
+                    "requested_revision": "v1.2.3",
+                    "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
+                },
+            }
+        )
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch("vibe_loop.cli.source_tree_git_commit_sha", return_value=""),
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(version, "1.2.3")
+
+    def test_package_version_includes_source_tree_commit_for_editable_install(
+        self,
+    ) -> None:
+        distribution = DirectUrlDistribution(
+            {
+                "url": "file:///workspace/vibe-loop",
+                "dir_info": {"editable": True},
+            }
+        )
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch(
+                "vibe_loop.cli.source_tree_git_commit_sha",
+                return_value="123456789abc",
+            ),
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(version, "1.2.3 (git 123456789abc)")
+
+    def test_package_version_omits_source_tree_commit_for_regular_install(
+        self,
+    ) -> None:
+        distribution = DirectUrlDistribution(None)
+
+        with (
+            patch("vibe_loop.cli.metadata_version", return_value="1.2.3"),
+            patch("vibe_loop.cli.metadata_distribution", return_value=distribution),
+            patch(
+                "vibe_loop.cli.source_tree_git_commit_sha",
+                return_value="123456789abc",
+            ),
+        ):
+            version = cli_module.package_version()
+
+        self.assertEqual(version, "1.2.3")
+
     def test_run_next_uses_codex_default_when_only_codex_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -239,11 +348,7 @@ class CliTests(unittest.TestCase):
             finite = home / ".codex" / "skills" / "vibe-loop" / "SKILL.md"
             infinite = home / ".codex" / "skills" / "infinite-vibe-loop" / "SKILL.md"
             orchestrated = (
-                home
-                / ".codex"
-                / "skills"
-                / "orchestrated-vibe-loop"
-                / "SKILL.md"
+                home / ".codex" / "skills" / "orchestrated-vibe-loop" / "SKILL.md"
             )
             finite_text = finite.read_text(encoding="utf-8")
             infinite_text = infinite.read_text(encoding="utf-8")
