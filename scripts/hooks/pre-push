@@ -1,0 +1,73 @@
+#!/bin/sh
+set -eu
+
+zero_oid=0000000000000000000000000000000000000000
+
+fail() {
+  echo "pre-push: $*" >&2
+  exit 1
+}
+
+extract_pyproject_version() {
+  sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1
+}
+
+extract_lock_version() {
+  awk '
+    $0 == "[[package]]" { in_package = 0 }
+    $0 == "name = \"vibe-loop\"" { in_package = 1; next }
+    in_package && /^version = "/ {
+      gsub(/^version = "/, "")
+      gsub(/"$/, "")
+      print
+      exit
+    }
+  '
+}
+
+validate_release_tag() {
+  local_ref=$1
+  local_oid=$2
+  remote_ref=$3
+
+  version=${remote_ref#refs/tags/v}
+  commit=$(git rev-parse --verify "${local_oid}^{commit}") ||
+    fail "cannot resolve $local_ref ($local_oid) to a commit"
+
+  pyproject_text=$(git show "${commit}:pyproject.toml") ||
+    fail "$remote_ref points at a commit without pyproject.toml"
+  pyproject_version=$(printf '%s\n' "$pyproject_text" | extract_pyproject_version)
+
+  if [ -z "$pyproject_version" ]; then
+    fail "$remote_ref points at a commit without project.version in pyproject.toml"
+  fi
+
+  if [ "$pyproject_version" != "$version" ]; then
+    fail "$remote_ref does not match pyproject.toml version $pyproject_version"
+  fi
+
+  lock_text=$(git show "${commit}:uv.lock") ||
+    fail "$remote_ref points at a commit without uv.lock"
+  lock_version=$(printf '%s\n' "$lock_text" | extract_lock_version)
+
+  if [ -z "$lock_version" ]; then
+    fail "$remote_ref points at a uv.lock without a vibe-loop package version"
+  fi
+
+  if [ "$lock_version" != "$version" ]; then
+    fail "$remote_ref does not match uv.lock vibe-loop version $lock_version"
+  fi
+}
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+  case "$remote_ref" in
+    refs/tags/v*) ;;
+    *) continue ;;
+  esac
+
+  if [ "$local_oid" = "$zero_oid" ]; then
+    continue
+  fi
+
+  validate_release_tag "$local_ref" "$local_oid" "$remote_ref"
+done

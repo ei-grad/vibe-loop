@@ -633,6 +633,21 @@ uv build
 uv run --with twine --no-project python -m twine check dist/*
 ```
 
+The `Makefile` wraps the common release steps:
+
+```bash
+make install-hooks
+make bump-patch
+make bump-minor
+make check
+make tag
+```
+
+`make tag` uses the current `uv version --short` value by default. Pass
+`VERSION=...` to check or tag an explicit version. The installed `pre-push` hook
+rejects pushed `v*` tags when `pyproject.toml` or the `vibe-loop` entry in
+`uv.lock` does not match the tag version.
+
 Releases are built by `.github/workflows/release.yml`. The workflow uses PyPI
 trusted publishing with the GitHub environments named `TestPyPI` and `PyPI`.
 Run the workflow manually with target `TestPyPI` for a staging upload. To publish
