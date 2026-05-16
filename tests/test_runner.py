@@ -1197,5 +1197,220 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("\ufffd", log_text)
 
 
+class TransientWorkerFailureTests(unittest.TestCase):
+    def test_is_transient_worker_failure_detects_quota_in_log(self) -> None:
+        from vibe_loop.runner import is_transient_worker_failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            log_path.write_text(
+                "starting task\nworking...\n"
+                "Error: 429 Too Many Requests\n"
+                "API quota exceeded\n",
+                encoding="utf-8",
+            )
+            result = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="failed",
+                exit_code=1,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+            )
+            self.assertTrue(is_transient_worker_failure(result))
+
+    def test_is_transient_worker_failure_ignores_non_transient_log(self) -> None:
+        from vibe_loop.runner import is_transient_worker_failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            log_path.write_text(
+                "starting task\nsyntax error at line 5\n",
+                encoding="utf-8",
+            )
+            result = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="failed",
+                exit_code=1,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+            )
+            self.assertFalse(is_transient_worker_failure(result))
+
+    def test_is_transient_worker_failure_ignores_completed(self) -> None:
+        from vibe_loop.runner import is_transient_worker_failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            log_path.write_text("rate limit\n", encoding="utf-8")
+            result = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="completed",
+                exit_code=0,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+            )
+            self.assertFalse(is_transient_worker_failure(result))
+
+    def test_is_transient_worker_failure_ignores_blocked_worker_report(self) -> None:
+        from vibe_loop.runner import is_transient_worker_failure
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "run.log"
+            log_path.write_text("rate limit\n", encoding="utf-8")
+            result = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="blocked",
+                exit_code=1,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+                worker_report={"status": "blocked", "message": "needs approval"},
+            )
+            self.assertFalse(is_transient_worker_failure(result))
+
+    def test_serial_loop_retries_transient_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("Error: 429 rate limit\n", encoding="utf-8")
+
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            call_count = 0
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal call_count
+                call_count += 1
+                if call_count <= 2:
+                    return RunResult(
+                        run_id=f"run-{call_count}",
+                        task_id=task.task_id,
+                        classification="failed",
+                        exit_code=1,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id=f"run-{call_count}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+            with patch("vibe_loop.runner.time.sleep"):
+                results = runner.run_until_done_serial()
+
+        self.assertEqual(call_count, 3)
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results[-1].classification, "completed")
+
+    def test_serial_loop_gives_up_after_max_transient_retries(self) -> None:
+        from vibe_loop.runner import MAX_TRANSIENT_TASK_RETRIES
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("Error: 503 Service Unavailable\n", encoding="utf-8")
+
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+
+            def run_task(task: Task) -> RunResult:
+                return RunResult(
+                    run_id="run-1",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+            with patch("vibe_loop.runner.time.sleep"):
+                results = runner.run_until_done_serial(continue_on_failure=True)
+
+        self.assertEqual(len(results), MAX_TRANSIENT_TASK_RETRIES + 1)
+        self.assertTrue(all(r.classification == "failed" for r in results))
+
+    def test_parallel_loop_retries_transient_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            call_count = 0
+            call_lock = threading.Lock()
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal call_count
+                with call_lock:
+                    call_count += 1
+                    current = call_count
+                if current == 1:
+                    return RunResult(
+                        run_id="run-1",
+                        task_id=task.task_id,
+                        classification="failed",
+                        exit_code=1,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-2",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done_parallel(
+                ask_agent=False,
+                max_slices=0,
+                continue_on_failure=False,
+                jobs=1,
+            )
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[-1].classification, "completed")
+
+
 if __name__ == "__main__":
     unittest.main()

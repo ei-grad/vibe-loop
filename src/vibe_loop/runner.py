@@ -28,6 +28,10 @@ from vibe_loop.generated_profiles import (
     resolve_runtime_task_source,
 )
 from vibe_loop.locks import LockBusy, LockManager, TaskLock
+from vibe_loop.retry import (
+    is_transient_stderr,
+    retry_subprocess_run,
+)
 from vibe_loop.runs import RunResult, RunStore, WorkerReport
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
@@ -121,6 +125,8 @@ CLI output before making assumptions.
 """
 RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS = 5.0
 RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
+MAX_TRANSIENT_TASK_RETRIES = 3
+TRANSIENT_COOLDOWN_SECONDS = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -303,7 +309,7 @@ class VibeRunner:
         command_str = command_template.format(prompt=shell_quote(prompt))
         cmd, use_shell = prepare_shell_command(command_str)
         try:
-            result = subprocess.run(
+            result = retry_subprocess_run(
                 cmd,
                 cwd=self.config.repo,
                 shell=use_shell,
@@ -313,6 +319,7 @@ class VibeRunner:
                 encoding="utf-8",
                 errors="replace",
                 timeout=900,
+                on_retry=_selection_retry_callback,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -344,7 +351,7 @@ class VibeRunner:
         command_str = command_template.format(prompt=shell_quote(prompt))
         cmd, use_shell = prepare_shell_command(command_str)
         try:
-            result = subprocess.run(
+            result = retry_subprocess_run(
                 cmd,
                 cwd=self.config.repo,
                 shell=use_shell,
@@ -354,6 +361,7 @@ class VibeRunner:
                 encoding="utf-8",
                 errors="replace",
                 timeout=900,
+                on_retry=_selection_retry_callback,
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -657,13 +665,29 @@ class VibeRunner:
     ) -> list[RunResult]:
         results: list[RunResult] = []
         skipped: set[str] = set()
+        transient_retries: dict[str, int] = {}
         while max_slices <= 0 or len(results) < max_slices:
             result = self.run_next(ask_agent=ask_agent, exclude=skipped)
             if result is None:
                 break
             results.append(result)
             if result.classification == "completed":
+                transient_retries.pop(result.task_id, None)
                 continue
+            if is_transient_worker_failure(result):
+                count = transient_retries.get(result.task_id, 0) + 1
+                transient_retries[result.task_id] = count
+                if count <= MAX_TRANSIENT_TASK_RETRIES:
+                    report_status(
+                        f"transient failure for {result.task_id} "
+                        f"(attempt {count}/{MAX_TRANSIENT_TASK_RETRIES}), "
+                        f"cooling down {TRANSIENT_COOLDOWN_SECONDS:.0f}s"
+                    )
+                    time.sleep(TRANSIENT_COOLDOWN_SECONDS)
+                    continue
+                report_status(
+                    f"transient retries exhausted for {result.task_id}, skipping"
+                )
             skipped.add(result.task_id)
             if not continue_on_failure and result.classification in {
                 "failed",
@@ -681,6 +705,7 @@ class VibeRunner:
     ) -> list[RunResult]:
         results: list[RunResult] = []
         skipped: set[str] = set()
+        transient_retries: dict[str, int] = {}
         in_flight: dict[Future[RunResult], str] = {}
         scheduled: dict[str, Task] = {}
         command_validated = False
@@ -757,7 +782,22 @@ class VibeRunner:
                         continue
                     results.append(result)
                     if result.classification == "completed":
+                        transient_retries.pop(result.task_id, None)
                         continue
+                    if is_transient_worker_failure(result):
+                        count = transient_retries.get(result.task_id, 0) + 1
+                        transient_retries[result.task_id] = count
+                        if count <= MAX_TRANSIENT_TASK_RETRIES:
+                            report_status(
+                                f"transient failure for {result.task_id} "
+                                f"(attempt {count}/{MAX_TRANSIENT_TASK_RETRIES}), "
+                                "will re-enqueue"
+                            )
+                            continue
+                        report_status(
+                            f"transient retries exhausted for {result.task_id}, "
+                            "skipping"
+                        )
                     skipped.add(result.task_id)
                     if result.classification in {"failed", "unknown"}:
                         stop_after_running = not continue_on_failure
@@ -1280,6 +1320,48 @@ def new_run_id(task_id: str) -> str:
 
 def format_detected_agents(detected: AgentDetection) -> str:
     return detected.summary()
+
+
+def _selection_retry_callback(attempt: int, delay: float, reason: str) -> None:
+    report_status(
+        f"agent selection retry {attempt} after {delay:.1f}s: {reason}"
+    )
+
+
+LOG_TAIL_LINES_FOR_TRANSIENT_CHECK = 50
+
+
+def is_transient_worker_failure(
+    result: RunResult,
+    log_tail_lines: int = LOG_TAIL_LINES_FOR_TRANSIENT_CHECK,
+) -> bool:
+    if result.exit_code == 0:
+        return False
+    if result.classification == "completed":
+        return False
+    worker_report = result.worker_report
+    if isinstance(worker_report, dict):
+        status = worker_report.get("status")
+        if status in {"completed", "blocked"}:
+            return False
+    log_path = result.log_path
+    if not isinstance(log_path, Path) or not log_path.exists():
+        return False
+    try:
+        tail = _read_log_tail(log_path, log_tail_lines)
+    except OSError:
+        return False
+    return is_transient_stderr(tail)
+
+
+def _read_log_tail(path: Path, max_lines: int) -> str:
+    lines: list[str] = []
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            lines.append(line)
+            if len(lines) > max_lines:
+                lines.pop(0)
+    return "".join(lines)
 
 
 def git_rev_parse(repo: Path, rev: str) -> str:

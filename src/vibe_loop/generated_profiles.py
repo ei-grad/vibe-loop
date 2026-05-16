@@ -24,6 +24,9 @@ from vibe_loop.generated_discovery import (
     EvidenceBundle,
     collect_generated_discovery_evidence,
 )
+from vibe_loop.retry import (
+    retry_subprocess_run,
+)
 
 
 GENERATED_PROFILE_CONFIDENCE_THRESHOLD = 0.7
@@ -406,7 +409,7 @@ def configure_generated_task_source(
     command_str = command_template.format(prompt=shell_quote(prompt))
     cmd, use_shell = prepare_shell_command(command_str)
     try:
-        result = subprocess.run(
+        result = retry_subprocess_run(
             cmd,
             cwd=config.repo,
             shell=use_shell,
@@ -416,6 +419,7 @@ def configure_generated_task_source(
             encoding="utf-8",
             errors="replace",
             timeout=900,
+            on_retry=_configure_retry_callback,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         payload = build_degraded_cache(
@@ -1722,6 +1726,15 @@ def agent_name_from_source(source: str) -> str:
     if source.startswith("unresolved:"):
         return "unresolved"
     return "unknown"
+
+
+def _configure_retry_callback(attempt: int, delay: float, reason: str) -> None:
+    import sys
+
+    print(
+        f"[vibe-loop] task configure retry {attempt} after {delay:.1f}s: {reason}",
+        file=sys.stderr,
+    )
 
 
 def generated_timestamp() -> str:
