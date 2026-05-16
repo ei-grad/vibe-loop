@@ -4,6 +4,7 @@ import dataclasses
 import json
 import math
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -1729,8 +1730,6 @@ def agent_name_from_source(source: str) -> str:
 
 
 def _configure_retry_callback(attempt: int, delay: float, reason: str) -> None:
-    import sys
-
     print(
         f"[vibe-loop] task configure retry {attempt} after {delay:.1f}s: {reason}",
         file=sys.stderr,

@@ -1355,13 +1355,13 @@ def is_transient_worker_failure(
 
 
 def _read_log_tail(path: Path, max_lines: int) -> str:
-    lines: list[str] = []
+    from collections import deque
+
+    tail: deque[str] = deque(maxlen=max_lines)
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
-            lines.append(line)
-            if len(lines) > max_lines:
-                lines.pop(0)
-    return "".join(lines)
+            tail.append(line)
+    return "".join(tail)
 
 
 def git_rev_parse(repo: Path, rev: str) -> str:

@@ -9,16 +9,15 @@ from collections.abc import Callable
 from typing import Any
 
 TRANSIENT_STDERR_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?:^|(?:error|status|HTTP|code)[:\s]*)\b429\b", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"(?:^|(?:error|status|HTTP|code)[:\s]*)\b500\b", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"(?:^|(?:error|status|HTTP|code)[:\s]*)\b502\b", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"(?:^|(?:error|status|HTTP|code)[:\s]*)\b503\b", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"(?:^|(?:error|status|HTTP|code)[:\s]*)\b529\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(
+        r"(?:error|status|HTTP|code)[:\s/\d.]*\b(429|500|502|503|529)\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"rate[_\s-]?limit", re.IGNORECASE),
-    re.compile(r"quota", re.IGNORECASE),
+    re.compile(r"\bquota\b", re.IGNORECASE),
     re.compile(r"overloaded", re.IGNORECASE),
     re.compile(r"throttl", re.IGNORECASE),
-    re.compile(r"capacity", re.IGNORECASE),
+    re.compile(r"\bcapacity\b", re.IGNORECASE),
     re.compile(r"too\s+many\s+requests", re.IGNORECASE),
     re.compile(r"server\s+error", re.IGNORECASE),
     re.compile(r"service\s+unavailable", re.IGNORECASE),
@@ -87,7 +86,7 @@ def retry_subprocess_run(
     sleep: Callable[[float], None] = time.sleep,
     **subprocess_kwargs: Any,
 ) -> subprocess.CompletedProcess[str]:
-    last_exc: OSError | subprocess.TimeoutExpired | None = None
+    max_retries = max(max_retries, 0)
     for attempt in range(max_retries + 1):
         try:
             result = subprocess.run(cmd, **subprocess_kwargs)
@@ -102,7 +101,6 @@ def retry_subprocess_run(
         except OSError as exc:
             if not is_transient_oserror(exc) or attempt >= max_retries:
                 raise
-            last_exc = exc
             delay = backoff_delay(attempt, base_delay, max_delay, jitter)
             if on_retry:
                 on_retry(attempt + 1, delay, f"OSError: {exc}")
@@ -124,5 +122,4 @@ def retry_subprocess_run(
             on_retry(attempt + 1, delay, reason)
         sleep(delay)
 
-    assert last_exc is not None
-    raise last_exc
+    raise RuntimeError("retry_subprocess_run: unreachable")

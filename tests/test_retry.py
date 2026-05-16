@@ -59,6 +59,12 @@ class TransientStderrDetectionTests(unittest.TestCase):
 
     def test_does_not_match_bare_numbers_in_context(self) -> None:
         self.assertFalse(is_transient_stderr("processed 500 items successfully"))
+        self.assertFalse(is_transient_stderr("502 items processed"))
+        self.assertFalse(is_transient_stderr("429 connections"))
+
+    def test_detects_http_version_status_format(self) -> None:
+        self.assertTrue(is_transient_stderr("HTTP/1.1 503 Service Unavailable"))
+        self.assertTrue(is_transient_stderr("HTTP/2 429"))
 
 
 class TransientOSErrorTests(unittest.TestCase):
@@ -316,7 +322,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
     def test_zero_max_retries_no_retry(self) -> None:
         fake_sleep = MagicMock()
         transient = subprocess.CompletedProcess(
-            args=["test"], returncode=1, stdout="", stderr="429 rate limit"
+            args=["test"], returncode=1, stdout="", stderr="error 429 rate limit"
         )
         with patch("subprocess.run", return_value=transient):
             result = retry_subprocess_run(
@@ -325,6 +331,23 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 stderr=subprocess.PIPE,
                 text=True,
                 max_retries=0,
+                sleep=fake_sleep,
+            )
+        self.assertEqual(result.returncode, 1)
+        fake_sleep.assert_not_called()
+
+    def test_negative_max_retries_treated_as_zero(self) -> None:
+        fake_sleep = MagicMock()
+        transient = subprocess.CompletedProcess(
+            args=["test"], returncode=1, stdout="", stderr="error 429 rate limit"
+        )
+        with patch("subprocess.run", return_value=transient):
+            result = retry_subprocess_run(
+                ["test"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                max_retries=-1,
                 sleep=fake_sleep,
             )
         self.assertEqual(result.returncode, 1)
