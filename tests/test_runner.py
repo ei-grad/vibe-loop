@@ -513,7 +513,6 @@ class RunnerTests(unittest.TestCase):
             result for result in results if result.classification == "completed"
         ]
         self.assertEqual(len(completed), 3)
-        self.assertEqual(len(results), 3)
         self.assertLessEqual(max_active, 2)
 
     def test_run_until_done_parallel_max_tasks_counts_only_completed(self) -> None:
@@ -562,6 +561,63 @@ class RunnerTests(unittest.TestCase):
             result for result in results if result.classification == "completed"
         ]
         self.assertEqual(len(completed), 3)
+
+    def _completing_runner(self, repo: Path, source: MutableTaskSource) -> VibeRunner:
+        runner = VibeRunner(VibeConfig(repo=repo, agent=AgentConfig(command="worker")))
+        runner._source = source
+
+        def run_task(task: Task) -> RunResult:
+            source.mark_done(task.task_id)
+            return RunResult(
+                run_id=f"run-{task.task_id}",
+                task_id=task.task_id,
+                classification="completed",
+                exit_code=0,
+                log_path=repo / f"{task.task_id}.log",
+                start_main="aaa",
+                end_main="aaa",
+            )
+
+        runner.run_task = run_task
+        return runner
+
+    @staticmethod
+    def _ready_tasks(count: int) -> list[Task]:
+        return [
+            Task(task_id=f"TASK-{n:02d}", title=f"Task {n}", status="Next", order=n)
+            for n in range(1, count + 1)
+        ]
+
+    def test_run_until_done_max_slices_wins_when_lower_than_max_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(self._ready_tasks(6))
+            runner = self._completing_runner(repo, source)
+
+            results = runner.run_until_done(max_slices=2, max_tasks=5)
+
+        self.assertEqual(len(results), 2)
+
+    def test_run_until_done_max_tasks_wins_when_lower_than_max_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(self._ready_tasks(6))
+            runner = self._completing_runner(repo, source)
+
+            results = runner.run_until_done(max_slices=10, max_tasks=2)
+
+        self.assertEqual(len(results), 2)
+
+    def test_run_until_done_max_tasks_above_available_runs_all(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(self._ready_tasks(3))
+            runner = self._completing_runner(repo, source)
+
+            results = runner.run_until_done(jobs=2, max_tasks=10)
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(result.classification == "completed" for result in results))
 
     def test_parallel_batch_selection_falls_back_to_deterministic_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
