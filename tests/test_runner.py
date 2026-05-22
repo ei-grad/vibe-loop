@@ -608,6 +608,16 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(len(results), 2)
 
+    def test_run_until_done_parallel_first_limit_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(self._ready_tasks(6))
+            runner = self._completing_runner(repo, source)
+
+            results = runner.run_until_done(jobs=2, max_slices=2, max_tasks=5)
+
+        self.assertEqual(len(results), 2)
+
     def test_run_until_done_max_tasks_above_available_runs_all(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
