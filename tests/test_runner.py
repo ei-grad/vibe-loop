@@ -426,6 +426,143 @@ class RunnerTests(unittest.TestCase):
             ["TASK-01", "TASK-02"],
         )
 
+    def test_run_until_done_serial_stops_after_max_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id=f"TASK-0{n}",
+                        title=f"Task {n}",
+                        status="Next",
+                        order=n,
+                    )
+                    for n in range(1, 5)
+                ]
+            )
+            runner._source = source
+
+            def run_task(task: Task) -> RunResult:
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done(max_tasks=2)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.classification == "completed" for result in results))
+
+    def test_run_until_done_parallel_stops_after_max_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id=f"TASK-0{n}",
+                        title=f"Task {n}",
+                        status="Next",
+                        order=n,
+                    )
+                    for n in range(1, 7)
+                ]
+            )
+            runner._source = source
+            active = 0
+            max_active = 0
+            active_lock = threading.Lock()
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                time.sleep(0.02)
+                source.mark_done(task.task_id)
+                with active_lock:
+                    active -= 1
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done(jobs=2, max_tasks=3)
+
+        completed = [
+            result for result in results if result.classification == "completed"
+        ]
+        self.assertEqual(len(completed), 3)
+        self.assertEqual(len(results), 3)
+        self.assertLessEqual(max_active, 2)
+
+    def test_run_until_done_parallel_max_tasks_counts_only_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id=f"TASK-0{n}",
+                        title=f"Task {n}",
+                        status="Next",
+                        order=n,
+                    )
+                    for n in range(1, 7)
+                ]
+            )
+            runner._source = source
+            failing = {"TASK-02", "TASK-04"}
+
+            def run_task(task: Task) -> RunResult:
+                if task.task_id in failing:
+                    classification = "failed"
+                else:
+                    source.mark_done(task.task_id)
+                    classification = "completed"
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification=classification,
+                    exit_code=0 if classification == "completed" else 1,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done(
+                jobs=2, max_tasks=3, continue_on_failure=True
+            )
+
+        completed = [
+            result for result in results if result.classification == "completed"
+        ]
+        self.assertEqual(len(completed), 3)
+
     def test_parallel_batch_selection_falls_back_to_deterministic_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

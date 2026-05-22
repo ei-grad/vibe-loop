@@ -310,6 +310,14 @@ stderr, `session_id` stores that native worker id and `session_id_source` is
 keep up to `N` finite worker commands active at once; each worker still gets its
 own task lock, run id, and log path. `run-next` always runs a single worker.
 
+Two independent stop limits bound a `run-until-done` session. `--max-slices N`
+caps the total number of dispatched slices, counting every attempt regardless of
+outcome. `--max-tasks N` stops once `N` slices have been classified `completed`;
+failed, blocked, and unknown results do not consume the budget. Both default to
+`0` (unlimited), and whichever limit is reached first ends the loop. Under
+`--jobs`, the parallel scheduler never dispatches more in-flight work than the
+remaining `--max-tasks` budget allows, so completed runs do not overshoot `N`.
+
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill
 conditions and agent commands, writes per-trial artifacts, and emits

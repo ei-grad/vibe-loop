@@ -641,6 +641,7 @@ class VibeRunner:
         max_slices: int = 0,
         continue_on_failure: bool = False,
         jobs: int = 1,
+        max_tasks: int = 0,
     ) -> list[RunResult]:
         if jobs < 1:
             raise ValueError("run-until-done --jobs must be at least 1")
@@ -649,12 +650,14 @@ class VibeRunner:
                 ask_agent=ask_agent,
                 max_slices=max_slices,
                 continue_on_failure=continue_on_failure,
+                max_tasks=max_tasks,
             )
         return self.run_until_done_parallel(
             ask_agent=ask_agent,
             max_slices=max_slices,
             continue_on_failure=continue_on_failure,
             jobs=jobs,
+            max_tasks=max_tasks,
         )
 
     def run_until_done_serial(
@@ -662,10 +665,12 @@ class VibeRunner:
         ask_agent: bool = False,
         max_slices: int = 0,
         continue_on_failure: bool = False,
+        max_tasks: int = 0,
     ) -> list[RunResult]:
         results: list[RunResult] = []
         skipped: set[str] = set()
         transient_retries: dict[str, int] = {}
+        completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
             result = self.run_next(ask_agent=ask_agent, exclude=skipped)
             if result is None:
@@ -673,6 +678,9 @@ class VibeRunner:
             results.append(result)
             if result.classification == "completed":
                 transient_retries.pop(result.task_id, None)
+                completed_count += 1
+                if max_tasks > 0 and completed_count >= max_tasks:
+                    break
                 continue
             if is_transient_worker_failure(result):
                 count = transient_retries.get(result.task_id, 0) + 1
@@ -702,10 +710,12 @@ class VibeRunner:
         max_slices: int,
         continue_on_failure: bool,
         jobs: int,
+        max_tasks: int = 0,
     ) -> list[RunResult]:
         results: list[RunResult] = []
         skipped: set[str] = set()
         transient_retries: dict[str, int] = {}
+        completed_count = 0
         in_flight: dict[Future[RunResult], str] = {}
         scheduled: dict[str, Task] = {}
         command_validated = False
@@ -721,6 +731,7 @@ class VibeRunner:
                     not stop_after_running
                     and len(in_flight) < jobs
                     and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
+                    and (max_tasks <= 0 or completed_count + len(in_flight) < max_tasks)
                 ):
                     candidates = self.list_candidates(exclude=skipped | set(scheduled))
                     candidates = filter_scheduled_conflicts(
@@ -737,6 +748,11 @@ class VibeRunner:
                         open_slots = min(
                             open_slots,
                             max_slices - len(results) - len(in_flight),
+                        )
+                    if max_tasks > 0:
+                        open_slots = min(
+                            open_slots,
+                            max_tasks - completed_count - len(in_flight),
                         )
                     tasks = self.select_batch_from_candidates(
                         candidates,
@@ -783,6 +799,9 @@ class VibeRunner:
                     results.append(result)
                     if result.classification == "completed":
                         transient_retries.pop(result.task_id, None)
+                        completed_count += 1
+                        if max_tasks > 0 and completed_count >= max_tasks:
+                            stop_after_running = True
                         continue
                     if is_transient_worker_failure(result):
                         count = transient_retries.get(result.task_id, 0) + 1

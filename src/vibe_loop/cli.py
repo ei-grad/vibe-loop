@@ -277,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(run_all)
     run_all.add_argument("--ask-agent", action="store_true")
     run_all.add_argument("--max-slices", type=int, default=0)
+    run_all.add_argument("--max-tasks", type=int, default=0)
     run_all.add_argument("--continue-on-failure", action="store_true")
     run_all.add_argument("--jobs", type=int, default=1)
 
@@ -603,6 +604,7 @@ def dispatch(args: argparse.Namespace) -> int:
             max_slices=args.max_slices,
             continue_on_failure=args.continue_on_failure,
             jobs=args.jobs,
+            max_tasks=args.max_tasks,
         )
         print(json.dumps([result.to_json() for result in results], indent=2))
         return run_until_done_exit_code(results)
