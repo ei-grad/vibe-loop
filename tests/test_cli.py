@@ -785,6 +785,68 @@ class CliTests(unittest.TestCase):
             self.assertIn("worker report status=completed", log_text)
             self.assertIn(f"[vibe-loop] log: {result['log']}", stderr.getvalue())
 
+    def test_run_until_done_max_tasks_stops_after_completed_budget(self) -> None:
+        with temporary_directory_with_cleanup_retry() as directory:
+            repo = Path(directory) / "repo"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(THREE_TASK_PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "import os\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from vibe_loop.cli import main\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
+                "            '--task-id', os.environ['VIBE_LOOP_TASK_ID'],\n"
+                "            '--status', 'completed',\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--jobs",
+                        "2",
+                        "--max-tasks",
+                        "2",
+                    ]
+                )
+
+            payload = parse_run_result(self, stdout, stderr, exit_code)
+
+        self.assertEqual(exit_code, 0)
+        # Three tasks are runnable but the completed budget is two: the loop
+        # must stop after two completed slices and never dispatch the third.
+        self.assertEqual(len(payload), 2)
+        self.assertTrue(
+            all(result["classification"] == "completed" for result in payload)
+        )
+        self.assertEqual(
+            sorted(result["task_id"] for result in payload),
+            ["TASK-01", "TASK-02"],
+        )
+        self.assertNotIn("TASK-03", {result["task_id"] for result in payload})
+        self.assertIn("[vibe-loop] parallel supervisor jobs=2", stderr.getvalue())
+
     def test_run_until_done_jobs_uses_agent_batch_selection(self) -> None:
         with temporary_directory_with_cleanup_retry() as directory:
             repo = Path(directory) / "repo"
