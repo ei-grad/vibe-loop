@@ -695,7 +695,7 @@ Install the repository tools with `uv`, then run the standard checks:
 uv sync
 uv run python -m unittest discover
 uv build
-uv run --with twine --no-project python -m twine check dist/*
+uv run --with twine --no-project -m twine check dist/*
 ```
 
 The `Makefile` wraps the common release steps:
