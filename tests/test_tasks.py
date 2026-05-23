@@ -129,6 +129,305 @@ class MarkdownPlanTests(unittest.TestCase):
 
         self.assertIn("DEMO-02", [task.task_id for task in tasks])
 
+    def test_ralphex_markdown_source_extracts_headings_and_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(ralphex_fixture_text(), encoding="utf-8")
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+            candidates = runnable_tasks(source, ("Active", "Next", "Planned"))
+
+        self.assertEqual(
+            [task.task_id for task in tasks],
+            [
+                "docs.plans.checkout:task-1",
+                "docs.plans.checkout:iteration-2.5",
+            ],
+        )
+        self.assertEqual(tasks[0].title, "Add checkout API")
+        self.assertEqual(tasks[0].section, "Checkout Flow")
+        self.assertEqual(tasks[0].status, "Planned")
+        self.assertEqual(tasks[0].resources, ("api", "checkout"))
+        self.assertEqual(
+            tasks[0].paths,
+            ("src/checkout.py", "tests/test_checkout.py"),
+        )
+        self.assertTrue(tasks[0].conflict_domains_known)
+        self.assertIn("Add checkout handler", tasks[0].acceptance)
+        self.assertIn(
+            "uv run -m pytest tests/test_checkout.py",
+            tasks[0].evidence,
+        )
+        self.assertNotIn("Add checkout handler", tasks[0].evidence)
+        self.assertNotIn("Resources:", tasks[0].evidence)
+        self.assertEqual(tasks[1].status, "Done")
+        self.assertEqual(tasks[1].resources, ())
+        self.assertEqual(tasks[1].paths, ())
+        self.assertTrue(tasks[1].conflict_domains_known)
+        self.assertEqual([task.task_id for task in candidates], [tasks[0].task_id])
+
+    def test_ralphex_markdown_source_discovers_single_plan_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(ralphex_fixture_text(), encoding="utf-8")
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(type="ralphex-markdown"),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].task_id, "docs.plans.checkout:task-1")
+
+    def test_ralphex_markdown_discovery_ignores_fenced_validation_examples(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            first = repo / "a.md"
+            second = repo / "b.md"
+            first.write_text(
+                "# Plan: A\n\n"
+                "```markdown\n"
+                "## Validation Commands\n"
+                "- fake validate\n"
+                "```\n\n"
+                "### Task 1: A\n"
+                "- [ ] Work\n",
+                encoding="utf-8",
+            )
+            second.write_text(
+                "# Plan: B\n\n### Task 1: B\n- [ ] Work\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "multiple ralphex markdown plan files tied",
+            ):
+                build_task_source(repo, TaskSourceConfig(type="ralphex-markdown"))
+
+    def test_ralphex_markdown_source_sanitizes_plan_path_in_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout flow.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(ralphex_fixture_text(), encoding="utf-8")
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout flow.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].task_id, "docs.plans.checkout-flow:task-1")
+
+    def test_ralphex_markdown_source_uses_plan_level_conflict_surface(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(
+                "# Plan: Checkout Flow\n\n"
+                "## Conflict Surface\n"
+                "- Resources: checkout, api\n"
+                "- Paths: src/checkout.py, tests/test_checkout.py\n\n"
+                "## Validation Commands\n"
+                "- `uv run -m pytest tests/test_checkout.py`\n\n"
+                "### Task 1: Add checkout API\n"
+                "- [ ] Add checkout handler\n",
+                encoding="utf-8",
+            )
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].resources, ("checkout", "api"))
+        self.assertEqual(
+            tasks[0].paths,
+            ("src/checkout.py", "tests/test_checkout.py"),
+        )
+        self.assertTrue(tasks[0].conflict_domains_known)
+
+    def test_ralphex_markdown_source_reads_unlabeled_conflict_surface_paths(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(
+                "# Plan: Checkout Flow\n\n"
+                "## Conflict Surface\n"
+                "Owned by this plan:\n"
+                "- `src/checkout.py`\n"
+                "- tests/test_checkout.py\n"
+                "- Makefile\n"
+                "- README.md\n"
+                "- `.vibe-loop.toml`\n"
+                "- `tools/task-tool` plus tests\n\n"
+                "- src/a.py, plus tests\n"
+                "- docs/notes.md.\n"
+                "- Kernel, scheduler, and runtime behavior\n\n"
+                "### Task 1: Add checkout API\n"
+                "- [ ] Add checkout handler\n",
+                encoding="utf-8",
+            )
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(
+            tasks[0].paths,
+            (
+                "src/checkout.py",
+                "tests/test_checkout.py",
+                "Makefile",
+                "README.md",
+                ".vibe-loop.toml",
+                "tools/task-tool",
+                "src/a.py",
+                "docs/notes.md",
+            ),
+        )
+        self.assertTrue(tasks[0].conflict_domains_known)
+
+    def test_ralphex_markdown_source_blank_task_labels_override_plan_domains(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(
+                "# Plan: Checkout Flow\n\n"
+                "## Conflict Surface\n"
+                "- Resources: checkout\n"
+                "- Paths: src/checkout.py\n\n"
+                "### Task 1: Add checkout API\n"
+                "- [ ] Add checkout handler\n"
+                "- Resources:\n"
+                "- Paths:\n",
+                encoding="utf-8",
+            )
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].resources, ())
+        self.assertEqual(tasks[0].paths, ())
+        self.assertFalse(tasks[0].conflict_domains_known)
+
+    def test_ralphex_markdown_source_splits_task_conflict_surface_label(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(
+                "# Plan: Checkout Flow\n\n"
+                "### Task 1: Add checkout API\n"
+                "- [ ] Add checkout handler\n"
+                "- Conflict Surface: resources: checkout, api; "
+                "paths: src/checkout.py, tests/test_checkout.py\n",
+                encoding="utf-8",
+            )
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].resources, ("checkout", "api"))
+        self.assertEqual(
+            tasks[0].paths,
+            ("src/checkout.py", "tests/test_checkout.py"),
+        )
+        self.assertTrue(tasks[0].conflict_domains_known)
+
+    def test_ralphex_markdown_source_reads_multiple_configured_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            first = repo / "docs" / "plans" / "checkout.md"
+            second = repo / "docs" / "plans" / "refund.md"
+            first.parent.mkdir(parents=True)
+            first.write_text(ralphex_fixture_text(), encoding="utf-8")
+            second.write_text(
+                ralphex_fixture_text().replace(
+                    "# Plan: Checkout Flow",
+                    "# Plan: Refund Flow",
+                ),
+                encoding="utf-8",
+            )
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_paths=(
+                        "docs/plans/checkout.md",
+                        "docs/plans/refund.md",
+                    ),
+                    explicit_keys=frozenset({"type", "plan_paths"}),
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(
+            [task.task_id for task in tasks],
+            [
+                "docs.plans.checkout:task-1",
+                "docs.plans.checkout:iteration-2.5",
+                "docs.plans.refund:task-1",
+                "docs.plans.refund:iteration-2.5",
+            ],
+        )
+
     def test_profile_table_supports_column_aliases_and_reordered_columns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -560,6 +859,12 @@ def list_profile() -> dict[str, object]:
             "blocked": ["Blocked"],
         },
     }
+
+
+def ralphex_fixture_text() -> str:
+    return (Path(__file__).parent / "fixtures" / "ralphex-plan.md").read_text(
+        encoding="utf-8"
+    )
 
 
 if __name__ == "__main__":

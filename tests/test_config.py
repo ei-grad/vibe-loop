@@ -289,6 +289,23 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.task_source.explicit_source_keys, ("profile",))
         self.assertEqual(config.task_source.runnable_statuses, ("Todo", "Doing"))
 
+    def test_explicit_ralphex_markdown_source_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "ralphex-markdown"\n'
+                'plan_path = "docs/plans/checkout.md"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.task_source.type, "ralphex-markdown")
+        self.assertEqual(config.task_source.plan_path, "docs/plans/checkout.md")
+        self.assertFalse(config.task_source.allows_generated_cache)
+        self.assertEqual(config.task_source.explicit_source_keys, ("plan_path", "type"))
+
     def test_generated_task_profiles_reject_command_adapters(self) -> None:
         profiles = [
             {"type": "command"},

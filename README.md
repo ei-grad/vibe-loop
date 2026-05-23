@@ -51,7 +51,9 @@ non-executable parser profile, validates it mechanically, and caches it under
 the configured state directory.
 
 This repository's own plan uses a Markdown table. That fixed table is an
-example of a supported shape, not the generic task-source contract:
+example of a supported shape, not the generic task-source contract. Built-in
+Markdown sources also include ralphex-style plan files with `### Task N:` or
+`### Iteration N:` headings and task checkboxes.
 
 ```text
 ID | Priority | Status | Dependencies | Scope | Acceptance | Evidence
@@ -511,6 +513,47 @@ arrays declare conflict domains for parallel scheduling. Resource names match
 exactly; path locks use repo-relative paths and conflict when one path is the
 same as, or an ancestor of, another. Omitted or `null` arrays are undeclared;
 empty arrays explicitly declare no conflict domains for that task.
+
+For ralphex-style Markdown plans:
+
+```toml
+[task_source]
+type = "ralphex-markdown"
+plan_path = "docs/plans/checkout.md"
+# Or expose several plan files:
+# plan_paths = ["docs/plans/checkout.md", "docs/plans/refund.md"]
+```
+
+The parser reads `### Task N:` and `### Iteration N:` headings, derives `Done`
+status only when every checkbox in that task block is checked, and uses
+`Planned` for tasks with any unchecked checkbox. Task IDs are stable
+repo-relative IDs such as `docs.plans.checkout:task-1`, so multiple plan files
+can be exposed together without colliding on `Task 1`. A `## Validation
+Commands` section is copied into each task's evidence text.
+
+Ralphex-style task blocks can declare conflict domains with labels:
+
+```markdown
+### Task 1: Add checkout API
+- [ ] Add checkout handler
+- Resources: api, checkout
+- Paths: src/checkout.py, tests/test_checkout.py
+```
+
+The same labels can live in a plan-level `## Conflict Surface` section and
+apply to every task unless that task declares its own values. A combined
+task-local label is also accepted:
+
+```markdown
+- Conflict Surface: resources: api, checkout; paths: src/checkout.py
+```
+
+In a plan-level `## Conflict Surface` section, unlabeled bullet items that look
+like repo-relative paths are also treated as path conflict domains, including
+root-level files such as `Makefile` and code-spanned paths inside short prose.
+
+Use `Resources: none` or `Paths: none` to explicitly declare an empty domain.
+Blank or absent labels leave the domain unknown.
 
 Markdown profiles can expose the same domains with optional `resources` and
 `paths` field mappings:

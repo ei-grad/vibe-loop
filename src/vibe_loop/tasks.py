@@ -9,7 +9,11 @@ from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from vibe_loop.config import DEFAULT_RUNNABLE_STATUSES, TaskSourceConfig
+from vibe_loop.config import (
+    DEFAULT_PLAN_PATHS,
+    DEFAULT_RUNNABLE_STATUSES,
+    TaskSourceConfig,
+)
 
 
 DONE_STATUS = "Done"
@@ -51,9 +55,16 @@ MARKDOWN_FIELD_MAPPING_KEYS = {
 DEPENDENCY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*$")
 HEADING_RE = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
 LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*+]\s+(?:\[[ xX]\]\s*)?(?P<body>.*)$")
+CHECKBOX_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[(?P<mark>[ xX])\]\s+(?P<body>.*)$")
+CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 LABEL_RE = re.compile(
     r"^\s*(?:[-*+]\s+)?(?:\[[ xX]\]\s*)?"
     r"(?P<label>[A-Za-z][A-Za-z0-9 _./-]{0,80})\s*:\s*(?P<value>.*)$"
+)
+RALPHEX_TASK_HEADING_RE = re.compile(
+    r"^(?P<kind>Task|Iteration)\s+(?P<number>[A-Za-z0-9_.-]+)\s*:"
+    r"\s*(?P<title>.+)$",
+    re.IGNORECASE,
 )
 DISCOVERY_SKIP_DIRS = {
     ".git",
@@ -67,6 +78,14 @@ DISCOVERY_SKIP_DIRS = {
 }
 MAX_DISCOVERY_FILE_BYTES = 2 * 1024 * 1024
 PLAN_NAME_TERMS = ("plan", "backlog", "roadmap", "task", "todo", "work")
+ROOT_PATH_FILENAMES = {
+    "Containerfile",
+    "Dockerfile",
+    "LICENSE",
+    "Makefile",
+    "NOTICE",
+    "README",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,6 +160,8 @@ def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
             discover_markdown_plan(repo, config),
             config.runnable_statuses,
         )
+    if config.type in {"ralphex-markdown", "ralphex-plan"}:
+        return RalphexMarkdownSource(repo, ralphex_source_paths(repo, config))
     raise ValueError(f"unsupported task source type: {config.type}")
 
 
@@ -235,6 +256,14 @@ class MarkdownRecord:
         return f"{self.path}:{location}"
 
 
+@dataclasses.dataclass(frozen=True)
+class RalphexConflictSurface:
+    resources: str = ""
+    paths: str = ""
+    resources_present: bool | None = False
+    paths_present: bool | None = False
+
+
 class MarkdownProfileSource:
     def __init__(
         self,
@@ -262,6 +291,29 @@ class MarkdownProfileSource:
                 tasks.append(
                     task_from_markdown_record(self.profile, record, len(tasks))
                 )
+        validate_task_set(tasks)
+        return tasks
+
+    def probe(self, task_id: str) -> Task | None:
+        return next(
+            (task for task in self.list_tasks() if task.task_id == task_id), None
+        )
+
+
+class RalphexMarkdownSource:
+    def __init__(self, repo: Path, paths: tuple[Path, ...]):
+        if not paths:
+            raise ValueError("ralphex markdown task source requires at least one path")
+        self.repo = repo
+        self.paths = paths
+
+    def list_tasks(self) -> list[Task]:
+        tasks: list[Task] = []
+        for path in self.paths:
+            if not path.exists():
+                raise FileNotFoundError(f"task source file not found: {path}")
+            text = path.read_text(encoding="utf-8", errors="replace")
+            tasks.extend(iter_ralphex_tasks(self.repo, path, text, len(tasks)))
         validate_task_set(tasks)
         return tasks
 
@@ -626,6 +678,543 @@ def iter_markdown_list_records(
         else:
             index += 1
     return records
+
+
+def ralphex_source_paths(repo: Path, config: TaskSourceConfig) -> tuple[Path, ...]:
+    if config.plan_path:
+        return (resolve_profile_path(repo, config.plan_path),)
+    if config.is_explicit("plan_paths") or config.plan_paths != DEFAULT_PLAN_PATHS:
+        return tuple(resolve_profile_path(repo, path) for path in config.plan_paths)
+    return (discover_ralphex_plan(repo, config),)
+
+
+def iter_ralphex_tasks(
+    repo: Path,
+    path: Path,
+    text: str,
+    order_offset: int,
+) -> list[Task]:
+    lines = strip_markdown_fenced_blocks(text.splitlines())
+    section = ralphex_plan_title(path, lines)
+    validation_commands = ralphex_validation_commands(lines)
+    evidence = ralphex_validation_evidence(validation_commands)
+    plan_conflict_surface = ralphex_plan_conflict_surface(lines)
+    records: list[Task] = []
+    index = 0
+    while index < len(lines):
+        heading = parse_heading(lines[index])
+        match = ralphex_task_heading_match(heading)
+        if match is None:
+            index += 1
+            continue
+        next_index = index + 1
+        while next_index < len(lines):
+            next_heading = parse_heading(lines[next_index])
+            if next_heading is not None and next_heading[0] <= 3:
+                break
+            next_index += 1
+        block_lines = lines[index + 1 : next_index]
+        try:
+            records.append(
+                ralphex_task_from_block(
+                    repo,
+                    path,
+                    section,
+                    evidence,
+                    match,
+                    block_lines,
+                    plan_conflict_surface,
+                    line_number=index + 1,
+                    order=order_offset + len(records),
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(f"{path}:line {index + 1}: {exc}") from exc
+        index = next_index
+    return records
+
+
+def ralphex_task_heading_match(
+    heading: tuple[int, str] | None,
+) -> re.Match[str] | None:
+    if heading is None:
+        return None
+    level, title = heading
+    if level != 3:
+        return None
+    return RALPHEX_TASK_HEADING_RE.match(title)
+
+
+def strip_markdown_fenced_blocks(lines: list[str]) -> list[str]:
+    stripped: list[str] = []
+    in_fence = False
+    fence_marker = ""
+    for line in lines:
+        fence = markdown_fence_marker(line)
+        if fence:
+            if not in_fence:
+                in_fence = True
+                fence_marker = fence
+            elif fence == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            stripped.append("")
+            continue
+        stripped.append("" if in_fence else line)
+    return stripped
+
+
+def markdown_fence_marker(line: str) -> str:
+    stripped = line.lstrip()
+    if stripped.startswith("```"):
+        return "```"
+    if stripped.startswith("~~~"):
+        return "~~~"
+    return ""
+
+
+def ralphex_task_from_block(
+    repo: Path,
+    path: Path,
+    section: str,
+    evidence: str,
+    match: re.Match[str],
+    block_lines: list[str],
+    plan_conflict_surface: RalphexConflictSurface,
+    *,
+    line_number: int,
+    order: int,
+) -> Task:
+    checkboxes = ralphex_checkboxes(block_lines)
+    labels = parse_label_values(block_lines)
+    dependencies_value = first_label(labels, "dependencies", "depends", "depends on")
+    resource_label = ralphex_resource_label(labels)
+    path_label = ralphex_path_label(labels)
+    resources_value = (
+        resource_label.resources
+        if resource_label.resources_present is not False
+        else plan_conflict_surface.resources
+    )
+    paths_value = (
+        path_label.paths
+        if path_label.paths_present is not False
+        else plan_conflict_surface.paths
+    )
+    resources_present = ralphex_domain_known(
+        resource_label.resources_present,
+        plan_conflict_surface.resources_present,
+    )
+    paths_present = ralphex_domain_known(
+        path_label.paths_present,
+        plan_conflict_surface.paths_present,
+    )
+    try:
+        dependencies = parse_dependencies(dependencies_value, none_values=("none", "-"))
+        resources = parse_resource_list(resources_value, none_values=("none", "-"))
+        paths = parse_path_list(paths_value, none_values=("none", "-"))
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
+    return Task(
+        task_id=ralphex_task_id(repo, path, match.group("kind"), match.group("number")),
+        title=match.group("title").strip(),
+        status=ralphex_checkbox_status(checkboxes),
+        section=section,
+        dependencies=dependencies,
+        resources=resources,
+        paths=paths,
+        conflict_domains_known=resources_present or paths_present,
+        scope=ralphex_scope(block_lines),
+        acceptance=ralphex_acceptance(checkboxes),
+        evidence=evidence,
+        source=f"{path}:line {line_number}",
+        order=order,
+    )
+
+
+def ralphex_checkboxes(lines: list[str]) -> tuple[tuple[bool, str], ...]:
+    checkboxes: list[tuple[bool, str]] = []
+    for line in lines:
+        match = CHECKBOX_ITEM_RE.match(line)
+        if match is None:
+            continue
+        checkboxes.append(
+            (
+                match.group("mark").casefold() == "x",
+                match.group("body").strip(),
+            )
+        )
+    return tuple(checkboxes)
+
+
+def ralphex_checkbox_status(checkboxes: tuple[tuple[bool, str], ...]) -> str:
+    if checkboxes and all(done for done, _ in checkboxes):
+        return DONE_STATUS
+    return "Planned"
+
+
+def ralphex_scope(lines: list[str]) -> str:
+    return "\n".join(line.rstrip() for line in lines).strip()
+
+
+def ralphex_acceptance(checkboxes: tuple[tuple[bool, str], ...]) -> str:
+    return "\n".join(body for _, body in checkboxes)
+
+
+def ralphex_plan_title(path: Path, lines: list[str]) -> str:
+    for line in lines:
+        heading = parse_heading(line)
+        if heading is not None and heading[0] == 1:
+            title = heading[1]
+            return title.removeprefix("Plan:").strip() or title
+    return path.stem
+
+
+def ralphex_validation_commands(lines: list[str]) -> tuple[str, ...]:
+    commands: list[str] = []
+    in_section = False
+    for line in lines:
+        heading = parse_heading(line)
+        if heading is not None:
+            if heading[0] <= 2:
+                in_section = normalize_label(heading[1]) in {
+                    "validation",
+                    "validation command",
+                    "validation commands",
+                }
+            elif in_section:
+                in_section = False
+            continue
+        if not in_section:
+            continue
+        command = ralphex_validation_command(line)
+        if command:
+            commands.append(command)
+    return tuple(commands)
+
+
+def ralphex_plan_conflict_surface(lines: list[str]) -> RalphexConflictSurface:
+    section_lines: list[str] = []
+    in_section = False
+    for line in lines:
+        heading = parse_heading(line)
+        if heading is not None:
+            if heading[0] <= 2:
+                in_section = normalize_label(heading[1]) in {
+                    "conflict surface",
+                    "conflict surfaces",
+                }
+            elif in_section:
+                in_section = False
+            continue
+        if in_section:
+            section_lines.append(line)
+    labels = parse_label_values(section_lines)
+    resources = ralphex_resource_label(labels)
+    paths = ralphex_path_label(labels)
+    unlabeled_paths = ralphex_unlabeled_conflict_paths(section_lines)
+    path_value = paths.paths
+    path_present = paths.paths_present
+    if unlabeled_paths:
+        path_value = ", ".join(
+            [value for value in (paths.paths, unlabeled_paths) if value]
+        )
+        path_present = True
+    return RalphexConflictSurface(
+        resources=resources.resources,
+        paths=path_value,
+        resources_present=resources.resources_present,
+        paths_present=path_present,
+    )
+
+
+def ralphex_domain_known(
+    task_present: bool | None,
+    plan_present: bool | None,
+) -> bool:
+    if task_present is None:
+        return False
+    if task_present:
+        return True
+    return bool(plan_present)
+
+
+def ralphex_resource_label(labels: dict[str, str]) -> RalphexConflictSurface:
+    value, present = first_label_value(
+        labels,
+        "resources",
+        "resource",
+        "conflict resources",
+        "conflict surface resources",
+    )
+    if present:
+        return RalphexConflictSurface(
+            resources=value,
+            resources_present=True if value.strip() else None,
+        )
+    conflict_value, conflict_present = first_label_value(
+        labels,
+        "conflict surface",
+        "conflict surfaces",
+    )
+    if not conflict_present:
+        return RalphexConflictSurface()
+    resources, paths = split_conflict_surface_value(conflict_value)
+    return RalphexConflictSurface(
+        resources=resources,
+        paths=paths,
+        resources_present=bool(resources.strip()),
+        paths_present=bool(paths.strip()),
+    )
+
+
+def ralphex_path_label(labels: dict[str, str]) -> RalphexConflictSurface:
+    value, present = first_label_value(labels, "paths", "path", "conflict paths")
+    if present:
+        return RalphexConflictSurface(
+            paths=value,
+            paths_present=True if value.strip() else None,
+        )
+    conflict_value, conflict_present = first_label_value(
+        labels,
+        "conflict surface",
+        "conflict surfaces",
+    )
+    if not conflict_present:
+        return RalphexConflictSurface()
+    resources, paths = split_conflict_surface_value(conflict_value)
+    return RalphexConflictSurface(
+        resources=resources,
+        paths=paths,
+        resources_present=bool(resources.strip()),
+        paths_present=bool(paths.strip()),
+    )
+
+
+def split_conflict_surface_value(value: str) -> tuple[str, str]:
+    resources: list[str] = []
+    paths: list[str] = []
+    for segment in (part.strip() for part in value.split(";")):
+        if not segment:
+            continue
+        key, raw_value = split_conflict_surface_segment(segment)
+        if key in {"path", "paths"}:
+            paths.append(raw_value)
+        elif key in {"resource", "resources"}:
+            resources.append(raw_value)
+        else:
+            resources.append(segment)
+    return ", ".join(resources), ", ".join(paths)
+
+
+def split_conflict_surface_segment(segment: str) -> tuple[str, str]:
+    for separator in (":", "="):
+        if separator not in segment:
+            continue
+        key, value = segment.split(separator, 1)
+        normalized = normalize_label(key)
+        if normalized in {"path", "paths", "resource", "resources"}:
+            return normalized, value.strip()
+    return "", segment
+
+
+def ralphex_unlabeled_conflict_paths(lines: list[str]) -> str:
+    paths: list[str] = []
+    for line in lines:
+        if CHECKBOX_ITEM_RE.match(line) or LABEL_RE.match(line):
+            continue
+        item = LIST_ITEM_RE.match(line)
+        if item is None:
+            continue
+        for value in ralphex_conflict_path_candidates(item.group("body").strip()):
+            if ralphex_looks_like_path(value):
+                paths.append(value)
+    return ", ".join(paths)
+
+
+def ralphex_conflict_path_candidates(value: str) -> tuple[str, ...]:
+    code_spans = tuple(
+        clean_path_token(candidate)
+        for candidate in CODE_SPAN_RE.findall(value)
+        if clean_path_token(candidate)
+    )
+    if code_spans:
+        return code_spans
+    stripped = strip_markdown_code_span(value)
+    words = stripped.split()
+    if len(words) > 1:
+        token = clean_path_token(words[0])
+        return (token,) if token else ()
+    token = clean_path_token(stripped)
+    return (token,) if token else ()
+
+
+def clean_path_token(value: str) -> str:
+    return value.strip().rstrip(".,;:")
+
+
+def ralphex_looks_like_path(value: str) -> bool:
+    path = value.strip()
+    if not path or any(char.isspace() for char in path):
+        return False
+    try:
+        normalize_path_lock(path)
+    except ValueError:
+        return False
+    return (
+        "/" in path
+        or "\\" in path
+        or path.startswith(".")
+        or bool(PurePosixPath(path).suffix)
+        or path in ROOT_PATH_FILENAMES
+    )
+
+
+def strip_markdown_code_span(value: str) -> str:
+    if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+        return value[1:-1].strip()
+    return value
+
+
+def first_label_value(labels: dict[str, str], *names: str) -> tuple[str, bool]:
+    for name in names:
+        normalized = normalize_label(name)
+        if normalized in labels:
+            return labels[normalized], True
+    return "", False
+
+
+def first_label(labels: dict[str, str], *names: str) -> str:
+    value, _ = first_label_value(labels, *names)
+    return value
+
+
+def ralphex_validation_command(line: str) -> str:
+    if CHECKBOX_ITEM_RE.match(line):
+        return ""
+    item = LIST_ITEM_RE.match(line)
+    if item is None:
+        return ""
+    value = item.group("body").strip()
+    return strip_markdown_code_span(value)
+
+
+def ralphex_validation_evidence(commands: tuple[str, ...]) -> str:
+    if not commands:
+        return ""
+    return "Validation commands:\n" + "\n".join(f"- {command}" for command in commands)
+
+
+def ralphex_task_id(repo: Path, path: Path, kind: str, number: str) -> str:
+    try:
+        relative = path.resolve().relative_to(repo.resolve())
+    except ValueError:
+        relative = Path(path.name)
+    plan = ".".join(
+        normalize_task_id_part(part) for part in relative.with_suffix("").parts
+    )
+    normalized_kind = normalize_task_id_part(kind).lower()
+    normalized_number = normalize_task_id_part(number).lower()
+    return f"{plan}:{normalized_kind}-{normalized_number}"
+
+
+def normalize_task_id_part(value: str) -> str:
+    return "".join(
+        char if char.isalnum() or char in "-._" else "-" for char in value.strip()
+    ).strip("-._")
+
+
+def discover_ralphex_plan(repo: Path, config: TaskSourceConfig) -> Path:
+    candidates = find_ralphex_plan_candidates(repo, config)
+    if len(candidates) == 1:
+        return candidates[0].path
+    if len(candidates) > 1:
+        best_score = candidates[0].score
+        best = [candidate for candidate in candidates if candidate.score == best_score]
+        if len(best) == 1:
+            return best[0].path
+        paths = ", ".join(
+            f"{candidate.path.relative_to(repo)} score={candidate.score}"
+            for candidate in best
+        )
+        raise ValueError(
+            f"multiple ralphex markdown plan files tied; set task_source.plan_path "
+            f"or task_source.plan_paths: {paths}"
+        )
+    searched = ", ".join(config.plan_paths)
+    raise FileNotFoundError(
+        "no ralphex markdown plan file found; set task_source.plan_path, "
+        "task_source.plan_paths, or add headings like '### Task 1:'. "
+        f"Candidate paths: {searched}"
+    )
+
+
+def find_ralphex_plan_candidates(
+    repo: Path,
+    config: TaskSourceConfig,
+) -> list[PlanCandidate]:
+    configured = {
+        (repo / path).resolve(): len(config.plan_paths) - index
+        for index, path in enumerate(config.plan_paths)
+    }
+    matches: list[PlanCandidate] = []
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = sorted(d for d in dirs if d not in DISCOVERY_SKIP_DIRS)
+        root_path = Path(root)
+        for filename in sorted(files):
+            if not filename.lower().endswith(".md"):
+                continue
+            path = root_path / filename
+            candidate = evaluate_ralphex_plan(repo, path, configured)
+            if candidate is not None:
+                matches.append(candidate)
+    return sorted(
+        matches,
+        key=lambda candidate: (
+            -candidate.score,
+            str(candidate.path),
+        ),
+    )
+
+
+def evaluate_ralphex_plan(
+    repo: Path,
+    path: Path,
+    configured: dict[Path, int],
+) -> PlanCandidate | None:
+    try:
+        if path.stat().st_size > MAX_DISCOVERY_FILE_BYTES:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    task_count = len(iter_ralphex_tasks(repo, path, text, 0))
+    if task_count == 0:
+        return None
+    score = 100 + min(task_count, 20)
+    reasons = ["ralphex-task-headings", f"tasks={task_count}"]
+    validation_commands = ralphex_validation_commands(
+        strip_markdown_fenced_blocks(text.splitlines())
+    )
+    if validation_commands:
+        score += 5
+        reasons.append("validation-commands")
+    relative_path = path.relative_to(repo)
+    if "plans" in {part.lower() for part in relative_path.parts}:
+        score += 10
+        reasons.append("plans-dir")
+    if any(term in path.name.lower() for term in PLAN_NAME_TERMS):
+        score += 5
+        reasons.append("plan-like-name")
+    configured_bonus = configured.get(path.resolve(), 0)
+    if configured_bonus:
+        score += configured_bonus
+        reasons.append("configured-candidate")
+    return PlanCandidate(
+        path=path,
+        score=score,
+        task_count=task_count,
+        reasons=tuple(reasons),
+    )
 
 
 def table_header_matches_profile(

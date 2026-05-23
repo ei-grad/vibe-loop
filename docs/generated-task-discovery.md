@@ -120,6 +120,17 @@ work. The generic path asks a configured agent to analyze bounded repository
 evidence, generate a normalized task-source profile, validate that profile
 mechanically, and cache it as repo-local state.
 
+Repositories that already use ralphex-style plan files can opt into the built-in
+`ralphex-markdown` source instead of generating a profile or writing a command
+adapter. It reads `### Task N:` and `### Iteration N:` sections, derives status
+from task checkboxes, records `## Validation Commands` as evidence, and maps
+plan-level or task-local `Resources`, `Paths`, and `Conflict Surface` labels
+into normalized conflict domains. Plan-level `## Conflict Surface` sections can
+also contain unlabeled bullet items that look like repo-relative paths. This
+source is explicit configuration, so setting `task_source.type =
+"ralphex-markdown"` disables generated cache use for the active task source in
+the same way as other user-authored source selectors.
+
 The agent-generated profile should describe how to read existing repo artifacts,
 not invent task state. It can map column names, heading/list conventions,
 statuses, dependency syntax, done states, candidate files, and title/acceptance
