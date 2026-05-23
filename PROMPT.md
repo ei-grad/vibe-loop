@@ -78,6 +78,14 @@ surfaces to higher-level PRDs, requirements, and task artifacts.
   spec-trace records.
 - Planning analytics report on the task/run/evidence graph; they must not become
   a hidden scheduler or completion source.
+- Bundled skills are self-sufficient workflow contracts. They must work when
+  invoked directly by an agent session, a slash command, a prompt template, or
+  an external orchestrator — not only under the `vibe-loop` CLI. Skills must
+  not reference CLI commands (`vibe-loop report`, `main-integration`,
+  `claim-workspace`) or CLI environment variables (`VIBE_LOOP_*`). The runner
+  appends CLI-specific coordination instructions at launch time through its
+  worker addendum; that addendum is the only place where CLI contracts appear
+  in the worker prompt.
 
 ## Viable System Model Mapping
 
