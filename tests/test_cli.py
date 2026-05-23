@@ -1622,6 +1622,75 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("command", cache["agent"])
         self.assertEqual(prompt["evidence"]["files"][0]["path"], "WORK.md")
 
+    def test_generated_profile_preserves_traceability_fields(self) -> None:
+        fingerprint = {
+            "path": "docs/spec.md",
+            "size": 10,
+            "sha256": "c" * 64,
+            "redacted": False,
+        }
+        trace_work_table = (
+            "# Work\n\n"
+            "| Key | State | Summary | Requirements | Spec Paths | Design Refs | Approval | Fingerprints |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "| DISC-X | Todo | Configure generated discovery. | PRD-SDE-003, REQ-2 | docs/spec.md | ADR-1, docs/design.md#trace | approved | "
+            f"{json.dumps([fingerprint], separators=(',', ':'))} |\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "WORK.md").write_text(trace_work_table, encoding="utf-8")
+            write_configure_agent(
+                bin_dir / "codex",
+                generated_profile_payload(
+                    "WORK.md",
+                    field_extra={
+                        "requirement_ids": {"column": "Requirements"},
+                        "spec_paths": {"column": "Spec Paths"},
+                        "design_refs": {"column": "Design Refs"},
+                        "approval_state": {"column": "Approval"},
+                        "source_fingerprints": {"column": "Fingerprints"},
+                    },
+                ),
+            )
+            configure_stdout = StringIO()
+            configure_stderr = StringIO()
+            list_stdout = StringIO()
+            list_stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with (
+                    redirect_stdout(configure_stdout),
+                    redirect_stderr(configure_stderr),
+                ):
+                    configure_exit = main(
+                        ["tasks", "configure", "--repo", str(repo), "--json"]
+                    )
+            with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
+                list_exit = main(["tasks", "list", "--repo", str(repo), "--json"])
+
+            configure_payload = json.loads(configure_stdout.getvalue())
+            tasks_payload = json.loads(list_stdout.getvalue())
+
+        self.assertEqual(configure_exit, 0)
+        self.assertEqual(list_exit, 0)
+        self.assertEqual(configure_stderr.getvalue(), "")
+        self.assertIn("task discovery source=generated_cache", list_stderr.getvalue())
+        self.assertIn(
+            "[task_source.profile.fields.requirement_ids]",
+            configure_payload["promotion_toml"],
+        )
+        self.assertEqual(tasks_payload[0]["requirement_ids"], ["PRD-SDE-003", "REQ-2"])
+        self.assertEqual(tasks_payload[0]["spec_paths"], ["docs/spec.md"])
+        self.assertEqual(
+            tasks_payload[0]["design_refs"],
+            ["ADR-1", "docs/design.md#trace"],
+        )
+        self.assertEqual(tasks_payload[0]["approval_state"], "approved")
+        self.assertEqual(tasks_payload[0]["source_fingerprints"], [fingerprint])
+
     def test_tasks_configure_dry_run_reports_profile_without_writing_cache(
         self,
     ) -> None:
@@ -3828,6 +3897,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(metadata["pid_scope"], "configured_command_process")
         self.assertIsInstance(metadata["supervisor_pid"], int)
         self.assertIn("base_main", metadata)
+
+    def test_run_next_worker_prompt_includes_traceability_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            (repo / "docs").mkdir()
+            (repo / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'TRACE-01','title':'Trace task',"
+                "'status':'Next','dependencies':[],"
+                "'requirement_ids':['PRD-SDE-003'],"
+                "'spec_paths':['docs/spec.md'],"
+                "'design_refs':['ADR-1'],"
+                "'approval_state':'approved',"
+                "'source_fingerprints':[{'path':'docs/spec.md','size':5,"
+                "'sha256':'" + "e" * 64 + "','redacted':False}]}]))\n",
+                encoding="utf-8",
+            )
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[3])\n"
+                "from vibe_loop.cli import main\n"
+                "Path('worker-prompt.txt').write_text(sys.argv[4], encoding='utf-8')\n"
+                "raise SystemExit(main([\n"
+                "    'report', '--repo', '.', '--run-id', sys.argv[1],\n"
+                "    '--task-id', sys.argv[2], '--status', 'completed',\n"
+                "    '--commit', 'trace-commit', '--message', 'trace complete',\n"
+                "]))\n",
+                encoding="utf-8",
+            )
+            command = (
+                f"{sys.executable} agent.py {{run_id}} {{task_id}} "
+                f"{source_path} {{prompt}}"
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                f'list = "{sys.executable} list_tasks.py"\n\n'
+                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            prompt = (repo / "worker-prompt.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertIn("### Normalized Task Traceability", prompt)
+        self.assertIn('"requirement_ids": [', prompt)
+        self.assertIn('"PRD-SDE-003"', prompt)
+        self.assertIn('"spec_paths": [', prompt)
+        self.assertIn('"docs/spec.md"', prompt)
+        self.assertIn('"approval_state": "approved"', prompt)
 
     def test_run_next_captures_explicit_worker_session_id_from_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

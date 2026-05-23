@@ -412,7 +412,7 @@ class VibeRunner:
         session_id = run_id
         session_id_source = "fallback:run_id"
         skill_prefix = self.config.agent.skill_ref_prefix
-        worker_prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
+        worker_prompt = build_worker_prompt(skill_prefix, task)
         command = command_template.format(
             prompt=shell_quote(worker_prompt),
             task_id=task.task_id,
@@ -938,6 +938,20 @@ def build_batch_selection_prompt(
         f"{json.dumps([task.to_json() for task in candidates], indent=2)}\n\n"
         f"{active_worker_context}\n\n"
         f"{recent_log_context}\n"
+    )
+
+
+def build_worker_prompt(skill_prefix: str, task: Task) -> str:
+    prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
+    if not task.has_traceability:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "### Normalized Task Traceability\n\n"
+        "This task includes optional traceability metadata from the task source:\n\n"
+        "```json\n"
+        f"{json.dumps(task.to_json(), indent=2, sort_keys=True)}\n"
+        "```\n"
     )
 
 

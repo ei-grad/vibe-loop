@@ -123,7 +123,13 @@ class PlanningEvidenceTests(unittest.TestCase):
             (repo / "list_tasks.py").write_text(
                 "import json\n"
                 "print(json.dumps([{'id':'CMD-01','title':'Command task',"
-                "'status':'Done','dependencies':[]}]))\n",
+                "'status':'Done','dependencies':[],"
+                "'requirement_ids':['PRD-SDE-003'],"
+                "'spec_paths':['docs/spec.md'],"
+                "'design_refs':['ADR-1'],"
+                "'approval_state':'approved',"
+                "'source_fingerprints':[{'path':'docs/spec.md','size':10,"
+                "'sha256':'" + "d" * 64 + "','redacted':False}]}]))\n",
                 encoding="utf-8",
             )
             (repo / "worklog.py").write_text(
@@ -147,6 +153,21 @@ class PlanningEvidenceTests(unittest.TestCase):
 
         self.assertEqual(evidence["task_source_origin"], "command_output")
         self.assertEqual(evidence["tasks"][0]["id"], "CMD-01")
+        self.assertEqual(evidence["tasks"][0]["requirement_ids"], ["PRD-SDE-003"])
+        self.assertEqual(evidence["tasks"][0]["spec_paths"], ["docs/spec.md"])
+        self.assertEqual(evidence["tasks"][0]["design_refs"], ["ADR-1"])
+        self.assertEqual(evidence["tasks"][0]["approval_state"], "approved")
+        self.assertEqual(
+            evidence["tasks"][0]["source_fingerprints"],
+            [
+                {
+                    "path": "docs/spec.md",
+                    "size": 10,
+                    "sha256": "d" * 64,
+                    "redacted": False,
+                }
+            ],
+        )
         self.assertTrue(evidence["worklog"]["configured"])
         self.assertIn(
             {

@@ -452,6 +452,50 @@ class PlanningTimelineTests(unittest.TestCase):
         self.assertIn(("stale_run_record", "OLD-01", ""), warning_tuples(timeline))
         self.assertNotIn("OLD-01", tasks_by_id(timeline))
 
+    def test_timeline_preserves_task_traceability_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_git_repo(repo)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'TRACE-01','title':'Trace task',"
+                "'status':'Planned','dependencies':[],"
+                "'requirement_ids':['PRD-SDE-003','REQ-2'],"
+                "'spec_paths':['docs/spec.md'],"
+                "'design_refs':['ADR-1','docs/design.md#trace'],"
+                "'approval_state':'approved',"
+                "'source_fingerprints':[{'path':'docs/spec.md','size':5,"
+                "'sha256':'" + "f" * 64 + "','redacted':False}]}]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                f'[task_source]\nlist = "{PYTHON} list_tasks.py"\n',
+                encoding="utf-8",
+            )
+            git(repo, "add", "docs/spec.md", "list_tasks.py", ".vibe-loop.toml")
+            git_commit(repo, "baseline", "2026-01-01T10:00:00+00:00")
+
+            timeline = build_planning_timeline(load_config(repo))
+
+        task = tasks_by_id(timeline)["TRACE-01"]
+        self.assertEqual(task["requirement_ids"], ["PRD-SDE-003", "REQ-2"])
+        self.assertEqual(task["spec_paths"], ["docs/spec.md"])
+        self.assertEqual(task["design_refs"], ["ADR-1", "docs/design.md#trace"])
+        self.assertEqual(task["approval_state"], "approved")
+        self.assertEqual(
+            task["source_fingerprints"],
+            [
+                {
+                    "path": "docs/spec.md",
+                    "size": 5,
+                    "sha256": "f" * 64,
+                    "redacted": False,
+                }
+            ],
+        )
+
     def test_json_schema_shape_is_stable_and_versioned(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

@@ -514,6 +514,11 @@ exactly; path locks use repo-relative paths and conflict when one path is the
 same as, or an ancestor of, another. Omitted or `null` arrays are undeclared;
 empty arrays explicitly declare no conflict domains for that task.
 
+Tasks may also include optional traceability fields: `requirement_ids`,
+`spec_paths`, `design_refs`, `approval_state`, and `source_fingerprints`.
+Traceability is emitted in task JSON, planning analytics, generated-profile
+promotion, and worker prompts when present; absent fields are omitted.
+
 For ralphex-style Markdown plans:
 
 ```toml
@@ -584,6 +589,9 @@ optional `[P]` and story markers, inline `(depends on T001)` text, and nested
 dependency and label patterns. Acceptance and evidence labels may be single-line
 values or followed by nested bullet text. Checked boxes normalize to `Done`,
 unchecked boxes to `Planned`, and `[-]` or `[~]` normalize to `Active`.
+Markdown profiles may map the same optional traceability fields as command
+task sources when the source artifact exposes them as columns, labels, prefixes,
+or patterns.
 
 When several task files are exposed, task IDs are prefixed with the parent
 spec/change directory, for example `001-login:T001`,

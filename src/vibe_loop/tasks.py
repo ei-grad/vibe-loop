@@ -38,14 +38,19 @@ SPEC_TOOL_TASK_SOURCE_TYPES = {
 }
 MARKDOWN_FIELD_NAMES = {
     "acceptance",
+    "approval_state",
     "dependencies",
+    "design_refs",
     "evidence",
     "id",
     "priority",
     "paths",
+    "requirement_ids",
     "resources",
     "scope",
     "section",
+    "source_fingerprints",
+    "spec_paths",
     "status",
     "title",
 }
@@ -104,12 +109,23 @@ MULTILINE_LABEL_TERMS = (
     "acceptance",
     "criteria",
     "description",
+    "design",
     "detail",
     "evidence",
+    "fingerprint",
     "notes",
     "proof",
+    "requirement",
     "scope",
+    "spec",
+    "trace",
 )
+TRACEABILITY_LIST_FIELDS = {
+    "design_refs",
+    "requirement_ids",
+    "source_fingerprints",
+    "spec_paths",
+}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -135,14 +151,29 @@ class Task:
     acceptance: str = ""
     evidence: str = ""
     source: str = ""
+    requirement_ids: tuple[str, ...] = ()
+    spec_paths: tuple[str, ...] = ()
+    design_refs: tuple[str, ...] = ()
+    approval_state: str = ""
+    source_fingerprints: tuple[dict[str, object], ...] = ()
     order: int = 0
 
     @property
     def done(self) -> bool:
         return self.status == DONE_STATUS
 
+    @property
+    def has_traceability(self) -> bool:
+        return bool(
+            self.requirement_ids
+            or self.spec_paths
+            or self.design_refs
+            or self.approval_state
+            or self.source_fingerprints
+        )
+
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "id": self.task_id,
             "title": self.title,
             "status": self.status,
@@ -157,6 +188,19 @@ class Task:
             "evidence": self.evidence,
             "source": self.source,
         }
+        if self.requirement_ids:
+            payload["requirement_ids"] = list(self.requirement_ids)
+        if self.spec_paths:
+            payload["spec_paths"] = list(self.spec_paths)
+        if self.design_refs:
+            payload["design_refs"] = list(self.design_refs)
+        if self.approval_state:
+            payload["approval_state"] = self.approval_state
+        if self.source_fingerprints:
+            payload["source_fingerprints"] = [
+                dict(fingerprint) for fingerprint in self.source_fingerprints
+            ]
+        return payload
 
 
 class TaskSource(Protocol):
@@ -632,7 +676,12 @@ def parse_field_mapping(field_name: str, mapping: dict[str, object]) -> FieldMap
         )
     none_values = mapping.get("none_values")
     if none_values is None:
-        none = ("none",) if field_name in {"dependencies", "resources", "paths"} else ()
+        none = (
+            ("none",)
+            if field_name in {"dependencies", "resources", "paths"}
+            or field_name in TRACEABILITY_LIST_FIELDS
+            else ()
+        )
     elif isinstance(none_values, list) and all(
         isinstance(item, str) and item for item in none_values
     ):
@@ -1587,6 +1636,18 @@ def task_from_markdown_record(
     paths_mapping = profile.fields.get("paths")
     resources_value = extract_profile_value(profile, record, "resources")
     paths_value = extract_profile_value(profile, record, "paths")
+    requirement_ids_mapping = profile.fields.get("requirement_ids")
+    spec_paths_mapping = profile.fields.get("spec_paths")
+    design_refs_mapping = profile.fields.get("design_refs")
+    source_fingerprints_mapping = profile.fields.get("source_fingerprints")
+    requirement_ids_value = extract_profile_value(profile, record, "requirement_ids")
+    spec_paths_value = extract_profile_value(profile, record, "spec_paths")
+    design_refs_value = extract_profile_value(profile, record, "design_refs")
+    source_fingerprints_value = extract_profile_value(
+        profile,
+        record,
+        "source_fingerprints",
+    )
     try:
         resources = parse_resource_list(
             resources_value,
@@ -1597,6 +1658,31 @@ def task_from_markdown_record(
         paths = parse_path_list(
             paths_value,
             none_values=paths_mapping.none_values if paths_mapping else ("none",),
+        )
+        requirement_ids = parse_requirement_id_list(
+            requirement_ids_value,
+            none_values=requirement_ids_mapping.none_values
+            if requirement_ids_mapping
+            else ("none",),
+        )
+        spec_paths = parse_path_list(
+            spec_paths_value,
+            none_values=spec_paths_mapping.none_values
+            if spec_paths_mapping
+            else ("none",),
+        )
+        design_refs = parse_trace_ref_list(
+            design_refs_value,
+            value_name="design reference",
+            none_values=design_refs_mapping.none_values
+            if design_refs_mapping
+            else ("none",),
+        )
+        source_fingerprints = parse_source_fingerprint_text(
+            source_fingerprints_value,
+            none_values=source_fingerprints_mapping.none_values
+            if source_fingerprints_mapping
+            else ("none",),
         )
     except ValueError as exc:
         raise ValueError(f"{record.source}: {exc}") from exc
@@ -1617,6 +1703,11 @@ def task_from_markdown_record(
         acceptance=extract_profile_value(profile, record, "acceptance"),
         evidence=extract_profile_value(profile, record, "evidence"),
         source=record.source,
+        requirement_ids=requirement_ids,
+        spec_paths=spec_paths,
+        design_refs=design_refs,
+        approval_state=extract_profile_value(profile, record, "approval_state"),
+        source_fingerprints=source_fingerprints,
         order=order,
     )
 
@@ -1965,6 +2056,23 @@ def task_from_mapping(value: object, order: int) -> Task:
         normalize_path_lock(path)
         for path in parse_task_string_array(value.get("paths"), "paths")
     )
+    requirement_ids = tuple(
+        normalize_requirement_id(requirement_id)
+        for requirement_id in parse_task_string_array(
+            value.get("requirement_ids"),
+            "requirement_ids",
+        )
+    )
+    spec_paths = tuple(
+        normalize_path_lock(path)
+        for path in parse_task_string_array(value.get("spec_paths"), "spec_paths")
+    )
+    design_refs = parse_task_string_array(value.get("design_refs"), "design_refs")
+    approval_state = optional_task_string(value.get("approval_state"), "approval_state")
+    source_fingerprints = normalize_source_fingerprints(
+        value.get("source_fingerprints"),
+        "source_fingerprints",
+    )
     return Task(
         task_id=str(value.get("id") or value.get("task_id") or ""),
         title=str(value.get("title") or value.get("id") or value.get("task_id") or ""),
@@ -1983,6 +2091,13 @@ def task_from_mapping(value: object, order: int) -> Task:
         acceptance=str(value.get("acceptance") or ""),
         evidence=str(value.get("evidence") or ""),
         source=str(value.get("source") or ""),
+        requirement_ids=dedupe_preserving_order(requirement_ids),
+        spec_paths=dedupe_preserving_order(spec_paths),
+        design_refs=dedupe_preserving_order(
+            ref.strip() for ref in design_refs if ref.strip()
+        ),
+        approval_state=approval_state,
+        source_fingerprints=source_fingerprints,
         order=order,
     )
 
@@ -2063,6 +2178,56 @@ def parse_path_list(
     )
 
 
+def parse_requirement_id_list(
+    value: str,
+    *,
+    none_values: tuple[str, ...] = ("none",),
+) -> tuple[str, ...]:
+    return dedupe_preserving_order(
+        normalize_requirement_id(part)
+        for part in parse_comma_separated_values(
+            value,
+            none_values=none_values,
+            value_name="requirement id",
+        )
+    )
+
+
+def parse_trace_ref_list(
+    value: str,
+    *,
+    value_name: str,
+    none_values: tuple[str, ...] = ("none",),
+) -> tuple[str, ...]:
+    return dedupe_preserving_order(
+        part
+        for part in parse_comma_separated_values(
+            value,
+            none_values=none_values,
+            value_name=value_name,
+        )
+    )
+
+
+def parse_source_fingerprint_text(
+    value: str,
+    *,
+    none_values: tuple[str, ...] = ("none",),
+) -> tuple[dict[str, object], ...]:
+    text = value.strip()
+    if not text:
+        return ()
+    if text.casefold() in {none.casefold() for none in none_values}:
+        return ()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "invalid source fingerprint syntax: expected a JSON array of objects"
+        ) from exc
+    return normalize_source_fingerprints(payload, "source_fingerprints")
+
+
 def parse_comma_separated_values(
     value: str,
     *,
@@ -2088,6 +2253,53 @@ def parse_task_string_array(value: object, name: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"task {name} must be an array of strings")
     return tuple(value)
+
+
+def optional_task_string(value: object, name: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError(f"task {name} must be a string")
+    return value.strip()
+
+
+def normalize_requirement_id(value: str) -> str:
+    requirement_id = value.strip()
+    if (
+        not requirement_id
+        or not DEPENDENCY_ID_RE.fullmatch(requirement_id)
+        or any(char.isspace() for char in requirement_id)
+    ):
+        raise ValueError(f"invalid requirement id syntax: {value}")
+    return requirement_id
+
+
+def normalize_source_fingerprints(
+    value: object,
+    name: str,
+) -> tuple[dict[str, object], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError(f"task {name} must be an array of objects")
+    fingerprints: list[dict[str, object]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"task {name}[{index}] must be an object")
+        normalized: dict[str, object] = {}
+        for key, child in item.items():
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"task {name}[{index}] keys must be strings")
+            normalized[key] = normalize_json_value(child, f"task {name}[{index}].{key}")
+        fingerprints.append(normalized)
+    return tuple(fingerprints)
+
+
+def normalize_json_value(value: object, name: str) -> object:
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be JSON-serializable") from exc
 
 
 def normalize_resource(value: str) -> str:

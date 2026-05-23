@@ -8,6 +8,7 @@ from vibe_loop.config import TaskSourceConfig
 from vibe_loop.tasks import (
     MarkdownPlanSource,
     MarkdownProfileSource,
+    Task,
     build_task_source,
     runnable_tasks,
     task_from_mapping,
@@ -30,6 +31,15 @@ PLAN = """# Plan
 
 
 class MarkdownPlanTests(unittest.TestCase):
+    def test_task_json_omits_empty_traceability_fields(self) -> None:
+        payload = Task("TASK-01", "Plain task", "Next").to_json()
+
+        self.assertNotIn("requirement_ids", payload)
+        self.assertNotIn("spec_paths", payload)
+        self.assertNotIn("design_refs", payload)
+        self.assertNotIn("approval_state", payload)
+        self.assertNotIn("source_fingerprints", payload)
+
     def test_runnable_tasks_filter_dependencies_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "PLAN.md"
@@ -696,6 +706,80 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertFalse(unknown.conflict_domains_known)
         self.assertTrue(empty.conflict_domains_known)
 
+    def test_command_task_source_preserves_traceability_fields(self) -> None:
+        task = task_from_mapping(
+            {
+                "id": "CMD-01",
+                "title": "Command task",
+                "status": "Next",
+                "requirement_ids": ["PRD-SDE-003", "PRD-SDE-003", "REQ-9"],
+                "spec_paths": ["docs/prd/spec-driven-execution.md"],
+                "design_refs": ["ADR-7", "docs/design.md#traceability"],
+                "approval_state": "approved",
+                "source_fingerprints": [
+                    {
+                        "path": "docs/prd/spec-driven-execution.md",
+                        "size": 20,
+                        "sha256": "a" * 64,
+                        "redacted": False,
+                    }
+                ],
+            },
+            0,
+        )
+
+        payload = task.to_json()
+
+        self.assertEqual(task.requirement_ids, ("PRD-SDE-003", "REQ-9"))
+        self.assertEqual(task.spec_paths, ("docs/prd/spec-driven-execution.md",))
+        self.assertEqual(
+            payload["source_fingerprints"],
+            [
+                {
+                    "path": "docs/prd/spec-driven-execution.md",
+                    "size": 20,
+                    "sha256": "a" * 64,
+                    "redacted": False,
+                }
+            ],
+        )
+        self.assertEqual(payload["approval_state"], "approved")
+
+    def test_profile_table_extracts_traceability_fields(self) -> None:
+        profile = work_table_profile()
+        fields = profile["fields"]
+        assert isinstance(fields, dict)
+        fields["requirement_ids"] = {"column": "Requirements"}
+        fields["spec_paths"] = {"column": "Spec Paths"}
+        fields["design_refs"] = {"column": "Design Refs"}
+        fields["approval_state"] = {"column": "Approval"}
+        fields["source_fingerprints"] = {"column": "Fingerprints"}
+        fingerprint = {
+            "path": "docs/spec.md",
+            "size": 10,
+            "sha256": "b" * 64,
+            "redacted": False,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "WORK.md").write_text(
+                "# Work\n\n"
+                "| Key | State | Summary | Requirements | Spec Paths | Design Refs | Approval | Fingerprints |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| WORK-01 | Todo | Trace task. | PRD-SDE-003, REQ-2 | docs/spec.md | ADR-1, docs/design.md#trace | approved | "
+                f"{json_fingerprint(fingerprint)} |\n",
+                encoding="utf-8",
+            )
+            source = MarkdownProfileSource(repo, profile)
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].requirement_ids, ("PRD-SDE-003", "REQ-2"))
+        self.assertEqual(tasks[0].spec_paths, ("docs/spec.md",))
+        self.assertEqual(tasks[0].design_refs, ("ADR-1", "docs/design.md#trace"))
+        self.assertEqual(tasks[0].approval_state, "approved")
+        self.assertEqual(tasks[0].source_fingerprints, (fingerprint,))
+
     def test_profile_heading_docs_extract_tasks_from_heading_and_labels(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1036,6 +1120,12 @@ def list_profile() -> dict[str, object]:
             "blocked": ["Blocked"],
         },
     }
+
+
+def json_fingerprint(value: dict[str, object]) -> str:
+    import json
+
+    return json.dumps([value], separators=(",", ":"))
 
 
 def ralphex_fixture_text() -> str:

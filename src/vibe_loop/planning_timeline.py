@@ -31,6 +31,13 @@ SIMILARITY_MAX_EXAMPLES = 3
 SIMILARITY_BLEND_WEIGHT = 0.25
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_./+-]*")
 TOKEN_FIELDS = ("title", "scope", "acceptance")
+TRACEABILITY_TASK_FIELDS = (
+    "requirement_ids",
+    "spec_paths",
+    "design_refs",
+    "approval_state",
+    "source_fingerprints",
+)
 TOKEN_STOPWORDS = {
     "acceptance",
     "add",
@@ -359,6 +366,9 @@ class PlanningTimelineBuilder:
                 "timeline_order": timeline_order(task, actual, projected),
                 "latest_run": _latest_run_summary(latest_run),
             }
+            for field in TRACEABILITY_TASK_FIELDS:
+                if field in task:
+                    payload[field] = task[field]
             payloads.append(payload)
         payloads.sort(key=timeline_payload_sort_key)
         return payloads
