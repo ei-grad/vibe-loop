@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import sys
 import tempfile
 import threading
@@ -12,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import vibe_loop.runner as runner_module
-from vibe_loop.config import AgentConfig, VibeConfig
+from vibe_loop.config import AgentConfig, SpecDiagnosticsConfig, VibeConfig
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
     SchedulerLockBusy,
@@ -27,6 +28,7 @@ from vibe_loop.runner import (
     validate_selected_task_batch,
 )
 from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
+from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import Task
 from vibe_loop.workers import ActiveRunState
 
@@ -770,6 +772,84 @@ class RunnerTests(unittest.TestCase):
                 ["TASK-02", "TASK-03"],
             ],
         )
+
+    def test_parallel_refill_rechecks_spec_gate_before_agent_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_path = repo / "docs" / "spec.md"
+            spec_text = "current spec\n"
+            spec_path.write_text(spec_text, encoding="utf-8")
+            fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text),
+                "sha256": hashlib.sha256(spec_text.encode("utf-8")).hexdigest(),
+            }
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker", selection_command="selector"),
+                    specs=SpecDiagnosticsConfig(require_current_fingerprints=True),
+                )
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-01",
+                        title="Task 1",
+                        status="Next",
+                        requirement_ids=("REQ-1",),
+                        approval_state="approved",
+                        source_fingerprints=(fingerprint,),
+                        order=1,
+                    ),
+                    Task(
+                        task_id="TASK-02",
+                        title="Task 2",
+                        status="Next",
+                        requirement_ids=("REQ-2",),
+                        approval_state="approved",
+                        source_fingerprints=(fingerprint,),
+                        order=2,
+                    ),
+                    Task(
+                        task_id="TASK-03",
+                        title="Task 3",
+                        status="Next",
+                        requirement_ids=("REQ-3",),
+                        approval_state="approved",
+                        source_fingerprints=(fingerprint,),
+                        order=3,
+                    ),
+                ]
+            )
+            runner._source = source
+            selected_batches: list[list[str]] = []
+
+            def select_one_task(candidates: list[Task], _limit: int) -> list[Task]:
+                selected_batches.append([task.task_id for task in candidates])
+                return [candidates[0]]
+
+            def run_task(task: Task) -> RunResult:
+                source.mark_done(task.task_id)
+                spec_path.write_text("drifted spec\n", encoding="utf-8")
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.ask_agent_to_select_batch = select_one_task
+            runner.run_task = run_task
+
+            with self.assertRaises(SpecExecutionGateError):
+                runner.run_until_done(ask_agent=True, jobs=2, max_slices=2)
+
+        self.assertEqual(selected_batches, [["TASK-01", "TASK-02", "TASK-03"]])
 
     def test_run_until_done_parallel_excludes_task_locks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

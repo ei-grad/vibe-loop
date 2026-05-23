@@ -271,6 +271,7 @@ vibe-loop tasks configure --repo . --promotion-toml
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
+vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --trials 3 --overwrite --record-output .vibe-loop/release-readiness.json
 vibe-loop workers --repo .
@@ -518,6 +519,27 @@ Tasks may also include optional traceability fields: `requirement_ids`,
 `spec_paths`, `design_refs`, `approval_state`, and `source_fingerprints`.
 Traceability is emitted in task JSON, planning analytics, generated-profile
 promotion, and worker prompts when present; absent fields are omitted.
+
+Spec diagnostics are read-only. `doctor` and `specs check` report unapproved
+tasks, stale source fingerprints, missing requirement IDs, and completed
+traceable tasks without evidence without launching an agent or running override
+commands. Repositories that require current approved specs can opt into
+execution gates:
+
+```toml
+[specs]
+require_approved = true
+require_current_fingerprints = true
+require_requirement_coverage = true
+require_completion_evidence = true
+approved_states = ["approved"]
+override_commands = ["make specs-override"]
+```
+
+The `require_*` settings are gates for execution commands such as `run-next`
+and `run-until-done`; read-only task inspection remains available. Override
+commands are reported as repository-owned recovery guidance and are never run
+as a side effect by `doctor`, `specs check`, or task selection.
 
 For ralphex-style Markdown plans:
 

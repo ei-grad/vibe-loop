@@ -103,6 +103,44 @@ WORK_TABLE = """# Work
 """
 
 
+def spec_profile_config(*, specs_section: str = "") -> str:
+    return (
+        '[task_source]\ntype = "markdown-profile"\n'
+        "[task_source.profile]\n"
+        'kind = "markdown_table"\n'
+        'source_paths = ["WORK.md"]\n'
+        "stable_ids = true\n"
+        '[task_source.profile.fields.id]\ncolumn = "ID"\n'
+        '[task_source.profile.fields.status]\ncolumn = "Status"\n'
+        '[task_source.profile.fields.title]\ncolumn = "Title"\n'
+        "[task_source.profile.fields.requirement_ids]\n"
+        'column = "Requirements"\nnone_values = ["none"]\n'
+        "[task_source.profile.fields.spec_paths]\n"
+        'column = "Spec Paths"\nnone_values = ["none"]\n'
+        '[task_source.profile.fields.approval_state]\ncolumn = "Approval"\n'
+        "[task_source.profile.fields.source_fingerprints]\n"
+        'column = "Fingerprints"\nnone_values = ["none"]\n'
+        '[task_source.profile.fields.evidence]\ncolumn = "Evidence"\n'
+        "[task_source.profile.status_map]\n"
+        'done = ["Done"]\n'
+        'runnable = ["Planned"]\n'
+        'blocked = ["Blocked"]\n'
+        f"{specs_section}"
+    )
+
+
+def spec_task_table(*, fingerprint: dict[str, object]) -> str:
+    fingerprint_json = json.dumps([fingerprint], separators=(",", ":"))
+    return (
+        "# Work\n\n"
+        "| ID | Status | Title | Requirements | Spec Paths | Approval | Fingerprints | Evidence |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        f"| TASK-01 | Planned | Stale draft spec. | REQ-1 | docs/spec.md | draft | {fingerprint_json} | Not run. |\n"
+        "| TASK-02 | Planned | Missing requirement. | none | docs/spec.md | approved | none | Not run. |\n"
+        "| TASK-03 | Done | Missing evidence. | REQ-3 | docs/spec.md | approved | none | Not run. |\n"
+    )
+
+
 class DirectUrlDistribution:
     def __init__(self, payload: dict[str, object] | None) -> None:
         self.payload = payload
@@ -1221,6 +1259,339 @@ class CliTests(unittest.TestCase):
             payload["planning_analytics"]["outputs"]["timeline_json"]["source"],
             "default_state_dir",
         )
+        self.assertEqual(payload["specs"]["status"], "not_configured")
+        self.assertEqual(payload["specs"]["diagnostics"], [])
+
+    def test_doctor_reports_spec_diagnostics_without_running_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            spec_text = "current spec\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            stale_fingerprint = {
+                "path": "docs/spec.md",
+                "size": 1,
+                "sha256": "0" * 64,
+            }
+            (repo / "WORK.md").write_text(
+                spec_task_table(fingerprint=stale_fingerprint),
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                spec_profile_config(
+                    specs_section=(
+                        "[specs]\n"
+                        "require_approved = true\n"
+                        "require_current_fingerprints = true\n"
+                        "require_requirement_coverage = true\n"
+                        "require_completion_evidence = true\n"
+                        'override_commands = ["make specs-override"]\n'
+                    )
+                ),
+                encoding="utf-8",
+            )
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('agent-ran').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            agent_ran = (repo / "agent-ran").exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(agent_ran)
+        self.assertEqual(payload["specs"]["status"], "blocked")
+        self.assertTrue(payload["specs"]["enforced"])
+        self.assertEqual(payload["specs"]["override_commands"], ["make specs-override"])
+        diagnostic_codes = {
+            diagnostic["code"] for diagnostic in payload["specs"]["diagnostics"]
+        }
+        self.assertIn("unapproved_spec", diagnostic_codes)
+        self.assertIn("stale_source_fingerprint", diagnostic_codes)
+        self.assertIn("missing_requirement_coverage", diagnostic_codes)
+        self.assertIn("completed_task_missing_evidence", diagnostic_codes)
+
+    def test_doctor_and_specs_skip_command_task_source_without_running_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "task_source.py").write_text(
+                "from pathlib import Path\n"
+                "Path('task-source-ran').write_text('ran', encoding='utf-8')\n"
+                "print('{\"tasks\": []}')\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "command"\n'
+                f'list = "{sys.executable} task_source.py"\n'
+                "[specs]\n"
+                "require_approved = true\n",
+                encoding="utf-8",
+            )
+            doctor_stdout = StringIO()
+            doctor_stderr = StringIO()
+            specs_stdout = StringIO()
+            specs_stderr = StringIO()
+
+            with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                doctor_exit = main(["doctor", "--repo", str(repo)])
+            with redirect_stdout(specs_stdout), redirect_stderr(specs_stderr):
+                specs_exit = main(["specs", "check", "--repo", str(repo), "--json"])
+            command_ran = (repo / "task-source-ran").exists()
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+            specs_payload = json.loads(specs_stdout.getvalue())
+
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(specs_exit, 1)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(specs_stderr.getvalue(), "")
+        self.assertFalse(command_ran)
+        self.assertEqual(
+            doctor_payload["specs"]["diagnostics"][0]["code"],
+            "command_task_source_unchecked",
+        )
+        self.assertEqual(
+            specs_payload["diagnostics"][0]["code"],
+            "command_task_source_unchecked",
+        )
+
+    def test_specs_check_advisory_diagnostics_do_not_fail_without_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            spec_text = "current spec\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            stale_fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text),
+                "sha256": "0" * 64,
+            }
+            (repo / "WORK.md").write_text(
+                "# Work\n\n"
+                "| ID | Status | Title | Requirements | Spec Paths | Approval | Fingerprints | Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | Planned | Stale draft spec. | REQ-1 | docs/spec.md | draft | "
+                f"{json.dumps([stale_fingerprint], separators=(',', ':'))} | Not run. |\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                spec_profile_config(),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["specs", "check", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "issues")
+        self.assertEqual(payload["blocking_count"], 0)
+        self.assertEqual(
+            {diagnostic["severity"] for diagnostic in payload["diagnostics"]},
+            {"warning"},
+        )
+
+    def test_specs_check_returns_nonzero_for_enforced_blockers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            spec_text = "current spec\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            stale_fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text),
+                "sha256": "0" * 64,
+            }
+            (repo / "WORK.md").write_text(
+                "# Work\n\n"
+                "| ID | Status | Title | Requirements | Spec Paths | Approval | Fingerprints | Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | Planned | Stale spec. | REQ-1 | docs/spec.md | approved | "
+                f"{json.dumps([stale_fingerprint], separators=(',', ':'))} | Not run. |\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                spec_profile_config(
+                    specs_section="[specs]\nrequire_current_fingerprints = true\n"
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["specs", "check", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["diagnostics"][0]["code"], "stale_source_fingerprint")
+
+    def test_specs_check_enforces_approval_and_fingerprints_without_traceability(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / ".vibe-loop.toml").write_text(
+                "[specs]\n"
+                "require_approved = true\n"
+                "require_current_fingerprints = true\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["specs", "check", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        diagnostic_codes = {diagnostic["code"] for diagnostic in payload["diagnostics"]}
+        self.assertEqual(payload["status"], "blocked")
+        self.assertIn("missing_spec_approval", diagnostic_codes)
+        self.assertIn("missing_source_fingerprint", diagnostic_codes)
+
+    def test_specs_check_includes_task_source_failure_detail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "PLAN.md").write_text("# No tasks\n", encoding="utf-8")
+            (repo / ".vibe-loop.toml").write_text(
+                "[specs]\nrequire_current_fingerprints = true\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["specs", "check", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["diagnostics"][0]["code"], "task_source_unusable")
+        self.assertIn("task source is not usable", payload["diagnostics"][0]["message"])
+
+    def test_specs_check_rejects_fingerprint_symlink_outside_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            outside = root / "outside-spec.md"
+            outside.write_text("outside spec\n", encoding="utf-8")
+            try:
+                os.symlink(outside, repo / "docs" / "spec.md")
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest(f"symlink unavailable: {exc}")
+            fingerprint = {
+                "path": "docs/spec.md",
+                "size": outside.stat().st_size,
+                "sha256": "0" * 64,
+            }
+            (repo / "WORK.md").write_text(
+                "# Work\n\n"
+                "| ID | Status | Title | Requirements | Spec Paths | Approval | Fingerprints | Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | Planned | Outside symlink. | REQ-1 | docs/spec.md | approved | "
+                f"{json.dumps([fingerprint], separators=(',', ':'))} | Not run. |\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                spec_profile_config(
+                    specs_section="[specs]\nrequire_current_fingerprints = true\n"
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["specs", "check", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(
+            payload["diagnostics"][0]["code"],
+            "unsafe_source_fingerprint_path",
+        )
+        self.assertIn("outside repository", payload["diagnostics"][0]["message"])
+
+    def test_run_next_spec_gate_blocks_before_agent_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            spec_text = "current spec\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            stale_fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text),
+                "sha256": "0" * 64,
+            }
+            (repo / "WORK.md").write_text(
+                "# Work\n\n"
+                "| ID | Status | Title | Requirements | Spec Paths | Approval | Fingerprints | Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | Planned | Stale spec. | REQ-1 | docs/spec.md | approved | "
+                f"{json.dumps([stale_fingerprint], separators=(',', ':'))} | Not run. |\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                spec_profile_config(
+                    specs_section="[specs]\nrequire_current_fingerprints = true\n"
+                ),
+                encoding="utf-8",
+            )
+            write_python_executable(
+                bin_dir / "codex",
+                "from pathlib import Path\n"
+                "Path('agent-ran').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+            agent_ran = (repo / "agent-ran").exists()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("spec execution gate blocked", stderr.getvalue())
+        self.assertFalse(agent_ran)
 
     def test_planning_timeline_json_command_emits_versioned_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

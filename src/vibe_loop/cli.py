@@ -60,6 +60,10 @@ from vibe_loop.planning_timeline import (
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
 from vibe_loop.skills import install_skills
+from vibe_loop.spec_diagnostics import (
+    build_spec_diagnostics_report,
+    render_spec_diagnostics,
+)
 from vibe_loop.task_views import (
     build_task_views,
     filter_views,
@@ -424,6 +428,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON object with additional structured report metadata",
     )
 
+    specs = subparsers.add_parser("specs", help="Inspect spec traceability checks")
+    add_repo_argument(specs)
+    specs_subparsers = specs.add_subparsers(dest="specs_command", required=True)
+    specs_check = specs_subparsers.add_parser(
+        "check",
+        help="Run read-only spec coverage and drift diagnostics",
+    )
+    add_repo_argument(specs_check)
+    specs_check.add_argument("--json", action="store_true")
+
     eval_parser = subparsers.add_parser("eval", help="Run local skill evaluations")
     add_repo_argument(eval_parser)
     eval_subparsers = eval_parser.add_subparsers(
@@ -666,6 +680,9 @@ def dispatch(args: argparse.Namespace) -> int:
         print(json.dumps(report.to_json(), indent=2))
         return 0
 
+    if args.command == "specs":
+        return dispatch_specs(args, config)
+
     if args.command == "eval":
         return dispatch_eval(args, config)
 
@@ -705,6 +722,10 @@ def dispatch(args: argparse.Namespace) -> int:
                     "task_source_runtime": task_source_runtime,
                     "generated_task_profile": generated_task_cache_report(config),
                     "planning_analytics": analytics_report,
+                    "specs": build_spec_diagnostics_report(
+                        config,
+                        task_source_runtime=task_source_runtime,
+                    ),
                     "agent": config.agent.to_json(),
                     "completion": config.completion.__dict__,
                     "stale_locks": stale_report,
@@ -943,6 +964,22 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
         return 0
 
     raise AssertionError(args.eval_command)
+
+
+def dispatch_specs(args: argparse.Namespace, config) -> int:
+    if args.specs_command == "check":
+        task_source_runtime = runtime_task_source_report(config)
+        report = build_spec_diagnostics_report(
+            config,
+            task_source_runtime=task_source_runtime,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(render_spec_diagnostics(report))
+        return 1 if int(report["blocking_count"]) else 0
+
+    raise AssertionError(args.specs_command)
 
 
 def _parse_benchmark_agent_commands(

@@ -183,6 +183,52 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "agent.forward_stderr"):
                 load_config(repo)
 
+    def test_specs_config_parses_execution_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[specs]\n"
+                "require_approved = true\n"
+                "require_current_fingerprints = true\n"
+                "require_requirement_coverage = true\n"
+                "require_completion_evidence = true\n"
+                'approved_states = ["approved", "accepted"]\n'
+                'override_commands = ["make specs-override"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertTrue(config.specs.enforces_execution)
+        self.assertTrue(config.specs.require_approved)
+        self.assertTrue(config.specs.require_current_fingerprints)
+        self.assertTrue(config.specs.require_requirement_coverage)
+        self.assertTrue(config.specs.require_completion_evidence)
+        self.assertEqual(config.specs.approved_states, ("approved", "accepted"))
+        self.assertEqual(config.specs.override_commands, ("make specs-override",))
+        self.assertEqual(
+            config.specs.to_json()["explicit_keys"],
+            [
+                "approved_states",
+                "override_commands",
+                "require_approved",
+                "require_completion_evidence",
+                "require_current_fingerprints",
+                "require_requirement_coverage",
+            ],
+        )
+
+    def test_specs_config_rejects_invalid_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[specs]\nrequire_approved = "yes"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "specs.require_approved"):
+                load_config(repo)
+
     def test_task_source_plan_paths_can_be_configured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

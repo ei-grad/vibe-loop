@@ -48,6 +48,15 @@ Acceptance must cover read-only diagnostics, explicit override behavior,
 stale-source fingerprint reporting, missing-requirement coverage, completed-task
 evidence gaps, and safe behavior when a repository has no spec layer.
 
+The diagnostic boundary is read-only: `doctor` and dedicated spec checks may
+inspect normalized task metadata and current repo files, but must not invoke
+selection agents, repair generated profiles, run configured override commands,
+or mutate task sources. Execution gates are opt-in per diagnostic class under
+repository configuration. Repositories can require approved states, current
+source fingerprints, requirement IDs, and completion evidence independently;
+the same diagnostics remain advisory when those gates are not enabled.
+Configured override commands are surfaced as recovery guidance only.
+
 Related implementation IDs: `DISC-04`, `GANTT-02`, `SDD-03`.
 
 ## PRD-SDE-005 Spec-Aware Worker Context

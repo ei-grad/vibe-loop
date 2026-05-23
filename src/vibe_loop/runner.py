@@ -33,6 +33,7 @@ from vibe_loop.retry import (
     retry_subprocess_run,
 )
 from vibe_loop.runs import RunResult, RunStore, WorkerReport
+from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
 
@@ -401,6 +402,7 @@ class VibeRunner:
         return "Active vibe-loop workers:\n" + json.dumps(workers, indent=2)
 
     def run_task(self, task: Task) -> RunResult:
+        self.ensure_spec_execution_gate()
         command_template = self.config.agent.require_command()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
@@ -637,6 +639,7 @@ class VibeRunner:
         candidates = self.list_candidates(exclude=exclude)
         if not candidates:
             return None
+        self.ensure_spec_execution_gate()
         self.config.agent.require_command()
         task = self.select_from_candidates(candidates, ask_agent=ask_agent)
         try:
@@ -762,6 +765,7 @@ class VibeRunner:
                     )
                     if not candidates:
                         break
+                    self.ensure_spec_execution_gate()
                     if not command_validated:
                         self.config.agent.require_command()
                         command_validated = True
@@ -863,6 +867,9 @@ class VibeRunner:
             if result.returncode != 0:
                 return f"completion check failed: {command}"
         return ""
+
+    def ensure_spec_execution_gate(self) -> None:
+        ensure_spec_execution_gate(self.config, self.source.list_tasks())
 
     def classify(
         self,

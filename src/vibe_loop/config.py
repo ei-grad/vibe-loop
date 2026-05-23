@@ -98,6 +98,17 @@ PLANNING_ANALYTICS_DEFAULT_OUTPUTS = {
 }
 PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES = ("diagnostic", "disabled")
 PLANNING_ANALYTICS_DURATION_MODEL_NAMES = ("robust-duration-baseline-v1",)
+SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
+SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
+    {
+        "require_approved",
+        "require_current_fingerprints",
+        "require_requirement_coverage",
+        "require_completion_evidence",
+        "approved_states",
+        "override_commands",
+    }
+)
 PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL = {
     "name": "robust-duration-baseline-v1",
     "group_min_sample_count": 2,
@@ -372,6 +383,41 @@ class PlanningAnalyticsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SpecDiagnosticsConfig:
+    require_approved: bool = False
+    require_current_fingerprints: bool = False
+    require_requirement_coverage: bool = False
+    require_completion_evidence: bool = False
+    approved_states: tuple[str, ...] = SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES
+    override_commands: tuple[str, ...] = ()
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def enforces_execution(self) -> bool:
+        return (
+            self.require_approved
+            or self.require_current_fingerprints
+            or self.require_requirement_coverage
+            or self.require_completion_evidence
+        )
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "require_approved": self.require_approved,
+            "require_current_fingerprints": self.require_current_fingerprints,
+            "require_requirement_coverage": self.require_requirement_coverage,
+            "require_completion_evidence": self.require_completion_evidence,
+            "approved_states": list(self.approved_states),
+            "override_commands": list(self.override_commands),
+            "explicit_keys": sorted(self.explicit_keys),
+            "enforces_execution": self.enforces_execution,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class VibeConfig:
     repo: Path
     main_branch: str = "main"
@@ -381,6 +427,9 @@ class VibeConfig:
     completion: CompletionConfig = dataclasses.field(default_factory=CompletionConfig)
     planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
         default_factory=PlanningAnalyticsConfig
+    )
+    specs: SpecDiagnosticsConfig = dataclasses.field(
+        default_factory=SpecDiagnosticsConfig
     )
 
     @property
@@ -403,6 +452,7 @@ def load_config(repo: Path) -> VibeConfig:
     completion = parse_completion(data.get("completion", {}), repo)
     agent = parse_agent(data.get("agent", {}))
     planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
+    specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
         repo=repo,
         main_branch=str(data.get("main_branch") or "main"),
@@ -411,6 +461,7 @@ def load_config(repo: Path) -> VibeConfig:
         task_source=task_source,
         completion=completion,
         planning_analytics=planning_analytics,
+        specs=specs,
     )
 
 
@@ -735,6 +786,46 @@ def parse_planning_analytics_outputs(data: object) -> PlanningAnalyticsOutputs:
     )
 
 
+def parse_specs(data: object) -> SpecDiagnosticsConfig:
+    table = expect_table(data, "specs")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - SPEC_DIAGNOSTICS_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"specs contains unsupported keys: {', '.join(unknown_keys)}")
+    return SpecDiagnosticsConfig(
+        require_approved=optional_bool(
+            table.get("require_approved"), False, "specs.require_approved"
+        ),
+        require_current_fingerprints=optional_bool(
+            table.get("require_current_fingerprints"),
+            False,
+            "specs.require_current_fingerprints",
+        ),
+        require_requirement_coverage=optional_bool(
+            table.get("require_requirement_coverage"),
+            False,
+            "specs.require_requirement_coverage",
+        ),
+        require_completion_evidence=optional_bool(
+            table.get("require_completion_evidence"),
+            False,
+            "specs.require_completion_evidence",
+        ),
+        approved_states=nonempty_string_tuple(
+            table.get("approved_states"),
+            SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES,
+            "specs.approved_states",
+        ),
+        override_commands=nonempty_string_tuple(
+            table.get("override_commands"),
+            (),
+            "specs.override_commands",
+            allow_empty=True,
+        ),
+        explicit_keys=explicit_keys,
+    )
+
+
 def planning_analytics_report(
     config: VibeConfig,
     task_source_runtime: dict[str, object] | None = None,
@@ -849,6 +940,24 @@ def optional_bool(value: object, default: bool, name: str) -> bool:
     if isinstance(value, bool):
         return value
     raise ValueError(f"{name} must be a boolean")
+
+
+def nonempty_string_tuple(
+    value: object,
+    default: tuple[str, ...],
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"{name} must be an array of non-empty strings")
+    if not value and not allow_empty:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(item.strip() for item in value)
 
 
 def positive_int(value: object, default: int, name: str) -> int:
