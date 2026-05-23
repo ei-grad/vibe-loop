@@ -27,24 +27,10 @@ uv build && uv run --with twine --no-project python -m twine check dist/*
 CI runs ruff check, ruff format --check, and unittest discover on Python 3.11
 and 3.14. Run these locally before pushing.
 
-## Architecture Boundary: Skills vs CLI
+## Architecture
 
-Bundled skills (`src/vibe_loop/skills/*/SKILL.md`) are self-sufficient workflow
-contracts. They must work when invoked directly by a slash command, prompt
-template, or external orchestrator — not only under the `vibe-loop` CLI.
-
-**Skills must not reference:**
-- CLI commands: `vibe-loop report`, `main-integration`, `claim-workspace`
-- CLI environment variables: `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, etc.
-- Supervisor-specific coordination protocols
-
-**The runner injects CLI coordination at launch time** through
-`CLI_WORKER_ADDENDUM` in `src/vibe_loop/runner.py`. That addendum is the only
-place where CLI-specific worker contracts (reports, integration locking,
-workspace claims, env vars) appear in the worker prompt.
-
-When adding CLI coordination features (workspace claims, integration locking,
-worker reports), update `CLI_WORKER_ADDENDUM` — not the skill files.
+Read `PROMPT.md` for architecture decisions, the VSM mapping, and the runtime
+evolution direction before making design choices.
 
 ## Task Source Ownership
 
