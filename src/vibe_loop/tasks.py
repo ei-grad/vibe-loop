@@ -161,7 +161,11 @@ class Task:
 
     @property
     def done(self) -> bool:
-        return self.status == DONE_STATUS
+        # Case-insensitive so command/JSON task sources that report a lowercase
+        # "done" (or any case) are recognized as done — otherwise their
+        # completed tasks never enter the done-set and no `depends_on` on a
+        # downstream task ever resolves, silently stalling dependency chains.
+        return self.status.casefold() == DONE_STATUS.casefold()
 
     @property
     def has_traceability(self) -> bool:
