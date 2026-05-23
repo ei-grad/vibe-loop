@@ -36,10 +36,10 @@ jobs:
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
 
       - name: Run ruff check
-        run: uv run --no-project --with 'ruff>=0.15,<0.16' ruff check src/ tests/
+        run: uv run ruff check
 
       - name: Run ruff format check
-        run: uv run --no-project --with 'ruff>=0.15,<0.16' ruff format --check src/ tests/
+        run: uv run ruff format --check
 
   test:
     name: Test / Python ${{ matrix.python-version }}

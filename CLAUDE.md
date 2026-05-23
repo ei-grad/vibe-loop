@@ -5,8 +5,8 @@
 ```bash
 uv run -m pytest tests/                          # run tests
 uv run python -m unittest discover               # alternative test runner
-uv run --no-project --with 'ruff>=0.15' ruff check src/ tests/
-uv run --no-project --with 'ruff>=0.15' ruff format src/ tests/
+uv run ruff check
+uv run ruff format
 uv build && uv run --with twine --no-project python -m twine check dist/*
 ```
 

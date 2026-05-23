@@ -548,7 +548,11 @@ def orchestrated_order_diagnostics(
         )
     diagnostics = []
     for before, after in sequences:
-        if before in events and after in events and events.index(before) > events.index(after):
+        if (
+            before in events
+            and after in events
+            and events.index(before) > events.index(after)
+        ):
             diagnostics.append(f"workflow event order missing: {before} -> {after}")
     return diagnostics
 

@@ -1364,9 +1364,7 @@ def format_detected_agents(detected: AgentDetection) -> str:
 
 
 def _selection_retry_callback(attempt: int, delay: float, reason: str) -> None:
-    report_status(
-        f"agent selection retry {attempt} after {delay:.1f}s: {reason}"
-    )
+    report_status(f"agent selection retry {attempt} after {delay:.1f}s: {reason}")
 
 
 LOG_TAIL_LINES_FOR_TRANSIENT_CHECK = 50
