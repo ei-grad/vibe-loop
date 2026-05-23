@@ -284,9 +284,7 @@ class WorkspaceGitState:
                 worktree.to_json() for worktree in self.duplicate_worktrees
             ],
             "merged_into": list(self.merged_into),
-            "diagnostics": [
-                diagnostic.to_json() for diagnostic in self.diagnostics
-            ],
+            "diagnostics": [diagnostic.to_json() for diagnostic in self.diagnostics],
         }
 
 
@@ -655,9 +653,7 @@ def inspect_workspace_git_state(
             )
         else:
             dirty_summary = tuple(
-                line
-                for line in status_text.splitlines()[:DIRTY_SUMMARY_LIMIT]
-                if line
+                line for line in status_text.splitlines()[:DIRTY_SUMMARY_LIMIT] if line
             )
             dirty = bool(dirty_summary)
             if current_branch and current_branch != claim.branch:
@@ -679,7 +675,9 @@ def inspect_workspace_git_state(
                         severity="warning",
                         message="claimed worker worktree has uncommitted changes",
                         recovery_hint="Treat the worktree as worker-owned; inspect or preserve changes before cleanup.",
-                        recovery_commands=(git_command(claim.worktree, "status", "--short"),),
+                        recovery_commands=(
+                            git_command(claim.worktree, "status", "--short"),
+                        ),
                         details={
                             "worktree": str(claim.worktree),
                             "dirty_summary": list(dirty_summary),
@@ -854,11 +852,17 @@ def run_git_result(repo: Path, *args: str) -> subprocess.CompletedProcess[str] |
 
 
 def git_error_text(result: subprocess.CompletedProcess[str]) -> str:
-    return result.stderr.strip() or result.stdout.strip() or f"git exited {result.returncode}"
+    return (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or f"git exited {result.returncode}"
+    )
 
 
 def git_ref_exists(repo: Path, ref: str) -> bool:
-    result = run_git_result(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}")
+    result = run_git_result(
+        repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"
+    )
     return result is not None and result.returncode == 0
 
 
@@ -974,9 +978,7 @@ def build_worker_views(
             else None
         )
         workspace_diagnostics = (
-            workspace_git_state.diagnostics
-            if workspace_git_state is not None
-            else ()
+            workspace_git_state.diagnostics if workspace_git_state is not None else ()
         )
         views.append(
             WorkerView(

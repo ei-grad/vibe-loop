@@ -1427,7 +1427,7 @@ def write_orchestrated_review_agent(path: Path) -> None:
         "    '    value = value.strip()\\n'\n"
         "    '    if not value:\\n'\n"
         "    '        return False\\n'\n"
-        "    '    return value.replace(\"-\", \"\").isalnum() and \"-\" in value\\n',\n"
+        '    \'    return value.replace("-", "").isalnum() and "-" in value\\n\',\n'
         "    encoding='utf-8',\n"
         ")\n"
         "tests = repo / 'tests' / 'test_codes.py'\n"

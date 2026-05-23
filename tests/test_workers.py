@@ -637,10 +637,7 @@ class WorkspaceGitDiagnosticsTests(unittest.TestCase):
 
     def test_worktree_porcelain_parser_uses_short_branch_names(self) -> None:
         entries = parse_git_worktree_list(
-            "worktree /tmp/repo\n"
-            "HEAD abc123\n"
-            "branch refs/heads/worker/TASK-01\n"
-            "\n"
+            "worktree /tmp/repo\nHEAD abc123\nbranch refs/heads/worker/TASK-01\n\n"
         )
 
         self.assertEqual(len(entries), 1)
@@ -668,7 +665,9 @@ def acquire_worker_lock(
     worktree: Path,
     base_commit: str = "",
 ) -> None:
-    claim_base = base_commit or git(repo, "rev-parse", "--verify", "HEAD").stdout.strip()
+    claim_base = (
+        base_commit or git(repo, "rev-parse", "--verify", "HEAD").stdout.strip()
+    )
     state = ActiveRunState(
         task_id=task_id,
         run_id=run_id,
