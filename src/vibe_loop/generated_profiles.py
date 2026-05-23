@@ -65,7 +65,7 @@ ALLOWED_FIELD_MAPPING_KEYS = frozenset(
     {"column", "label", "none_values", "pattern", "prefix", "required", "strategy"}
 )
 ALLOWED_FIELD_STRATEGIES = frozenset(
-    {"first_sentence", "full_text", "heading_text", "label_value"}
+    {"checkbox_status", "first_sentence", "full_text", "heading_text", "label_value"}
 )
 ALLOWED_STATUS_MAP_KEYS = frozenset({"blocked", "done", "runnable"})
 PROFILE_FIELD_TOML_ORDER = (
@@ -582,6 +582,7 @@ def build_generated_task_source_prompt(bundle: EvidenceBundle) -> str:
             "profile.source_paths": "non-empty repo-relative paths from evidence",
             "profile.stable_ids": True,
             "profile.fields": ["id", "title", "status"],
+            "profile.field_strategies": sorted(ALLOWED_FIELD_STRATEGIES),
             "profile.status_map": ["done", "runnable"],
         },
         "degradation_requirements": {
@@ -844,7 +845,7 @@ def validate_generated_profile(
                     "unknown_field_column",
                     f"profile.fields.{field_name}.column was not found in source evidence: {column}",
                 )
-        elif not has_nonempty_mapping_value(mapping):
+        elif not has_nonempty_mapping_value(mapping, field_name):
             return (
                 "incomplete_field_mapping",
                 f"profile.fields.{field_name} must contain a non-empty mapping rule",
@@ -932,6 +933,13 @@ def validate_profile_schema(profile: dict[str, Any]) -> tuple[str, str] | None:
             mapping_value_error = validate_field_mapping_values(field_name, mapping)
             if mapping_value_error is not None:
                 return mapping_value_error
+            checkbox_strategy_error = validate_checkbox_status_strategy(
+                profile.get("kind"),
+                field_name,
+                mapping,
+            )
+            if checkbox_strategy_error is not None:
+                return checkbox_strategy_error
 
     status_map = profile.get("status_map")
     if isinstance(status_map, dict):
@@ -943,6 +951,26 @@ def validate_profile_schema(profile: dict[str, Any]) -> tuple[str, str] | None:
                 "unsupported_status_map_key",
                 f"profile.status_map contains unsupported keys: {', '.join(str(key) for key in unknown_statuses)}",
             )
+    return None
+
+
+def validate_checkbox_status_strategy(
+    kind: object,
+    field_name: object,
+    mapping: dict[Any, Any],
+) -> tuple[str, str] | None:
+    if mapping.get("strategy") != "checkbox_status":
+        return None
+    if field_name != "status":
+        return (
+            "invalid_field_mapping_value",
+            f"profile.fields.{field_name}.checkbox_status requires the status field",
+        )
+    if kind != "markdown_list":
+        return (
+            "invalid_field_mapping_value",
+            "profile.fields.status.checkbox_status requires markdown_list",
+        )
     return None
 
 
@@ -1678,7 +1706,12 @@ def is_nonempty_string_list(value: object) -> bool:
     )
 
 
-def has_nonempty_mapping_value(mapping: dict[object, object]) -> bool:
+def has_nonempty_mapping_value(
+    mapping: dict[object, object],
+    field_name: object = "",
+) -> bool:
+    if mapping.get("strategy") == "checkbox_status":
+        return field_name == "status"
     if mapping.get("strategy") in {"full_text", "heading_text"}:
         return True
     return any(

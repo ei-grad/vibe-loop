@@ -555,6 +555,45 @@ root-level files such as `Makefile` and code-spanned paths inside short prose.
 Use `Resources: none` or `Paths: none` to explicitly declare an empty domain.
 Blank or absent labels leave the domain unknown.
 
+For common spec-driven task artifacts, use a built-in non-executable preset
+instead of a command adapter:
+
+```toml
+[task_source]
+type = "spec-kit"
+# Default discovery: specs/*/tasks.md, .specify/specs/*/tasks.md
+```
+
+```toml
+[task_source]
+type = "kiro"
+# Default discovery: .kiro/specs/*/tasks.md
+```
+
+```toml
+[task_source]
+type = "openspec"
+# Default discovery: openspec/changes/*/tasks.md
+```
+
+The `spec-kit` preset reads checkbox task lists with `T001`-style IDs,
+optional `[P]` and story markers, inline `(depends on T001)` text, and nested
+`Depends`, `Depends on`, `Dependencies`, `Acceptance`, and `Evidence` labels.
+`kiro` and `openspec` read numbered checkbox lists such as
+`1. Prepare fixtures` or `1.2 Implement mutation` with the same optional
+dependency and label patterns. Acceptance and evidence labels may be single-line
+values or followed by nested bullet text. Checked boxes normalize to `Done`,
+unchecked boxes to `Planned`, and `[-]` or `[~]` normalize to `Active`.
+
+When several task files are exposed, task IDs are prefixed with the parent
+spec/change directory, for example `001-login:T001`,
+`session-refresh:2`, or `checkout-mutation:1.2`. Dependencies declared with
+local IDs are rewritten with the same prefix. Source provenance points back to
+the source `tasks.md` file and section. Set `plan_path` or `plan_paths` to pin
+specific files. Missing source files, missing stable IDs, duplicate IDs, and
+invalid dependency syntax fail visibly instead of silently inventing runnable
+tasks.
+
 Markdown profiles can expose the same domains with optional `resources` and
 `paths` field mappings:
 

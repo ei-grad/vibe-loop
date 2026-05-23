@@ -30,6 +30,12 @@ DEFAULT_TASK_TABLE_COLUMNS = (
 )
 REQUIRED_TASK_FIELDS = ("id", "title", "status")
 MARKDOWN_PROFILE_KINDS = {"markdown_table", "markdown_headings", "markdown_list"}
+SPEC_TOOL_TASK_SOURCE_TYPES = {
+    "kiro",
+    "openspec",
+    "spec-kit",
+    "speckit",
+}
 MARKDOWN_FIELD_NAMES = {
     "acceptance",
     "dependencies",
@@ -53,8 +59,16 @@ MARKDOWN_FIELD_MAPPING_KEYS = {
     "strategy",
 }
 DEPENDENCY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/+-]*$")
+SPEC_TOOL_DEPENDENCY_PATTERN = (
+    r"(?:^|\n)\s*(?:[-*+]\s+)?"
+    r"(?i:depends(?:\s+on)?|dependencies):\s*([^\n]+)"
+    r"|\((?i:depends on)\s+([^)]+)\)"
+)
 HEADING_RE = re.compile(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$")
-LIST_ITEM_RE = re.compile(r"^(?P<indent>[ \t]*)[-*+]\s+(?:\[[ xX]\]\s*)?(?P<body>.*)$")
+LIST_ITEM_RE = re.compile(
+    r"^(?P<indent>[ \t]*)[-*+]\s+"
+    r"(?:\[(?P<mark>[ xX~.-])\]\s*)?(?P<body>.*)$"
+)
 CHECKBOX_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[(?P<mark>[ xX])\]\s+(?P<body>.*)$")
 CODE_SPAN_RE = re.compile(r"`([^`]+)`")
 LABEL_RE = re.compile(
@@ -86,6 +100,16 @@ ROOT_PATH_FILENAMES = {
     "NOTICE",
     "README",
 }
+MULTILINE_LABEL_TERMS = (
+    "acceptance",
+    "criteria",
+    "description",
+    "detail",
+    "evidence",
+    "notes",
+    "proof",
+    "scope",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -162,6 +186,8 @@ def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
         )
     if config.type in {"ralphex-markdown", "ralphex-plan"}:
         return RalphexMarkdownSource(repo, ralphex_source_paths(repo, config))
+    if config.type in SPEC_TOOL_TASK_SOURCE_TYPES:
+        return SpecToolMarkdownSource(repo, config)
     raise ValueError(f"unsupported task source type: {config.type}")
 
 
@@ -247,6 +273,7 @@ class MarkdownRecord:
     section: str
     heading: str
     text: str
+    checkbox_mark: str | None = None
     columns: dict[str, str] = dataclasses.field(default_factory=dict)
     labels: dict[str, str] = dataclasses.field(default_factory=dict)
 
@@ -262,6 +289,14 @@ class RalphexConflictSurface:
     paths: str = ""
     resources_present: bool | None = False
     paths_present: bool | None = False
+
+
+@dataclasses.dataclass(frozen=True)
+class SpecToolPreset:
+    name: str
+    display_name: str
+    source_globs: tuple[str, ...]
+    profile: dict[str, object]
 
 
 class MarkdownProfileSource:
@@ -323,6 +358,38 @@ class RalphexMarkdownSource:
         )
 
 
+class SpecToolMarkdownSource:
+    def __init__(self, repo: Path, config: TaskSourceConfig):
+        preset = spec_tool_preset(config.type)
+        self.repo = repo
+        self.preset = preset
+        self.paths = spec_tool_source_paths(repo, config, preset)
+
+    def list_tasks(self) -> list[Task]:
+        tasks: list[Task] = []
+        for path in self.paths:
+            source = MarkdownProfileSource(
+                self.repo,
+                spec_tool_profile_for_path(self.repo, self.preset, path),
+            )
+            prefix = spec_tool_task_prefix(self.repo, path)
+            local_tasks = source.list_tasks()
+            if not local_tasks:
+                raise ValueError(
+                    f"{path}: no {self.preset.display_name} tasks found; expected "
+                    "checkbox list items with stable task IDs"
+                )
+            for local_task in local_tasks:
+                tasks.append(prefix_spec_tool_task(local_task, prefix))
+        validate_task_set(tasks)
+        return tasks
+
+    def probe(self, task_id: str) -> Task | None:
+        return next(
+            (task for task in self.list_tasks() if task.task_id == task_id), None
+        )
+
+
 def default_markdown_plan_profile(source_paths: tuple[str, ...]) -> dict[str, object]:
     return {
         "kind": "markdown_table",
@@ -346,6 +413,137 @@ def default_markdown_plan_profile(source_paths: tuple[str, ...]) -> dict[str, ob
     }
 
 
+def spec_tool_preset(source_type: str) -> SpecToolPreset:
+    normalized = "spec-kit" if source_type == "speckit" else source_type
+    if normalized == "spec-kit":
+        return SpecToolPreset(
+            name="spec-kit",
+            display_name="Spec Kit",
+            source_globs=("specs/*/tasks.md", ".specify/specs/*/tasks.md"),
+            profile={
+                "kind": "markdown_list",
+                "source_paths": [],
+                "stable_ids": True,
+                "fields": {
+                    "id": {
+                        "pattern": r"^(?P<id>T\d{3,})\b",
+                        "strategy": "heading_text",
+                    },
+                    "title": {
+                        "pattern": (
+                            r"^T\d{3,}\s+(?:\[P\]\s+)?"
+                            r"(?:\[[A-Za-z0-9_-]+\]\s+)?"
+                            r"(?P<title>.+?)(?:\s+\([Dd]epends on [^)]+\))?$"
+                        ),
+                        "strategy": "heading_text",
+                    },
+                    "status": {"strategy": "checkbox_status"},
+                    "dependencies": {
+                        "pattern": SPEC_TOOL_DEPENDENCY_PATTERN,
+                        "none_values": ["none", "-"],
+                    },
+                    "acceptance": {"label": "Acceptance"},
+                    "evidence": {"label": "Evidence"},
+                },
+                "status_map": {
+                    "done": [DONE_STATUS],
+                    "runnable": list(DEFAULT_RUNNABLE_STATUSES),
+                    "blocked": sorted(BLOCKED_STATUSES),
+                },
+            },
+        )
+    if normalized == "kiro":
+        return SpecToolPreset(
+            name="kiro",
+            display_name="Kiro",
+            source_globs=(".kiro/specs/*/tasks.md",),
+            profile={
+                "kind": "markdown_list",
+                "source_paths": [],
+                "stable_ids": True,
+                "fields": {
+                    "id": {
+                        "pattern": r"^(?P<id>\d+(?:\.\d+)*)(?:\.\s+|\s+)",
+                        "strategy": "heading_text",
+                    },
+                    "title": {
+                        "pattern": (
+                            r"^\d+(?:\.\d+)*(?:\.\s+|\s+)"
+                            r"(?P<title>.+?)(?:\s+\([Dd]epends on [^)]+\))?$"
+                        ),
+                        "strategy": "heading_text",
+                    },
+                    "status": {"strategy": "checkbox_status"},
+                    "dependencies": {
+                        "pattern": SPEC_TOOL_DEPENDENCY_PATTERN,
+                        "none_values": ["none", "-"],
+                    },
+                    "acceptance": {"label": "Acceptance"},
+                    "evidence": {"label": "Evidence"},
+                },
+                "status_map": {
+                    "done": [DONE_STATUS],
+                    "runnable": list(DEFAULT_RUNNABLE_STATUSES),
+                    "blocked": sorted(BLOCKED_STATUSES),
+                },
+            },
+        )
+    if normalized == "openspec":
+        return SpecToolPreset(
+            name="openspec",
+            display_name="OpenSpec",
+            source_globs=("openspec/changes/*/tasks.md",),
+            profile={
+                "kind": "markdown_list",
+                "source_paths": [],
+                "stable_ids": True,
+                "fields": {
+                    "id": {
+                        "pattern": r"^(?P<id>\d+(?:\.\d+)*)(?:\.\s+|\s+)",
+                        "strategy": "heading_text",
+                    },
+                    "title": {
+                        "pattern": (
+                            r"^\d+(?:\.\d+)*(?:\.\s+|\s+)"
+                            r"(?P<title>.+?)(?:\s+\([Dd]epends on [^)]+\))?$"
+                        ),
+                        "strategy": "heading_text",
+                    },
+                    "status": {"strategy": "checkbox_status"},
+                    "dependencies": {
+                        "pattern": SPEC_TOOL_DEPENDENCY_PATTERN,
+                        "none_values": ["none", "-"],
+                    },
+                    "acceptance": {"label": "Acceptance"},
+                    "evidence": {"label": "Evidence"},
+                },
+                "status_map": {
+                    "done": [DONE_STATUS],
+                    "runnable": list(DEFAULT_RUNNABLE_STATUSES),
+                    "blocked": sorted(BLOCKED_STATUSES),
+                },
+            },
+        )
+    raise ValueError(f"unsupported spec-driven task source type: {source_type}")
+
+
+def spec_tool_profile_for_path(
+    repo: Path,
+    preset: SpecToolPreset,
+    path: Path,
+) -> dict[str, object]:
+    profile = dict(preset.profile)
+    profile["source_paths"] = [profile_source_path(repo, path)]
+    return profile
+
+
+def profile_source_path(repo: Path, path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(repo.resolve()))
+    except ValueError:
+        return str(path)
+
+
 def parse_markdown_task_profile(
     profile: object,
     *,
@@ -367,6 +565,7 @@ def parse_markdown_task_profile(
     ):
         raise ValueError("markdown task profile.source_paths must be non-empty strings")
     fields = parse_profile_fields(profile.get("fields"))
+    validate_profile_strategy_compatibility(kind, fields)
     status_map = parse_profile_status_map(profile.get("status_map"))
     return MarkdownTaskProfile(
         kind=kind,
@@ -412,6 +611,7 @@ def parse_field_mapping(field_name: str, mapping: dict[str, object]) -> FieldMap
     prefix = optional_profile_string(mapping.get("prefix"))
     strategy = str(mapping.get("strategy") or "full_text")
     if strategy not in {
+        "checkbox_status",
         "first_sentence",
         "full_text",
         "heading_text",
@@ -420,6 +620,11 @@ def parse_field_mapping(field_name: str, mapping: dict[str, object]) -> FieldMap
         raise ValueError(
             f"markdown task profile.fields.{field_name}.strategy is not supported: "
             f"{strategy}"
+        )
+    if strategy == "checkbox_status" and field_name != "status":
+        raise ValueError(
+            f"markdown task profile.fields.{field_name}.checkbox_status "
+            "requires the status field"
         )
     if strategy == "label_value" and label is None:
         raise ValueError(
@@ -458,6 +663,20 @@ def parse_field_mapping(field_name: str, mapping: dict[str, object]) -> FieldMap
         required=required,
         strategy=strategy,
     )
+
+
+def validate_profile_strategy_compatibility(
+    kind: str,
+    fields: dict[str, FieldMapping],
+) -> None:
+    if kind == "markdown_list":
+        return
+    for field_name, mapping in fields.items():
+        if mapping.strategy == "checkbox_status":
+            raise ValueError(
+                f"markdown task profile.fields.{field_name}.checkbox_status "
+                "requires markdown_list"
+            )
 
 
 def parse_profile_status_map(value: object) -> dict[str, tuple[str, ...]]:
@@ -658,6 +877,7 @@ def iter_markdown_list_records(
             section=section,
             heading=body,
             text="\n".join([body, *block_lines]),
+            checkbox_mark=item.group("mark"),
             labels=parse_label_values([body, *block_lines]),
         )
         if extract_profile_value(profile, record, "id", enforce_required=False):
@@ -670,6 +890,7 @@ def iter_markdown_list_records(
                 section=section,
                 heading=body,
                 text=body,
+                checkbox_mark=item.group("mark"),
                 labels=parse_label_values([body]),
             )
             if record_has_profile_values(profile, direct_record):
@@ -686,6 +907,74 @@ def ralphex_source_paths(repo: Path, config: TaskSourceConfig) -> tuple[Path, ..
     if config.is_explicit("plan_paths") or config.plan_paths != DEFAULT_PLAN_PATHS:
         return tuple(resolve_profile_path(repo, path) for path in config.plan_paths)
     return (discover_ralphex_plan(repo, config),)
+
+
+def spec_tool_source_paths(
+    repo: Path,
+    config: TaskSourceConfig,
+    preset: SpecToolPreset,
+) -> tuple[Path, ...]:
+    if config.plan_path:
+        return (resolve_profile_path(repo, config.plan_path),)
+    if config.is_explicit("plan_paths") or config.plan_paths != DEFAULT_PLAN_PATHS:
+        paths = tuple(resolve_profile_path(repo, path) for path in config.plan_paths)
+        if not paths:
+            raise ValueError(
+                f"{preset.display_name} task source requires at least one path"
+            )
+        return paths
+    paths: list[Path] = []
+    for pattern in preset.source_globs:
+        paths.extend(path for path in repo.glob(pattern) if path.is_file())
+    if paths:
+        return tuple(sorted(dedupe_preserving_order(paths), key=lambda path: str(path)))
+    searched = ", ".join(preset.source_globs)
+    raise FileNotFoundError(
+        f"no {preset.display_name} task files found; set task_source.plan_path "
+        f"or task_source.plan_paths. Candidate patterns: {searched}"
+    )
+
+
+def prefix_spec_tool_task(
+    task: Task,
+    prefix: str,
+) -> Task:
+    return dataclasses.replace(
+        task,
+        task_id=prefix_spec_tool_dependency(task.task_id, prefix),
+        dependencies=tuple(
+            prefix_spec_tool_dependency(dependency, prefix)
+            for dependency in task.dependencies
+        ),
+    )
+
+
+def prefix_spec_tool_dependency(
+    task_id: str,
+    prefix: str,
+) -> str:
+    if ":" in task_id:
+        return task_id
+    return f"{prefix}:{task_id}"
+
+
+def spec_tool_task_prefix(repo: Path, path: Path) -> str:
+    path = path.resolve()
+    try:
+        relative = path.relative_to(repo.resolve())
+    except ValueError:
+        relative = Path(path.name)
+    if path.name == "tasks.md" and path.parent != path:
+        raw = path.parent.name
+    else:
+        raw = relative.with_suffix("").as_posix()
+    return sanitize_spec_tool_id_component(raw)
+
+
+def sanitize_spec_tool_id_component(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.+-]+", "-", value.strip())
+    text = text.strip("-._")
+    return text or "tasks"
 
 
 def iter_ralphex_tasks(
@@ -1366,6 +1655,8 @@ def raw_profile_value(
         value = record.labels.get(normalize_label(mapping.label), "")
     elif mapping.prefix is not None:
         value = prefixed_value(record, mapping.prefix)
+    elif mapping.strategy == "checkbox_status":
+        value = checkbox_status_value(record)
     elif mapping.strategy == "full_text":
         value = record.text
     elif mapping.strategy == "heading_text":
@@ -1376,6 +1667,17 @@ def raw_profile_value(
         )
         value = regex_value(mapping.pattern, target, field_name)
     return value
+
+
+def checkbox_status_value(record: MarkdownRecord) -> str:
+    if record.checkbox_mark is None:
+        return ""
+    mark = record.checkbox_mark.strip().casefold()
+    if mark == "x":
+        return DONE_STATUS
+    if mark in {"-", "~", "."}:
+        return "Active"
+    return "Planned"
 
 
 def column_value_from_record(record: MarkdownRecord, column: str) -> str:
@@ -1411,12 +1713,13 @@ def regex_value(pattern: str, text: str, field_name: str) -> str:
     match = re.search(pattern, text, re.MULTILINE)
     if match is None:
         return ""
-    if field_name in match.groupdict():
+    if field_name in match.groupdict() and match.group(field_name):
         return match.group(field_name)
-    if "value" in match.groupdict():
+    if "value" in match.groupdict() and match.group("value"):
         return match.group("value")
-    if match.groups():
-        return match.group(1)
+    for group in match.groups():
+        if group:
+            return group
     return match.group(0)
 
 
@@ -1439,13 +1742,45 @@ def validate_task_set(tasks: list[Task]) -> None:
 
 
 def parse_label_values(lines: list[str]) -> dict[str, str]:
-    labels: dict[str, str] = {}
+    labels: dict[str, list[str]] = {}
+    current_label: str | None = None
     for line in lines:
         match = LABEL_RE.match(line)
-        if match is None:
+        if match is not None:
+            current_label = normalize_label(match.group("label"))
+            value = match.group("value").strip()
+            if value:
+                if label_allows_continuation(current_label):
+                    labels.setdefault(current_label, []).append(value)
+                else:
+                    labels[current_label] = [value]
+                current_label = None
+            elif label_allows_continuation(current_label):
+                labels.setdefault(current_label, [])
+            else:
+                labels[current_label] = []
+                current_label = None
             continue
-        labels[normalize_label(match.group("label"))] = match.group("value").strip()
-    return labels
+        if current_label is None:
+            continue
+        value = label_continuation_value(line)
+        if value:
+            labels[current_label].append(value)
+    return {label: "\n".join(parts).strip() for label, parts in labels.items()}
+
+
+def label_allows_continuation(label: str) -> bool:
+    return any(term in label for term in MULTILINE_LABEL_TERMS)
+
+
+def label_continuation_value(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ""
+    item = LIST_ITEM_RE.match(line)
+    if item is not None:
+        return item.group("body").strip()
+    return stripped
 
 
 def normalize_label(value: str) -> str:

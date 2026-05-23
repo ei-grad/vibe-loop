@@ -357,6 +357,36 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertEqual(tasks[0].paths, ())
         self.assertFalse(tasks[0].conflict_domains_known)
 
+    def test_ralphex_blank_task_label_clears_earlier_task_label(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            plan_path = repo / "docs" / "plans" / "checkout.md"
+            plan_path.parent.mkdir(parents=True)
+            plan_path.write_text(
+                "# Plan: Checkout Flow\n\n"
+                "### Task 1: Add checkout API\n"
+                "- [ ] Add checkout handler\n"
+                "- Resources: checkout\n"
+                "- Resources:\n"
+                "- Paths: src/checkout.py\n"
+                "- Paths:\n",
+                encoding="utf-8",
+            )
+
+            source = build_task_source(
+                repo,
+                TaskSourceConfig(
+                    type="ralphex-markdown",
+                    plan_path="docs/plans/checkout.md",
+                ),
+            )
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].resources, ())
+        self.assertEqual(tasks[0].paths, ())
+        self.assertFalse(tasks[0].conflict_domains_known)
+
     def test_ralphex_markdown_source_splits_task_conflict_surface_label(
         self,
     ) -> None:
@@ -427,6 +457,132 @@ class MarkdownPlanTests(unittest.TestCase):
                 "docs.plans.refund:iteration-2.5",
             ],
         )
+
+    def test_spec_kit_source_extracts_prefixed_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / "specs" / "001-checkout" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                spec_driven_fixture_text("spec-kit-tasks.md"),
+                encoding="utf-8",
+            )
+            source = build_task_source(repo, TaskSourceConfig(type="spec-kit"))
+
+            tasks = source.list_tasks()
+            candidates = runnable_tasks(source, ("Active", "Next", "Planned"))
+
+        self.assertEqual(
+            [task.task_id for task in tasks],
+            ["001-checkout:T001", "001-checkout:T002"],
+        )
+        self.assertEqual(tasks[0].status, "Done")
+        self.assertEqual(tasks[1].status, "Planned")
+        self.assertEqual(tasks[1].title, "Add checkout API contract test")
+        self.assertEqual(tasks[1].dependencies, ("001-checkout:T001",))
+        self.assertIn("contract test fails", tasks[1].acceptance)
+        self.assertIn("specs/001-checkout/tasks.md", tasks[1].source)
+        self.assertEqual([task.task_id for task in candidates], ["001-checkout:T002"])
+
+    def test_kiro_source_discovers_tasks_and_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / ".kiro" / "specs" / "session-refresh" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                spec_driven_fixture_text("kiro-tasks.md"),
+                encoding="utf-8",
+            )
+            source = build_task_source(repo, TaskSourceConfig(type="kiro"))
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(
+            [task.task_id for task in tasks],
+            ["session-refresh:1", "session-refresh:2"],
+        )
+        self.assertEqual(tasks[1].dependencies, ("session-refresh:1",))
+        self.assertEqual(tasks[1].status, "Planned")
+        self.assertEqual(tasks[1].title, "Implement session refresh")
+        self.assertIn("repository abstraction", tasks[1].acceptance)
+
+    def test_openspec_source_treats_in_progress_checkbox_as_active(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / "openspec" / "changes" / "checkout-mutation" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                spec_driven_fixture_text("openspec-tasks.md"),
+                encoding="utf-8",
+            )
+            source = build_task_source(repo, TaskSourceConfig(type="openspec"))
+
+            tasks = source.list_tasks()
+            candidates = runnable_tasks(source, ("Active", "Next", "Planned"))
+
+        self.assertEqual(
+            [task.task_id for task in tasks],
+            ["checkout-mutation:1.1", "checkout-mutation:1.2"],
+        )
+        self.assertEqual(tasks[1].status, "Active")
+        self.assertEqual(tasks[1].dependencies, ("checkout-mutation:1.1",))
+        self.assertIn("idempotency keys", tasks[1].acceptance)
+        self.assertIn("duplicate request", tasks[1].acceptance)
+        self.assertEqual(
+            [task.task_id for task in candidates], ["checkout-mutation:1.2"]
+        )
+
+    def test_spec_tool_sources_degrade_when_stable_ids_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / "openspec" / "changes" / "ambiguous" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("- [ ] Implement ambiguous task\n", encoding="utf-8")
+            source = build_task_source(repo, TaskSourceConfig(type="openspec"))
+
+            with self.assertRaisesRegex(ValueError, "missing required field id"):
+                source.list_tasks()
+
+    def test_spec_tool_sources_reject_empty_task_extraction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / ".kiro" / "specs" / "unsupported" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text("# Tasks\n\nNo checkbox tasks here.\n", encoding="utf-8")
+            source = build_task_source(repo, TaskSourceConfig(type="kiro"))
+
+            with self.assertRaisesRegex(ValueError, "no Kiro tasks found"):
+                source.list_tasks()
+
+    def test_spec_tool_sources_reject_explicit_empty_plan_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+
+            with self.assertRaisesRegex(ValueError, "requires at least one path"):
+                build_task_source(
+                    repo,
+                    TaskSourceConfig(
+                        type="openspec",
+                        plan_paths=(),
+                        explicit_keys=frozenset({"type", "plan_paths"}),
+                    ),
+                )
+
+    def test_spec_tool_sources_reject_invalid_dependency_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / "specs" / "broken-deps" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "- [x] T001 Base task\n"
+                "- [ ] T002 Dependent task\n"
+                "  - Dependencies: T001 T003\n",
+                encoding="utf-8",
+            )
+            source = build_task_source(repo, TaskSourceConfig(type="spec-kit"))
+
+            with self.assertRaisesRegex(ValueError, "invalid dependency syntax"):
+                source.list_tasks()
 
     def test_profile_table_supports_column_aliases_and_reordered_columns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -744,6 +900,27 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertIn("Full Text Task", tasks[0].title)
         self.assertIn("Status: Ready", tasks[0].title)
 
+    def test_profile_heading_scalar_labels_do_not_absorb_following_prose(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "BACKLOG.md").write_text(
+                "# Backlog\n\n"
+                "## HEAD-01: Build heading parser\n"
+                "Status: Ready\n"
+                "This prose belongs to the task body, not the status label.\n"
+                "Acceptance:\n"
+                "- Parser keeps scalar labels bounded.\n",
+                encoding="utf-8",
+            )
+            source = MarkdownProfileSource(repo, heading_profile())
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].status, "Ready")
+        self.assertIn("Parser keeps scalar labels", tasks[0].acceptance)
+
     def test_profile_list_rejects_task_like_record_without_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -863,6 +1040,12 @@ def list_profile() -> dict[str, object]:
 
 def ralphex_fixture_text() -> str:
     return (Path(__file__).parent / "fixtures" / "ralphex-plan.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def spec_driven_fixture_text(name: str) -> str:
+    return (Path(__file__).parent / "fixtures" / "spec-driven" / name).read_text(
         encoding="utf-8"
     )
 

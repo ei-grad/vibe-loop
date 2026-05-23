@@ -15,6 +15,8 @@ from vibe_loop.config import (
     planning_analytics_report,
     reject_generated_command_adapters,
 )
+from vibe_loop.generated_discovery import EvidenceBundle, EvidenceFile, EvidenceLimits
+from vibe_loop.generated_profiles import validate_generated_profile
 
 
 class ConfigTests(unittest.TestCase):
@@ -367,6 +369,147 @@ class ConfigTests(unittest.TestCase):
                             **envelope,
                         }
                     )
+
+    def test_generated_markdown_profile_allows_checkbox_status_strategy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            content = "- [ ] TASK-01 Add runnable task\n"
+            bundle = EvidenceBundle(
+                repo=repo,
+                limits=EvidenceLimits(),
+                files=(
+                    EvidenceFile(
+                        path="TASKS.md",
+                        size=len(content),
+                        sha256="0" * 64,
+                        mtime_ns=0,
+                        content=content,
+                    ),
+                ),
+                skipped=(),
+            )
+
+            error = validate_generated_profile(
+                {
+                    "kind": "markdown_list",
+                    "source_paths": ["TASKS.md"],
+                    "stable_ids": True,
+                    "fields": {
+                        "id": {
+                            "pattern": r"^(?P<id>TASK-\d+)\b",
+                            "strategy": "heading_text",
+                        },
+                        "title": {
+                            "pattern": r"^TASK-\d+\s+(?P<title>.+)$",
+                            "strategy": "heading_text",
+                        },
+                        "status": {"strategy": "checkbox_status"},
+                    },
+                    "status_map": {
+                        "done": ["Done"],
+                        "runnable": ["Planned"],
+                    },
+                },
+                bundle,
+            )
+
+        self.assertIsNone(error)
+
+    def test_generated_markdown_profile_rejects_checkbox_status_for_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            content = "- [ ] TASK-01 Add runnable task\n"
+            bundle = EvidenceBundle(
+                repo=repo,
+                limits=EvidenceLimits(),
+                files=(
+                    EvidenceFile(
+                        path="TASKS.md",
+                        size=len(content),
+                        sha256="0" * 64,
+                        mtime_ns=0,
+                        content=content,
+                    ),
+                ),
+                skipped=(),
+            )
+
+            error = validate_generated_profile(
+                {
+                    "kind": "markdown_list",
+                    "source_paths": ["TASKS.md"],
+                    "stable_ids": True,
+                    "fields": {
+                        "id": {"strategy": "checkbox_status"},
+                        "title": {
+                            "pattern": r"^TASK-\d+\s+(?P<title>.+)$",
+                            "strategy": "heading_text",
+                        },
+                        "status": {"strategy": "checkbox_status"},
+                    },
+                    "status_map": {
+                        "done": ["Done"],
+                        "runnable": ["Planned"],
+                    },
+                },
+                bundle,
+            )
+
+        self.assertIsNotNone(error)
+        assert error is not None
+        self.assertEqual(error[0], "invalid_field_mapping_value")
+        self.assertIn("requires the status field", error[1])
+
+    def test_generated_markdown_profile_rejects_checkbox_status_for_tables(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            content = (
+                "| ID | Task | Status |\n"
+                "| --- | --- | --- |\n"
+                "| TASK-01 | Add runnable task | Todo |\n"
+            )
+            bundle = EvidenceBundle(
+                repo=repo,
+                limits=EvidenceLimits(),
+                files=(
+                    EvidenceFile(
+                        path="TASKS.md",
+                        size=len(content),
+                        sha256="0" * 64,
+                        mtime_ns=0,
+                        content=content,
+                    ),
+                ),
+                skipped=(),
+            )
+
+            error = validate_generated_profile(
+                {
+                    "kind": "markdown_table",
+                    "source_paths": ["TASKS.md"],
+                    "stable_ids": True,
+                    "fields": {
+                        "id": {"column": "ID"},
+                        "title": {"column": "Task"},
+                        "status": {
+                            "column": "Status",
+                            "strategy": "checkbox_status",
+                        },
+                    },
+                    "status_map": {
+                        "done": ["Done"],
+                        "runnable": ["Planned"],
+                    },
+                },
+                bundle,
+            )
+
+        self.assertIsNotNone(error)
+        assert error is not None
+        self.assertEqual(error[0], "invalid_field_mapping_value")
+        self.assertIn("requires markdown_list", error[1])
 
     def test_task_source_plan_paths_rejects_non_string_entries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

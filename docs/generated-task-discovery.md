@@ -131,6 +131,31 @@ source is explicit configuration, so setting `task_source.type =
 "ralphex-markdown"` disables generated cache use for the active task source in
 the same way as other user-authored source selectors.
 
+Repositories using common spec-driven development tools can opt into built-in
+non-executable presets rather than asking generated discovery to infer those
+formats or writing command adapters:
+
+| `task_source.type` | Default source paths | Task shape |
+| --- | --- | --- |
+| `spec-kit` | `specs/*/tasks.md`, `.specify/specs/*/tasks.md` | Checkbox list items with `T001`-style IDs, optional `[P]` and story markers |
+| `kiro` | `.kiro/specs/*/tasks.md` | Numbered checkbox list items such as `1. Implement task` |
+| `openspec` | `openspec/changes/*/tasks.md` | Numbered checkbox list items such as `1.2 Implement task` |
+
+The presets normalize checked boxes to `Done`, unchecked boxes to `Planned`,
+and in-progress markers such as `[-]` or `[~]` to `Active`. Nested `Depends`,
+`Depends on`, `Dependencies`, `Acceptance`, and `Evidence` labels are copied
+into the normalized task when present, and inline dependency text such as
+`(depends on T012, T013)` is parsed as a local dependency list. Acceptance and
+evidence labels can be single-line values or followed by nested bullet text.
+Task IDs are prefixed with the parent spec or change directory so multiple
+`tasks.md` files can be exposed together without collisions, and local
+dependency IDs are rewritten with the same prefix. These presets are explicit
+source selectors; setting `task_source.type` to one of them disables generated
+cache use for the active source. If a task file is missing stable IDs, contains
+duplicates, has no parseable spec-tool tasks, or uses invalid dependency
+syntax, parsing fails with an actionable diagnostic instead of creating
+synthetic runnable tasks.
+
 The agent-generated profile should describe how to read existing repo artifacts,
 not invent task state. It can map column names, heading/list conventions,
 statuses, dependency syntax, done states, candidate files, and title/acceptance
