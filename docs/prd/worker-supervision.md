@@ -100,3 +100,96 @@ automatic removal of locks or worktrees, and no stealing another worker's dirty
 workspace or integration lock.
 
 Related implementation IDs: `PAR-09`, `PAR-11`, `EVAL-09`.
+
+## PRD-WRK-009 Runtime Lifecycle Events
+
+`runs.jsonl` should support additional record types beyond `run_result` and
+`worker_report`. New types include lock events (acquired, released, expired),
+workspace events (claimed, mismatch detected), and run state transitions
+(started, classified).
+
+Records must be additive — unknown types are ignored on read, consistent with
+the existing invalid JSON line tolerance. Each record carries `schema_version`,
+`record_type`, `occurred_at`, and a type-specific payload. Records for the same
+run share `run_id`; lock records carry `task_id`.
+
+Events are diagnostic and inspectable, not authoritative for task status. The
+task source remains the authority for task completion state.
+
+Acceptance must cover new record types appended without breaking existing
+readers, unknown type tolerance, correlation by `run_id` and `task_id`, payload
+schema per type, and the rule that lifecycle events do not replace task-source
+authority.
+
+Related implementation IDs: `RT-01`, `RT-05`.
+
+## PRD-WRK-010 Run State Machine
+
+The run lifecycle should be formalized into explicit derivable states:
+`scheduled`, `started`, `session_observed`, `workspace_claimed`, `reported`,
+`classified`, and `finalized`.
+
+State must be derivable from existing records in `runs.jsonl` without hidden
+mutable state. `runs inspect` and `workers` should show the current lifecycle
+state. Incomplete runs show which transitions are missing.
+
+Acceptance must cover state derivation from recorded events, correct lifecycle
+display in `runs inspect` and `workers`, partial state for incomplete runs,
+and no hidden mutable state outside the append-only log.
+
+Related implementation IDs: `RT-02`.
+
+## PRD-WRK-011 Pluggable Lock Backends
+
+Lock backends should be configurable so repositories can use directory-based
+advisory locks (the default), command-backed adapters for external coordination
+tools, or future backend implementations.
+
+Command-backed lock adapters should follow the same pattern as command-backed
+task sources: explicit user-authored commands in `.vibe-loop.toml`, bounded
+JSON contracts for acquire/release/status/list, and clear failure diagnostics.
+Generated profiles must not introduce lock adapters.
+
+Acceptance must cover directory-based default behavior, command adapter
+configuration, acquire/release/status/list command contracts, error handling
+for adapter failures, fallback behavior when an adapter is unavailable, and
+the rule that generated profiles cannot introduce lock backends. When a
+configured command adapter is unavailable, lock operations must fail closed
+with an actionable diagnostic rather than silently falling back to directory
+locks.
+
+Related implementation IDs: `RT-06`.
+
+## PRD-WRK-012 Lock Leases
+
+Lock metadata should support optional `lease_seconds` and heartbeat fields.
+When a lease is set, the lock is considered expired after `lease_seconds`
+without a heartbeat update.
+
+Expired leases are visible in `doctor` and `workers` as an additional stale
+reason alongside PID-based checks. Fencing tokens provide a monotonic
+generation counter per lock path; sensitive operations (report, workspace
+claim, integration lock release) should validate the token. Default behavior
+is advisory locks without leases, fully backward compatible.
+
+Acceptance must cover lease expiry detection, heartbeat updates resetting the
+lease timer, fencing token validation on release and update, expired lease
+visibility in diagnostics, and unchanged default advisory lock behavior.
+
+Related implementation IDs: `RT-03`.
+
+## PRD-WRK-013 Restart Budgets
+
+The maximum restart count per task per supervisor session should be configurable
+rather than hardcoded. Cooldown between retries should also be configurable.
+
+Restart count must be visible in `workers` and `runs` output. When the budget
+is exhausted, the supervisor escalates to a failed state with an explicit
+exhaustion reason instead of stopping silently. The budget does not cross
+supervisor sessions.
+
+Acceptance must cover configurable max restarts and cooldown, restart count
+visibility, explicit exhaustion failure classification, budget isolation per
+supervisor session, and default values matching current hardcoded behavior.
+
+Related implementation IDs: `RT-04`.

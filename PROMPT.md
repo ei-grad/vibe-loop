@@ -79,6 +79,62 @@ surfaces to higher-level PRDs, requirements, and task artifacts.
 - Planning analytics report on the task/run/evidence graph; they must not become
   a hidden scheduler or completion source.
 
+## Viable System Model Mapping
+
+`vibe-loop` maps onto Stafford Beer's Viable System Model. This mapping
+explains the role of each subsystem and guides where new functionality belongs.
+
+- **System 1 — Operations.** Worker agents that execute individual task slices.
+  Each worker owns its branch/worktree, implementation, review, and integration
+  lifecycle. Workers are finite and independent.
+- **System 2 — Coordination.** Task locks, conflict-domain scheduling,
+  integration locks, and workspace claims. These mechanisms prevent interference
+  between concurrent S1 workers without centralized control. Coordination is
+  advisory and inspectable, not automatic.
+- **System 3 — Control.** The scheduler/dispatcher: task selection, `run-next`,
+  `run-until-done`, `--jobs N`, refill, and restart budgets. S3 allocates work
+  to S1 workers and monitors their completion.
+- **System 3\* — Audit.** `doctor`, stale lock detection, workspace diagnostics,
+  and worker state visibility. Sporadic read-only checks that surface problems
+  without taking corrective action.
+- **System 4 — Intelligence.** Planning analytics, duration estimation,
+  agent-assisted selection, and timeline projections. S4 observes the
+  environment and informs future decisions, but does not directly drive
+  scheduling. The boundary between S3 and S4 is intentional: analytics report,
+  they do not actuate.
+- **System 5 — Policy.** User configuration (`.vibe-loop.toml`), task-source
+  authority, `PROMPT.md`, and repository-level conventions. S5 sets identity and
+  ultimate authority. The task source — not the runtime — remains the source of
+  truth for project state.
+
+New features should strengthen the system they belong to rather than blur
+boundaries between systems. S2 coordination should remain advisory. S3\*
+audit should remain read-only. S4 intelligence should inform without actuating.
+
+## Runtime Evolution Direction
+
+- Extend `runs.jsonl` with typed lifecycle events beyond `run_result` and
+  `worker_report`: lock acquisitions and releases, workspace claims, run state
+  transitions, and restart attempts. New record types are additive; readers must
+  tolerate unknown types.
+- Make run state transitions explicit and inspectable. A run progresses through
+  observable states — scheduled, started, session observed, workspace claimed,
+  reported, classified, finalized — recorded as events and derivable from the existing
+  append-only log.
+- Lock backends should be pluggable. Directory-based advisory locks are the
+  default, but repositories that share `state_dir` across hosts or integrate
+  with external coordination should be able to use command-backed lock adapters,
+  mirroring the task-source command adapter pattern.
+- Support optional lock leases with time-based expiry alongside PID-based stale
+  detection. Fencing tokens prevent stale holders from corrupting newer lock
+  state. Advisory locks without leases remain the default.
+- Make restart budgets explicit and configurable rather than hardcoded. When a
+  budget is exhausted, the supervisor escalates to a clear failed state rather
+  than retrying silently.
+- Keep concurrency decisions explicit and user-controlled. `--jobs N` is the WIP
+  limit. `doctor` and `workers` commands surface WIP count, blocked ratio, and
+  lock contention as diagnostics, not as inputs to automatic adjustment.
+
 ## Spec And Planning Flow
 
 Use three levels:
