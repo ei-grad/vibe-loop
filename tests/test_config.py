@@ -16,7 +16,10 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
 )
 from vibe_loop.generated_discovery import EvidenceBundle, EvidenceFile, EvidenceLimits
-from vibe_loop.generated_profiles import validate_generated_profile
+from vibe_loop.generated_profiles import (
+    agent_name_from_config,
+    validate_generated_profile,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -46,7 +49,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agent.command_source, "auto:codex")
         self.assertEqual(config.agent.selection_command, "codex exec {prompt}")
         self.assertEqual(config.agent.selection_command_source, "auto:codex")
-        self.assertEqual(config.agent.resolved_cli, "codex")
+        self.assertEqual(config.agent.agent_kind, "auto")
+        self.assertEqual(config.agent.executable_kind, "codex")
+        self.assertEqual(config.agent.prompt_dialect, "codex")
+        self.assertEqual(config.agent.prompt_dialect_source, "auto:codex")
         self.assertEqual(config.agent.skill_ref_prefix, "$")
 
     def test_claude_only_path_resolves_default_agent_commands(self) -> None:
@@ -64,7 +70,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agent.command_source, "auto:claude")
         self.assertEqual(config.agent.selection_command, "claude -p {prompt}")
         self.assertEqual(config.agent.selection_command_source, "auto:claude")
-        self.assertEqual(config.agent.resolved_cli, "claude")
+        self.assertEqual(config.agent.agent_kind, "auto")
+        self.assertEqual(config.agent.executable_kind, "claude")
+        self.assertEqual(config.agent.prompt_dialect, "claude")
+        self.assertEqual(config.agent.prompt_dialect_source, "auto:claude")
         self.assertEqual(config.agent.skill_ref_prefix, "/")
 
     def test_missing_agent_cli_leaves_defaults_unresolved(self) -> None:
@@ -79,6 +88,8 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsNone(config.agent.command)
         self.assertEqual(config.agent.command_source, "unresolved:no-supported-cli")
+        self.assertIsNone(config.agent.prompt_dialect)
+        self.assertIsNone(config.agent.skill_ref_prefix)
         with self.assertRaisesRegex(AgentResolutionError, "install codex or claude"):
             config.agent.require_command()
 
@@ -104,10 +115,15 @@ class ConfigTests(unittest.TestCase):
             config.agent.selection_command_source,
             "auto:codex:codex-first",
         )
-        self.assertEqual(config.agent.resolved_cli, "codex")
+        self.assertEqual(config.agent.executable_kind, "codex")
+        self.assertEqual(config.agent.prompt_dialect, "codex")
+        self.assertEqual(
+            config.agent.prompt_dialect_source,
+            "auto:codex:codex-first",
+        )
         self.assertEqual(config.agent.diagnostics(), [])
 
-    def test_explicit_claude_commands_remain_authoritative_with_both_clis(
+    def test_legacy_explicit_claude_commands_infer_prompt_dialect(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -119,7 +135,7 @@ class ConfigTests(unittest.TestCase):
             write_executable(bin_dir / "claude")
             (repo / ".vibe-loop.toml").write_text(
                 "[agent]\n"
-                "command = \"claude -p '$vibe-loop {task_id}'\"\n"
+                'command = "claude -p {prompt}"\n'
                 'selection_command = "claude -p {prompt}"\n',
                 encoding="utf-8",
             )
@@ -127,11 +143,67 @@ class ConfigTests(unittest.TestCase):
             with patch.dict("os.environ", {"PATH": str(bin_dir)}):
                 config = load_config(repo)
 
-        self.assertEqual(config.agent.command, "claude -p '$vibe-loop {task_id}'")
+        self.assertEqual(config.agent.command, "claude -p {prompt}")
         self.assertEqual(config.agent.command_source, "explicit")
-        self.assertIsNone(config.agent.resolved_cli)
+        self.assertIsNone(config.agent.executable_kind)
         self.assertEqual(config.agent.selection_command, "claude -p {prompt}")
         self.assertEqual(config.agent.selection_command_source, "explicit")
+        self.assertEqual(config.agent.prompt_dialect, "claude")
+        self.assertEqual(
+            config.agent.prompt_dialect_source,
+            "legacy-command-inference:claude",
+        )
+        self.assertEqual(config.agent.skill_ref_prefix, "/")
+        self.assertIn("legacy command parsing", "\n".join(config.agent.diagnostics()))
+
+    def test_agent_kind_claude_sets_prompt_dialect_for_env_prefixed_command(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "codex")
+            write_executable(bin_dir / "claude")
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "claude"\n'
+                'command = "CLAUDE_HOME=.claude claude -p {prompt}"\n',
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        self.assertEqual(config.agent.command_source, "explicit")
+        self.assertEqual(config.agent.agent_kind, "claude")
+        self.assertIsNone(config.agent.executable_kind)
+        self.assertEqual(config.agent.prompt_dialect, "claude")
+        self.assertEqual(config.agent.prompt_dialect_source, "agent.kind:claude")
+        self.assertEqual(config.agent.skill_ref_prefix, "/")
+        self.assertEqual(config.agent.diagnostics(), [])
+
+    def test_explicit_selection_command_reports_custom_executable_identity(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "claude"\n'
+                'command = "worker-wrapper {prompt}"\n'
+                'selection_command = "selector-wrapper {prompt}"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.agent.agent_kind, "claude")
+        self.assertIsNone(config.agent.executable_kind)
+        self.assertEqual(config.agent.prompt_dialect, "claude")
+        self.assertEqual(agent_name_from_config(config), "custom")
 
     def test_explicit_agent_commands_remain_authoritative(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -153,6 +225,76 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agent.command_source, "explicit")
         self.assertEqual(config.agent.selection_command, "custom-selector {prompt}")
         self.assertEqual(config.agent.selection_command_source, "explicit")
+        self.assertEqual(config.agent.agent_kind, "auto")
+        self.assertEqual(config.agent.prompt_dialect, "codex")
+        self.assertEqual(config.agent.prompt_dialect_source, "legacy-default:codex")
+        self.assertEqual(config.agent.skill_ref_prefix, "$")
+        self.assertIn("legacy Codex-style", "\n".join(config.agent.diagnostics()))
+
+    def test_custom_agent_kind_requires_prompt_dialect_or_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nkind = "custom"\ncommand = "custom-worker {prompt}"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.agent.agent_kind, "custom")
+        self.assertEqual(config.agent.command_source, "explicit")
+        self.assertIsNone(config.agent.prompt_dialect)
+        self.assertIsNone(config.agent.skill_ref_prefix)
+        self.assertIn("agent.kind is custom", "\n".join(config.agent.diagnostics()))
+        with self.assertRaisesRegex(AgentResolutionError, "agent.kind is custom"):
+            config.agent.require_skill_ref_prefix()
+
+    def test_custom_agent_kind_accepts_explicit_prompt_dialect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "custom"\n'
+                'command = "custom-worker {prompt}"\n'
+                'prompt_dialect = "claude"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.agent.agent_kind, "custom")
+        self.assertEqual(config.agent.prompt_dialect, "claude")
+        self.assertEqual(
+            config.agent.prompt_dialect_source,
+            "explicit:agent.prompt_dialect",
+        )
+        self.assertEqual(config.agent.skill_ref_prefix, "/")
+        self.assertNotIn(
+            "worker prompt construction requires",
+            "\n".join(config.agent.diagnostics()),
+        )
+
+    def test_agent_prompt_dialect_and_prefix_must_agree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nprompt_dialect = "codex"\nskill_ref_prefix = "/"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "disagree"):
+                load_config(repo)
+
+    def test_builtin_agent_kind_rejects_conflicting_prompt_syntax(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nkind = "codex"\nprompt_dialect = "claude"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "agent.kind"):
+                load_config(repo)
 
     def test_agent_forward_stderr_defaults_to_false(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

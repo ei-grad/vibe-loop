@@ -419,8 +419,9 @@ main_branch = "main"
 state_dir = ".vibe-loop"
 
 [agent]
-# Optional when Codex or Claude is available on PATH.
-command = "codex exec '$vibe-loop {task_id}'"
+# Optional when kind = "auto" and Codex or Claude is available on PATH.
+kind = "auto"
+command = "codex exec {prompt}"
 selection_command = "codex exec {prompt}"
 forward_stderr = false
 
@@ -468,34 +469,82 @@ disables generated cache as the active task source. Non-source settings such as
 `runnable_statuses` can still override matching generated fields without
 disabling the generated parser.
 
-Agent commands are resolved independently. Explicit `.vibe-loop.toml` values
-remain authoritative. Omitted worker and selection commands use a deterministic
+Agent executable commands and worker prompt dialect are resolved independently.
+`agent.command` and `agent.selection_command` are shell command templates.
+`agent.kind`, `agent.prompt_dialect`, and `agent.skill_ref_prefix` control how
+the worker prompt references the bundled skill. Explicit `.vibe-loop.toml`
+command values remain authoritative; no generated profile can introduce
+executable commands.
+
+Supported agent kinds:
+
+- `auto`: default. Omitted worker and selection commands use deterministic
+  supported-agent detection.
+- `codex`: use Codex-style worker prompts with `$vibe-loop`.
+- `claude`: use Claude-style worker prompts with `/vibe-loop`.
+- `custom`: use explicit command templates and require `prompt_dialect` or
+  `skill_ref_prefix` before a worker prompt can be built.
+
+Omitted worker and selection commands under `kind = "auto"` use a deterministic
 Codex-first policy:
 
-- Codex only: `codex exec '$vibe-loop {task_id}'` and `codex exec {prompt}`.
-- Claude only: `claude -p '$vibe-loop {task_id}'` and `claude -p {prompt}`.
+- Codex only: `codex exec {prompt}` for worker and selection commands.
+- Claude only: `claude -p {prompt}` for worker and selection commands.
 - Codex and Claude: Codex is selected for omitted commands.
 
 When neither supported CLI is available, agent-using commands fail with a
 diagnostic that points to installation or explicit config.
 
 Configure Claude prompt mode explicitly when that is the worker or selector you
-want to run regardless of what else is installed:
+want to run regardless of what else is installed. The executable command can use
+environment prefixes or wrappers because the prompt dialect comes from
+`kind = "claude"`, not from parsing the command string:
 
 ```toml
 [agent]
-command = "claude -p '$vibe-loop {task_id}'"
-selection_command = "claude -p {prompt}"
+kind = "claude"
+command = "CLAUDE_HOME=.claude claude -p {prompt}"
+selection_command = "CLAUDE_HOME=.claude claude -p {prompt}"
 forward_stderr = false
 ```
 
+Configure a custom launcher by making both the executable template and skill
+syntax explicit:
+
+```toml
+[agent]
+kind = "custom"
+command = "my-worker --prompt {prompt}"
+selection_command = "my-selector --prompt {prompt}"
+prompt_dialect = "claude"
+# Equivalent low-level form:
+# skill_ref_prefix = "/"
+```
+
+`prompt_dialect = "codex"` maps to `$vibe-loop`; `prompt_dialect = "claude"`
+maps to `/vibe-loop`. `skill_ref_prefix` accepts `$` or `/` directly. If both
+are set, they must agree. `kind = "custom"` without one of those fields is a
+configuration diagnostic and worker launch failure, not an implicit Codex-style
+default.
+
+For compatibility, old configurations that set an explicit `agent.command`
+without `agent.kind` still run. The runtime reports the prompt dialect source as
+legacy command inference when it recognizes a simple Codex or Claude command, or
+as a legacy Codex-style default when it cannot infer one. Set `agent.kind`,
+`agent.prompt_dialect`, or `agent.skill_ref_prefix` to remove that migration
+diagnostic.
+
 `agent.command` receives `{task_id}` for the selected task and `{run_id}` for
-the supervisor run. Worker commands also receive `VIBE_LOOP_RUN_ID`,
-`VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in their environment.
-`selection_command` receives a shell-quoted `{prompt}` containing the
-dependency-ready candidate list and recent run context. Single-task selection
-should print JSON containing `task_id`; parallel batch selection should print
-JSON containing `task_ids`.
+the supervisor run. It also receives a shell-quoted `{prompt}` containing the
+skill reference, normalized task context, and the CLI worker addendum. Worker
+commands also receive `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`,
+and `VIBE_LOOP_LOG` in their environment. `selection_command` receives a
+shell-quoted `{prompt}` containing the dependency-ready candidate list and
+recent run context. Single-task selection should print JSON containing
+`task_id`; parallel batch selection should print JSON containing `task_ids`.
+Spec traceability and future spec gate context are added to the worker prompt
+from normalized task metadata independently of the executable command and prompt
+dialect.
 
 For command-backed task sources:
 
@@ -818,10 +867,11 @@ new holder permission to take over automatically.
 `runs.jsonl` is an append-only stream of versioned run result records. Run
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the
 `session_id_source`, the `agent_command_source` used for the worker command,
-the `agent_selection_command_source`, and the default agent policy source used
-when commands are auto-resolved. `vibe-loop runs list` groups those records by
-run id and shows the latest structured status plus the log path; `vibe-loop runs
-inspect <run-id>` prints the detailed record history for one run.
+the `agent_selection_command_source`, prompt dialect and skill reference source
+metadata, and the default agent policy source used when commands are
+auto-resolved. `vibe-loop runs list` groups those records by run id and shows
+the latest structured status plus the log path; `vibe-loop runs inspect
+<run-id>` prints the detailed record history for one run.
 Project worklogs should remain final evidence ledgers. Attempt logs and failed
 runs belong in `.vibe-loop/`, not in project completion records.
 

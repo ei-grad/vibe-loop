@@ -51,6 +51,11 @@ class RunResult:
     agent_selection_command_source: str = ""
     agent_default_policy_source: str = ""
     agent_default_policy: str = ""
+    agent_kind: str = ""
+    agent_prompt_dialect: str = ""
+    agent_prompt_dialect_source: str = ""
+    agent_skill_ref_prefix: str = ""
+    agent_skill_ref_prefix_source: str = ""
     classification_source: str = ""
     worker_report: dict[str, object] | None = None
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
@@ -71,6 +76,11 @@ class RunResult:
             "agent_selection_command_source": self.agent_selection_command_source,
             "agent_default_policy_source": self.agent_default_policy_source,
             "agent_default_policy": self.agent_default_policy,
+            "agent_kind": self.agent_kind,
+            "agent_prompt_dialect": self.agent_prompt_dialect,
+            "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
+            "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
+            "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
             "finished_at": self.finished_at,

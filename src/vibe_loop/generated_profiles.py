@@ -1049,7 +1049,10 @@ def build_cache_envelope(
         "status": status,
         "generated_at": generated_timestamp(),
         "agent": {
-            "name": agent_name_from_source(config.agent.selection_command_source),
+            "name": agent_name_from_config(config),
+            "kind": config.agent.agent_kind,
+            "prompt_dialect": config.agent.prompt_dialect,
+            "prompt_dialect_source": config.agent.prompt_dialect_source,
             "selection_command_source": config.agent.selection_command_source,
             "default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "default_policy": AGENT_DEFAULT_POLICY,
@@ -1075,6 +1078,9 @@ def build_config_disabled_cache(config: VibeConfig) -> dict[str, Any]:
         "generated_at": generated_timestamp(),
         "agent": {
             "name": "not_run",
+            "kind": config.agent.agent_kind,
+            "prompt_dialect": config.agent.prompt_dialect,
+            "prompt_dialect_source": config.agent.prompt_dialect_source,
             "selection_command_source": config.agent.selection_command_source,
             "default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "default_policy": AGENT_DEFAULT_POLICY,
@@ -1769,9 +1775,15 @@ def is_markdown_separator_row(cells: list[str]) -> bool:
     return bool(cells) and all(set(cell) <= {"-", ":", " "} for cell in cells)
 
 
+def agent_name_from_config(config: VibeConfig) -> str:
+    return agent_name_from_source(config.agent.selection_command_source)
+
+
 def agent_name_from_source(source: str) -> str:
     if source.startswith("auto:"):
         return source.split(":", 2)[1]
+    if source.startswith("agent.kind:"):
+        return source.split(":", 1)[1]
     if source == "explicit":
         return "custom"
     if source.startswith("unresolved:"):

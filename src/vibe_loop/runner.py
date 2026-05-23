@@ -411,7 +411,7 @@ class VibeRunner:
         message = ""
         session_id = run_id
         session_id_source = "fallback:run_id"
-        skill_prefix = self.config.agent.skill_ref_prefix
+        skill_prefix = self.config.agent.require_skill_ref_prefix()
         worker_prompt = build_worker_prompt(skill_prefix, task)
         command = command_template.format(
             prompt=shell_quote(worker_prompt),
@@ -451,6 +451,11 @@ class VibeRunner:
                     self.config.agent.command_source,
                     self.config.agent.selection_command_source,
                     self.config.agent.detected,
+                    self.config.agent.agent_kind,
+                    self.config.agent.prompt_dialect,
+                    self.config.agent.prompt_dialect_source,
+                    self.config.agent.skill_ref_prefix,
+                    self.config.agent.skill_ref_prefix_source,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"run_id={run_id}", log)
@@ -469,6 +474,19 @@ class VibeRunner:
                     log,
                 )
                 report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}", log)
+                report_status(f"agent kind: {self.config.agent.agent_kind}", log)
+                report_status(
+                    "agent prompt dialect source: "
+                    f"{self.config.agent.prompt_dialect_source}",
+                    log,
+                )
+                report_status(
+                    "agent skill ref prefix source: "
+                    f"{self.config.agent.skill_ref_prefix_source}",
+                    log,
+                )
+                for diagnostic in self.config.agent.compatibility_diagnostics:
+                    report_status(f"agent diagnostic: {diagnostic}", log)
                 report_status(
                     "detected agents: "
                     f"{format_detected_agents(self.config.agent.detected)}",
@@ -543,6 +561,11 @@ class VibeRunner:
                 agent_selection_command_source=self.config.agent.selection_command_source,
                 agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
                 agent_default_policy=AGENT_DEFAULT_POLICY,
+                agent_kind=self.config.agent.agent_kind,
+                agent_prompt_dialect=self.config.agent.prompt_dialect or "",
+                agent_prompt_dialect_source=self.config.agent.prompt_dialect_source,
+                agent_skill_ref_prefix=self.config.agent.skill_ref_prefix or "",
+                agent_skill_ref_prefix_source=self.config.agent.skill_ref_prefix_source,
                 classification_source=classification.source,
                 worker_report=(
                     worker_report.to_json() if worker_report is not None else None
@@ -637,7 +660,7 @@ class VibeRunner:
         candidates = self.list_candidates(exclude=exclude)
         if not candidates:
             return None
-        self.config.agent.require_command()
+        self.require_worker_launch_config()
         task = self.select_from_candidates(candidates, ask_agent=ask_agent)
         try:
             return self.run_task(task)
@@ -763,7 +786,7 @@ class VibeRunner:
                     if not candidates:
                         break
                     if not command_validated:
-                        self.config.agent.require_command()
+                        self.require_worker_launch_config()
                         command_validated = True
                     open_slots = jobs - len(in_flight)
                     if max_slices > 0:
@@ -843,6 +866,10 @@ class VibeRunner:
                     if result.classification in {"failed", "unknown"}:
                         stop_after_running = not continue_on_failure
         return results
+
+    def require_worker_launch_config(self) -> None:
+        self.config.agent.require_command()
+        self.config.agent.require_skill_ref_prefix()
 
     def run_completion_checks(self, log) -> str:
         for command in self.config.completion.commands:
@@ -1243,6 +1270,11 @@ def write_log_header(
     command_source: str,
     selection_command_source: str,
     detected: AgentDetection,
+    agent_kind: str,
+    prompt_dialect: str | None,
+    prompt_dialect_source: str,
+    skill_ref_prefix: str | None,
+    skill_ref_prefix_source: str,
 ) -> None:
     log.write(f"[vibe-loop] run_id={run_id}\n")
     log.write(f"[vibe-loop] task_id={task.task_id}\n")
@@ -1256,6 +1288,11 @@ def write_log_header(
         f"[vibe-loop] agent_default_policy_source={AGENT_DEFAULT_POLICY_SOURCE}\n"
     )
     log.write(f"[vibe-loop] agent_default_policy={AGENT_DEFAULT_POLICY}\n")
+    log.write(f"[vibe-loop] agent_kind={agent_kind}\n")
+    log.write(f"[vibe-loop] agent_prompt_dialect={prompt_dialect or ''}\n")
+    log.write(f"[vibe-loop] agent_prompt_dialect_source={prompt_dialect_source}\n")
+    log.write(f"[vibe-loop] agent_skill_ref_prefix={skill_ref_prefix or ''}\n")
+    log.write(f"[vibe-loop] agent_skill_ref_prefix_source={skill_ref_prefix_source}\n")
     log.write(f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n")
     log.write(f"[vibe-loop] start_main={start_main}\n\n")
 

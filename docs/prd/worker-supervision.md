@@ -21,9 +21,9 @@ Task locks and run records must make active and historical worker attempts
 inspectable without reading raw logs as the primary source of truth.
 
 Acceptance must cover lock ownership, worker PID, task ID, run ID, log path,
-start time, base main revision, host, resolved command identity, append-only
-`runs.jsonl`, invalid JSON line tolerance, and `workers`, `runs list`, and
-`runs inspect` views.
+start time, base main revision, host, resolved command identity, prompt dialect
+and skill reference source metadata, append-only `runs.jsonl`, invalid JSON line
+tolerance, and `workers`, `runs list`, and `runs inspect` views.
 
 Related implementation IDs: `CORE-01`, `PAR-02`, `PAR-06`, `PAR-09`.
 

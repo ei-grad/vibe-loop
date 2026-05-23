@@ -128,9 +128,14 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
     }
 )
 
+AGENT_KIND_VALUES = ("auto", "codex", "claude", "custom")
+AGENT_PROMPT_DIALECTS = ("codex", "claude")
 AGENT_SKILL_REF_PREFIX = {
     "codex": "$",
     "claude": "/",
+}
+AGENT_SKILL_REF_DIALECT = {
+    prefix: dialect for dialect, prefix in AGENT_SKILL_REF_PREFIX.items()
 }
 AGENT_COMMAND_DEFAULTS = {
     "codex": {
@@ -146,11 +151,11 @@ SUPPORTED_AGENT_CLIS = tuple(AGENT_COMMAND_DEFAULTS)
 AGENT_PREFERRED_CLI = "codex"
 AGENT_DEFAULT_POLICY_SOURCE = "codex-first"
 AGENT_DEFAULT_POLICY = (
-    "Explicit .vibe-loop.toml agent commands win. Omitted commands use Codex "
-    "when Codex is available, including when Claude is also available; otherwise "
-    "they use Claude when it is the sole available supported CLI. If no "
-    "supported CLI is available, configure a command explicitly or install Codex "
-    "or Claude."
+    "Explicit .vibe-loop.toml agent commands win. agent.kind controls built-in "
+    "prompt dialects; kind=auto keeps Codex-first defaults for omitted commands. "
+    "Custom agents must configure prompt_dialect or skill_ref_prefix for worker "
+    "prompts. Legacy unkinded explicit commands may use compatibility inference, "
+    "reported through diagnostics."
 )
 
 
@@ -190,6 +195,15 @@ class AgentDetection:
 
 
 @dataclasses.dataclass(frozen=True)
+class AgentPromptDialectResolution:
+    prompt_dialect: str | None
+    prompt_dialect_source: str
+    skill_ref_prefix: str | None
+    skill_ref_prefix_source: str
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
 class AgentConfig:
     command: str | None = None
     selection_command: str | None = None
@@ -197,13 +211,14 @@ class AgentConfig:
     selection_command_source: str = "unresolved:no-supported-cli"
     detected: AgentDetection = dataclasses.field(default_factory=AgentDetection)
     forward_stderr: bool = False
-    resolved_cli: str | None = None
-
-    @property
-    def skill_ref_prefix(self) -> str:
-        if self.resolved_cli:
-            return AGENT_SKILL_REF_PREFIX.get(self.resolved_cli, "$")
-        return "$"
+    agent_kind: str = "auto"
+    agent_kind_source: str = "default:auto"
+    executable_kind: str | None = None
+    prompt_dialect: str | None = "codex"
+    prompt_dialect_source: str = "legacy-default:codex"
+    skill_ref_prefix: str | None = "$"
+    skill_ref_prefix_source: str = "legacy-default:codex"
+    compatibility_diagnostics: tuple[str, ...] = ()
 
     def require_command(self) -> str:
         if self.command:
@@ -227,8 +242,18 @@ class AgentConfig:
             )
         )
 
+    def require_skill_ref_prefix(self) -> str:
+        if self.skill_ref_prefix:
+            return self.skill_ref_prefix
+        raise AgentResolutionError(
+            unresolved_prompt_dialect_message(
+                self.agent_kind,
+                self.prompt_dialect_source,
+            )
+        )
+
     def diagnostics(self) -> list[str]:
-        messages: list[str] = []
+        messages: list[str] = list(self.compatibility_diagnostics)
         if not self.command:
             messages.append(
                 unresolved_agent_command_message(
@@ -245,17 +270,29 @@ class AgentConfig:
                     self.detected,
                 )
             )
+        if self.command and not self.skill_ref_prefix:
+            messages.append(
+                unresolved_prompt_dialect_message(
+                    self.agent_kind,
+                    self.prompt_dialect_source,
+                )
+            )
         return messages
 
     def to_json(self) -> dict[str, object]:
         return {
-            "command": self.command,
+            "command_configured": self.command is not None,
             "command_source": self.command_source,
-            "selection_command": self.selection_command,
+            "selection_command_configured": self.selection_command is not None,
             "selection_command_source": self.selection_command_source,
             "forward_stderr": self.forward_stderr,
-            "resolved_cli": self.resolved_cli,
+            "agent_kind": self.agent_kind,
+            "agent_kind_source": self.agent_kind_source,
+            "executable_kind": self.executable_kind,
+            "prompt_dialect": self.prompt_dialect,
+            "prompt_dialect_source": self.prompt_dialect_source,
             "skill_ref_prefix": self.skill_ref_prefix,
+            "skill_ref_prefix_source": self.skill_ref_prefix_source,
             "detected": self.detected.to_json(),
             "default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "default_policy": AGENT_DEFAULT_POLICY,
@@ -427,17 +464,60 @@ def read_config_file(path: Path) -> dict[str, Any]:
 def parse_agent(data: object) -> AgentConfig:
     table = expect_table(data, "agent")
     detected = detect_agent_clis()
+    agent_kind = optional_nonempty_string(table.get("kind")) or "auto"
+    if agent_kind not in AGENT_KIND_VALUES:
+        allowed = ", ".join(AGENT_KIND_VALUES)
+        raise ValueError(f"agent.kind must be one of: {allowed}")
+    agent_kind_source = "explicit" if "kind" in table else "default:auto"
+    prompt_dialect_setting = optional_nonempty_string(table.get("prompt_dialect"))
+    if (
+        prompt_dialect_setting is not None
+        and prompt_dialect_setting not in AGENT_PROMPT_DIALECTS
+    ):
+        allowed = ", ".join(AGENT_PROMPT_DIALECTS)
+        raise ValueError(f"agent.prompt_dialect must be one of: {allowed}")
+    skill_ref_prefix_setting = optional_nonempty_string(table.get("skill_ref_prefix"))
+    if (
+        skill_ref_prefix_setting is not None
+        and skill_ref_prefix_setting not in AGENT_SKILL_REF_DIALECT
+    ):
+        allowed = ", ".join(sorted(AGENT_SKILL_REF_DIALECT))
+        raise ValueError(f"agent.skill_ref_prefix must be one of: {allowed}")
+    if (
+        prompt_dialect_setting is not None
+        and skill_ref_prefix_setting is not None
+        and AGENT_SKILL_REF_PREFIX[prompt_dialect_setting] != skill_ref_prefix_setting
+    ):
+        raise ValueError("agent.prompt_dialect and agent.skill_ref_prefix disagree")
+    if agent_kind in AGENT_PROMPT_DIALECTS:
+        expected_prefix = AGENT_SKILL_REF_PREFIX[agent_kind]
+        if prompt_dialect_setting is not None and prompt_dialect_setting != agent_kind:
+            raise ValueError("agent.kind and agent.prompt_dialect disagree")
+        if (
+            skill_ref_prefix_setting is not None
+            and skill_ref_prefix_setting != expected_prefix
+        ):
+            raise ValueError("agent.kind and agent.skill_ref_prefix disagree")
     configured_command = optional_nonempty_string(table.get("command"))
     configured_selection = optional_nonempty_string(table.get("selection_command"))
-    command, command_source, resolved_cli = resolve_agent_default(
+    command, command_source, executable_kind = resolve_agent_command(
         "command",
         configured_command,
+        agent_kind,
         detected,
     )
-    selection_command, selection_command_source, _ = resolve_agent_default(
+    selection_command, selection_command_source, _ = resolve_agent_command(
         "selection_command",
         configured_selection,
+        agent_kind,
         detected,
+    )
+    prompt_resolution = resolve_agent_prompt_dialect(
+        agent_kind,
+        command,
+        command_source,
+        prompt_dialect_setting,
+        skill_ref_prefix_setting,
     )
     return AgentConfig(
         command=command,
@@ -448,7 +528,14 @@ def parse_agent(data: object) -> AgentConfig:
         forward_stderr=optional_bool(
             table.get("forward_stderr"), False, "agent.forward_stderr"
         ),
-        resolved_cli=resolved_cli,
+        agent_kind=agent_kind,
+        agent_kind_source=agent_kind_source,
+        executable_kind=executable_kind,
+        prompt_dialect=prompt_resolution.prompt_dialect,
+        prompt_dialect_source=prompt_resolution.prompt_dialect_source,
+        skill_ref_prefix=prompt_resolution.skill_ref_prefix,
+        skill_ref_prefix_source=prompt_resolution.skill_ref_prefix_source,
+        compatibility_diagnostics=prompt_resolution.diagnostics,
     )
 
 
@@ -459,13 +546,24 @@ def detect_agent_clis(path: str | None = None) -> AgentDetection:
     )
 
 
-def resolve_agent_default(
+def resolve_agent_command(
     key: str,
     configured: str | None,
+    agent_kind: str,
     detected: AgentDetection,
 ) -> tuple[str | None, str, str | None]:
     if configured is not None:
         return configured, "explicit", None
+    if agent_kind == "custom":
+        return None, f"unresolved:custom-{key}-required", "custom"
+    if agent_kind in SUPPORTED_AGENT_CLIS:
+        if detected.path_for(agent_kind):
+            return (
+                AGENT_COMMAND_DEFAULTS[agent_kind][key],
+                f"agent.kind:{agent_kind}",
+                agent_kind,
+            )
+        return None, f"unresolved:{agent_kind}-not-found", agent_kind
     available = detected.available
     if AGENT_PREFERRED_CLI in available:
         source = "auto:codex"
@@ -484,6 +582,167 @@ def resolve_agent_default(
     return None, "unresolved:multiple-supported-clis", None
 
 
+def resolve_agent_prompt_dialect(
+    agent_kind: str,
+    command: str | None,
+    command_source: str,
+    prompt_dialect_setting: str | None,
+    skill_ref_prefix_setting: str | None,
+) -> AgentPromptDialectResolution:
+    if agent_kind in AGENT_PROMPT_DIALECTS:
+        return AgentPromptDialectResolution(
+            prompt_dialect=agent_kind,
+            prompt_dialect_source=f"agent.kind:{agent_kind}",
+            skill_ref_prefix=AGENT_SKILL_REF_PREFIX[agent_kind],
+            skill_ref_prefix_source=f"agent.kind:{agent_kind}",
+        )
+
+    explicit_prompt = explicit_prompt_dialect_resolution(
+        prompt_dialect_setting,
+        skill_ref_prefix_setting,
+    )
+    if explicit_prompt is not None:
+        return explicit_prompt
+
+    if agent_kind == "custom":
+        return AgentPromptDialectResolution(
+            prompt_dialect=None,
+            prompt_dialect_source="unresolved:custom-missing-prompt-dialect",
+            skill_ref_prefix=None,
+            skill_ref_prefix_source="unresolved:custom-missing-skill-ref-prefix",
+        )
+
+    auto_kind = auto_prompt_dialect_from_command_source(command_source)
+    if auto_kind is not None:
+        return AgentPromptDialectResolution(
+            prompt_dialect=auto_kind,
+            prompt_dialect_source=command_source,
+            skill_ref_prefix=AGENT_SKILL_REF_PREFIX[auto_kind],
+            skill_ref_prefix_source=command_source,
+        )
+
+    if command is None:
+        return AgentPromptDialectResolution(
+            prompt_dialect=None,
+            prompt_dialect_source="unresolved:no-worker-command",
+            skill_ref_prefix=None,
+            skill_ref_prefix_source="unresolved:no-worker-command",
+        )
+
+    inferred = infer_legacy_prompt_dialect(command)
+    if inferred is not None:
+        diagnostic = (
+            "agent.kind is auto and agent.command is explicit; inferred "
+            f"prompt dialect {inferred!r} from legacy command parsing. Set "
+            "agent.kind or agent.prompt_dialect to make this explicit."
+        )
+        source = f"legacy-command-inference:{inferred}"
+        return AgentPromptDialectResolution(
+            prompt_dialect=inferred,
+            prompt_dialect_source=source,
+            skill_ref_prefix=AGENT_SKILL_REF_PREFIX[inferred],
+            skill_ref_prefix_source=source,
+            diagnostics=(diagnostic,),
+        )
+
+    diagnostic = (
+        "agent.kind is auto and agent.command is explicit, but the prompt "
+        "dialect could not be inferred; using the legacy Codex-style "
+        "skill_ref_prefix '$'. Set agent.kind = 'custom' with "
+        "agent.prompt_dialect or agent.skill_ref_prefix to make this explicit."
+    )
+    return AgentPromptDialectResolution(
+        prompt_dialect="codex",
+        prompt_dialect_source="legacy-default:codex",
+        skill_ref_prefix="$",
+        skill_ref_prefix_source="legacy-default:codex",
+        diagnostics=(diagnostic,),
+    )
+
+
+def explicit_prompt_dialect_resolution(
+    prompt_dialect_setting: str | None,
+    skill_ref_prefix_setting: str | None,
+) -> AgentPromptDialectResolution | None:
+    if prompt_dialect_setting is not None:
+        source = "explicit:agent.prompt_dialect"
+        return AgentPromptDialectResolution(
+            prompt_dialect=prompt_dialect_setting,
+            prompt_dialect_source=source,
+            skill_ref_prefix=AGENT_SKILL_REF_PREFIX[prompt_dialect_setting],
+            skill_ref_prefix_source=source,
+        )
+    if skill_ref_prefix_setting is not None:
+        source = "explicit:agent.skill_ref_prefix"
+        return AgentPromptDialectResolution(
+            prompt_dialect=AGENT_SKILL_REF_DIALECT[skill_ref_prefix_setting],
+            prompt_dialect_source=source,
+            skill_ref_prefix=skill_ref_prefix_setting,
+            skill_ref_prefix_source=source,
+        )
+    return None
+
+
+def auto_prompt_dialect_from_command_source(source: str) -> str | None:
+    for agent_name in AGENT_PROMPT_DIALECTS:
+        if source == f"auto:{agent_name}" or source.startswith(f"auto:{agent_name}:"):
+            return agent_name
+    return None
+
+
+def infer_legacy_prompt_dialect(command: str) -> str | None:
+    executable = legacy_command_executable(command)
+    if executable is None:
+        return None
+    executable_name = Path(executable).name
+    if executable_name in AGENT_PROMPT_DIALECTS:
+        return executable_name
+    return None
+
+
+def legacy_command_executable(command: str) -> str | None:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    index = 0
+    while index < len(parts) and shell_env_assignment(parts[index]):
+        index += 1
+    if index >= len(parts):
+        return None
+    if parts[index] != "env":
+        return parts[index]
+    index += 1
+    while index < len(parts):
+        token = parts[index]
+        if token == "--":
+            index += 1
+            break
+        if token == "-i" or token.startswith("-i") and token != "-":
+            index += 1
+            continue
+        if token == "-u":
+            index += 2
+            continue
+        if token.startswith("-u") and token != "-u":
+            index += 1
+            continue
+        if shell_env_assignment(token):
+            index += 1
+            continue
+        break
+    if index >= len(parts):
+        return None
+    return parts[index]
+
+
+def shell_env_assignment(token: str) -> bool:
+    name, separator, _value = token.partition("=")
+    if not separator or not name:
+        return False
+    return all(char == "_" or char.isalnum() for char in name) and not name[0].isdigit()
+
+
 def unresolved_agent_command_message(
     setting: str,
     source: str,
@@ -496,10 +755,35 @@ def unresolved_agent_command_message(
             f"available on PATH ({available}); set {setting} in .vibe-loop.toml "
             "to choose the command explicitly."
         )
+    if source.startswith("unresolved:custom-"):
+        return (
+            f"{setting} is not configured and agent.kind is custom; set "
+            f"{setting} in .vibe-loop.toml."
+        )
+    for agent_name in SUPPORTED_AGENT_CLIS:
+        if source == f"unresolved:{agent_name}-not-found":
+            return (
+                f"{setting} is not configured and agent.kind is {agent_name}, "
+                f"but {agent_name} was not found on PATH; install {agent_name} "
+                f"or set {setting} explicitly in .vibe-loop.toml."
+            )
     return (
         f"{setting} is not configured and no supported agent CLI was found on "
         "PATH; install codex or claude, or set the command explicitly in "
         ".vibe-loop.toml."
+    )
+
+
+def unresolved_prompt_dialect_message(agent_kind: str, source: str) -> str:
+    if source.startswith("unresolved:custom-"):
+        return (
+            "agent.kind is custom, so worker prompt construction requires "
+            "agent.prompt_dialect or agent.skill_ref_prefix in .vibe-loop.toml."
+        )
+    return (
+        "worker prompt dialect could not be resolved from agent configuration "
+        f"(agent.kind={agent_kind}, source={source}); set agent.kind, "
+        "agent.prompt_dialect, or agent.skill_ref_prefix."
     )
 
 

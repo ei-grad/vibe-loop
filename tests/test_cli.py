@@ -261,14 +261,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["session_id_source"], "native:stdout")
         self.assertEqual(payload["agent_command_source"], "auto:codex")
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
+        self.assertEqual(payload["agent_kind"], "auto")
+        self.assertEqual(payload["agent_prompt_dialect"], "codex")
+        self.assertEqual(payload["agent_prompt_dialect_source"], "auto:codex")
+        self.assertEqual(payload["agent_skill_ref_prefix"], "$")
         self.assertEqual(run_records[0]["session_id"], "codex-native-123")
         self.assertEqual(run_records[0]["session_id_source"], "native:stdout")
+        self.assertEqual(run_records[0]["agent_prompt_dialect"], "codex")
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
         self.assertIn("$vibe-loop TASK-01", agent_lines[1])
         self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
+        self.assertIn("agent prompt dialect source: auto:codex", stderr.getvalue())
         self.assertIn("agent_command_source=auto:codex", log_text)
+        self.assertIn("agent_prompt_dialect_source=auto:codex", log_text)
         self.assertIn("session_id_source=native:stdout", log_text)
 
     def test_auto_codex_worker_can_report_with_run_id_environment(self) -> None:
@@ -595,6 +602,10 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(payload["agent_default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent_default_policy"])
+        self.assertEqual(payload["agent_prompt_dialect"], "codex")
+        self.assertEqual(
+            payload["agent_prompt_dialect_source"], "auto:codex:codex-first"
+        )
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
         self.assertIn("$vibe-loop TASK-01", agent_lines[1])
@@ -606,6 +617,10 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("agent default policy source: codex-first", stderr.getvalue())
         self.assertIn("agent default policy:", stderr.getvalue())
+        self.assertIn(
+            "agent prompt dialect source: auto:codex:codex-first",
+            stderr.getvalue(),
+        )
         self.assertIn("agent_command_source=auto:codex:codex-first", log_text)
         self.assertIn(
             "agent_selection_command_source=auto:codex:codex-first",
@@ -613,6 +628,7 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn("agent_default_policy_source=codex-first", log_text)
         self.assertIn("agent_default_policy=", log_text)
+        self.assertIn("agent_prompt_dialect_source=auto:codex:codex-first", log_text)
 
     def test_run_until_done_uses_codex_first_default_when_both_agents_are_available(
         self,
@@ -1145,6 +1161,93 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent.command", stderr.getvalue())
         self.assertFalse((repo / "selector-ran").exists())
 
+    def test_run_next_validates_custom_prompt_syntax_before_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "custom"\n'
+                'command = "worker {prompt}"\n'
+                'selection_command = "selector {prompt}"\n',
+                encoding="utf-8",
+            )
+            write_python_executable(
+                bin_dir / "selector",
+                "from pathlib import Path\n"
+                "Path('selector-ran').write_text('ran', encoding='utf-8')\n"
+                'print(\'{"task_id":"TASK-02"}\')\n',
+            )
+            write_python_executable(
+                bin_dir / "worker",
+                "from pathlib import Path\n"
+                "Path('worker-ran').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo), "--ask-agent"])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("agent.kind is custom", stderr.getvalue())
+        self.assertFalse((repo / "selector-ran").exists())
+        self.assertFalse((repo / "worker-ran").exists())
+
+    def test_parallel_run_validates_custom_prompt_syntax_before_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(TWO_TASK_PLAN, encoding="utf-8")
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "custom"\n'
+                'command = "worker {prompt}"\n'
+                'selection_command = "selector {prompt}"\n',
+                encoding="utf-8",
+            )
+            write_python_executable(
+                bin_dir / "selector",
+                "from pathlib import Path\n"
+                "Path('selector-ran').write_text('ran', encoding='utf-8')\n"
+                'print(\'{"task_ids":["TASK-01","TASK-02"]}\')\n',
+            )
+            write_python_executable(
+                bin_dir / "worker",
+                "from pathlib import Path\n"
+                "Path('worker-ran').write_text('ran', encoding='utf-8')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        [
+                            "run-until-done",
+                            "--repo",
+                            str(repo),
+                            "--jobs",
+                            "2",
+                            "--ask-agent",
+                        ]
+                    )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("agent.kind is custom", stderr.getvalue())
+        self.assertFalse((repo / "selector-ran").exists())
+        self.assertFalse((repo / "worker-ran").exists())
+
     def test_doctor_reports_agent_detection_and_command_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -1163,8 +1266,13 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("command", payload["agent"])
         self.assertEqual(payload["agent"]["command_source"], "auto:codex")
         self.assertEqual(payload["agent"]["selection_command_source"], "auto:codex")
+        self.assertEqual(payload["agent"]["agent_kind"], "auto")
+        self.assertEqual(payload["agent"]["prompt_dialect"], "codex")
+        self.assertEqual(payload["agent"]["prompt_dialect_source"], "auto:codex")
+        self.assertEqual(payload["agent"]["skill_ref_prefix"], "$")
         self.assertEqual(payload["agent"]["detected"]["available"], ["codex"])
 
     def test_doctor_reports_codex_first_policy_with_both_agents(self) -> None:
@@ -1194,6 +1302,42 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent"]["detected"]["available"], ["codex", "claude"])
         self.assertEqual(payload["agent"]["default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent"]["default_policy"])
+        self.assertEqual(payload["agent"]["prompt_dialect"], "codex")
+        self.assertEqual(
+            payload["agent"]["prompt_dialect_source"],
+            "auto:codex:codex-first",
+        )
+
+    def test_doctor_reports_custom_missing_prompt_dialect_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "custom"\n'
+                'command = "PRIVATE_PATH=/tmp/private custom-worker {prompt}"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("command", payload["agent"])
+        self.assertNotIn("custom-worker", stdout.getvalue())
+        self.assertNotIn("/tmp/private", stdout.getvalue())
+        self.assertEqual(payload["agent"]["agent_kind"], "custom")
+        self.assertIsNone(payload["agent"]["prompt_dialect"])
+        self.assertIsNone(payload["agent"]["skill_ref_prefix"])
+        self.assertIn(
+            "agent.kind is custom",
+            "\n".join(payload["agent"]["diagnostics"]),
+        )
 
     def test_doctor_reports_planning_analytics_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1617,6 +1761,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cache["profile"]["source_paths"], ["WORK.md"])
         self.assertEqual(cache["source_fingerprints"][0]["path"], "WORK.md")
         self.assertEqual(cache["agent"]["name"], "codex")
+        self.assertEqual(cache["agent"]["kind"], "auto")
+        self.assertEqual(cache["agent"]["prompt_dialect"], "codex")
+        self.assertEqual(cache["agent"]["prompt_dialect_source"], "auto:codex")
         self.assertEqual(cache["agent"]["selection_command_source"], "auto:codex")
         self.assertEqual(payload["agent"]["command_source"], "auto:codex")
         self.assertNotIn("command", cache["agent"])
@@ -2124,6 +2271,11 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(payload["agent"]["default_policy_source"], "codex-first")
         self.assertIn("Codex", payload["agent"]["default_policy"])
+        self.assertEqual(payload["agent"]["prompt_dialect"], "codex")
+        self.assertEqual(
+            payload["agent"]["prompt_dialect_source"],
+            "auto:codex:codex-first",
+        )
         self.assertFalse((repo / "claude-should-not-run").exists())
 
     def test_tasks_configure_text_reports_detected_agent_state(self) -> None:
@@ -2158,7 +2310,9 @@ class CliTests(unittest.TestCase):
         self.assertIn("detected agents: claude=", stdout.getvalue())
         self.assertIn("agent default policy source: codex-first", stdout.getvalue())
         self.assertIn("agent default policy:", stdout.getvalue())
+        self.assertIn("agent.kind: auto", stdout.getvalue())
         self.assertIn("agent.command source: auto:claude", stdout.getvalue())
+        self.assertIn("agent.prompt_dialect source: auto:claude", stdout.getvalue())
         self.assertIn("no_tasks: no task source found", stdout.getvalue())
 
     def test_tasks_configure_degrades_malformed_agent_json(self) -> None:
@@ -3936,7 +4090,9 @@ class CliTests(unittest.TestCase):
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
                 f'list = "{sys.executable} list_tasks.py"\n\n'
-                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                "[agent]\n"
+                'kind = "claude"\n'
+                "command = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
             stdout = StringIO()
@@ -3950,6 +4106,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
+        self.assertIn("/vibe-loop TRACE-01", prompt)
+        self.assertNotIn("$vibe-loop TRACE-01", prompt)
+        self.assertEqual(payload["agent_prompt_dialect"], "claude")
         self.assertIn("### Normalized Task Traceability", prompt)
         self.assertIn('"requirement_ids": [', prompt)
         self.assertIn('"PRD-SDE-003"', prompt)
@@ -4014,9 +4173,10 @@ class CliTests(unittest.TestCase):
             (repo / "worker.py").write_text(
                 "from pathlib import Path\n"
                 "import sys\n"
-                "task_id = sys.argv[1]\n"
-                "print(f'claude out: $vibe-loop {task_id}')\n"
-                "print(f'claude err: $vibe-loop {task_id}', file=sys.stderr)\n"
+                "prompt = sys.argv[1]\n"
+                "Path('worker-prompt.txt').write_text(prompt, encoding='utf-8')\n"
+                "print(f'claude out: {prompt.splitlines()[0]}')\n"
+                "print(f'claude err: {prompt.splitlines()[0]}', file=sys.stderr)\n"
                 "plan = Path('docs/PLAN.md')\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
@@ -4025,9 +4185,9 @@ class CliTests(unittest.TestCase):
                 ")\n",
                 encoding="utf-8",
             )
-            command = f"{sys.executable} worker.py {{task_id}}"
+            command = f"CLAUDE_HOME=.claude {sys.executable} worker.py {{prompt}}"
             (repo / ".vibe-loop.toml").write_text(
-                "[agent]\ncommand = " + json.dumps(command) + "\n",
+                '[agent]\nkind = "claude"\ncommand = ' + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
             stdout = StringIO()
@@ -4038,6 +4198,7 @@ class CliTests(unittest.TestCase):
 
             payload = json.loads(stdout.getvalue())
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+            prompt = (repo / "worker-prompt.txt").read_text(encoding="utf-8")
             run_records = [
                 json.loads(line)
                 for line in (repo / ".vibe-loop" / "runs.jsonl")
@@ -4048,12 +4209,86 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["task_id"], "TASK-01")
         self.assertEqual(payload["classification"], "completed")
-        self.assertIn("claude out: $vibe-loop TASK-01", stderr.getvalue())
+        self.assertIn("/vibe-loop TASK-01", prompt)
+        self.assertNotIn("$vibe-loop TASK-01", prompt)
+        self.assertEqual(payload["agent_prompt_dialect"], "claude")
+        self.assertEqual(payload["agent_prompt_dialect_source"], "agent.kind:claude")
+        self.assertIn("claude out: /vibe-loop TASK-01", stderr.getvalue())
         self.assertNotIn("claude err", stderr.getvalue())
-        self.assertIn("claude out: $vibe-loop TASK-01", log_text)
-        self.assertIn("claude err: $vibe-loop TASK-01", log_text)
+        self.assertIn("claude out: /vibe-loop TASK-01", log_text)
+        self.assertIn("claude err: /vibe-loop TASK-01", log_text)
         self.assertEqual(run_records[0]["task_id"], "TASK-01")
         self.assertEqual(run_records[0]["status"], "completed")
+        self.assertEqual(run_records[0]["agent_prompt_dialect"], "claude")
+
+    def test_run_next_refuses_custom_agent_without_prompt_dialect(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "Path('agent-ran').write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{prompt}}"
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nkind = "custom"\ncommand = ' + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertFalse((repo / "agent-ran").exists())
+        self.assertIn("agent.kind is custom", stderr.getvalue())
+
+    def test_run_next_custom_agent_uses_explicit_skill_ref_prefix(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path('worker-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{prompt}}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "custom"\n'
+                "command = " + json.dumps(command) + "\n"
+                'skill_ref_prefix = "/"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            prompt = (repo / "worker-prompt.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertIn("/vibe-loop TASK-01", prompt)
+        self.assertEqual(payload["agent_prompt_dialect"], "claude")
+        self.assertEqual(
+            payload["agent_prompt_dialect_source"],
+            "explicit:agent.skill_ref_prefix",
+        )
 
     def test_next_supports_configured_claude_prompt_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

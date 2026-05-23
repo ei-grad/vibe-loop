@@ -1224,10 +1224,15 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
             print(f"detected agents: {config.agent.detected.summary()}")
             print(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
             print(f"agent default policy: {AGENT_DEFAULT_POLICY}")
+            print(f"agent.kind: {config.agent.agent_kind}")
             print(f"agent.command source: {config.agent.command_source}")
             print(
                 "agent.selection_command source: "
                 f"{config.agent.selection_command_source}"
+            )
+            print(f"agent.prompt_dialect source: {config.agent.prompt_dialect_source}")
+            print(
+                f"agent.skill_ref_prefix source: {config.agent.skill_ref_prefix_source}"
             )
             diagnostics = list(result.diagnostics) + config.agent.diagnostics()
             if diagnostics:

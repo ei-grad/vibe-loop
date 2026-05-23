@@ -46,16 +46,39 @@ ledger or worker-owned verification evidence.
 
 Related implementation IDs: `PAR-03`.
 
-## PRD-CLI-004 Agent Command Resolution
+## PRD-CLI-004 Agent Command And Prompt Dialect Resolution
 
-Worker and selection commands must be configurable template strings, with
-deterministic defaults for supported prompt-mode agents when explicit config is
-absent.
+Worker and selection executable commands must be configurable template strings,
+while worker prompt construction must be controlled by explicit agent kind or
+prompt dialect metadata rather than by guessing from the command string.
+
+The `[agent]` table supports `kind = "auto" | "codex" | "claude" | "custom"`.
+Built-in kinds determine the bundled skill reference syntax directly: Codex uses
+`$vibe-loop`, Claude uses `/vibe-loop`. `auto` keeps the deterministic
+Codex-first default for omitted worker and selection commands. `custom` has no
+implicit skill syntax; it must set `prompt_dialect` or `skill_ref_prefix` before
+a worker prompt can be built. Existing unkinded explicit commands remain a
+compatibility path only: the runtime may infer a known Codex or Claude dialect
+from a simple command shape, or fall back to the legacy Codex-style prefix, but
+diagnostics must identify that the prompt dialect came from legacy inference or
+legacy defaulting and tell the user how to make it explicit.
+
+Executable command resolution and prompt dialect resolution are independent.
+Explicit user-authored `command` and `selection_command` values remain
+authoritative executable templates. `command` receives `{prompt}`, `{task_id}`,
+and `{run_id}`; `selection_command` receives `{prompt}`. The worker prompt is
+constructed from the selected skill reference syntax, the normalized task, and
+the runner's worker addendum; selection prompts do not use the worker skill
+reference syntax.
 
 Acceptance must cover Codex-only, Claude-only, both-present, neither-present,
-explicit override, worker `{task_id}` and `{run_id}` interpolation, selection
-`{prompt}` interpolation, shell quoting, command-source diagnostics, and clear
-failure when no supported agent command is available.
+explicit `kind`, explicit prompt dialect or skill prefix, explicit command
+overrides including environment-prefixed Claude commands, custom commands with
+and without explicit prompt syntax, legacy unkinded explicit commands, worker
+`{prompt}`, `{task_id}`, and `{run_id}` interpolation, selection `{prompt}`
+interpolation, shell quoting, command-source diagnostics, prompt-dialect/source
+diagnostics, and clear failure when no supported agent command or required
+custom prompt syntax is available.
 
 Related implementation IDs: `AGENT-01`, `AGENT-02`, `AGENT-04`.
 

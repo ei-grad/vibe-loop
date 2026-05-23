@@ -55,11 +55,13 @@ Related implementation IDs: `DISC-04`, `GANTT-02`, `SDD-03`.
 When a worker is launched for a task with linked spec context, the prompt should
 include a compact, bounded bundle of relevant requirement text, acceptance
 criteria, design references, source fingerprints, and required verification
-gates.
+gates. That spec-aware context is appended independently of the executable agent
+command and independently of whether the skill reference syntax is Codex-style
+or Claude-style.
 
 Acceptance must cover size limits, secret-like path exclusions, deterministic
-prompt construction, worker log visibility, and behavior when linked spec
-context is missing or stale.
+prompt construction, worker log visibility, prompt dialect compatibility, and
+behavior when linked spec context is missing or stale.
 
 Related implementation IDs: `PAR-03`, `PAR-07`, `SDD-04`.
 
