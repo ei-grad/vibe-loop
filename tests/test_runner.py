@@ -464,6 +464,58 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result.classification == "completed" for result in results))
 
+    def test_run_until_done_serial_rotates_completed_still_ready_tasks(self) -> None:
+        # A completed task that stays runnable (multi-slice work) must not
+        # monopolize the chain: every other ready task gets a turn first.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id=f"TASK-0{n}",
+                        title=f"Task {n}",
+                        status="Next",
+                        order=n,
+                    )
+                    for n in range(1, 4)
+                ]
+            )
+            runner._source = source
+
+            def run_task(task: Task) -> RunResult:
+                # Deliberately do NOT mark the task done, so it stays ready and
+                # would be re-selected forever without rotation.
+                return RunResult(
+                    run_id=f"run-{task.task_id}-{len(seen)}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            seen: list[str] = []
+            original = run_task
+
+            def tracking_run_task(task: Task) -> RunResult:
+                seen.append(task.task_id)
+                return original(task)
+
+            runner.run_task = tracking_run_task
+
+            results = runner.run_until_done(max_tasks=3)
+
+        self.assertEqual(len(results), 3)
+        # Breadth: three distinct tasks, not three slices of the first one.
+        self.assertEqual(
+            sorted(result.task_id for result in results),
+            ["TASK-01", "TASK-02", "TASK-03"],
+        )
+
     def test_run_until_done_parallel_stops_after_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

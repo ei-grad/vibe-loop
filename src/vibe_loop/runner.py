@@ -669,15 +669,25 @@ class VibeRunner:
     ) -> list[RunResult]:
         results: list[RunResult] = []
         skipped: set[str] = set()
+        # Completed tasks that remain runnable (multi-slice work). They are
+        # deprioritized so every other ready task gets a turn before any single
+        # task is re-selected, which keeps one large multi-slice task from
+        # monopolizing the whole chain. The set is cleared once no other
+        # candidate remains, so genuinely multi-slice work still progresses.
+        yielded: set[str] = set()
         transient_retries: dict[str, int] = {}
         completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
-            result = self.run_next(ask_agent=ask_agent, exclude=skipped)
+            result = self.run_next(ask_agent=ask_agent, exclude=skipped | yielded)
             if result is None:
+                if yielded:
+                    yielded.clear()
+                    continue
                 break
             results.append(result)
             if result.classification == "completed":
                 transient_retries.pop(result.task_id, None)
+                yielded.add(result.task_id)
                 completed_count += 1
                 if max_tasks > 0 and completed_count >= max_tasks:
                     break
