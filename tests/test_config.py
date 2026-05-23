@@ -127,7 +127,10 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.agent.command, "claude -p '$vibe-loop {task_id}'")
         self.assertEqual(config.agent.command_source, "explicit")
-        self.assertIsNone(config.agent.resolved_cli)
+        # An explicit command stays authoritative, but the CLI is still inferred
+        # from it so the skill-ref prefix is correct (claude -> "/", not "$").
+        self.assertEqual(config.agent.resolved_cli, "claude")
+        self.assertEqual(config.agent.skill_ref_prefix, "/")
         self.assertEqual(config.agent.selection_command, "claude -p {prompt}")
         self.assertEqual(config.agent.selection_command_source, "explicit")
 

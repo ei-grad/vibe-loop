@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import shlex
 import shutil
 import subprocess
@@ -459,13 +460,33 @@ def detect_agent_clis(path: str | None = None) -> AgentDetection:
     )
 
 
+def infer_cli_from_command(command: str) -> str | None:
+    """Best-effort map an explicit agent command to a supported CLI name.
+
+    The skill-ref prefix (codex ``$`` vs claude ``/``) is keyed off the resolved
+    CLI, so an explicitly configured command must still report which CLI it
+    drives; otherwise the prefix wrongly defaults to codex.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+    if not tokens:
+        return None
+    exe = os.path.basename(tokens[0])
+    for name in SUPPORTED_AGENT_CLIS:
+        if exe == name:
+            return name
+    return None
+
+
 def resolve_agent_default(
     key: str,
     configured: str | None,
     detected: AgentDetection,
 ) -> tuple[str | None, str, str | None]:
     if configured is not None:
-        return configured, "explicit", None
+        return configured, "explicit", infer_cli_from_command(configured)
     available = detected.available
     if AGENT_PREFERRED_CLI in available:
         source = "auto:codex"
