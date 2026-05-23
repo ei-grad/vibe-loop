@@ -33,8 +33,10 @@ cross-slice backlog.
 ## Core Loop
 
 1. Inspect the task, code, tests, docs, repo instructions, worktree state, and
-   constraints; create or choose the slice workspace and initialize slice state
-   before implementation edits.
+   constraints; if the prompt includes spec-aware worker context, use it as
+   bounded source context for linked requirements, design references,
+   fingerprints, and verification gates; create or choose the slice workspace
+   and initialize slice state before implementation edits.
 2. Plan the next coherent slice from repo-local sources first: instructions,
    design docs, roadmaps, issues, TODOs, and existing plans.
 3. Edit in scoped increments and keep the project working.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
 
 from vibe_loop.config import (
@@ -26,6 +27,14 @@ from vibe_loop.config import (
 from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
     resolve_runtime_task_source,
+)
+from vibe_loop.generated_discovery import (
+    is_allowed_evidence_file,
+    is_secret_like_directory_name,
+    is_secret_like_path,
+    is_webhook_like_evidence_path,
+    redact_evidence_text,
+    redact_manifest_text,
 )
 from vibe_loop.locks import LockBusy, LockManager, TaskLock
 from vibe_loop.retry import (
@@ -53,7 +62,18 @@ SESSION_ID_RE = re.compile(
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
+SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
+SPEC_WORKER_CONTEXT_SCHEMA_VERSION = 1
+SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS = 12_000
+SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS = 4_000
+SPEC_WORKER_CONTEXT_MAX_FILE_BYTES = 512 * 1024
+SPEC_WORKER_CONTEXT_MAX_ARTIFACTS = 8
+SPEC_WORKER_CONTEXT_MAX_FIELD_CHARS = 1_500
+SPEC_WORKER_CONTEXT_MAX_REF_CHARS = 300
+SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS = 20
+SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS = 20
+SPEC_WORKER_CONTEXT_LINE_CONTEXT = 3
 
 CLI_WORKER_ADDENDUM = """\
 
@@ -414,7 +434,7 @@ class VibeRunner:
         session_id = run_id
         session_id_source = "fallback:run_id"
         skill_prefix = self.config.agent.skill_ref_prefix
-        worker_prompt = build_worker_prompt(skill_prefix, task)
+        worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
         command = command_template.format(
             prompt=shell_quote(worker_prompt),
             task_id=task.task_id,
@@ -948,18 +968,867 @@ def build_batch_selection_prompt(
     )
 
 
-def build_worker_prompt(skill_prefix: str, task: Task) -> str:
+def build_worker_prompt(
+    skill_prefix: str,
+    task: Task,
+    config: VibeConfig | None = None,
+) -> str:
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
     if not task.has_traceability:
         return prompt
-    return (
+    prompt = (
         f"{prompt}\n\n"
         "### Normalized Task Traceability\n\n"
         "This task includes optional traceability metadata from the task source:\n\n"
         "```json\n"
-        f"{json.dumps(task.to_json(), indent=2, sort_keys=True)}\n"
+        f"{json.dumps(worker_traceability_json(task), indent=2, sort_keys=True)}\n"
         "```\n"
     )
+    if config is None:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "### Spec-Aware Worker Context\n\n"
+        "Bounded repo-local spec context for this task:\n\n"
+        "```json\n"
+        f"{json.dumps(build_spec_worker_context(config, task), indent=2, sort_keys=True)}\n"
+        "```\n"
+    )
+
+
+def build_spec_worker_context(config: VibeConfig, task: Task) -> dict[str, object]:
+    artifact_refs = spec_context_artifact_refs(task)
+    fingerprints_by_path = source_fingerprints_by_path(task)
+    artifacts: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    remaining_chars = SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+
+    for path, ref_payload in artifact_refs.items():
+        if len(artifacts) >= SPEC_WORKER_CONTEXT_MAX_ARTIFACTS:
+            skipped.append(
+                skipped_spec_context_artifact(
+                    path,
+                    "artifact_count_limit",
+                    f"{len(artifacts) + 1} > {SPEC_WORKER_CONTEXT_MAX_ARTIFACTS}",
+                )
+            )
+            continue
+        if remaining_chars <= 0:
+            skipped.append(skipped_spec_context_artifact(path, "context_size_limit"))
+            continue
+        artifact = load_spec_context_artifact(
+            config,
+            task,
+            path,
+            roles=tuple(sorted(ref_payload["roles"])),
+            refs=tuple(ref_payload["refs"]),
+            fingerprints=fingerprints_by_path.get(path, ()),
+            max_chars=min(SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS, remaining_chars),
+        )
+        if "skipped" in artifact:
+            skipped.append(artifact["skipped"])
+            continue
+        artifacts.append(artifact)
+        remaining_chars -= len(str(artifact.get("content", "")))
+
+    if task.has_traceability and not artifact_refs:
+        skipped.append(
+            {
+                "path": "",
+                "reason": "no_linked_spec_artifacts",
+                "detail": (
+                    "task has traceability metadata but no spec_paths, design_refs "
+                    "with repo-relative paths, or source_fingerprints paths"
+                ),
+            }
+        )
+
+    context = {
+        "schema_version": SPEC_WORKER_CONTEXT_SCHEMA_VERSION,
+        "task": worker_task_context_json(task),
+        "required_verification_gates": required_worker_verification_gates(
+            config,
+            task,
+        ),
+        "limits": {
+            "max_total_chars": SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+            "max_artifact_chars": SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS,
+            "max_file_bytes": SPEC_WORKER_CONTEXT_MAX_FILE_BYTES,
+            "max_artifacts": SPEC_WORKER_CONTEXT_MAX_ARTIFACTS,
+        },
+        "artifacts": artifacts,
+        "skipped_artifacts": skipped,
+    }
+    return trim_spec_worker_context_to_limit(context)
+
+
+def worker_traceability_json(task: Task) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": bounded_context_text(task.task_id, SPEC_WORKER_CONTEXT_MAX_REF_CHARS),
+        "title": bounded_context_text(task.title),
+        "status": bounded_context_text(task.status, SPEC_WORKER_CONTEXT_MAX_REF_CHARS),
+        "source": bounded_context_text(task.source),
+    }
+    if task.requirement_ids:
+        payload["requirement_ids"] = bounded_context_list(task.requirement_ids)
+    if task.spec_paths:
+        payload["spec_paths"] = bounded_path_context_list(task.spec_paths)
+    if task.design_refs:
+        payload["design_refs"] = bounded_path_context_list(task.design_refs)
+    if task.approval_state:
+        payload["approval_state"] = bounded_context_text(task.approval_state)
+    if task.source_fingerprints:
+        payload["source_fingerprints"] = bounded_source_fingerprints(
+            task.source_fingerprints
+        )
+    return payload
+
+
+def worker_task_context_json(task: Task) -> dict[str, object]:
+    payload = worker_traceability_json(task)
+    payload.update(
+        {
+            "priority": bounded_context_text(
+                task.priority,
+                SPEC_WORKER_CONTEXT_MAX_REF_CHARS,
+            ),
+            "scope": bounded_context_text(task.scope),
+        }
+    )
+    if task.resources:
+        payload["resources"] = bounded_context_list(task.resources)
+    if task.paths:
+        payload["paths"] = bounded_path_context_list(task.paths)
+    if task.conflict_domains_known:
+        payload["conflict_domains_known"] = True
+    return payload
+
+
+def bounded_context_text(
+    value: str,
+    max_chars: int = SPEC_WORKER_CONTEXT_MAX_FIELD_CHARS,
+) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    truncated, _ = truncate_spec_context_text(text, max_chars)
+    return truncated
+
+
+def bounded_context_list(values: tuple[str, ...]) -> list[str]:
+    bounded = [
+        bounded_context_text(value, SPEC_WORKER_CONTEXT_MAX_REF_CHARS)
+        for value in values[:SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS]
+    ]
+    omitted = len(values) - len(bounded)
+    if omitted > 0:
+        bounded.append(f"...[{omitted} omitted]")
+    return bounded
+
+
+def bounded_path_context_list(values: tuple[str, ...]) -> list[str]:
+    bounded = [
+        bounded_context_path(value)
+        for value in values[:SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS]
+    ]
+    omitted = len(values) - len(bounded)
+    if omitted > 0:
+        bounded.append(f"...[{omitted} omitted]")
+    return bounded
+
+
+def bounded_context_path(value: str) -> str:
+    sanitized = safe_path_text_for_prompt(value)
+    return bounded_context_text(sanitized, SPEC_WORKER_CONTEXT_MAX_REF_CHARS)
+
+
+def bounded_source_fingerprints(
+    fingerprints: tuple[dict[str, object], ...],
+) -> list[dict[str, object]]:
+    bounded: list[dict[str, object]] = []
+    for fingerprint in fingerprints[:SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS]:
+        entry = safe_source_fingerprint_for_prompt(fingerprint)
+        if entry:
+            bounded.append(entry)
+    omitted = len(fingerprints) - len(bounded)
+    if omitted > 0:
+        bounded.append({"omitted": omitted})
+    return bounded
+
+
+def spec_context_artifact_refs(task: Task) -> dict[str, dict[str, object]]:
+    refs: dict[str, dict[str, object]] = {}
+
+    def add(path: str, role: str, ref: str = "") -> None:
+        payload = refs.setdefault(path, {"roles": set(), "refs": []})
+        payload["roles"].add(role)
+        if ref:
+            payload["refs"].append(ref)
+
+    for path in task.spec_paths:
+        normalized = normalize_context_reference_path(path, allow_bare_path=True)
+        if normalized:
+            add(normalized, "spec_path", path)
+    for ref in task.design_refs:
+        normalized = normalize_context_reference_path(ref, allow_bare_path=False)
+        if normalized:
+            add(normalized, "design_ref", ref)
+    for fingerprint in task.source_fingerprints:
+        raw_path = fingerprint.get("path")
+        if isinstance(raw_path, str):
+            normalized = normalize_context_reference_path(
+                raw_path,
+                allow_bare_path=True,
+            )
+            if normalized:
+                add(normalized, "source_fingerprint", raw_path)
+    return refs
+
+
+def source_fingerprints_by_path(
+    task: Task,
+) -> dict[str, tuple[dict[str, object], ...]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for fingerprint in task.source_fingerprints:
+        raw_path = fingerprint.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        normalized = normalize_context_reference_path(raw_path, allow_bare_path=True)
+        if normalized:
+            grouped.setdefault(normalized, []).append(fingerprint)
+    return {path: tuple(items) for path, items in grouped.items()}
+
+
+def normalize_context_reference_path(
+    value: str,
+    *,
+    allow_bare_path: bool,
+) -> str:
+    raw_path = value.strip().replace("\\", "/").split("#", 1)[0].strip()
+    if not raw_path:
+        return ""
+    if (
+        not allow_bare_path
+        and "/" not in raw_path
+        and "." not in PurePosixPath(raw_path).name
+    ):
+        return ""
+    return raw_path
+
+
+def load_spec_context_artifact(
+    config: VibeConfig,
+    task: Task,
+    path: str,
+    *,
+    roles: tuple[str, ...],
+    refs: tuple[str, ...],
+    fingerprints: tuple[dict[str, object], ...],
+    max_chars: int,
+) -> dict[str, object]:
+    safe_path, path_error = safe_spec_context_path(path)
+    if path_error:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                path,
+                "unsafe_path",
+                path_error,
+            )
+        }
+    if not is_allowed_evidence_file(Path(safe_path)):
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unsupported_file_type",
+            )
+        }
+    repo = config.repo.resolve()
+    requested_path = config.repo / safe_path
+    if path_has_symlink_component(repo, requested_path):
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "symlink",
+            )
+        }
+    source_path = requested_path.resolve()
+    try:
+        resolved_relative = source_path.relative_to(repo).as_posix()
+    except ValueError:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "outside_repo",
+            )
+        }
+    _resolved_path, resolved_path_error = safe_spec_context_path(resolved_relative)
+    if resolved_path_error:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unsafe_resolved_path",
+                resolved_path_error,
+            )
+        }
+    if not source_path.exists():
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "missing",
+            )
+        }
+    try:
+        stat_result = source_path.stat()
+    except OSError as exc:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unreadable",
+                str(exc),
+            )
+        }
+    if not source_path.is_file():
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "not_file",
+            )
+        }
+    if stat_result.st_size > SPEC_WORKER_CONTEXT_MAX_FILE_BYTES:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "file_too_large",
+                f"{stat_result.st_size} > {SPEC_WORKER_CONTEXT_MAX_FILE_BYTES}",
+            )
+        }
+    try:
+        raw = source_path.read_bytes()
+    except OSError as exc:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unreadable",
+                str(exc),
+            )
+        }
+    if b"\0" in raw[:4096]:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "binary_file",
+            )
+        }
+    text = raw.decode("utf-8", errors="replace")
+    redacted = redact_evidence_text(text)
+    selected_text, matched_terms = select_spec_context_text(
+        redacted,
+        task,
+        roles=roles,
+        refs=refs,
+    )
+    content, truncated = truncate_spec_context_text(
+        selected_text.strip(),
+        max_chars,
+    )
+    return {
+        "path": safe_path,
+        "roles": list(roles),
+        "refs": [safe_path_text_for_prompt(ref) for ref in refs],
+        "size": stat_result.st_size,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "redacted": redacted != text,
+        "matched_terms": [
+            safe_context_value_for_prompt(term, SPEC_WORKER_CONTEXT_MAX_REF_CHARS)
+            for term in matched_terms
+        ],
+        "truncated": truncated,
+        "fingerprint_checks": [
+            source_fingerprint_check(fingerprint, raw, stat_result.st_size)
+            for fingerprint in fingerprints
+        ],
+        "content": content,
+    }
+
+
+def safe_spec_context_path(path: str) -> tuple[str, str]:
+    normalized = path.strip().replace("\\", "/")
+    pure_path = PurePosixPath(normalized)
+    if (
+        pure_path.is_absolute()
+        or any(part in {"", ".."} for part in pure_path.parts)
+        or not pure_path.parts
+    ):
+        return normalized, "path must be safe and repo-relative"
+    if is_webhook_like_evidence_path(normalized):
+        return normalized, "path is secret-like"
+    if any(is_secret_like_directory_name(part) for part in pure_path.parts[:-1]):
+        return normalized, "path contains a secret-like directory"
+    if is_secret_like_path(Path(pure_path.name)):
+        return normalized, "path is secret-like"
+    return str(pure_path), ""
+
+
+def safe_path_text_for_prompt(value: str) -> str:
+    raw_path, separator, fragment = value.strip().replace("\\", "/").partition("#")
+    if not raw_path:
+        return ""
+    if raw_path == ".":
+        return "."
+    _safe_path, path_error = safe_spec_context_path(raw_path)
+    if path_error:
+        return "<redacted>"
+    if separator:
+        return f"{raw_path}#{safe_context_value_for_prompt(fragment, 80)}"
+    return raw_path
+
+
+def safe_context_value_for_prompt(value: str, max_chars: int) -> str:
+    if secret_like_prompt_value(value):
+        return "<redacted>"
+    redacted = redact_evidence_text(value)
+    return bounded_context_text(redacted, max_chars)
+
+
+def secret_like_prompt_value(value: str) -> bool:
+    normalized = value.strip().replace("\\", "/")
+    path = PurePosixPath(normalized)
+    return (
+        is_webhook_like_evidence_path(normalized)
+        or any(is_secret_like_directory_name(part) for part in path.parts[:-1])
+        or is_secret_like_path(Path(path.name))
+    )
+
+
+def path_has_symlink_component(repo: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(repo)
+    except ValueError:
+        return False
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def source_fingerprint_check(
+    fingerprint: dict[str, object],
+    raw: bytes,
+    actual_size: int,
+) -> dict[str, object]:
+    actual_sha = hashlib.sha256(raw).hexdigest()
+    check: dict[str, object] = {
+        "expected": safe_source_fingerprint_for_prompt(fingerprint),
+        "actual": {
+            "size": actual_size,
+            "sha256": actual_sha,
+        },
+    }
+    expected_size = fingerprint.get("size")
+    expected_sha = fingerprint.get("sha256")
+    expected_size_is_int = isinstance(expected_size, int) and not isinstance(
+        expected_size,
+        bool,
+    )
+    mismatches: list[str] = []
+    if expected_size_is_int:
+        if expected_size != actual_size:
+            mismatches.append("size")
+    if isinstance(expected_sha, str) and expected_sha != actual_sha:
+        mismatches.append("sha256")
+    if not isinstance(expected_sha, str) and not expected_size_is_int:
+        check["status"] = "invalid"
+        check["reason"] = "fingerprint must include sha256 or size"
+    elif mismatches:
+        check["status"] = "stale"
+        check["mismatches"] = mismatches
+    else:
+        check["status"] = "current"
+    return check
+
+
+def safe_source_fingerprint_for_prompt(
+    fingerprint: dict[str, object],
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    raw_path = fingerprint.get("path")
+    if isinstance(raw_path, str):
+        payload["path"] = bounded_context_path(raw_path)
+    size = fingerprint.get("size")
+    if isinstance(size, int) and not isinstance(size, bool):
+        payload["size"] = size
+    sha256 = fingerprint.get("sha256")
+    if isinstance(sha256, str):
+        payload["sha256"] = sha256 if SHA256_HEX_RE.fullmatch(sha256) else "<invalid>"
+    redacted = fingerprint.get("redacted")
+    if isinstance(redacted, bool):
+        payload["redacted"] = redacted
+    return payload
+
+
+def select_spec_context_text(
+    text: str,
+    task: Task,
+    *,
+    roles: tuple[str, ...],
+    refs: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]]:
+    terms = spec_context_search_terms(task, roles=roles, refs=refs)
+    if not terms:
+        return text, ()
+    sections = markdown_sections_matching_terms(text, terms)
+    if sections:
+        return "\n\n".join(section for _term, section in sections), tuple(
+            dict.fromkeys(term for term, _section in sections)
+        )
+    line_context = line_context_matching_terms(text, terms)
+    if line_context:
+        return line_context[1], line_context[0]
+    return text, ()
+
+
+def spec_context_search_terms(
+    task: Task,
+    *,
+    roles: tuple[str, ...],
+    refs: tuple[str, ...],
+) -> tuple[str, ...]:
+    terms: list[str] = []
+    if "spec_path" in roles or "source_fingerprint" in roles:
+        terms.extend(task.requirement_ids)
+    if "design_ref" in roles:
+        for ref in refs:
+            _path, separator, fragment = ref.partition("#")
+            if separator and fragment.strip():
+                terms.append(fragment.strip())
+    return tuple(dict.fromkeys(term for term in terms if term.strip()))
+
+
+def markdown_sections_matching_terms(
+    text: str,
+    terms: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    lines = text.splitlines()
+    headings: list[tuple[int, int, str]] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$", line)
+        if match is None:
+            continue
+        headings.append((index, len(match.group("marks")), match.group("title")))
+    matches: list[tuple[str, str]] = []
+    seen_starts: set[int] = set()
+    for heading_index, (line_index, level, title) in enumerate(headings):
+        term = first_contained_term(title, terms)
+        if term is None or line_index in seen_starts:
+            continue
+        end = len(lines)
+        for next_line, next_level, _next_title in headings[heading_index + 1 :]:
+            if next_level <= level:
+                end = next_line
+                break
+        seen_starts.add(line_index)
+        matches.append((term, "\n".join(lines[line_index:end]).strip()))
+    return matches
+
+
+def line_context_matching_terms(
+    text: str,
+    terms: tuple[str, ...],
+) -> tuple[tuple[str, ...], str] | None:
+    lines = text.splitlines()
+    ranges: list[tuple[int, int]] = []
+    matched_terms: list[str] = []
+    for index, line in enumerate(lines):
+        term = first_contained_term(line, terms)
+        if term is None:
+            continue
+        matched_terms.append(term)
+        ranges.append(
+            (
+                max(0, index - SPEC_WORKER_CONTEXT_LINE_CONTEXT),
+                min(len(lines), index + SPEC_WORKER_CONTEXT_LINE_CONTEXT + 1),
+            )
+        )
+    if not ranges:
+        return None
+    merged = merge_line_ranges(ranges)
+    chunks = ["\n".join(lines[start:end]).strip() for start, end in merged]
+    return tuple(dict.fromkeys(matched_terms)), "\n\n".join(chunks)
+
+
+def first_contained_term(value: str, terms: tuple[str, ...]) -> str | None:
+    folded = value.casefold()
+    for term in terms:
+        if term.casefold() in folded:
+            return term
+    return None
+
+
+def merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def truncate_spec_context_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    marker = "\n...[truncated]\n"
+    if max_chars <= len(marker):
+        return text[:max_chars], True
+    return f"{text[: max_chars - len(marker)]}{marker}", True
+
+
+def skipped_spec_context_artifact(
+    path: str,
+    reason: str,
+    detail: str = "",
+) -> dict[str, str]:
+    payload = {
+        "path": safe_path_text_for_prompt(path),
+        "reason": reason,
+    }
+    if detail:
+        payload["detail"] = redact_manifest_text(detail)
+    return payload
+
+
+def trim_spec_worker_context_to_limit(
+    context: dict[str, object],
+) -> dict[str, object]:
+    context_len = spec_worker_context_json_length(context)
+    if context_len <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        return context
+
+    artifacts = context.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in reversed(artifacts):
+            if not isinstance(artifact, dict):
+                continue
+            content = artifact.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            while context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and content:
+                excess = context_len - SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+                target_chars = max(0, len(content) - excess - 128)
+                content, _truncated = truncate_spec_context_text(
+                    content,
+                    target_chars,
+                )
+                artifact["content"] = content
+                artifact["truncated"] = True
+                context_len = spec_worker_context_json_length(context)
+            if context_len <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+                return context
+
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        context["artifacts"] = []
+        skipped = context.setdefault("skipped_artifacts", [])
+        if isinstance(skipped, list):
+            skipped.append(
+                skipped_spec_context_artifact(
+                    ".",
+                    "context_size_limit",
+                    "artifacts omitted because metadata used the context budget",
+                )
+            )
+        context_len = spec_worker_context_json_length(context)
+    skipped = context.get("skipped_artifacts")
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and isinstance(
+        skipped,
+        list,
+    ):
+        original_count = len(skipped)
+        while skipped and context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+            skipped.pop()
+            context_len = spec_worker_context_json_length(context)
+        omitted = original_count - len(skipped)
+        if omitted > 0:
+            skipped.append(
+                {
+                    "path": ".",
+                    "reason": "skipped_artifact_diagnostics_limit",
+                    "detail": f"{omitted} skipped artifact diagnostics omitted",
+                }
+            )
+        while (
+            skipped
+            and spec_worker_context_json_length(context)
+            > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+        ):
+            skipped.pop()
+    context_len = spec_worker_context_json_length(context)
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        trim_spec_context_strings(context)
+        context_len = spec_worker_context_json_length(context)
+    task = context.get("task")
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and isinstance(task, dict):
+        for key in (
+            "source_fingerprints",
+            "design_refs",
+            "spec_paths",
+            "resources",
+            "paths",
+            "requirement_ids",
+            "scope",
+            "source",
+        ):
+            if key in task:
+                task.pop(key)
+                context_len = spec_worker_context_json_length(context)
+                if context_len <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+                    break
+    gates = context.get("required_verification_gates")
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and isinstance(gates, list):
+        context["required_verification_gates"] = [
+            {"id": str(gate.get("id", "")), "required": True}
+            for gate in gates
+            if isinstance(gate, dict)
+        ]
+        context_len = spec_worker_context_json_length(context)
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        task = context.get("task")
+        task_id = ""
+        if isinstance(task, dict):
+            raw_task_id = task.get("id")
+            if isinstance(raw_task_id, str):
+                task_id = bounded_context_text(raw_task_id, 128)
+        context.clear()
+        context.update(
+            {
+                "schema_version": SPEC_WORKER_CONTEXT_SCHEMA_VERSION,
+                "task": {
+                    "id": task_id,
+                    "metadata_omitted": "context_size_limit",
+                },
+                "required_verification_gates": [
+                    {
+                        "id": "task.acceptance",
+                        "required": True,
+                        "omitted": "context_size_limit",
+                    }
+                ],
+                "limits": {
+                    "max_total_chars": SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+                    "max_artifact_chars": SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS,
+                    "max_file_bytes": SPEC_WORKER_CONTEXT_MAX_FILE_BYTES,
+                    "max_artifacts": SPEC_WORKER_CONTEXT_MAX_ARTIFACTS,
+                },
+                "artifacts": [],
+                "skipped_artifacts": [
+                    skipped_spec_context_artifact(
+                        ".",
+                        "context_size_limit",
+                        "metadata omitted because it exceeded the context budget",
+                    )
+                ],
+            }
+        )
+    return context
+
+
+def spec_worker_context_json_length(context: dict[str, object]) -> int:
+    return len(json.dumps(context, indent=2, sort_keys=True))
+
+
+def trim_spec_context_strings(context: dict[str, object]) -> None:
+    targets: list[dict[str, object]] = []
+    task = context.get("task")
+    if isinstance(task, dict):
+        targets.append(task)
+    gates = context.get("required_verification_gates")
+    if isinstance(gates, list):
+        targets.extend(gate for gate in gates if isinstance(gate, dict))
+    for mapping in reversed(targets):
+        for key in ("command", "evidence", "acceptance", "scope", "source", "title"):
+            value = mapping.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            while (
+                spec_worker_context_json_length(context)
+                > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+                and value
+            ):
+                excess = (
+                    spec_worker_context_json_length(context)
+                    - SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+                )
+                target_chars = max(0, len(value) - excess - 128)
+                value, _truncated = truncate_spec_context_text(value, target_chars)
+                mapping[key] = value
+            if (
+                spec_worker_context_json_length(context)
+                <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+            ):
+                return
+
+
+def required_worker_verification_gates(
+    config: VibeConfig,
+    task: Task,
+) -> list[dict[str, object]]:
+    gates: list[dict[str, object]] = [
+        {
+            "id": "task.acceptance",
+            "required": True,
+            "description": "Verify the task acceptance criteria before reporting completion.",
+            "acceptance": bounded_context_text(task.acceptance),
+        }
+    ]
+    if task.evidence:
+        gates.append(
+            {
+                "id": "task.evidence",
+                "required": True,
+                "description": "Use the task evidence field to choose concrete checks and artifacts.",
+                "evidence": bounded_context_text(task.evidence),
+            }
+        )
+    if config.specs.require_approved:
+        gates.append(
+            {
+                "id": "spec.require_approved",
+                "required": True,
+                "approved_states": list(config.specs.approved_states),
+            }
+        )
+    if config.specs.require_current_fingerprints:
+        gates.append({"id": "spec.require_current_fingerprints", "required": True})
+    if config.specs.require_requirement_coverage:
+        gates.append({"id": "spec.require_requirement_coverage", "required": True})
+    if config.specs.require_completion_evidence:
+        gates.append({"id": "spec.require_completion_evidence", "required": True})
+    for command in config.completion.commands[:SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS]:
+        gates.append(
+            {
+                "id": "completion.command",
+                "required": True,
+                "command": bounded_context_text(
+                    command,
+                    SPEC_WORKER_CONTEXT_MAX_REF_CHARS,
+                ),
+            }
+        )
+    omitted_commands = (
+        len(config.completion.commands) - SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS
+    )
+    if omitted_commands > 0:
+        gates.append(
+            {
+                "id": "completion.command",
+                "required": True,
+                "omitted": omitted_commands,
+            }
+        )
+    return gates
 
 
 def selection_worker_json(worker: WorkerView) -> dict[str, object]:

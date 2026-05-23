@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import sys
 import tempfile
 import threading
@@ -13,13 +14,21 @@ from pathlib import Path
 from unittest.mock import patch
 
 import vibe_loop.runner as runner_module
-from vibe_loop.config import AgentConfig, SpecDiagnosticsConfig, VibeConfig
+from vibe_loop.config import (
+    AgentConfig,
+    CompletionConfig,
+    SpecDiagnosticsConfig,
+    VibeConfig,
+)
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
+    SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     SchedulerLockBusy,
     VibeRunner,
     build_batch_selection_prompt,
     build_selection_prompt,
+    build_spec_worker_context,
+    build_worker_prompt,
     deterministic_task_batch,
     parse_selected_task_id,
     parse_selected_task_ids,
@@ -85,6 +94,262 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("LIVE-04", prompt)
         self.assertIn("recent log tail", prompt)
         self.assertIn("Active vibe-loop workers", prompt)
+
+    def test_worker_prompt_includes_bounded_spec_context_and_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = (
+                "# Spec\n\n"
+                "## PRD-SDE-005 Spec-Aware Worker Context\n\n"
+                "Worker prompts include relevant requirement text.\n"
+                + ("Bounded requirement detail.\n" * 600)
+                + "\n## PRD-SDE-999 Unrelated Requirement\n\n"
+                "This unrelated requirement should not be copied.\n"
+            )
+            design_text = (
+                "# Design\n\n## ADR-1\n\nDesign reference body for the worker prompt.\n"
+            )
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
+            fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text.encode("utf-8")),
+                "sha256": hashlib.sha256(spec_text.encode("utf-8")).hexdigest(),
+            }
+            task = Task(
+                task_id="TRACE-01",
+                title="Trace task",
+                status="Next",
+                acceptance="Worker prompts include bounded spec-aware context.",
+                evidence="CLI/runner tests with bounded prompt assertions.",
+                requirement_ids=("PRD-SDE-005",),
+                spec_paths=("docs/spec.md",),
+                design_refs=("docs/design.md#ADR-1",),
+                approval_state="approved",
+                source_fingerprints=(fingerprint,),
+            )
+            config = VibeConfig(
+                repo=repo,
+                specs=SpecDiagnosticsConfig(
+                    require_approved=True,
+                    require_current_fingerprints=True,
+                ),
+                completion=CompletionConfig(
+                    commands=("uv run python -m unittest discover -s tests",),
+                ),
+            )
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn("### Spec-Aware Worker Context", prompt)
+        self.assertIn("Worker prompts include relevant requirement text.", prompt)
+        self.assertIn("Design reference body for the worker prompt.", prompt)
+        self.assertIn('"status": "current"', prompt)
+        self.assertIn('"id": "spec.require_approved"', prompt)
+        self.assertIn('"id": "spec.require_current_fingerprints"', prompt)
+        self.assertIn('"id": "completion.command"', prompt)
+        self.assertIn("...[truncated]", prompt)
+        self.assertNotIn("This unrelated requirement should not be copied.", prompt)
+
+    def test_worker_prompt_skips_secret_like_spec_context_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "secrets").mkdir()
+            (repo / "secrets" / "spec.md").write_text(
+                "TOKEN=secret\nREQ-SECRET must stay hidden.\n",
+                encoding="utf-8",
+            )
+            task = Task(
+                task_id="TRACE-02",
+                title="Secret trace task",
+                status="Next",
+                requirement_ids=("REQ-SECRET",),
+                spec_paths=("secrets/spec.md",),
+                source_fingerprints=(
+                    {
+                        "path": "secrets/spec.md",
+                        "size": 37,
+                        "sha256": "0" * 64,
+                    },
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn('"reason": "unsafe_path"', prompt)
+        self.assertNotIn("secrets/spec.md", prompt)
+        self.assertNotIn("TOKEN=secret", prompt)
+        self.assertNotIn("REQ-SECRET must stay hidden.", prompt)
+
+    def test_worker_prompt_skips_symlinked_spec_context_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "secrets").mkdir()
+            (repo / "secrets" / "spec.md").write_text(
+                "TOKEN=secret\nREQ-SYMLINK must stay hidden.\n",
+                encoding="utf-8",
+            )
+            (repo / "docs" / "spec.md").symlink_to("../secrets/spec.md")
+            task = Task(
+                task_id="TRACE-04",
+                title="Symlink trace task",
+                status="Next",
+                requirement_ids=("REQ-SYMLINK",),
+                spec_paths=("docs/spec.md",),
+            )
+            config = VibeConfig(
+                repo=repo,
+                completion=CompletionConfig(
+                    commands=tuple(
+                        f"pytest {'x' * 1000} --case {index}" for index in range(30)
+                    ),
+                ),
+            )
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn('"reason": "symlink"', prompt)
+        self.assertNotIn("TOKEN=secret", prompt)
+        self.assertNotIn("REQ-SYMLINK must stay hidden.", prompt)
+
+    def test_worker_prompt_reports_stale_and_missing_spec_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = "## REQ-1\n\nCurrent requirement text.\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            task = Task(
+                task_id="TRACE-03",
+                title="Stale trace task",
+                status="Next",
+                requirement_ids=("REQ-1",),
+                spec_paths=("docs/spec.md",),
+                source_fingerprints=(
+                    {
+                        "path": "docs/spec.md",
+                        "size": len(spec_text.encode("utf-8")),
+                        "sha256": "1" * 64,
+                    },
+                    {
+                        "path": "docs/missing.md",
+                        "size": 10,
+                    },
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn("Current requirement text.", prompt)
+        self.assertIn('"status": "stale"', prompt)
+        self.assertIn('"mismatches": [', prompt)
+        self.assertIn('"sha256"', prompt)
+        self.assertIn('"path": "docs/missing.md"', prompt)
+        self.assertIn('"reason": "missing"', prompt)
+
+    def test_worker_prompt_redacts_secret_like_ref_and_fingerprint_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = "## REQ-REF\n\nRequirement text.\n"
+            design_text = "safe design body\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
+            task = Task(
+                task_id="TRACE-06",
+                title="Ref metadata task",
+                status="Next",
+                requirement_ids=("REQ-REF",),
+                spec_paths=("docs/spec.md",),
+                design_refs=(
+                    "docs/design.md#https://hooks.slack.com/services/T/B/C",
+                    "docs/design.md#foo/secrets/token",
+                ),
+                source_fingerprints=(
+                    {
+                        "path": "docs/spec.md",
+                        "size": len(spec_text.encode("utf-8")),
+                        "sha256": "https://hooks.slack.com/services/T/B/C",
+                        "webhook_url": "https://hooks.slack.com/services/T/B/C",
+                        "api_token": "secret-token",
+                    },
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn("docs/design.md#<redacted>", prompt)
+        self.assertIn('"sha256": "<invalid>"', prompt)
+        self.assertNotIn("hooks.slack.com", prompt)
+        self.assertNotIn("foo/secrets/token", prompt)
+        self.assertNotIn("secret-token", prompt)
+        self.assertNotIn("webhook_url", prompt)
+        self.assertNotIn("api_token", prompt)
+
+    def test_spec_worker_context_respects_total_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = "## REQ-LARGE\n\n" + ("requirement detail\n" * 1000)
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            task = Task(
+                task_id="TRACE-05",
+                title="Large trace task",
+                status="Next",
+                scope="scope " * 1000,
+                acceptance="acceptance " * 1000,
+                evidence="evidence " * 1000,
+                requirement_ids=tuple(f"REQ-{index}" for index in range(50)),
+                spec_paths=("docs/spec.md",),
+                design_refs=tuple(
+                    f"docs/design-{index}.md#ADR-{index}" for index in range(50)
+                ),
+                source_fingerprints=tuple(
+                    {
+                        "path": f"docs/spec-{index}.md",
+                        "size": index,
+                        "sha256": "a" * 64,
+                    }
+                    for index in range(50)
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            context = build_spec_worker_context(config, task)
+            context_json = json.dumps(context, indent=2, sort_keys=True)
+
+        self.assertLessEqual(len(context_json), SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS)
+        self.assertIn("...[truncated]", context_json)
+
+    def test_spec_worker_context_bounds_required_scalar_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "spec.md").write_text(
+                "## REQ-SCALAR\n\nRequirement text.\n",
+                encoding="utf-8",
+            )
+            task = Task(
+                task_id="TRACE-" + ("x" * 20000),
+                title="Scalar trace task",
+                status="Next" + ("y" * 20000),
+                priority="P1" + ("z" * 20000),
+                requirement_ids=("REQ-SCALAR",),
+                spec_paths=("docs/spec.md",),
+            )
+            config = VibeConfig(repo=repo)
+
+            context = build_spec_worker_context(config, task)
+            context_json = json.dumps(context, indent=2, sort_keys=True)
+
+        self.assertLessEqual(len(context_json), SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS)
+        self.assertIn("...[truncated]", context_json)
 
     def test_parse_selected_task_id_from_json_only_or_wrapped_output(self) -> None:
         self.assertEqual(

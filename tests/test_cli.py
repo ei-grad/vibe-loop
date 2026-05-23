@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import socket
@@ -4274,17 +4275,30 @@ class CliTests(unittest.TestCase):
             repo = Path(directory)
             source_path = Path(__file__).resolve().parents[1] / "src"
             (repo / "docs").mkdir()
-            (repo / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
+            spec_text = (
+                "# Spec\n\n"
+                "## PRD-SDE-003 Traceability\n\n"
+                "Requirement text for launched workers.\n"
+            )
+            design_text = "# Design\n\n## ADR-1\n\nDesign context for workers.\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
+            spec_sha = hashlib.sha256(spec_text.encode("utf-8")).hexdigest()
             (repo / "list_tasks.py").write_text(
                 "import json\n"
                 "print(json.dumps([{'id':'TRACE-01','title':'Trace task',"
                 "'status':'Next','dependencies':[],"
+                "'acceptance':'Prompt includes bounded spec context.',"
+                "'evidence':'CLI prompt assertion.',"
                 "'requirement_ids':['PRD-SDE-003'],"
                 "'spec_paths':['docs/spec.md'],"
-                "'design_refs':['ADR-1'],"
+                "'design_refs':['docs/design.md#ADR-1'],"
                 "'approval_state':'approved',"
-                "'source_fingerprints':[{'path':'docs/spec.md','size':5,"
-                "'sha256':'" + "e" * 64 + "','redacted':False}]}]))\n",
+                "'source_fingerprints':[{'path':'docs/spec.md','size':"
+                + str(len(spec_text.encode("utf-8")))
+                + ",'sha256':'"
+                + spec_sha
+                + "','redacted':False}]}]))\n",
                 encoding="utf-8",
             )
             (repo / "agent.py").write_text(
@@ -4327,6 +4341,11 @@ class CliTests(unittest.TestCase):
         self.assertIn('"spec_paths": [', prompt)
         self.assertIn('"docs/spec.md"', prompt)
         self.assertIn('"approval_state": "approved"', prompt)
+        self.assertIn("### Spec-Aware Worker Context", prompt)
+        self.assertIn("Requirement text for launched workers.", prompt)
+        self.assertIn("Design context for workers.", prompt)
+        self.assertIn('"id": "task.acceptance"', prompt)
+        self.assertIn('"status": "current"', prompt)
 
     def test_run_next_captures_explicit_worker_session_id_from_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
