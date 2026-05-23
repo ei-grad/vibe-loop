@@ -72,6 +72,16 @@ and custom task tools.
 Runnable statuses default to `Active`, `Next`, and `Planned`. A task is runnable
 when all listed dependencies are `Done` and no local lock exists.
 
+The active task source is the source of truth for the dependency graph.
+`.vibe-loop/runs.jsonl` records worker attempts and outcomes, but those records
+do not advance task status. A completed worker must update the task source
+itself, or make sure the configured command-backed adapter will report the task
+as completed/non-runnable before the next scheduling pass. This is an
+intentional design boundary: `vibe-loop` should not create a private task-state
+channel that only its supervisor understands. Agents and humans working on the
+same project without the CLI must be able to advance the same backlog by
+updating the project-owned plan, tracker, or adapter state directly.
+
 ## Spec-Driven Workflow Execution
 
 `vibe-loop` can sit underneath spec-driven development tools as the task
@@ -350,8 +360,12 @@ vibe-loop report --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" \
 ```
 
 Report statuses are `completed`, `blocked`, `failed`, and `unknown`. Matching
-report records are authoritative; without a report, the supervisor falls back to
-exit status, completion checks, task probing, and main-branch change heuristics.
+report records are authoritative for classifying that worker run; they are not
+task-source mutations and do not by themselves mark a task `Done` in the
+runnable graph. Before reporting `completed`, the worker should update the
+active task source, such as the Markdown plan row or command-backed tracker
+state. Without a report, the supervisor falls back to exit status, completion
+checks, task probing, and main-branch change heuristics.
 
 Workers that create or adopt their own branch/worktree can make that ownership
 visible without transferring control to the supervisor:

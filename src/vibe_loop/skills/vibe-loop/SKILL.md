@@ -48,6 +48,21 @@ cross-slice backlog.
 7. Commit the reviewed slice, integrate it to `main` when permitted, verify on
    `main`, clean up the slice worktree/branch, and stop.
 
+## Task Source State
+
+For CLI-supervised runs, completion is reflected through the repository's active
+task source, not through the supervisor run record alone. Before reporting a
+slice as completed, update the relevant task source so the task is no longer
+runnable there: for example, mark the Markdown task row `Done`, update the
+project tracker, or verify that the configured command-backed adapter now
+returns a completed/non-runnable status. If that update is blocked by policy,
+tooling, or missing access, report the slice as blocked or unknown with the
+specific reason instead of claiming completion only in local run metadata.
+
+This is a deliberate part of the workflow model: task status remains
+project-owned, so agents and humans working without the `vibe-loop` CLI can
+manage the same backlog through the normal plan, tracker, or adapter.
+
 ## Review
 
 Spec review checks requested behavior and evidence. Code-quality review checks

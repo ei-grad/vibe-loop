@@ -84,6 +84,18 @@ you cannot classify the result. Include the best available commit reference
 and a concise message; include --metadata-json only for structured facts that
 help the supervisor or later review.
 
+The report records the outcome of this worker run; it does not update the task
+graph. Before reporting "completed", update the repository's active task source
+so this task is no longer runnable there: for example, mark the Markdown plan
+row `Done`, or ensure the configured command-backed task adapter will return a
+completed/non-runnable status. If policy or tooling prevents that update,
+report "blocked" or "unknown" with the precise reason instead of reporting a
+completed run that the task source still exposes as runnable.
+
+This boundary is intentional. Task status must remain project-owned so agents
+and humans working without the vibe-loop CLI can manage the same backlog through
+the repository's normal plan, tracker, or adapter workflow.
+
 When a blocker or failure occurs after code was changed, commit or otherwise
 stabilize the slice before reporting unless doing so would be unsafe. Do not
 let the report replace the final user-facing summary; the report is supervisor

@@ -22,7 +22,9 @@ while making `vibe-loop run-until-done --jobs N` useful for unattended work.
    transferring workspace management to the supervisor.
 6. Workers use an advisory `main-integration` lock around the final refresh,
    verification, fast-forward merge, and immediate `main` verification.
-7. The supervisor watches worker exits, re-reads task state, records results,
+7. Workers update the repository's active task source before reporting
+   `completed`, so the task graph reflects the finished slice.
+8. The supervisor watches worker exits, re-reads task state, records results,
    and fills open worker slots until no runnable tasks remain.
 
 The supervisor must not resolve merge conflicts, run reviews for workers, or
@@ -33,6 +35,12 @@ results are missing or ambiguous.
 
 - `runs.jsonl` is append-only and versioned. The CLI may add richer record types
   later, but readers must tolerate unknown fields and skip invalid JSON lines.
+- `runs.jsonl` is run history, not the task graph. Worker reports classify
+  individual attempts; they do not replace Markdown plan rows, command-backed
+  tracker state, or any other active task source.
+- Keeping task state in the active task source is a deliberate design choice.
+  Agents and humans working without the `vibe-loop` supervisor must be able to
+  manage task status through the same project-owned plan, tracker, or adapter.
 - Agent-facing result JSON remains stable and scriptable on stdout. Supervisor
   progress, worker output mirroring, and empty-queue messages belong on stderr.
 - Task discovery is explicit-first. User-authored `.vibe-loop.toml` and command
