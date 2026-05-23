@@ -10,8 +10,8 @@ uv run --no-project --with 'ruff>=0.15' ruff format src/ tests/
 uv build && uv run --with twine --no-project python -m twine check dist/*
 ```
 
-CI runs ruff check, ruff format --check, and unittest discover on Python 3.11
-and 3.14. Run these locally before pushing.
+Run ruff check and ruff format before committing. CI also runs unittest
+discover on Python 3.11 and 3.14 (minimum supported and latest).
 
 ## Design Context
 
