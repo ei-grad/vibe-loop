@@ -42,6 +42,25 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertEqual([task.task_id for task in tasks], ["DEMO-02", "DEMO-04"])
         self.assertNotIn("DEMO-01", [task.task_id for task in done_included])
 
+    def test_lowercase_done_status_resolves_dependencies(self) -> None:
+        # A command/JSON task source reporting a lowercase "done" must be
+        # recognized as done so a dependent "ready" task becomes runnable.
+        done_task = task_from_mapping({"id": "DEP", "status": "done"}, 0)
+        gated = task_from_mapping(
+            {"id": "GATED", "status": "ready", "dependencies": ["DEP"]}, 1
+        )
+        self.assertTrue(done_task.done)
+
+        class _Source:
+            def list_tasks(self):
+                return [done_task, gated]
+
+            def probe(self, task_id):
+                return None
+
+        runnable = runnable_tasks(_Source(), ("ready",))
+        self.assertEqual([task.task_id for task in runnable], ["GATED"])
+
     def test_plan_tasks_include_section_for_tree_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "PLAN.md"
