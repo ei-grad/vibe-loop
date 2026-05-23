@@ -869,7 +869,8 @@ def planning_analytics_report(
                 "task source completion state",
                 "worker reports with explicit task ids",
                 "project worklog adapter records",
-                "explicit commit refs or Plan-Item trailers",
+                "explicit commit refs, Plan-Item trailers, or Requirement trailers",
+                "worker report metadata requirement_ids and plan_items",
             ],
             "diagnostic_only": [
                 "subject matching",

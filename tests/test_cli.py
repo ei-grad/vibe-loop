@@ -1611,7 +1611,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["generated_by"], "vibe-loop planning timeline")
         self.assertEqual(payload["tasks"][0]["id"], "TASK-01")
         self.assertEqual(payload["tasks"][0]["projected"]["estimate"]["minutes"], 60)
@@ -1948,6 +1948,37 @@ class CliTests(unittest.TestCase):
         self.assertEqual(gantt["freshness"], "not_checked")
         self.assertEqual(gantt["schema_status"], "current_schema")
         self.assertEqual(gantt["warning_count"], 7)
+
+    def test_planning_artifact_inspect_reports_old_timeline_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve() / "repo"
+            init_planning_repo(repo, PLAN)
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                generate_exit = main(["planning", "artifacts", "--repo", str(repo)])
+            timeline_path = repo / ".vibe-loop" / "planning-analytics" / "timeline.json"
+            timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+            timeline["schema_version"] = 1
+            timeline_path.write_text(json.dumps(timeline), encoding="utf-8")
+            inspect_stdout = StringIO()
+            inspect_stderr = StringIO()
+            with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
+                inspect_exit = main(
+                    [
+                        "planning",
+                        "artifacts",
+                        "--repo",
+                        str(repo),
+                        "--inspect",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(inspect_stdout.getvalue())
+
+        self.assertEqual(generate_exit, 0)
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(inspect_stderr.getvalue(), "")
+        self.assertEqual(payload["timeline_json"]["schema_status"], "unknown_schema")
 
     def test_tasks_configure_writes_validated_profile_cache_with_stub_agent(
         self,

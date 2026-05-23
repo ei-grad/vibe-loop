@@ -515,7 +515,7 @@ class PlanningTimelineTests(unittest.TestCase):
             timeline = build_planning_timeline(load_config(repo))
 
         task = timeline["tasks"][0]
-        self.assertEqual(timeline["schema_version"], 1)
+        self.assertEqual(timeline["schema_version"], 2)
         self.assertEqual(
             list(timeline),
             [
@@ -524,6 +524,7 @@ class PlanningTimelineTests(unittest.TestCase):
                 "schedule_policy",
                 "source_provenance",
                 "sections",
+                "requirements",
                 "tasks",
                 "warnings",
             ],
@@ -818,6 +819,43 @@ class TimelineCrossReferenceTests(unittest.TestCase):
         self.assertTrue(len(stale_warnings) > 0)
         runnable_ids = [t.task_id for t in runnable]
         self.assertEqual(runnable_ids, ["T-02"])
+
+    def test_timeline_json_exposes_requirement_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_git_repo(repo)
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([\n"
+                "  {'id':'TASK-01','title':'Done task','status':'Done',"
+                "'dependencies':[],'requirement_ids':['REQ-1']},\n"
+                "  {'id':'TASK-02','title':'Future task','status':'Planned',"
+                "'dependencies':[],'requirement_ids':['REQ-2']},\n"
+                "]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                f'[task_source]\nlist = "{PYTHON} list_tasks.py"\n',
+                encoding="utf-8",
+            )
+            (repo / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(repo, "add", "list_tasks.py", ".vibe-loop.toml", "feature.txt")
+            git_commit(
+                repo,
+                "TASK-01 work",
+                "2026-01-01T10:00:00+00:00",
+                plan_item="TASK-01",
+            )
+
+            timeline = build_planning_timeline(load_config(repo))
+
+        coverage = {item["requirement_id"]: item for item in timeline["requirements"]}
+        self.assertEqual(coverage["REQ-1"]["status"], "satisfied")
+        self.assertEqual(coverage["REQ-2"]["status"], "pending")
+        self.assertEqual(
+            timeline["source_provenance"]["requirements"],
+            {"count": 2, "by_status": {"pending": 1, "satisfied": 1}},
+        )
 
 
 class ReadTimelineFileTests(unittest.TestCase):

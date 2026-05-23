@@ -416,6 +416,171 @@ class PlanningEvidenceTests(unittest.TestCase):
         )
         self.assertIn(("unmapped_commit", None, commit), warnings)
 
+    def test_requirement_coverage_maps_reports_trailers_reviews_and_tests(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_git_repo(repo)
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([\n"
+                "  {'id':'TASK-01','title':'Done task','status':'Done',"
+                "'dependencies':[],'requirement_ids':['REQ-1']},\n"
+                "  {'id':'TASK-02','title':'Attempted task','status':'Planned',"
+                "'dependencies':[],'requirement_ids':['REQ-2']},\n"
+                "  {'id':'TASK-03','title':'Missing evidence','status':'Done',"
+                "'dependencies':[],'requirement_ids':['REQ-3']},\n"
+                "  {'id':'TASK-04','title':'Future task','status':'Planned',"
+                "'dependencies':[],'requirement_ids':['REQ-4']},\n"
+                "]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                f'[task_source]\nlist = "{PYTHON} list_tasks.py"\n',
+                encoding="utf-8",
+            )
+            git(repo, "add", "list_tasks.py", ".vibe-loop.toml")
+            git(repo, "commit", "-m", "baseline")
+            (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+            git(repo, "add", "feature.py")
+            git(
+                repo,
+                "commit",
+                "-m",
+                "satisfy requirement",
+                "-m",
+                "Plan-Item: TASK-01\n"
+                "Review: review-1\n"
+                "Test: pytest tests/test_planning_evidence.py",
+            )
+            satisfied_commit = git(repo, "rev-parse", "HEAD").stdout.strip()
+            (repo / "attempt.py").write_text("value = 2\n", encoding="utf-8")
+            git(repo, "add", "attempt.py")
+            git(repo, "commit", "-m", "attempt requirement")
+            attempted_commit = git(repo, "rev-parse", "HEAD").stdout.strip()
+            (repo / "unmapped.py").write_text("value = 3\n", encoding="utf-8")
+            git(repo, "add", "unmapped.py")
+            git(
+                repo,
+                "commit",
+                "-m",
+                "direct requirement evidence",
+                "-m",
+                "Requirement: REQ-X",
+            )
+            unmapped_commit = git(repo, "rev-parse", "HEAD").stdout.strip()
+            RunStore(repo / ".vibe-loop" / "runs.jsonl").append_report(
+                WorkerReport(
+                    run_id="run-2",
+                    task_id="TASK-02",
+                    status="failed",
+                    commit=attempted_commit,
+                    metadata={
+                        "plan_items": ["TASK-02"],
+                        "requirement_ids": ["REQ-2"],
+                        "reviews": ["review-2"],
+                        "tests": ["pytest attempted"],
+                    },
+                )
+            )
+
+            evidence = collect_planning_evidence(
+                load_config(repo),
+                git_commit_limit=3,
+            ).to_json()
+
+        coverage = {
+            item["requirement_id"]: item for item in evidence["requirement_coverage"]
+        }
+        self.assertEqual(coverage["REQ-1"]["status"], "satisfied")
+        self.assertEqual(coverage["REQ-1"]["satisfied_task_ids"], ["TASK-01"])
+        self.assertIn(satisfied_commit, coverage["REQ-1"]["commits"])
+        self.assertEqual(coverage["REQ-1"]["review_refs"], ["review-1"])
+        self.assertEqual(
+            coverage["REQ-1"]["test_refs"],
+            ["pytest tests/test_planning_evidence.py"],
+        )
+        self.assertEqual(coverage["REQ-2"]["status"], "attempted")
+        self.assertEqual(coverage["REQ-2"]["attempted_task_ids"], ["TASK-02"])
+        self.assertIn(attempted_commit, coverage["REQ-2"]["commits"])
+        self.assertEqual(coverage["REQ-2"]["review_refs"], ["review-2"])
+        self.assertEqual(coverage["REQ-2"]["test_refs"], ["pytest attempted"])
+        self.assertEqual(coverage["REQ-3"]["status"], "missing_evidence")
+        self.assertEqual(
+            coverage["REQ-3"]["missing_evidence_task_ids"],
+            ["TASK-03"],
+        )
+        self.assertEqual(coverage["REQ-4"]["status"], "pending")
+        self.assertEqual(coverage["REQ-X"]["status"], "unmapped")
+        self.assertEqual(coverage["REQ-X"]["task_ids"], [])
+        self.assertIn(unmapped_commit, coverage["REQ-X"]["commits"])
+        mapping_sources = {
+            (mapping["requirement_id"], mapping["source"])
+            for mapping in evidence["requirement_mappings"]
+        }
+        self.assertIn(("REQ-1", "plan_item_trailer"), mapping_sources)
+        self.assertIn(("REQ-2", "worker_report_metadata"), mapping_sources)
+        attempt = next(
+            item for item in evidence["run_attempts"] if item["run_id"] == "run-2"
+        )
+        self.assertEqual(
+            attempt["metadata_evidence"],
+            {
+                "plan_items": ["TASK-02"],
+                "requirement_ids": ["REQ-2"],
+                "review_refs": ["review-2"],
+                "test_refs": ["pytest attempted"],
+            },
+        )
+        warning_keys = {
+            (
+                warning["code"],
+                warning.get("requirement_id"),
+                tuple(warning.get("diagnostic_task_ids", [])),
+            )
+            for warning in evidence["warnings"]
+        }
+        self.assertIn(("unmapped_requirement", "REQ-X", ()), warning_keys)
+        self.assertIn(
+            ("requirement_missing_evidence", "REQ-3", ("TASK-03",)),
+            warning_keys,
+        )
+
+    def test_requirement_only_trailer_does_not_satisfy_done_plan_row(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_git_repo(repo)
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'TASK-01','title':'Done task',"
+                "'status':'Done','dependencies':[],"
+                "'requirement_ids':['REQ-1']}]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                f'[task_source]\nlist = "{PYTHON} list_tasks.py"\n',
+                encoding="utf-8",
+            )
+            git(repo, "add", "list_tasks.py", ".vibe-loop.toml")
+            git(repo, "commit", "-m", "baseline")
+            (repo / "feature.py").write_text("value = 1\n", encoding="utf-8")
+            git(repo, "add", "feature.py")
+            git(repo, "commit", "-m", "work", "-m", "Requirement: REQ-1")
+            commit = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            evidence = collect_planning_evidence(
+                load_config(repo),
+                git_commit_limit=1,
+            ).to_json()
+
+        coverage = evidence["requirement_coverage"][0]
+        self.assertEqual(coverage["requirement_id"], "REQ-1")
+        self.assertEqual(coverage["status"], "missing_evidence")
+        self.assertEqual(coverage["satisfied_task_ids"], [])
+        self.assertEqual(coverage["missing_evidence_task_ids"], ["TASK-01"])
+        self.assertIn(commit, coverage["commits"])
+
     def test_worklog_output_is_bounded_with_skipped_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

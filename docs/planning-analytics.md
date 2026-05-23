@@ -26,10 +26,12 @@ work to task ids:
 
 - normalized task-source completion state, especially `Done`;
 - structured worker reports with explicit task ids and commit refs;
+- structured worker-report metadata that declares `plan_items`,
+  `requirement_ids`, `reviews`, or `tests`;
 - optional project worklog adapter records that include task ids or explicit
   commit mappings;
 - explicit commit references in task evidence fields;
-- `Plan-Item:` commit trailers.
+- `Plan-Item:` and `Requirement:` commit trailers.
 
 Diagnostic evidence can explain likely relationships, but must not satisfy
 coverage by default:
@@ -113,11 +115,22 @@ Coverage answers two separate questions:
 - Commit coverage: every non-generated, in-scope commit in the selected window
   should be mapped to an explicit task id or reported with a skipped/warning
   reason.
+- Requirement coverage: every requirement id exposed by normalized tasks or
+  explicit evidence should be classified as `satisfied`, `attempted`,
+  `missing_evidence`, `pending`, or `unmapped`.
 
 Generated commits and generated analytics artifacts are excluded from commit
 coverage by default. Subject matching may add diagnostics for unmapped commits,
 but coverage remains failed or warning-marked unless an authoritative mapping is
 present.
+
+Requirement coverage is derived from normalized task `requirement_ids`,
+task-level completion evidence, worker-report metadata, and `Requirement:`
+commit trailers. `satisfied` means accepted completion evidence exists beyond
+task-source status alone. `attempted` means a report or mapping exists but is
+not accepted completion evidence. `missing_evidence` means a requirement is
+linked to completed plan rows without accepted evidence. `unmapped` means
+evidence cites a requirement id that no plan row exposes.
 
 ## Projection Policy
 
@@ -143,6 +156,11 @@ clipped to eight hours; the first mapped commit uses a one-minute floor because
 there is no prior mapped author time. The output preserves both
 `raw_duration_minutes` and `idle_gap_clipped_minutes` so long idle periods are
 visible without inflating projected durations.
+
+The timeline JSON also includes `requirements`, a requirement coverage ledger
+with linked task ids, satisfied or attempted task ids, missing-evidence task ids,
+mapped commits, run ids, source names, and review/test references. Source
+provenance includes requirement counts by status.
 
 Incomplete tasks receive `projected` spans from the latest actual end, or from a
 documented fallback anchor when no actual end exists. Projections are scheduled

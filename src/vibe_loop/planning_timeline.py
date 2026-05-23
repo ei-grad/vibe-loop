@@ -18,7 +18,7 @@ from vibe_loop.planning_evidence import (
 from vibe_loop.tasks import DONE_STATUS, STATUS_RANK, priority_rank
 
 
-PLANNING_TIMELINE_SCHEMA_VERSION = 1
+PLANNING_TIMELINE_SCHEMA_VERSION = 2
 ACTUAL_IDLE_GAP_CLIP_MINUTES = 8 * 60
 FIRST_COMMIT_FLOOR_MINUTES = 1
 DEFAULT_PROJECTED_DURATION_MINUTES = 60
@@ -156,6 +156,7 @@ class PlanningTimelineBuilder:
                 duration_model,
             ),
             "sections": sections_for_tasks(task_payloads),
+            "requirements": list(self.evidence.requirement_coverage),
             "tasks": task_payloads,
             "warnings": dedupe_warning_payloads(self.warnings),
         }
@@ -178,6 +179,9 @@ class PlanningTimelineBuilder:
                 "commits_collected": len(self.evidence.commits),
             },
             "worklog": {"configured": self.evidence.worklog_configured},
+            "requirements": requirement_coverage_summary(
+                self.evidence.requirement_coverage
+            ),
             "actual": {
                 "task_count": len(actual_spans),
                 "idle_gap_clip_minutes": ACTUAL_IDLE_GAP_CLIP_MINUTES,
@@ -1228,6 +1232,19 @@ def task_position(tasks: list[dict[str, object]]):
         string_value(task.get("id")): index for index, task in enumerate(tasks)
     }
     return lambda task: positions.get(task, 0)
+
+
+def requirement_coverage_summary(
+    requirement_coverage: tuple[dict[str, object], ...],
+) -> dict[str, object]:
+    by_status: dict[str, int] = {}
+    for item in requirement_coverage:
+        status = string_value(item.get("status")) or "unknown"
+        by_status[status] = by_status.get(status, 0) + 1
+    return {
+        "count": len(requirement_coverage),
+        "by_status": dict(sorted(by_status.items())),
+    }
 
 
 def max_datetime(*values: datetime | None) -> datetime:
