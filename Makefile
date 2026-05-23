@@ -23,7 +23,7 @@ unittest:
 
 build:
 	$(UV) build
-	$(UV) run --with twine --no-project python -m twine check dist/*
+	$(UV) run --with twine --no-project -m twine check dist/*
 
 check: test build
 

@@ -7,7 +7,7 @@ uv run -m pytest tests/                          # run tests
 uv run python -m unittest discover               # alternative test runner
 uv run ruff check
 uv run ruff format
-uv build && uv run --with twine --no-project python -m twine check dist/*
+uv build && uv run --with twine --no-project -m twine check dist/*
 ```
 
 Run ruff check and ruff format before committing. CI also runs unittest
