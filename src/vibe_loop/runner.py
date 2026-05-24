@@ -1917,6 +1917,7 @@ def selection_worker_json(worker: WorkerView) -> dict[str, object]:
         "state": payload["state"],
         "process_state": payload["process_state"],
         "stale_reason": payload["stale_reason"],
+        "lifecycle_state": payload["lifecycle_state"],
         "result_status": payload["result_status"],
         "started_at": payload["started_at"],
         "log": payload["log"],

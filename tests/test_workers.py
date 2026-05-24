@@ -6,7 +6,13 @@ import unittest
 from pathlib import Path
 
 from vibe_loop.locks import LockManager
-from vibe_loop.runs import RunResult, RunStore, WorkerReport
+from vibe_loop.runs import (
+    LOCK_ACQUIRED_RECORD_TYPE,
+    RunLifecycleEvent,
+    RunResult,
+    RunStore,
+    WorkerReport,
+)
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
@@ -150,6 +156,7 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(recorded[0].process_state, "running")
         self.assertEqual(recorded[0].stale_reason, "result_recorded")
         self.assertEqual(recorded[0].result_status, "completed")
+        self.assertEqual(recorded[0].lifecycle_progress.state, "finalized")
 
     def test_worker_views_show_report_status_before_final_result_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -188,6 +195,61 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(views[0].result_status, "blocked")
         self.assertEqual(views[0].result_record_type, "worker_report")
         self.assertEqual(views[0].result_metadata, {"reason": "dependency"})
+        self.assertEqual(views[0].lifecycle_progress.state, "reported")
+        payload = views[0].to_json()
+        self.assertEqual(payload["lifecycle_state"], "reported")
+        self.assertIn("finalized", payload["missing_lifecycle_transitions"])
+
+    def test_worker_views_include_lifecycle_progress_from_run_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="PAR-03",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent PAR-03",
+            )
+            manager.acquire("PAR-03", "run-1", metadata=state.to_lock_metadata())
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_ACQUIRED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="PAR-03",
+                    lock_kind="task",
+                    lock_path=repo / ".vibe-loop" / "locks" / "PAR-03.lock",
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="PAR-03",
+                    to_state="started",
+                    reason="task_lock_acquired",
+                )
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+            payload = views[0].to_json()
+
+        self.assertEqual(payload["lifecycle_state"], "started")
+        by_state = {
+            transition["state"]: transition
+            for transition in payload["lifecycle_transitions"]
+        }
+        self.assertTrue(by_state["scheduled"]["observed"])
+        self.assertTrue(by_state["started"]["observed"])
+        self.assertFalse(by_state["reported"]["observed"])
 
     def test_worker_views_ignore_invalid_or_mismatched_report_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -231,6 +293,8 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(views[0].state, "running")
         self.assertEqual(views[0].result_status, None)
         self.assertEqual(views[0].result_metadata, None)
+        self.assertEqual(views[0].lifecycle_progress.state, "")
+        self.assertEqual(views[0].lifecycle_progress.missing_states[0], "scheduled")
 
     def test_worker_views_report_corrupt_or_incomplete_lock_directories(
         self,

@@ -1439,6 +1439,7 @@ def render_workers(workers: list[WorkerView]) -> str:
         result = (
             f"\tresult={payload['result_status']}" if payload["result_status"] else ""
         )
+        lifecycle = f"\tlifecycle={payload['lifecycle_state'] or '-'}"
         workspace = ""
         if isinstance(payload["workspace"], dict):
             dirty = "dirty" if payload["workspace"].get("dirty") else "clean"
@@ -1455,7 +1456,8 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
-            f"\tcommand={payload['command']}{workspace}{result}{diagnostics}{stale}"
+            f"\tcommand={payload['command']}{workspace}{lifecycle}{result}"
+            f"{diagnostics}{stale}"
         )
     return "\n".join(lines)
 
@@ -1590,6 +1592,13 @@ def render_run_inspection(inspection) -> str:
         f"session: {payload['session_id']} ({payload['session_id_source'] or '-'})",
         f"log: {payload['log'] or '-'}",
         f"message: {payload['message'] or '-'}",
+        f"lifecycle: {payload['lifecycle_state'] or '-'}",
+        "missing_lifecycle: "
+        + (
+            ", ".join(payload["missing_lifecycle_transitions"])
+            if payload["missing_lifecycle_transitions"]
+            else "-"
+        ),
         f"records: {payload['record_count']}",
     ]
     if payload["worker_report"]:

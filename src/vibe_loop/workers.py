@@ -17,8 +17,11 @@ from vibe_loop.runs import (
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKER_REPORT_RECORD_TYPE,
+    RunLifecycleProgress,
     RunStore,
     WorkerReport,
+    derive_run_lifecycle,
+    empty_run_lifecycle,
     utc_now_iso,
 )
 
@@ -305,11 +308,14 @@ class WorkerView:
     result_finished_at: str | None = None
     result_record_type: str | None = None
     result_metadata: dict[str, Any] | None = None
+    lifecycle_progress: RunLifecycleProgress = dataclasses.field(
+        default_factory=empty_run_lifecycle
+    )
     workspace_git_state: WorkspaceGitState | None = None
     workspace_diagnostics: tuple[WorkspaceDiagnostic, ...] = ()
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "task_id": self.active.task_id,
             "run_id": self.active.run_id,
             "state": self.state,
@@ -347,6 +353,8 @@ class WorkerView:
             "result_record_type": self.result_record_type,
             "result_metadata": self.result_metadata,
         }
+        payload.update(self.lifecycle_progress.to_json())
+        return payload
 
 
 ProcessExists = Callable[[int], bool]
@@ -937,7 +945,8 @@ def build_worker_views(
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
     process_checker = process_exists if process_exists is not None else pid_exists
-    result_by_run_id = latest_worker_status_by_run_id(run_store.read_records())
+    records = run_store.read_records()
+    result_by_run_id = latest_worker_status_by_run_id(records)
     workspace_context = (
         build_workspace_git_context(repo, main_branch=main_branch)
         if repo is not None
@@ -997,11 +1006,43 @@ def build_worker_views(
                 result_finished_at=result_finished_at,
                 result_record_type=result_record_type,
                 result_metadata=result_metadata,
+                lifecycle_progress=worker_lifecycle_progress(active, records),
                 workspace_git_state=workspace_git_state,
                 workspace_diagnostics=workspace_diagnostics,
             )
         )
     return views
+
+
+def worker_lifecycle_progress(
+    active: ActiveRunState,
+    records: list[dict[str, Any]],
+) -> RunLifecycleProgress:
+    if not active.run_id:
+        return empty_run_lifecycle()
+    return derive_run_lifecycle(
+        [
+            record
+            for record in records
+            if record_matches_worker_identity(
+                record,
+                run_id=active.run_id,
+                task_id=active.task_id,
+            )
+        ]
+    )
+
+
+def record_matches_worker_identity(
+    record: dict[str, Any],
+    *,
+    run_id: str,
+    task_id: str,
+) -> bool:
+    if record.get("run_id") != run_id:
+        return False
+    record_task_id = optional_string(record.get("task_id"))
+    return record_task_id is None or record_task_id == task_id
 
 
 def classify_process(

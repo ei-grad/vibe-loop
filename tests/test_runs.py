@@ -10,9 +10,12 @@ from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_EXPIRED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
+    LIFECYCLE_STATES,
     RUN_RECORD_TYPE,
     RUN_SCHEMA_VERSION,
     RUN_STATE_TRANSITION_RECORD_TYPE,
+    WORKSPACE_CLAIM_RECORD_TYPE,
+    WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     WORKER_REPORT_SCHEMA_VERSION,
@@ -20,6 +23,7 @@ from vibe_loop.runs import (
     RunResult,
     RunStore,
     WorkerReport,
+    derive_run_lifecycle,
 )
 
 
@@ -176,6 +180,115 @@ class RunStoreTests(unittest.TestCase):
                 run_id="run-1",
                 payload={"run_id": "other"},
             )
+
+    def test_derive_run_lifecycle_uses_recorded_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            records = [
+                RunLifecycleEvent.lock_event(
+                    LOCK_ACQUIRED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    lock_kind="task",
+                    lock_path=repo / "TASK-01.lock",
+                ).to_record(),
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    to_state="started",
+                    reason="task_lock_acquired",
+                ).to_record(),
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    from_state="started",
+                    to_state="session_observed",
+                    reason="native:stdout",
+                    payload={"session_id": "native-1"},
+                ).to_record(),
+                {
+                    "schema_version": 1,
+                    "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+                    "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "occurred_at": "2026-05-09T00:00:20+00:00",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(repo),
+                },
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                    reported_at="2026-05-09T00:00:30+00:00",
+                ).to_record(),
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    from_state="session_observed",
+                    to_state="classified",
+                    reason="worker_report",
+                ).to_record(),
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "run-1.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                    finished_at="2026-05-09T00:01:00+00:00",
+                ).to_record(),
+            ]
+
+            progress = derive_run_lifecycle(records)
+            payload = progress.to_json()
+
+        self.assertEqual(progress.state, "finalized")
+        self.assertEqual(
+            [transition["state"] for transition in payload["lifecycle_transitions"]],
+            list(LIFECYCLE_STATES),
+        )
+        self.assertEqual(payload["missing_lifecycle_transitions"], [])
+        self.assertTrue(
+            all(
+                transition["observed"]
+                for transition in payload["lifecycle_transitions"]
+            )
+        )
+        by_state = {
+            transition["state"]: transition
+            for transition in payload["lifecycle_transitions"]
+        }
+        self.assertEqual(
+            by_state["scheduled"]["record_type"], LOCK_ACQUIRED_RECORD_TYPE
+        )
+        self.assertEqual(by_state["reported"]["record_type"], WORKER_REPORT_RECORD_TYPE)
+        self.assertEqual(by_state["finalized"]["record_type"], RUN_RECORD_TYPE)
+
+    def test_derive_run_lifecycle_keeps_missing_transitions_visible(self) -> None:
+        progress = derive_run_lifecycle(
+            [
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="blocked",
+                    reported_at="2026-05-09T00:00:30+00:00",
+                ).to_record()
+            ]
+        )
+        payload = progress.to_json()
+        by_state = {
+            transition["state"]: transition
+            for transition in payload["lifecycle_transitions"]
+        }
+
+        self.assertEqual(progress.state, "reported")
+        self.assertTrue(by_state["reported"]["observed"])
+        self.assertFalse(by_state["scheduled"]["observed"])
+        self.assertFalse(by_state["finalized"]["observed"])
+        self.assertIn("scheduled", payload["missing_lifecycle_transitions"])
+        self.assertIn("finalized", payload["missing_lifecycle_transitions"])
 
     def test_latest_worker_report_uses_latest_matching_valid_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -5436,18 +5436,20 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[0]["command"], "python worker.py")
         self.assertEqual(payload[0]["pid_source"], "popen")
         self.assertEqual(payload[0]["pid_scope"], "configured_command_process")
+        self.assertEqual(payload[0]["lifecycle_state"], "reported")
         self.assertEqual(payload[0]["result_status"], "blocked")
         self.assertEqual(payload[1]["task_id"], "TASK-02")
         self.assertEqual(payload[1]["state"], "stale")
         self.assertEqual(payload[1]["process_state"], "missing")
         self.assertEqual(payload[1]["stale_reason"], "missing_process")
+        self.assertEqual(payload[1]["lifecycle_state"], "")
         text_output = text_stdout.getvalue()
         self.assertIn(
             "TASK-01\trun-1\trunning\tprocess=running"
             f"\tpid={os.getpid()}"
             "\tstarted=2026-05-09T00:00:00+00:00"
             f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-1.log'}"
-            "\tcommand=python worker.py\tresult=blocked\n",
+            "\tcommand=python worker.py\tlifecycle=reported\tresult=blocked\n",
             text_output,
         )
         self.assertIn(
@@ -5455,7 +5457,7 @@ class CliTests(unittest.TestCase):
             "\tpid=999999999"
             "\tstarted=2026-05-09T00:01:00+00:00"
             f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-2.log'}"
-            "\tcommand=python worker.py\tmissing_process\n",
+            "\tcommand=python worker.py\tlifecycle=-\tmissing_process\n",
             text_output,
         )
         self.assertIn("1 stale lock(s) found.", text_output)
@@ -5714,6 +5716,8 @@ class CliTests(unittest.TestCase):
             list_text_stderr = StringIO()
             inspect_stdout = StringIO()
             inspect_stderr = StringIO()
+            inspect_json_stdout = StringIO()
+            inspect_json_stderr = StringIO()
 
             with redirect_stdout(list_stdout), redirect_stderr(list_stderr):
                 list_exit = main(["runs", "list", "--repo", str(repo), "--json"])
@@ -5723,21 +5727,50 @@ class CliTests(unittest.TestCase):
                 )
             with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
                 inspect_exit = main(["runs", "inspect", "run-1", "--repo", str(repo)])
+            with (
+                redirect_stdout(inspect_json_stdout),
+                redirect_stderr(inspect_json_stderr),
+            ):
+                inspect_json_exit = main(
+                    ["runs", "inspect", "run-1", "--repo", str(repo), "--json"]
+                )
 
             list_payload = json.loads(list_stdout.getvalue())
+            inspect_payload = json.loads(inspect_json_stdout.getvalue())
 
         self.assertEqual(list_exit, 0)
         self.assertEqual(list_text_exit, 0)
         self.assertEqual(inspect_exit, 0)
+        self.assertEqual(inspect_json_exit, 0)
         self.assertEqual(list_stderr.getvalue(), "")
         self.assertEqual(list_text_stderr.getvalue(), "")
         self.assertEqual(inspect_stderr.getvalue(), "")
+        self.assertEqual(inspect_json_stderr.getvalue(), "")
         self.assertEqual([run["run_id"] for run in list_payload], ["run-2", "run-1"])
         self.assertEqual(list_payload[0]["status"], "blocked")
         self.assertEqual(list_payload[0]["record_type"], "worker_report")
+        self.assertEqual(list_payload[0]["lifecycle_state"], "reported")
         self.assertEqual(list_payload[1]["status"], "completed")
         self.assertEqual(list_payload[1]["record_type"], "run_result")
+        self.assertEqual(list_payload[1]["lifecycle_state"], "finalized")
         self.assertEqual(list_payload[1]["log"], str(runs_dir / "run-1.log"))
+        self.assertEqual(inspect_payload["lifecycle_state"], "finalized")
+        self.assertIn(
+            "started",
+            inspect_payload["missing_lifecycle_transitions"],
+        )
+        self.assertIn(
+            "session_observed",
+            inspect_payload["missing_lifecycle_transitions"],
+        )
+        self.assertEqual(
+            [
+                transition["state"]
+                for transition in inspect_payload["lifecycle_transitions"]
+                if transition["observed"]
+            ],
+            ["scheduled", "reported", "classified", "finalized"],
+        )
         self.assertEqual(
             list_text_stdout.getvalue(),
             "run-2\tTASK-02\tblocked\trecord=worker_report"
@@ -5757,6 +5790,8 @@ class CliTests(unittest.TestCase):
             "session: native-1 (native:stdout)\n"
             f"log: {runs_dir / 'run-1.log'}\n"
             "message: -\n"
+            "lifecycle: finalized\n"
+            "missing_lifecycle: started, session_observed, workspace_claimed\n"
             "records: 4\n"
             'worker_report: {"commit": "abc123", "message": "", '
             '"metadata": {"source": "worker"}, '

@@ -47,6 +47,15 @@ LIFECYCLE_RECORD_TYPES = frozenset(
 KNOWN_RECORD_TYPES = frozenset(
     {RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE, *LIFECYCLE_RECORD_TYPES}
 )
+LIFECYCLE_STATES = (
+    "scheduled",
+    "started",
+    "session_observed",
+    "workspace_claimed",
+    "reported",
+    "classified",
+    "finalized",
+)
 LIFECYCLE_PROTECTED_KEYS = frozenset(
     {"schema_version", "record_type", "occurred_at", "run_id"}
 )
@@ -288,6 +297,45 @@ class RunLifecycleEvent:
 
 
 @dataclasses.dataclass(frozen=True)
+class RunLifecycleTransition:
+    state: str
+    observed: bool
+    record_type: str = ""
+    occurred_at: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "observed": self.observed,
+            "record_type": self.record_type,
+            "occurred_at": self.occurred_at,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class RunLifecycleProgress:
+    state: str
+    transitions: tuple[RunLifecycleTransition, ...]
+
+    @property
+    def missing_states(self) -> tuple[str, ...]:
+        return tuple(
+            transition.state
+            for transition in self.transitions
+            if not transition.observed
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "lifecycle_state": self.state,
+            "lifecycle_transitions": [
+                transition.to_json() for transition in self.transitions
+            ],
+            "missing_lifecycle_transitions": list(self.missing_states),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class RunHistoryView:
     run_id: str
     task_id: str
@@ -303,6 +351,7 @@ class RunHistoryView:
     worker_report: dict[str, Any] | None
     record_count: int
     latest_record: dict[str, Any]
+    lifecycle_progress: RunLifecycleProgress
 
     @classmethod
     def from_records(
@@ -327,10 +376,11 @@ class RunHistoryView:
             worker_report=latest_worker_report_payload(valid_records),
             record_count=len(records),
             latest_record=latest,
+            lifecycle_progress=derive_run_lifecycle(records),
         )
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "task_id": self.task_id,
             "status": self.status,
@@ -346,6 +396,8 @@ class RunHistoryView:
             "record_count": self.record_count,
             "latest_record": self.latest_record,
         }
+        payload.update(self.lifecycle_progress.to_json())
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -488,6 +540,74 @@ def build_run_history_views(
         )
         for run_id in ordered
     ]
+
+
+def empty_run_lifecycle() -> RunLifecycleProgress:
+    return derive_run_lifecycle([])
+
+
+def derive_run_lifecycle(records: list[dict[str, Any]]) -> RunLifecycleProgress:
+    observed: dict[str, RunLifecycleTransition] = {}
+    for record in records:
+        for state in observed_lifecycle_states(record):
+            observed.setdefault(
+                state,
+                RunLifecycleTransition(
+                    state=state,
+                    observed=True,
+                    record_type=record_type_label(record),
+                    occurred_at=record_updated_at(record),
+                ),
+            )
+    transitions = tuple(
+        observed.get(state)
+        or RunLifecycleTransition(
+            state=state,
+            observed=False,
+        )
+        for state in LIFECYCLE_STATES
+    )
+    current_state = ""
+    for transition in transitions:
+        if transition.observed:
+            current_state = transition.state
+    return RunLifecycleProgress(state=current_state, transitions=transitions)
+
+
+def observed_lifecycle_states(record: dict[str, Any]) -> tuple[str, ...]:
+    record_type = record.get("record_type")
+    states: list[str] = []
+    if record_type in {
+        LOCK_ACQUIRED_RECORD_TYPE,
+        LOCK_RELEASED_RECORD_TYPE,
+        LOCK_EXPIRED_RECORD_TYPE,
+    } and lock_record_is_task_scoped(record):
+        states.append("scheduled")
+    if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
+        to_state = string_value(record.get("to_state"))
+        if to_state in LIFECYCLE_STATES:
+            states.append(to_state)
+    if record_type == WORKSPACE_CLAIM_RECORD_TYPE and workspace_claim_is_observed(
+        record
+    ):
+        states.append("workspace_claimed")
+    if WorkerReport.from_record(record) is not None:
+        states.append("reported")
+    if record_type in {None, RUN_RECORD_TYPE}:
+        if isinstance(record.get("worker_report"), dict):
+            states.append("reported")
+        states.extend(("classified", "finalized"))
+    return tuple(dict.fromkeys(states))
+
+
+def lock_record_is_task_scoped(record: dict[str, Any]) -> bool:
+    lock_kind = string_value(record.get("lock_kind"))
+    return lock_kind in {"", "task"}
+
+
+def workspace_claim_is_observed(record: dict[str, Any]) -> bool:
+    event_type = string_value(record.get("event_type"))
+    return event_type in {"", WORKSPACE_CLAIMED_EVENT_TYPE}
 
 
 def run_history_order_index(records: list[tuple[int, dict[str, Any]]]) -> int:
