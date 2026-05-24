@@ -105,7 +105,7 @@ LOCK_BACKEND_TYPES = ("directory", "command")
 LOCKS_COMMAND_KEYS = frozenset(
     {"acquire_command", "release_command", "status_command", "list_command"}
 )
-LOCKS_CONFIG_KEYS = frozenset({"type"}) | LOCKS_COMMAND_KEYS
+LOCKS_CONFIG_KEYS = frozenset({"type", "lease_seconds"}) | LOCKS_COMMAND_KEYS
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -356,6 +356,7 @@ class LockConfig:
     release_command: str | None = None
     status_command: str | None = None
     list_command: str | None = None
+    lease_seconds: int | None = None
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     @property
@@ -373,6 +374,7 @@ class LockConfig:
             "release_command": self.release_command,
             "status_command": self.status_command,
             "list_command": self.list_command,
+            "lease_seconds": self.lease_seconds,
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -792,6 +794,10 @@ def parse_locks(data: object) -> LockConfig:
         release_command=commands["release_command"],
         status_command=commands["status_command"],
         list_command=commands["list_command"],
+        lease_seconds=optional_positive_int(
+            table.get("lease_seconds"),
+            "locks.lease_seconds",
+        ),
         explicit_keys=explicit_keys,
     )
 
@@ -1089,6 +1095,15 @@ def nonempty_string_tuple(
 
 def positive_int(value: object, default: int, name: str) -> int:
     parsed = optional_int(value, default, name)
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def optional_positive_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    parsed = optional_int(value, 0, name)
     if parsed < 1:
         raise ValueError(f"{name} must be a positive integer")
     return parsed

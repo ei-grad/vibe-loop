@@ -41,7 +41,9 @@ from vibe_loop.generated_profiles import (
     runtime_task_source_report,
 )
 from vibe_loop.locks import (
+    LockBackendError,
     LockBusy,
+    LockFencingMismatch,
     LockManager,
     LockOwnerMismatch,
     build_lock_manager,
@@ -320,6 +322,16 @@ def build_parser() -> argparse.ArgumentParser:
     claim_workspace.add_argument("--branch", required=True)
     claim_workspace.add_argument("--worktree", type=Path, required=True)
     claim_workspace.add_argument("--base-commit", default="")
+    claim_workspace.add_argument("--fencing-token", default="")
+    heartbeat = worker_subparsers.add_parser(
+        "heartbeat",
+        help="Refresh the heartbeat timestamp on an active task lock",
+    )
+    add_repo_argument(heartbeat)
+    heartbeat.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    heartbeat.add_argument("--run-id", default="")
+    heartbeat.add_argument("--task-id", default="")
+    heartbeat.add_argument("--fencing-token", default="")
 
     workers = subparsers.add_parser("workers", help="List active worker runs")
     add_repo_argument(workers)
@@ -440,6 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     integration_release.add_argument("--run-id", default="")
     integration_release.add_argument("--task-id", default="")
+    integration_release.add_argument("--fencing-token", default="")
 
     report = subparsers.add_parser("report", help="Record a worker result report")
     add_repo_argument(report)
@@ -448,6 +461,7 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--status", required=True, choices=WORKER_REPORT_STATUSES)
     report.add_argument("--commit", default="")
     report.add_argument("--message", default="")
+    report.add_argument("--fencing-token", default="")
     report.add_argument(
         "--metadata-json",
         help="JSON object with additional structured report metadata",
@@ -693,6 +707,9 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_main_integration(args, config)
 
     if args.command == "report":
+        report_error = validate_report_fencing(args, config)
+        if report_error is not None:
+            return report_error
         report = WorkerReport(
             run_id=args.run_id,
             task_id=args.task_id,
@@ -1090,6 +1107,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 worktree=args.worktree,
                 repo=config.repo,
                 base_commit=args.base_commit,
+                fencing_token=fencing_token_from_args(args),
             )
         except WorkspaceClaimError as exc:
             run_store.append_lifecycle_event(
@@ -1127,6 +1145,54 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 "worker workspace claimed "
                 f"task={task_id} run={run_id} branch={claim.branch} "
                 f"worktree={claim.worktree}"
+            )
+        return 0
+
+    if args.worker_command == "heartbeat":
+        run_id, task_id = worker_identity_from_args(args)
+        if not run_id or not task_id:
+            print(
+                "worker heartbeat requires --run-id and --task-id "
+                "or VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID",
+                file=sys.stderr,
+            )
+            return 2
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
+        try:
+            task_lock = manager.heartbeat(
+                task_id=task_id,
+                run_id=run_id,
+                fencing_token=fencing_token_from_args(args),
+            )
+        except LockOwnerMismatch as exc:
+            return print_lock_mutation_refused(args, "owner_mismatch", exc.metadata)
+        except LockFencingMismatch as exc:
+            return print_lock_mutation_refused(
+                args,
+                "fencing_token_mismatch",
+                exc.metadata,
+                expected_token=exc.expected_token,
+                actual_token=exc.actual_token,
+            )
+        except LockBackendError as exc:
+            return print_lock_mutation_refused(args, "lock_unavailable", {}, str(exc))
+        payload = {
+            "heartbeat": True,
+            "task_id": task_id,
+            "run_id": run_id,
+            "heartbeat_at": task_lock.metadata.get("heartbeat_at"),
+            "fencing_token": task_lock.metadata.get("fencing_token"),
+        }
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                "worker heartbeat recorded "
+                f"task={task_id} run={run_id} at={payload['heartbeat_at']}"
             )
         return 0
 
@@ -1172,7 +1238,11 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
     if args.main_integration_command == "release":
         before_status = manager.main_integration_status()
         try:
-            released = manager.release_main_integration(task_id=task_id, run_id=run_id)
+            released = manager.release_main_integration(
+                task_id=task_id,
+                run_id=run_id,
+                fencing_token=explicit_fencing_token_from_args(args),
+            )
         except LockOwnerMismatch as exc:
             status = manager.main_integration_status()
             payload = {
@@ -1188,6 +1258,23 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
                     "main-integration release refused: owner_mismatch "
                     f"holder_run={status.to_json()['run_id']} "
                     f"holder_task={status.to_json()['owner_task_id']}",
+                    file=sys.stderr,
+                )
+            return 1
+        except LockFencingMismatch as exc:
+            status = manager.main_integration_status()
+            payload = {
+                "released": False,
+                "error": "fencing_token_mismatch",
+                "expected_token": exc.expected_token,
+                "actual_token": exc.actual_token,
+                "status": status.to_json(),
+            }
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    "main-integration release refused: fencing_token_mismatch",
                     file=sys.stderr,
                 )
             return 1
@@ -1728,6 +1815,71 @@ def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:
     run_id = args.run_id or os.environ.get("VIBE_LOOP_RUN_ID", "")
     task_id = args.task_id or os.environ.get("VIBE_LOOP_TASK_ID", "")
     return run_id, task_id
+
+
+def fencing_token_from_args(args: argparse.Namespace) -> str:
+    return optional_string(getattr(args, "fencing_token", "")) or os.environ.get(
+        "VIBE_LOOP_FENCING_TOKEN", ""
+    )
+
+
+def explicit_fencing_token_from_args(args: argparse.Namespace) -> str:
+    return optional_string(getattr(args, "fencing_token", "")) or ""
+
+
+def validate_report_fencing(args: argparse.Namespace, config) -> int | None:
+    fencing_token = fencing_token_from_args(args)
+    if not fencing_token:
+        return None
+    manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+    )
+    try:
+        manager.validate_owner(
+            task_id=args.task_id,
+            run_id=args.run_id,
+            fencing_token=fencing_token,
+        )
+    except LockOwnerMismatch:
+        print("worker report refused: owner_mismatch", file=sys.stderr)
+        return 1
+    except LockFencingMismatch:
+        print("worker report refused: fencing_token_mismatch", file=sys.stderr)
+        return 1
+    except LockBackendError as exc:
+        print(f"worker report refused: {exc}", file=sys.stderr)
+        return 1
+    return None
+
+
+def print_lock_mutation_refused(
+    args: argparse.Namespace,
+    error: str,
+    metadata: dict[str, object],
+    message: str = "",
+    *,
+    expected_token: str = "",
+    actual_token: str = "",
+) -> int:
+    payload: dict[str, object] = {
+        "heartbeat": False,
+        "updated": False,
+        "error": error,
+        "metadata": metadata,
+    }
+    if message:
+        payload["message"] = message
+    if expected_token or actual_token:
+        payload["expected_token"] = expected_token
+        payload["actual_token"] = actual_token
+    if json_requested(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        detail = f": {message}" if message else ""
+        print(f"lock update refused: {error}{detail}", file=sys.stderr)
+    return 1
 
 
 def acquire_main_integration_command(

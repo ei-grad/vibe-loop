@@ -36,7 +36,13 @@ from vibe_loop.generated_discovery import (
     redact_evidence_text,
     redact_manifest_text,
 )
-from vibe_loop.locks import LockBusy, LockManager, TaskLock, build_lock_manager
+from vibe_loop.locks import (
+    LockBusy,
+    LockManager,
+    TaskLock,
+    build_lock_manager,
+    fencing_token_value,
+)
 from vibe_loop.retry import (
     is_transient_stderr,
     retry_subprocess_run,
@@ -92,6 +98,7 @@ environment variables identify this run:
 - VIBE_LOOP_RUN_ID - unique run identifier
 - VIBE_LOOP_TASK_ID - task being worked on
 - VIBE_LOOP_LOG - path to the run log file
+- VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
 
 ### Workspace Claim
 
@@ -524,6 +531,9 @@ class VibeRunner:
             run_id,
             active_state,
         )
+        fencing_token = fencing_token_value(task_lock.metadata.get("fencing_token"))
+        if fencing_token:
+            command_env["VIBE_LOOP_FENCING_TOKEN"] = fencing_token
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.lock_event(
                 LOCK_ACQUIRED_RECORD_TYPE,

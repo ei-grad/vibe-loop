@@ -450,6 +450,9 @@ cooldown_seconds = 30.0
 
 [locks]
 type = "directory"
+# Optional. When set, locks become stale after this many seconds without a
+# heartbeat update.
+# lease_seconds = 300
 
 [planning_analytics]
 schedule_policy = "current-runner-parity"
@@ -505,6 +508,11 @@ release_command = "my-lock-tool release --json"
 status_command = "my-lock-tool status --json"
 list_command = "my-lock-tool list --json"
 ```
+
+When `locks.lease_seconds` is set, acquired locks include `lease_seconds`,
+`heartbeat_at`, and a fencing token. Workers can refresh the lease with
+`vibe-loop worker heartbeat`; mutating lock operations that receive a fencing
+token reject stale holders when the current lock generation differs.
 
 Lock commands run from the repository root and receive
 `VIBE_LOOP_LOCK_OPERATION`, `VIBE_LOOP_LOCK_TASK_ID`,
@@ -855,12 +863,13 @@ Runner state is intentionally untracked:
 ```
 
 Active task locks store the worker command `pid`, `task_id`, `run_id`, log path,
-start time, base `main` revision, host, and resolved command. `vibe-loop
-workers` reconstructs the active view from those lock files plus `runs.jsonl`,
-then marks same-host locks with missing worker processes, missing worker PIDs,
-or incomplete metadata as stale without reading raw logs. The PID is the
-immediate configured command process started by the runner; deeper process
-identity checks are left to the later watchdog work.
+start time, base `main` revision, host, resolved command, and optional lease
+metadata. `vibe-loop workers` reconstructs the active view from those lock
+files plus `runs.jsonl`, then marks same-host locks with missing worker
+processes, missing worker PIDs, expired leases, or incomplete metadata as stale
+without reading raw logs. The PID is the immediate configured command process
+started by the runner; deeper process identity checks are left to the later
+watchdog work.
 
 When a worker claims its workspace, the active task lock also stores a
 `workspace` object with the branch, worktree path, base commit, current HEAD,

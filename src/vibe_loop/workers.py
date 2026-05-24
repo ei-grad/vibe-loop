@@ -14,8 +14,13 @@ from typing import Any
 from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
     LockBackendError,
+    LockFencingMismatch,
     LockManager,
     TaskLock,
+    fencing_token_value,
+    lock_lease_expired,
+    numeric_value,
+    validate_lock_fencing_token,
 )
 from vibe_loop.runs import (
     RUN_RECORD_TYPE,
@@ -123,6 +128,9 @@ class ActiveRunState:
     conflict_domains_known: bool = False
     restart_count: int = 0
     max_restarts: int = 0
+    lease_seconds: int | float | None = None
+    heartbeat_at: str = ""
+    fencing_token: str = ""
     worker_pid: int | None = None
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
@@ -197,6 +205,9 @@ class ActiveRunState:
             ),
             restart_count=optional_int(metadata.get("restart_count")) or 0,
             max_restarts=optional_int(metadata.get("max_restarts")) or 0,
+            lease_seconds=numeric_value(metadata.get("lease_seconds")),
+            heartbeat_at=optional_string(metadata.get("heartbeat_at")) or "",
+            fencing_token=fencing_token_value(metadata.get("fencing_token")),
             worker_pid=worker_pid,
             pid_source=pid_source,
             pid_scope=(
@@ -235,6 +246,12 @@ class ActiveRunState:
             "restart_count": self.restart_count,
             "max_restarts": self.max_restarts,
         }
+        if self.lease_seconds is not None:
+            metadata["lease_seconds"] = self.lease_seconds
+        if self.heartbeat_at:
+            metadata["heartbeat_at"] = self.heartbeat_at
+        if self.fencing_token:
+            metadata["fencing_token"] = self.fencing_token
         if self.workspace is not None:
             metadata["workspace"] = self.workspace.to_json()
         return metadata
@@ -351,6 +368,9 @@ class WorkerView:
             "conflict_domains_known": self.active.conflict_domains_known,
             "restart_count": self.active.restart_count,
             "max_restarts": self.active.max_restarts,
+            "lease_seconds": self.active.lease_seconds,
+            "heartbeat_at": self.active.heartbeat_at,
+            "fencing_token": self.active.fencing_token,
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
             "workspace": (
                 self.active.workspace.to_json()
@@ -396,13 +416,19 @@ def claim_worker_workspace(
     worktree: Path,
     repo: Path,
     base_commit: str = "",
+    fencing_token: str | None = None,
 ) -> WorkspaceClaim:
     if not branch:
         raise WorkspaceClaimError(
             "missing_branch",
             "workspace claim requires a branch",
         )
-    lock = active_task_lock_for_claim(lock_manager, task_id=task_id, run_id=run_id)
+    lock = active_task_lock_for_claim(
+        lock_manager,
+        task_id=task_id,
+        run_id=run_id,
+        fencing_token=fencing_token,
+    )
     worktree_path = resolve_claim_worktree(repo, worktree)
     claim = inspect_workspace_claim(
         task_id=task_id,
@@ -425,6 +451,7 @@ def active_task_lock_for_claim(
     *,
     task_id: str,
     run_id: str,
+    fencing_token: str | None = None,
 ) -> TaskLock:
     matching_task: list[dict[str, object]] = []
     for metadata in lock_manager.list_locks():
@@ -435,6 +462,23 @@ def active_task_lock_for_claim(
             continue
         path = optional_path(metadata.get("path"))
         if path is not None:
+            try:
+                if fencing_token:
+                    validate_lock_fencing_token(
+                        {"fencing_token": fencing_token},
+                        metadata,
+                        path=path,
+                    )
+            except LockFencingMismatch as exc:
+                raise WorkspaceClaimError(
+                    "fencing_token_mismatch",
+                    "workspace claim refused: fencing token mismatch",
+                    details={
+                        "expected_token": exc.expected_token,
+                        "actual_token": exc.actual_token,
+                        "lock_path": str(exc.path),
+                    },
+                ) from exc
             return TaskLock(task_id=task_id, path=path, metadata=metadata)
     if matching_task:
         raise WorkspaceClaimError(
@@ -993,6 +1037,9 @@ def build_worker_views(
         if not active.run_id:
             state = "stale"
             stale_reason = "missing_run_id"
+        elif lock_lease_expired(active.to_lock_metadata()):
+            state = "stale"
+            stale_reason = "lease_expired"
         elif result_status and result_record_type != WORKER_REPORT_RECORD_TYPE:
             state = "stale"
             stale_reason = "result_recorded"

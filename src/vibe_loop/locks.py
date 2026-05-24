@@ -48,6 +48,25 @@ class LockOwnerMismatch(RuntimeError):
         )
 
 
+class LockFencingMismatch(RuntimeError):
+    def __init__(
+        self,
+        path: Path,
+        metadata: dict[str, object],
+        *,
+        expected_token: str,
+        actual_token: str,
+    ):
+        self.path = path
+        self.metadata = metadata
+        self.expected_token = expected_token
+        self.actual_token = actual_token
+        super().__init__(
+            f"lock fencing token mismatch: {path} "
+            f"expected={expected_token} actual={actual_token}"
+        )
+
+
 class LockBackendError(RuntimeError):
     pass
 
@@ -82,6 +101,9 @@ class IntegrationLockStatus:
             "pid_source": string_value(self.metadata.get("pid_source")),
             "host": string_value(self.metadata.get("host")),
             "started_at": string_value(self.metadata.get("started_at")),
+            "lease_seconds": numeric_value(self.metadata.get("lease_seconds")),
+            "heartbeat_at": string_value(self.metadata.get("heartbeat_at")),
+            "fencing_token": fencing_token_value(self.metadata.get("fencing_token")),
             "metadata": self.metadata,
         }
 
@@ -133,10 +155,87 @@ class LockManager:
         return self.backend.acquire(task_id, run_id, metadata=metadata)
 
     def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
-        return self.backend.update(task_lock, metadata)
+        current = self.current_lock(task_lock.task_id)
+        validate_lock_fencing_token(
+            task_lock.metadata,
+            current.metadata,
+            path=current.path,
+        )
+        return self.backend.update(
+            current,
+            preserve_runtime_lock_fields(metadata, current.metadata),
+        )
 
     def release(self, task_lock: TaskLock) -> None:
-        self.backend.release(task_lock)
+        current = self.backend.status(task_lock.task_id)
+        if current is None:
+            return
+        current_path = path_from_metadata(
+            current,
+            self.backend.path_for(task_lock.task_id),
+        )
+        validate_lock_fencing_token(task_lock.metadata, current, path=current_path)
+        self.backend.release(
+            TaskLock(
+                task_id=task_lock.task_id,
+                path=current_path,
+                metadata=current,
+            )
+        )
+
+    def status(self, task_id: str) -> dict[str, object] | None:
+        return self.backend.status(task_id)
+
+    def current_lock(self, task_id: str) -> TaskLock:
+        metadata = self.backend.status(task_id)
+        path = self.backend.path_for(task_id)
+        if metadata is None:
+            raise LockBackendError(f"active lock not found: {path}")
+        return TaskLock(
+            task_id=task_id,
+            path=path_from_metadata(metadata, path),
+            metadata=metadata,
+        )
+
+    def validate_owner(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        fencing_token: str | None = None,
+    ) -> TaskLock:
+        current = self.current_lock(task_id)
+        if string_value(current.metadata.get("run_id")) != run_id:
+            raise LockOwnerMismatch(
+                current.path,
+                current.metadata,
+                run_id=run_id,
+                task_id=task_id,
+            )
+        if fencing_token:
+            validate_lock_fencing_token(
+                {"fencing_token": fencing_token},
+                current.metadata,
+                path=current.path,
+            )
+        return current
+
+    def heartbeat(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        fencing_token: str | None = None,
+        heartbeat_at: str | None = None,
+    ) -> TaskLock:
+        current = self.validate_owner(
+            task_id=task_id,
+            run_id=run_id,
+            fencing_token=fencing_token,
+        )
+        metadata = dict(current.metadata)
+        metadata["heartbeat_at"] = heartbeat_at or utc_now_iso()
+        return self.update(current, metadata)
 
     def is_locked(self, task_id: str) -> bool:
         return self.backend.status(task_id) is not None
@@ -215,7 +314,13 @@ class LockManager:
                 status=self.main_integration_status(),
             )
 
-    def release_main_integration(self, *, task_id: str, run_id: str) -> bool:
+    def release_main_integration(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        fencing_token: str | None = None,
+    ) -> bool:
         status = self.main_integration_status()
         if not status.locked:
             return False
@@ -227,6 +332,12 @@ class LockManager:
                 status.metadata,
                 run_id=run_id,
                 task_id=task_id,
+            )
+        if fencing_token:
+            validate_lock_fencing_token(
+                {"fencing_token": fencing_token},
+                status.metadata,
+                path=status.path,
             )
         self.release(
             TaskLock(
@@ -295,8 +406,9 @@ class LockManager:
 
 
 class DirectoryLockBackend:
-    def __init__(self, lock_root: Path):
+    def __init__(self, lock_root: Path, lease_seconds: int | None = None):
         self.lock_root = lock_root
+        self.lease_seconds = lease_seconds
 
     def path_for(self, task_id: str) -> Path:
         return self.lock_root / f"{safe_name(task_id)}.lock"
@@ -309,7 +421,11 @@ class DirectoryLockBackend:
     ) -> TaskLock:
         self.lock_root.mkdir(parents=True, exist_ok=True)
         path = self.path_for(task_id)
-        lock_metadata = default_lock_metadata(task_id, run_id)
+        lock_metadata = default_lock_metadata(
+            task_id,
+            run_id,
+            lease_seconds=self.lease_seconds,
+        )
         if metadata is not None:
             lock_metadata.update(metadata)
         try:
@@ -317,6 +433,10 @@ class DirectoryLockBackend:
         except FileExistsError as exc:
             raise LockBusy(path, read_metadata(path)) from exc
         try:
+            lock_metadata["fencing_token"] = next_fencing_token(
+                self.lock_root,
+                task_id,
+            )
             write_metadata(path, lock_metadata)
         except OSError:
             shutil.rmtree(path)
@@ -368,6 +488,7 @@ class CommandLockBackend:
         release_command: str,
         status_command: str,
         list_command: str,
+        lease_seconds: int | None = None,
     ):
         self.repo = repo
         self.lock_root = lock_root
@@ -375,6 +496,7 @@ class CommandLockBackend:
         self.release_command = release_command
         self.status_command = status_command
         self.list_command = list_command
+        self.lease_seconds = lease_seconds
 
     def path_for(self, task_id: str) -> Path:
         return self.lock_root / f"{safe_name(task_id)}.lock"
@@ -385,9 +507,14 @@ class CommandLockBackend:
         run_id: str,
         metadata: dict[str, object] | None = None,
     ) -> TaskLock:
-        lock_metadata = default_lock_metadata(task_id, run_id)
+        lock_metadata = default_lock_metadata(
+            task_id,
+            run_id,
+            lease_seconds=self.lease_seconds,
+        )
         if metadata is not None:
             lock_metadata.update(metadata)
+        lock_metadata["fencing_token"] = next_fencing_token(self.lock_root, task_id)
         payload = self._run_json_command(
             "locks.acquire_command",
             self.acquire_command,
@@ -686,19 +813,116 @@ def build_lock_manager(repo: Path, lock_root: Path, lock_config: object) -> Lock
                 release_command=str(getattr(lock_config, "release_command")),
                 status_command=str(getattr(lock_config, "status_command")),
                 list_command=str(getattr(lock_config, "list_command")),
+                lease_seconds=getattr(lock_config, "lease_seconds", None),
             ),
         )
-    return LockManager(lock_root)
+    return LockManager(
+        lock_root,
+        backend=DirectoryLockBackend(
+            lock_root,
+            lease_seconds=getattr(lock_config, "lease_seconds", None),
+        ),
+    )
 
 
-def default_lock_metadata(task_id: str, run_id: str) -> dict[str, object]:
-    return {
+def default_lock_metadata(
+    task_id: str,
+    run_id: str,
+    *,
+    lease_seconds: int | None = None,
+) -> dict[str, object]:
+    started_at = datetime.now(UTC).isoformat()
+    metadata: dict[str, object] = {
         "task_id": task_id,
         "run_id": run_id,
         "pid": os.getpid(),
         "host": socket.gethostname(),
-        "started_at": datetime.now(UTC).isoformat(),
+        "started_at": started_at,
     }
+    if lease_seconds is not None:
+        metadata["lease_seconds"] = lease_seconds
+        metadata["heartbeat_at"] = started_at
+    return metadata
+
+
+def utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+def preserve_runtime_lock_fields(
+    metadata: dict[str, object],
+    current: dict[str, object],
+) -> dict[str, object]:
+    updated = dict(metadata)
+    for key in ("fencing_token", "lease_seconds", "heartbeat_at"):
+        if key not in updated and key in current:
+            updated[key] = current[key]
+    return updated
+
+
+def next_fencing_token(lock_root: Path, task_id: str) -> str:
+    token_root = lock_root / ".fencing-tokens"
+    token_root.mkdir(parents=True, exist_ok=True)
+    token_path = token_root / f"{safe_name(task_id)}.token"
+    current = 0
+    try:
+        current = int(token_path.read_text(encoding="utf-8").strip() or "0")
+    except (OSError, ValueError):
+        current = 0
+    next_token = current + 1
+    token_path.write_text(f"{next_token}\n", encoding="utf-8")
+    return str(next_token)
+
+
+def validate_lock_fencing_token(
+    expected: dict[str, object],
+    current: dict[str, object],
+    *,
+    path: Path,
+) -> None:
+    actual_token = fencing_token_value(current.get("fencing_token"))
+    if not actual_token:
+        return
+    expected_token = fencing_token_value(expected.get("fencing_token"))
+    if expected_token != actual_token:
+        raise LockFencingMismatch(
+            path,
+            current,
+            expected_token=expected_token,
+            actual_token=actual_token,
+        )
+
+
+def lock_lease_expired(
+    metadata: dict[str, object],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    lease_seconds = numeric_value(metadata.get("lease_seconds"))
+    if lease_seconds is None or lease_seconds <= 0:
+        return False
+    heartbeat = string_value(metadata.get("heartbeat_at")) or string_value(
+        metadata.get("started_at")
+    )
+    heartbeat_at = parse_iso_datetime(heartbeat)
+    if heartbeat_at is None:
+        return False
+    current = now if now is not None else datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return current.timestamp() > heartbeat_at.timestamp() + float(lease_seconds)
+
+
+def parse_iso_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def command_payload_metadata(
@@ -777,6 +1001,9 @@ def classify_integration_lock(
         state = "stale"
         process_state = "unknown_pid" if pid is None else "unknown"
         stale_reason = "missing_run_id"
+    elif lock_lease_expired(metadata):
+        state = "stale"
+        stale_reason = "lease_expired"
     elif host and host != local_host:
         state = "unknown"
         process_state = "foreign_host"
@@ -820,6 +1047,22 @@ def pid_exists(pid: int) -> bool:
 
 def string_value(value: object) -> str:
     return value if isinstance(value, str) else ""
+
+
+def fencing_token_value(value: object) -> str:
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, str)):
+        return str(value)
+    return ""
+
+
+def numeric_value(value: object) -> int | float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
 
 
 def int_value(value: object) -> int | None:

@@ -243,7 +243,21 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.locks.type, "directory")
         self.assertFalse(config.locks.command_backend)
+        self.assertIsNone(config.locks.lease_seconds)
         self.assertEqual(config.locks.explicit_keys, frozenset())
+
+    def test_lock_config_parses_lease_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[locks]\nlease_seconds = 30\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.locks.lease_seconds, 30)
+        self.assertEqual(config.locks.to_json()["lease_seconds"], 30)
 
     def test_lock_config_parses_command_backend(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -279,6 +293,8 @@ class ConfigTests(unittest.TestCase):
     def test_lock_config_rejects_invalid_command_backend(self) -> None:
         cases = [
             ('type = "sqlite"\n', "locks.type"),
+            ("lease_seconds = 0\n", "locks.lease_seconds"),
+            ('lease_seconds = "soon"\n', "locks.lease_seconds"),
             (
                 'type = "command"\n'
                 'acquire_command = "locks acquire"\n'

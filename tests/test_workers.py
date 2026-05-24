@@ -12,6 +12,7 @@ from vibe_loop.locks import (
     COMMAND_LOCK_MAX_OUTPUT_BYTES,
     LockBackendError,
     LockBusy,
+    LockFencingMismatch,
     LockManager,
     build_lock_manager,
 )
@@ -136,6 +137,144 @@ class WorkerStateTests(unittest.TestCase):
 
             self.assertFalse(manager.is_locked("TASK-01"))
             self.assertEqual(manager.list_locks(), [])
+
+    def test_command_lock_backend_fencing_rejects_stale_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            adapter = repo / "lock_adapter.py"
+            write_command_lock_adapter(adapter)
+            command = f"{sys.executable} {json.dumps(str(adapter))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+            first = manager.acquire("TASK-01", "run-1")
+            first_token = first.metadata["fencing_token"]
+            manager.release(first)
+            second = manager.acquire("TASK-01", "run-2")
+            second_token = second.metadata["fencing_token"]
+
+            with self.assertRaises(LockFencingMismatch):
+                manager.update(first, {"task_id": "TASK-01", "run_id": "run-1"})
+            with self.assertRaises(LockFencingMismatch):
+                manager.release(first)
+
+            still_locked = manager.is_locked("TASK-01")
+            manager.release(second)
+
+        self.assertNotEqual(first_token, second_token)
+        self.assertTrue(still_locked)
+
+    def test_directory_lock_acquire_cleans_up_when_fencing_token_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            lock_root.mkdir(parents=True)
+            (lock_root / ".fencing-tokens").write_text("not a dir\n", encoding="utf-8")
+            manager = LockManager(lock_root)
+
+            with self.assertRaises(OSError):
+                manager.acquire("TASK-01", "run-1")
+
+            lock_path = manager.backend.path_for("TASK-01")
+            lock_exists = lock_path.exists()
+
+        self.assertFalse(lock_exists)
+
+    def test_directory_lock_preserves_fencing_token_on_update(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            task_lock = manager.acquire("TASK-01", "run-1")
+            token = task_lock.metadata["fencing_token"]
+
+            updated_lock = manager.update(
+                task_lock,
+                {"task_id": "TASK-01", "run_id": "run-1", "worker_pid": 123},
+            )
+
+        self.assertEqual(updated_lock.metadata["worker_pid"], 123)
+        self.assertEqual(updated_lock.metadata["fencing_token"], token)
+
+    def test_directory_lock_fencing_rejects_stale_update_and_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            first = manager.acquire("TASK-01", "run-1")
+            first_token = first.metadata["fencing_token"]
+            manager.release(first)
+            second = manager.acquire("TASK-01", "run-2")
+            second_token = second.metadata["fencing_token"]
+
+            with self.assertRaises(LockFencingMismatch):
+                manager.update(first, {"task_id": "TASK-01", "run_id": "run-1"})
+            with self.assertRaises(LockFencingMismatch):
+                manager.release(first)
+
+            still_locked = manager.is_locked("TASK-01")
+            manager.release(second)
+
+        self.assertNotEqual(first_token, second_token)
+        self.assertTrue(still_locked)
+
+    def test_expired_lease_marks_worker_stale_and_heartbeat_refreshes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(lease_seconds=60),
+            )
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            task_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata=state.to_lock_metadata(),
+            )
+            expired_metadata = dict(task_lock.metadata)
+            expired_metadata["heartbeat_at"] = "2000-01-01T00:00:00+00:00"
+            task_lock = manager.update(task_lock, expired_metadata)
+
+            expired = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+            manager.heartbeat(
+                task_id="TASK-01",
+                run_id="run-1",
+                fencing_token=str(task_lock.metadata["fencing_token"]),
+            )
+            refreshed = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+        self.assertEqual(expired[0].state, "stale")
+        self.assertEqual(expired[0].process_state, "running")
+        self.assertEqual(expired[0].stale_reason, "lease_expired")
+        self.assertEqual(refreshed[0].state, "running")
+        self.assertIsNone(refreshed[0].stale_reason)
 
     def test_command_lock_backend_handles_main_integration_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
