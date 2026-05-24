@@ -354,7 +354,7 @@ def apply_seed_workspace_state(target: Path, seed: dict[str, object]) -> None:
 def write_seeded_file(worktree: Path, relative_path: str, content: str) -> None:
     destination = worktree / relative_path
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(content, encoding="utf-8")
+    destination.write_text(content, encoding="utf-8", newline="\n")
 
 
 def workspace_seed_root(target: Path) -> Path:

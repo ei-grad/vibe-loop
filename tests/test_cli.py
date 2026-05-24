@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -1689,20 +1690,29 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
-            lock_acquire_command = (
-                f'{sys.executable} -c "import json; '
-                "print(json.dumps({'acquired': False, 'metadata': {}}))\""
+            lock_acquire_command = shell_command(
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps({'acquired': False, 'metadata': {}}))",
+                "PRIVATE_VALUE",
             )
-            lock_release_command = (
-                f'{sys.executable} -c "import json; '
-                "print(json.dumps({'released': True}))\""
+            lock_release_command = shell_command(
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps({'released': True}))",
+                "PRIVATE_VALUE",
             )
-            lock_status_command = (
-                f'{sys.executable} -c "import json; '
-                "print(json.dumps({'locked': False}))\""
+            lock_status_command = shell_command(
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps({'locked': False}))",
+                "PRIVATE_VALUE",
             )
-            lock_list_command = (
-                f'{sys.executable} -c "import json; print(json.dumps([]))"'
+            lock_list_command = shell_command(
+                sys.executable,
+                "-c",
+                "import json; print(json.dumps([]))",
+                "PRIVATE_VALUE",
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
@@ -1711,10 +1721,10 @@ class CliTests(unittest.TestCase):
                 'probe = "PRIVATE_VALUE tracker probe"\n'
                 "[locks]\n"
                 'type = "command"\n'
-                f"acquire_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_acquire_command)}\n"
-                f"release_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_release_command)}\n"
-                f"status_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_status_command)}\n"
-                f"list_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_list_command)}\n"
+                f"acquire_command = {json.dumps(lock_acquire_command)}\n"
+                f"release_command = {json.dumps(lock_release_command)}\n"
+                f"status_command = {json.dumps(lock_status_command)}\n"
+                f"list_command = {json.dumps(lock_list_command)}\n"
                 "[completion]\n"
                 'commands = ["PRIVATE_VALUE completion"]\n',
                 encoding="utf-8",
@@ -5216,7 +5226,7 @@ class CliTests(unittest.TestCase):
                 ")\n",
                 encoding="utf-8",
             )
-            command = f"CLAUDE_HOME=.claude {sys.executable} worker.py {{prompt}}"
+            command = f"{shell_command(sys.executable, 'worker.py')} {{prompt}}"
             (repo / ".vibe-loop.toml").write_text(
                 '[agent]\nkind = "claude"\ncommand = ' + json.dumps(command) + "\n",
                 encoding="utf-8",
@@ -6860,6 +6870,12 @@ def write_python_executable(path: Path, body: str) -> None:
         cmd.write_text(
             f'@"{sys.executable}" "%~dp0{path.name}" %*\r\n', encoding="utf-8"
         )
+
+
+def shell_command(*args: str) -> str:
+    if sys.platform == "win32":
+        return subprocess.list2cmdline(list(args))
+    return shlex.join(args)
 
 
 def init_planning_repo(repo: Path, plan_text: str) -> None:

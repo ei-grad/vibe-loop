@@ -91,7 +91,7 @@ class MarkdownPlanTests(unittest.TestCase):
 
             source = build_task_source(repo, TaskSourceConfig())
 
-            expected = f"{repo / 'planning' / 'backlog.md'}:Demo"
+            expected = f"{(repo / 'planning' / 'backlog.md').as_posix()}:Demo"
             self.assertEqual(source.list_tasks()[0].source, expected)
 
     def test_explicit_plan_path_wins_over_discovery(self) -> None:
