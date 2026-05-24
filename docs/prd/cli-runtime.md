@@ -30,8 +30,8 @@ Acceptance must cover `main_branch`, `state_dir`, `agent`, `task_source`,
 tracking; safe reporting that does not print raw command strings where those may
 include local sensitive details; and validation errors for unsupported values.
 
-Related implementation IDs: `AGENT-02`, `AGENT-04`, `DISC-01`, `DISC-04`,
-`GANTT-01`, `GANTT-05`.
+Related implementation IDs: `AGENT-02`, `AGENT-04`, `CORE-03`, `DISC-01`,
+`DISC-04`, `GANTT-01`, `GANTT-05`.
 
 ## PRD-CLI-003 Completion Checks
 
@@ -82,7 +82,8 @@ interpolation, shell quoting, command-source diagnostics, prompt-dialect/source
 diagnostics, prompt-required diagnostics for traceable tasks, and clear failure
 when no supported agent command or required custom prompt syntax is available.
 
-Related implementation IDs: `AGENT-01`, `AGENT-02`, `AGENT-04`.
+Related implementation IDs: `AGENT-01`, `AGENT-02`, `AGENT-04`, `AGENT-05`,
+`AGENT-06`.
 
 ## PRD-CLI-005 Output And Logging Contract
 
@@ -110,8 +111,8 @@ Acceptance must cover `.vibe-loop/locks`, `.vibe-loop/runs`,
 artifacts, eval output directories, state-dir configurability, and no accidental
 mutation of repository docs from read-only commands.
 
-Related implementation IDs: `CORE-01`, `DISC-02`, `DISC-04`, `GANTT-06`,
-`EVAL-03`.
+Related implementation IDs: `CORE-01`, `CORE-03`, `DISC-02`, `DISC-04`,
+`GANTT-06`, `EVAL-03`.
 
 ## PRD-CLI-007 Permission And Isolation Policy
 

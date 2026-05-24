@@ -74,7 +74,7 @@ Acceptance must cover size limits, secret-like path exclusions, deterministic
 prompt construction, worker log visibility, prompt dialect compatibility, and
 behavior when linked spec context is missing or stale.
 
-Related implementation IDs: `PAR-03`, `PAR-07`, `SDD-04`.
+Related implementation IDs: `AGENT-06`, `PAR-03`, `PAR-07`, `SDD-04`.
 
 ## PRD-SDE-006 Completion Evidence From Specs To Code
 

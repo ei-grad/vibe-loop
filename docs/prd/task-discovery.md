@@ -15,7 +15,8 @@ classification, dependency readiness, JSON output, duplicate ID detection,
 invalid dependency diagnostics, and backward compatibility for sources that omit
 optional fields.
 
-Related implementation IDs: `CORE-02`, `DISC-03`, `PAR-08`, `GANTT-01`.
+Related implementation IDs: `CORE-02`, `DISC-03`, `DISC-10`, `PAR-08`,
+`GANTT-01`.
 
 ## PRD-TSK-002 Markdown Task Sources
 
@@ -90,4 +91,5 @@ Acceptance must cover default runnable statuses `Active`, `Next`, and
 order; lock exclusion; agent-assisted selection validation; and conflict-domain
 filtering when parallel scheduling is active.
 
-Related implementation IDs: `CORE-02`, `PAR-01`, `PAR-07`, `PAR-08`.
+Related implementation IDs: `CORE-02`, `DISC-10`, `PAR-01`, `PAR-07`,
+`PAR-08`.
