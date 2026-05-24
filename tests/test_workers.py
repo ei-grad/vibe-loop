@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from vibe_loop.locks import LockManager
+from vibe_loop.config import LockConfig
+from vibe_loop.locks import (
+    COMMAND_LOCK_MAX_OUTPUT_BYTES,
+    LockBackendError,
+    LockBusy,
+    LockManager,
+    build_lock_manager,
+)
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     RunLifecycleEvent,
@@ -84,6 +93,284 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(workspace.worktree, repo)
         self.assertTrue(workspace.dirty)
         self.assertEqual(workspace.dirty_summary, (" M src/example.py",))
+
+    def test_command_lock_backend_delegates_lock_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            adapter = repo / "lock_adapter.py"
+            write_command_lock_adapter(adapter)
+            command = f"{sys.executable} {json.dumps(str(adapter))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            task_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata={"record_type": "active_run", "custom": "value"},
+            )
+            updated_metadata = dict(task_lock.metadata)
+            updated_metadata["worker_pid"] = 123
+            updated_lock = manager.update(task_lock, updated_metadata)
+            locks = manager.list_locks()
+
+            with self.assertRaises(LockBusy) as busy:
+                manager.acquire("TASK-01", "run-2")
+
+            self.assertTrue(manager.is_locked("TASK-01"))
+            self.assertEqual(updated_lock.metadata["worker_pid"], 123)
+            self.assertEqual(len(locks), 1)
+            self.assertEqual(locks[0]["task_id"], "TASK-01")
+            self.assertEqual(locks[0]["run_id"], "run-1")
+            self.assertEqual(busy.exception.metadata["run_id"], "run-1")
+
+            manager.release(updated_lock)
+
+            self.assertFalse(manager.is_locked("TASK-01"))
+            self.assertEqual(manager.list_locks(), [])
+
+    def test_command_lock_backend_handles_main_integration_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            adapter = repo / "lock_adapter.py"
+            write_command_lock_adapter(adapter)
+            command = f"{sys.executable} {json.dumps(str(adapter))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": 123, "pid_source": "test", "host": "test-host"},
+            )
+            status = manager.main_integration_status(
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+
+            self.assertTrue(status.locked)
+            self.assertEqual(status.metadata["owner_task_id"], "TASK-01")
+            self.assertEqual(status.state, "held")
+            self.assertIsNone(status.stale_reason)
+            self.assertTrue(
+                manager.release_main_integration(task_id="TASK-01", run_id="run-1")
+            )
+            self.assertFalse(manager.main_integration_status().locked)
+
+    def test_command_lock_backend_failure_is_actionable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            failing = repo / "failing_lock_adapter.py"
+            failing.write_text(
+                "import sys\n"
+                "print('adapter unavailable', file=sys.stderr)\n"
+                "raise SystemExit(17)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} {json.dumps(str(failing))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            with self.assertRaisesRegex(
+                LockBackendError,
+                "locks.status_command exited with status 17: adapter unavailable",
+            ):
+                manager.is_locked("TASK-01")
+
+    def test_command_lock_backend_rejects_invalid_json_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            invalid = repo / "invalid_lock_adapter.py"
+            invalid.write_text("print('not-json')\n", encoding="utf-8")
+            command = f"{sys.executable} {json.dumps(str(invalid))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            with self.assertRaisesRegex(LockBackendError, "valid JSON"):
+                manager.list_locks()
+
+    def test_command_lock_backend_rejects_oversized_stdout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            oversized = repo / "oversized_lock_adapter.py"
+            oversized.write_text(
+                f"print('x' * {COMMAND_LOCK_MAX_OUTPUT_BYTES + 1})\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} {json.dumps(str(oversized))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            with self.assertRaisesRegex(LockBackendError, "stdout exceeds"):
+                manager.list_locks()
+
+    def test_command_lock_backend_release_false_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            adapter = repo / "lock_adapter.py"
+            release_false = repo / "release_false.py"
+            write_command_lock_adapter(adapter)
+            release_false.write_text(
+                "import json\nprint(json.dumps({'released': False}))\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} {json.dumps(str(adapter))}"
+            release_command = f"{sys.executable} {json.dumps(str(release_false))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=release_command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            task_lock = manager.acquire("TASK-01", "run-1")
+
+            with self.assertRaisesRegex(LockBackendError, "released=false"):
+                manager.release(task_lock)
+
+            self.assertTrue(manager.is_locked("TASK-01"))
+
+    def test_command_lock_backend_requires_update_success_marker(self) -> None:
+        cases = [
+            "{}",
+            '{"updated": "false"}',
+            '{"ok": false}',
+        ]
+        for payload in cases:
+            with self.subTest(payload=payload):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    adapter = repo / "lock_adapter.py"
+                    update_adapter = repo / "update_adapter.py"
+                    write_command_lock_adapter(adapter)
+                    update_adapter.write_text(
+                        "from __future__ import annotations\n"
+                        "\n"
+                        "import os\n"
+                        "import runpy\n"
+                        "\n"
+                        "if os.environ['VIBE_LOOP_LOCK_OPERATION'] == 'update':\n"
+                        f"    print({payload!r})\n"
+                        "else:\n"
+                        f"    runpy.run_path({str(adapter)!r}, run_name='__main__')\n",
+                        encoding="utf-8",
+                    )
+                    command = f"{sys.executable} {json.dumps(str(update_adapter))}"
+                    manager = build_lock_manager(
+                        repo,
+                        repo / ".vibe-loop" / "locks",
+                        LockConfig(
+                            type="command",
+                            acquire_command=command,
+                            release_command=command,
+                            status_command=command,
+                            list_command=command,
+                        ),
+                    )
+                    task_lock = manager.acquire("TASK-01", "run-1")
+
+                    with self.assertRaisesRegex(
+                        LockBackendError,
+                        "must return boolean acquired or updated",
+                    ):
+                        manager.update(task_lock, task_lock.metadata)
+
+    def test_command_lock_backend_stale_cleanup_delegates_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            adapter = repo / "lock_adapter.py"
+            write_command_lock_adapter(adapter)
+            command = f"{sys.executable} {json.dumps(str(adapter))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            result = clean_stale_locks(stale, manager)
+
+            self.assertEqual(len(stale), 1)
+            self.assertEqual(
+                stale[0].recovery_command,
+                "vibe-loop workers clean --force",
+            )
+            self.assertFalse(stale[0].lock_path.exists())
+            self.assertEqual(result.cleaned, stale)
+            self.assertEqual(result.errors, [])
+            self.assertFalse(manager.is_locked("TASK-01"))
 
     def test_process_classification_detects_running_and_missing_pid(self) -> None:
         state = ActiveRunState(
@@ -1104,6 +1391,59 @@ class StaleLockTests(unittest.TestCase):
         self.assertEqual(parts[0], "rm")
         self.assertEqual(parts[1], "-rf")
         self.assertEqual(parts[2], str(spaced_lock))
+
+
+def write_command_lock_adapter(path: Path) -> None:
+    path.write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "\n"
+        "lock_root = Path(os.environ['VIBE_LOOP_LOCK_ROOT'])\n"
+        "store_path = lock_root.parent / 'command-lock-store.json'\n"
+        "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
+        "task_id = os.environ['VIBE_LOOP_LOCK_TASK_ID']\n"
+        "run_id = os.environ.get('VIBE_LOOP_LOCK_RUN_ID', '')\n"
+        "metadata = json.loads(os.environ.get('VIBE_LOOP_LOCK_METADATA_JSON') or '{}')\n"
+        "\n"
+        "def read_store():\n"
+        "    if not store_path.exists():\n"
+        "        return {}\n"
+        "    return json.loads(store_path.read_text(encoding='utf-8'))\n"
+        "\n"
+        "def write_store(store):\n"
+        "    store_path.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    store_path.write_text(json.dumps(store, sort_keys=True), encoding='utf-8')\n"
+        "\n"
+        "store = read_store()\n"
+        "if operation in {'acquire', 'update'}:\n"
+        "    existing = store.get(task_id)\n"
+        "    if operation == 'acquire' and existing and existing.get('run_id') != run_id:\n"
+        "        print(json.dumps({'acquired': False, 'metadata': existing}))\n"
+        "    else:\n"
+        "        metadata['task_id'] = task_id\n"
+        "        if run_id:\n"
+        "            metadata['run_id'] = run_id\n"
+        "        metadata.setdefault('path', str(lock_root / f'{task_id}.lock'))\n"
+        "        store[task_id] = metadata\n"
+        "        write_store(store)\n"
+        "        print(json.dumps({'acquired': True, 'updated': operation == 'update', 'metadata': metadata}))\n"
+        "elif operation == 'release':\n"
+        "    released = task_id in store\n"
+        "    store.pop(task_id, None)\n"
+        "    write_store(store)\n"
+        "    print(json.dumps({'released': released}))\n"
+        "elif operation == 'status':\n"
+        "    current = store.get(task_id)\n"
+        "    print(json.dumps({'locked': current is not None, 'metadata': current or {}}))\n"
+        "elif operation == 'list':\n"
+        "    print(json.dumps({'locks': list(store.values())}))\n"
+        "else:\n"
+        "    raise SystemExit(f'unsupported operation: {operation}')\n",
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":

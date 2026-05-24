@@ -448,6 +448,9 @@ commands = [
 max_restarts = 3
 cooldown_seconds = 30.0
 
+[locks]
+type = "directory"
+
 [planning_analytics]
 schedule_policy = "current-runner-parity"
 subject_matching = "diagnostic"
@@ -489,6 +492,31 @@ Codex-first policy:
 
 When neither supported CLI is available, agent-using commands fail with a
 diagnostic that points to installation or explicit config.
+
+Lock storage defaults to directory locks under `<state_dir>/locks`. Repos that
+coordinate through an external service can opt into command-backed locks with
+explicit user-authored commands:
+
+```toml
+[locks]
+type = "command"
+acquire_command = "my-lock-tool acquire --json"
+release_command = "my-lock-tool release --json"
+status_command = "my-lock-tool status --json"
+list_command = "my-lock-tool list --json"
+```
+
+Lock commands run from the repository root and receive
+`VIBE_LOOP_LOCK_OPERATION`, `VIBE_LOOP_LOCK_TASK_ID`,
+`VIBE_LOOP_LOCK_RUN_ID`, `VIBE_LOOP_LOCK_ROOT`, and
+`VIBE_LOOP_LOCK_METADATA_JSON`. `acquire_command` handles both `acquire` and
+`update` operations. Acquire/update returns `{"acquired": true,
+"metadata": {...}}` or `{"acquired": false, "metadata": {...}}` for a held
+lock. Release must return `{"released": true}`; `false` is treated as a failed
+release. Status returns `{"locked": true, "metadata": {...}}` or
+`{"locked": false}`. List returns a JSON array or `{"locks": [...]}`. Once
+`type = "command"` is set, lock command failures fail closed instead of falling
+back to directory locks.
 
 Configure Claude prompt mode explicitly when that is the worker or selector you
 want to run regardless of what else is installed:
@@ -699,8 +727,9 @@ source keys disable generated discovery for the active source: `type`,
 not count as explicit settings, and non-source settings such as
 `task_source.runnable_statuses` override the matching generated field without
 disabling the generated parser. Generated cache records cannot contain
-executable adapters such as `type = "command"`, `list`, `next`, `probe`, or
-generic command fields. Add explicit `[task_source]` settings to override cached
+executable adapters or lock backend settings such as `type = "command"`,
+`list`, `next`, `probe`, generic command fields, `[locks]`, or lock command
+fields. Add explicit `[task_source]` or `[locks]` settings to override cached
 generated behavior.
 
 Promote a reviewed generated profile into committed configuration when a repo

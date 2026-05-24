@@ -40,7 +40,12 @@ from vibe_loop.generated_profiles import (
     read_only_generated_cache_message,
     runtime_task_source_report,
 )
-from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.locks import (
+    LockBusy,
+    LockManager,
+    LockOwnerMismatch,
+    build_lock_manager,
+)
 from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.planning_artifacts import (
     build_planning_artifact_bundle,
@@ -747,6 +752,7 @@ def dispatch(args: argparse.Namespace) -> int:
                         task_source_runtime=task_source_runtime,
                     ),
                     "agent": config.agent.to_json(),
+                    "locks": config.locks.to_json(),
                     "completion": config.completion.__dict__,
                     "stale_locks": stale_report,
                     "workspace_diagnostics": workspace_diagnostics_report(workers),
@@ -1068,7 +1074,11 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 file=sys.stderr,
             )
             return 2
-        manager = LockManager(config.state_path / "locks")
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
         run_store = RunStore(config.state_path / "runs.jsonl")
         try:
             claim = claim_worker_workspace(
@@ -1124,7 +1134,11 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
 
 
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:
-    manager = LockManager(config.state_path / "locks")
+    manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+    )
     run_store = RunStore(config.state_path / "runs.jsonl")
     if args.main_integration_command == "status":
         status = manager.main_integration_status()
@@ -1513,7 +1527,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
             print("No stale locks found.")
         return 0
     if args.force:
-        result = clean_stale_locks(stale)
+        result = clean_stale_locks(stale, runner.lock_manager)
         record_expired_locks(runner.run_store, result.cleaned)
         if args.json:
             print(

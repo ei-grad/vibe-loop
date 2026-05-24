@@ -11,7 +11,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.locks import MAIN_INTEGRATION_LOCK_NAME, LockManager, TaskLock
+from vibe_loop.locks import (
+    MAIN_INTEGRATION_LOCK_NAME,
+    LockBackendError,
+    LockManager,
+    TaskLock,
+)
 from vibe_loop.runs import (
     RUN_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
@@ -1206,7 +1211,10 @@ def collect_stale_locks(
                 lock_path=lock_path,
                 stale_reason=view.stale_reason or "unknown",
                 kind="task",
-                recovery_command=f"rm -rf {shlex.quote(str(lock_path))}",
+                recovery_command=stale_lock_recovery_command(
+                    lock_manager,
+                    lock_path,
+                ),
             )
         )
 
@@ -1226,8 +1234,9 @@ def collect_stale_locks(
                 lock_path=integration_status.path,
                 stale_reason=integration_status.stale_reason or "unknown",
                 kind="integration",
-                recovery_command=(
-                    f"rm -rf {shlex.quote(str(integration_status.path))}"
+                recovery_command=stale_lock_recovery_command(
+                    lock_manager,
+                    integration_status.path,
                 ),
             )
         )
@@ -1242,10 +1251,25 @@ class CleanResult:
 
 def clean_stale_locks(
     stale_locks: list[StaleLock],
+    lock_manager: LockManager | None = None,
 ) -> CleanResult:
     cleaned: list[StaleLock] = []
     errors: list[tuple[StaleLock, str]] = []
     for lock in stale_locks:
+        if lock_manager is not None:
+            try:
+                released = lock_manager.release_stale_lock(
+                    task_id=lock.task_id,
+                    run_id=lock.run_id,
+                    path=lock.lock_path,
+                    kind=lock.kind,
+                )
+            except LockBackendError as exc:
+                errors.append((lock, str(exc)))
+                continue
+            if released:
+                cleaned.append(lock)
+            continue
         if not lock.lock_path.exists():
             continue
         if not _lock_metadata_matches(lock):
@@ -1258,6 +1282,12 @@ def clean_stale_locks(
             continue
         cleaned.append(lock)
     return CleanResult(cleaned=cleaned, errors=errors)
+
+
+def stale_lock_recovery_command(lock_manager: LockManager, lock_path: Path) -> str:
+    if lock_manager.uses_directory_backend:
+        return f"rm -rf {shlex.quote(str(lock_path))}"
+    return "vibe-loop workers clean --force"
 
 
 def _lock_metadata_matches(lock: StaleLock) -> bool:

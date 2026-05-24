@@ -237,6 +237,69 @@ class ConfigTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, expected):
                         load_config(repo)
 
+    def test_lock_config_defaults_to_directory_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        self.assertEqual(config.locks.type, "directory")
+        self.assertFalse(config.locks.command_backend)
+        self.assertEqual(config.locks.explicit_keys, frozenset())
+
+    def test_lock_config_parses_command_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[locks]\n"
+                'type = "command"\n'
+                'acquire_command = "locks acquire"\n'
+                'release_command = "locks release"\n'
+                'status_command = "locks status"\n'
+                'list_command = "locks list"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertTrue(config.locks.command_backend)
+        self.assertEqual(config.locks.acquire_command, "locks acquire")
+        self.assertEqual(config.locks.release_command, "locks release")
+        self.assertEqual(config.locks.status_command, "locks status")
+        self.assertEqual(config.locks.list_command, "locks list")
+        self.assertEqual(
+            config.locks.to_json()["explicit_keys"],
+            [
+                "acquire_command",
+                "list_command",
+                "release_command",
+                "status_command",
+                "type",
+            ],
+        )
+
+    def test_lock_config_rejects_invalid_command_backend(self) -> None:
+        cases = [
+            ('type = "sqlite"\n', "locks.type"),
+            (
+                'type = "command"\n'
+                'acquire_command = "locks acquire"\n'
+                'release_command = "locks release"\n',
+                "locks.list_command",
+            ),
+            ('acquire_command = "locks acquire"\n', "locks.type"),
+            ('type = "directory"\nunknown = true\n', "unsupported"),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[locks]\n" + toml,
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, expected):
+                        load_config(repo)
+
     def test_specs_config_parses_execution_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -413,6 +476,9 @@ class ConfigTests(unittest.TestCase):
             {"type": "command"},
             {"parser": {"list": "tracker list --json"}},
             {"task_source": {"probe": "tracker show {task_id} --json"}},
+            {"locks": {"type": "command"}},
+            {"lock_backend": {"acquire_command": "lock acquire"}},
+            {"profile": {"status_command": "lock status"}},
         ]
         for profile in profiles:
             with self.subTest(profile=profile):

@@ -36,7 +36,7 @@ from vibe_loop.generated_discovery import (
     redact_evidence_text,
     redact_manifest_text,
 )
-from vibe_loop.locks import LockBusy, LockManager, TaskLock
+from vibe_loop.locks import LockBusy, LockManager, TaskLock, build_lock_manager
 from vibe_loop.retry import (
     is_transient_stderr,
     retry_subprocess_run,
@@ -262,7 +262,11 @@ class VibeRunner:
         self.config = config
         self._source: TaskSource | None = None
         self._source_resolution: RuntimeTaskSourceResolution | None = None
-        self.lock_manager = LockManager(config.state_path / "locks")
+        self.lock_manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()

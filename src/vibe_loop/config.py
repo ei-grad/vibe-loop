@@ -101,6 +101,11 @@ PLANNING_ANALYTICS_DURATION_MODEL_NAMES = ("robust-duration-baseline-v1",)
 SUPERVISION_DEFAULT_MAX_RESTARTS = 3
 SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
 SUPERVISION_CONFIG_KEYS = frozenset({"max_restarts", "cooldown_seconds"})
+LOCK_BACKEND_TYPES = ("directory", "command")
+LOCKS_COMMAND_KEYS = frozenset(
+    {"acquire_command", "release_command", "status_command", "list_command"}
+)
+LOCKS_CONFIG_KEYS = frozenset({"type"}) | LOCKS_COMMAND_KEYS
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -139,6 +144,12 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "next",
         "probe",
         "selection_command",
+        "locks",
+        "lock_backend",
+        "acquire_command",
+        "release_command",
+        "status_command",
+        "list_command",
     }
 )
 
@@ -339,6 +350,34 @@ class SupervisionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class LockConfig:
+    type: str = "directory"
+    acquire_command: str | None = None
+    release_command: str | None = None
+    status_command: str | None = None
+    list_command: str | None = None
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def command_backend(self) -> bool:
+        return self.type == "command"
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "type": self.type,
+            "command_backend": self.command_backend,
+            "acquire_command": self.acquire_command,
+            "release_command": self.release_command,
+            "status_command": self.status_command,
+            "list_command": self.list_command,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PlanningAnalyticsOutputs:
     timeline_json: str | None = None
     gantt_html: str | None = None
@@ -448,6 +487,7 @@ class VibeConfig:
     supervision: SupervisionConfig = dataclasses.field(
         default_factory=SupervisionConfig
     )
+    locks: LockConfig = dataclasses.field(default_factory=LockConfig)
     planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
         default_factory=PlanningAnalyticsConfig
     )
@@ -475,6 +515,7 @@ def load_config(repo: Path) -> VibeConfig:
     completion = parse_completion(data.get("completion", {}), repo)
     agent = parse_agent(data.get("agent", {}))
     supervision = parse_supervision(data.get("supervision", {}))
+    locks = parse_locks(data.get("locks", {}))
     planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
     specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
@@ -485,6 +526,7 @@ def load_config(repo: Path) -> VibeConfig:
         task_source=task_source,
         completion=completion,
         supervision=supervision,
+        locks=locks,
         planning_analytics=planning_analytics,
         specs=specs,
     )
@@ -648,7 +690,7 @@ def reject_generated_command_adapters(profile: object) -> None:
         fields = ", ".join(forbidden)
         raise ValueError(
             "generated task-source profiles cannot define executable command "
-            f"adapters: {fields}"
+            f"adapters or lock backends: {fields}"
         )
 
 
@@ -714,6 +756,42 @@ def parse_supervision(data: object) -> SupervisionConfig:
             SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
             "supervision.cooldown_seconds",
         ),
+        explicit_keys=explicit_keys,
+    )
+
+
+def parse_locks(data: object) -> LockConfig:
+    table = expect_table(data, "locks")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - LOCKS_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"locks contains unsupported keys: {', '.join(unknown_keys)}")
+    lock_type = optional_nonempty_string(table.get("type")) or "directory"
+    if lock_type not in LOCK_BACKEND_TYPES:
+        allowed = ", ".join(LOCK_BACKEND_TYPES)
+        raise ValueError(f"locks.type must be one of: {allowed}")
+    commands = {
+        key: optional_nonempty_string(table.get(key)) for key in LOCKS_COMMAND_KEYS
+    }
+    configured_command_keys = {
+        key for key, value in commands.items() if value is not None
+    }
+    if lock_type == "directory" and configured_command_keys:
+        keys = ", ".join(sorted(configured_command_keys))
+        raise ValueError(
+            f'locks command adapter keys require locks.type = "command": {keys}'
+        )
+    if lock_type == "command":
+        missing = sorted(key for key, value in commands.items() if value is None)
+        if missing:
+            keys = ", ".join(f"locks.{key}" for key in missing)
+            raise ValueError(f"locks.type command requires {keys}")
+    return LockConfig(
+        type=lock_type,
+        acquire_command=commands["acquire_command"],
+        release_command=commands["release_command"],
+        status_command=commands["status_command"],
+        list_command=commands["list_command"],
         explicit_keys=explicit_keys,
     )
 
