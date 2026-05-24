@@ -4051,6 +4051,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(metadata["pid_scope"], "configured_command_process")
         self.assertIsInstance(metadata["supervisor_pid"], int)
         self.assertIn("base_main", metadata)
+        self.assertEqual(metadata["agent_kind"], "auto")
+        self.assertEqual(metadata["agent_prompt_dialect"], "codex")
+        self.assertEqual(metadata["agent_prompt_dialect_source"], "legacy-default:codex")
+        self.assertEqual(metadata["agent_skill_ref_prefix"], "$")
+        self.assertEqual(
+            metadata["agent_skill_ref_prefix_source"],
+            "legacy-default:codex",
+        )
 
     def test_run_next_worker_prompt_includes_traceability_when_present(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4115,6 +4123,46 @@ class CliTests(unittest.TestCase):
         self.assertIn('"spec_paths": [', prompt)
         self.assertIn('"docs/spec.md"', prompt)
         self.assertIn('"approval_state": "approved"', prompt)
+
+    def test_run_next_refuses_traceable_task_when_command_omits_prompt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "spec.md").write_text("spec\n", encoding="utf-8")
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'TRACE-01','title':'Trace task',"
+                "'status':'Next','dependencies':[],"
+                "'requirement_ids':['PRD-SDE-003'],"
+                "'spec_paths':['docs/spec.md']}]))\n",
+                encoding="utf-8",
+            )
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "Path('agent-ran').write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {{task_id}}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                f'list = "{sys.executable} list_tasks.py"\n\n'
+                "[agent]\n"
+                "command = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertFalse((repo / "agent-ran").exists())
+        self.assertIn("agent.command must include {prompt}", stderr.getvalue())
+        self.assertIn("spec context cannot be delivered", stderr.getvalue())
 
     def test_run_next_captures_explicit_worker_session_id_from_stderr(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

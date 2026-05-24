@@ -544,7 +544,9 @@ recent run context. Single-task selection should print JSON containing
 `task_id`; parallel batch selection should print JSON containing `task_ids`.
 Spec traceability and future spec gate context are added to the worker prompt
 from normalized task metadata independently of the executable command and prompt
-dialect.
+dialect. If a task has traceability metadata, `agent.command` must include the
+`{prompt}` placeholder; legacy task-id-only command templates fail fast because
+they cannot receive the spec-aware prompt bundle.
 
 For command-backed task sources:
 

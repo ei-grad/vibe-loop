@@ -106,6 +106,11 @@ class ActiveRunState:
     resources: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
     conflict_domains_known: bool = False
+    agent_kind: str = ""
+    agent_prompt_dialect: str = ""
+    agent_prompt_dialect_source: str = ""
+    agent_skill_ref_prefix: str = ""
+    agent_skill_ref_prefix_source: str = ""
     worker_pid: int | None = None
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
@@ -126,6 +131,11 @@ class ActiveRunState:
         resources: tuple[str, ...] = (),
         paths: tuple[str, ...] = (),
         conflict_domains_known: bool = False,
+        agent_kind: str = "",
+        agent_prompt_dialect: str = "",
+        agent_prompt_dialect_source: str = "",
+        agent_skill_ref_prefix: str = "",
+        agent_skill_ref_prefix_source: str = "",
     ) -> ActiveRunState:
         return cls(
             task_id=task_id,
@@ -137,6 +147,11 @@ class ActiveRunState:
             resources=resources,
             paths=paths,
             conflict_domains_known=conflict_domains_known,
+            agent_kind=agent_kind,
+            agent_prompt_dialect=agent_prompt_dialect,
+            agent_prompt_dialect_source=agent_prompt_dialect_source,
+            agent_skill_ref_prefix=agent_skill_ref_prefix,
+            agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
             supervisor_pid=os.getpid(),
         )
 
@@ -174,6 +189,19 @@ class ActiveRunState:
             conflict_domains_known=optional_bool(
                 metadata.get("conflict_domains_known")
             ),
+            agent_kind=optional_string(metadata.get("agent_kind")) or "",
+            agent_prompt_dialect=(
+                optional_string(metadata.get("agent_prompt_dialect")) or ""
+            ),
+            agent_prompt_dialect_source=(
+                optional_string(metadata.get("agent_prompt_dialect_source")) or ""
+            ),
+            agent_skill_ref_prefix=(
+                optional_string(metadata.get("agent_skill_ref_prefix")) or ""
+            ),
+            agent_skill_ref_prefix_source=(
+                optional_string(metadata.get("agent_skill_ref_prefix_source")) or ""
+            ),
             worker_pid=worker_pid,
             pid_source=pid_source,
             pid_scope=(
@@ -209,6 +237,11 @@ class ActiveRunState:
             "resources": list(self.resources),
             "paths": list(self.paths),
             "conflict_domains_known": self.conflict_domains_known,
+            "agent_kind": self.agent_kind,
+            "agent_prompt_dialect": self.agent_prompt_dialect,
+            "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
+            "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
+            "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
         }
         if self.workspace is not None:
             metadata["workspace"] = self.workspace.to_json()
@@ -321,6 +354,11 @@ class WorkerView:
             "resources": list(self.active.resources),
             "paths": list(self.active.paths),
             "conflict_domains_known": self.active.conflict_domains_known,
+            "agent_kind": self.active.agent_kind,
+            "agent_prompt_dialect": self.active.agent_prompt_dialect,
+            "agent_prompt_dialect_source": self.active.agent_prompt_dialect_source,
+            "agent_skill_ref_prefix": self.active.agent_skill_ref_prefix,
+            "agent_skill_ref_prefix_source": self.active.agent_skill_ref_prefix_source,
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
             "workspace": (
                 self.active.workspace.to_json()

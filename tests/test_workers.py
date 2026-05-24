@@ -36,6 +36,11 @@ class WorkerStateTests(unittest.TestCase):
                 log_path=log_path,
                 base_main="abc123",
                 command="codex exec '$vibe-loop PAR-02'",
+                agent_kind="codex",
+                agent_prompt_dialect="codex",
+                agent_prompt_dialect_source="agent.kind:codex",
+                agent_skill_ref_prefix="$",
+                agent_skill_ref_prefix_source="agent.kind:codex",
                 workspace=WorkspaceClaim(
                     task_id="PAR-02",
                     run_id="run-1",
@@ -69,6 +74,11 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].log_path, log_path)
         self.assertEqual(loaded[0].base_main, "abc123")
         self.assertEqual(loaded[0].command, "codex exec '$vibe-loop PAR-02'")
+        self.assertEqual(loaded[0].agent_kind, "codex")
+        self.assertEqual(loaded[0].agent_prompt_dialect, "codex")
+        self.assertEqual(loaded[0].agent_prompt_dialect_source, "agent.kind:codex")
+        self.assertEqual(loaded[0].agent_skill_ref_prefix, "$")
+        self.assertEqual(loaded[0].agent_skill_ref_prefix_source, "agent.kind:codex")
         self.assertEqual(loaded[0].lock_path, task_lock.path)
         workspace = loaded[0].workspace
         self.assertIsNotNone(workspace)
@@ -116,6 +126,11 @@ class WorkerStateTests(unittest.TestCase):
                 log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
                 base_main="abc123",
                 command="agent PAR-02",
+                agent_kind="claude",
+                agent_prompt_dialect="claude",
+                agent_prompt_dialect_source="agent.kind:claude",
+                agent_skill_ref_prefix="/",
+                agent_skill_ref_prefix_source="agent.kind:claude",
             )
             manager.acquire("PAR-02", "run-1", metadata=state.to_lock_metadata())
 
@@ -125,6 +140,7 @@ class WorkerStateTests(unittest.TestCase):
                 current_host="test-host",
                 process_exists=lambda pid: False,
             )
+            missing_payload = missing[0].to_json()
             run_store.append_result(
                 RunResult(
                     run_id="run-1",
@@ -146,6 +162,17 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(missing[0].state, "stale")
         self.assertEqual(missing[0].process_state, "missing")
         self.assertEqual(missing[0].stale_reason, "missing_process")
+        self.assertEqual(missing_payload["agent_kind"], "claude")
+        self.assertEqual(missing_payload["agent_prompt_dialect"], "claude")
+        self.assertEqual(
+            missing_payload["agent_prompt_dialect_source"],
+            "agent.kind:claude",
+        )
+        self.assertEqual(missing_payload["agent_skill_ref_prefix"], "/")
+        self.assertEqual(
+            missing_payload["agent_skill_ref_prefix_source"],
+            "agent.kind:claude",
+        )
         self.assertEqual(recorded[0].state, "stale")
         self.assertEqual(recorded[0].process_state, "running")
         self.assertEqual(recorded[0].stale_reason, "result_recorded")

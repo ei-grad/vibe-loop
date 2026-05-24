@@ -177,6 +177,11 @@ class RunHistoryView:
     session_id: str
     session_id_source: str
     message: str
+    agent_kind: str
+    agent_prompt_dialect: str
+    agent_prompt_dialect_source: str
+    agent_skill_ref_prefix: str
+    agent_skill_ref_prefix_source: str
     classification_source: str
     worker_report: dict[str, Any] | None
     record_count: int
@@ -201,6 +206,20 @@ class RunHistoryView:
             session_id=latest_text(valid_records, "session_id") or run_id,
             session_id_source=latest_text(valid_records, "session_id_source"),
             message=latest_text(valid_records, "message"),
+            agent_kind=latest_text(valid_records, "agent_kind"),
+            agent_prompt_dialect=latest_text(valid_records, "agent_prompt_dialect"),
+            agent_prompt_dialect_source=latest_text(
+                valid_records,
+                "agent_prompt_dialect_source",
+            ),
+            agent_skill_ref_prefix=latest_text(
+                valid_records,
+                "agent_skill_ref_prefix",
+            ),
+            agent_skill_ref_prefix_source=latest_text(
+                valid_records,
+                "agent_skill_ref_prefix_source",
+            ),
             classification_source=latest_text(valid_records, "classification_source"),
             worker_report=latest_worker_report_payload(valid_records),
             record_count=len(records),
@@ -219,6 +238,11 @@ class RunHistoryView:
             "session_id": self.session_id,
             "session_id_source": self.session_id_source,
             "message": self.message,
+            "agent_kind": self.agent_kind,
+            "agent_prompt_dialect": self.agent_prompt_dialect,
+            "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
+            "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
+            "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
             "record_count": self.record_count,

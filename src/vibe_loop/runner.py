@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import re
+import string
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
     AgentDetection,
+    AgentResolutionError,
     VibeConfig,
     shell_quote,
     prepare_shell_command,
@@ -413,6 +415,7 @@ class VibeRunner:
         session_id_source = "fallback:run_id"
         skill_prefix = self.config.agent.require_skill_ref_prefix()
         worker_prompt = build_worker_prompt(skill_prefix, task)
+        validate_worker_prompt_delivery(command_template, task)
         command = command_template.format(
             prompt=shell_quote(worker_prompt),
             task_id=task.task_id,
@@ -434,6 +437,11 @@ class VibeRunner:
             resources=task.resources,
             paths=task.paths,
             conflict_domains_known=task.conflict_domains_known,
+            agent_kind=self.config.agent.agent_kind,
+            agent_prompt_dialect=self.config.agent.prompt_dialect or "",
+            agent_prompt_dialect_source=self.config.agent.prompt_dialect_source,
+            agent_skill_ref_prefix=self.config.agent.skill_ref_prefix or "",
+            agent_skill_ref_prefix_source=self.config.agent.skill_ref_prefix_source,
         )
         task_lock = self.acquire_scheduled_task_lock(
             task,
@@ -982,6 +990,28 @@ def build_worker_prompt(skill_prefix: str, task: Task) -> str:
     )
 
 
+def validate_worker_prompt_delivery(command_template: str, task: Task) -> None:
+    if not task.has_traceability:
+        return
+    if command_template_uses_field(command_template, "prompt"):
+        return
+    raise AgentResolutionError(
+        "agent.command must include {prompt} for tasks with traceability "
+        "metadata; otherwise the worker prompt addendum and spec context cannot "
+        "be delivered. Set agent.command to a prompt-mode template such as "
+        "`codex exec {prompt}` or `claude -p {prompt}`."
+    )
+
+
+def command_template_uses_field(command_template: str, field: str) -> bool:
+    for _literal_text, field_name, _format_spec, _conversion in string.Formatter().parse(
+        command_template
+    ):
+        if field_name == field:
+            return True
+    return False
+
+
 def selection_worker_json(worker: WorkerView) -> dict[str, object]:
     payload = worker.to_json()
     return {
@@ -996,6 +1026,10 @@ def selection_worker_json(worker: WorkerView) -> dict[str, object]:
         "resources": payload["resources"],
         "paths": payload["paths"],
         "conflict_domains_known": payload["conflict_domains_known"],
+        "agent_kind": payload["agent_kind"],
+        "agent_prompt_dialect": payload["agent_prompt_dialect"],
+        "agent_prompt_dialect_source": payload["agent_prompt_dialect_source"],
+        "agent_skill_ref_prefix_source": payload["agent_skill_ref_prefix_source"],
         "workspace": payload["workspace"],
     }
 

@@ -69,7 +69,9 @@ authoritative executable templates. `command` receives `{prompt}`, `{task_id}`,
 and `{run_id}`; `selection_command` receives `{prompt}`. The worker prompt is
 constructed from the selected skill reference syntax, the normalized task, and
 the runner's worker addendum; selection prompts do not use the worker skill
-reference syntax.
+reference syntax. A worker command for a task with traceability metadata must
+include `{prompt}`; task-id-only compatibility templates must fail clearly rather
+than silently dropping spec-aware worker context.
 
 Acceptance must cover Codex-only, Claude-only, both-present, neither-present,
 explicit `kind`, explicit prompt dialect or skill prefix, explicit command
@@ -77,8 +79,8 @@ overrides including environment-prefixed Claude commands, custom commands with
 and without explicit prompt syntax, legacy unkinded explicit commands, worker
 `{prompt}`, `{task_id}`, and `{run_id}` interpolation, selection `{prompt}`
 interpolation, shell quoting, command-source diagnostics, prompt-dialect/source
-diagnostics, and clear failure when no supported agent command or required
-custom prompt syntax is available.
+diagnostics, prompt-required diagnostics for traceable tasks, and clear failure
+when no supported agent command or required custom prompt syntax is available.
 
 Related implementation IDs: `AGENT-01`, `AGENT-02`, `AGENT-04`.
 

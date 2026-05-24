@@ -57,7 +57,9 @@ include a compact, bounded bundle of relevant requirement text, acceptance
 criteria, design references, source fingerprints, and required verification
 gates. That spec-aware context is appended independently of the executable agent
 command and independently of whether the skill reference syntax is Codex-style
-or Claude-style.
+or Claude-style, but delivery requires the worker command template to consume
+`{prompt}`. Traceable task launches with legacy task-id-only command templates
+must fail clearly instead of silently dropping linked spec context.
 
 Acceptance must cover size limits, secret-like path exclusions, deterministic
 prompt construction, worker log visibility, prompt dialect compatibility, and

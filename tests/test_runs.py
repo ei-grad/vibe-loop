@@ -188,6 +188,11 @@ class RunStoreTests(unittest.TestCase):
                     log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
                     start_main="aaa",
                     end_main="bbb",
+                    agent_kind="claude",
+                    agent_prompt_dialect="claude",
+                    agent_prompt_dialect_source="agent.kind:claude",
+                    agent_skill_ref_prefix="/",
+                    agent_skill_ref_prefix_source="agent.kind:claude",
                     worker_report={
                         "run_id": "run-1",
                         "task_id": "TASK-01",
@@ -218,6 +223,11 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(runs[1].record_type, "run_result")
         self.assertEqual(runs[1].exit_code, 0)
         self.assertEqual(runs[1].record_count, 2)
+        self.assertEqual(runs[1].agent_kind, "claude")
+        self.assertEqual(runs[1].agent_prompt_dialect, "claude")
+        self.assertEqual(runs[1].agent_prompt_dialect_source, "agent.kind:claude")
+        self.assertEqual(runs[1].agent_skill_ref_prefix, "/")
+        self.assertEqual(runs[1].agent_skill_ref_prefix_source, "agent.kind:claude")
         self.assertEqual(runs[1].worker_report["commit"], "abc123")
 
     def test_list_runs_limit_zero_returns_no_runs(self) -> None:
