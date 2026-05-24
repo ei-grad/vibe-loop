@@ -405,16 +405,52 @@ class CliTests(unittest.TestCase):
             ],
         )
         for text in (finite_text, infinite_text, orchestrated_text):
-            self.assertNotIn("VIBE_LOOP_REPO", text)
-            self.assertNotIn("vibe-loop report", text)
-            self.assertNotIn("vibe-loop main-integration", text)
+            self.assertNotRegex(text, r"\bVIBE_LOOP_[A-Z0-9_]+\b")
+            self.assertNotRegex(
+                text,
+                r"\bvibe-loop\s+"
+                r"(?:report|worker|main-integration|tasks|next|run-next|"
+                r"run-until-done|workers|runs|planning|doctor|install-skills|"
+                r"specs|eval)\b",
+            )
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
 
+        workspace_claim = CLI_WORKER_ADDENDUM.index("### Workspace Claim")
+        worker_reports = CLI_WORKER_ADDENDUM.index("### Worker Reports")
+        integration_locking = CLI_WORKER_ADDENDUM.index("### Integration Locking")
+        self.assertLess(workspace_claim, worker_reports)
+        self.assertLess(worker_reports, integration_locking)
+
+        self.assertIn(
+            "After creating or choosing your task branch/worktree, and before "
+            "implementation\nedits",
+            CLI_WORKER_ADDENDUM,
+        )
+        self.assertIn("vibe-loop worker claim-workspace", CLI_WORKER_ADDENDUM)
+        self.assertIn("--branch <branch-name>", CLI_WORKER_ADDENDUM)
+        self.assertIn("--worktree <absolute-worktree-path>", CLI_WORKER_ADDENDUM)
+        self.assertRegex(
+            CLI_WORKER_ADDENDUM,
+            r"claim fails with an owner mismatch[\s\S]*report the run as blocked",
+        )
+        self.assertIn("advisory visibility metadata only", CLI_WORKER_ADDENDUM)
+        self.assertIn(
+            "do not permit deleting,\nresetting, cleaning, merging, or stealing",
+            CLI_WORKER_ADDENDUM,
+        )
         self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', CLI_WORKER_ADDENDUM)
         self.assertIn("vibe-loop main-integration acquire", CLI_WORKER_ADDENDUM)
         self.assertIn("--wait --timeout 300", CLI_WORKER_ADDENDUM)
+        self.assertRegex(
+            CLI_WORKER_ADDENDUM,
+            r"live holder timeout[\s\S]*park the slice as blocked",
+        )
+        self.assertRegex(
+            CLI_WORKER_ADDENDUM,
+            r"workspace preflight[\s\S]*report the run as blocked",
+        )
         self.assertIn("vibe-loop main-integration release", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_RUN_ID", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_TASK_ID", CLI_WORKER_ADDENDUM)

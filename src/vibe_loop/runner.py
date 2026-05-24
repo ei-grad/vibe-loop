@@ -86,6 +86,24 @@ environment variables identify this run:
 - VIBE_LOOP_TASK_ID - task being worked on
 - VIBE_LOOP_LOG - path to the run log file
 
+### Workspace Claim
+
+After creating or choosing your task branch/worktree, and before implementation
+edits, attach that workspace to the active task lock:
+
+```bash
+vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
+  --branch <branch-name> --worktree <absolute-worktree-path>
+```
+
+Use the real branch name and absolute worktree path, not the placeholders. If
+the claim fails with an owner mismatch, missing active task lock, mismatched
+branch/worktree, or unsafe workspace diagnostic, stop mutating repository state
+and report the run as blocked through the worker report protocol. Workspace
+claims are advisory visibility metadata only; they do not permit deleting,
+resetting, cleaning, merging, or stealing another worker's branch/worktree.
+
 ### Worker Reports
 
 Report your final status before exiting:
@@ -136,8 +154,8 @@ vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \\
 If the command reports a live holder timeout, park the slice as blocked; do not
 enter the final integration section without the lock. If the lock appears
 stale, or workspace preflight reports unsafe claimed-workspace diagnostics,
-report the precise status and follow repo policy rather than stealing or
-cleaning state.
+report the run as blocked with the precise integration-lock or workspace reason
+and follow repo policy rather than stealing or cleaning state.
 
 Release the lock after main verification or immediately when integration is
 parked:
