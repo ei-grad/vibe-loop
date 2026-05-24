@@ -37,7 +37,7 @@ Acceptance must cover JSON output, command-backed task sources, Markdown
 profiles, generated profiles, planning analytics, and backward compatibility
 for task sources that do not expose traceability fields.
 
-Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-02`.
+Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-02`, `DOC-04`.
 
 ## PRD-SDE-004 Spec Approval And Drift Gates
 

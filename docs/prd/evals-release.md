@@ -13,7 +13,8 @@ Acceptance must cover `no_skill`, `vibe_loop`, optional `infinite_vibe_loop`,
 candidate/self-generated conditions, fresh fixture checkouts, fresh eval state,
 stable prompts, stable agent harness settings, budgets, and repeated trials.
 
-Related implementation IDs: `EVAL-00`, `EVAL-01`, `EVAL-02`, `EVAL-03`.
+Related implementation IDs: `EVAL-00`, `EVAL-01`, `EVAL-02`, `EVAL-03`,
+`EVAL-08`.
 
 ## PRD-EVL-002 Artifact Schema
 
@@ -38,7 +39,8 @@ unnecessary prompts, state contamination, timeout and infrastructure separation,
 and transcript/trace-envelope grading only where final state cannot prove the
 behavior.
 
-Related implementation IDs: `EVAL-02`, `EVAL-03`, `EVAL-05`, `EVAL-09`.
+Related implementation IDs: `EVAL-02`, `EVAL-03`, `EVAL-05`, `EVAL-08`,
+`EVAL-09`.
 
 ## PRD-EVL-004 Aggregate Skill Quality Reporting
 
