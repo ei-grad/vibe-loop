@@ -4117,6 +4117,57 @@ class CliTests(unittest.TestCase):
         )
         self.assertTrue(doctor_payload["task_source_runtime"]["usable"])
 
+    def test_tasks_list_warns_when_using_main_worktree_config_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main_repo = root / "main"
+            linked_repo = root / "linked"
+            main_repo.mkdir()
+            linked_repo.mkdir()
+            main_config = main_repo / ".vibe-loop.toml"
+            main_config.write_text(
+                '[task_source]\nlist = "python list_tasks.py"\n',
+                encoding="utf-8",
+            )
+            (linked_repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'CMD-01','title':'Command task',"
+                "'status':'Next','dependencies':[]}]))\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+            doctor_stdout = StringIO()
+            doctor_stderr = StringIO()
+
+            with patch(
+                "vibe_loop.config.main_worktree_config_path",
+                return_value=main_config,
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    list_exit = main(["tasks", "list", "--repo", str(linked_repo)])
+                with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                    doctor_exit = main(["doctor", "--repo", str(linked_repo)])
+
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+
+        self.assertEqual(list_exit, 0)
+        self.assertIn("CMD-01", stdout.getvalue())
+        self.assertIn(
+            "warning: using config_source=main_worktree",
+            stderr.getvalue(),
+        )
+        self.assertIn(f"config_path={main_config.resolve()}", stderr.getvalue())
+        self.assertIn(f"tasks_repo={linked_repo.resolve()}", stderr.getvalue())
+        self.assertIn("task discovery source=command_output", stderr.getvalue())
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(doctor_payload["config"]["source"], "main_worktree")
+        self.assertEqual(doctor_payload["config"]["path"], str(main_config.resolve()))
+        self.assertEqual(
+            doctor_payload["task_source_runtime"]["origin"], "command_output"
+        )
+
     def test_doctor_reports_command_adapter_missing_list_as_unusable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

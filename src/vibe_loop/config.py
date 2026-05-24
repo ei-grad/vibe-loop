@@ -80,6 +80,7 @@ DEFAULT_PLAN_PATHS = (
     "ROADMAP.md",
     "TODO.md",
 )
+CONFIG_FILE_NAME = ".vibe-loop.toml"
 DEFAULT_RUNNABLE_STATUSES = ("Active", "Next", "Planned")
 GENERATED_TASK_PROFILE_CACHE_FILE = "generated-task-source.json"
 GENERATED_TASK_PROFILE_SCHEMA_VERSION = 1
@@ -533,6 +534,8 @@ class VibeConfig:
     specs: SpecDiagnosticsConfig = dataclasses.field(
         default_factory=SpecDiagnosticsConfig
     )
+    config_path: Path | None = None
+    config_source: str = "default"
 
     @property
     def state_path(self) -> Path:
@@ -546,10 +549,17 @@ class VibeConfig:
     def planning_analytics_state_path(self) -> Path:
         return self.state_path / PLANNING_ANALYTICS_ARTIFACT_DIR
 
+    def config_report(self) -> dict[str, object]:
+        return {
+            "source": self.config_source,
+            "path": str(self.config_path) if self.config_path else None,
+        }
+
 
 def load_config(repo: Path) -> VibeConfig:
     repo = repo.resolve()
-    data = read_config_file(repo / ".vibe-loop.toml")
+    config_path, config_source = resolve_config_file(repo)
+    data = read_config_file(config_path) if config_path is not None else {}
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
     agent = parse_agent(data.get("agent", {}))
@@ -559,6 +569,8 @@ def load_config(repo: Path) -> VibeConfig:
     specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
         repo=repo,
+        config_path=config_path,
+        config_source=config_source,
         main_branch=str(data.get("main_branch") or "main"),
         state_dir=str(data.get("state_dir") or ".vibe-loop"),
         agent=agent,
@@ -569,6 +581,57 @@ def load_config(repo: Path) -> VibeConfig:
         planning_analytics=planning_analytics,
         specs=specs,
     )
+
+
+def resolve_config_file(repo: Path) -> tuple[Path | None, str]:
+    local = repo / CONFIG_FILE_NAME
+    if local.is_file():
+        return local.resolve(), "repo"
+    fallback = main_worktree_config_path(repo)
+    if fallback is not None:
+        return fallback.resolve(), "main_worktree"
+    return None, "default"
+
+
+def main_worktree_config_path(repo: Path) -> Path | None:
+    main_worktree = git_main_worktree_path(repo)
+    if main_worktree is None:
+        return None
+    main_worktree = main_worktree.resolve()
+    if main_worktree == repo:
+        return None
+    candidate = main_worktree / CONFIG_FILE_NAME
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def git_main_worktree_path(repo: Path) -> Path | None:
+    try:
+        completed = subprocess.run(
+            ("git", "-C", str(repo), "worktree", "list", "--porcelain"),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return parse_main_worktree_path(completed.stdout)
+
+
+def parse_main_worktree_path(porcelain: str) -> Path | None:
+    for line in porcelain.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = line.removeprefix("worktree ").strip()
+        if path:
+            return Path(path)
+        return None
+    return None
 
 
 def read_config_file(path: Path) -> dict[str, Any]:

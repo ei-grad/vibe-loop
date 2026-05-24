@@ -486,6 +486,13 @@ disables generated cache as the active task source. Non-source settings such as
 `runnable_statuses` can still override matching generated fields without
 disabling the generated parser.
 
+When `--repo` points at a Git linked worktree that does not have its own
+`.vibe-loop.toml`, `vibe-loop` falls back to the main worktree's local
+`.vibe-loop.toml` if it exists. Read-only task commands warn on stderr with the
+fallback config path and the task repo they are showing. Runtime state, locks,
+logs, generated task-source caches, and planning analytics outputs still live
+under the invoked `--repo` worktree.
+
 Agent executable commands and worker prompt dialect are resolved independently.
 `agent.command` and `agent.selection_command` are shell command templates.
 `agent.kind`, `agent.prompt_dialect`, and `agent.skill_ref_prefix` control how
