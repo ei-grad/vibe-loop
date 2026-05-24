@@ -129,13 +129,15 @@ main-integration lock:
 
 ```bash
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \\
-  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
+  --wait --timeout 300
 ```
 
-If the lock is held by another live worker, wait and retry or park the slice
-as blocked; do not enter the final integration section without the lock. If
-the lock appears stale, report the precise status and follow repo policy
-rather than stealing it.
+If the command reports a live holder timeout, park the slice as blocked; do not
+enter the final integration section without the lock. If the lock appears
+stale, or workspace preflight reports unsafe claimed-workspace diagnostics,
+report the precise status and follow repo policy rather than stealing or
+cleaning state.
 
 Release the lock after main verification or immediately when integration is
 parked:

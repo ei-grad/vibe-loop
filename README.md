@@ -286,7 +286,7 @@ vibe-loop planning benchmark-duration --repo . --check
 vibe-loop doctor --repo .
 vibe-loop doctor --repo . --json
 vibe-loop main-integration status --repo .
-vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
+vibe-loop main-integration acquire --repo . --run-id ... --task-id ... --wait --timeout 300
 vibe-loop main-integration release --repo . --run-id ... --task-id ...
 vibe-loop worker claim-workspace --repo . --run-id ... --task-id ... --branch ... --worktree ...
 vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
@@ -391,17 +391,23 @@ serialize that final critical section:
 
 ```bash
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
-  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
+  --wait --timeout 300
 vibe-loop main-integration release --repo "$VIBE_LOOP_REPO" \
   --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
 ```
 
+`main-integration acquire --wait --timeout N` waits for a live or unknown
+holder to release the advisory lock and returns the same busy payload if the
+timeout expires. Stale locks are reported immediately and are not stolen.
 `main-integration status` shows the current holder, process state, and stale
-reason when the recorded same-host process is missing. Stale locks are reported
-conservatively; a waiter does not steal them automatically. By default,
-`acquire` records the active task lock's worker process for the same run and
-task. Pass `--pid` only when a wrapper needs to record a different long-lived
-owner process or no active task lock exists.
+reason when the recorded same-host process is missing. By default, `acquire`
+records the active task lock's worker process for the same run and task. If the
+active task lock has a workspace claim, `acquire` also checks the claim against
+the current worktree list and branch state before entering the final integration
+section; stale or warning diagnostics block acquisition with recovery hints.
+Pass `--pid` only when a wrapper needs to record a different long-lived owner
+process or no active task lock exists.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
@@ -835,7 +841,10 @@ The `main-integration.lock` entry is a separate advisory lock for worker-owned
 final integration. Its metadata records the owner task, run id, host, pid, and
 start time. It is visible through `vibe-loop main-integration status` rather
 than `vibe-loop workers`; stale status is diagnostic only and does not grant a
-new holder permission to take over automatically.
+new holder permission to take over automatically. `main-integration acquire`
+can wait for a live holder with `--wait --timeout N`, but it blocks immediately
+when the worker's claimed workspace has diagnostics that make final integration
+unsafe.
 
 `runs.jsonl` is an append-only stream of versioned run result records. Run
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the

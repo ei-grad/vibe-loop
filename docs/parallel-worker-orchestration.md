@@ -56,7 +56,10 @@ results are missing or ambiguous.
 - Child agents are finite `$vibe-loop <task_id>` workers. The supervisor owns
   continuation; workers own their slice lifecycle and integration attempt.
 - `main-integration` is an advisory lock for the final refresh/verify/merge
-  window, not a central merge queue.
+  window, not a central merge queue. Workers can use
+  `main-integration acquire --wait --timeout N` to wait for a live holder
+  without hand-rolled polling; stale holders remain diagnostic and are not
+  stolen.
 - Workspace ownership is advisory metadata on the task lock. It records the
   claimed branch, worktree path, base commit, and current git state so
   `workers` and `doctor` can report missing worktrees, duplicate branch
@@ -74,6 +77,10 @@ results are missing or ambiguous.
   recovery hints for missing claimed worktrees, duplicate branch worktrees,
   already-merged active branches, dirty worker-owned worktrees, and stale
   lock-to-worktree mismatches. These diagnostics are read-only.
+- `main-integration acquire` performs the same claimed-workspace sanity check
+  for the acquiring worker before the final integration section. A claim with
+  stale or warning diagnostics blocks acquisition and returns the diagnostic
+  payload with manual recovery hints.
 
 ## Non-Goals
 

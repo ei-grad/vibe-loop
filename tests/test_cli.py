@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import vibe_loop.cli as cli_module
 from vibe_loop.cli import main
+from vibe_loop.locks import LockManager
 
 
 @contextmanager
@@ -413,6 +414,7 @@ class CliTests(unittest.TestCase):
 
         self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', CLI_WORKER_ADDENDUM)
         self.assertIn("vibe-loop main-integration acquire", CLI_WORKER_ADDENDUM)
+        self.assertIn("--wait --timeout 300", CLI_WORKER_ADDENDUM)
         self.assertIn("vibe-loop main-integration release", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_RUN_ID", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_TASK_ID", CLI_WORKER_ADDENDUM)
@@ -4634,6 +4636,466 @@ class CliTests(unittest.TestCase):
         self.assertTrue(release["released"])
         self.assertFalse(release["status"]["locked"])
 
+    def test_main_integration_acquire_waits_until_holder_releases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_active_run_lock(repo, "TASK-01", "run-holder")
+            write_active_run_lock(repo, "TASK-02", "run-waiter")
+            holder_stdout = StringIO()
+            holder_stderr = StringIO()
+            waiter_stdout = StringIO()
+            waiter_stderr = StringIO()
+            sleep_calls: list[float] = []
+
+            with redirect_stdout(holder_stdout), redirect_stderr(holder_stderr):
+                holder_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            def release_holder(delay: float) -> None:
+                sleep_calls.append(delay)
+                shutil.rmtree(repo / ".vibe-loop" / "locks" / "main-integration.lock")
+
+            with patch("vibe_loop.cli.time.sleep", side_effect=release_holder):
+                with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
+                    waiter_exit = main(
+                        [
+                            "main-integration",
+                            "acquire",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-waiter",
+                            "--task-id",
+                            "TASK-02",
+                            "--wait",
+                            "--timeout",
+                            "5",
+                            "--poll-interval",
+                            "0.1",
+                            "--json",
+                        ]
+                    )
+
+            holder = json.loads(holder_stdout.getvalue())
+            waiter = json.loads(waiter_stdout.getvalue())
+
+        self.assertEqual(holder_exit, 0)
+        self.assertEqual(holder_stderr.getvalue(), "")
+        self.assertTrue(holder["acquired"])
+        self.assertEqual(waiter_exit, 0)
+        self.assertEqual(waiter_stderr.getvalue(), "")
+        self.assertEqual(sleep_calls, [0.1])
+        self.assertTrue(waiter["acquired"])
+        self.assertFalse(waiter["timed_out"])
+        self.assertEqual(waiter["status"]["owner_task_id"], "TASK-02")
+        self.assertEqual(waiter["status"]["run_id"], "run-waiter")
+
+    def test_main_integration_acquire_wait_timeout_respects_live_holder(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_active_run_lock(repo, "TASK-01", "run-holder")
+            write_active_run_lock(repo, "TASK-02", "run-waiter")
+            holder_stdout = StringIO()
+            holder_stderr = StringIO()
+            waiter_stdout = StringIO()
+            waiter_stderr = StringIO()
+            status_stdout = StringIO()
+            status_stderr = StringIO()
+
+            with redirect_stdout(holder_stdout), redirect_stderr(holder_stderr):
+                holder_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                    ]
+                )
+            with patch("vibe_loop.cli.time.sleep") as sleep:
+                with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
+                    waiter_exit = main(
+                        [
+                            "main-integration",
+                            "acquire",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-waiter",
+                            "--task-id",
+                            "TASK-02",
+                            "--wait",
+                            "--timeout",
+                            "0",
+                            "--json",
+                        ]
+                    )
+                sleep.assert_not_called()
+            with redirect_stdout(status_stdout), redirect_stderr(status_stderr):
+                status_exit = main(
+                    ["main-integration", "status", "--repo", str(repo), "--json"]
+                )
+
+            waiter = json.loads(waiter_stdout.getvalue())
+            status = json.loads(status_stdout.getvalue())
+
+        self.assertEqual(holder_exit, 0)
+        self.assertEqual(holder_stderr.getvalue(), "")
+        self.assertEqual(waiter_exit, 1)
+        self.assertEqual(waiter_stderr.getvalue(), "")
+        self.assertFalse(waiter["acquired"])
+        self.assertTrue(waiter["timed_out"])
+        self.assertEqual(waiter["status"]["state"], "held")
+        self.assertEqual(waiter["status"]["owner_task_id"], "TASK-01")
+        self.assertEqual(status_exit, 0)
+        self.assertEqual(status_stderr.getvalue(), "")
+        self.assertEqual(status["owner_task_id"], "TASK-01")
+        self.assertEqual(status["run_id"], "run-holder")
+
+    def test_main_integration_acquire_wait_reports_stale_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_active_run_lock(repo, "TASK-02", "run-waiter")
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+                metadata={"pid": 999999999, "host": socket.gethostname()},
+            )
+            waiter_stdout = StringIO()
+            waiter_stderr = StringIO()
+
+            with patch("vibe_loop.cli.time.sleep") as sleep:
+                with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
+                    waiter_exit = main(
+                        [
+                            "main-integration",
+                            "acquire",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-waiter",
+                            "--task-id",
+                            "TASK-02",
+                            "--wait",
+                            "--timeout",
+                            "10",
+                            "--json",
+                        ]
+                    )
+                sleep.assert_not_called()
+
+            waiter = json.loads(waiter_stdout.getvalue())
+
+        self.assertEqual(waiter_exit, 1)
+        self.assertEqual(waiter_stderr.getvalue(), "")
+        self.assertFalse(waiter["acquired"])
+        self.assertFalse(waiter["timed_out"])
+        self.assertEqual(waiter["status"]["state"], "stale")
+        self.assertEqual(waiter["status"]["stale_reason"], "missing_process")
+        self.assertEqual(waiter["status"]["owner_task_id"], "TASK-01")
+
+    def test_main_integration_acquire_rechecks_workspace_after_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            base_commit = subprocess.run(
+                ["git", "rev-parse", "--verify", "HEAD"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            write_active_run_lock(repo, "TASK-01", "run-holder")
+            write_active_run_lock(
+                repo,
+                "TASK-02",
+                "run-waiter",
+                workspace={
+                    "schema_version": 1,
+                    "record_type": "workspace_claim",
+                    "task_id": "TASK-02",
+                    "run_id": "run-waiter",
+                    "branch": "main",
+                    "worktree": str(repo),
+                    "base_commit": base_commit,
+                    "head_commit": base_commit,
+                    "current_branch": "main",
+                    "dirty": False,
+                    "dirty_summary": [],
+                    "claimed_at": "2026-05-09T00:01:00+00:00",
+                },
+            )
+            holder_stdout = StringIO()
+            holder_stderr = StringIO()
+            waiter_stdout = StringIO()
+            waiter_stderr = StringIO()
+
+            with redirect_stdout(holder_stdout), redirect_stderr(holder_stderr):
+                holder_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-holder",
+                        "--task-id",
+                        "TASK-01",
+                    ]
+                )
+
+            def dirty_workspace_and_release(delay: float) -> None:
+                self.assertEqual(delay, 0.1)
+                (repo / "notes.txt").write_text("not committed\n", encoding="utf-8")
+                shutil.rmtree(repo / ".vibe-loop" / "locks" / "main-integration.lock")
+
+            with patch(
+                "vibe_loop.cli.time.sleep",
+                side_effect=dirty_workspace_and_release,
+            ):
+                with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
+                    waiter_exit = main(
+                        [
+                            "main-integration",
+                            "acquire",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-waiter",
+                            "--task-id",
+                            "TASK-02",
+                            "--wait",
+                            "--timeout",
+                            "5",
+                            "--poll-interval",
+                            "0.1",
+                            "--json",
+                        ]
+                    )
+
+            payload = json.loads(waiter_stdout.getvalue())
+            codes = {
+                diagnostic["code"] for diagnostic in payload["workspace_diagnostics"]
+            }
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(holder_exit, 0)
+        self.assertEqual(holder_stderr.getvalue(), "")
+        self.assertEqual(waiter_exit, 1)
+        self.assertEqual(waiter_stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertIn("foreign_dirty_claimed_worktree", codes)
+        self.assertFalse(lock_exists)
+
+    def test_main_integration_acquire_rejects_task_lock_owner_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_active_run_lock(repo, "TASK-01", "run-other")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "owner_mismatch")
+        self.assertEqual(payload["active_run_ids"], ["run-other"])
+        self.assertFalse(lock_exists)
+
+    def test_main_integration_acquire_rejects_pid_owner_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_active_run_lock(repo, "TASK-01", "run-other")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--pid",
+                        "123",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "owner_mismatch")
+        self.assertEqual(payload["active_run_ids"], ["run-other"])
+        self.assertFalse(lock_exists)
+
+    def test_main_integration_acquire_rejects_workspace_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            missing_worktree = repo.parent / "missing-worker"
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace={
+                    "schema_version": 1,
+                    "record_type": "workspace_claim",
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(missing_worktree),
+                    "base_commit": "base",
+                    "head_commit": "",
+                    "current_branch": "worker/TASK-01",
+                    "dirty": False,
+                    "dirty_summary": [],
+                    "claimed_at": "2026-05-09T00:01:00+00:00",
+                },
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            codes = {
+                diagnostic["code"] for diagnostic in payload["workspace_diagnostics"]
+            }
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertIn("missing_claimed_worktree", codes)
+        self.assertFalse(lock_exists)
+
+    def test_main_integration_acquire_rejects_pid_workspace_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            missing_worktree = repo.parent / "missing-worker"
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace={
+                    "schema_version": 1,
+                    "record_type": "workspace_claim",
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(missing_worktree),
+                    "base_commit": "base",
+                    "head_commit": "",
+                    "current_branch": "worker/TASK-01",
+                    "dirty": False,
+                    "dirty_summary": [],
+                    "claimed_at": "2026-05-09T00:01:00+00:00",
+                },
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--pid",
+                        "123",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            codes = {
+                diagnostic["code"] for diagnostic in payload["workspace_diagnostics"]
+            }
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertIn("missing_claimed_worktree", codes)
+        self.assertFalse(lock_exists)
+
     def test_main_integration_acquire_requires_pid_or_active_task_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -5179,6 +5641,34 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+    )
+
+
+def write_active_run_lock(
+    repo: Path,
+    task_id: str,
+    run_id: str,
+    *,
+    workspace: dict[str, object] | None = None,
+) -> None:
+    active_lock = repo / ".vibe-loop" / "locks" / f"{task_id}.lock"
+    active_lock.mkdir(parents=True)
+    metadata: dict[str, object] = {
+        "record_type": "active_run",
+        "schema_version": 1,
+        "task_id": task_id,
+        "run_id": run_id,
+        "pid": os.getpid(),
+        "worker_pid": os.getpid(),
+        "pid_source": "popen",
+        "host": socket.gethostname(),
+        "started_at": "2026-05-09T00:00:00+00:00",
+    }
+    if workspace is not None:
+        metadata["workspace"] = workspace
+    (active_lock / "lock.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
     )
 
 

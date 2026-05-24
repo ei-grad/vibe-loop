@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import socket
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -76,6 +77,15 @@ class IntegrationLockStatus:
 
 
 ProcessExists = Callable[[int], bool]
+Sleep = Callable[[float], None]
+Monotonic = Callable[[], float]
+
+
+@dataclasses.dataclass(frozen=True)
+class IntegrationLockAcquireResult:
+    acquired: bool
+    status: IntegrationLockStatus
+    timed_out: bool = False
 
 
 class LockManager:
@@ -148,6 +158,57 @@ class LockManager:
             run_id,
             metadata=lock_metadata,
         )
+
+    def acquire_main_integration_with_wait(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        metadata: dict[str, object] | None = None,
+        wait: bool = False,
+        timeout_seconds: float | None = 0,
+        poll_interval_seconds: float = 1,
+        sleep: Sleep | None = None,
+        monotonic: Monotonic | None = None,
+    ) -> IntegrationLockAcquireResult:
+        sleeper = sleep if sleep is not None else time.sleep
+        clock = monotonic if monotonic is not None else time.monotonic
+        deadline = (
+            None if timeout_seconds is None else clock() + max(0.0, timeout_seconds)
+        )
+        interval = max(0.01, poll_interval_seconds)
+        while True:
+            try:
+                self.acquire_main_integration(
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                )
+            except LockBusy:
+                status = self.main_integration_status()
+                if not status.locked and wait:
+                    continue
+                if not wait or not integration_lock_waitable(status):
+                    return IntegrationLockAcquireResult(
+                        acquired=False,
+                        status=status,
+                    )
+                if deadline is None:
+                    sleeper(interval)
+                    continue
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    return IntegrationLockAcquireResult(
+                        acquired=False,
+                        status=status,
+                        timed_out=True,
+                    )
+                sleeper(min(interval, remaining))
+                continue
+            return IntegrationLockAcquireResult(
+                acquired=True,
+                status=self.main_integration_status(),
+            )
 
     def release_main_integration(self, *, task_id: str, run_id: str) -> bool:
         status = self.main_integration_status()
@@ -254,6 +315,10 @@ def classify_integration_lock(
         process_state=process_state,
         stale_reason=stale_reason,
     )
+
+
+def integration_lock_waitable(status: IntegrationLockStatus) -> bool:
+    return status.locked and status.state in {"held", "unknown"}
 
 
 def pid_exists(pid: int) -> bool:

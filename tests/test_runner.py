@@ -1645,6 +1645,92 @@ class RunnerTests(unittest.TestCase):
             finally:
                 manager.release(held_lock)
 
+    def test_main_integration_wait_retries_until_lock_is_released(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            holder = manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+            sleeps: list[float] = []
+
+            def release_holder(delay: float) -> None:
+                sleeps.append(delay)
+                manager.release(holder)
+
+            result = manager.acquire_main_integration_with_wait(
+                task_id="TASK-02",
+                run_id="run-waiter",
+                wait=True,
+                timeout_seconds=10,
+                poll_interval_seconds=0.1,
+                sleep=release_holder,
+            )
+
+        self.assertTrue(result.acquired)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(sleeps, [0.1])
+        self.assertEqual(result.status.metadata["owner_task_id"], "TASK-02")
+
+    def test_main_integration_wait_times_out_without_stealing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+
+            result = manager.acquire_main_integration_with_wait(
+                task_id="TASK-02",
+                run_id="run-waiter",
+                wait=True,
+                timeout_seconds=0,
+            )
+            status = manager.main_integration_status(process_exists=lambda pid: True)
+
+        self.assertFalse(result.acquired)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.status.metadata["owner_task_id"], "TASK-01")
+        self.assertEqual(status.metadata["owner_task_id"], "TASK-01")
+
+    def test_main_integration_wait_retries_available_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            holder = manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+            original_acquire = manager.acquire_main_integration
+            attempts = 0
+
+            def acquire_with_race(*, task_id, run_id, metadata=None):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    manager.release(holder)
+                    raise LockBusy(holder.path, holder.metadata)
+                return original_acquire(
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                )
+
+            with patch.object(
+                manager,
+                "acquire_main_integration",
+                side_effect=acquire_with_race,
+            ):
+                result = manager.acquire_main_integration_with_wait(
+                    task_id="TASK-02",
+                    run_id="run-waiter",
+                    wait=True,
+                    timeout_seconds=10,
+                )
+
+        self.assertTrue(result.acquired)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result.status.metadata["owner_task_id"], "TASK-02")
+
     def test_streaming_command_forwards_stdout_and_logs_stderr_by_default(
         self,
     ) -> None:
