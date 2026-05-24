@@ -5820,6 +5820,23 @@ class CliTests(unittest.TestCase):
             lock_exists = (
                 repo / ".vibe-loop" / "locks" / "main-integration.lock"
             ).exists()
+            lock_path = repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            lock_debug = {
+                "lock_exists": lock_exists,
+                "lock_path": str(lock_path),
+                "lock_metadata": (
+                    json.loads((lock_path / "lock.json").read_text(encoding="utf-8"))
+                    if (lock_path / "lock.json").exists()
+                    else None
+                ),
+                "lock_entries": (
+                    sorted(path.name for path in lock_path.iterdir())
+                    if lock_path.exists()
+                    else []
+                ),
+                "payload_status": payload.get("status"),
+                "payload_error": payload.get("error"),
+            }
 
         self.assertEqual(holder_exit, 0)
         self.assertEqual(holder_stderr.getvalue(), "")
@@ -5828,7 +5845,7 @@ class CliTests(unittest.TestCase):
         self.assertFalse(payload["acquired"])
         self.assertEqual(payload["error"], "workspace_preflight_failed")
         self.assertIn("foreign_dirty_claimed_worktree", codes)
-        self.assertFalse(lock_exists)
+        self.assertFalse(lock_exists, lock_debug)
 
     def test_main_integration_acquire_rejects_task_lock_owner_mismatch(
         self,
