@@ -10,6 +10,8 @@ from vibe_loop.config import (
     AgentResolutionError,
     GENERATED_TASK_PROFILE_CACHE_FILE,
     PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY,
+    SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
+    SUPERVISION_DEFAULT_MAX_RESTARTS,
     detect_agent_clis,
     load_config,
     planning_analytics_report,
@@ -182,6 +184,58 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "agent.forward_stderr"):
                 load_config(repo)
+
+    def test_supervision_config_defaults_match_legacy_retry_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        self.assertEqual(config.supervision.max_restarts, 3)
+        self.assertEqual(
+            config.supervision.max_restarts,
+            SUPERVISION_DEFAULT_MAX_RESTARTS,
+        )
+        self.assertEqual(config.supervision.cooldown_seconds, 30.0)
+        self.assertEqual(
+            config.supervision.cooldown_seconds,
+            SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
+        )
+        self.assertEqual(config.supervision.explicit_keys, frozenset())
+
+    def test_supervision_config_parses_restart_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nmax_restarts = 1\ncooldown_seconds = 0.25\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.supervision.max_restarts, 1)
+        self.assertEqual(config.supervision.cooldown_seconds, 0.25)
+        self.assertEqual(
+            config.supervision.to_json()["explicit_keys"],
+            ["cooldown_seconds", "max_restarts"],
+        )
+
+    def test_supervision_config_rejects_invalid_values(self) -> None:
+        cases = [
+            ("max_restarts = -1\n", "supervision.max_restarts"),
+            ('cooldown_seconds = "soon"\n', "supervision.cooldown_seconds"),
+            ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
+            ("unsupported = true\n", "unsupported"),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[supervision]\n" + toml,
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, expected):
+                        load_config(repo)
 
     def test_specs_config_parses_execution_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -14,6 +14,7 @@ from vibe_loop.runs import (
     RUN_RECORD_TYPE,
     RUN_SCHEMA_VERSION,
     RUN_STATE_TRANSITION_RECORD_TYPE,
+    TASK_RESTART_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
@@ -654,6 +655,48 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(inspection.view.record_type, RUN_STATE_TRANSITION_RECORD_TYPE)
         self.assertEqual(inspection.view.status, "classified")
         self.assertEqual(inspection.view.record_count, 2)
+
+    def test_inspect_run_includes_restart_lifecycle_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_restart(
+                    run_id="run-1",
+                    task_id="RT-04",
+                    restart_count=2,
+                    max_restarts=3,
+                    cooldown_seconds=0.5,
+                    reason="transient_worker_failure",
+                )
+            )
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_restart(
+                    run_id="run-1",
+                    task_id="RT-04",
+                    restart_count=3,
+                    max_restarts=3,
+                    cooldown_seconds=0.5,
+                    reason="restart_budget_exhausted",
+                    exhausted=True,
+                    attempted_restart_count=4,
+                )
+            )
+
+            inspection = store.inspect_run("run-1")
+
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(inspection.view.record_type, TASK_RESTART_RECORD_TYPE)
+        self.assertEqual(inspection.view.status, "restart_budget_exhausted")
+        self.assertEqual(inspection.view.restart_count, 3)
+        self.assertEqual(inspection.view.max_restarts, 3)
+        self.assertTrue(inspection.view.restart_exhausted)
+        self.assertEqual(
+            inspection.view.restart_exhausted_reason,
+            "restart_budget_exhausted",
+        )
+        self.assertEqual(inspection.records[-1]["attempted_restart_count"], 4)
 
     def test_recent_log_context_ignores_records_without_file_logs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

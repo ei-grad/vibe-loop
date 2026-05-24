@@ -68,6 +68,7 @@ from vibe_loop.runs import (
     RunLifecycleEvent,
     RunResult,
     RunStore,
+    TASK_RESTART_RECORD_TYPE,
     WorkerReport,
     WORKER_REPORT_STATUSES,
 )
@@ -1440,6 +1441,10 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tresult={payload['result_status']}" if payload["result_status"] else ""
         )
         lifecycle = f"\tlifecycle={payload['lifecycle_state'] or '-'}"
+        restart_count = payload.get("restart_count")
+        restarts = ""
+        if isinstance(restart_count, int) and restart_count > 0:
+            restarts = f"\trestarts={restart_count}/{payload['max_restarts']}"
         workspace = ""
         if isinstance(payload["workspace"], dict):
             dirty = "dirty" if payload["workspace"].get("dirty") else "clean"
@@ -1457,7 +1462,7 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
             f"\tcommand={payload['command']}{workspace}{lifecycle}{result}"
-            f"{diagnostics}{stale}"
+            f"{restarts}{diagnostics}{stale}"
         )
     return "\n".join(lines)
 
@@ -1601,6 +1606,16 @@ def render_run_inspection(inspection) -> str:
         ),
         f"records: {payload['record_count']}",
     ]
+    if payload["restart_count"] or payload["restart_exhausted"]:
+        lines.insert(
+            -1,
+            f"restarts: {payload['restart_count']}/{payload['max_restarts']}",
+        )
+    if payload["restart_exhausted"]:
+        lines.insert(
+            -1,
+            f"restart_exhausted: {payload['restart_exhausted_reason'] or '-'}",
+        )
     if payload["worker_report"]:
         lines.append(
             "worker_report: " + json.dumps(payload["worker_report"], sort_keys=True)
@@ -1616,6 +1631,11 @@ def render_run_inspection(inspection) -> str:
                 status = record.get("event_type") or "workspace_claimed"
             elif record_type == "workspace_claim_mismatch":
                 status = record.get("reason") or "mismatch"
+            elif record_type == TASK_RESTART_RECORD_TYPE:
+                if record.get("exhausted") is True:
+                    status = record.get("reason") or "restart_budget_exhausted"
+                else:
+                    status = "restart_scheduled"
             elif isinstance(record_type, str) and record_type.startswith("lock_"):
                 status = record_type.removeprefix("lock_")
         updated = (
@@ -1625,7 +1645,12 @@ def render_run_inspection(inspection) -> str:
             or record.get("claimed_at")
             or "-"
         )
-        lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}")
+        restart = ""
+        if record_type == TASK_RESTART_RECORD_TYPE:
+            restart = (
+                f"\trestart={record.get('restart_count')}/{record.get('max_restarts')}"
+            )
+        lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}{restart}")
     return "\n".join(lines)
 
 

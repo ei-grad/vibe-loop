@@ -251,6 +251,36 @@ class WorkerStateTests(unittest.TestCase):
         self.assertTrue(by_state["started"]["observed"])
         self.assertFalse(by_state["reported"]["observed"])
 
+    def test_worker_views_include_restart_count_from_active_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="RT-04",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent RT-04",
+                restart_count=2,
+                max_restarts=3,
+            )
+            manager.acquire("RT-04", "run-1", metadata=state.to_lock_metadata())
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+            payload = views[0].to_json()
+
+        self.assertEqual(payload["restart_count"], 2)
+        self.assertEqual(payload["max_restarts"], 3)
+
     def test_worker_views_ignore_invalid_or_mismatched_report_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

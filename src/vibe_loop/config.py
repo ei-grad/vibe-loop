@@ -98,6 +98,9 @@ PLANNING_ANALYTICS_DEFAULT_OUTPUTS = {
 }
 PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES = ("diagnostic", "disabled")
 PLANNING_ANALYTICS_DURATION_MODEL_NAMES = ("robust-duration-baseline-v1",)
+SUPERVISION_DEFAULT_MAX_RESTARTS = 3
+SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
+SUPERVISION_CONFIG_KEYS = frozenset({"max_restarts", "cooldown_seconds"})
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -319,6 +322,23 @@ class CompletionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SupervisionConfig:
+    max_restarts: int = SUPERVISION_DEFAULT_MAX_RESTARTS
+    cooldown_seconds: float = SUPERVISION_DEFAULT_COOLDOWN_SECONDS
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "max_restarts": self.max_restarts,
+            "cooldown_seconds": self.cooldown_seconds,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PlanningAnalyticsOutputs:
     timeline_json: str | None = None
     gantt_html: str | None = None
@@ -425,6 +445,9 @@ class VibeConfig:
     agent: AgentConfig = dataclasses.field(default_factory=AgentConfig)
     task_source: TaskSourceConfig = dataclasses.field(default_factory=TaskSourceConfig)
     completion: CompletionConfig = dataclasses.field(default_factory=CompletionConfig)
+    supervision: SupervisionConfig = dataclasses.field(
+        default_factory=SupervisionConfig
+    )
     planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
         default_factory=PlanningAnalyticsConfig
     )
@@ -451,6 +474,7 @@ def load_config(repo: Path) -> VibeConfig:
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
     agent = parse_agent(data.get("agent", {}))
+    supervision = parse_supervision(data.get("supervision", {}))
     planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
     specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
@@ -460,6 +484,7 @@ def load_config(repo: Path) -> VibeConfig:
         agent=agent,
         task_source=task_source,
         completion=completion,
+        supervision=supervision,
         planning_analytics=planning_analytics,
         specs=specs,
     )
@@ -668,6 +693,29 @@ def default_completion_commands(repo: Path) -> tuple[str, ...]:
             "uv run python scripts/generate_gantt.py --coverage-check",
         )
     return ()
+
+
+def parse_supervision(data: object) -> SupervisionConfig:
+    table = expect_table(data, "supervision")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - SUPERVISION_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            f"supervision contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    return SupervisionConfig(
+        max_restarts=nonnegative_int(
+            table.get("max_restarts"),
+            SUPERVISION_DEFAULT_MAX_RESTARTS,
+            "supervision.max_restarts",
+        ),
+        cooldown_seconds=nonnegative_float(
+            table.get("cooldown_seconds"),
+            SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
+            "supervision.cooldown_seconds",
+        ),
+        explicit_keys=explicit_keys,
+    )
 
 
 def parse_planning_analytics(data: object) -> PlanningAnalyticsConfig:
@@ -972,6 +1020,20 @@ def nonnegative_int(value: object, default: int, name: str) -> int:
     parsed = optional_int(value, default, name)
     if parsed < 0:
         raise ValueError(f"{name} must be a non-negative integer")
+    return parsed
+
+
+def nonnegative_float(value: object, default: float, name: str) -> float:
+    if value is None:
+        parsed = default
+    elif isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    else:
+        parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    if parsed < 0.0:
+        raise ValueError(f"{name} must be a non-negative number")
     return parsed
 
 

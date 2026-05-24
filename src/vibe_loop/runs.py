@@ -34,6 +34,7 @@ WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
 WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE = "workspace_claim_mismatch"
 RUN_STATE_TRANSITION_RECORD_TYPE = "run_state_transition"
+TASK_RESTART_RECORD_TYPE = "task_restart"
 LIFECYCLE_RECORD_TYPES = frozenset(
     {
         LOCK_ACQUIRED_RECORD_TYPE,
@@ -42,6 +43,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         WORKSPACE_CLAIM_RECORD_TYPE,
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
         RUN_STATE_TRANSITION_RECORD_TYPE,
+        TASK_RESTART_RECORD_TYPE,
     }
 )
 KNOWN_RECORD_TYPES = frozenset(
@@ -86,6 +88,8 @@ class RunResult:
     agent_default_policy: str = ""
     classification_source: str = ""
     worker_report: dict[str, object] | None = None
+    restart_count: int = 0
+    max_restarts: int = 0
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
@@ -106,6 +110,8 @@ class RunResult:
             "agent_default_policy": self.agent_default_policy,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
+            "restart_count": self.restart_count,
+            "max_restarts": self.max_restarts,
             "finished_at": self.finished_at,
         }
 
@@ -283,6 +289,35 @@ class RunLifecycleEvent:
             payload=event_payload,
         )
 
+    @classmethod
+    def task_restart(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        restart_count: int,
+        max_restarts: int,
+        cooldown_seconds: float,
+        reason: str,
+        exhausted: bool = False,
+        attempted_restart_count: int | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "restart_count": restart_count,
+            "max_restarts": max_restarts,
+            "cooldown_seconds": cooldown_seconds,
+            "reason": reason,
+            "exhausted": exhausted,
+        }
+        if attempted_restart_count is not None:
+            event_payload["attempted_restart_count"] = attempted_restart_count
+        return cls(
+            record_type=TASK_RESTART_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
     def to_record(self) -> dict[str, object]:
         record: dict[str, object] = {
             "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
@@ -349,6 +384,10 @@ class RunHistoryView:
     message: str
     classification_source: str
     worker_report: dict[str, Any] | None
+    restart_count: int
+    max_restarts: int
+    restart_exhausted: bool
+    restart_exhausted_reason: str
     record_count: int
     latest_record: dict[str, Any]
     lifecycle_progress: RunLifecycleProgress
@@ -374,6 +413,10 @@ class RunHistoryView:
             message=latest_text(valid_records, "message"),
             classification_source=latest_text(valid_records, "classification_source"),
             worker_report=latest_worker_report_payload(valid_records),
+            restart_count=latest_int(records, "restart_count") or 0,
+            max_restarts=latest_int(records, "max_restarts") or 0,
+            restart_exhausted=latest_restart_exhausted(records),
+            restart_exhausted_reason=latest_restart_exhausted_reason(records),
             record_count=len(records),
             latest_record=latest,
             lifecycle_progress=derive_run_lifecycle(records),
@@ -393,6 +436,10 @@ class RunHistoryView:
             "message": self.message,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
+            "restart_count": self.restart_count,
+            "max_restarts": self.max_restarts,
+            "restart_exhausted": self.restart_exhausted,
+            "restart_exhausted_reason": self.restart_exhausted_reason,
             "record_count": self.record_count,
             "latest_record": self.latest_record,
         }
@@ -666,6 +713,10 @@ def record_status(record: dict[str, Any]) -> str:
         return string_value(record.get("event_type")) or WORKSPACE_CLAIMED_EVENT_TYPE
     if record_type == WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE:
         return string_value(record.get("reason")) or "mismatch"
+    if record_type == TASK_RESTART_RECORD_TYPE:
+        if record.get("exhausted") is True:
+            return string_value(record.get("reason")) or "restart_budget_exhausted"
+        return "restart_scheduled"
     if record_type in {
         LOCK_ACQUIRED_RECORD_TYPE,
         LOCK_RELEASED_RECORD_TYPE,
@@ -717,6 +768,34 @@ def latest_text(records: list[dict[str, Any]], key: str) -> str:
         value = string_value(record.get(key))
         if value:
             return value
+    return ""
+
+
+def latest_int(records: list[dict[str, Any]], key: str) -> int | None:
+    for record in reversed(records):
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def latest_restart_exhausted(records: list[dict[str, Any]]) -> bool:
+    return any(
+        record.get("record_type") == TASK_RESTART_RECORD_TYPE
+        and record.get("exhausted") is True
+        for record in records
+    )
+
+
+def latest_restart_exhausted_reason(records: list[dict[str, Any]]) -> str:
+    for record in reversed(records):
+        if (
+            record.get("record_type") == TASK_RESTART_RECORD_TYPE
+            and record.get("exhausted") is True
+        ):
+            return string_value(record.get("reason"))
     return ""
 
 

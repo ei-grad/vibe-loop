@@ -116,6 +116,8 @@ class ActiveRunState:
     resources: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
     conflict_domains_known: bool = False
+    restart_count: int = 0
+    max_restarts: int = 0
     worker_pid: int | None = None
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
@@ -136,6 +138,8 @@ class ActiveRunState:
         resources: tuple[str, ...] = (),
         paths: tuple[str, ...] = (),
         conflict_domains_known: bool = False,
+        restart_count: int = 0,
+        max_restarts: int = 0,
     ) -> ActiveRunState:
         return cls(
             task_id=task_id,
@@ -147,6 +151,8 @@ class ActiveRunState:
             resources=resources,
             paths=paths,
             conflict_domains_known=conflict_domains_known,
+            restart_count=restart_count,
+            max_restarts=max_restarts,
             supervisor_pid=os.getpid(),
         )
 
@@ -184,6 +190,8 @@ class ActiveRunState:
             conflict_domains_known=optional_bool(
                 metadata.get("conflict_domains_known")
             ),
+            restart_count=optional_int(metadata.get("restart_count")) or 0,
+            max_restarts=optional_int(metadata.get("max_restarts")) or 0,
             worker_pid=worker_pid,
             pid_source=pid_source,
             pid_scope=(
@@ -219,6 +227,8 @@ class ActiveRunState:
             "resources": list(self.resources),
             "paths": list(self.paths),
             "conflict_domains_known": self.conflict_domains_known,
+            "restart_count": self.restart_count,
+            "max_restarts": self.max_restarts,
         }
         if self.workspace is not None:
             metadata["workspace"] = self.workspace.to_json()
@@ -334,6 +344,8 @@ class WorkerView:
             "resources": list(self.active.resources),
             "paths": list(self.active.paths),
             "conflict_domains_known": self.active.conflict_domains_known,
+            "restart_count": self.active.restart_count,
+            "max_restarts": self.active.max_restarts,
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
             "workspace": (
                 self.active.workspace.to_json()

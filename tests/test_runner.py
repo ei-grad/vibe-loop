@@ -18,6 +18,8 @@ from vibe_loop.config import (
     AgentConfig,
     CompletionConfig,
     SpecDiagnosticsConfig,
+    SupervisionConfig,
+    SUPERVISION_DEFAULT_MAX_RESTARTS,
     VibeConfig,
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
@@ -2009,8 +2011,6 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertEqual(results[-1].classification, "completed")
 
     def test_serial_loop_gives_up_after_max_transient_retries(self) -> None:
-        from vibe_loop.runner import MAX_TRANSIENT_TASK_RETRIES
-
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             runner = VibeRunner(
@@ -2039,14 +2039,118 @@ class TransientWorkerFailureTests(unittest.TestCase):
             with patch("vibe_loop.runner.time.sleep"):
                 results = runner.run_until_done_serial(continue_on_failure=True)
 
-        self.assertEqual(len(results), MAX_TRANSIENT_TASK_RETRIES + 1)
+        self.assertEqual(len(results), SUPERVISION_DEFAULT_MAX_RESTARTS + 1)
         self.assertTrue(all(r.classification == "failed" for r in results))
+        self.assertEqual(
+            results[-1].classification_source,
+            "restart_budget_exhausted",
+        )
+
+    def test_serial_loop_honors_configured_restart_budget_and_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.25,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("Error: 429 rate limit\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                return RunResult(
+                    run_id=f"run-{restart_count}",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            runner.run_task = run_task
+            with patch("vibe_loop.runner.time.sleep") as sleep:
+                results = runner.run_until_done_serial(continue_on_failure=True)
+
+            records = runner.run_store.read_records()
+
+        self.assertEqual([result.restart_count for result in results], [0, 1])
+        self.assertEqual(results[-1].classification_source, "restart_budget_exhausted")
+        sleep.assert_called_once_with(0.25)
+        restart_records = [
+            record for record in records if record.get("record_type") == "task_restart"
+        ]
+        self.assertEqual(len(restart_records), 2)
+        self.assertEqual(restart_records[0]["restart_count"], 1)
+        self.assertFalse(restart_records[0]["exhausted"])
+        self.assertEqual(restart_records[1]["restart_count"], 1)
+        self.assertEqual(restart_records[1]["attempted_restart_count"], 2)
+        self.assertTrue(restart_records[1]["exhausted"])
+        self.assertEqual(restart_records[1]["reason"], "restart_budget_exhausted")
+
+    def test_restart_counts_do_not_accumulate_across_supervisor_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(max_restarts=1, cooldown_seconds=0),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("Error: 503 Service Unavailable\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            run_sequence = 0
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal run_sequence
+                run_sequence += 1
+                restart_count = runner.current_restart_count(task.task_id)
+                return RunResult(
+                    run_id=f"run-{run_sequence}",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            runner.run_task = run_task
+            with patch("vibe_loop.runner.time.sleep"):
+                first = runner.run_until_done_serial(continue_on_failure=True)
+                second = runner.run_until_done_serial(continue_on_failure=True)
+
+        self.assertEqual([result.restart_count for result in first], [0, 1])
+        self.assertEqual([result.restart_count for result in second], [0, 1])
 
     def test_parallel_loop_retries_transient_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             runner = VibeRunner(
-                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(cooldown_seconds=0),
+                )
             )
             log_path = repo / "transient.log"
             log_path.write_text("overloaded, please wait\n", encoding="utf-8")
@@ -2096,6 +2200,239 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertEqual(call_count, 2)
         self.assertEqual(len(results), 2)
         self.assertEqual(results[-1].classification, "completed")
+
+    def test_parallel_loop_honors_configured_restart_budget_and_cooldown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.25,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            clock = [0.0]
+            sleeps: list[float] = []
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                return RunResult(
+                    run_id=f"run-{restart_count}",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            def advance_clock(delay: float) -> None:
+                sleeps.append(delay)
+                clock[0] += delay
+
+            runner.run_task = run_task
+            with (
+                patch(
+                    "vibe_loop.runner.time.monotonic",
+                    side_effect=lambda: clock[0],
+                ),
+                patch("vibe_loop.runner.time.sleep", side_effect=advance_clock),
+            ):
+                results = runner.run_until_done_parallel(
+                    ask_agent=False,
+                    max_slices=0,
+                    continue_on_failure=True,
+                    jobs=1,
+                )
+            records = runner.run_store.read_records()
+
+        self.assertEqual([result.restart_count for result in results], [0, 1])
+        self.assertEqual(results[-1].classification, "failed")
+        self.assertEqual(
+            results[-1].classification_source,
+            "restart_budget_exhausted",
+        )
+        self.assertEqual(sleeps, [0.25])
+        restart_records = [
+            record for record in records if record.get("record_type") == "task_restart"
+        ]
+        self.assertEqual(len(restart_records), 2)
+        self.assertFalse(restart_records[0]["exhausted"])
+        self.assertTrue(restart_records[1]["exhausted"])
+
+    def test_parallel_loop_rebuilds_candidates_when_cooldown_expires_during_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.25,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            clock = [0.0]
+            original_list_candidates = runner.list_candidates
+            discovery_advanced = False
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                if restart_count:
+                    source.mark_done(task.task_id)
+                return RunResult(
+                    run_id=f"run-{restart_count}",
+                    task_id=task.task_id,
+                    classification="completed" if restart_count else "failed",
+                    exit_code=0 if restart_count else 1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb" if restart_count else "aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            def list_candidates(exclude: set[str] | None = None) -> list[Task]:
+                nonlocal discovery_advanced
+                candidates = original_list_candidates(exclude=exclude)
+                if (
+                    exclude is not None
+                    and "TASK-01" in exclude
+                    and not discovery_advanced
+                ):
+                    discovery_advanced = True
+                    clock[0] = 0.25
+                return candidates
+
+            runner.run_task = run_task
+            runner.list_candidates = list_candidates
+            with (
+                patch(
+                    "vibe_loop.runner.time.monotonic",
+                    side_effect=lambda: clock[0],
+                ),
+                patch("vibe_loop.runner.time.sleep") as sleep,
+            ):
+                results = runner.run_until_done_parallel(
+                    ask_agent=False,
+                    max_slices=0,
+                    continue_on_failure=False,
+                    jobs=1,
+                )
+
+        self.assertTrue(discovery_advanced)
+        sleep.assert_not_called()
+        self.assertEqual([result.restart_count for result in results], [0, 1])
+        self.assertEqual(results[-1].classification, "completed")
+
+    def test_parallel_loop_requeues_ready_retry_while_other_task_is_running(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.01,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [
+                    Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                    Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                ]
+            )
+            runner._source = source
+            retry_started = threading.Event()
+            b_finished = threading.Event()
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                if task.task_id == "TASK-01" and restart_count == 0:
+                    return RunResult(
+                        run_id="run-a-0",
+                        task_id=task.task_id,
+                        classification="failed",
+                        exit_code=1,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                        restart_count=restart_count,
+                        max_restarts=runner.config.supervision.max_restarts,
+                    )
+                if task.task_id == "TASK-01":
+                    retry_started.set()
+                    source.mark_done(task.task_id)
+                    return RunResult(
+                        run_id="run-a-1",
+                        task_id=task.task_id,
+                        classification="completed",
+                        exit_code=0,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="bbb",
+                        restart_count=restart_count,
+                        max_restarts=runner.config.supervision.max_restarts,
+                    )
+                retry_started.wait(timeout=1.0)
+                b_finished.set()
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-b",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "task-b.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done_parallel(
+                ask_agent=False,
+                max_slices=0,
+                continue_on_failure=False,
+                jobs=2,
+                max_tasks=2,
+            )
+
+        self.assertTrue(retry_started.is_set())
+        self.assertTrue(b_finished.is_set())
+        self.assertEqual(
+            [result.task_id for result in results],
+            ["TASK-01", "TASK-01", "TASK-02"],
+        )
+        self.assertEqual(results[1].restart_count, 1)
+        self.assertEqual(results[1].classification, "completed")
 
 
 if __name__ == "__main__":

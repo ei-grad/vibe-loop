@@ -444,6 +444,10 @@ commands = [
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
 
+[supervision]
+max_restarts = 3
+cooldown_seconds = 30.0
+
 [planning_analytics]
 schedule_policy = "current-runner-parity"
 subject_matching = "diagnostic"

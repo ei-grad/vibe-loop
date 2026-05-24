@@ -185,8 +185,6 @@ CLI output before making assumptions.
 """
 RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS = 5.0
 RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
-MAX_TRANSIENT_TASK_RETRIES = 3
-TRANSIENT_COOLDOWN_SECONDS = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -268,6 +266,7 @@ class VibeRunner:
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()
+        self._restart_context = threading.local()
 
     @property
     def source_resolution(self) -> RuntimeTaskSourceResolution:
@@ -448,6 +447,34 @@ class VibeRunner:
             return "No active vibe-loop workers recorded."
         return "Active vibe-loop workers:\n" + json.dumps(workers, indent=2)
 
+    def run_task_with_supervision(
+        self,
+        task: Task,
+        *,
+        restart_count: int = 0,
+    ) -> RunResult:
+        previous = getattr(self._restart_context, "value", None)
+        self._restart_context.value = (task.task_id, restart_count)
+        try:
+            return self.run_task(task)
+        finally:
+            if previous is None:
+                try:
+                    del self._restart_context.value
+                except AttributeError:
+                    pass
+            else:
+                self._restart_context.value = previous
+
+    def current_restart_count(self, task_id: str) -> int:
+        value = getattr(self._restart_context, "value", None)
+        if not isinstance(value, tuple) or len(value) != 2:
+            return 0
+        context_task_id, restart_count = value
+        if context_task_id != task_id or not isinstance(restart_count, int):
+            return 0
+        return max(0, restart_count)
+
     def run_task(self, task: Task) -> RunResult:
         self.ensure_spec_execution_gate()
         command_template = self.config.agent.require_command()
@@ -456,6 +483,8 @@ class VibeRunner:
         log_path = self.runs_dir / f"{run_id}.log"
         start_main = git_rev_parse(self.config.repo, "HEAD")
         base_main = git_rev_parse(self.config.repo, self.config.main_branch)
+        restart_count = self.current_restart_count(task.task_id)
+        max_restarts = self.config.supervision.max_restarts
         exit_code = 1
         message = ""
         session_id = run_id
@@ -483,6 +512,8 @@ class VibeRunner:
             resources=task.resources,
             paths=task.paths,
             conflict_domains_known=task.conflict_domains_known,
+            restart_count=restart_count,
+            max_restarts=max_restarts,
         )
         task_lock = self.acquire_scheduled_task_lock(
             task,
@@ -500,6 +531,8 @@ class VibeRunner:
                     "resources": list(task.resources),
                     "paths": list(task.paths),
                     "conflict_domains_known": task.conflict_domains_known,
+                    "restart_count": restart_count,
+                    "max_restarts": max_restarts,
                 },
             )
         )
@@ -526,6 +559,11 @@ class VibeRunner:
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"run_id={run_id}", log)
                 report_status(f"log: {log_path}", log)
+                if restart_count:
+                    report_status(
+                        f"restart_count={restart_count}/{max_restarts}",
+                        log,
+                    )
                 report_status(
                     f"agent command source: {self.config.agent.command_source}",
                     log,
@@ -638,6 +676,8 @@ class VibeRunner:
                 worker_report=(
                     worker_report.to_json() if worker_report is not None else None
                 ),
+                restart_count=restart_count,
+                max_restarts=max_restarts,
             )
             self.record_result(result)
             report_status(
@@ -732,7 +772,10 @@ class VibeRunner:
             scheduler_lock.handle.close()
 
     def run_next(
-        self, ask_agent: bool = False, exclude: set[str] | None = None
+        self,
+        ask_agent: bool = False,
+        exclude: set[str] | None = None,
+        restart_counts: dict[str, int] | None = None,
     ) -> RunResult | None:
         candidates = self.list_candidates(exclude=exclude)
         if not candidates:
@@ -741,12 +784,20 @@ class VibeRunner:
         self.config.agent.require_command()
         task = self.select_from_candidates(candidates, ask_agent=ask_agent)
         try:
-            return self.run_task(task)
+            restart_count = (restart_counts or {}).get(task.task_id, 0)
+            return self.run_task_with_supervision(
+                task,
+                restart_count=restart_count,
+            )
         except LockBusy:
             report_status(f"task locked during acquire, retrying: {task.task_id}")
             excluded = set(exclude or set())
             excluded.add(task.task_id)
-            return self.run_next(ask_agent=ask_agent, exclude=excluded)
+            return self.run_next(
+                ask_agent=ask_agent,
+                exclude=excluded,
+                restart_counts=restart_counts,
+            )
 
     def run_until_done(
         self,
@@ -791,7 +842,11 @@ class VibeRunner:
         transient_retries: dict[str, int] = {}
         completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
-            result = self.run_next(ask_agent=ask_agent, exclude=skipped | yielded)
+            result = self.run_next(
+                ask_agent=ask_agent,
+                exclude=skipped | yielded,
+                restart_counts=transient_retries,
+            )
             if result is None:
                 if yielded:
                     yielded.clear()
@@ -808,14 +863,17 @@ class VibeRunner:
             if is_transient_worker_failure(result):
                 count = transient_retries.get(result.task_id, 0) + 1
                 transient_retries[result.task_id] = count
-                if count <= MAX_TRANSIENT_TASK_RETRIES:
+                if count <= self.config.supervision.max_restarts:
+                    self.record_task_restart(result, count, exhausted=False)
                     report_status(
                         f"transient failure for {result.task_id} "
-                        f"(attempt {count}/{MAX_TRANSIENT_TASK_RETRIES}), "
-                        f"cooling down {TRANSIENT_COOLDOWN_SECONDS:.0f}s"
+                        f"(restart {count}/{self.config.supervision.max_restarts}), "
+                        f"cooling down {self.config.supervision.cooldown_seconds:.0f}s"
                     )
-                    time.sleep(TRANSIENT_COOLDOWN_SECONDS)
+                    time.sleep(self.config.supervision.cooldown_seconds)
                     continue
+                result = self.record_restart_budget_exhausted(result, count)
+                results[-1] = result
                 report_status(
                     f"transient retries exhausted for {result.task_id}, skipping"
                 )
@@ -838,6 +896,7 @@ class VibeRunner:
         results: list[RunResult] = []
         skipped: set[str] = set()
         transient_retries: dict[str, int] = {}
+        retry_ready_at: dict[str, float] = {}
         completed_count = 0
         in_flight: dict[Future[RunResult], str] = {}
         scheduled: dict[str, Task] = {}
@@ -856,7 +915,16 @@ class VibeRunner:
                     and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
                     and (max_tasks <= 0 or completed_count + len(in_flight) < max_tasks)
                 ):
-                    candidates = self.list_candidates(exclude=skipped | set(scheduled))
+                    discard_ready_retries(retry_ready_at)
+                    now = time.monotonic()
+                    cooling_down = {
+                        task_id
+                        for task_id, ready_at in retry_ready_at.items()
+                        if ready_at > now
+                    }
+                    candidates = self.list_candidates(
+                        exclude=skipped | set(scheduled) | cooling_down
+                    )
                     candidates = filter_scheduled_conflicts(
                         candidates,
                         list(scheduled.values()),
@@ -891,17 +959,54 @@ class VibeRunner:
                     for task in tasks:
                         scheduled[task.task_id] = task
                         report_status(f"queueing {task.task_id}: {task.title}")
-                        in_flight[executor.submit(self.run_task, task)] = task.task_id
+                        in_flight[
+                            executor.submit(
+                                self.run_task_with_supervision,
+                                task,
+                                restart_count=transient_retries.get(task.task_id, 0),
+                            )
+                        ] = task.task_id
                     if ask_agent and len(candidates) > 1 and len(tasks) < open_slots:
                         break
 
+                if discard_ready_retries(retry_ready_at):
+                    continue
+
                 if not in_flight:
+                    retry_delay = next_retry_delay(retry_ready_at)
+                    if (
+                        retry_delay is not None
+                        and not stop_after_running
+                        and (
+                            max_slices <= 0
+                            or len(results) + len(in_flight) < max_slices
+                        )
+                        and (
+                            max_tasks <= 0
+                            or completed_count + len(in_flight) < max_tasks
+                        )
+                    ):
+                        time.sleep(retry_delay)
+                        continue
                     break
 
+                wait_timeout = None
+                retry_delay = next_retry_delay(retry_ready_at)
+                if (
+                    retry_delay is not None
+                    and not stop_after_running
+                    and len(in_flight) < jobs
+                    and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
+                    and (max_tasks <= 0 or completed_count + len(in_flight) < max_tasks)
+                ):
+                    wait_timeout = retry_delay
                 completed, _pending = wait(
                     in_flight,
                     return_when=FIRST_COMPLETED,
+                    timeout=wait_timeout,
                 )
+                if not completed:
+                    continue
                 for future in completed:
                     task_id = in_flight.pop(future)
                     scheduled.pop(task_id, None)
@@ -923,6 +1028,7 @@ class VibeRunner:
                     results.append(result)
                     if result.classification == "completed":
                         transient_retries.pop(result.task_id, None)
+                        retry_ready_at.pop(result.task_id, None)
                         completed_count += 1
                         if max_tasks > 0 and completed_count >= max_tasks:
                             stop_after_running = True
@@ -930,13 +1036,22 @@ class VibeRunner:
                     if is_transient_worker_failure(result):
                         count = transient_retries.get(result.task_id, 0) + 1
                         transient_retries[result.task_id] = count
-                        if count <= MAX_TRANSIENT_TASK_RETRIES:
+                        if count <= self.config.supervision.max_restarts:
+                            self.record_task_restart(result, count, exhausted=False)
+                            retry_ready_at[result.task_id] = (
+                                time.monotonic()
+                                + self.config.supervision.cooldown_seconds
+                            )
                             report_status(
                                 f"transient failure for {result.task_id} "
-                                f"(attempt {count}/{MAX_TRANSIENT_TASK_RETRIES}), "
+                                f"(restart {count}/"
+                                f"{self.config.supervision.max_restarts}), "
                                 "will re-enqueue"
                             )
                             continue
+                        result = self.record_restart_budget_exhausted(result, count)
+                        results[-1] = result
+                        retry_ready_at.pop(result.task_id, None)
                         report_status(
                             f"transient retries exhausted for {result.task_id}, "
                             "skipping"
@@ -968,6 +1083,58 @@ class VibeRunner:
 
     def ensure_spec_execution_gate(self) -> None:
         ensure_spec_execution_gate(self.config, self.source.list_tasks())
+
+    def record_task_restart(
+        self,
+        result: RunResult,
+        restart_count: int,
+        *,
+        exhausted: bool,
+        attempted_restart_count: int | None = None,
+    ) -> None:
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_restart(
+                run_id=result.run_id,
+                task_id=result.task_id,
+                restart_count=restart_count,
+                max_restarts=self.config.supervision.max_restarts,
+                cooldown_seconds=self.config.supervision.cooldown_seconds,
+                reason=(
+                    "restart_budget_exhausted"
+                    if exhausted
+                    else "transient_worker_failure"
+                ),
+                exhausted=exhausted,
+                attempted_restart_count=attempted_restart_count,
+            )
+        )
+
+    def record_restart_budget_exhausted(
+        self,
+        result: RunResult,
+        attempted_restart_count: int,
+    ) -> RunResult:
+        max_restarts = self.config.supervision.max_restarts
+        restarts_used = min(max(0, attempted_restart_count - 1), max_restarts)
+        self.record_task_restart(
+            result,
+            restarts_used,
+            exhausted=True,
+            attempted_restart_count=attempted_restart_count,
+        )
+        exhausted = dataclasses.replace(
+            result,
+            classification="failed",
+            classification_source="restart_budget_exhausted",
+            message=(
+                "restart budget exhausted after "
+                f"{max_restarts} restart(s) for {result.task_id}"
+            ),
+            restart_count=restarts_used,
+            max_restarts=max_restarts,
+        )
+        self.record_result(exhausted)
+        return exhausted
 
     def classify(
         self,
@@ -2360,6 +2527,24 @@ def is_transient_worker_failure(
     except OSError:
         return False
     return is_transient_stderr(tail)
+
+
+def next_retry_delay(retry_ready_at: dict[str, float]) -> float | None:
+    now = time.monotonic()
+    future_times = [ready_at for ready_at in retry_ready_at.values() if ready_at > now]
+    if not future_times:
+        return None
+    return max(0.0, min(future_times) - now)
+
+
+def discard_ready_retries(retry_ready_at: dict[str, float]) -> bool:
+    now = time.monotonic()
+    ready_task_ids = [
+        task_id for task_id, ready_at in retry_ready_at.items() if ready_at <= now
+    ]
+    for task_id in ready_task_ids:
+        retry_ready_at.pop(task_id, None)
+    return bool(ready_task_ids)
 
 
 def _read_log_tail(path: Path, max_lines: int) -> str:
