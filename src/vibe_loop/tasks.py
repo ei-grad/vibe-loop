@@ -329,7 +329,7 @@ class MarkdownRecord:
     @property
     def source(self) -> str:
         location = self.section or f"line {self.line_number}"
-        return f"{self.path}:{location}"
+        return f"{self.path.as_posix()}:{location}"
 
 
 @dataclasses.dataclass(frozen=True)

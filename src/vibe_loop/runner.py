@@ -60,7 +60,12 @@ from vibe_loop.runs import (
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
-from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
+from vibe_loop.workers import (
+    ActiveRunState,
+    WorkerView,
+    active_run_is_live,
+    build_worker_views,
+)
 
 try:
     import fcntl
@@ -1904,7 +1909,7 @@ def load_spec_context_artifact(
         }
     repo = config.repo.resolve()
     requested_path = config.repo / safe_path
-    if path_has_symlink_component(repo, requested_path):
+    if path_has_symlink_component(config.repo, requested_path):
         return {
             "skipped": skipped_spec_context_artifact(
                 safe_path,
@@ -2061,11 +2066,13 @@ def secret_like_prompt_value(value: str) -> bool:
 
 
 def path_has_symlink_component(repo: Path, path: Path) -> bool:
+    base = repo if repo.is_absolute() else repo.absolute()
+    candidate = path if path.is_absolute() else path.absolute()
     try:
-        relative = path.relative_to(repo)
+        relative = candidate.relative_to(base)
     except ValueError:
         return False
-    current = repo
+    current = base
     for part in relative.parts:
         current = current / part
         if current.is_symlink():
@@ -2687,6 +2694,11 @@ def active_lock_conflict_domains(
     for metadata in lock_manager.list_locks():
         active = ActiveRunState.from_lock_metadata(metadata)
         if active is None:
+            continue
+        # Only live runs hold their conflict-domain leases. A lock left behind
+        # by a dead/expired run must not keep serializing unrelated work
+        # against its (often broad) domain set.
+        if not active_run_is_live(active):
             continue
         domains.append(conflict_domains_from_task_like(active))
     return tuple(domains)

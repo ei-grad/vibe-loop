@@ -2134,6 +2134,28 @@ def acquire_main_integration_command(
             time.sleep(min(args.poll_interval, remaining))
             continue
         status = manager.main_integration_status()
+        post_acquire_preflight = main_integration_workspace_preflight_error(
+            config,
+            manager,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if post_acquire_preflight is not None:
+            try:
+                manager.release_main_integration(task_id=task_id, run_id=run_id)
+            except (LockOwnerMismatch, LockFencingMismatch, LockBackendError):
+                pass
+            record_workspace_preflight_mismatch(
+                run_store,
+                run_id=run_id,
+                task_id=task_id,
+                preflight=post_acquire_preflight,
+            )
+            return finish_main_integration_preflight_error(
+                args,
+                manager,
+                post_acquire_preflight,
+            )
         run_store.append_lifecycle_event(
             RunLifecycleEvent.lock_event(
                 LOCK_ACQUIRED_RECORD_TYPE,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+import socket
 import sys
 import tempfile
 import threading
@@ -27,6 +29,7 @@ from vibe_loop.runner import (
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     SchedulerLockBusy,
     VibeRunner,
+    active_lock_conflict_domains,
     build_batch_selection_prompt,
     build_selection_prompt,
     build_spec_worker_context,
@@ -72,6 +75,15 @@ class MutableTaskSource:
             self._done.add(task_id)
 
 
+def file_fingerprint(path: Path, relative_path: str) -> dict[str, object]:
+    raw = path.read_bytes()
+    return {
+        "path": relative_path,
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 class RunnerTests(unittest.TestCase):
     def test_selection_prompt_includes_recent_logs(self) -> None:
         task = Task(task_id="LIVE-04", title="Realtime reconcile", status="Next")
@@ -115,11 +127,7 @@ class RunnerTests(unittest.TestCase):
             )
             (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
             (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
-            fingerprint = {
-                "path": "docs/spec.md",
-                "size": len(spec_text.encode("utf-8")),
-                "sha256": hashlib.sha256(spec_text.encode("utf-8")).hexdigest(),
-            }
+            fingerprint = file_fingerprint(repo / "docs" / "spec.md", "docs/spec.md")
             task = Task(
                 task_id="TRACE-01",
                 title="Trace task",
@@ -233,7 +241,7 @@ class RunnerTests(unittest.TestCase):
                 source_fingerprints=(
                     {
                         "path": "docs/spec.md",
-                        "size": len(spec_text.encode("utf-8")),
+                        "size": (repo / "docs" / "spec.md").stat().st_size,
                         "sha256": "1" * 64,
                     },
                     {
@@ -276,7 +284,7 @@ class RunnerTests(unittest.TestCase):
                 source_fingerprints=(
                     {
                         "path": "docs/spec.md",
-                        "size": len(spec_text.encode("utf-8")),
+                        "size": (repo / "docs" / "spec.md").stat().st_size,
                         "sha256": "https://hooks.slack.com/services/T/B/C",
                         "webhook_url": "https://hooks.slack.com/services/T/B/C",
                         "api_token": "secret-token",
@@ -1048,11 +1056,7 @@ class RunnerTests(unittest.TestCase):
             spec_path = repo / "docs" / "spec.md"
             spec_text = "current spec\n"
             spec_path.write_text(spec_text, encoding="utf-8")
-            fingerprint = {
-                "path": "docs/spec.md",
-                "size": len(spec_text),
-                "sha256": hashlib.sha256(spec_text.encode("utf-8")).hexdigest(),
-            }
+            fingerprint = file_fingerprint(spec_path, "docs/spec.md")
             runner = VibeRunner(
                 VibeConfig(
                     repo=repo,
@@ -2511,6 +2515,180 @@ class TransientWorkerFailureTests(unittest.TestCase):
             if result.task_id == "TASK-01" and result.classification == "completed"
         )
         self.assertEqual(retry_result.restart_count, 1)
+
+
+def _active_run_state(
+    *,
+    task_id: str,
+    run_id: str,
+    worker_pid: int,
+    host: str,
+    repo: Path,
+    paths: tuple[str, ...] = (),
+    resources: tuple[str, ...] = (),
+) -> ActiveRunState:
+    return ActiveRunState(
+        task_id=task_id,
+        run_id=run_id,
+        worker_pid=worker_pid,
+        supervisor_pid=worker_pid,
+        host=host,
+        started_at="2026-05-09T00:00:00+00:00",
+        log_path=repo / ".vibe-loop" / "runs" / f"{run_id}.log",
+        base_main="abc123",
+        command=f"agent {task_id}",
+        paths=paths,
+        resources=resources,
+        conflict_domains_known=True,
+    )
+
+
+class ActiveLockConflictDomainLivenessTests(unittest.TestCase):
+    """A lock only leases its conflict domains while its run is actually live.
+
+    Regression guard for the run-until-done empty-selection bug: a lock left
+    behind by a dead worker (matching host, dead pid) kept serializing its
+    broad path/resource domains, which blocked every dep-free ready task that
+    shared one of those domains and made the runnable set empty.
+    """
+
+    def test_stale_lock_does_not_hold_conflict_domains(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            state = _active_run_state(
+                task_id="DEAD-OWNER",
+                run_id="run-dead",
+                worker_pid=999999999,  # not a live pid on this host
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("kernel/src/cap", "Makefile"),
+                resources=("resource:system-monitoring",),
+            )
+            manager.acquire("DEAD-OWNER", "run-dead", metadata=state.to_lock_metadata())
+
+            domains = active_lock_conflict_domains(manager)
+
+            self.assertEqual(
+                domains,
+                (),
+                "a dead-owner lock must not keep leasing its conflict domains",
+            )
+
+    def test_live_lock_still_holds_conflict_domains(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            state = _active_run_state(
+                task_id="LIVE-OWNER",
+                run_id="run-live",
+                worker_pid=os.getpid(),  # this test process is alive
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("kernel/src/cap", "Makefile"),
+                resources=("resource:system-monitoring",),
+            )
+            manager.acquire("LIVE-OWNER", "run-live", metadata=state.to_lock_metadata())
+
+            domains = active_lock_conflict_domains(manager)
+
+            self.assertEqual(
+                len(domains),
+                1,
+                "a live lock must keep serializing its conflict domains",
+            )
+            self.assertIn("Makefile", domains[0].paths)
+            self.assertIn("resource:system-monitoring", domains[0].resources)
+
+
+class StaleLockSelectionDrainingTests(unittest.TestCase):
+    """list_candidates drains dep-free ready tasks past a stale broad lock."""
+
+    def _runner(self, repo: Path, tasks: list[Task]) -> VibeRunner:
+        runner = VibeRunner(VibeConfig(repo=repo, agent=AgentConfig(command="worker")))
+        runner._source = MutableTaskSource(tasks)
+        return runner
+
+    def test_dep_free_tasks_selectable_despite_stale_broad_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop").mkdir(parents=True, exist_ok=True)
+            tasks = [
+                Task(
+                    task_id="dep-free-a",
+                    title="dep-free a",
+                    status="Next",
+                    paths=("kernel/src/cap",),
+                    resources=("resource:a",),
+                    conflict_domains_known=True,
+                ),
+                Task(
+                    task_id="dep-free-b",
+                    title="dep-free b",
+                    status="Next",
+                    paths=("Makefile",),
+                    resources=("resource:b",),
+                    conflict_domains_known=True,
+                ),
+            ]
+            runner = self._runner(repo, tasks)
+            # Stale lock with broad paths overlapping both ready tasks.
+            stale = _active_run_state(
+                task_id="stale-owner",
+                run_id="run-stale",
+                worker_pid=999999999,
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("kernel/src/cap", "Makefile"),
+                resources=("resource:stale",),
+            )
+            runner.lock_manager.acquire(
+                "stale-owner", "run-stale", metadata=stale.to_lock_metadata()
+            )
+
+            candidate_ids = {task.task_id for task in runner.list_candidates()}
+
+            self.assertEqual(candidate_ids, {"dep-free-a", "dep-free-b"})
+
+    def test_live_broad_lock_still_serializes_overlapping_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop").mkdir(parents=True, exist_ok=True)
+            tasks = [
+                Task(
+                    task_id="overlaps",
+                    title="overlaps Makefile",
+                    status="Next",
+                    paths=("Makefile",),
+                    resources=("resource:a",),
+                    conflict_domains_known=True,
+                ),
+                Task(
+                    task_id="disjoint",
+                    title="disjoint domain",
+                    status="Next",
+                    paths=("demos/",),
+                    resources=("resource:b",),
+                    conflict_domains_known=True,
+                ),
+            ]
+            runner = self._runner(repo, tasks)
+            live = _active_run_state(
+                task_id="live-owner",
+                run_id="run-live",
+                worker_pid=os.getpid(),
+                host=socket.gethostname(),
+                repo=repo,
+                paths=("Makefile",),
+                resources=("resource:live",),
+            )
+            runner.lock_manager.acquire(
+                "live-owner", "run-live", metadata=live.to_lock_metadata()
+            )
+
+            candidate_ids = {task.task_id for task in runner.list_candidates()}
+
+            self.assertEqual(candidate_ids, {"disjoint"})
 
 
 if __name__ == "__main__":

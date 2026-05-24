@@ -1290,6 +1290,29 @@ def classify_process(
     return "running" if process_checker(active.worker_pid) else "missing"
 
 
+def active_run_is_live(
+    active: ActiveRunState,
+    *,
+    current_host: str | None = None,
+    process_exists: ProcessExists | None = None,
+) -> bool:
+    """Whether an active-run lock still represents a run that may make progress.
+
+    Mirrors the staleness rules in ``build_worker_views``: a run whose owning
+    process is gone (missing pid / no recorded pid), whose lease expired, or
+    whose run_id is missing is not live and must not keep holding its
+    conflict-domain leases. A run on another host is treated as live (uncertain
+    rather than provably dead) so cross-host work still serializes.
+    """
+    if not active.run_id:
+        return False
+    if lock_lease_expired(active.to_lock_metadata()):
+        return False
+    host = current_host if current_host is not None else socket.gethostname()
+    process_state = classify_process(active, host, process_exists)
+    return process_state not in {"missing", "unknown_pid"}
+
+
 def latest_worker_status_by_run_id(
     records: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:

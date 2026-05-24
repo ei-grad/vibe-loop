@@ -53,7 +53,20 @@ def remove_tree_with_windows_retries(path: Path) -> None:
         except PermissionError:
             if attempt == attempts - 1:
                 raise
-            time.sleep(delay)
+        time.sleep(delay)
+
+
+def toml_string(value: str) -> str:
+    return json.dumps(value)
+
+
+def file_fingerprint(path: Path, relative_path: str) -> dict[str, object]:
+    raw = path.read_bytes()
+    return {
+        "path": relative_path,
+        "size": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
 
 
 def parse_run_result(
@@ -1835,7 +1848,7 @@ class CliTests(unittest.TestCase):
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
                 'type = "command"\n'
-                f'list = "{sys.executable} task_source.py"\n'
+                f"list = {toml_string(f'{sys.executable} task_source.py')}\n"
                 "[specs]\n"
                 "require_approved = true\n",
                 encoding="utf-8",
@@ -1880,7 +1893,7 @@ class CliTests(unittest.TestCase):
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
                 'type = "command"\n'
-                f'list = "{sys.executable} task_source.py"\n',
+                f"list = {toml_string(f'{sys.executable} task_source.py')}\n",
                 encoding="utf-8",
             )
             stdout = StringIO()
@@ -5020,7 +5033,7 @@ class CliTests(unittest.TestCase):
             design_text = "# Design\n\n## ADR-1\n\nDesign context for workers.\n"
             (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
             (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
-            spec_sha = hashlib.sha256(spec_text.encode("utf-8")).hexdigest()
+            fingerprint = file_fingerprint(repo / "docs" / "spec.md", "docs/spec.md")
             (repo / "list_tasks.py").write_text(
                 "import json\n"
                 "print(json.dumps([{'id':'TRACE-01','title':'Trace task',"
@@ -5032,9 +5045,9 @@ class CliTests(unittest.TestCase):
                 "'design_refs':['docs/design.md#ADR-1'],"
                 "'approval_state':'approved',"
                 "'source_fingerprints':[{'path':'docs/spec.md','size':"
-                + str(len(spec_text.encode("utf-8")))
+                + str(fingerprint["size"])
                 + ",'sha256':'"
-                + spec_sha
+                + str(fingerprint["sha256"])
                 + "','redacted':False}]}]))\n",
                 encoding="utf-8",
             )
@@ -5057,7 +5070,7 @@ class CliTests(unittest.TestCase):
             )
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
-                f'list = "{sys.executable} list_tasks.py"\n\n'
+                f"list = {toml_string(f'{sys.executable} list_tasks.py')}\n\n"
                 "[agent]\n"
                 'kind = "claude"\n'
                 "command = " + json.dumps(command) + "\n",
@@ -5112,7 +5125,7 @@ class CliTests(unittest.TestCase):
             command = f"{sys.executable} agent.py {{task_id}}"
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
-                f'list = "{sys.executable} list_tasks.py"\n\n'
+                f"list = {toml_string(f'{sys.executable} list_tasks.py')}\n\n"
                 "[agent]\n"
                 "command = " + json.dumps(command) + "\n",
                 encoding="utf-8",
