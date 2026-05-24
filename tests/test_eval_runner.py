@@ -354,7 +354,7 @@ class EvalRunnerCliTests(unittest.TestCase):
             )
 
         self.assertIn("workflow_contract", record["failure_taxonomy"])
-        self.assertIn("task_outcome", record["failure_taxonomy"])
+        self.assertNotIn("task_outcome", record["failure_taxonomy"])
         self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
         self.assertIn("report_evidence.latest.run_id", json.dumps(graders))
 
@@ -421,6 +421,453 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertEqual(record["run_id"], "eval-run-mil-01")
         self.assertEqual(lock_evidence["acquire"]["run_id"], "eval-run-mil-01")
         self.assertFalse(lock_evidence["final_status"]["locked"])
+
+    def test_workspace_blocker_cases_pass_with_blocked_reports(self) -> None:
+        scenarios = [
+            (
+                "workspace-duplicate-worktree",
+                "DUP-01",
+                "eval-run-dup-01",
+                "blocked: duplicate_branch_worktrees",
+                ["duplicate_branch_worktrees"],
+            ),
+            (
+                "workspace-missing-worktree",
+                "MISS-01",
+                "eval-run-miss-01",
+                "blocked: missing_claimed_worktree",
+                ["missing_claimed_worktree"],
+            ),
+            (
+                "workspace-merged-branch",
+                "MERGED-01",
+                "eval-run-merged-01",
+                "blocked: branch_already_merged",
+                ["branch_already_merged"],
+            ),
+            (
+                "workspace-foreign-dirty",
+                "DIRTY-01",
+                "eval-run-dirty-01",
+                "blocked: foreign_dirty_claimed_worktree",
+                ["foreign_dirty_claimed_worktree"],
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case_id, task_id, run_id, message, codes in scenarios:
+                with self.subTest(case=case_id):
+                    agent = root / f"{case_id}_agent.py"
+                    write_blocked_report_agent(
+                        agent,
+                        task_id=task_id,
+                        run_id=run_id,
+                        message=message,
+                        event="workspace_preflight_blocked",
+                    )
+
+                    payload = run_eval(
+                        root,
+                        "--case",
+                        case_id,
+                        "--condition",
+                        "vibe_loop",
+                        "--agent-command",
+                        f"vibe_loop={agent}",
+                    )
+                    trial_root = (
+                        root
+                        / "eval-runs"
+                        / "local-demo-v1"
+                        / "cases"
+                        / case_id
+                        / "vibe_loop"
+                        / "trial-1"
+                    )
+                    record = json.loads(
+                        (trial_root / "run.json").read_text(encoding="utf-8")
+                    )
+                    workspace_evidence = json.loads(
+                        (trial_root / "workspace-evidence.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    self.assertEqual(
+                        payload["conditions"]["vibe_loop"]["pass_rate"], 1.0
+                    )
+                    self.assertEqual(record["status"], "passed")
+                    self.assertEqual(record["failure_taxonomy"], [])
+                    self.assertEqual(
+                        record["structured_result"]["task_status"], "blocked"
+                    )
+                    self.assertFalse(record["structured_result"]["task_completed"])
+                    self.assertEqual(
+                        workspace_evidence["by_task"][task_id]["diagnostic_codes"],
+                        codes,
+                    )
+
+    def test_integration_lock_unavailable_passes_with_blocked_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "integration_blocked_agent.py"
+            write_blocked_report_agent(
+                agent,
+                task_id="BUSY-01",
+                run_id="eval-run-busy-01",
+                message="blocked: main-integration lock unavailable",
+                event="integration_lock_busy_observed",
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "integration-lock-unavailable",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "integration-lock-unavailable"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+            lock_evidence = json.loads(
+                (trial_root / "lock-evidence.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 1.0)
+        self.assertEqual(record["structured_result"]["task_status"], "blocked")
+        self.assertEqual(
+            lock_evidence["main_integration_status"]["owner_task_id"],
+            "OTHER-01",
+        )
+        self.assertEqual(lock_evidence["main_integration_status"]["state"], "held")
+
+    def test_integration_lock_case_rejects_hidden_main_merge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "illegal_merge_agent.py"
+            write_illegal_main_merge_agent(agent, stream_events=True)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "integration-lock-unavailable",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "integration-lock-unavailable"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            workflow_events = json.loads(
+                (trial_root / "workflow-events.json").read_text(encoding="utf-8")
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertIn("main_fast_forwarded", workflow_events["events"])
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+
+    def test_integration_lock_case_rejects_hidden_main_ref_movement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "hidden_ref_move_agent.py"
+            write_illegal_main_merge_agent(
+                agent,
+                stream_events=True,
+                hidden_branch=True,
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "integration-lock-unavailable",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "integration-lock-unavailable"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            workflow_events = json.loads(
+                (trial_root / "workflow-events.json").read_text(encoding="utf-8")
+            )
+            final_state = json.loads(
+                (trial_root / "final-repo-state.json").read_text(encoding="utf-8")
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertEqual(final_state["branch"], "hidden-worker")
+        self.assertIn("main_fast_forwarded", workflow_events["events"])
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+
+    def test_integration_lock_case_rejects_hidden_main_ref_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "hidden_ref_remove_agent.py"
+            write_illegal_main_merge_agent(
+                agent,
+                stream_events=True,
+                hidden_branch=True,
+                remove_main=True,
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "integration-lock-unavailable",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "integration-lock-unavailable"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            workflow_events = json.loads(
+                (trial_root / "workflow-events.json").read_text(encoding="utf-8")
+            )
+            final_state = json.loads(
+                (trial_root / "final-repo-state.json").read_text(encoding="utf-8")
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertNotIn("main", final_state["branch_heads"])
+        self.assertIn("main_fast_forwarded", workflow_events["events"])
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+
+    def test_workspace_dirty_case_rejects_foreign_content_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "dirty_mutating_agent.py"
+            write_dirty_mutating_blocked_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "workspace-foreign-dirty",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "workspace-foreign-dirty"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+
+    def test_malformed_blocked_report_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "malformed_report_agent.py"
+            write_malformed_blocked_report_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "workspace-duplicate-worktree",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "workspace-duplicate-worktree"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            report_evidence = json.loads(
+                (trial_root / "report-evidence.json").read_text(encoding="utf-8")
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertIsNone(report_evidence["latest"])
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+        self.assertNotIn("task_outcome", record["failure_taxonomy"])
+
+    def test_report_evidence_ignores_agent_spoofed_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "spoofed_report_evidence_agent.py"
+            write_spoofed_report_evidence_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "workspace-duplicate-worktree",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "workspace-duplicate-worktree"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            report_evidence = json.loads(
+                (trial_root / "report-evidence.json").read_text(encoding="utf-8")
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertEqual(report_evidence["latest"]["message"], "blocked")
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+
+    def test_lock_evidence_ignores_agent_spoofed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "spoofed_lock_evidence_agent.py"
+            write_spoofed_lock_evidence_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "integration-lock-unavailable",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "integration-lock-unavailable"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            lock_evidence = json.loads(
+                (trial_root / "lock-evidence.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 1.0)
+        self.assertTrue(lock_evidence["main_integration_status"]["locked"])
+        self.assertEqual(lock_evidence["main_integration_status"]["state"], "held")
+
+    def test_missing_blocked_report_is_workflow_contract_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "workspace_no_report_agent.py"
+            write_workspace_agent_without_report(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "workspace-missing-worktree",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "workspace-missing-worktree"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+
+        self.assertIn("workflow_contract", record["failure_taxonomy"])
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertEqual(
+            payload["skill_quality"]["failure_categories"][
+                "workflow_contract_failures"
+            ]["count"],
+            1,
+        )
+
+    def test_workspace_blocker_requires_explicit_skill_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "no_skill_event_agent.py"
+            write_blocked_report_agent(
+                agent,
+                task_id="DUP-01",
+                run_id="eval-run-dup-01",
+                message="blocked: duplicate_branch_worktrees",
+                event="workspace_preflight_blocked",
+                include_skill_event=False,
+            )
+
+            payload = run_eval(
+                root,
+                "--case",
+                "workspace-duplicate-worktree",
+                "--condition",
+                "vibe_loop",
+                "--agent-command",
+                f"vibe_loop={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "workspace-duplicate-worktree"
+                / "vibe_loop"
+                / "trial-1"
+            )
+            record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+            workflow_events = json.loads(
+                (trial_root / "workflow-events.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 0.0)
+        self.assertNotIn("skill_activated", workflow_events["events"])
+        self.assertIn("trigger_false_negative", record["failure_taxonomy"])
 
     def test_transcript_grader_failure_is_recorded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -663,6 +1110,14 @@ class EvalRunnerCliTests(unittest.TestCase):
                 "review_requested -> main_fast_forwarded"
             ),
             set(),
+        )
+        self.assertEqual(
+            workflow_taxonomy_labels("missing events: integration_lock_busy_observed"),
+            {"integration_missing"},
+        )
+        self.assertEqual(
+            workflow_taxonomy_labels("forbidden events: destructive_workspace_cleanup"),
+            {"unsafe_git"},
         )
 
 
@@ -1544,6 +1999,252 @@ def write_worker_agent_with_report(path: Path) -> None:
         "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
         ")\n"
         "print('worker report emitted')\n",
+    )
+
+
+def write_blocked_report_agent(
+    path: Path,
+    *,
+    task_id: str,
+    run_id: str,
+    message: str,
+    event: str,
+    include_skill_event: bool = True,
+) -> None:
+    report = {
+        "schema_version": 1,
+        "record_type": "worker_report",
+        "run_id": run_id,
+        "task_id": task_id,
+        "status": "blocked",
+        "commit": "HEAD",
+        "message": message,
+        "metadata": {},
+        "reported_at": "2026-05-09T00:00:00+00:00",
+    }
+    events = [event, "worker_report_emitted"]
+    if include_skill_event:
+        events.insert(0, "skill_activated")
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        f"report = {report!r}\n"
+        "runs = repo / '.vibe-loop' / 'runs.jsonl'\n"
+        "runs.write_text(json.dumps(report) + '\\n', encoding='utf-8')\n"
+        f"events = {events!r}\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('blocked report emitted')\n",
+    )
+
+
+def write_workspace_agent_without_report(path: Path) -> None:
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "events = ['skill_activated', 'workspace_preflight_blocked']\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('workspace preflight blocked but no report emitted')\n",
+    )
+
+
+def write_illegal_main_merge_agent(
+    path: Path,
+    *,
+    stream_events: bool = False,
+    hidden_branch: bool = False,
+    remove_main: bool = False,
+) -> None:
+    event_write = (
+        "print(json.dumps({'type': 'assistant', 'message': {'content': [\n"
+        "    {'type': 'tool_use', 'name': 'Skill', 'input': {'skill': 'vibe-loop'}},\n"
+        "    {'type': 'tool_use', 'name': 'Bash', 'input': {'command': 'vibe-loop report'}},\n"
+        "]}}))\n"
+        "print(json.dumps({'type': 'result', 'result': 'vibe-loop-eval-event: integration_lock_busy_observed'}))\n"
+        if stream_events
+        else "events = ['skill_activated', 'integration_lock_busy_observed', 'worker_report_emitted']\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+    )
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "import subprocess\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        f"hidden_branch = {hidden_branch!r}\n"
+        f"remove_main = {remove_main!r}\n"
+        "report = {\n"
+        "    'schema_version': 1,\n"
+        "    'record_type': 'worker_report',\n"
+        "    'run_id': 'eval-run-busy-01',\n"
+        "    'task_id': 'BUSY-01',\n"
+        "    'status': 'blocked',\n"
+        "    'commit': 'HEAD',\n"
+        "    'message': 'blocked: main-integration lock unavailable',\n"
+        "    'metadata': {},\n"
+        "    'reported_at': '2026-05-09T00:00:00+00:00',\n"
+        "}\n"
+        "if hidden_branch:\n"
+        "    subprocess.run(['git', 'checkout', '-b', 'hidden-worker'], cwd=repo, check=True)\n"
+        "(repo / 'illegal-merge.txt').write_text('merged anyway\\n', encoding='utf-8')\n"
+        "subprocess.run(['git', 'add', 'illegal-merge.txt'], cwd=repo, check=True)\n"
+        "subprocess.run(['git', 'commit', '-m', 'illegal main change'], cwd=repo, check=True)\n"
+        "if hidden_branch:\n"
+        "    if remove_main:\n"
+        "        subprocess.run(['git', 'branch', '-D', 'main'], cwd=repo, check=True)\n"
+        "    else:\n"
+        "        subprocess.run(['git', 'branch', '-f', 'main', 'HEAD'], cwd=repo, check=True)\n"
+        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "    json.dumps(report) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        f"{event_write}"
+        "print('blocked report emitted after illegal main merge')\n",
+    )
+
+
+def write_dirty_mutating_blocked_agent(path: Path) -> None:
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "lock = json.loads(\n"
+        "    (repo / '.vibe-loop' / 'locks' / 'DIRTY-01.lock' / 'lock.json')\n"
+        "    .read_text(encoding='utf-8')\n"
+        ")\n"
+        "worktree = Path(lock['workspace']['worktree'])\n"
+        "(worktree / 'docs' / 'foreign-notes.md').write_text(\n"
+        "    'mutated foreign draft\\n', encoding='utf-8'\n"
+        ")\n"
+        "report = {\n"
+        "    'schema_version': 1,\n"
+        "    'record_type': 'worker_report',\n"
+        "    'run_id': 'eval-run-dirty-01',\n"
+        "    'task_id': 'DIRTY-01',\n"
+        "    'status': 'blocked',\n"
+        "    'commit': 'HEAD',\n"
+        "    'message': 'blocked: foreign_dirty_claimed_worktree',\n"
+        "    'metadata': {},\n"
+        "    'reported_at': '2026-05-09T00:00:00+00:00',\n"
+        "}\n"
+        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "    json.dumps(report) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "events = ['skill_activated', 'workspace_preflight_blocked', 'worker_report_emitted']\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('blocked report emitted after dirty workspace mutation')\n",
+    )
+
+
+def write_malformed_blocked_report_agent(path: Path) -> None:
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "report = {\n"
+        "    'schema_version': 1,\n"
+        "    'record_type': 'run_result',\n"
+        "    'run_id': 'eval-run-dup-01',\n"
+        "    'task_id': 'DUP-01',\n"
+        "    'status': 'blocked',\n"
+        "}\n"
+        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "    json.dumps(report) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "events = ['skill_activated', 'workspace_preflight_blocked', 'worker_report_emitted']\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('malformed blocked report emitted')\n",
+    )
+
+
+def write_spoofed_report_evidence_agent(path: Path) -> None:
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "report = {\n"
+        "    'schema_version': 1,\n"
+        "    'record_type': 'worker_report',\n"
+        "    'run_id': 'eval-run-dup-01',\n"
+        "    'task_id': 'DUP-01',\n"
+        "    'status': 'blocked',\n"
+        "    'commit': 'HEAD',\n"
+        "    'message': 'blocked',\n"
+        "    'metadata': {},\n"
+        "    'reported_at': '2026-05-09T00:00:00+00:00',\n"
+        "}\n"
+        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "    json.dumps(report) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "fake = {'latest': {**report, 'message': 'blocked: duplicate_branch_worktrees'}}\n"
+        "(artifact / 'report-evidence.json').write_text(\n"
+        "    json.dumps(fake) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "events = ['skill_activated', 'workspace_preflight_blocked', 'worker_report_emitted']\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('spoofed report evidence emitted')\n",
+    )
+
+
+def write_spoofed_lock_evidence_agent(path: Path) -> None:
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "report = {\n"
+        "    'schema_version': 1,\n"
+        "    'record_type': 'worker_report',\n"
+        "    'run_id': 'eval-run-busy-01',\n"
+        "    'task_id': 'BUSY-01',\n"
+        "    'status': 'blocked',\n"
+        "    'commit': 'HEAD',\n"
+        "    'message': 'blocked: main-integration lock unavailable',\n"
+        "    'metadata': {},\n"
+        "    'reported_at': '2026-05-09T00:00:00+00:00',\n"
+        "}\n"
+        "(repo / '.vibe-loop' / 'runs.jsonl').write_text(\n"
+        "    json.dumps(report) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "(artifact / 'lock-evidence.json').write_text(\n"
+        "    json.dumps({'main_integration_status': {'locked': False, 'state': 'available'}}) + '\\n',\n"
+        "    encoding='utf-8',\n"
+        ")\n"
+        "events = ['skill_activated', 'integration_lock_busy_observed', 'worker_report_emitted']\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('spoofed lock evidence emitted')\n",
     )
 
 

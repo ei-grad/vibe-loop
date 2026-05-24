@@ -1,0 +1,6 @@
+diff --git a/.vibe-loop/runs.jsonl b/.vibe-loop/runs.jsonl
+new file mode 100644
+--- /dev/null
++++ b/.vibe-loop/runs.jsonl
+@@ -0,0 +1 @@
++{"schema_version": 1, "record_type": "worker_report", "run_id": "eval-run-miss-01", "task_id": "MISS-01", "status": "blocked", "commit": "HEAD", "message": "blocked: missing_claimed_worktree", "metadata": {}, "reported_at": "2026-05-09T00:00:00+00:00"}

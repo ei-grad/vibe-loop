@@ -73,6 +73,11 @@ committed inside the fixture.
 | `dirty-main-worktree` | Docs/code project with unrelated seeded user changes in the main checkout | Worktree discipline, unrelated-change preservation, conservative git behavior | yes |
 | `supervised-worker-report` | Fixture launched with supervisor run metadata and local `.vibe-loop/` state | Worker reporting, run result records, task lock ownership | yes |
 | `main-integration-lock` | Tiny package with two ready tasks and a seeded integration critical section | `main-integration` lock acquisition/release, final verification on `main` | yes |
+| `workspace-duplicate-worktree` | Worker-state repository with a claimed branch checked out in two worktrees | Workspace ownership diagnostics, no destructive cleanup | yes |
+| `workspace-missing-worktree` | Worker-state repository with an active lock claiming a missing worktree | Stale workspace claim blocking and reporting | yes |
+| `workspace-merged-branch` | Worker-state repository whose active worker branch is already merged into `main` | Merged worker branch diagnostics, no automatic cleanup | yes |
+| `workspace-foreign-dirty` | Worker-state repository with uncommitted changes in another worker's claimed worktree | Dirty foreign-owned worktree preservation | yes |
+| `integration-lock-unavailable` | Worker-state repository with a live foreign `main-integration` holder | Blocked final integration and actionable report | yes |
 | `locked-task-selection` | Backlog repository with one ready task already locked by another worker | Task locks, safe task selection, no locked-task mutation | yes |
 | `main-advanced-before-merge` | Package where the harness advances `main` with a compatible commit before integration | Main advancement inspection, merge from current `main`, after-merge verification | yes |
 | `negative-trigger-set` | Shared lightweight repo plus standalone prompts | Skill silence on ordinary coding, review, and explanation prompts | no |
@@ -483,6 +488,64 @@ Artifacts:
 
 Budget: generated discovery or worker-state case.
 
+### Workspace Ownership And Lock Blockers
+
+Project type: small worker-state repositories that are already unsafe for final
+integration before implementation begins.
+
+Prompts:
+
+```text
+$vibe-loop DUP-01
+$vibe-loop MISS-01
+$vibe-loop MERGED-01
+$vibe-loop DIRTY-01
+$vibe-loop BUSY-01
+```
+
+Seeded state:
+
+- `workspace-duplicate-worktree` seeds an active task lock whose claimed branch
+  appears in two git worktrees.
+- `workspace-missing-worktree` seeds an active task lock whose workspace claim
+  points at a missing path.
+- `workspace-merged-branch` seeds a worker branch with commits already contained
+  in `main`.
+- `workspace-foreign-dirty` seeds a claimed worker worktree with uncommitted
+  changes to a tracked file.
+- `integration-lock-unavailable` seeds a live foreign holder for
+  `.vibe-loop/locks/main-integration.lock/lock.json`.
+
+Deterministic graders:
+
+- The task plan row remains `Planned`; these cases pass by blocking safely, not
+  by completing the task.
+- `.vibe-loop/runs.jsonl` contains a `worker_report` with `status = blocked`
+  and a message naming the unsafe workspace or lock condition.
+- The seeded lock, claimed worktree, duplicate worktrees, dirty file state, or
+  live integration lock remain present as applicable.
+- No final merge or main verification is accepted without a safe ownership
+  preflight and integration lock.
+
+Expected workflow evidence:
+
+- The agent inspects worker/workspace or integration-lock state before final
+  integration.
+- It emits an actionable blocked report instead of deleting locks, removing
+  worktrees, stealing the integration lock, or fast-forwarding `main`.
+- Workflow-contract failures for these cases are reported separately from task
+  outcome failures in skill-quality summaries.
+
+Artifacts:
+
+- Required schema artifacts.
+- `workspace-evidence.json` for workspace-owned cases, keyed by task id with
+  diagnostic codes, workspace status, dirty state, dirty-file fingerprints,
+  duplicate count, and merged-into targets.
+- `lock-evidence.json` and `report-evidence.json`.
+
+Budget: generated discovery or worker-state case.
+
 ### `locked-task-selection`
 
 Project type: a backlog repository where the user asks the agent to choose the
@@ -802,6 +865,7 @@ also add these optional roles when available:
 | `test_results` | Machine-readable command result for each verification command. |
 | `review_evidence` | Review request, reviewer identity or stub identity, findings, remediation mapping, and re-review result. |
 | `lock_evidence` | Task lock and main-integration lock records before and after the run. |
+| `workspace_evidence` | Worker workspace diagnostics keyed by task id, including diagnostic codes, stale/warning status, dirty summaries and fingerprints, duplicate worktree counts, and merged targets. |
 | `report_evidence` | `vibe-loop report` command result and matching run-store records. |
 | `generated_profile` | Generated discovery cache plus validation diagnostics. |
 | `budget_evidence` | Timeout, command count, output byte count, and disk delta. |
@@ -884,5 +948,5 @@ requirements. Acceptable implementation choices:
 If fixture authors need to drop or combine a case for maintenance cost, they
 should preserve coverage of these contract areas: finite slice execution,
 generated task discovery, review remediation, dirty worktree preservation,
-worker reporting, task locks, `main-integration` locks, and main-advanced
-integration.
+worker reporting, task locks, workspace ownership diagnostics,
+`main-integration` locks, and main-advanced integration.

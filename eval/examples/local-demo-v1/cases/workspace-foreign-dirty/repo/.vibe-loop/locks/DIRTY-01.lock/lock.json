@@ -1,0 +1,13 @@
+{
+  "record_type": "active_run",
+  "schema_version": 1,
+  "task_id": "DIRTY-01",
+  "run_id": "eval-run-dirty-01",
+  "pid": 0,
+  "worker_pid": 0,
+  "pid_source": "fixture-template",
+  "host": "local-demo-v1",
+  "started_at": "2026-05-09T00:00:00+00:00",
+  "log": ".vibe-loop/runs/eval-run-dirty-01.log",
+  "command": "codex exec '$vibe-loop DIRTY-01'"
+}

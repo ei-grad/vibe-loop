@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from vibe_loop.config import prepare_shell_command, shell_quote
+from vibe_loop.locks import LockManager
 
 from vibe_loop.eval_examples import (
     EXAMPLE_SUITE_ID,
@@ -36,11 +37,14 @@ from vibe_loop.evals import (
     EvalArtifactRef,
     EvalSourceFingerprint,
     SkillEvalRunRecord,
+    has_symlink_component,
     is_secret_like_eval_path,
     path_diagnostics,
     sha256_file,
     validate_skill_eval_run_record,
 )
+from vibe_loop.runs import RunStore, WORKER_REPORT_STATUSES
+from vibe_loop.workers import build_worker_views
 
 
 HARNESS_NAME = "vibe-loop-eval"
@@ -62,6 +66,7 @@ ROLE_PATHS = {
     "test_results": "test-results.json",
     "review_evidence": "review-evidence.json",
     "lock_evidence": "lock-evidence.json",
+    "workspace_evidence": "workspace-evidence.json",
     "report_evidence": "report-evidence.json",
     "delegation_evidence": "delegation-evidence.json",
     "generated_profile": "generated-profile.json",
@@ -462,9 +467,7 @@ def run_trial(
             condition=condition,
         )
     else:
-        workflow_events = list(
-            agent_batch.workflow_events
-        ) or workflow_events_for_trial(
+        workflow_events = workflow_events_for_trial(
             trial_root,
             execution,
             transcript_graders,
@@ -473,11 +476,14 @@ def run_trial(
             git_after=git_after,
             grader_output=deterministic,
             condition=condition,
+            extra_events=agent_batch.workflow_events,
         )
     write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
     lock_after = collect_lock_state(repo, case.task_id)
-    write_lock_evidence(trial_root, lock_before, lock_after)
-    write_report_evidence(trial_root, latest_worker_report(repo, case.task_id))
+    write_lock_evidence(trial_root, lock_before, lock_after, repo=repo)
+    latest_report = latest_worker_report(repo, case.task_id)
+    write_report_evidence(trial_root, latest_report)
+    write_workspace_evidence(trial_root, repo)
     write_generated_profile_artifact(trial_root, repo)
     write_missing_case_role_artifacts(trial_root, case, deterministic, execution)
     command_results = list(agent_batch.command_results) + [
@@ -521,6 +527,7 @@ def run_trial(
             transcript_graders,
             trial_root,
         ),
+        reported_status=worker_report_status(latest_report),
         usage=usage,
     )
     write_json_artifact(trial_root, "structured_result", structured_result)
@@ -579,6 +586,7 @@ def run_trial(
             trial_root,
         ),
         schema_diagnostics=schema_diagnostics,
+        reported_status=worker_report_status(latest_report),
         usage=usage,
     )
     write_json_artifact(trial_root, "structured_result", structured_result)
@@ -1355,15 +1363,15 @@ def workflow_events_for_trial(
     git_after: Mapping[str, object] | None = None,
     grader_output: Mapping[str, object] | None = None,
     condition: str = "",
+    extra_events: Sequence[str] = (),
 ) -> list[str]:
     existing = artifact_path(artifact_root, "workflow_events")
+    events: list[str] = []
+    events.extend(extra_events)
     if allow_artifact_events and existing.is_file():
         loaded = load_json(existing)
         raw_events = loaded.get("events") if isinstance(loaded, Mapping) else loaded
-        events = normalize_events(raw_events)
-        if events:
-            return events
-    events: list[str] = []
+        events.extend(normalize_events(raw_events))
     for result in transcript_graders:
         events.extend(result.workflow_events)
     if is_stream_json(execution.stdout):
@@ -1372,12 +1380,22 @@ def workflow_events_for_trial(
     else:
         events.extend(events_from_text(execution.stdout))
     events.extend(events_from_text(execution.stderr))
-    if not events and git_before and git_after:
-        events.extend(
-            detect_events_from_repo_state(
-                git_before, git_after, grader_output, condition
+    has_explicit_events = bool(events)
+    if git_before and git_after:
+        if has_explicit_events:
+            events.extend(
+                detect_regression_events_from_repo_state(
+                    git_before,
+                    git_after,
+                    grader_output,
+                )
             )
-        )
+        else:
+            events.extend(
+                detect_events_from_repo_state(
+                    git_before, git_after, grader_output, condition
+                )
+            )
     if execution.unsafe_refused or unsafe_command_reason(
         execution.stdout + execution.stderr
     ):
@@ -1396,6 +1414,7 @@ def detect_events_from_repo_state(
     head_after = git_after.get("head", "")
     branch_after = git_after.get("branch", "")
     head_changed = head_before != head_after and head_after
+    main_ref_changed = mainline_ref_changed(git_before, git_after)
 
     events.append("instructions_inspected")
     events.append("worktree_state_inspected")
@@ -1421,7 +1440,7 @@ def detect_events_from_repo_state(
     if head_changed:
         events.append("commit_created")
 
-    if head_changed and branch_after in ("main", "master"):
+    if main_ref_changed or (head_changed and branch_after in ("main", "master")):
         events.append("main_fast_forwarded")
         if "verification_ran" in events:
             events.append("main_verification_ran")
@@ -1430,6 +1449,61 @@ def detect_events_from_repo_state(
         events.append("skill_activated")
 
     return events
+
+
+def detect_regression_events_from_repo_state(
+    git_before: Mapping[str, object],
+    git_after: Mapping[str, object],
+    grader_output: Mapping[str, object] | None,
+) -> list[str]:
+    events: list[str] = []
+    head_before = git_before.get("head", "")
+    head_after = git_after.get("head", "")
+    branch_after = git_after.get("branch", "")
+    head_changed = head_before != head_after and head_after
+    if not (
+        mainline_ref_changed(git_before, git_after)
+        or (head_changed and branch_after in ("main", "master"))
+    ):
+        return events
+    events.append("main_fast_forwarded")
+    if deterministic_unit_tests_passed(grader_output):
+        events.append("main_verification_ran")
+    return events
+
+
+def mainline_ref_changed(
+    git_before: Mapping[str, object],
+    git_after: Mapping[str, object],
+) -> bool:
+    before_heads = git_before.get("branch_heads")
+    after_heads = git_after.get("branch_heads")
+    if not isinstance(before_heads, Mapping) or not isinstance(after_heads, Mapping):
+        return False
+    for branch in ("main", "master"):
+        before = before_heads.get(branch)
+        after = after_heads.get(branch)
+        if isinstance(before, str) and before and before != after:
+            return True
+        if isinstance(after, str) and after and before != after:
+            return True
+    return False
+
+
+def deterministic_unit_tests_passed(
+    grader_output: Mapping[str, object] | None,
+) -> bool:
+    if not grader_output:
+        return False
+    checks = grader_output.get("checks", [])
+    if not isinstance(checks, list):
+        return False
+    return any(
+        isinstance(check, Mapping)
+        and check.get("id") == "unit-tests"
+        and check.get("passed") is True
+        for check in checks
+    )
 
 
 def events_from_text(text: str) -> list[str]:
@@ -1858,7 +1932,7 @@ def failure_taxonomy_for_trial(
     ):
         labels.add("task_outcome")
     if deterministic.get("passed") is not True:
-        labels.add("task_outcome")
+        labels.update(deterministic_failure_labels(deterministic))
     if command_count > max_commands:
         labels.add("workflow_contract")
     if schema_diagnostics:
@@ -1872,6 +1946,38 @@ def failure_taxonomy_for_trial(
     if artifact_result is not None and artifact_result.get("passed") is not True:
         labels.update(artifact_failure_labels(case, condition, artifact_result))
     return labels
+
+
+def deterministic_failure_labels(
+    deterministic: Mapping[str, object],
+) -> set[str]:
+    checks = deterministic.get("checks")
+    if not isinstance(checks, Sequence) or isinstance(checks, (str, bytes)):
+        return {"task_outcome"}
+    labels: set[str] = set()
+    for check in checks:
+        if not isinstance(check, Mapping) or check.get("passed") is True:
+            continue
+        check_id = str(check.get("id", ""))
+        if deterministic_check_is_workflow_contract(check_id):
+            labels.add("workflow_contract")
+        else:
+            labels.add("task_outcome")
+    return labels or {"task_outcome"}
+
+
+def deterministic_check_is_workflow_contract(check_id: str) -> bool:
+    prefixes = (
+        "worker-report",
+        "task-lock",
+        "integration-lock",
+    )
+    exact = {
+        "locked-task-preserved",
+        "dependent-plan-row-untouched",
+        "plan-row-not-completed",
+    }
+    return check_id in exact or check_id.startswith(prefixes)
 
 
 def artifact_failure_labels(
@@ -1906,7 +2012,7 @@ def artifact_failure_labels(
 
 def workflow_taxonomy_labels(message: str) -> set[str]:
     labels: set[str] = set()
-    if "unsafe_git_command" in message:
+    if "unsafe_git_command" in message or "destructive_workspace_cleanup" in message:
         labels.add("unsafe_git")
     if "unnecessary_user_prompt" in message:
         labels.add("unnecessary_user_prompt")
@@ -1929,6 +2035,8 @@ def workflow_taxonomy_labels(message: str) -> set[str]:
             "main_fast_forwarded",
             "main_verification_ran",
             "main_advanced_detected",
+            "integration_lock_busy_observed",
+            "workspace_preflight_blocked",
         )
     ):
         labels.add("integration_missing")
@@ -1954,11 +2062,14 @@ def structured_trial_result(
     *,
     command_count: int,
     schema_diagnostics: Sequence[str] = (),
+    reported_status: str | None = None,
     usage: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     passed = scoring.get("passed") is True
     if execution.timeout:
         task_status = "timeout"
+    elif reported_status is not None:
+        task_status = reported_status
     elif passed:
         task_status = "completed"
     else:
@@ -1969,7 +2080,7 @@ def structured_trial_result(
         "exit_code": execution.exit_code,
         "timeout": execution.timeout,
         "task_status": task_status,
-        "task_completed": passed,
+        "task_completed": task_status == "completed" and passed,
         "workflow_contract_completed": scoring.get("workflow_score") == 1.0,
         "duration_seconds": round(execution.duration_seconds, 6),
         "latency_seconds": round(execution.duration_seconds, 6),
@@ -2201,8 +2312,24 @@ def collect_git_state(repo: Path) -> dict[str, object]:
         "branches": git_output(
             repo, "branch", "--format=%(refname:short)"
         ).splitlines(),
+        "branch_heads": local_branch_heads(repo),
         "worktrees": git_output(repo, "worktree", "list", "--porcelain").splitlines(),
     }
+
+
+def local_branch_heads(repo: Path) -> dict[str, str]:
+    output = git_output(
+        repo,
+        "for-each-ref",
+        "--format=%(refname:short) %(objectname)",
+        "refs/heads",
+    )
+    heads: dict[str, str] = {}
+    for line in output.splitlines():
+        branch, _, commit = line.partition(" ")
+        if branch and commit:
+            heads[branch] = commit
+    return heads
 
 
 def collect_lock_state(repo: Path, task_id: str | None) -> dict[str, object]:
@@ -2222,11 +2349,14 @@ def write_lock_evidence(
     artifact_root: Path,
     before: Mapping[str, object],
     after: Mapping[str, object],
+    *,
+    repo: Path,
 ) -> None:
     existing = load_json(artifact_path(artifact_root, "lock_evidence"))
     evidence = dict(existing) if isinstance(existing, Mapping) else {}
-    evidence.setdefault("before", dict(before))
-    evidence.setdefault("after", dict(after))
+    evidence["before"] = dict(before)
+    evidence["after"] = dict(after)
+    evidence["main_integration_status"] = main_integration_status(repo)
     write_json_artifact(artifact_root, "lock_evidence", evidence)
 
 
@@ -2236,7 +2366,7 @@ def write_report_evidence(
 ) -> None:
     existing = load_json(artifact_path(artifact_root, "report_evidence"))
     evidence = dict(existing) if isinstance(existing, Mapping) else {}
-    evidence.setdefault("latest", dict(latest) if latest is not None else None)
+    evidence["latest"] = dict(latest) if latest is not None else None
     write_json_artifact(artifact_root, "report_evidence", evidence)
 
 
@@ -2252,10 +2382,150 @@ def latest_worker_report(repo: Path, task_id: str | None) -> dict[str, object] |
             continue
         if not isinstance(payload, dict):
             continue
+        if payload.get("record_type") != "worker_report":
+            continue
         if task_id is not None and payload.get("task_id") != task_id:
             continue
         records.append(payload)
     return records[-1] if records else None
+
+
+def worker_report_status(report: Mapping[str, object] | None) -> str | None:
+    if report is None:
+        return None
+    status = report.get("status")
+    return status if status in WORKER_REPORT_STATUSES else None
+
+
+def main_integration_status(repo: Path) -> dict[str, object]:
+    manager = LockManager(repo / ".vibe-loop" / "locks")
+    return manager.main_integration_status().to_json()
+
+
+def write_workspace_evidence(artifact_root: Path, repo: Path) -> None:
+    manager = LockManager(repo / ".vibe-loop" / "locks")
+    run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+    views = build_worker_views(manager, run_store, repo=repo)
+    workers = [view.to_json() for view in views]
+    by_task: dict[str, object] = {}
+    for worker in workers:
+        task_id = worker.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        workspace_state = worker.get("workspace_git_state")
+        if isinstance(workspace_state, Mapping):
+            diagnostics = workspace_state.get("diagnostics")
+            diagnostic_codes = (
+                [
+                    item.get("code")
+                    for item in diagnostics
+                    if isinstance(item, Mapping) and isinstance(item.get("code"), str)
+                ]
+                if isinstance(diagnostics, Sequence)
+                else []
+            )
+            duplicate_worktrees = workspace_state.get("duplicate_worktrees")
+            duplicate_count = (
+                len(duplicate_worktrees)
+                if isinstance(duplicate_worktrees, Sequence)
+                and not isinstance(duplicate_worktrees, (str, bytes))
+                else 0
+            )
+            by_task[task_id] = {
+                "state": worker.get("state"),
+                "process_state": worker.get("process_state"),
+                "result_status": worker.get("result_status"),
+                "workspace_status": workspace_state.get("status"),
+                "worktree_exists": workspace_state.get("worktree_exists"),
+                "worktree_listed": workspace_state.get("worktree_listed"),
+                "dirty": workspace_state.get("dirty"),
+                "dirty_summary": workspace_state.get("dirty_summary"),
+                "dirty_files": workspace_dirty_files(worker, workspace_state),
+                "duplicate_worktree_count": duplicate_count,
+                "merged_into": workspace_state.get("merged_into"),
+                "diagnostic_codes": diagnostic_codes,
+            }
+        else:
+            by_task[task_id] = {
+                "state": worker.get("state"),
+                "process_state": worker.get("process_state"),
+                "result_status": worker.get("result_status"),
+                "workspace_status": None,
+                "diagnostic_codes": [],
+            }
+    write_json_artifact(
+        artifact_root,
+        "workspace_evidence",
+        {
+            "schema_version": 1,
+            "workers": workers,
+            "by_task": by_task,
+        },
+    )
+
+
+def workspace_dirty_files(
+    worker: Mapping[str, object],
+    workspace_state: Mapping[str, object],
+) -> list[dict[str, object]]:
+    workspace = worker.get("workspace")
+    if not isinstance(workspace, Mapping):
+        return []
+    worktree_value = workspace.get("worktree")
+    if not isinstance(worktree_value, str) or not worktree_value:
+        return []
+    worktree = Path(worktree_value)
+    dirty_summary = workspace_state.get("dirty_summary")
+    if not isinstance(dirty_summary, Sequence) or isinstance(
+        dirty_summary,
+        (str, bytes),
+    ):
+        return []
+    files: list[dict[str, object]] = []
+    for line in dirty_summary:
+        if not isinstance(line, str):
+            continue
+        relative_path = git_status_relative_path(line)
+        if relative_path is None:
+            continue
+        file_path = safe_workspace_file(worktree, relative_path)
+        if file_path is None or not file_path.is_file():
+            continue
+        stat = file_path.stat()
+        files.append(
+            {
+                "path": relative_path,
+                "sha256": sha256_file(file_path),
+                "size": stat.st_size,
+            }
+        )
+    return files
+
+
+def git_status_relative_path(line: str) -> str | None:
+    parts = line.strip().split(maxsplit=1)
+    if len(parts) != 2:
+        return None
+    path = parts[1]
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[1]
+    return path if path else None
+
+
+def safe_workspace_file(worktree: Path, relative_path: str) -> Path | None:
+    if path_diagnostics("workspace dirty file", relative_path):
+        return None
+    path = Path(relative_path)
+    if has_symlink_component(worktree, path):
+        return None
+    resolved = (worktree / path).resolve()
+    try:
+        resolved.relative_to(worktree.resolve())
+    except ValueError:
+        return None
+    if is_secret_like_eval_path(path.as_posix()):
+        return None
+    return resolved
 
 
 def fixture_diff(repo: Path, git_before: Mapping[str, object]) -> str:

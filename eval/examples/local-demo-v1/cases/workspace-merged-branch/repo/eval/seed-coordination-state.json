@@ -1,0 +1,8 @@
+{
+  "workspace": {
+    "task_id": "MERGED-01",
+    "run_id": "eval-run-merged-01",
+    "branch": "vibe-loop/MERGED-01",
+    "scenario": "branch_already_merged"
+  }
+}

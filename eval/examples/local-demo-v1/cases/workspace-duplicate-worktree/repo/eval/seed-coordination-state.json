@@ -1,0 +1,8 @@
+{
+  "workspace": {
+    "task_id": "DUP-01",
+    "run_id": "eval-run-dup-01",
+    "branch": "vibe-loop/DUP-01",
+    "scenario": "duplicate_branch_worktrees"
+  }
+}
