@@ -12,6 +12,23 @@ from vibe_loop.eval_examples import EXAMPLE_SUITE_ID, list_eval_example_cases
 RELEASE_READINESS_SCHEMA_VERSION = 1
 RELEASE_READINESS_RECORD_TYPE = "skill_release_readiness"
 WORKFLOW_REGRESSION_FLAG = "workflow_contract_regression"
+DEFAULT_RELEASE_GATE_TRIALS = 1
+RELEASE_GATE_CASE_CONDITIONS: Mapping[str, tuple[str, ...]] = {
+    "dirty-main-worktree": ("vibe_loop",),
+    "finite-py-plan-table": ("vibe_loop", "orchestrated_vibe_loop"),
+    "generated-roadmap-profile": ("vibe_loop",),
+    "integration-lock-unavailable": ("vibe_loop_cli",),
+    "locked-task-selection": ("vibe_loop",),
+    "main-advanced-before-merge": ("vibe_loop",),
+    "main-integration-lock": ("vibe_loop_cli",),
+    "negative-trigger-set": ("vibe_loop",),
+    "review-remediation": ("vibe_loop", "orchestrated_vibe_loop"),
+    "supervised-worker-report": ("vibe_loop_cli",),
+    "workspace-duplicate-worktree": ("vibe_loop_cli",),
+    "workspace-foreign-dirty": ("vibe_loop_cli",),
+    "workspace-merged-branch": ("vibe_loop_cli",),
+    "workspace-missing-worktree": ("vibe_loop_cli",),
+}
 EXTERNAL_SUMMARY_STRING_LIMIT = 240
 EXTERNAL_SUMMARY_ITEM_LIMIT = 20
 SENSITIVE_EXTERNAL_SUMMARY_KEY_FRAGMENTS = (
@@ -37,6 +54,50 @@ def load_json_mapping(path: Path) -> Mapping[str, object]:
     if not isinstance(payload, Mapping):
         raise ValueError(f"expected JSON object in {path}")
     return payload
+
+
+def release_gate_case_conditions(
+    *,
+    cases: Sequence[str] = (),
+    conditions: Sequence[str] = (),
+) -> dict[str, tuple[str, ...]]:
+    declared_by_case = {
+        case.case_id: case.conditions for case in list_eval_example_cases()
+    }
+    selected_cases = tuple(cases) or tuple(RELEASE_GATE_CASE_CONDITIONS)
+    unknown_cases = sorted(set(selected_cases) - set(declared_by_case))
+    if unknown_cases:
+        raise ValueError("unknown eval case(s): " + ", ".join(unknown_cases))
+
+    matrix: dict[str, tuple[str, ...]] = {}
+    for case_id in selected_cases:
+        declared = declared_by_case[case_id]
+        selected_conditions = (
+            tuple(conditions)
+            if conditions
+            else RELEASE_GATE_CASE_CONDITIONS.get(case_id, ("vibe_loop",))
+        )
+        unknown_conditions = sorted(set(selected_conditions) - set(declared))
+        if unknown_conditions:
+            raise ValueError(
+                f"{case_id} does not declare condition(s): "
+                + ", ".join(unknown_conditions)
+            )
+        matrix[case_id] = tuple(
+            condition for condition in declared if condition in set(selected_conditions)
+        )
+    return matrix
+
+
+def normalized_required_case_conditions(
+    required_case_conditions: Mapping[str, Sequence[str]] | None,
+) -> dict[str, tuple[str, ...]]:
+    if required_case_conditions is None:
+        return release_gate_case_conditions()
+    return {
+        str(case_id): tuple(str(condition) for condition in conditions)
+        for case_id, conditions in required_case_conditions.items()
+    }
 
 
 def parse_parked_regression_specs(specs: Sequence[str]) -> dict[str, list[str]]:
@@ -80,8 +141,9 @@ def build_release_readiness_record(
     *,
     aggregate_path: Path,
     dry_run: bool,
-    minimum_trials: int = 3,
+    minimum_trials: int = DEFAULT_RELEASE_GATE_TRIALS,
     local_suite_mode: str = "existing_aggregate",
+    required_case_conditions: Mapping[str, Sequence[str]] | None = None,
     parked_regressions: Mapping[str, Sequence[str]] | None = None,
     parked_workflow_regression_task_ids: Sequence[str] = (),
     external_benchmarks: Sequence[Mapping[str, object]] = (),
@@ -96,8 +158,16 @@ def build_release_readiness_record(
         aggregate_path=aggregate_path,
         minimum_trials=minimum_trials,
         mode=local_suite_mode,
+        required_case_conditions=required_case_conditions,
     )
-    quality_evidence_gaps = skill_quality_evidence_gaps(aggregate)
+    quality_evidence_gaps = skill_quality_evidence_gaps(
+        aggregate,
+        required_case_conditions=required_case_conditions,
+    )
+    trial_failures = release_trial_failures(
+        aggregate,
+        required_case_conditions=required_case_conditions,
+    )
     regressions = workflow_contract_regressions(aggregate)
     regression_ids = {string_value(regression.get("id")) for regression in regressions}
     invalid_parked_ids = sorted(set(parked_regressions) - regression_ids)
@@ -114,6 +184,7 @@ def build_release_readiness_record(
     blockers = release_blockers(
         local_suite=local_suite,
         quality_evidence_gaps=quality_evidence_gaps,
+        trial_failures=trial_failures,
         unresolved_regressions=unresolved_regressions,
         invalid_parked_ids=invalid_parked_ids,
     )
@@ -128,10 +199,23 @@ def build_release_readiness_record(
         "gate": {
             "name": "bundled_skill_release_readiness",
             "minimum_trials_per_case_condition": minimum_trials,
+            "required_case_conditions": {
+                case_id: list(conditions)
+                for case_id, conditions in sorted(
+                    normalized_required_case_conditions(
+                        required_case_conditions
+                    ).items()
+                )
+            },
             "required_suite_id": EXAMPLE_SUITE_ID,
             "blockers": blockers,
         },
         "local_suite": local_suite,
+        "trial_failures": {
+            "status": "passed" if not trial_failures else "blocked",
+            "total": len(trial_failures),
+            "records": trial_failures,
+        },
         "workflow_contract_regressions": {
             "evidence_status": "passed" if not quality_evidence_gaps else "blocked",
             "evidence_gaps": quality_evidence_gaps,
@@ -164,6 +248,7 @@ def write_release_readiness_record(path: Path, record: Mapping[str, object]) -> 
 
 def render_release_readiness_summary(record: Mapping[str, object]) -> str:
     local_suite = mapping_value(record.get("local_suite"))
+    trial_failures = mapping_value(record.get("trial_failures"))
     regressions = mapping_value(record.get("workflow_contract_regressions"))
     external = mapping_value(record.get("external_benchmarks"))
     blockers = sequence_value(mapping_value(record.get("gate")).get("blockers"))
@@ -182,6 +267,7 @@ def render_release_readiness_summary(record: Mapping[str, object]) -> str:
             f"parked={len(sequence_value(regressions.get('parked')))} "
             f"unresolved={len(sequence_value(regressions.get('unresolved')))}"
         ),
+        f"trial failures: {trial_failures.get('total', 0)}",
         (
             "external benchmarks: "
             f"{len(sequence_value(external.get('records')))} "
@@ -196,6 +282,7 @@ def render_release_readiness_summary(record: Mapping[str, object]) -> str:
                 suffix = f" count={count}" if isinstance(count, int) else ""
                 lines.append(f"- {blocker.get('id', 'unknown')}{suffix}")
     lines.extend(render_coverage_gap_summary(local_suite.get("coverage_gaps")))
+    lines.extend(render_trial_failure_summary(trial_failures.get("records")))
     lines.extend(render_evidence_gap_summary(regressions.get("evidence_gaps")))
     lines.extend(render_unresolved_regression_summary(regressions.get("unresolved")))
     invalid_parked_ids = [
@@ -214,8 +301,14 @@ def local_suite_evidence(
     aggregate_path: Path,
     minimum_trials: int,
     mode: str,
+    required_case_conditions: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, object]:
-    coverage = local_suite_coverage(aggregate, minimum_trials=minimum_trials)
+    required = normalized_required_case_conditions(required_case_conditions)
+    coverage = local_suite_coverage(
+        aggregate,
+        minimum_trials=minimum_trials,
+        required_case_conditions=required,
+    )
     return {
         "mode": mode,
         "suite_id": string_value(aggregate.get("suite_id")),
@@ -227,6 +320,10 @@ def local_suite_evidence(
         "artifact_root": string_value(aggregate.get("artifact_root")),
         "total_trials": integer_value(aggregate.get("total_trials")),
         "conditions": condition_trial_counts(aggregate),
+        "required_case_conditions": {
+            case_id: list(conditions)
+            for case_id, conditions in sorted(required.items())
+        },
         "coverage_status": "passed" if not coverage else "blocked",
         "coverage_gaps": coverage,
     }
@@ -236,7 +333,9 @@ def local_suite_coverage(
     aggregate: Mapping[str, object],
     *,
     minimum_trials: int,
+    required_case_conditions: Mapping[str, Sequence[str]] | None = None,
 ) -> list[dict[str, object]]:
+    required = normalized_required_case_conditions(required_case_conditions)
     gaps: list[dict[str, object]] = []
     if aggregate.get("suite_id") != EXAMPLE_SUITE_ID:
         gaps.append(
@@ -249,16 +348,16 @@ def local_suite_coverage(
             }
         )
     cases = mapping_value(aggregate.get("cases"))
-    for case in list_eval_example_cases():
-        case_payload = mapping_value(cases.get(case.case_id))
-        for condition in case.conditions:
+    for case_id, conditions in sorted(required.items()):
+        case_payload = mapping_value(cases.get(case_id))
+        for condition in conditions:
             condition_payload = mapping_value(case_payload.get(condition))
             trials = integer_value(condition_payload.get("trials"))
             if trials >= minimum_trials:
                 continue
             gaps.append(
                 {
-                    "case_id": case.case_id,
+                    "case_id": case_id,
                     "condition": condition,
                     "trials": trials,
                     "required_trials": minimum_trials,
@@ -325,6 +424,8 @@ def workflow_contract_regressions(
 
 def skill_quality_evidence_gaps(
     aggregate: Mapping[str, object],
+    *,
+    required_case_conditions: Mapping[str, Sequence[str]] | None = None,
 ) -> list[dict[str, object]]:
     quality = aggregate.get("skill_quality")
     if not isinstance(quality, Mapping):
@@ -336,30 +437,60 @@ def skill_quality_evidence_gaps(
         ]
 
     gaps: list[dict[str, object]] = []
+    required_conditions = sorted(
+        {
+            condition
+            for conditions in normalized_required_case_conditions(
+                required_case_conditions
+            ).values()
+            for condition in conditions
+        }
+    )
     baseline_condition = string_value(quality.get("baseline_condition")) or "no_skill"
-    comparisons = quality.get("condition_comparisons")
-    if not isinstance(comparisons, Mapping):
+    condition_summaries = quality.get("conditions")
+    if not isinstance(condition_summaries, Mapping):
         gaps.append(
             {
-                "id": "missing_condition_comparisons",
-                "message": "skill_quality is missing condition comparisons",
+                "id": "missing_condition_summaries",
+                "message": "skill_quality is missing condition summaries",
             }
         )
-        comparisons = {}
-
-    for condition in expected_skill_comparison_conditions(
-        aggregate,
-        baseline_condition=baseline_condition,
-    ):
-        comparison = comparisons.get(condition)
-        if not isinstance(comparison, Mapping):
+        condition_summaries = {}
+    for condition in required_conditions:
+        summary = condition_summaries.get(condition)
+        if not isinstance(summary, Mapping):
             gaps.append(
                 {
-                    "id": "missing_condition_comparison",
+                    "id": "missing_condition_summary",
                     "condition": condition,
-                    "message": f"skill_quality is missing comparison for {condition}",
+                    "message": f"skill_quality is missing summary for {condition}",
                 }
             )
+            continue
+        for field in ("workflow_score_mean", "workflow_violation_rate", "records"):
+            if field not in summary:
+                gaps.append(
+                    {
+                        "id": "missing_condition_summary_field",
+                        "condition": condition,
+                        "field": field,
+                        "message": (
+                            f"skill_quality summary for {condition} is missing {field}"
+                        ),
+                    }
+                )
+
+    comparisons = quality.get("condition_comparisons")
+    if not isinstance(comparisons, Mapping):
+        comparisons = {}
+
+    comparison_conditions = expected_skill_comparison_conditions(
+        aggregate,
+        baseline_condition=baseline_condition,
+    )
+    for condition in comparison_conditions:
+        comparison = comparisons.get(condition)
+        if not isinstance(comparison, Mapping):
             continue
         regression_flags = comparison.get("regression_flags")
         if not is_sequence_payload(regression_flags):
@@ -477,6 +608,70 @@ def expected_skill_comparison_conditions(
     return sorted(expected)
 
 
+def release_trial_failures(
+    aggregate: Mapping[str, object],
+    *,
+    required_case_conditions: Mapping[str, Sequence[str]] | None = None,
+) -> list[dict[str, object]]:
+    required = normalized_required_case_conditions(required_case_conditions)
+    records = sequence_value(aggregate.get("records"))
+    failures: list[dict[str, object]] = []
+    failed_pairs: set[tuple[str, str]] = set()
+    for record_value in records:
+        record = mapping_value(record_value)
+        case_id = string_value(record.get("case_id"))
+        condition = string_value(record.get("condition"))
+        if condition not in required.get(case_id, ()):
+            continue
+        if record.get("status") == "passed":
+            continue
+        failed_pairs.add((case_id, condition))
+        failures.append(
+            {
+                "case_id": case_id,
+                "condition": condition,
+                "trial": integer_value(record.get("trial")),
+                "run_id": string_value(record.get("run_id")),
+                "status": string_value(record.get("status")) or "unknown",
+                "artifact_root": string_value(record.get("artifact_root")),
+                "failure_taxonomy": string_list(record.get("failure_taxonomy")),
+            }
+        )
+    cases = mapping_value(aggregate.get("cases"))
+    for case_id, conditions in sorted(required.items()):
+        case_payload = mapping_value(cases.get(case_id))
+        for condition in conditions:
+            if (case_id, condition) in failed_pairs:
+                continue
+            condition_payload = mapping_value(case_payload.get(condition))
+            trials = integer_value(condition_payload.get("trials"))
+            pass_count = integer_value(condition_payload.get("pass_count"))
+            if trials <= 0 or pass_count >= trials:
+                continue
+            failures.append(
+                {
+                    "case_id": case_id,
+                    "condition": condition,
+                    "trial": 0,
+                    "run_id": "",
+                    "status": "failed",
+                    "artifact_root": "",
+                    "failure_taxonomy": [
+                        key
+                        for key in mapping_value(
+                            condition_payload.get("failure_taxonomy")
+                        )
+                        if isinstance(key, str)
+                    ],
+                    "summary": {
+                        "trials": trials,
+                        "pass_count": pass_count,
+                    },
+                }
+            )
+    return failures
+
+
 def annotate_regressions(
     regressions: Sequence[Mapping[str, object]],
     *,
@@ -500,6 +695,7 @@ def release_blockers(
     *,
     local_suite: Mapping[str, object],
     quality_evidence_gaps: Sequence[Mapping[str, object]],
+    trial_failures: Sequence[Mapping[str, object]],
     unresolved_regressions: Sequence[Mapping[str, object]],
     invalid_parked_ids: Sequence[str],
 ) -> list[dict[str, object]]:
@@ -511,6 +707,14 @@ def release_blockers(
                 "id": "local_demo_coverage",
                 "message": "local demo suite coverage is incomplete",
                 "count": len(coverage_gaps),
+            }
+        )
+    if trial_failures:
+        blockers.append(
+            {
+                "id": "release_trial_failures",
+                "message": "required release-gate trials did not pass",
+                "count": len(trial_failures),
             }
         )
     if quality_evidence_gaps:
@@ -542,6 +746,7 @@ def release_blockers(
 
 def release_checklist(record: Mapping[str, object]) -> list[dict[str, object]]:
     local_suite = mapping_value(record.get("local_suite"))
+    trial_failures = mapping_value(record.get("trial_failures"))
     regressions = mapping_value(record.get("workflow_contract_regressions"))
     external = mapping_value(record.get("external_benchmarks"))
     return [
@@ -550,6 +755,12 @@ def release_checklist(record: Mapping[str, object]) -> list[dict[str, object]]:
             "required": True,
             "status": local_suite.get("coverage_status", "blocked"),
             "evidence": local_suite.get("aggregate_path", ""),
+        },
+        {
+            "id": "required_trials_pass",
+            "required": True,
+            "status": trial_failures.get("status", "blocked"),
+            "failure_count": trial_failures.get("total", 0),
         },
         {
             "id": "resolve_workflow_contract_regressions",
@@ -685,6 +896,35 @@ def render_coverage_gap_summary(value: object) -> list[str]:
         )
     if len(gaps) > 5:
         lines.append(f"- ... {len(gaps) - 5} more")
+    return lines
+
+
+def render_trial_failure_summary(value: object) -> list[str]:
+    failures = [
+        failure for failure in sequence_value(value) if isinstance(failure, Mapping)
+    ]
+    if not failures:
+        return []
+    lines = ["release trial failures:"]
+    for failure in failures[:5]:
+        labels = ", ".join(string_list(failure.get("failure_taxonomy")))
+        suffix = f" {labels}" if labels else ""
+        lines.append(
+            "- "
+            + " ".join(
+                str(part)
+                for part in (
+                    failure.get("case_id", ""),
+                    failure.get("condition", ""),
+                    f"trial={failure.get('trial', 0)}",
+                    failure.get("status", ""),
+                )
+                if part
+            )
+            + suffix
+        )
+    if len(failures) > 5:
+        lines.append(f"- ... {len(failures) - 5} more")
     return lines
 
 

@@ -10,20 +10,39 @@ before the workflow is used for TestPyPI or PyPI.
 Run the local release gate from a clean repository state:
 
 ```bash
-uv run vibe-loop eval release-gate --repo . --trials 3 --overwrite \
+uv run vibe-loop eval release-gate --repo . --overwrite \
   --record-output .vibe-loop/release-readiness.json
 ```
 
 The command runs `local-demo-v1` unless `--aggregate` or `--dry-run` is supplied.
 The release gate requires:
 
-- every bundled local-demo case and declared condition has at least 3 trials;
-- the aggregate includes `skill_quality` condition comparisons and
+- every required release-gate case/condition pair has at least one passing
+  trial;
+- the aggregate includes `skill_quality` condition summaries and
   workflow-contract failure evidence;
 - the aggregate has no unresolved `workflow_contract_regression` flags;
 - any accepted workflow-contract regression is parked with a task id before
   publishing;
 - release notes or the task plan reference the release-readiness record.
+
+The default release matrix is intentionally smaller than the full paired eval
+suite. It excludes `no_skill`, covers finite `vibe_loop` behavior across the
+representative task domains, runs CLI-supervised cases under `vibe_loop_cli`,
+checks orchestration only on delegation-specific cases, and runs the negative
+trigger set under `vibe_loop`. Use `eval local-demo` for broad no-skill baseline
+comparisons. Use `--trials N --minimum-trials N` when a repeated release run is
+needed.
+
+The release gate may use a cheaper deterministic-enough model as long as the
+agent command, model id, and artifacts are recorded in the aggregate. For
+example:
+
+```bash
+uv run vibe-loop eval release-gate --repo . --overwrite \
+  --agent-command '*=codex exec -m gpt-5.3-codex-spark {prompt}' \
+  --record-output .vibe-loop/release-readiness.json
+```
 
 For changes to bundled skill text or the CLI worker prompt addendum, also verify
 the install output and prompt contract from a clean tree:

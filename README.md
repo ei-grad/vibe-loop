@@ -273,7 +273,7 @@ vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
-vibe-loop eval release-gate --repo . --trials 3 --overwrite --record-output .vibe-loop/release-readiness.json
+vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
 vibe-loop workers --repo .
 vibe-loop workers --repo . --json
 vibe-loop runs list --repo .
@@ -342,13 +342,17 @@ aggregate in the same output directory, and links each reported count or delta
 back to the contributing trial artifact roots.
 
 `eval release-gate` is the bundled skill release-readiness check. Without
-`--aggregate` or `--dry-run`, it runs the local demo suite with a release default
-of 3 trials per case and condition, then writes or prints a
-`skill_release_readiness` record. The gate requires full local-demo coverage and
-requires `skill_quality` comparison evidence before it can pass. It blocks
-unresolved `workflow_contract_regression` findings from the aggregate's
-`skill_quality` section. A regression can be accepted only when it is parked with
-a task id, for example
+`--aggregate` or `--dry-run`, it runs a compact release matrix from
+`local-demo-v1`, then writes or prints a `skill_release_readiness` record. The
+default matrix is 16 required case/condition trials: finite `vibe_loop` cases,
+CLI-supervised `vibe_loop_cli` cases, two `orchestrated_vibe_loop` delegation
+cases, and the negative trigger set under `vibe_loop`. The release gate does not
+require `no_skill` baseline trials; paired no-skill comparisons remain available
+through `eval local-demo` for research or broader regression analysis. The gate
+requires required trials to pass, requires `skill_quality` condition summaries
+and workflow-failure evidence, and blocks unresolved `workflow_contract_regression`
+findings from comparison or prior-run evidence. A regression can be accepted only
+when it is parked with a task id, for example
 `--parked-regression condition_comparison:vibe_loop=EVAL-99`. External benchmark
 smoke evidence can be attached with `--external-benchmark-json`; it is recorded
 as optional context and is not required for every bundled skill change.
@@ -911,7 +915,7 @@ Before publishing bundled skill changes, run the release-readiness gate and put
 the resulting record path or artifact link in the release notes:
 
 ```bash
-uv run vibe-loop eval release-gate --repo . --trials 3 --overwrite \
+uv run vibe-loop eval release-gate --repo . --overwrite \
   --record-output .vibe-loop/release-readiness.json
 ```
 

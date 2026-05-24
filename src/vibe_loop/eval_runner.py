@@ -91,6 +91,7 @@ class LocalSkillEvalConfig:
     default_agent_command: str | None = None
     cases: Sequence[str] = ()
     conditions: Sequence[str] = ()
+    case_conditions: Mapping[str, Sequence[str]] | None = None
     trials: int = 1
     transcript_graders: Sequence[str] = ()
     timeout_seconds: int | None = None
@@ -204,7 +205,11 @@ def run_local_demo_eval(config: LocalSkillEvalConfig) -> dict[str, object]:
     trial_results: list[TrialResult] = []
     run_order = 0
     for case in cases:
-        conditions = selected_conditions(case, config.conditions)
+        conditions = selected_conditions(
+            case,
+            config.conditions,
+            config.case_conditions,
+        )
         for condition in conditions:
             command = command_for_condition(condition, config)
             for trial in range(1, config.trials + 1):
@@ -358,9 +363,21 @@ def selected_cases(config: LocalSkillEvalConfig) -> list[EvalExampleCase]:
 def selected_conditions(
     case: EvalExampleCase,
     requested: Sequence[str],
+    case_conditions: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str, ...]:
     declared = case.conditions
     if not requested:
+        if case_conditions is not None:
+            selected = tuple(case_conditions.get(case.case_id, ()))
+            unknown = sorted(set(selected) - set(declared))
+            if unknown:
+                raise ValueError(
+                    f"{case.case_id} does not declare condition(s): "
+                    + ", ".join(unknown)
+                )
+            return tuple(
+                condition for condition in declared if condition in set(selected)
+            )
         return declared
     unknown = sorted(set(requested) - set(declared))
     if unknown:

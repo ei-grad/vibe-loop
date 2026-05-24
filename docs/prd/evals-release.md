@@ -56,13 +56,16 @@ Related implementation IDs: `EVAL-03`, `EVAL-05`.
 
 ## PRD-EVL-005 Release Readiness Gate
 
-Bundled skill releases must require complete local-demo evidence and block
-unresolved workflow-contract regressions unless they are explicitly parked with
-task IDs.
+Bundled skill releases must require compact, release-relevant local-demo
+evidence and block unresolved workflow-contract regressions unless they are
+explicitly parked with task IDs.
 
-Acceptance must cover default three-trial release runs, dry-run over existing
-aggregates, release-readiness records, parked regression flags, optional
-external benchmark summaries, and release-note references to evidence.
+Acceptance must cover a curated release matrix distinct from the full paired
+eval suite, no required `no_skill` baseline for release readiness, required
+trial pass/fail blocking, dry-run over existing aggregates, release-readiness
+records, parked regression flags, optional external benchmark summaries, and
+release-note references to evidence. The full local-demo suite must still
+support paired `no_skill` comparisons for broader analysis.
 
 Related implementation IDs: `EVAL-06`.
 

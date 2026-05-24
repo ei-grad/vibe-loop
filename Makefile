@@ -28,7 +28,7 @@ build:
 check: test build
 
 release-gate:
-	$(UV) run vibe-loop eval release-gate --repo . --trials 3 --overwrite \
+	$(UV) run vibe-loop eval release-gate --repo . --overwrite \
 	  --record-output $(RELEASE_RECORD)
 
 install-hooks:

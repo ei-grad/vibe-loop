@@ -64,7 +64,8 @@ tests while still violating the workflow contract.
 
 ## Paired Conditions
 
-Every bundled skill task should run under a controlled matrix:
+Full skill-quality analysis should run bundled skill tasks under a controlled
+paired matrix:
 
 - `no_skill`: same user prompt, no bundled skill available.
 - `vibe_loop`: bundled `vibe-loop` skill available and expected to activate.
@@ -85,6 +86,13 @@ and run order for every trial.
 Each trial needs a clean worktree or fresh fixture checkout. Do not reuse a
 modified repository, `.vibe-loop/` state directory, lock file, transcript, or
 skill cache across conditions unless that state is explicitly part of the task.
+
+The release-readiness gate is a smaller smoke matrix, not the full paired
+comparison. It should require the release-relevant `vibe_loop`,
+`vibe_loop_cli`, and `orchestrated_vibe_loop` case/condition pairs to pass, plus
+negative trigger prompts under `vibe_loop`; it should not require `no_skill`
+baseline failures before publishing. Paired no-skill evidence remains useful
+when measuring uplift or investigating regressions outside the release gate.
 
 ## Task Suite Design
 

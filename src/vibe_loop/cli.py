@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import distribution as metadata_distribution
 from importlib.metadata import version as metadata_version
@@ -25,11 +26,13 @@ from vibe_loop.eval_runner import (
     run_local_demo_eval,
 )
 from vibe_loop.eval_release import (
+    DEFAULT_RELEASE_GATE_TRIALS,
     build_release_readiness_record,
     load_external_benchmark_evidence,
     load_json_mapping,
     parse_parked_regression_specs,
     render_release_readiness_summary,
+    release_gate_case_conditions,
     write_release_readiness_record,
 )
 from vibe_loop.generated_profiles import (
@@ -520,8 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     release_gate.add_argument(
         "--minimum-trials",
         type=int,
-        default=3,
-        help="Required trials per local-demo case and condition",
+        default=DEFAULT_RELEASE_GATE_TRIALS,
+        help="Required trials per release-gate case and condition",
     )
     release_gate.add_argument(
         "--parked-regression",
@@ -542,7 +545,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Optional external benchmark smoke summary JSON",
     )
-    add_local_demo_eval_arguments(release_gate, default_trials=3)
+    add_local_demo_eval_arguments(
+        release_gate, default_trials=DEFAULT_RELEASE_GATE_TRIALS
+    )
     release_gate.add_argument("--json", action="store_true")
 
     benchmark = eval_subparsers.add_parser(
@@ -997,10 +1002,24 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
         aggregate_path = args.aggregate or (
             output_root / "local-demo-v1" / "aggregate.json"
         )
+        try:
+            required_case_conditions = release_gate_case_conditions(
+                cases=tuple(args.case),
+                conditions=tuple(args.condition),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         local_suite_mode = "existing_aggregate"
         if not args.dry_run and args.aggregate is None:
             aggregate = run_local_demo_eval(
-                local_demo_config_from_args(args, config, output_root=output_root)
+                local_demo_config_from_args(
+                    args,
+                    config,
+                    output_root=output_root,
+                    cases=tuple(required_case_conditions),
+                    case_conditions=required_case_conditions,
+                )
             )
             aggregate_path = output_root / "local-demo-v1" / "aggregate.json"
             local_suite_mode = "executed"
@@ -1012,6 +1031,7 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
             dry_run=args.dry_run,
             minimum_trials=args.minimum_trials,
             local_suite_mode=local_suite_mode,
+            required_case_conditions=required_case_conditions,
             parked_regressions=parse_parked_regression_specs(args.parked_regression),
             parked_workflow_regression_task_ids=tuple(args.parked_workflow_regression),
             external_benchmarks=load_external_benchmark_evidence(
@@ -1125,6 +1145,8 @@ def local_demo_config_from_args(
     config,
     *,
     output_root: Path,
+    cases: Sequence[str] | None = None,
+    case_conditions: Mapping[str, Sequence[str]] | None = None,
 ) -> LocalSkillEvalConfig:
     agent_commands, default_agent_command = parse_agent_command_specs(
         args.agent_command
@@ -1135,8 +1157,9 @@ def local_demo_config_from_args(
         output_root=output_root,
         agent_commands=agent_commands,
         default_agent_command=default_agent_command,
-        cases=tuple(args.case),
-        conditions=tuple(args.condition),
+        cases=tuple(cases) if cases is not None else tuple(args.case),
+        conditions=() if case_conditions is not None else tuple(args.condition),
+        case_conditions=case_conditions,
         trials=args.trials,
         transcript_graders=tuple(args.transcript_grader),
         timeout_seconds=args.timeout_seconds,

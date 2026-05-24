@@ -15,6 +15,7 @@ from vibe_loop.eval_release import (
     load_json_mapping,
     parse_parked_regression_specs,
     render_release_readiness_summary,
+    release_gate_case_conditions,
 )
 
 
@@ -49,6 +50,7 @@ class EvalReleaseTests(unittest.TestCase):
         self.assertTrue(record["dry_run"])
         self.assertEqual(record["local_suite"]["coverage_status"], "passed")
         self.assertEqual(record["workflow_contract_regressions"]["unresolved"], [])
+        self.assertEqual(record["trial_failures"]["status"], "passed")
         self.assertEqual(record["external_benchmarks"]["status"], "recorded")
         self.assertEqual(
             record["checklist"][0],
@@ -97,10 +99,11 @@ class EvalReleaseTests(unittest.TestCase):
             ["EVAL-99"],
         )
 
-    def test_coverage_gaps_block_release_gate(self) -> None:
+    def test_coverage_gaps_block_release_gate_for_required_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             aggregate_path = Path(directory) / "aggregate.json"
-            aggregate = passing_release_aggregate(trials=1)
+            aggregate = passing_release_aggregate()
+            aggregate["cases"]["finite-py-plan-table"]["vibe_loop"]["trials"] = 0
             write_json(aggregate_path, aggregate)
 
             record = build_release_readiness_record(
@@ -112,7 +115,7 @@ class EvalReleaseTests(unittest.TestCase):
 
         self.assertEqual(record["status"], "blocked")
         self.assertEqual(record["gate"]["blockers"][0]["id"], "local_demo_coverage")
-        self.assertEqual(record["local_suite"]["coverage_gaps"][0]["trials"], 1)
+        self.assertEqual(record["local_suite"]["coverage_gaps"][0]["trials"], 0)
 
     def test_missing_skill_quality_blocks_release_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -138,12 +141,31 @@ class EvalReleaseTests(unittest.TestCase):
             "missing_skill_quality",
         )
 
-    def test_case_coverage_requires_condition_comparison(self) -> None:
+    def test_release_gate_does_not_require_no_skill_condition_comparisons(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             aggregate_path = Path(directory) / "aggregate.json"
             aggregate = passing_release_aggregate()
-            del aggregate["conditions"]["vibe_loop"]
             aggregate["skill_quality"]["condition_comparisons"] = {}
+            write_json(aggregate_path, aggregate)
+
+            record = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                generated_at="2026-05-09T00:00:00+00:00",
+            )
+
+        self.assertEqual(record["status"], "passed")
+        self.assertEqual(
+            record["workflow_contract_regressions"]["evidence_gaps"],
+            [],
+        )
+
+    def test_missing_required_condition_summary_blocks_release_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            aggregate_path = Path(directory) / "aggregate.json"
+            aggregate = passing_release_aggregate()
+            del aggregate["skill_quality"]["conditions"]["vibe_loop"]
             write_json(aggregate_path, aggregate)
 
             record = build_release_readiness_record(
@@ -155,14 +177,8 @@ class EvalReleaseTests(unittest.TestCase):
 
         self.assertEqual(record["status"], "blocked")
         self.assertEqual(
-            record["workflow_contract_regressions"]["evidence_gaps"][0],
-            {
-                "id": "missing_condition_comparison",
-                "condition": "orchestrated_vibe_loop",
-                "message": (
-                    "skill_quality is missing comparison for orchestrated_vibe_loop"
-                ),
-            },
+            record["workflow_contract_regressions"]["evidence_gaps"][0]["id"],
+            "missing_condition_summary",
         )
 
     def test_regression_flags_must_be_strings(self) -> None:
@@ -221,8 +237,10 @@ class EvalReleaseTests(unittest.TestCase):
     def test_blocked_summary_includes_actionable_regression_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             aggregate_path = Path(directory) / "aggregate.json"
+            aggregate = passing_release_aggregate(workflow_regression=True)
+            aggregate["cases"]["finite-py-plan-table"]["vibe_loop"]["trials"] = 0
             record = build_release_readiness_record(
-                passing_release_aggregate(trials=1, workflow_regression=True),
+                aggregate,
                 aggregate_path=aggregate_path,
                 dry_run=True,
                 generated_at="2026-05-09T00:00:00+00:00",
@@ -237,6 +255,53 @@ class EvalReleaseTests(unittest.TestCase):
         self.assertIn(
             "--parked-regression condition_comparison:vibe_loop=TASK-ID",
             summary,
+        )
+
+    def test_current_required_trial_failure_blocks_release_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            aggregate_path = Path(directory) / "aggregate.json"
+            aggregate = passing_release_aggregate()
+            aggregate["records"][0]["status"] = "failed"
+            aggregate["records"][0]["failure_taxonomy"] = ["workflow_contract"]
+            write_json(aggregate_path, aggregate)
+
+            record = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                generated_at="2026-05-09T00:00:00+00:00",
+            )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["trial_failures"]["total"], 1)
+        self.assertIn(
+            "release_trial_failures",
+            [blocker["id"] for blocker in record["gate"]["blockers"]],
+        )
+
+    def test_failed_required_case_summary_blocks_release_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            aggregate_path = Path(directory) / "aggregate.json"
+            aggregate = passing_release_aggregate()
+            aggregate["records"] = []
+            summary = aggregate["cases"]["finite-py-plan-table"]["vibe_loop"]
+            summary["pass_count"] = 0
+            summary["pass_rate"] = 0.0
+            summary["failure_taxonomy"] = {"workflow_contract": 1}
+            write_json(aggregate_path, aggregate)
+
+            record = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                generated_at="2026-05-09T00:00:00+00:00",
+            )
+
+        self.assertEqual(record["status"], "blocked")
+        self.assertEqual(record["trial_failures"]["total"], 1)
+        self.assertEqual(
+            record["trial_failures"]["records"][0]["failure_taxonomy"],
+            ["workflow_contract"],
         )
 
     def test_external_benchmark_summary_omits_sensitive_nested_values(self) -> None:
@@ -320,6 +385,7 @@ def passing_release_aggregate(
     trials: int = 3,
     workflow_regression: bool = False,
 ) -> dict[str, object]:
+    required = release_gate_case_conditions()
     cases = {
         case.case_id: {
             condition: {
@@ -348,6 +414,48 @@ def passing_release_aggregate(
     regression_flags = ["workflow_contract_regression"] if workflow_regression else []
     workflow_delta = -1.0 if workflow_regression else 0.0
     workflow_violation_delta = 1.0 if workflow_regression else 0.0
+    records = [
+        {
+            "case_id": case_id,
+            "condition": condition,
+            "trial": trial,
+            "run_id": f"{case_id}-{condition}-{trial}",
+            "status": "passed",
+            "artifact_root": f"cases/{case_id}/{condition}/trial-{trial}",
+            "failure_taxonomy": [],
+        }
+        for case_id, conditions in required.items()
+        for condition in conditions
+        for trial in range(1, trials + 1)
+    ]
+    quality_conditions = {
+        condition: {
+            "trials": count,
+            "primary_trials": count,
+            "pass_count": count,
+            "pass_rate": 1.0,
+            "task_score_mean": 1.0,
+            "workflow_score_mean": 1.0,
+            "trigger_score_mean": 1.0,
+            "workflow_violation_rate": 0.0,
+            "trigger_miss_rate": 0.0,
+            "latency_seconds_mean": 1.0,
+            "command_count_mean": 1.0,
+            "records": [
+                {
+                    "run_id": record["run_id"],
+                    "case_id": record["case_id"],
+                    "condition": record["condition"],
+                    "trial": record["trial"],
+                    "status": record["status"],
+                    "artifact_root": record["artifact_root"],
+                }
+                for record in records
+                if record["condition"] == condition
+            ],
+        }
+        for condition, count in total_by_condition.items()
+    }
     return {
         "schema_version": 1,
         "suite_id": "local-demo-v1",
@@ -366,6 +474,8 @@ def passing_release_aggregate(
         },
         "cases": cases,
         "skill_quality": {
+            "baseline_condition": "no_skill",
+            "conditions": quality_conditions,
             "condition_comparisons": {
                 "vibe_loop": {
                     "regression_flags": regression_flags,
@@ -400,6 +510,7 @@ def passing_release_aggregate(
                 "workflow_contract_failures": {"count": 0, "records": []}
             },
         },
+        "records": records,
     }
 
 

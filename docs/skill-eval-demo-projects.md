@@ -50,6 +50,13 @@ no skill activation and no finite-slice workflow. Future suites can add
 `candidate_skill` and `infinite_vibe_loop` conditions without changing these
 case IDs.
 
+The release gate uses a smaller required matrix than the full suite. It runs
+representative finite cases under `vibe_loop`, protocol-heavy worker cases under
+`vibe_loop_cli`, only delegation-specific cases under
+`orchestrated_vibe_loop`, and the negative trigger set under `vibe_loop`. It
+does not require `no_skill` baseline trials; those remain part of full paired
+eval analysis.
+
 Each trial starts from a fresh fixture checkout and a fresh eval state directory.
 The harness records the run artifacts required by
 [`docs/skill-eval-schema.md`](skill-eval-schema.md): prompt, run log,
