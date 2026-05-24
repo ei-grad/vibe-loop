@@ -494,6 +494,41 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertIn("specs/001-checkout/tasks.md", tasks[1].source)
         self.assertEqual([task.task_id for task in candidates], ["001-checkout:T002"])
 
+    def test_spec_tool_source_extracts_conflict_domains(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            path = repo / "specs" / "001-checkout" / "tasks.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "# Tasks\n\n"
+                "- [ ] T001 Add checkout API\n"
+                "  - Resources: API docs and reviewer setup\n"
+                "  - Conflict Resources:\n"
+                "    - api\n"
+                "    - checkout\n"
+                "  - Conflict Paths:\n"
+                "    - src/api\n"
+                "    - src/checkout.py\n"
+                "- [ ] T002 Update docs\n"
+                "  - Conflict Resources: none\n"
+                "  - Conflict Paths: none\n"
+                "- [ ] T003 Missing conflict metadata\n",
+                encoding="utf-8",
+            )
+            source = build_task_source(repo, TaskSourceConfig(type="spec-kit"))
+
+            tasks = source.list_tasks()
+
+        self.assertEqual(tasks[0].resources, ("api", "checkout"))
+        self.assertEqual(tasks[0].paths, ("src/api", "src/checkout.py"))
+        self.assertTrue(tasks[0].conflict_domains_known)
+        self.assertEqual(tasks[1].resources, ())
+        self.assertEqual(tasks[1].paths, ())
+        self.assertTrue(tasks[1].conflict_domains_known)
+        self.assertEqual(tasks[2].resources, ())
+        self.assertEqual(tasks[2].paths, ())
+        self.assertFalse(tasks[2].conflict_domains_known)
+
     def test_kiro_source_discovers_tasks_and_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

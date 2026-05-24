@@ -649,6 +649,11 @@ optional `[P]` and story markers, inline `(depends on T001)` text, and nested
 dependency and label patterns. Acceptance and evidence labels may be single-line
 values or followed by nested bullet text. Checked boxes normalize to `Done`,
 unchecked boxes to `Planned`, and `[-]` or `[~]` normalize to `Active`.
+All three presets also read nested `Conflict Resources` and `Conflict Paths`
+labels as conflict domains for `run-until-done --jobs N`. Use comma-separated
+values or nested bullets, or `none` to declare an explicitly empty domain for a
+task. Unprefixed `Resources` and `Paths` labels are left available for
+repository-specific prose.
 Markdown profiles may map the same optional traceability fields as command
 task sources when the source artifact exposes them as columns, labels, prefixes,
 or patterns.

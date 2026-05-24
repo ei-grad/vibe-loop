@@ -1124,6 +1124,191 @@ class CliTests(unittest.TestCase):
             stderr.getvalue(),
         )
 
+    def test_run_until_done_jobs_executes_spec_derived_dependency_waves(
+        self,
+    ) -> None:
+        with temporary_directory_with_cleanup_retry() as directory:
+            repo = Path(directory) / "repo"
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            tasks_path = repo / "specs" / "001-checkout" / "tasks.md"
+            tasks_path.parent.mkdir(parents=True)
+            tasks_path.write_text(
+                "# Tasks: Checkout Flow\n\n"
+                "- [ ] T001 Add checkout API\n"
+                "  - Conflict Resources: api\n"
+                "  - Conflict Paths: src/api\n"
+                "  - Evidence: pytest tests/test_api.py\n"
+                "- [ ] T004 Add checkout migration (depends on T001, T002)\n"
+                "  - Conflict Resources: db\n"
+                "  - Conflict Paths: db/migrations\n"
+                "  - Evidence: pytest tests/test_migrations.py\n"
+                "- [ ] T003 Add checkout API client\n"
+                "  - Conflict Resources: api\n"
+                "  - Conflict Paths: src/api/client.py\n"
+                "  - Evidence: pytest tests/test_client.py\n"
+                "- [ ] T002 Update checkout docs\n"
+                "  - Conflict Resources: docs\n"
+                "  - Conflict Paths: docs/checkout.md\n"
+                "  - Evidence: markdownlint docs/checkout.md\n",
+                encoding="utf-8",
+            )
+            (repo / "agent.py").write_text(
+                "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
+                "import sys\n"
+                "import time\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from vibe_loop.cli import main\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
+                "local_id = task_id.split(':', 1)[-1]\n"
+                "safe_id = task_id.replace(':', '__')\n"
+                "done = Path('done')\n"
+                "done.mkdir(exist_ok=True)\n"
+                "done_at_start = sorted(path.name for path in done.iterdir())\n"
+                "wave = 'wave1' if local_id in {'T001', 'T002'} else 'wave2'\n"
+                "started_root = Path('started')\n"
+                "started_all = started_root / 'all'\n"
+                "started_all.mkdir(parents=True, exist_ok=True)\n"
+                "(started_all / safe_id).write_text(run_id, encoding='utf-8')\n"
+                "started = started_root / wave\n"
+                "started.mkdir(parents=True, exist_ok=True)\n"
+                "(started / safe_id).write_text(run_id, encoding='utf-8')\n"
+                "if wave == 'wave1':\n"
+                "    expected_wave1 = {'001-checkout__T001', '001-checkout__T002'}\n"
+                "    deadline = time.monotonic() + 15\n"
+                "    while len(list(started.iterdir())) < 2:\n"
+                "        unexpected = sorted(\n"
+                "            path.name\n"
+                "            for path in started_all.iterdir()\n"
+                "            if path.name not in expected_wave1\n"
+                "        )\n"
+                "        if unexpected:\n"
+                "            raise SystemExit(f'unexpected first wave: {unexpected}')\n"
+                "        if time.monotonic() > deadline:\n"
+                "            raise SystemExit(f'{wave} barrier timed out for {task_id}')\n"
+                "        time.sleep(0.02)\n"
+                "lock_task_ids = []\n"
+                "for lock_path in Path('.vibe-loop/locks').glob('*.lock'):\n"
+                "    metadata_path = lock_path / 'lock.json'\n"
+                "    if metadata_path.exists():\n"
+                "        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))\n"
+                "        lock_task_ids.append(metadata.get('task_id'))\n"
+                "observed = Path('observed')\n"
+                "observed.mkdir(exist_ok=True)\n"
+                "(observed / f'{safe_id}.json').write_text(\n"
+                "    json.dumps(\n"
+                "        {\n"
+                "            'task_id': task_id,\n"
+                "            'wave': wave,\n"
+                "            'done_at_start': done_at_start,\n"
+                "            'lock_task_ids': sorted(lock_task_ids),\n"
+                "        },\n"
+                "        sort_keys=True,\n"
+                "    ),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "if wave == 'wave1':\n"
+                "    scanned = Path('scanned') / wave\n"
+                "    scanned.mkdir(parents=True, exist_ok=True)\n"
+                "    (scanned / safe_id).write_text(run_id, encoding='utf-8')\n"
+                "    deadline = time.monotonic() + 15\n"
+                "    while len(list(scanned.iterdir())) < 2:\n"
+                "        if time.monotonic() > deadline:\n"
+                "            raise SystemExit(f'{wave} scan barrier timed out for {task_id}')\n"
+                "        time.sleep(0.02)\n"
+                "lock = Path('.task-update.lock')\n"
+                "deadline = time.monotonic() + 15\n"
+                "while True:\n"
+                "    try:\n"
+                "        lock.mkdir()\n"
+                "        break\n"
+                "    except FileExistsError:\n"
+                "        if time.monotonic() > deadline:\n"
+                "            raise SystemExit('task update lock timed out')\n"
+                "        time.sleep(0.02)\n"
+                "try:\n"
+                "    tasks = Path('specs/001-checkout/tasks.md')\n"
+                "    text = tasks.read_text(encoding='utf-8')\n"
+                "    text = text.replace(f'- [ ] {local_id}', f'- [x] {local_id}', 1)\n"
+                "    tasks.write_text(text, encoding='utf-8')\n"
+                "finally:\n"
+                "    lock.rmdir()\n"
+                "(done / safe_id).write_text(local_id, encoding='utf-8')\n"
+                "raise SystemExit(\n"
+                "    main(\n"
+                "        [\n"
+                "            'report',\n"
+                "            '--repo', '.',\n"
+                "            '--run-id', run_id,\n"
+                "            '--task-id', task_id,\n"
+                "            '--status', 'completed',\n"
+                "        ]\n"
+                "    )\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} agent.py {source_path}"
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "spec-kit"\n\n'
+                "[agent]\n"
+                "command = " + json.dumps(command) + "\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "run-until-done",
+                        "--repo",
+                        str(repo),
+                        "--jobs",
+                        "2",
+                        "--max-tasks",
+                        "4",
+                    ]
+                )
+
+            payload = parse_run_result(self, stdout, stderr, exit_code)
+            observed = {
+                path.stem.replace("__", ":"): json.loads(
+                    path.read_text(encoding="utf-8")
+                )
+                for path in (repo / "observed").glob("*.json")
+            }
+            wave1_started = {
+                path.name.replace("__", ":")
+                for path in (repo / "started" / "wave1").iterdir()
+            }
+            final_tasks = tasks_path.read_text(encoding="utf-8")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(payload), 4)
+        self.assertTrue(
+            all(result["classification"] == "completed" for result in payload)
+        )
+        self.assertEqual(
+            wave1_started,
+            {"001-checkout:T001", "001-checkout:T002"},
+        )
+        self.assertEqual(
+            sorted(observed["001-checkout:T001"]["lock_task_ids"]),
+            ["001-checkout:T001", "001-checkout:T002"],
+        )
+        self.assertEqual(observed["001-checkout:T004"]["wave"], "wave2")
+        self.assertIn(
+            "001-checkout__T001", observed["001-checkout:T004"]["done_at_start"]
+        )
+        self.assertIn(
+            "001-checkout__T002", observed["001-checkout:T004"]["done_at_start"]
+        )
+        self.assertIn("- [x] T004 Add checkout migration", final_tasks)
+        self.assertIn("[vibe-loop] parallel supervisor jobs=2", stderr.getvalue())
+
     def test_run_until_done_continue_on_failure_exits_nonzero_for_any_failure(
         self,
     ) -> None:

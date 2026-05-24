@@ -50,6 +50,11 @@ results are missing or ambiguous.
   supervisor rejects overlapping resources or path ancestry before spawning a
   batch; undeclared domains are treated conservatively once conflict-domain
   scheduling is active.
+- Built-in spec-tool task sources preserve the same scheduling contract:
+  dependency-ready Spec Kit, Kiro, and OpenSpec tasks can run in parallel when
+  their nested `Conflict Resources` and `Conflict Paths` labels are disjoint,
+  while local task IDs are prefixed per spec/change before dependency and
+  conflict checks run.
 - Agent execution is configurable. `codex exec` is the default worker command,
   not a required runtime dependency; other prompt-mode agents such as
   `claude -p` should be supported as first-class configured commands.
