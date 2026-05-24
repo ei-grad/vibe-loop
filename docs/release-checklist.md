@@ -25,6 +25,22 @@ The release gate requires:
   publishing;
 - release notes or the task plan reference the release-readiness record.
 
+For changes to bundled skill text or the CLI worker prompt addendum, also verify
+the install output and prompt contract from a clean tree:
+
+```bash
+uv run vibe-loop install-skills --codex --home <tmpdir>
+uv run python -m unittest tests.test_cli.CliTests.test_install_skills_are_cli_agnostic \
+  tests.test_cli.CliTests.test_cli_worker_addendum_contains_coordination
+```
+
+Installed skill files must remain CLI-agnostic: no worker report commands,
+workspace-claim commands, integration-lock commands, or supervisor environment
+variables belong in the reusable skill text. CLI-launched worker coordination
+belongs in the runner addendum and must include workspace claiming,
+integration-lock wait behavior, and blocked-report guidance for unsafe
+workspace or integration-lock states.
+
 For a dry-run over an existing aggregate, use:
 
 ```bash

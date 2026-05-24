@@ -271,6 +271,7 @@ vibe-loop tasks configure --repo . --promotion-toml
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
+vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --trials 3 --overwrite --record-output .vibe-loop/release-readiness.json
 vibe-loop workers --repo .
@@ -285,7 +286,7 @@ vibe-loop planning benchmark-duration --repo . --check
 vibe-loop doctor --repo .
 vibe-loop doctor --repo . --json
 vibe-loop main-integration status --repo .
-vibe-loop main-integration acquire --repo . --run-id ... --task-id ...
+vibe-loop main-integration acquire --repo . --run-id ... --task-id ... --wait --timeout 300
 vibe-loop main-integration release --repo . --run-id ... --task-id ...
 vibe-loop worker claim-workspace --repo . --run-id ... --task-id ... --branch ... --worktree ...
 vibe-loop report --repo . --run-id ... --task-id ... --status completed --commit ...
@@ -390,17 +391,23 @@ serialize that final critical section:
 
 ```bash
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
-  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
+  --wait --timeout 300
 vibe-loop main-integration release --repo "$VIBE_LOOP_REPO" \
   --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
 ```
 
+`main-integration acquire --wait --timeout N` waits for a live or unknown
+holder to release the advisory lock and returns the same busy payload if the
+timeout expires. Stale locks are reported immediately and are not stolen.
 `main-integration status` shows the current holder, process state, and stale
-reason when the recorded same-host process is missing. Stale locks are reported
-conservatively; a waiter does not steal them automatically. By default,
-`acquire` records the active task lock's worker process for the same run and
-task. Pass `--pid` only when a wrapper needs to record a different long-lived
-owner process or no active task lock exists.
+reason when the recorded same-host process is missing. By default, `acquire`
+records the active task lock's worker process for the same run and task. If the
+active task lock has a workspace claim, `acquire` also checks the claim against
+the current worktree list and branch state before entering the final integration
+section; stale or warning diagnostics block acquisition with recovery hints.
+Pass `--pid` only when a wrapper needs to record a different long-lived owner
+process or no active task lock exists.
 
 Worktree and branch handling are intentionally outside the CLI runtime. Put that
 policy in the repository instructions or in the configured agent command; keep
@@ -437,6 +444,16 @@ commands = [
   "uv run python scripts/record_worklog.py --validate",
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
+
+[supervision]
+max_restarts = 3
+cooldown_seconds = 30.0
+
+[locks]
+type = "directory"
+# Optional. When set, locks become stale after this many seconds without a
+# heartbeat update.
+# lease_seconds = 300
 
 [planning_analytics]
 schedule_policy = "current-runner-parity"
@@ -494,6 +511,36 @@ Codex-first policy:
 
 When neither supported CLI is available, agent-using commands fail with a
 diagnostic that points to installation or explicit config.
+
+Lock storage defaults to directory locks under `<state_dir>/locks`. Repos that
+coordinate through an external service can opt into command-backed locks with
+explicit user-authored commands:
+
+```toml
+[locks]
+type = "command"
+acquire_command = "my-lock-tool acquire --json"
+release_command = "my-lock-tool release --json"
+status_command = "my-lock-tool status --json"
+list_command = "my-lock-tool list --json"
+```
+
+When `locks.lease_seconds` is set, acquired locks include `lease_seconds`,
+`heartbeat_at`, and a fencing token. Workers can refresh the lease with
+`vibe-loop worker heartbeat`; mutating lock operations that receive a fencing
+token reject stale holders when the current lock generation differs.
+
+Lock commands run from the repository root and receive
+`VIBE_LOOP_LOCK_OPERATION`, `VIBE_LOOP_LOCK_TASK_ID`,
+`VIBE_LOOP_LOCK_RUN_ID`, `VIBE_LOOP_LOCK_ROOT`, and
+`VIBE_LOOP_LOCK_METADATA_JSON`. `acquire_command` handles both `acquire` and
+`update` operations. Acquire/update returns `{"acquired": true,
+"metadata": {...}}` or `{"acquired": false, "metadata": {...}}` for a held
+lock. Release must return `{"released": true}`; `false` is treated as a failed
+release. Status returns `{"locked": true, "metadata": {...}}` or
+`{"locked": false}`. List returns a JSON array or `{"locks": [...]}`. Once
+`type = "command"` is set, lock command failures fail closed instead of falling
+back to directory locks.
 
 Configure Claude prompt mode explicitly when that is the worker or selector you
 want to run regardless of what else is installed. The executable command can use
@@ -570,6 +617,27 @@ Tasks may also include optional traceability fields: `requirement_ids`,
 Traceability is emitted in task JSON, planning analytics, generated-profile
 promotion, and worker prompts when present; absent fields are omitted.
 
+Spec diagnostics are read-only. `doctor` and `specs check` report unapproved
+tasks, stale source fingerprints, missing requirement IDs, and completed
+traceable tasks without evidence without launching an agent or running override
+commands. Repositories that require current approved specs can opt into
+execution gates:
+
+```toml
+[specs]
+require_approved = true
+require_current_fingerprints = true
+require_requirement_coverage = true
+require_completion_evidence = true
+approved_states = ["approved"]
+override_commands = ["make specs-override"]
+```
+
+The `require_*` settings are gates for execution commands such as `run-next`
+and `run-until-done`; read-only task inspection remains available. Override
+commands are reported as repository-owned recovery guidance and are never run
+as a side effect by `doctor`, `specs check`, or task selection.
+
 For ralphex-style Markdown plans:
 
 ```toml
@@ -640,6 +708,11 @@ optional `[P]` and story markers, inline `(depends on T001)` text, and nested
 dependency and label patterns. Acceptance and evidence labels may be single-line
 values or followed by nested bullet text. Checked boxes normalize to `Done`,
 unchecked boxes to `Planned`, and `[-]` or `[~]` normalize to `Active`.
+All three presets also read nested `Conflict Resources` and `Conflict Paths`
+labels as conflict domains for `run-until-done --jobs N`. Use comma-separated
+values or nested bullets, or `none` to declare an explicitly empty domain for a
+task. Unprefixed `Resources` and `Paths` labels are left available for
+repository-specific prose.
 Markdown profiles may map the same optional traceability fields as command
 task sources when the source artifact exposes them as columns, labels, prefixes,
 or patterns.
@@ -718,8 +791,9 @@ source keys disable generated discovery for the active source: `type`,
 not count as explicit settings, and non-source settings such as
 `task_source.runnable_statuses` override the matching generated field without
 disabling the generated parser. Generated cache records cannot contain
-executable adapters such as `type = "command"`, `list`, `next`, `probe`, or
-generic command fields. Add explicit `[task_source]` settings to override cached
+executable adapters or lock backend settings such as `type = "command"`,
+`list`, `next`, `probe`, generic command fields, `[locks]`, or lock command
+fields. Add explicit `[task_source]` or `[locks]` settings to override cached
 generated behavior.
 
 Promote a reviewed generated profile into committed configuration when a repo
@@ -840,12 +914,13 @@ Runner state is intentionally untracked:
 ```
 
 Active task locks store the worker command `pid`, `task_id`, `run_id`, log path,
-start time, base `main` revision, host, and resolved command. `vibe-loop
-workers` reconstructs the active view from those lock files plus `runs.jsonl`,
-then marks same-host locks with missing worker processes, missing worker PIDs,
-or incomplete metadata as stale without reading raw logs. The PID is the
-immediate configured command process started by the runner; deeper process
-identity checks are left to the later watchdog work.
+start time, base `main` revision, host, resolved command, and optional lease
+metadata. `vibe-loop workers` reconstructs the active view from those lock
+files plus `runs.jsonl`, then marks same-host locks with missing worker
+processes, missing worker PIDs, expired leases, or incomplete metadata as stale
+without reading raw logs. The PID is the immediate configured command process
+started by the runner; deeper process identity checks are left to the later
+watchdog work.
 
 When a worker claims its workspace, the active task lock also stores a
 `workspace` object with the branch, worktree path, base commit, current HEAD,
@@ -864,7 +939,10 @@ The `main-integration.lock` entry is a separate advisory lock for worker-owned
 final integration. Its metadata records the owner task, run id, host, pid, and
 start time. It is visible through `vibe-loop main-integration status` rather
 than `vibe-loop workers`; stale status is diagnostic only and does not grant a
-new holder permission to take over automatically.
+new holder permission to take over automatically. `main-integration acquire`
+can wait for a live holder with `--wait --timeout N`, but it blocks immediately
+when the worker's claimed workspace has diagnostics that make final integration
+unsafe.
 
 `runs.jsonl` is an append-only stream of versioned run result records. Run
 records include the vibe-loop `run_id`, the resolved worker `session_id`, the

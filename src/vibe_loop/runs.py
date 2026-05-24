@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Mapping
 
 try:
     import fcntl
@@ -26,6 +26,41 @@ RUN_RECORD_TYPE = "run_result"
 WORKER_REPORT_SCHEMA_VERSION = 1
 WORKER_REPORT_RECORD_TYPE = "worker_report"
 WORKER_REPORT_STATUSES = ("completed", "blocked", "failed", "unknown")
+LIFECYCLE_EVENT_SCHEMA_VERSION = 1
+LOCK_ACQUIRED_RECORD_TYPE = "lock_acquired"
+LOCK_RELEASED_RECORD_TYPE = "lock_released"
+LOCK_EXPIRED_RECORD_TYPE = "lock_expired"
+WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
+WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
+WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE = "workspace_claim_mismatch"
+RUN_STATE_TRANSITION_RECORD_TYPE = "run_state_transition"
+TASK_RESTART_RECORD_TYPE = "task_restart"
+LIFECYCLE_RECORD_TYPES = frozenset(
+    {
+        LOCK_ACQUIRED_RECORD_TYPE,
+        LOCK_RELEASED_RECORD_TYPE,
+        LOCK_EXPIRED_RECORD_TYPE,
+        WORKSPACE_CLAIM_RECORD_TYPE,
+        WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+        RUN_STATE_TRANSITION_RECORD_TYPE,
+        TASK_RESTART_RECORD_TYPE,
+    }
+)
+KNOWN_RECORD_TYPES = frozenset(
+    {RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE, *LIFECYCLE_RECORD_TYPES}
+)
+LIFECYCLE_STATES = (
+    "scheduled",
+    "started",
+    "session_observed",
+    "workspace_claimed",
+    "reported",
+    "classified",
+    "finalized",
+)
+LIFECYCLE_PROTECTED_KEYS = frozenset(
+    {"schema_version", "record_type", "occurred_at", "run_id"}
+)
 _APPEND_LOCK = threading.Lock()
 LOCK_POLL_SECONDS = 0.05
 LOCK_TIMEOUT_SECONDS = 30.0
@@ -58,6 +93,8 @@ class RunResult:
     agent_skill_ref_prefix_source: str = ""
     classification_source: str = ""
     worker_report: dict[str, object] | None = None
+    restart_count: int = 0
+    max_restarts: int = 0
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
@@ -83,6 +120,8 @@ class RunResult:
             "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
+            "restart_count": self.restart_count,
+            "max_restarts": self.max_restarts,
             "finished_at": self.finished_at,
         }
 
@@ -166,6 +205,182 @@ class WorkerReport:
 
 
 @dataclasses.dataclass(frozen=True)
+class RunLifecycleEvent:
+    record_type: str
+    run_id: str
+    task_id: str = ""
+    payload: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    occurred_at: str = dataclasses.field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        if self.record_type not in LIFECYCLE_RECORD_TYPES:
+            raise ValueError(
+                "lifecycle event record_type must be one of: "
+                f"{', '.join(sorted(LIFECYCLE_RECORD_TYPES))}"
+            )
+        if not self.run_id:
+            raise ValueError("lifecycle event run_id is required")
+        protected = LIFECYCLE_PROTECTED_KEYS.intersection(self.payload)
+        if protected:
+            raise ValueError(
+                "lifecycle event payload cannot override core keys: "
+                f"{', '.join(sorted(protected))}"
+            )
+
+    @classmethod
+    def lock_event(
+        cls,
+        record_type: str,
+        *,
+        run_id: str,
+        task_id: str,
+        lock_kind: str,
+        lock_path: Path | str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "lock_kind": lock_kind,
+            "lock_path": str(lock_path),
+        }
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(record_type=record_type, run_id=run_id, payload=event_payload)
+
+    @classmethod
+    def workspace_claim_mismatch(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        reason: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "reason": reason,
+            "message": message,
+            "details": dict(details or {}),
+        }
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
+    @classmethod
+    def run_state_transition(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        to_state: str,
+        from_state: str = "",
+        reason: str = "",
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "to_state": to_state,
+        }
+        if from_state:
+            event_payload["from_state"] = from_state
+        if reason:
+            event_payload["reason"] = reason
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=RUN_STATE_TRANSITION_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
+    @classmethod
+    def task_restart(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        restart_count: int,
+        max_restarts: int,
+        cooldown_seconds: float,
+        reason: str,
+        exhausted: bool = False,
+        attempted_restart_count: int | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "restart_count": restart_count,
+            "max_restarts": max_restarts,
+            "cooldown_seconds": cooldown_seconds,
+            "reason": reason,
+            "exhausted": exhausted,
+        }
+        if attempted_restart_count is not None:
+            event_payload["attempted_restart_count"] = attempted_restart_count
+        return cls(
+            record_type=TASK_RESTART_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
+    def to_record(self) -> dict[str, object]:
+        record: dict[str, object] = {
+            "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+            "record_type": self.record_type,
+            "occurred_at": self.occurred_at,
+            "run_id": self.run_id,
+        }
+        if self.task_id:
+            record["task_id"] = self.task_id
+        record.update(dict(self.payload))
+        return record
+
+
+@dataclasses.dataclass(frozen=True)
+class RunLifecycleTransition:
+    state: str
+    observed: bool
+    record_type: str = ""
+    occurred_at: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "state": self.state,
+            "observed": self.observed,
+            "record_type": self.record_type,
+            "occurred_at": self.occurred_at,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class RunLifecycleProgress:
+    state: str
+    transitions: tuple[RunLifecycleTransition, ...]
+
+    @property
+    def missing_states(self) -> tuple[str, ...]:
+        return tuple(
+            transition.state
+            for transition in self.transitions
+            if not transition.observed
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "lifecycle_state": self.state,
+            "lifecycle_transitions": [
+                transition.to_json() for transition in self.transitions
+            ],
+            "missing_lifecycle_transitions": list(self.missing_states),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class RunHistoryView:
     run_id: str
     task_id: str
@@ -184,8 +399,13 @@ class RunHistoryView:
     agent_skill_ref_prefix_source: str
     classification_source: str
     worker_report: dict[str, Any] | None
+    restart_count: int
+    max_restarts: int
+    restart_exhausted: bool
+    restart_exhausted_reason: str
     record_count: int
     latest_record: dict[str, Any]
+    lifecycle_progress: RunLifecycleProgress
 
     @classmethod
     def from_records(
@@ -222,12 +442,17 @@ class RunHistoryView:
             ),
             classification_source=latest_text(valid_records, "classification_source"),
             worker_report=latest_worker_report_payload(valid_records),
+            restart_count=latest_int(records, "restart_count") or 0,
+            max_restarts=latest_int(records, "max_restarts") or 0,
+            restart_exhausted=latest_restart_exhausted(records),
+            restart_exhausted_reason=latest_restart_exhausted_reason(records),
             record_count=len(records),
             latest_record=latest,
+            lifecycle_progress=derive_run_lifecycle(records),
         )
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "task_id": self.task_id,
             "status": self.status,
@@ -245,9 +470,15 @@ class RunHistoryView:
             "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
+            "restart_count": self.restart_count,
+            "max_restarts": self.max_restarts,
+            "restart_exhausted": self.restart_exhausted,
+            "restart_exhausted_reason": self.restart_exhausted_reason,
             "record_count": self.record_count,
             "latest_record": self.latest_record,
         }
+        payload.update(self.lifecycle_progress.to_json())
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -271,6 +502,9 @@ class RunStore:
     def append_report(self, report: WorkerReport) -> None:
         self.append_record(report.to_record())
 
+    def append_lifecycle_event(self, event: RunLifecycleEvent) -> None:
+        self.append_record(event.to_record())
+
     def append_record(self, record: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
@@ -290,7 +524,7 @@ class RunStore:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and is_known_record_type(payload):
                 records.append(payload)
         return records
 
@@ -366,26 +600,118 @@ def build_run_history_views(
     *,
     limit: int = 20,
 ) -> list[RunHistoryView]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    last_indices: dict[str, int] = {}
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     for index, record in enumerate(records):
         run_id = string_value(record.get("run_id"))
         if not run_id:
             continue
-        if not is_run_history_view_record(record):
+        if not is_run_history_record(record):
             continue
-        grouped.setdefault(run_id, []).append(record)
-        last_indices[run_id] = index
-    ordered = sorted(last_indices, key=last_indices.__getitem__, reverse=True)
+        grouped.setdefault(run_id, []).append((index, record))
+    ordered = sorted(
+        grouped,
+        key=lambda run_id: run_history_order_index(grouped[run_id]),
+        reverse=True,
+    )
     ordered = ordered[:limit]
-    return [RunHistoryView.from_records(run_id, grouped[run_id]) for run_id in ordered]
+    return [
+        RunHistoryView.from_records(
+            run_id,
+            [record for _index, record in grouped[run_id]],
+        )
+        for run_id in ordered
+    ]
+
+
+def empty_run_lifecycle() -> RunLifecycleProgress:
+    return derive_run_lifecycle([])
+
+
+def derive_run_lifecycle(records: list[dict[str, Any]]) -> RunLifecycleProgress:
+    observed: dict[str, RunLifecycleTransition] = {}
+    for record in records:
+        for state in observed_lifecycle_states(record):
+            observed.setdefault(
+                state,
+                RunLifecycleTransition(
+                    state=state,
+                    observed=True,
+                    record_type=record_type_label(record),
+                    occurred_at=record_updated_at(record),
+                ),
+            )
+    transitions = tuple(
+        observed.get(state)
+        or RunLifecycleTransition(
+            state=state,
+            observed=False,
+        )
+        for state in LIFECYCLE_STATES
+    )
+    current_state = ""
+    for transition in transitions:
+        if transition.observed:
+            current_state = transition.state
+    return RunLifecycleProgress(state=current_state, transitions=transitions)
+
+
+def observed_lifecycle_states(record: dict[str, Any]) -> tuple[str, ...]:
+    record_type = record.get("record_type")
+    states: list[str] = []
+    if record_type in {
+        LOCK_ACQUIRED_RECORD_TYPE,
+        LOCK_RELEASED_RECORD_TYPE,
+        LOCK_EXPIRED_RECORD_TYPE,
+    } and lock_record_is_task_scoped(record):
+        states.append("scheduled")
+    if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
+        to_state = string_value(record.get("to_state"))
+        if to_state in LIFECYCLE_STATES:
+            states.append(to_state)
+    if record_type == WORKSPACE_CLAIM_RECORD_TYPE and workspace_claim_is_observed(
+        record
+    ):
+        states.append("workspace_claimed")
+    if WorkerReport.from_record(record) is not None:
+        states.append("reported")
+    if record_type in {None, RUN_RECORD_TYPE}:
+        if isinstance(record.get("worker_report"), dict):
+            states.append("reported")
+        states.extend(("classified", "finalized"))
+    return tuple(dict.fromkeys(states))
+
+
+def lock_record_is_task_scoped(record: dict[str, Any]) -> bool:
+    lock_kind = string_value(record.get("lock_kind"))
+    return lock_kind in {"", "task"}
+
+
+def workspace_claim_is_observed(record: dict[str, Any]) -> bool:
+    event_type = string_value(record.get("event_type"))
+    return event_type in {"", WORKSPACE_CLAIMED_EVENT_TYPE}
+
+
+def run_history_order_index(records: list[tuple[int, dict[str, Any]]]) -> int:
+    status_records = [
+        (index, record) for index, record in records if is_run_status_record(record)
+    ]
+    if status_records:
+        return status_records[-1][0]
+    return records[-1][0]
 
 
 def run_history_view_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [record for record in records if is_run_history_view_record(record)]
+    status_records = [record for record in records if is_run_status_record(record)]
+    if status_records:
+        return status_records
+    return [record for record in records if is_lifecycle_event_record(record)]
 
 
-def is_run_history_view_record(record: dict[str, Any]) -> bool:
+def is_run_history_record(record: dict[str, Any]) -> bool:
+    return is_run_status_record(record) or is_lifecycle_event_record(record)
+
+
+def is_run_status_record(record: dict[str, Any]) -> bool:
     record_type = record.get("record_type")
     if record_type in {None, RUN_RECORD_TYPE}:
         return True
@@ -394,20 +720,52 @@ def is_run_history_view_record(record: dict[str, Any]) -> bool:
     return False
 
 
+def is_lifecycle_event_record(record: dict[str, Any]) -> bool:
+    return record.get("record_type") in LIFECYCLE_RECORD_TYPES
+
+
+def is_known_record_type(record: dict[str, Any]) -> bool:
+    record_type = record.get("record_type")
+    return record_type is None or record_type in KNOWN_RECORD_TYPES
+
+
 def record_type_label(record: dict[str, Any]) -> str:
     record_type = string_value(record.get("record_type"))
     return record_type or RUN_RECORD_TYPE
 
 
 def record_status(record: dict[str, Any]) -> str:
-    return string_value(record.get("status")) or string_value(
+    status = string_value(record.get("status")) or string_value(
         record.get("classification")
     )
+    if status:
+        return status
+    record_type = record.get("record_type")
+    if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
+        return string_value(record.get("to_state"))
+    if record_type == WORKSPACE_CLAIM_RECORD_TYPE:
+        return string_value(record.get("event_type")) or WORKSPACE_CLAIMED_EVENT_TYPE
+    if record_type == WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE:
+        return string_value(record.get("reason")) or "mismatch"
+    if record_type == TASK_RESTART_RECORD_TYPE:
+        if record.get("exhausted") is True:
+            return string_value(record.get("reason")) or "restart_budget_exhausted"
+        return "restart_scheduled"
+    if record_type in {
+        LOCK_ACQUIRED_RECORD_TYPE,
+        LOCK_RELEASED_RECORD_TYPE,
+        LOCK_EXPIRED_RECORD_TYPE,
+    }:
+        return str(record_type).removeprefix("lock_")
+    return ""
 
 
 def record_updated_at(record: dict[str, Any]) -> str:
-    return string_value(record.get("finished_at")) or string_value(
-        record.get("reported_at")
+    return (
+        string_value(record.get("finished_at"))
+        or string_value(record.get("reported_at"))
+        or string_value(record.get("occurred_at"))
+        or string_value(record.get("claimed_at"))
     )
 
 
@@ -444,6 +802,34 @@ def latest_text(records: list[dict[str, Any]], key: str) -> str:
         value = string_value(record.get(key))
         if value:
             return value
+    return ""
+
+
+def latest_int(records: list[dict[str, Any]], key: str) -> int | None:
+    for record in reversed(records):
+        value = record.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+    return None
+
+
+def latest_restart_exhausted(records: list[dict[str, Any]]) -> bool:
+    return any(
+        record.get("record_type") == TASK_RESTART_RECORD_TYPE
+        and record.get("exhausted") is True
+        for record in records
+    )
+
+
+def latest_restart_exhausted_reason(records: list[dict[str, Any]]) -> str:
+    for record in reversed(records):
+        if (
+            record.get("record_type") == TASK_RESTART_RECORD_TYPE
+            and record.get("exhausted") is True
+        ):
+            return string_value(record.get("reason"))
     return ""
 
 

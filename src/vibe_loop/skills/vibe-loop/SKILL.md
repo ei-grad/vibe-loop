@@ -33,8 +33,10 @@ cross-slice backlog.
 ## Core Loop
 
 1. Inspect the task, code, tests, docs, repo instructions, worktree state, and
-   constraints; create or choose the slice workspace and initialize slice state
-   before implementation edits.
+   constraints; if the prompt includes spec-aware worker context, use it as
+   bounded source context for linked requirements, design references,
+   fingerprints, and verification gates; create or choose the slice workspace
+   and initialize slice state before implementation edits.
 2. Plan the next coherent slice from repo-local sources first: instructions,
    design docs, roadmaps, issues, TODOs, and existing plans.
 3. Edit in scoped increments and keep the project working.
@@ -101,6 +103,12 @@ For full-cycle bounded work, use a dedicated branch/worktree; keep `main` clean
 during implementation. Create the slice branch/worktree before implementation
 edits begin.
 
+When an external supervisor provides advisory workspace ownership, record the
+claimed branch and worktree immediately after creating or choosing the
+workspace and before implementation edits. Treat that ownership data as
+diagnostic coordination state only: it never authorizes automatic cleanup,
+branch deletion, resets, lock stealing, or central merge-queue behavior.
+
 If a dedicated worktree cannot be created, or repo/user policy forbids creating
 one, state the precise blocker and proceed in the primary worktree only after
 inspecting its current state. Do not silently fall back to editing the primary
@@ -113,6 +121,12 @@ branch. Do not push, force-push, reset, or bypass repo/user policy.
 
 If repo/user policy forbids local integration or requires missing approval, stop
 with the precise blocker after the reviewed slice is committed.
+
+When an external supervisor provides an advisory integration lock, use its
+wait/timeout path for the final refresh, verification, fast-forward merge, and
+immediate `main` verification section. If the lock is unavailable or reports
+unsafe workspace state, park the slice as blocked with the precise reason
+instead of entering integration.
 
 When branch integration is permitted and `main` advanced after a slice passed
 review:

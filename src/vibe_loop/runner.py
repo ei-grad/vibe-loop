@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,7 @@ import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
 
 from vibe_loop.config import (
@@ -29,12 +30,34 @@ from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
     resolve_runtime_task_source,
 )
-from vibe_loop.locks import LockBusy, LockManager, TaskLock
+from vibe_loop.generated_discovery import (
+    is_allowed_evidence_file,
+    is_secret_like_directory_name,
+    is_secret_like_path,
+    is_webhook_like_evidence_path,
+    redact_evidence_text,
+    redact_manifest_text,
+)
+from vibe_loop.locks import (
+    LockBusy,
+    LockManager,
+    TaskLock,
+    build_lock_manager,
+    fencing_token_value,
+)
 from vibe_loop.retry import (
     is_transient_stderr,
     retry_subprocess_run,
 )
-from vibe_loop.runs import RunResult, RunStore, WorkerReport
+from vibe_loop.runs import (
+    LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
+    RunLifecycleEvent,
+    RunResult,
+    RunStore,
+    WorkerReport,
+)
+from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
 
@@ -54,7 +77,18 @@ SESSION_ID_RE = re.compile(
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
+SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
+SPEC_WORKER_CONTEXT_SCHEMA_VERSION = 1
+SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS = 12_000
+SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS = 4_000
+SPEC_WORKER_CONTEXT_MAX_FILE_BYTES = 512 * 1024
+SPEC_WORKER_CONTEXT_MAX_ARTIFACTS = 8
+SPEC_WORKER_CONTEXT_MAX_FIELD_CHARS = 1_500
+SPEC_WORKER_CONTEXT_MAX_REF_CHARS = 300
+SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS = 20
+SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS = 20
+SPEC_WORKER_CONTEXT_LINE_CONTEXT = 3
 
 CLI_WORKER_ADDENDUM = """\
 
@@ -66,6 +100,25 @@ environment variables identify this run:
 - VIBE_LOOP_RUN_ID - unique run identifier
 - VIBE_LOOP_TASK_ID - task being worked on
 - VIBE_LOOP_LOG - path to the run log file
+- VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
+
+### Workspace Claim
+
+After creating or choosing your task branch/worktree, and before implementation
+edits, attach that workspace to the active task lock:
+
+```bash
+vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
+  --branch <branch-name> --worktree <absolute-worktree-path>
+```
+
+Use the real branch name and absolute worktree path, not the placeholders. If
+the claim fails with an owner mismatch, missing active task lock, mismatched
+branch/worktree, or unsafe workspace diagnostic, stop mutating repository state
+and report the run as blocked through the worker report protocol. Workspace
+claims are advisory visibility metadata only; they do not permit deleting,
+resetting, cleaning, merging, or stealing another worker's branch/worktree.
 
 ### Worker Reports
 
@@ -110,13 +163,15 @@ main-integration lock:
 
 ```bash
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \\
-  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID"
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
+  --wait --timeout 300
 ```
 
-If the lock is held by another live worker, wait and retry or park the slice
-as blocked; do not enter the final integration section without the lock. If
-the lock appears stale, report the precise status and follow repo policy
-rather than stealing it.
+If the command reports a live holder timeout, park the slice as blocked; do not
+enter the final integration section without the lock. If the lock appears
+stale, or workspace preflight reports unsafe claimed-workspace diagnostics,
+report the run as blocked with the precise integration-lock or workspace reason
+and follow repo policy rather than stealing or cleaning state.
 
 Release the lock after main verification or immediately when integration is
 parked:
@@ -139,8 +194,6 @@ CLI output before making assumptions.
 """
 RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS = 5.0
 RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
-MAX_TRANSIENT_TASK_RETRIES = 3
-TRANSIENT_COOLDOWN_SECONDS = 30.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,10 +271,15 @@ class VibeRunner:
         self.config = config
         self._source: TaskSource | None = None
         self._source_resolution: RuntimeTaskSourceResolution | None = None
-        self.lock_manager = LockManager(config.state_path / "locks")
+        self.lock_manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()
+        self._restart_context = threading.local()
 
     @property
     def source_resolution(self) -> RuntimeTaskSourceResolution:
@@ -402,19 +460,50 @@ class VibeRunner:
             return "No active vibe-loop workers recorded."
         return "Active vibe-loop workers:\n" + json.dumps(workers, indent=2)
 
+    def run_task_with_supervision(
+        self,
+        task: Task,
+        *,
+        restart_count: int = 0,
+    ) -> RunResult:
+        previous = getattr(self._restart_context, "value", None)
+        self._restart_context.value = (task.task_id, restart_count)
+        try:
+            return self.run_task(task)
+        finally:
+            if previous is None:
+                try:
+                    del self._restart_context.value
+                except AttributeError:
+                    pass
+            else:
+                self._restart_context.value = previous
+
+    def current_restart_count(self, task_id: str) -> int:
+        value = getattr(self._restart_context, "value", None)
+        if not isinstance(value, tuple) or len(value) != 2:
+            return 0
+        context_task_id, restart_count = value
+        if context_task_id != task_id or not isinstance(restart_count, int):
+            return 0
+        return max(0, restart_count)
+
     def run_task(self, task: Task) -> RunResult:
+        self.ensure_spec_execution_gate()
         command_template = self.config.agent.require_command()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
         start_main = git_rev_parse(self.config.repo, "HEAD")
         base_main = git_rev_parse(self.config.repo, self.config.main_branch)
+        restart_count = self.current_restart_count(task.task_id)
+        max_restarts = self.config.supervision.max_restarts
         exit_code = 1
         message = ""
         session_id = run_id
         session_id_source = "fallback:run_id"
         skill_prefix = self.config.agent.require_skill_ref_prefix()
-        worker_prompt = build_worker_prompt(skill_prefix, task)
+        worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
         validate_worker_prompt_delivery(command_template, task)
         command = command_template.format(
             prompt=shell_quote(worker_prompt),
@@ -442,11 +531,40 @@ class VibeRunner:
             agent_prompt_dialect_source=self.config.agent.prompt_dialect_source,
             agent_skill_ref_prefix=self.config.agent.skill_ref_prefix or "",
             agent_skill_ref_prefix_source=self.config.agent.skill_ref_prefix_source,
+            restart_count=restart_count,
+            max_restarts=max_restarts,
         )
         task_lock = self.acquire_scheduled_task_lock(
             task,
             run_id,
             active_state,
+        )
+        fencing_token = fencing_token_value(task_lock.metadata.get("fencing_token"))
+        if fencing_token:
+            command_env["VIBE_LOOP_FENCING_TOKEN"] = fencing_token
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_ACQUIRED_RECORD_TYPE,
+                run_id=run_id,
+                task_id=task.task_id,
+                lock_kind="task",
+                lock_path=task_lock.path,
+                payload={
+                    "resources": list(task.resources),
+                    "paths": list(task.paths),
+                    "conflict_domains_known": task.conflict_domains_known,
+                    "restart_count": restart_count,
+                    "max_restarts": max_restarts,
+                },
+            )
+        )
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task.task_id,
+                to_state="started",
+                reason="task_lock_acquired",
+            )
         )
         try:
             with log_path.open("w", encoding="utf-8") as log:
@@ -468,6 +586,11 @@ class VibeRunner:
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"run_id={run_id}", log)
                 report_status(f"log: {log_path}", log)
+                if restart_count:
+                    report_status(
+                        f"restart_count={restart_count}/{max_restarts}",
+                        log,
+                    )
                 report_status(
                     f"agent command source: {self.config.agent.command_source}",
                     log,
@@ -526,6 +649,16 @@ class VibeRunner:
                 exit_code = stream_result.exit_code
                 session_id = stream_result.session_id or run_id
                 session_id_source = stream_result.session_id_source or "fallback:run_id"
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.run_state_transition(
+                        run_id=run_id,
+                        task_id=task.task_id,
+                        from_state="started",
+                        to_state="session_observed",
+                        reason=session_id_source,
+                        payload={"session_id": session_id},
+                    )
+                )
                 report_status(f"agent command exit_code={exit_code}", log)
                 report_status(f"session_id={session_id}", log)
                 report_status(f"session_id_source={session_id_source}", log)
@@ -554,6 +687,16 @@ class VibeRunner:
                 message,
                 worker_report,
             )
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_state_transition(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    from_state="session_observed",
+                    to_state="classified",
+                    reason=classification.source,
+                    payload={"classification": classification.status},
+                )
+            )
             result = RunResult(
                 run_id=run_id,
                 task_id=task.task_id,
@@ -578,6 +721,8 @@ class VibeRunner:
                 worker_report=(
                     worker_report.to_json() if worker_report is not None else None
                 ),
+                restart_count=restart_count,
+                max_restarts=max_restarts,
             )
             self.record_result(result)
             report_status(
@@ -587,6 +732,15 @@ class VibeRunner:
             return result
         finally:
             self.lock_manager.release(task_lock)
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_RELEASED_RECORD_TYPE,
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    lock_kind="task",
+                    lock_path=task_lock.path,
+                )
+            )
 
     def acquire_scheduled_task_lock(
         self,
@@ -663,20 +817,32 @@ class VibeRunner:
             scheduler_lock.handle.close()
 
     def run_next(
-        self, ask_agent: bool = False, exclude: set[str] | None = None
+        self,
+        ask_agent: bool = False,
+        exclude: set[str] | None = None,
+        restart_counts: dict[str, int] | None = None,
     ) -> RunResult | None:
         candidates = self.list_candidates(exclude=exclude)
         if not candidates:
             return None
+        self.ensure_spec_execution_gate()
         self.require_worker_launch_config()
         task = self.select_from_candidates(candidates, ask_agent=ask_agent)
         try:
-            return self.run_task(task)
+            restart_count = (restart_counts or {}).get(task.task_id, 0)
+            return self.run_task_with_supervision(
+                task,
+                restart_count=restart_count,
+            )
         except LockBusy:
             report_status(f"task locked during acquire, retrying: {task.task_id}")
             excluded = set(exclude or set())
             excluded.add(task.task_id)
-            return self.run_next(ask_agent=ask_agent, exclude=excluded)
+            return self.run_next(
+                ask_agent=ask_agent,
+                exclude=excluded,
+                restart_counts=restart_counts,
+            )
 
     def run_until_done(
         self,
@@ -721,7 +887,11 @@ class VibeRunner:
         transient_retries: dict[str, int] = {}
         completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
-            result = self.run_next(ask_agent=ask_agent, exclude=skipped | yielded)
+            result = self.run_next(
+                ask_agent=ask_agent,
+                exclude=skipped | yielded,
+                restart_counts=transient_retries,
+            )
             if result is None:
                 if yielded:
                     yielded.clear()
@@ -738,14 +908,17 @@ class VibeRunner:
             if is_transient_worker_failure(result):
                 count = transient_retries.get(result.task_id, 0) + 1
                 transient_retries[result.task_id] = count
-                if count <= MAX_TRANSIENT_TASK_RETRIES:
+                if count <= self.config.supervision.max_restarts:
+                    self.record_task_restart(result, count, exhausted=False)
                     report_status(
                         f"transient failure for {result.task_id} "
-                        f"(attempt {count}/{MAX_TRANSIENT_TASK_RETRIES}), "
-                        f"cooling down {TRANSIENT_COOLDOWN_SECONDS:.0f}s"
+                        f"(restart {count}/{self.config.supervision.max_restarts}), "
+                        f"cooling down {self.config.supervision.cooldown_seconds:.0f}s"
                     )
-                    time.sleep(TRANSIENT_COOLDOWN_SECONDS)
+                    time.sleep(self.config.supervision.cooldown_seconds)
                     continue
+                result = self.record_restart_budget_exhausted(result, count)
+                results[-1] = result
                 report_status(
                     f"transient retries exhausted for {result.task_id}, skipping"
                 )
@@ -768,6 +941,7 @@ class VibeRunner:
         results: list[RunResult] = []
         skipped: set[str] = set()
         transient_retries: dict[str, int] = {}
+        retry_ready_at: dict[str, float] = {}
         completed_count = 0
         in_flight: dict[Future[RunResult], str] = {}
         scheduled: dict[str, Task] = {}
@@ -786,13 +960,23 @@ class VibeRunner:
                     and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
                     and (max_tasks <= 0 or completed_count + len(in_flight) < max_tasks)
                 ):
-                    candidates = self.list_candidates(exclude=skipped | set(scheduled))
+                    discard_ready_retries(retry_ready_at)
+                    now = time.monotonic()
+                    cooling_down = {
+                        task_id
+                        for task_id, ready_at in retry_ready_at.items()
+                        if ready_at > now
+                    }
+                    candidates = self.list_candidates(
+                        exclude=skipped | set(scheduled) | cooling_down
+                    )
                     candidates = filter_scheduled_conflicts(
                         candidates,
                         list(scheduled.values()),
                     )
                     if not candidates:
                         break
+                    self.ensure_spec_execution_gate()
                     if not command_validated:
                         self.require_worker_launch_config()
                         command_validated = True
@@ -820,17 +1004,54 @@ class VibeRunner:
                     for task in tasks:
                         scheduled[task.task_id] = task
                         report_status(f"queueing {task.task_id}: {task.title}")
-                        in_flight[executor.submit(self.run_task, task)] = task.task_id
+                        in_flight[
+                            executor.submit(
+                                self.run_task_with_supervision,
+                                task,
+                                restart_count=transient_retries.get(task.task_id, 0),
+                            )
+                        ] = task.task_id
                     if ask_agent and len(candidates) > 1 and len(tasks) < open_slots:
                         break
 
+                if discard_ready_retries(retry_ready_at):
+                    continue
+
                 if not in_flight:
+                    retry_delay = next_retry_delay(retry_ready_at)
+                    if (
+                        retry_delay is not None
+                        and not stop_after_running
+                        and (
+                            max_slices <= 0
+                            or len(results) + len(in_flight) < max_slices
+                        )
+                        and (
+                            max_tasks <= 0
+                            or completed_count + len(in_flight) < max_tasks
+                        )
+                    ):
+                        time.sleep(retry_delay)
+                        continue
                     break
 
+                wait_timeout = None
+                retry_delay = next_retry_delay(retry_ready_at)
+                if (
+                    retry_delay is not None
+                    and not stop_after_running
+                    and len(in_flight) < jobs
+                    and (max_slices <= 0 or len(results) + len(in_flight) < max_slices)
+                    and (max_tasks <= 0 or completed_count + len(in_flight) < max_tasks)
+                ):
+                    wait_timeout = retry_delay
                 completed, _pending = wait(
                     in_flight,
                     return_when=FIRST_COMPLETED,
+                    timeout=wait_timeout,
                 )
+                if not completed:
+                    continue
                 for future in completed:
                     task_id = in_flight.pop(future)
                     scheduled.pop(task_id, None)
@@ -852,6 +1073,7 @@ class VibeRunner:
                     results.append(result)
                     if result.classification == "completed":
                         transient_retries.pop(result.task_id, None)
+                        retry_ready_at.pop(result.task_id, None)
                         completed_count += 1
                         if max_tasks > 0 and completed_count >= max_tasks:
                             stop_after_running = True
@@ -859,13 +1081,22 @@ class VibeRunner:
                     if is_transient_worker_failure(result):
                         count = transient_retries.get(result.task_id, 0) + 1
                         transient_retries[result.task_id] = count
-                        if count <= MAX_TRANSIENT_TASK_RETRIES:
+                        if count <= self.config.supervision.max_restarts:
+                            self.record_task_restart(result, count, exhausted=False)
+                            retry_ready_at[result.task_id] = (
+                                time.monotonic()
+                                + self.config.supervision.cooldown_seconds
+                            )
                             report_status(
                                 f"transient failure for {result.task_id} "
-                                f"(attempt {count}/{MAX_TRANSIENT_TASK_RETRIES}), "
+                                f"(restart {count}/"
+                                f"{self.config.supervision.max_restarts}), "
                                 "will re-enqueue"
                             )
                             continue
+                        result = self.record_restart_budget_exhausted(result, count)
+                        results[-1] = result
+                        retry_ready_at.pop(result.task_id, None)
                         report_status(
                             f"transient retries exhausted for {result.task_id}, "
                             "skipping"
@@ -898,6 +1129,61 @@ class VibeRunner:
             if result.returncode != 0:
                 return f"completion check failed: {command}"
         return ""
+
+    def ensure_spec_execution_gate(self) -> None:
+        ensure_spec_execution_gate(self.config, self.source.list_tasks())
+
+    def record_task_restart(
+        self,
+        result: RunResult,
+        restart_count: int,
+        *,
+        exhausted: bool,
+        attempted_restart_count: int | None = None,
+    ) -> None:
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_restart(
+                run_id=result.run_id,
+                task_id=result.task_id,
+                restart_count=restart_count,
+                max_restarts=self.config.supervision.max_restarts,
+                cooldown_seconds=self.config.supervision.cooldown_seconds,
+                reason=(
+                    "restart_budget_exhausted"
+                    if exhausted
+                    else "transient_worker_failure"
+                ),
+                exhausted=exhausted,
+                attempted_restart_count=attempted_restart_count,
+            )
+        )
+
+    def record_restart_budget_exhausted(
+        self,
+        result: RunResult,
+        attempted_restart_count: int,
+    ) -> RunResult:
+        max_restarts = self.config.supervision.max_restarts
+        restarts_used = min(max(0, attempted_restart_count - 1), max_restarts)
+        self.record_task_restart(
+            result,
+            restarts_used,
+            exhausted=True,
+            attempted_restart_count=attempted_restart_count,
+        )
+        exhausted = dataclasses.replace(
+            result,
+            classification="failed",
+            classification_source="restart_budget_exhausted",
+            message=(
+                "restart budget exhausted after "
+                f"{max_restarts} restart(s) for {result.task_id}"
+            ),
+            restart_count=restarts_used,
+            max_restarts=max_restarts,
+        )
+        self.record_result(exhausted)
+        return exhausted
 
     def classify(
         self,
@@ -976,18 +1262,867 @@ def build_batch_selection_prompt(
     )
 
 
-def build_worker_prompt(skill_prefix: str, task: Task) -> str:
+def build_worker_prompt(
+    skill_prefix: str,
+    task: Task,
+    config: VibeConfig | None = None,
+) -> str:
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
     if not task.has_traceability:
         return prompt
-    return (
+    prompt = (
         f"{prompt}\n\n"
         "### Normalized Task Traceability\n\n"
         "This task includes optional traceability metadata from the task source:\n\n"
         "```json\n"
-        f"{json.dumps(task.to_json(), indent=2, sort_keys=True)}\n"
+        f"{json.dumps(worker_traceability_json(task), indent=2, sort_keys=True)}\n"
         "```\n"
     )
+    if config is None:
+        return prompt
+    return (
+        f"{prompt}\n\n"
+        "### Spec-Aware Worker Context\n\n"
+        "Bounded repo-local spec context for this task:\n\n"
+        "```json\n"
+        f"{json.dumps(build_spec_worker_context(config, task), indent=2, sort_keys=True)}\n"
+        "```\n"
+    )
+
+
+def build_spec_worker_context(config: VibeConfig, task: Task) -> dict[str, object]:
+    artifact_refs = spec_context_artifact_refs(task)
+    fingerprints_by_path = source_fingerprints_by_path(task)
+    artifacts: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    remaining_chars = SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+
+    for path, ref_payload in artifact_refs.items():
+        if len(artifacts) >= SPEC_WORKER_CONTEXT_MAX_ARTIFACTS:
+            skipped.append(
+                skipped_spec_context_artifact(
+                    path,
+                    "artifact_count_limit",
+                    f"{len(artifacts) + 1} > {SPEC_WORKER_CONTEXT_MAX_ARTIFACTS}",
+                )
+            )
+            continue
+        if remaining_chars <= 0:
+            skipped.append(skipped_spec_context_artifact(path, "context_size_limit"))
+            continue
+        artifact = load_spec_context_artifact(
+            config,
+            task,
+            path,
+            roles=tuple(sorted(ref_payload["roles"])),
+            refs=tuple(ref_payload["refs"]),
+            fingerprints=fingerprints_by_path.get(path, ()),
+            max_chars=min(SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS, remaining_chars),
+        )
+        if "skipped" in artifact:
+            skipped.append(artifact["skipped"])
+            continue
+        artifacts.append(artifact)
+        remaining_chars -= len(str(artifact.get("content", "")))
+
+    if task.has_traceability and not artifact_refs:
+        skipped.append(
+            {
+                "path": "",
+                "reason": "no_linked_spec_artifacts",
+                "detail": (
+                    "task has traceability metadata but no spec_paths, design_refs "
+                    "with repo-relative paths, or source_fingerprints paths"
+                ),
+            }
+        )
+
+    context = {
+        "schema_version": SPEC_WORKER_CONTEXT_SCHEMA_VERSION,
+        "task": worker_task_context_json(task),
+        "required_verification_gates": required_worker_verification_gates(
+            config,
+            task,
+        ),
+        "limits": {
+            "max_total_chars": SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+            "max_artifact_chars": SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS,
+            "max_file_bytes": SPEC_WORKER_CONTEXT_MAX_FILE_BYTES,
+            "max_artifacts": SPEC_WORKER_CONTEXT_MAX_ARTIFACTS,
+        },
+        "artifacts": artifacts,
+        "skipped_artifacts": skipped,
+    }
+    return trim_spec_worker_context_to_limit(context)
+
+
+def worker_traceability_json(task: Task) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": bounded_context_text(task.task_id, SPEC_WORKER_CONTEXT_MAX_REF_CHARS),
+        "title": bounded_context_text(task.title),
+        "status": bounded_context_text(task.status, SPEC_WORKER_CONTEXT_MAX_REF_CHARS),
+        "source": bounded_context_text(task.source),
+    }
+    if task.requirement_ids:
+        payload["requirement_ids"] = bounded_context_list(task.requirement_ids)
+    if task.spec_paths:
+        payload["spec_paths"] = bounded_path_context_list(task.spec_paths)
+    if task.design_refs:
+        payload["design_refs"] = bounded_path_context_list(task.design_refs)
+    if task.approval_state:
+        payload["approval_state"] = bounded_context_text(task.approval_state)
+    if task.source_fingerprints:
+        payload["source_fingerprints"] = bounded_source_fingerprints(
+            task.source_fingerprints
+        )
+    return payload
+
+
+def worker_task_context_json(task: Task) -> dict[str, object]:
+    payload = worker_traceability_json(task)
+    payload.update(
+        {
+            "priority": bounded_context_text(
+                task.priority,
+                SPEC_WORKER_CONTEXT_MAX_REF_CHARS,
+            ),
+            "scope": bounded_context_text(task.scope),
+        }
+    )
+    if task.resources:
+        payload["resources"] = bounded_context_list(task.resources)
+    if task.paths:
+        payload["paths"] = bounded_path_context_list(task.paths)
+    if task.conflict_domains_known:
+        payload["conflict_domains_known"] = True
+    return payload
+
+
+def bounded_context_text(
+    value: str,
+    max_chars: int = SPEC_WORKER_CONTEXT_MAX_FIELD_CHARS,
+) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    truncated, _ = truncate_spec_context_text(text, max_chars)
+    return truncated
+
+
+def bounded_context_list(values: tuple[str, ...]) -> list[str]:
+    bounded = [
+        bounded_context_text(value, SPEC_WORKER_CONTEXT_MAX_REF_CHARS)
+        for value in values[:SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS]
+    ]
+    omitted = len(values) - len(bounded)
+    if omitted > 0:
+        bounded.append(f"...[{omitted} omitted]")
+    return bounded
+
+
+def bounded_path_context_list(values: tuple[str, ...]) -> list[str]:
+    bounded = [
+        bounded_context_path(value)
+        for value in values[:SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS]
+    ]
+    omitted = len(values) - len(bounded)
+    if omitted > 0:
+        bounded.append(f"...[{omitted} omitted]")
+    return bounded
+
+
+def bounded_context_path(value: str) -> str:
+    sanitized = safe_path_text_for_prompt(value)
+    return bounded_context_text(sanitized, SPEC_WORKER_CONTEXT_MAX_REF_CHARS)
+
+
+def bounded_source_fingerprints(
+    fingerprints: tuple[dict[str, object], ...],
+) -> list[dict[str, object]]:
+    bounded: list[dict[str, object]] = []
+    for fingerprint in fingerprints[:SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS]:
+        entry = safe_source_fingerprint_for_prompt(fingerprint)
+        if entry:
+            bounded.append(entry)
+    omitted = len(fingerprints) - len(bounded)
+    if omitted > 0:
+        bounded.append({"omitted": omitted})
+    return bounded
+
+
+def spec_context_artifact_refs(task: Task) -> dict[str, dict[str, object]]:
+    refs: dict[str, dict[str, object]] = {}
+
+    def add(path: str, role: str, ref: str = "") -> None:
+        payload = refs.setdefault(path, {"roles": set(), "refs": []})
+        payload["roles"].add(role)
+        if ref:
+            payload["refs"].append(ref)
+
+    for path in task.spec_paths:
+        normalized = normalize_context_reference_path(path, allow_bare_path=True)
+        if normalized:
+            add(normalized, "spec_path", path)
+    for ref in task.design_refs:
+        normalized = normalize_context_reference_path(ref, allow_bare_path=False)
+        if normalized:
+            add(normalized, "design_ref", ref)
+    for fingerprint in task.source_fingerprints:
+        raw_path = fingerprint.get("path")
+        if isinstance(raw_path, str):
+            normalized = normalize_context_reference_path(
+                raw_path,
+                allow_bare_path=True,
+            )
+            if normalized:
+                add(normalized, "source_fingerprint", raw_path)
+    return refs
+
+
+def source_fingerprints_by_path(
+    task: Task,
+) -> dict[str, tuple[dict[str, object], ...]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for fingerprint in task.source_fingerprints:
+        raw_path = fingerprint.get("path")
+        if not isinstance(raw_path, str):
+            continue
+        normalized = normalize_context_reference_path(raw_path, allow_bare_path=True)
+        if normalized:
+            grouped.setdefault(normalized, []).append(fingerprint)
+    return {path: tuple(items) for path, items in grouped.items()}
+
+
+def normalize_context_reference_path(
+    value: str,
+    *,
+    allow_bare_path: bool,
+) -> str:
+    raw_path = value.strip().replace("\\", "/").split("#", 1)[0].strip()
+    if not raw_path:
+        return ""
+    if (
+        not allow_bare_path
+        and "/" not in raw_path
+        and "." not in PurePosixPath(raw_path).name
+    ):
+        return ""
+    return raw_path
+
+
+def load_spec_context_artifact(
+    config: VibeConfig,
+    task: Task,
+    path: str,
+    *,
+    roles: tuple[str, ...],
+    refs: tuple[str, ...],
+    fingerprints: tuple[dict[str, object], ...],
+    max_chars: int,
+) -> dict[str, object]:
+    safe_path, path_error = safe_spec_context_path(path)
+    if path_error:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                path,
+                "unsafe_path",
+                path_error,
+            )
+        }
+    if not is_allowed_evidence_file(Path(safe_path)):
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unsupported_file_type",
+            )
+        }
+    repo = config.repo.resolve()
+    requested_path = config.repo / safe_path
+    if path_has_symlink_component(repo, requested_path):
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "symlink",
+            )
+        }
+    source_path = requested_path.resolve()
+    try:
+        resolved_relative = source_path.relative_to(repo).as_posix()
+    except ValueError:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "outside_repo",
+            )
+        }
+    _resolved_path, resolved_path_error = safe_spec_context_path(resolved_relative)
+    if resolved_path_error:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unsafe_resolved_path",
+                resolved_path_error,
+            )
+        }
+    if not source_path.exists():
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "missing",
+            )
+        }
+    try:
+        stat_result = source_path.stat()
+    except OSError as exc:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unreadable",
+                str(exc),
+            )
+        }
+    if not source_path.is_file():
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "not_file",
+            )
+        }
+    if stat_result.st_size > SPEC_WORKER_CONTEXT_MAX_FILE_BYTES:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "file_too_large",
+                f"{stat_result.st_size} > {SPEC_WORKER_CONTEXT_MAX_FILE_BYTES}",
+            )
+        }
+    try:
+        raw = source_path.read_bytes()
+    except OSError as exc:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "unreadable",
+                str(exc),
+            )
+        }
+    if b"\0" in raw[:4096]:
+        return {
+            "skipped": skipped_spec_context_artifact(
+                safe_path,
+                "binary_file",
+            )
+        }
+    text = raw.decode("utf-8", errors="replace")
+    redacted = redact_evidence_text(text)
+    selected_text, matched_terms = select_spec_context_text(
+        redacted,
+        task,
+        roles=roles,
+        refs=refs,
+    )
+    content, truncated = truncate_spec_context_text(
+        selected_text.strip(),
+        max_chars,
+    )
+    return {
+        "path": safe_path,
+        "roles": list(roles),
+        "refs": [safe_path_text_for_prompt(ref) for ref in refs],
+        "size": stat_result.st_size,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "redacted": redacted != text,
+        "matched_terms": [
+            safe_context_value_for_prompt(term, SPEC_WORKER_CONTEXT_MAX_REF_CHARS)
+            for term in matched_terms
+        ],
+        "truncated": truncated,
+        "fingerprint_checks": [
+            source_fingerprint_check(fingerprint, raw, stat_result.st_size)
+            for fingerprint in fingerprints
+        ],
+        "content": content,
+    }
+
+
+def safe_spec_context_path(path: str) -> tuple[str, str]:
+    normalized = path.strip().replace("\\", "/")
+    pure_path = PurePosixPath(normalized)
+    if (
+        pure_path.is_absolute()
+        or any(part in {"", ".."} for part in pure_path.parts)
+        or not pure_path.parts
+    ):
+        return normalized, "path must be safe and repo-relative"
+    if is_webhook_like_evidence_path(normalized):
+        return normalized, "path is secret-like"
+    if any(is_secret_like_directory_name(part) for part in pure_path.parts[:-1]):
+        return normalized, "path contains a secret-like directory"
+    if is_secret_like_path(Path(pure_path.name)):
+        return normalized, "path is secret-like"
+    return str(pure_path), ""
+
+
+def safe_path_text_for_prompt(value: str) -> str:
+    raw_path, separator, fragment = value.strip().replace("\\", "/").partition("#")
+    if not raw_path:
+        return ""
+    if raw_path == ".":
+        return "."
+    _safe_path, path_error = safe_spec_context_path(raw_path)
+    if path_error:
+        return "<redacted>"
+    if separator:
+        return f"{raw_path}#{safe_context_value_for_prompt(fragment, 80)}"
+    return raw_path
+
+
+def safe_context_value_for_prompt(value: str, max_chars: int) -> str:
+    if secret_like_prompt_value(value):
+        return "<redacted>"
+    redacted = redact_evidence_text(value)
+    return bounded_context_text(redacted, max_chars)
+
+
+def secret_like_prompt_value(value: str) -> bool:
+    normalized = value.strip().replace("\\", "/")
+    path = PurePosixPath(normalized)
+    return (
+        is_webhook_like_evidence_path(normalized)
+        or any(is_secret_like_directory_name(part) for part in path.parts[:-1])
+        or is_secret_like_path(Path(path.name))
+    )
+
+
+def path_has_symlink_component(repo: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(repo)
+    except ValueError:
+        return False
+    current = repo
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def source_fingerprint_check(
+    fingerprint: dict[str, object],
+    raw: bytes,
+    actual_size: int,
+) -> dict[str, object]:
+    actual_sha = hashlib.sha256(raw).hexdigest()
+    check: dict[str, object] = {
+        "expected": safe_source_fingerprint_for_prompt(fingerprint),
+        "actual": {
+            "size": actual_size,
+            "sha256": actual_sha,
+        },
+    }
+    expected_size = fingerprint.get("size")
+    expected_sha = fingerprint.get("sha256")
+    expected_size_is_int = isinstance(expected_size, int) and not isinstance(
+        expected_size,
+        bool,
+    )
+    mismatches: list[str] = []
+    if expected_size_is_int:
+        if expected_size != actual_size:
+            mismatches.append("size")
+    if isinstance(expected_sha, str) and expected_sha != actual_sha:
+        mismatches.append("sha256")
+    if not isinstance(expected_sha, str) and not expected_size_is_int:
+        check["status"] = "invalid"
+        check["reason"] = "fingerprint must include sha256 or size"
+    elif mismatches:
+        check["status"] = "stale"
+        check["mismatches"] = mismatches
+    else:
+        check["status"] = "current"
+    return check
+
+
+def safe_source_fingerprint_for_prompt(
+    fingerprint: dict[str, object],
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    raw_path = fingerprint.get("path")
+    if isinstance(raw_path, str):
+        payload["path"] = bounded_context_path(raw_path)
+    size = fingerprint.get("size")
+    if isinstance(size, int) and not isinstance(size, bool):
+        payload["size"] = size
+    sha256 = fingerprint.get("sha256")
+    if isinstance(sha256, str):
+        payload["sha256"] = sha256 if SHA256_HEX_RE.fullmatch(sha256) else "<invalid>"
+    redacted = fingerprint.get("redacted")
+    if isinstance(redacted, bool):
+        payload["redacted"] = redacted
+    return payload
+
+
+def select_spec_context_text(
+    text: str,
+    task: Task,
+    *,
+    roles: tuple[str, ...],
+    refs: tuple[str, ...],
+) -> tuple[str, tuple[str, ...]]:
+    terms = spec_context_search_terms(task, roles=roles, refs=refs)
+    if not terms:
+        return text, ()
+    sections = markdown_sections_matching_terms(text, terms)
+    if sections:
+        return "\n\n".join(section for _term, section in sections), tuple(
+            dict.fromkeys(term for term, _section in sections)
+        )
+    line_context = line_context_matching_terms(text, terms)
+    if line_context:
+        return line_context[1], line_context[0]
+    return text, ()
+
+
+def spec_context_search_terms(
+    task: Task,
+    *,
+    roles: tuple[str, ...],
+    refs: tuple[str, ...],
+) -> tuple[str, ...]:
+    terms: list[str] = []
+    if "spec_path" in roles or "source_fingerprint" in roles:
+        terms.extend(task.requirement_ids)
+    if "design_ref" in roles:
+        for ref in refs:
+            _path, separator, fragment = ref.partition("#")
+            if separator and fragment.strip():
+                terms.append(fragment.strip())
+    return tuple(dict.fromkeys(term for term in terms if term.strip()))
+
+
+def markdown_sections_matching_terms(
+    text: str,
+    terms: tuple[str, ...],
+) -> list[tuple[str, str]]:
+    lines = text.splitlines()
+    headings: list[tuple[int, int, str]] = []
+    for index, line in enumerate(lines):
+        match = re.match(r"^(?P<marks>#{1,6})\s+(?P<title>.+?)\s*$", line)
+        if match is None:
+            continue
+        headings.append((index, len(match.group("marks")), match.group("title")))
+    matches: list[tuple[str, str]] = []
+    seen_starts: set[int] = set()
+    for heading_index, (line_index, level, title) in enumerate(headings):
+        term = first_contained_term(title, terms)
+        if term is None or line_index in seen_starts:
+            continue
+        end = len(lines)
+        for next_line, next_level, _next_title in headings[heading_index + 1 :]:
+            if next_level <= level:
+                end = next_line
+                break
+        seen_starts.add(line_index)
+        matches.append((term, "\n".join(lines[line_index:end]).strip()))
+    return matches
+
+
+def line_context_matching_terms(
+    text: str,
+    terms: tuple[str, ...],
+) -> tuple[tuple[str, ...], str] | None:
+    lines = text.splitlines()
+    ranges: list[tuple[int, int]] = []
+    matched_terms: list[str] = []
+    for index, line in enumerate(lines):
+        term = first_contained_term(line, terms)
+        if term is None:
+            continue
+        matched_terms.append(term)
+        ranges.append(
+            (
+                max(0, index - SPEC_WORKER_CONTEXT_LINE_CONTEXT),
+                min(len(lines), index + SPEC_WORKER_CONTEXT_LINE_CONTEXT + 1),
+            )
+        )
+    if not ranges:
+        return None
+    merged = merge_line_ranges(ranges)
+    chunks = ["\n".join(lines[start:end]).strip() for start, end in merged]
+    return tuple(dict.fromkeys(matched_terms)), "\n\n".join(chunks)
+
+
+def first_contained_term(value: str, terms: tuple[str, ...]) -> str | None:
+    folded = value.casefold()
+    for term in terms:
+        if term.casefold() in folded:
+            return term
+    return None
+
+
+def merge_line_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    ranges.sort()
+    merged: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
+
+
+def truncate_spec_context_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    marker = "\n...[truncated]\n"
+    if max_chars <= len(marker):
+        return text[:max_chars], True
+    return f"{text[: max_chars - len(marker)]}{marker}", True
+
+
+def skipped_spec_context_artifact(
+    path: str,
+    reason: str,
+    detail: str = "",
+) -> dict[str, str]:
+    payload = {
+        "path": safe_path_text_for_prompt(path),
+        "reason": reason,
+    }
+    if detail:
+        payload["detail"] = redact_manifest_text(detail)
+    return payload
+
+
+def trim_spec_worker_context_to_limit(
+    context: dict[str, object],
+) -> dict[str, object]:
+    context_len = spec_worker_context_json_length(context)
+    if context_len <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        return context
+
+    artifacts = context.get("artifacts")
+    if isinstance(artifacts, list):
+        for artifact in reversed(artifacts):
+            if not isinstance(artifact, dict):
+                continue
+            content = artifact.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            while context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and content:
+                excess = context_len - SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+                target_chars = max(0, len(content) - excess - 128)
+                content, _truncated = truncate_spec_context_text(
+                    content,
+                    target_chars,
+                )
+                artifact["content"] = content
+                artifact["truncated"] = True
+                context_len = spec_worker_context_json_length(context)
+            if context_len <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+                return context
+
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        context["artifacts"] = []
+        skipped = context.setdefault("skipped_artifacts", [])
+        if isinstance(skipped, list):
+            skipped.append(
+                skipped_spec_context_artifact(
+                    ".",
+                    "context_size_limit",
+                    "artifacts omitted because metadata used the context budget",
+                )
+            )
+        context_len = spec_worker_context_json_length(context)
+    skipped = context.get("skipped_artifacts")
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and isinstance(
+        skipped,
+        list,
+    ):
+        original_count = len(skipped)
+        while skipped and context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+            skipped.pop()
+            context_len = spec_worker_context_json_length(context)
+        omitted = original_count - len(skipped)
+        if omitted > 0:
+            skipped.append(
+                {
+                    "path": ".",
+                    "reason": "skipped_artifact_diagnostics_limit",
+                    "detail": f"{omitted} skipped artifact diagnostics omitted",
+                }
+            )
+        while (
+            skipped
+            and spec_worker_context_json_length(context)
+            > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+        ):
+            skipped.pop()
+    context_len = spec_worker_context_json_length(context)
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        trim_spec_context_strings(context)
+        context_len = spec_worker_context_json_length(context)
+    task = context.get("task")
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and isinstance(task, dict):
+        for key in (
+            "source_fingerprints",
+            "design_refs",
+            "spec_paths",
+            "resources",
+            "paths",
+            "requirement_ids",
+            "scope",
+            "source",
+        ):
+            if key in task:
+                task.pop(key)
+                context_len = spec_worker_context_json_length(context)
+                if context_len <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+                    break
+    gates = context.get("required_verification_gates")
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS and isinstance(gates, list):
+        context["required_verification_gates"] = [
+            {"id": str(gate.get("id", "")), "required": True}
+            for gate in gates
+            if isinstance(gate, dict)
+        ]
+        context_len = spec_worker_context_json_length(context)
+    if context_len > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS:
+        task = context.get("task")
+        task_id = ""
+        if isinstance(task, dict):
+            raw_task_id = task.get("id")
+            if isinstance(raw_task_id, str):
+                task_id = bounded_context_text(raw_task_id, 128)
+        context.clear()
+        context.update(
+            {
+                "schema_version": SPEC_WORKER_CONTEXT_SCHEMA_VERSION,
+                "task": {
+                    "id": task_id,
+                    "metadata_omitted": "context_size_limit",
+                },
+                "required_verification_gates": [
+                    {
+                        "id": "task.acceptance",
+                        "required": True,
+                        "omitted": "context_size_limit",
+                    }
+                ],
+                "limits": {
+                    "max_total_chars": SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+                    "max_artifact_chars": SPEC_WORKER_CONTEXT_MAX_ARTIFACT_CHARS,
+                    "max_file_bytes": SPEC_WORKER_CONTEXT_MAX_FILE_BYTES,
+                    "max_artifacts": SPEC_WORKER_CONTEXT_MAX_ARTIFACTS,
+                },
+                "artifacts": [],
+                "skipped_artifacts": [
+                    skipped_spec_context_artifact(
+                        ".",
+                        "context_size_limit",
+                        "metadata omitted because it exceeded the context budget",
+                    )
+                ],
+            }
+        )
+    return context
+
+
+def spec_worker_context_json_length(context: dict[str, object]) -> int:
+    return len(json.dumps(context, indent=2, sort_keys=True))
+
+
+def trim_spec_context_strings(context: dict[str, object]) -> None:
+    targets: list[dict[str, object]] = []
+    task = context.get("task")
+    if isinstance(task, dict):
+        targets.append(task)
+    gates = context.get("required_verification_gates")
+    if isinstance(gates, list):
+        targets.extend(gate for gate in gates if isinstance(gate, dict))
+    for mapping in reversed(targets):
+        for key in ("command", "evidence", "acceptance", "scope", "source", "title"):
+            value = mapping.get(key)
+            if not isinstance(value, str) or not value:
+                continue
+            while (
+                spec_worker_context_json_length(context)
+                > SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+                and value
+            ):
+                excess = (
+                    spec_worker_context_json_length(context)
+                    - SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+                )
+                target_chars = max(0, len(value) - excess - 128)
+                value, _truncated = truncate_spec_context_text(value, target_chars)
+                mapping[key] = value
+            if (
+                spec_worker_context_json_length(context)
+                <= SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS
+            ):
+                return
+
+
+def required_worker_verification_gates(
+    config: VibeConfig,
+    task: Task,
+) -> list[dict[str, object]]:
+    gates: list[dict[str, object]] = [
+        {
+            "id": "task.acceptance",
+            "required": True,
+            "description": "Verify the task acceptance criteria before reporting completion.",
+            "acceptance": bounded_context_text(task.acceptance),
+        }
+    ]
+    if task.evidence:
+        gates.append(
+            {
+                "id": "task.evidence",
+                "required": True,
+                "description": "Use the task evidence field to choose concrete checks and artifacts.",
+                "evidence": bounded_context_text(task.evidence),
+            }
+        )
+    if config.specs.require_approved:
+        gates.append(
+            {
+                "id": "spec.require_approved",
+                "required": True,
+                "approved_states": list(config.specs.approved_states),
+            }
+        )
+    if config.specs.require_current_fingerprints:
+        gates.append({"id": "spec.require_current_fingerprints", "required": True})
+    if config.specs.require_requirement_coverage:
+        gates.append({"id": "spec.require_requirement_coverage", "required": True})
+    if config.specs.require_completion_evidence:
+        gates.append({"id": "spec.require_completion_evidence", "required": True})
+    for command in config.completion.commands[:SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS]:
+        gates.append(
+            {
+                "id": "completion.command",
+                "required": True,
+                "command": bounded_context_text(
+                    command,
+                    SPEC_WORKER_CONTEXT_MAX_REF_CHARS,
+                ),
+            }
+        )
+    omitted_commands = (
+        len(config.completion.commands) - SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS
+    )
+    if omitted_commands > 0:
+        gates.append(
+            {
+                "id": "completion.command",
+                "required": True,
+                "omitted": omitted_commands,
+            }
+        )
+    return gates
 
 
 def validate_worker_prompt_delivery(command_template: str, task: Task) -> None:
@@ -1004,9 +2139,12 @@ def validate_worker_prompt_delivery(command_template: str, task: Task) -> None:
 
 
 def command_template_uses_field(command_template: str, field: str) -> bool:
-    for _literal_text, field_name, _format_spec, _conversion in string.Formatter().parse(
-        command_template
-    ):
+    for (
+        _literal_text,
+        field_name,
+        _format_spec,
+        _conversion,
+    ) in string.Formatter().parse(command_template):
         if field_name == field:
             return True
     return False
@@ -1020,6 +2158,7 @@ def selection_worker_json(worker: WorkerView) -> dict[str, object]:
         "state": payload["state"],
         "process_state": payload["process_state"],
         "stale_reason": payload["stale_reason"],
+        "lifecycle_state": payload["lifecycle_state"],
         "result_status": payload["result_status"],
         "started_at": payload["started_at"],
         "log": payload["log"],
@@ -1476,6 +2615,24 @@ def is_transient_worker_failure(
     except OSError:
         return False
     return is_transient_stderr(tail)
+
+
+def next_retry_delay(retry_ready_at: dict[str, float]) -> float | None:
+    now = time.monotonic()
+    future_times = [ready_at for ready_at in retry_ready_at.values() if ready_at > now]
+    if not future_times:
+        return None
+    return max(0.0, min(future_times) - now)
+
+
+def discard_ready_retries(retry_ready_at: dict[str, float]) -> bool:
+    now = time.monotonic()
+    ready_task_ids = [
+        task_id for task_id, ready_at in retry_ready_at.items() if ready_at <= now
+    ]
+    for task_id in ready_task_ids:
+        retry_ready_at.pop(task_id, None)
+    return bool(ready_task_ids)
 
 
 def _read_log_tail(path: Path, max_lines: int) -> str:

@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import threading
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -41,6 +42,10 @@ EXPLICIT_COMMIT_REF_RE = re.compile(
 )
 COMMIT_REF_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 SUBJECT_TASK_BOUNDARY = r"(?<![A-Za-z0-9_.:/+-]){}(?![A-Za-z0-9_.:/+-])"
+TASK_SOURCE_STATUS_SOURCE = "task_source_status"
+TASK_TRACEABILITY_SOURCE = "task_traceability"
+REQUIREMENT_TRAILER_SOURCE = "requirement_trailer"
+WORKER_REPORT_METADATA_SOURCE = "worker_report_metadata"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,6 +59,9 @@ class GitCommit:
     parents: tuple[str, ...]
     plan_items: tuple[str, ...]
     changed_paths: tuple[str, ...]
+    requirement_ids: tuple[str, ...] = ()
+    review_refs: tuple[str, ...] = ()
+    test_refs: tuple[str, ...] = ()
     skipped_path_count: int = 0
     coverage_exempt_reason: str = ""
 
@@ -68,6 +76,9 @@ class GitCommit:
             "parents": list(self.parents),
             "parent_count": len(self.parents),
             "plan_items": list(self.plan_items),
+            "requirement_ids": list(self.requirement_ids),
+            "review_refs": list(self.review_refs),
+            "test_refs": list(self.test_refs),
             "changed_paths": list(self.changed_paths),
             "skipped_path_count": self.skipped_path_count,
         }
@@ -83,6 +94,7 @@ class PlanningEvidenceWarning:
     task_id: str = ""
     commit: str = ""
     source: str = ""
+    requirement_id: str = ""
     diagnostic_task_ids: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, object]:
@@ -96,6 +108,8 @@ class PlanningEvidenceWarning:
             payload["commit"] = self.commit
         if self.source:
             payload["source"] = self.source
+        if self.requirement_id:
+            payload["requirement_id"] = self.requirement_id
         if self.diagnostic_task_ids:
             payload["diagnostic_task_ids"] = list(self.diagnostic_task_ids)
         return payload
@@ -108,6 +122,8 @@ class PlanningEvidence:
     run_attempts: tuple[dict[str, object], ...]
     commit_mappings: tuple[dict[str, object], ...]
     diagnostic_commit_mappings: tuple[dict[str, object], ...]
+    requirement_mappings: tuple[dict[str, object], ...]
+    requirement_coverage: tuple[dict[str, object], ...]
     commits: tuple[GitCommit, ...]
     skipped_evidence: tuple[SkippedEvidence, ...]
     warnings: tuple[PlanningEvidenceWarning, ...]
@@ -129,6 +145,8 @@ class PlanningEvidence:
             "run_attempts": list(self.run_attempts),
             "commit_mappings": list(self.commit_mappings),
             "diagnostic_commit_mappings": list(self.diagnostic_commit_mappings),
+            "requirement_mappings": list(self.requirement_mappings),
+            "requirement_coverage": list(self.requirement_coverage),
             "commits": [commit.to_json() for commit in self.commits],
             "skipped_evidence": [
                 skipped.to_json() for skipped in self.skipped_evidence
@@ -166,7 +184,7 @@ def collect_planning_evidence(
     completion_evidence: list[dict[str, object]] = [
         {
             "task_id": task.task_id,
-            "source": "task_source_status",
+            "source": TASK_SOURCE_STATUS_SOURCE,
             "status": task.status,
             "authoritative": True,
         }
@@ -238,6 +256,21 @@ def collect_planning_evidence(
             diagnostic_mappings,
         )
     )
+    requirement_mappings = build_requirement_mappings(
+        config,
+        tasks,
+        run_records,
+        git_commits,
+        commit_lookup,
+        completion_evidence,
+        commit_mappings,
+        warnings,
+    )
+    requirement_coverage = build_requirement_coverage(
+        tasks,
+        requirement_mappings,
+        warnings,
+    )
 
     return PlanningEvidence(
         tasks=task_payloads,
@@ -245,6 +278,8 @@ def collect_planning_evidence(
         run_attempts=tuple(run_attempts),
         commit_mappings=tuple(sorted_commit_mappings(commit_mappings)),
         diagnostic_commit_mappings=tuple(diagnostic_mappings),
+        requirement_mappings=tuple(sorted_requirement_mappings(requirement_mappings)),
+        requirement_coverage=tuple(requirement_coverage),
         commits=tuple(git_commits),
         skipped_evidence=tuple(
             sorted(skipped, key=lambda item: (item.path, item.reason, item.detail))
@@ -298,6 +333,10 @@ def normalize_run_attempts(
         log = string_value(record.get("log"))
         if log:
             payload["log"] = repo_relative_text(repo, log)
+        metadata = report_metadata(record)
+        metadata_payload = report_metadata_evidence_payload(metadata)
+        if metadata_payload:
+            payload["metadata_evidence"] = metadata_payload
         attempts.append(payload)
     return tuple(attempts)
 
@@ -553,7 +592,11 @@ def collect_git_commits(
 
     format_spec = (
         "%x1e%H%x1f%an%x1f%ae%x1f%aI%x1f%cI%x1f%P%x1f%s%x1f"
-        "%(trailers:key=Plan-Item,valueonly,separator=%x1d)"
+        "%(trailers:key=Plan-Item,valueonly,separator=%x1d)%x1f"
+        "%(trailers:key=Requirement,valueonly,separator=%x1d)%x1f"
+        "%(trailers:key=Requirement-ID,valueonly,separator=%x1d)%x1f"
+        "%(trailers:key=Review,valueonly,separator=%x1d)%x1f"
+        "%(trailers:key=Test,valueonly,separator=%x1d)"
     )
     result = run_git(
         config.repo,
@@ -583,7 +626,7 @@ def collect_git_commits(
         if not lines:
             continue
         metadata = lines[0].split("\x1f")
-        if len(metadata) != 8:
+        if len(metadata) != 12:
             warnings.append(
                 PlanningEvidenceWarning(
                     code="git_log_parse_failed",
@@ -608,6 +651,14 @@ def collect_git_commits(
             parents=tuple(parent for parent in metadata[5].split() if parent),
             subject=metadata[6],
             plan_items=parse_plan_item_values(metadata[7]),
+            requirement_ids=dedupe_text(
+                [
+                    *parse_plan_item_values(metadata[8]),
+                    *parse_plan_item_values(metadata[9]),
+                ]
+            ),
+            review_refs=parse_trailer_ref_values(metadata[10]),
+            test_refs=parse_trailer_ref_values(metadata[11]),
             changed_paths=changed_paths,
             skipped_path_count=skipped_count,
             coverage_exempt_reason=coverage_exempt_reason,
@@ -738,55 +789,75 @@ def add_run_record_evidence(
     warnings: list[PlanningEvidenceWarning],
 ) -> None:
     for index, record in enumerate(records):
-        task_id = string_value(record.get("task_id"))
-        if not task_id:
+        record_type = string_value(record.get("record_type")) or RUN_RECORD_TYPE
+        if record_type not in {RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE}:
             continue
-        if task_id not in task_ids:
+        record_task_ids = worker_report_task_ids(record)
+        if not record_task_ids:
+            continue
+        known_task_ids = tuple(
+            task_id for task_id in record_task_ids if task_id in task_ids
+        )
+        for task_id in record_task_ids:
+            if task_id in task_ids:
+                continue
             warnings.append(
                 unknown_task_reference_warning(
                     task_id,
                     source="worker_report"
-                    if record.get("record_type") == WORKER_REPORT_RECORD_TYPE
+                    if record_type == WORKER_REPORT_RECORD_TYPE
                     else "run_result",
                 )
             )
+        if not known_task_ids:
             continue
-        record_type = string_value(record.get("record_type")) or RUN_RECORD_TYPE
         status = string_value(record.get("status")) or string_value(
             record.get("classification")
         )
         commit_ref = worker_report_commit(record) or string_value(record.get("commit"))
+        metadata = report_metadata(record)
+        review_refs = metadata_review_refs(metadata)
+        test_refs = metadata_test_refs(metadata)
         embedded_report_completed = worker_report_status(record) == "completed"
         direct_report_completed = (
             record_type == WORKER_REPORT_RECORD_TYPE and status == "completed"
         )
-        if embedded_report_completed:
-            completion_evidence.append(
-                {
+        for task_id in known_task_ids:
+            if embedded_report_completed:
+                evidence_payload = {
                     "task_id": task_id,
                     "source": "run_result_worker_report",
                     "run_id": string_value(record.get("run_id")),
                     "status": "completed",
                     "authoritative": True,
                 }
-            )
-        elif direct_report_completed:
-            completion_evidence.append(
-                {
+                add_reference_lists(
+                    evidence_payload,
+                    review_refs=review_refs,
+                    test_refs=test_refs,
+                )
+                completion_evidence.append(evidence_payload)
+            elif direct_report_completed:
+                evidence_payload = {
                     "task_id": task_id,
                     "source": "worker_report",
                     "run_id": string_value(record.get("run_id")),
                     "status": status,
                     "authoritative": True,
                 }
-            )
+                add_reference_lists(
+                    evidence_payload,
+                    review_refs=review_refs,
+                    test_refs=test_refs,
+                )
+                completion_evidence.append(evidence_payload)
         if not commit_ref:
             continue
         commit = resolve_commit_ref(config.repo, commit_ref, commit_lookup, warnings)
         if commit is None:
             continue
-        commit_mappings.append(
-            {
+        for task_id in known_task_ids:
+            mapping_payload = {
                 "task_id": task_id,
                 "commit": commit,
                 "source": "worker_report"
@@ -796,7 +867,12 @@ def add_run_record_evidence(
                 "record_index": index,
                 "authoritative": embedded_report_completed or direct_report_completed,
             }
-        )
+            add_reference_lists(
+                mapping_payload,
+                review_refs=review_refs,
+                test_refs=test_refs,
+            )
+            commit_mappings.append(mapping_payload)
 
 
 def add_worklog_evidence(
@@ -867,22 +943,22 @@ def add_task_evidence_commit_refs(
             )
             if commit is None:
                 continue
-            commit_mappings.append(
-                {
-                    "task_id": task.task_id,
-                    "commit": commit,
-                    "source": "task_evidence_commit_ref",
-                    "authoritative": True,
-                }
-            )
-            completion_evidence.append(
-                {
-                    "task_id": task.task_id,
-                    "commit": commit,
-                    "source": "task_evidence_commit_ref",
-                    "authoritative": True,
-                }
-            )
+            git_commit = commit_lookup.get(commit)
+            mapping_payload: dict[str, object] = {
+                "task_id": task.task_id,
+                "commit": commit,
+                "source": "task_evidence_commit_ref",
+                "authoritative": True,
+            }
+            if git_commit is not None:
+                add_reference_lists(
+                    mapping_payload,
+                    review_refs=git_commit.review_refs,
+                    test_refs=git_commit.test_refs,
+                )
+            commit_mappings.append(mapping_payload)
+            evidence_payload = dict(mapping_payload)
+            completion_evidence.append(evidence_payload)
 
 
 def add_plan_item_mappings(
@@ -905,22 +981,20 @@ def add_plan_item_mappings(
                     )
                 )
                 continue
-            commit_mappings.append(
-                {
-                    "task_id": plan_item,
-                    "commit": commit.commit,
-                    "source": "plan_item_trailer",
-                    "authoritative": True,
-                }
+            mapping_payload: dict[str, object] = {
+                "task_id": plan_item,
+                "commit": commit.commit,
+                "source": "plan_item_trailer",
+                "authoritative": True,
+            }
+            add_reference_lists(
+                mapping_payload,
+                review_refs=commit.review_refs,
+                test_refs=commit.test_refs,
             )
-            completion_evidence.append(
-                {
-                    "task_id": plan_item,
-                    "commit": commit.commit,
-                    "source": "plan_item_trailer",
-                    "authoritative": True,
-                }
-            )
+            commit_mappings.append(mapping_payload)
+            evidence_payload = dict(mapping_payload)
+            completion_evidence.append(evidence_payload)
 
 
 def diagnostic_subject_mappings(
@@ -1018,6 +1092,326 @@ def coverage_warnings(
     return tuple(warnings)
 
 
+def build_requirement_mappings(
+    config: VibeConfig,
+    tasks: list[Task],
+    records: list[dict[str, Any]],
+    commits: list[GitCommit],
+    commit_lookup: dict[str, GitCommit],
+    completion_evidence: list[dict[str, object]],
+    commit_mappings: list[dict[str, object]],
+    warnings: list[PlanningEvidenceWarning],
+) -> list[dict[str, object]]:
+    requirements_by_task = task_requirements(tasks)
+    known_requirements = {
+        requirement_id
+        for requirement_ids in requirements_by_task.values()
+        for requirement_id in requirement_ids
+    }
+    mappings: list[dict[str, object]] = []
+    for task in tasks:
+        for requirement_id in task.requirement_ids:
+            mappings.append(
+                {
+                    "requirement_id": requirement_id,
+                    "task_id": task.task_id,
+                    "source": TASK_TRACEABILITY_SOURCE,
+                    "authoritative": False,
+                }
+            )
+    for evidence in completion_evidence:
+        task_id = string_value(evidence.get("task_id"))
+        for requirement_id in requirements_by_task.get(task_id, ()):
+            payload = requirement_mapping_from_task_payload(requirement_id, evidence)
+            if payload:
+                mappings.append(payload)
+    for mapping in commit_mappings:
+        task_id = string_value(mapping.get("task_id"))
+        for requirement_id in requirements_by_task.get(task_id, ()):
+            payload = requirement_mapping_from_task_payload(requirement_id, mapping)
+            if payload:
+                mappings.append(payload)
+    for commit in commits:
+        for requirement_id in commit.requirement_ids:
+            if requirement_id not in known_requirements:
+                warnings.append(
+                    unmapped_requirement_warning(
+                        requirement_id,
+                        source=REQUIREMENT_TRAILER_SOURCE,
+                        commit=commit.commit,
+                    )
+                )
+            payload: dict[str, object] = {
+                "requirement_id": requirement_id,
+                "commit": commit.commit,
+                "source": REQUIREMENT_TRAILER_SOURCE,
+                "authoritative": True,
+            }
+            add_reference_lists(
+                payload,
+                review_refs=commit.review_refs,
+                test_refs=commit.test_refs,
+            )
+            mappings.append(payload)
+    add_worker_report_requirement_mappings(
+        config,
+        records,
+        commit_lookup,
+        known_requirements,
+        mappings,
+        warnings,
+    )
+    return dedupe_json_records(mappings)
+
+
+def requirement_mapping_from_task_payload(
+    requirement_id: str,
+    source_payload: dict[str, object],
+) -> dict[str, object]:
+    task_id = string_value(source_payload.get("task_id"))
+    source = string_value(source_payload.get("source"))
+    if not task_id or not source:
+        return {}
+    payload: dict[str, object] = {
+        "requirement_id": requirement_id,
+        "task_id": task_id,
+        "source": source,
+        "authoritative": source_payload.get("authoritative") is True,
+    }
+    for key in ("commit", "run_id", "status", "record_index"):
+        optional_copy(payload, key, source_payload)
+    add_reference_lists(
+        payload,
+        review_refs=tuple(string_list(source_payload.get("review_refs"))),
+        test_refs=tuple(string_list(source_payload.get("test_refs"))),
+    )
+    return payload
+
+
+def add_worker_report_requirement_mappings(
+    config: VibeConfig,
+    records: list[dict[str, Any]],
+    commit_lookup: dict[str, GitCommit],
+    known_requirements: set[str],
+    mappings: list[dict[str, object]],
+    warnings: list[PlanningEvidenceWarning],
+) -> None:
+    for index, record in enumerate(records):
+        metadata = report_metadata(record)
+        requirement_ids = metadata_requirement_ids(metadata)
+        if not requirement_ids:
+            continue
+        commit_ref = worker_report_commit(record) or string_value(record.get("commit"))
+        commit = ""
+        if commit_ref:
+            commit = (
+                resolve_commit_ref(
+                    config.repo,
+                    commit_ref,
+                    commit_lookup,
+                    warnings,
+                )
+                or ""
+            )
+        status = worker_report_status(record) or string_value(record.get("status"))
+        completed = worker_report_completed(record)
+        review_refs = metadata_review_refs(metadata)
+        test_refs = metadata_test_refs(metadata)
+        for requirement_id in requirement_ids:
+            if requirement_id not in known_requirements:
+                warnings.append(
+                    unmapped_requirement_warning(
+                        requirement_id,
+                        source=WORKER_REPORT_METADATA_SOURCE,
+                    )
+                )
+            payload: dict[str, object] = {
+                "requirement_id": requirement_id,
+                "source": WORKER_REPORT_METADATA_SOURCE,
+                "run_id": string_value(record.get("run_id")),
+                "record_index": index,
+                "status": status,
+                "authoritative": completed,
+            }
+            task_id = string_value(record.get("task_id"))
+            if task_id:
+                payload["task_id"] = task_id
+            if commit:
+                payload["commit"] = commit
+            add_reference_lists(payload, review_refs=review_refs, test_refs=test_refs)
+            mappings.append(payload)
+
+
+def build_requirement_coverage(
+    tasks: list[Task],
+    mappings: list[dict[str, object]],
+    warnings: list[PlanningEvidenceWarning],
+) -> list[dict[str, object]]:
+    requirements_by_task = task_requirements(tasks)
+    task_order = {task.task_id: task.order for task in tasks}
+    done_tasks = {task.task_id for task in tasks if task.status == DONE_STATUS}
+    all_requirements = {
+        requirement_id
+        for requirement_ids in requirements_by_task.values()
+        for requirement_id in requirement_ids
+    }
+    all_requirements.update(
+        string_value(mapping.get("requirement_id")) for mapping in mappings
+    )
+    all_requirements.discard("")
+    coverage: list[dict[str, object]] = []
+    for requirement_id in sorted(all_requirements):
+        linked_task_ids = tuple(
+            task_id
+            for task_id, requirement_ids in sorted(
+                requirements_by_task.items(),
+                key=lambda item: task_order.get(item[0], 0),
+            )
+            if requirement_id in requirement_ids
+        )
+        requirement_mappings = [
+            mapping
+            for mapping in mappings
+            if string_value(mapping.get("requirement_id")) == requirement_id
+        ]
+        satisfying = [
+            mapping
+            for mapping in requirement_mappings
+            if requirement_mapping_satisfies(mapping)
+        ]
+        task_satisfying = [
+            mapping
+            for mapping in satisfying
+            if string_value(mapping.get("task_id")) in linked_task_ids
+        ]
+        direct_evidence = [
+            mapping
+            for mapping in requirement_mappings
+            if not string_value(mapping.get("task_id"))
+            and mapping.get("source") != TASK_TRACEABILITY_SOURCE
+        ]
+        attempted = [
+            mapping
+            for mapping in requirement_mappings
+            if requirement_mapping_attempts(mapping)
+        ]
+        satisfied_task_ids = unique_mapping_values(
+            task_satisfying,
+            "task_id",
+            task_order,
+        )
+        attempted_task_ids = unique_mapping_values(attempted, "task_id", task_order)
+        missing_task_ids = tuple(
+            task_id
+            for task_id in linked_task_ids
+            if task_id in done_tasks and task_id not in satisfied_task_ids
+        )
+        if not linked_task_ids:
+            status = "unmapped"
+        elif satisfied_task_ids:
+            status = "satisfied"
+        elif missing_task_ids:
+            status = "missing_evidence"
+            warnings.append(
+                PlanningEvidenceWarning(
+                    code="requirement_missing_evidence",
+                    message=(
+                        "requirement is linked to completed plan rows without "
+                        "accepted completion evidence"
+                    ),
+                    requirement_id=requirement_id,
+                    source="requirement_coverage",
+                    diagnostic_task_ids=missing_task_ids,
+                )
+            )
+        elif attempted or direct_evidence:
+            status = "attempted"
+        else:
+            status = "pending"
+        coverage.append(
+            {
+                "requirement_id": requirement_id,
+                "status": status,
+                "task_ids": list(linked_task_ids),
+                "satisfied_task_ids": list(satisfied_task_ids),
+                "attempted_task_ids": list(attempted_task_ids),
+                "missing_evidence_task_ids": list(missing_task_ids),
+                "commits": unique_mapping_values(requirement_mappings, "commit"),
+                "runs": unique_mapping_values(requirement_mappings, "run_id"),
+                "sources": unique_mapping_values(requirement_mappings, "source"),
+                "review_refs": list(
+                    unique_strings(
+                        value
+                        for mapping in requirement_mappings
+                        for value in string_list(mapping.get("review_refs"))
+                    )
+                ),
+                "test_refs": list(
+                    unique_strings(
+                        value
+                        for mapping in requirement_mappings
+                        for value in string_list(mapping.get("test_refs"))
+                    )
+                ),
+            }
+        )
+    return coverage
+
+
+def task_requirements(tasks: list[Task]) -> dict[str, tuple[str, ...]]:
+    return {
+        task.task_id: tuple(dict.fromkeys(task.requirement_ids))
+        for task in tasks
+        if task.requirement_ids
+    }
+
+
+def requirement_mapping_satisfies(mapping: dict[str, object]) -> bool:
+    return mapping.get("authoritative") is True and mapping.get("source") not in {
+        TASK_SOURCE_STATUS_SOURCE,
+        TASK_TRACEABILITY_SOURCE,
+    }
+
+
+def requirement_mapping_attempts(mapping: dict[str, object]) -> bool:
+    return (
+        mapping.get("authoritative") is False
+        and mapping.get("source") != TASK_TRACEABILITY_SOURCE
+    )
+
+
+def unique_mapping_values(
+    mappings: list[dict[str, object]] | tuple[dict[str, object], ...],
+    key: str,
+    task_order: dict[str, int] | None = None,
+) -> tuple[str, ...]:
+    values: list[str] = []
+    for mapping in mappings:
+        value = string_value(mapping.get(key)) if key else string_value(mapping)
+        if value:
+            values.append(value)
+    deduped = tuple(dict.fromkeys(values))
+    if task_order is None:
+        return tuple(sorted(deduped))
+    return tuple(sorted(deduped, key=lambda value: task_order.get(value, 0)))
+
+
+def unique_strings(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(sorted(dict.fromkeys(value for value in values if value)))
+
+
+def add_reference_lists(
+    payload: dict[str, object],
+    *,
+    review_refs: tuple[str, ...],
+    test_refs: tuple[str, ...],
+) -> None:
+    if review_refs:
+        payload["review_refs"] = list(review_refs)
+    if test_refs:
+        payload["test_refs"] = list(test_refs)
+
+
 def explicit_commit_refs(text: str) -> tuple[str, ...]:
     refs = [match.group("ref") for match in EXPLICIT_COMMIT_REF_RE.finditer(text)]
     return tuple(dict.fromkeys(refs))
@@ -1046,6 +1440,71 @@ def worklog_commit_refs(record: dict[str, Any]) -> tuple[str, ...]:
     refs.extend(string_list(record.get("commits")))
     refs.extend(string_list(record.get("commit_refs")))
     return tuple(dict.fromkeys(refs))
+
+
+def worker_report_task_ids(record: dict[str, Any]) -> tuple[str, ...]:
+    metadata = report_metadata(record)
+    return dedupe_text(
+        [
+            string_value(record.get("task_id")),
+            *metadata_task_ids(metadata),
+        ]
+    )
+
+
+def metadata_task_ids(metadata: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in (
+        "task_id",
+        "task_ids",
+        "tasks",
+        "plan_item",
+        "plan_items",
+        "plan_id",
+        "plan_ids",
+    ):
+        values.extend(string_list(metadata.get(key)))
+    return dedupe_text(values)
+
+
+def metadata_requirement_ids(metadata: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ("requirement_id", "requirement_ids", "requirements"):
+        values.extend(string_list(metadata.get(key)))
+    return dedupe_text(values)
+
+
+def metadata_review_refs(metadata: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ("review", "reviews", "review_ref", "review_refs"):
+        values.extend(string_list(metadata.get(key)))
+    return dedupe_text(values)
+
+
+def metadata_test_refs(metadata: dict[str, Any]) -> tuple[str, ...]:
+    values: list[str] = []
+    for key in ("test", "tests", "test_ref", "test_refs"):
+        values.extend(string_list(metadata.get(key)))
+    return dedupe_text(values)
+
+
+def report_metadata_evidence_payload(
+    metadata: dict[str, Any],
+) -> dict[str, object]:
+    payload: dict[str, object] = {}
+    task_ids = metadata_task_ids(metadata)
+    requirement_ids = metadata_requirement_ids(metadata)
+    review_refs = metadata_review_refs(metadata)
+    test_refs = metadata_test_refs(metadata)
+    if task_ids:
+        payload["plan_items"] = list(task_ids)
+    if requirement_ids:
+        payload["requirement_ids"] = list(requirement_ids)
+    if review_refs:
+        payload["review_refs"] = list(review_refs)
+    if test_refs:
+        payload["test_refs"] = list(test_refs)
+    return payload
 
 
 def resolve_commit_ref(
@@ -1092,6 +1551,21 @@ def unknown_task_reference_warning(
     )
 
 
+def unmapped_requirement_warning(
+    requirement_id: str,
+    *,
+    source: str,
+    commit: str = "",
+) -> PlanningEvidenceWarning:
+    return PlanningEvidenceWarning(
+        code="unmapped_requirement",
+        message=f"{source} references requirement {requirement_id} without a plan row",
+        requirement_id=requirement_id,
+        commit=commit,
+        source=source,
+    )
+
+
 def parse_plan_item_values(value: str) -> tuple[str, ...]:
     if not value:
         return ()
@@ -1101,6 +1575,20 @@ def parse_plan_item_values(value: str) -> tuple[str, ...]:
             if part:
                 items.append(part)
     return tuple(dict.fromkeys(items))
+
+
+def parse_trailer_ref_values(value: str) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return dedupe_text(
+        trailer_value.strip()
+        for trailer_value in value.split("\x1d")
+        if trailer_value.strip()
+    )
+
+
+def dedupe_text(values: Iterable[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(value for value in values if value))
 
 
 def worker_report_commit(record: dict[str, Any]) -> str:
@@ -1117,6 +1605,26 @@ def worker_report_status(record: dict[str, Any]) -> str:
     return ""
 
 
+def report_metadata(record: dict[str, Any]) -> dict[str, Any]:
+    worker_report = record.get("worker_report")
+    if isinstance(worker_report, dict):
+        metadata = worker_report.get("metadata")
+        if isinstance(metadata, dict):
+            return metadata
+    metadata = record.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def worker_report_completed(record: dict[str, Any]) -> bool:
+    record_type = string_value(record.get("record_type")) or RUN_RECORD_TYPE
+    status = string_value(record.get("status")) or string_value(
+        record.get("classification")
+    )
+    return worker_report_status(record) == "completed" or (
+        record_type == WORKER_REPORT_RECORD_TYPE and status == "completed"
+    )
+
+
 def sorted_commit_mappings(
     mappings: list[dict[str, object]],
 ) -> list[dict[str, object]]:
@@ -1125,6 +1633,22 @@ def sorted_commit_mappings(
         key=lambda mapping: (
             str(mapping.get("commit", "")),
             str(mapping.get("task_id", "")),
+            str(mapping.get("source", "")),
+            str(mapping.get("run_id", "")),
+            int_value(mapping.get("record_index")),
+        ),
+    )
+
+
+def sorted_requirement_mappings(
+    mappings: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    return sorted(
+        mappings,
+        key=lambda mapping: (
+            str(mapping.get("requirement_id", "")),
+            str(mapping.get("task_id", "")),
+            str(mapping.get("commit", "")),
             str(mapping.get("source", "")),
             str(mapping.get("run_id", "")),
             int_value(mapping.get("record_index")),
@@ -1158,6 +1682,7 @@ def dedupe_warnings(
             warning.task_id,
             warning.commit,
             warning.source,
+            warning.requirement_id,
             warning.diagnostic_task_ids,
         )
         if key in seen:

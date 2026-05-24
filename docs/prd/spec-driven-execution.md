@@ -37,7 +37,7 @@ Acceptance must cover JSON output, command-backed task sources, Markdown
 profiles, generated profiles, planning analytics, and backward compatibility
 for task sources that do not expose traceability fields.
 
-Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-02`.
+Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-02`, `DOC-04`.
 
 ## PRD-SDE-004 Spec Approval And Drift Gates
 
@@ -47,6 +47,15 @@ task comes from an unapproved, stale, or internally inconsistent spec artifact.
 Acceptance must cover read-only diagnostics, explicit override behavior,
 stale-source fingerprint reporting, missing-requirement coverage, completed-task
 evidence gaps, and safe behavior when a repository has no spec layer.
+
+The diagnostic boundary is read-only: `doctor` and dedicated spec checks may
+inspect normalized task metadata and current repo files, but must not invoke
+selection agents, repair generated profiles, run configured override commands,
+or mutate task sources. Execution gates are opt-in per diagnostic class under
+repository configuration. Repositories can require approved states, current
+source fingerprints, requirement IDs, and completion evidence independently;
+the same diagnostics remain advisory when those gates are not enabled.
+Configured override commands are surfaced as recovery guidance only.
 
 Related implementation IDs: `DISC-04`, `GANTT-02`, `SDD-03`.
 

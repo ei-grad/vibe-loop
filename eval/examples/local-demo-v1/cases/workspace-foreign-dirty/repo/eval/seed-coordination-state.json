@@ -1,0 +1,8 @@
+{
+  "workspace": {
+    "task_id": "DIRTY-01",
+    "run_id": "eval-run-dirty-01",
+    "branch": "vibe-loop/DIRTY-01",
+    "scenario": "foreign_dirty_claimed_worktree"
+  }
+}

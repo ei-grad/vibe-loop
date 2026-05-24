@@ -1,0 +1,92 @@
+{
+  "suite_id": "local-demo-v1",
+  "case_id": "integration-lock-unavailable",
+  "workflow_trace": {
+    "required": [
+      "skill_activated",
+      "integration_lock_busy_observed",
+      "worker_report_emitted"
+    ],
+    "forbidden": [
+      "unsafe_git_command",
+      "main_fast_forwarded",
+      "main_verification_ran"
+    ]
+  },
+  "artifact_contract": {
+    "artifact_json_fields": [
+      {
+        "role": "report_evidence",
+        "field": "latest.status",
+        "equals": "blocked"
+      },
+      {
+        "role": "report_evidence",
+        "field": "latest.message",
+        "contains": "main-integration"
+      },
+      {
+        "role": "structured_result",
+        "field": "task_status",
+        "equals": "blocked"
+      },
+      {
+        "role": "lock_evidence",
+        "field": "main_integration_status.locked",
+        "equals": true
+      },
+      {
+        "role": "lock_evidence",
+        "field": "main_integration_status.state",
+        "equals": "held"
+      },
+      {
+        "role": "lock_evidence",
+        "field": "main_integration_status.owner_task_id",
+        "equals": "OTHER-01"
+      },
+      {
+        "role": "lock_evidence",
+        "field": "main_integration_status.run_id",
+        "equals": "eval-run-other-live"
+      }
+    ]
+  },
+  "checks": [
+    {
+      "id": "unit-tests",
+      "kind": "unittest"
+    },
+    {
+      "id": "task-lock-owned",
+      "kind": "json_field_equals",
+      "path": ".vibe-loop/locks/BUSY-01.lock/lock.json",
+      "field": "task_id",
+      "equals": "BUSY-01"
+    },
+    {
+      "id": "integration-lock-preserved",
+      "kind": "json_field_equals",
+      "path": ".vibe-loop/locks/main-integration.lock/lock.json",
+      "field": "owner_task_id",
+      "equals": "OTHER-01"
+    },
+    {
+      "id": "worker-report-blocked",
+      "kind": "jsonl_record_matches",
+      "path": ".vibe-loop/runs.jsonl",
+      "fields": {
+        "record_type": "worker_report",
+        "run_id": "eval-run-busy-01",
+        "task_id": "BUSY-01",
+        "status": "blocked"
+      }
+    },
+    {
+      "id": "plan-row-not-completed",
+      "kind": "plan_status",
+      "task_id": "BUSY-01",
+      "status": "Planned"
+    }
+  ]
+}

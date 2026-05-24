@@ -6,13 +6,25 @@ import unittest
 from pathlib import Path
 
 from vibe_loop.runs import (
+    LIFECYCLE_EVENT_SCHEMA_VERSION,
+    LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_EXPIRED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
+    LIFECYCLE_STATES,
     RUN_RECORD_TYPE,
     RUN_SCHEMA_VERSION,
+    RUN_STATE_TRANSITION_RECORD_TYPE,
+    TASK_RESTART_RECORD_TYPE,
+    WORKSPACE_CLAIM_RECORD_TYPE,
+    WORKSPACE_CLAIMED_EVENT_TYPE,
+    WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     WORKER_REPORT_SCHEMA_VERSION,
+    RunLifecycleEvent,
     RunResult,
     RunStore,
     WorkerReport,
+    derive_run_lifecycle,
 )
 
 
@@ -132,6 +144,153 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["commit"], "abc123")
         self.assertEqual(payload["metadata"], {"reason": "external"})
 
+    def test_append_lifecycle_event_writes_versioned_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            store = RunStore(path)
+
+            store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_ACQUIRED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    lock_kind="task",
+                    lock_path=Path(directory) / "TASK-01.lock",
+                    payload={"resources": ["db"]},
+                )
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["schema_version"], LIFECYCLE_EVENT_SCHEMA_VERSION)
+        self.assertEqual(payload["record_type"], LOCK_ACQUIRED_RECORD_TYPE)
+        self.assertEqual(payload["run_id"], "run-1")
+        self.assertEqual(payload["task_id"], "TASK-01")
+        self.assertEqual(payload["lock_kind"], "task")
+        self.assertEqual(payload["resources"], ["db"])
+        self.assertTrue(payload["occurred_at"])
+
+    def test_lifecycle_event_rejects_unknown_type(self) -> None:
+        with self.assertRaises(ValueError):
+            RunLifecycleEvent(record_type="surprise", run_id="run-1")
+
+    def test_lifecycle_event_rejects_payload_core_key_override(self) -> None:
+        with self.assertRaises(ValueError):
+            RunLifecycleEvent(
+                record_type=LOCK_RELEASED_RECORD_TYPE,
+                run_id="run-1",
+                payload={"run_id": "other"},
+            )
+
+    def test_derive_run_lifecycle_uses_recorded_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            records = [
+                RunLifecycleEvent.lock_event(
+                    LOCK_ACQUIRED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    lock_kind="task",
+                    lock_path=repo / "TASK-01.lock",
+                ).to_record(),
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    to_state="started",
+                    reason="task_lock_acquired",
+                ).to_record(),
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    from_state="started",
+                    to_state="session_observed",
+                    reason="native:stdout",
+                    payload={"session_id": "native-1"},
+                ).to_record(),
+                {
+                    "schema_version": 1,
+                    "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+                    "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "occurred_at": "2026-05-09T00:00:20+00:00",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(repo),
+                },
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                    reported_at="2026-05-09T00:00:30+00:00",
+                ).to_record(),
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    from_state="session_observed",
+                    to_state="classified",
+                    reason="worker_report",
+                ).to_record(),
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "run-1.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                    finished_at="2026-05-09T00:01:00+00:00",
+                ).to_record(),
+            ]
+
+            progress = derive_run_lifecycle(records)
+            payload = progress.to_json()
+
+        self.assertEqual(progress.state, "finalized")
+        self.assertEqual(
+            [transition["state"] for transition in payload["lifecycle_transitions"]],
+            list(LIFECYCLE_STATES),
+        )
+        self.assertEqual(payload["missing_lifecycle_transitions"], [])
+        self.assertTrue(
+            all(
+                transition["observed"]
+                for transition in payload["lifecycle_transitions"]
+            )
+        )
+        by_state = {
+            transition["state"]: transition
+            for transition in payload["lifecycle_transitions"]
+        }
+        self.assertEqual(
+            by_state["scheduled"]["record_type"], LOCK_ACQUIRED_RECORD_TYPE
+        )
+        self.assertEqual(by_state["reported"]["record_type"], WORKER_REPORT_RECORD_TYPE)
+        self.assertEqual(by_state["finalized"]["record_type"], RUN_RECORD_TYPE)
+
+    def test_derive_run_lifecycle_keeps_missing_transitions_visible(self) -> None:
+        progress = derive_run_lifecycle(
+            [
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="blocked",
+                    reported_at="2026-05-09T00:00:30+00:00",
+                ).to_record()
+            ]
+        )
+        payload = progress.to_json()
+        by_state = {
+            transition["state"]: transition
+            for transition in payload["lifecycle_transitions"]
+        }
+
+        self.assertEqual(progress.state, "reported")
+        self.assertTrue(by_state["reported"]["observed"])
+        self.assertFalse(by_state["scheduled"]["observed"])
+        self.assertFalse(by_state["finalized"]["observed"])
+        self.assertIn("scheduled", payload["missing_lifecycle_transitions"])
+        self.assertIn("finalized", payload["missing_lifecycle_transitions"])
+
     def test_latest_worker_report_uses_latest_matching_valid_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = RunStore(Path(directory) / "runs.jsonl")
@@ -171,6 +330,15 @@ class RunStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             store = RunStore(repo / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_ACQUIRED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    lock_kind="task",
+                    lock_path=repo / "TASK-01.lock",
+                )
+            )
             store.append_report(
                 WorkerReport(
                     run_id="run-1",
@@ -214,6 +382,7 @@ class RunStoreTests(unittest.TestCase):
             )
 
             runs = store.list_runs()
+            inspection = store.inspect_run("run-1")
 
         self.assertEqual([run.run_id for run in runs], ["run-2", "run-1"])
         self.assertEqual(runs[0].status, "blocked")
@@ -222,13 +391,19 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(runs[1].status, "completed")
         self.assertEqual(runs[1].record_type, "run_result")
         self.assertEqual(runs[1].exit_code, 0)
-        self.assertEqual(runs[1].record_count, 2)
+        self.assertEqual(runs[1].record_count, 3)
         self.assertEqual(runs[1].agent_kind, "claude")
         self.assertEqual(runs[1].agent_prompt_dialect, "claude")
         self.assertEqual(runs[1].agent_prompt_dialect_source, "agent.kind:claude")
         self.assertEqual(runs[1].agent_skill_ref_prefix, "/")
         self.assertEqual(runs[1].agent_skill_ref_prefix_source, "agent.kind:claude")
         self.assertEqual(runs[1].worker_report["commit"], "abc123")
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(
+            [record["record_type"] for record in inspection.records],
+            ["lock_acquired", "worker_report", "run_result"],
+        )
 
     def test_list_runs_limit_zero_returns_no_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -245,6 +420,48 @@ class RunStoreTests(unittest.TestCase):
             runs = store.list_runs(limit=0)
 
         self.assertEqual(runs, [])
+
+    def test_list_runs_orders_by_displayed_status_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "run-1.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+            )
+            store.append_report(
+                WorkerReport(
+                    run_id="run-2",
+                    task_id="TASK-02",
+                    status="blocked",
+                    message="waiting",
+                )
+            )
+            store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_RELEASED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    lock_kind="task",
+                    lock_path=repo / "TASK-01.lock",
+                )
+            )
+
+            runs = store.list_runs()
+            inspection = store.inspect_run("run-1")
+
+        self.assertEqual([run.run_id for run in runs], ["run-2", "run-1"])
+        self.assertEqual(runs[1].record_type, RUN_RECORD_TYPE)
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(inspection.view.record_count, 2)
 
     def test_list_runs_ignores_invalid_worker_reports_for_latest_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -386,17 +603,110 @@ class RunStoreTests(unittest.TestCase):
         self.assertIn("log 2", context)
         self.assertIn("log 3", context)
 
-    def test_recent_records_ignore_invalid_json_lines(self) -> None:
+    def test_read_records_ignore_invalid_json_lines_and_unknown_types(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"
             path.write_text(
-                'not json\n{"task_id":"TASK-01","log":"/tmp/missing.log"}\n',
+                "\n".join(
+                    [
+                        "not json",
+                        '{"record_type":"future_record","task_id":"SKIP"}',
+                        '{"task_id":"TASK-01","log":"/tmp/missing.log"}',
+                        json.dumps(
+                            RunLifecycleEvent.workspace_claim_mismatch(
+                                run_id="run-1",
+                                task_id="TASK-02",
+                                reason="branch_worktree_mismatch",
+                                message="workspace claim refused",
+                            ).to_record()
+                        ),
+                    ]
+                )
+                + "\n",
                 encoding="utf-8",
             )
 
             records = RunStore(path).recent_records()
 
-        self.assertEqual([record["task_id"] for record in records], ["TASK-01"])
+        self.assertEqual(
+            [record["task_id"] for record in records], ["TASK-01", "TASK-02"]
+        )
+        self.assertEqual(
+            records[1]["record_type"], WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE
+        )
+
+    def test_inspect_run_can_show_lifecycle_only_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_EXPIRED_RECORD_TYPE,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    lock_kind="task",
+                    lock_path=repo / "TASK-01.lock",
+                    payload={"stale_reason": "missing_process"},
+                )
+            )
+            store.append_lifecycle_event(
+                RunLifecycleEvent.run_state_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    to_state="classified",
+                    reason="worker_report",
+                )
+            )
+
+            inspection = store.inspect_run("run-1")
+
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(inspection.view.record_type, RUN_STATE_TRANSITION_RECORD_TYPE)
+        self.assertEqual(inspection.view.status, "classified")
+        self.assertEqual(inspection.view.record_count, 2)
+
+    def test_inspect_run_includes_restart_lifecycle_records(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_restart(
+                    run_id="run-1",
+                    task_id="RT-04",
+                    restart_count=2,
+                    max_restarts=3,
+                    cooldown_seconds=0.5,
+                    reason="transient_worker_failure",
+                )
+            )
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_restart(
+                    run_id="run-1",
+                    task_id="RT-04",
+                    restart_count=3,
+                    max_restarts=3,
+                    cooldown_seconds=0.5,
+                    reason="restart_budget_exhausted",
+                    exhausted=True,
+                    attempted_restart_count=4,
+                )
+            )
+
+            inspection = store.inspect_run("run-1")
+
+        self.assertIsNotNone(inspection)
+        assert inspection is not None
+        self.assertEqual(inspection.view.record_type, TASK_RESTART_RECORD_TYPE)
+        self.assertEqual(inspection.view.status, "restart_budget_exhausted")
+        self.assertEqual(inspection.view.restart_count, 3)
+        self.assertEqual(inspection.view.max_restarts, 3)
+        self.assertTrue(inspection.view.restart_exhausted)
+        self.assertEqual(
+            inspection.view.restart_exhausted_reason,
+            "restart_budget_exhausted",
+        )
+        self.assertEqual(inspection.records[-1]["attempted_restart_count"], 4)
 
     def test_recent_log_context_ignores_records_without_file_logs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

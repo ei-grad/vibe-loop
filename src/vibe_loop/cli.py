@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
+import time
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import distribution as metadata_distribution
 from importlib.metadata import version as metadata_version
@@ -38,7 +40,15 @@ from vibe_loop.generated_profiles import (
     read_only_generated_cache_message,
     runtime_task_source_report,
 )
-from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.locks import (
+    LockBackendError,
+    LockBusy,
+    LockFencingMismatch,
+    LockManager,
+    LockOwnerMismatch,
+    build_lock_manager,
+)
+from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.planning_artifacts import (
     build_planning_artifact_bundle,
     check_planning_artifacts,
@@ -58,8 +68,22 @@ from vibe_loop.planning_timeline import (
     read_timeline_file,
 )
 from vibe_loop.runner import VibeRunner
-from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
+from vibe_loop.runs import (
+    LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_EXPIRED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
+    RunLifecycleEvent,
+    RunResult,
+    RunStore,
+    TASK_RESTART_RECORD_TYPE,
+    WorkerReport,
+    WORKER_REPORT_STATUSES,
+)
 from vibe_loop.skills import install_skills
+from vibe_loop.spec_diagnostics import (
+    build_spec_diagnostics_report,
+    render_spec_diagnostics,
+)
 from vibe_loop.task_views import (
     build_task_views,
     filter_views,
@@ -298,6 +322,16 @@ def build_parser() -> argparse.ArgumentParser:
     claim_workspace.add_argument("--branch", required=True)
     claim_workspace.add_argument("--worktree", type=Path, required=True)
     claim_workspace.add_argument("--base-commit", default="")
+    claim_workspace.add_argument("--fencing-token", default="")
+    heartbeat = worker_subparsers.add_parser(
+        "heartbeat",
+        help="Refresh the heartbeat timestamp on an active task lock",
+    )
+    add_repo_argument(heartbeat)
+    heartbeat.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    heartbeat.add_argument("--run-id", default="")
+    heartbeat.add_argument("--task-id", default="")
+    heartbeat.add_argument("--fencing-token", default="")
 
     workers = subparsers.add_parser("workers", help="List active worker runs")
     add_repo_argument(workers)
@@ -401,6 +435,13 @@ def build_parser() -> argparse.ArgumentParser:
     integration_acquire.add_argument("--run-id", default="")
     integration_acquire.add_argument("--task-id", default="")
     integration_acquire.add_argument("--pid", type=int, default=0)
+    integration_acquire.add_argument("--wait", action="store_true")
+    integration_acquire.add_argument("--timeout", type=nonnegative_float)
+    integration_acquire.add_argument(
+        "--poll-interval",
+        type=positive_float,
+        default=1.0,
+    )
     integration_release = integration_subparsers.add_parser(
         "release",
         help="Release the main integration lock",
@@ -411,6 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     integration_release.add_argument("--run-id", default="")
     integration_release.add_argument("--task-id", default="")
+    integration_release.add_argument("--fencing-token", default="")
 
     report = subparsers.add_parser("report", help="Record a worker result report")
     add_repo_argument(report)
@@ -419,10 +461,21 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--status", required=True, choices=WORKER_REPORT_STATUSES)
     report.add_argument("--commit", default="")
     report.add_argument("--message", default="")
+    report.add_argument("--fencing-token", default="")
     report.add_argument(
         "--metadata-json",
         help="JSON object with additional structured report metadata",
     )
+
+    specs = subparsers.add_parser("specs", help="Inspect spec traceability checks")
+    add_repo_argument(specs)
+    specs_subparsers = specs.add_subparsers(dest="specs_command", required=True)
+    specs_check = specs_subparsers.add_parser(
+        "check",
+        help="Run read-only spec coverage and drift diagnostics",
+    )
+    add_repo_argument(specs_check)
+    specs_check.add_argument("--json", action="store_true")
 
     eval_parser = subparsers.add_parser("eval", help="Run local skill evaluations")
     add_repo_argument(eval_parser)
@@ -654,6 +707,9 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_main_integration(args, config)
 
     if args.command == "report":
+        report_error = validate_report_fencing(args, config)
+        if report_error is not None:
+            return report_error
         report = WorkerReport(
             run_id=args.run_id,
             task_id=args.task_id,
@@ -665,6 +721,9 @@ def dispatch(args: argparse.Namespace) -> int:
         RunStore(config.state_path / "runs.jsonl").append_report(report)
         print(json.dumps(report.to_json(), indent=2))
         return 0
+
+    if args.command == "specs":
+        return dispatch_specs(args, config)
 
     if args.command == "eval":
         return dispatch_eval(args, config)
@@ -705,9 +764,15 @@ def dispatch(args: argparse.Namespace) -> int:
                     "task_source_runtime": task_source_runtime,
                     "generated_task_profile": generated_task_cache_report(config),
                     "planning_analytics": analytics_report,
+                    "specs": build_spec_diagnostics_report(
+                        config,
+                        task_source_runtime=task_source_runtime,
+                    ),
                     "agent": config.agent.to_json(),
+                    "locks": config.locks.to_json(),
                     "completion": config.completion.__dict__,
                     "stale_locks": stale_report,
+                    "concurrency_diagnostics": concurrency_diagnostics_report(workers),
                     "workspace_diagnostics": workspace_diagnostics_report(workers),
                 },
                 indent=2,
@@ -945,6 +1010,22 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
     raise AssertionError(args.eval_command)
 
 
+def dispatch_specs(args: argparse.Namespace, config) -> int:
+    if args.specs_command == "check":
+        task_source_runtime = runtime_task_source_report(config)
+        report = build_spec_diagnostics_report(
+            config,
+            task_source_runtime=task_source_runtime,
+        )
+        if args.json:
+            print(json.dumps(report, indent=2))
+        else:
+            print(render_spec_diagnostics(report))
+        return 1 if int(report["blocking_count"]) else 0
+
+    raise AssertionError(args.specs_command)
+
+
 def _parse_benchmark_agent_commands(
     specs: list[str],
 ) -> dict[str, str]:
@@ -1011,7 +1092,11 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 file=sys.stderr,
             )
             return 2
-        manager = LockManager(config.state_path / "locks")
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
         run_store = RunStore(config.state_path / "runs.jsonl")
         try:
             claim = claim_worker_workspace(
@@ -1023,8 +1108,22 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 worktree=args.worktree,
                 repo=config.repo,
                 base_commit=args.base_commit,
+                fencing_token=fencing_token_from_args(args),
             )
         except WorkspaceClaimError as exc:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_claim_mismatch(
+                    run_id=run_id,
+                    task_id=task_id,
+                    reason=exc.code,
+                    message=str(exc),
+                    details=exc.details,
+                    payload={
+                        "branch": args.branch,
+                        "worktree": str(args.worktree),
+                    },
+                )
+            )
             payload = {
                 "claimed": False,
                 "error": exc.code,
@@ -1050,11 +1149,64 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             )
         return 0
 
+    if args.worker_command == "heartbeat":
+        run_id, task_id = worker_identity_from_args(args)
+        if not run_id or not task_id:
+            print(
+                "worker heartbeat requires --run-id and --task-id "
+                "or VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID",
+                file=sys.stderr,
+            )
+            return 2
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
+        try:
+            task_lock = manager.heartbeat(
+                task_id=task_id,
+                run_id=run_id,
+                fencing_token=fencing_token_from_args(args),
+            )
+        except LockOwnerMismatch as exc:
+            return print_lock_mutation_refused(args, "owner_mismatch", exc.metadata)
+        except LockFencingMismatch as exc:
+            return print_lock_mutation_refused(
+                args,
+                "fencing_token_mismatch",
+                exc.metadata,
+                expected_token=exc.expected_token,
+                actual_token=exc.actual_token,
+            )
+        except LockBackendError as exc:
+            return print_lock_mutation_refused(args, "lock_unavailable", {}, str(exc))
+        payload = {
+            "heartbeat": True,
+            "task_id": task_id,
+            "run_id": run_id,
+            "heartbeat_at": task_lock.metadata.get("heartbeat_at"),
+            "fencing_token": task_lock.metadata.get("fencing_token"),
+        }
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                "worker heartbeat recorded "
+                f"task={task_id} run={run_id} at={payload['heartbeat_at']}"
+            )
+        return 0
+
     raise AssertionError(args.worker_command)
 
 
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:
-    manager = LockManager(config.state_path / "locks")
+    manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+    )
+    run_store = RunStore(config.state_path / "runs.jsonl")
     if args.main_integration_command == "status":
         status = manager.main_integration_status()
         if json_requested(args):
@@ -1075,55 +1227,23 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
         return 2
 
     if args.main_integration_command == "acquire":
-        owner_metadata = main_integration_owner_metadata(
+        return acquire_main_integration_command(
             args,
+            config,
             manager,
+            run_store,
             run_id=run_id,
             task_id=task_id,
         )
-        if owner_metadata is None:
-            status = manager.main_integration_status()
-            if status.locked:
-                payload = {"acquired": False, "status": status.to_json()}
-                if json_requested(args):
-                    print(json.dumps(payload, indent=2))
-                else:
-                    print(
-                        render_main_integration_busy(payload["status"]),
-                        file=sys.stderr,
-                    )
-                return 1
-            print(
-                "main-integration acquire requires an active task lock with "
-                "matching run_id/task_id or an explicit --pid",
-                file=sys.stderr,
-            )
-            return 2
-        try:
-            manager.acquire_main_integration(
-                task_id=task_id,
-                run_id=run_id,
-                metadata=owner_metadata,
-            )
-        except LockBusy:
-            status = manager.main_integration_status()
-            payload = {"acquired": False, "status": status.to_json()}
-            if json_requested(args):
-                print(json.dumps(payload, indent=2))
-            else:
-                print(render_main_integration_busy(payload["status"]), file=sys.stderr)
-            return 1
-        status = manager.main_integration_status()
-        payload = {"acquired": True, "status": status.to_json()}
-        if json_requested(args):
-            print(json.dumps(payload, indent=2))
-        else:
-            print(render_main_integration_acquired(payload["status"]))
-        return 0
 
     if args.main_integration_command == "release":
+        before_status = manager.main_integration_status()
         try:
-            released = manager.release_main_integration(task_id=task_id, run_id=run_id)
+            released = manager.release_main_integration(
+                task_id=task_id,
+                run_id=run_id,
+                fencing_token=explicit_fencing_token_from_args(args),
+            )
         except LockOwnerMismatch as exc:
             status = manager.main_integration_status()
             payload = {
@@ -1142,7 +1262,38 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
                     file=sys.stderr,
                 )
             return 1
+        except LockFencingMismatch as exc:
+            status = manager.main_integration_status()
+            payload = {
+                "released": False,
+                "error": "fencing_token_mismatch",
+                "expected_token": exc.expected_token,
+                "actual_token": exc.actual_token,
+                "status": status.to_json(),
+            }
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(
+                    "main-integration release refused: fencing_token_mismatch",
+                    file=sys.stderr,
+                )
+            return 1
         status = manager.main_integration_status()
+        if released:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_RELEASED_RECORD_TYPE,
+                    run_id=run_id,
+                    task_id=task_id,
+                    lock_kind="integration",
+                    lock_path=before_status.path,
+                    payload={
+                        "resource": "main-integration",
+                        "owner_task_id": task_id,
+                    },
+                )
+            )
         payload = {"released": released, "status": status.to_json()}
         if json_requested(args):
             print(json.dumps(payload, indent=2))
@@ -1396,6 +1547,11 @@ def render_workers(workers: list[WorkerView]) -> str:
         result = (
             f"\tresult={payload['result_status']}" if payload["result_status"] else ""
         )
+        lifecycle = f"\tlifecycle={payload['lifecycle_state'] or '-'}"
+        restart_count = payload.get("restart_count")
+        restarts = ""
+        if isinstance(restart_count, int) and restart_count > 0:
+            restarts = f"\trestarts={restart_count}/{payload['max_restarts']}"
         workspace = ""
         if isinstance(payload["workspace"], dict):
             dirty = "dirty" if payload["workspace"].get("dirty") else "clean"
@@ -1412,7 +1568,8 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
-            f"\tcommand={payload['command']}{workspace}{result}{diagnostics}{stale}"
+            f"\tcommand={payload['command']}{workspace}{lifecycle}{result}"
+            f"{restarts}{diagnostics}{stale}"
         )
     return "\n".join(lines)
 
@@ -1433,6 +1590,52 @@ def workspace_diagnostics_report(workers: list[WorkerView]) -> dict[str, object]
             )
             diagnostics.append(payload)
     return {"count": len(diagnostics), "diagnostics": diagnostics}
+
+
+def concurrency_diagnostics_report(workers: list[WorkerView]) -> dict[str, object]:
+    active_lock_count = len(workers)
+    blocked_events = [
+        lock_contention_event(worker)
+        for worker in workers
+        if worker_has_lock_contention(worker)
+    ]
+    return {
+        "wip_count": sum(1 for worker in workers if worker.state == "running"),
+        "blocked_ratio": (
+            len(blocked_events) / active_lock_count if active_lock_count else 0.0
+        ),
+        "active_lock_count": active_lock_count,
+        "lock_contention_events": blocked_events,
+    }
+
+
+def worker_has_lock_contention(worker: WorkerView) -> bool:
+    return worker.state != "running" or worker.result_status in {
+        "blocked",
+        "failed",
+        "unknown",
+    }
+
+
+def lock_contention_event(worker: WorkerView) -> dict[str, object]:
+    return {
+        "task_id": worker.active.task_id,
+        "run_id": worker.active.run_id,
+        "state": worker.state,
+        "process_state": worker.process_state,
+        "reason": lock_contention_reason(worker),
+        "stale_reason": worker.stale_reason,
+        "result_status": worker.result_status,
+        "lock": str(worker.active.lock_path or ""),
+    }
+
+
+def lock_contention_reason(worker: WorkerView) -> str:
+    if worker.state != "running":
+        return worker.stale_reason or worker.state
+    if worker.result_status:
+        return f"result_{worker.result_status}"
+    return ""
 
 
 def render_stale_locks(stale_locks: list[StaleLock]) -> str:
@@ -1463,7 +1666,8 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
             print("No stale locks found.")
         return 0
     if args.force:
-        result = clean_stale_locks(stale)
+        result = clean_stale_locks(stale, runner.lock_manager)
+        record_expired_locks(runner.run_store, result.cleaned)
         if args.json:
             print(
                 json.dumps(
@@ -1504,6 +1708,22 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def record_expired_locks(run_store: RunStore, stale_locks: list[StaleLock]) -> None:
+    for stale_lock in stale_locks:
+        if not stale_lock.run_id:
+            continue
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_EXPIRED_RECORD_TYPE,
+                run_id=stale_lock.run_id,
+                task_id=stale_lock.task_id,
+                lock_kind=stale_lock.kind,
+                lock_path=stale_lock.lock_path,
+                payload={"stale_reason": stale_lock.stale_reason},
+            )
+        )
+
+
 def render_runs(runs) -> str:
     lines: list[str] = []
     for run in runs:
@@ -1530,8 +1750,25 @@ def render_run_inspection(inspection) -> str:
         f"session: {payload['session_id']} ({payload['session_id_source'] or '-'})",
         f"log: {payload['log'] or '-'}",
         f"message: {payload['message'] or '-'}",
+        f"lifecycle: {payload['lifecycle_state'] or '-'}",
+        "missing_lifecycle: "
+        + (
+            ", ".join(payload["missing_lifecycle_transitions"])
+            if payload["missing_lifecycle_transitions"]
+            else "-"
+        ),
         f"records: {payload['record_count']}",
     ]
+    if payload["restart_count"] or payload["restart_exhausted"]:
+        lines.insert(
+            -1,
+            f"restarts: {payload['restart_count']}/{payload['max_restarts']}",
+        )
+    if payload["restart_exhausted"]:
+        lines.insert(
+            -1,
+            f"restart_exhausted: {payload['restart_exhausted_reason'] or '-'}",
+        )
     if payload["worker_report"]:
         lines.append(
             "worker_report: " + json.dumps(payload["worker_report"], sort_keys=True)
@@ -1540,8 +1777,33 @@ def render_run_inspection(inspection) -> str:
     for record in payload["records"]:
         record_type = record.get("record_type") or "run_result"
         status = record.get("status") or record.get("classification") or "-"
-        updated = record.get("finished_at") or record.get("reported_at") or "-"
-        lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}")
+        if status == "-":
+            if record_type == "run_state_transition":
+                status = record.get("to_state") or "-"
+            elif record_type == "workspace_claim":
+                status = record.get("event_type") or "workspace_claimed"
+            elif record_type == "workspace_claim_mismatch":
+                status = record.get("reason") or "mismatch"
+            elif record_type == TASK_RESTART_RECORD_TYPE:
+                if record.get("exhausted") is True:
+                    status = record.get("reason") or "restart_budget_exhausted"
+                else:
+                    status = "restart_scheduled"
+            elif isinstance(record_type, str) and record_type.startswith("lock_"):
+                status = record_type.removeprefix("lock_")
+        updated = (
+            record.get("finished_at")
+            or record.get("reported_at")
+            or record.get("occurred_at")
+            or record.get("claimed_at")
+            or "-"
+        )
+        restart = ""
+        if record_type == TASK_RESTART_RECORD_TYPE:
+            restart = (
+                f"\trestart={record.get('restart_count')}/{record.get('max_restarts')}"
+            )
+        lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}{restart}")
     return "\n".join(lines)
 
 
@@ -1607,30 +1869,399 @@ def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:
     return run_id, task_id
 
 
-def main_integration_owner_metadata(
+def fencing_token_from_args(args: argparse.Namespace) -> str:
+    return optional_string(getattr(args, "fencing_token", "")) or os.environ.get(
+        "VIBE_LOOP_FENCING_TOKEN", ""
+    )
+
+
+def explicit_fencing_token_from_args(args: argparse.Namespace) -> str:
+    return optional_string(getattr(args, "fencing_token", "")) or ""
+
+
+def validate_report_fencing(args: argparse.Namespace, config) -> int | None:
+    fencing_token = fencing_token_from_args(args)
+    if not fencing_token:
+        return None
+    manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+    )
+    try:
+        manager.validate_owner(
+            task_id=args.task_id,
+            run_id=args.run_id,
+            fencing_token=fencing_token,
+        )
+    except LockOwnerMismatch:
+        print("worker report refused: owner_mismatch", file=sys.stderr)
+        return 1
+    except LockFencingMismatch:
+        print("worker report refused: fencing_token_mismatch", file=sys.stderr)
+        return 1
+    except LockBackendError as exc:
+        print(f"worker report refused: {exc}", file=sys.stderr)
+        return 1
+    return None
+
+
+def print_lock_mutation_refused(
     args: argparse.Namespace,
+    error: str,
+    metadata: dict[str, object],
+    message: str = "",
+    *,
+    expected_token: str = "",
+    actual_token: str = "",
+) -> int:
+    payload: dict[str, object] = {
+        "heartbeat": False,
+        "updated": False,
+        "error": error,
+        "metadata": metadata,
+    }
+    if message:
+        payload["message"] = message
+    if expected_token or actual_token:
+        payload["expected_token"] = expected_token
+        payload["actual_token"] = actual_token
+    if json_requested(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        detail = f": {message}" if message else ""
+        print(f"lock update refused: {error}{detail}", file=sys.stderr)
+    return 1
+
+
+def acquire_main_integration_command(
+    args: argparse.Namespace,
+    config,
+    manager: LockManager,
+    run_store: RunStore,
+    *,
+    run_id: str,
+    task_id: str,
+) -> int:
+    wait_requested = bool(args.wait or args.timeout is not None)
+    deadline = (
+        None
+        if args.timeout is None
+        else time.monotonic() + max(0.0, float(args.timeout))
+    )
+    while True:
+        preflight = main_integration_acquire_preflight(
+            args,
+            config,
+            manager,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if preflight.get("error"):
+            record_workspace_preflight_mismatch(
+                run_store,
+                run_id=run_id,
+                task_id=task_id,
+                preflight=preflight,
+            )
+            return finish_main_integration_preflight_error(args, manager, preflight)
+        owner_metadata = preflight.get("metadata")
+        if not isinstance(owner_metadata, dict):
+            status = manager.main_integration_status()
+            if status.locked:
+                finish_main_integration_busy(
+                    args,
+                    status.to_json(),
+                    timed_out=False,
+                )
+                return 1
+            print(
+                "main-integration acquire requires an active task lock with "
+                "matching run_id/task_id or an explicit --pid",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            manager.acquire_main_integration(
+                task_id=task_id,
+                run_id=run_id,
+                metadata=owner_metadata,
+            )
+        except LockBusy:
+            status = manager.main_integration_status()
+            if not status.locked and wait_requested:
+                continue
+            if not wait_requested or not integration_lock_waitable(status):
+                finish_main_integration_busy(
+                    args,
+                    status.to_json(),
+                    timed_out=False,
+                )
+                return 1
+            if deadline is None:
+                time.sleep(args.poll_interval)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                finish_main_integration_busy(
+                    args,
+                    status.to_json(),
+                    timed_out=True,
+                )
+                return 1
+            time.sleep(min(args.poll_interval, remaining))
+            continue
+        status = manager.main_integration_status()
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_ACQUIRED_RECORD_TYPE,
+                run_id=run_id,
+                task_id=task_id,
+                lock_kind="integration",
+                lock_path=status.path,
+                payload={
+                    "resource": "main-integration",
+                    "owner_task_id": task_id,
+                },
+            )
+        )
+        payload = {
+            "acquired": True,
+            "status": status.to_json(),
+            "timed_out": False,
+        }
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(render_main_integration_acquired(payload["status"]))
+        return 0
+
+
+def finish_main_integration_preflight_error(
+    args: argparse.Namespace,
+    manager: LockManager,
+    preflight: dict[str, object],
+) -> int:
+    payload = dict(preflight)
+    payload["acquired"] = False
+    payload["status"] = manager.main_integration_status().to_json()
+    payload["timed_out"] = False
+    if json_requested(args):
+        print(json.dumps(payload, indent=2))
+    else:
+        print(render_main_integration_preflight_error(payload), file=sys.stderr)
+    return int(payload.get("exit_code", 1))
+
+
+def record_workspace_preflight_mismatch(
+    run_store: RunStore,
+    *,
+    run_id: str,
+    task_id: str,
+    preflight: dict[str, object],
+) -> None:
+    if preflight.get("error") != "workspace_preflight_failed":
+        return
+    diagnostics = preflight.get("workspace_diagnostics")
+    diagnostic_payload = diagnostics if isinstance(diagnostics, list) else []
+    run_store.append_lifecycle_event(
+        RunLifecycleEvent.workspace_claim_mismatch(
+            run_id=run_id,
+            task_id=task_id,
+            reason="workspace_preflight_failed",
+            message=str(preflight.get("message") or ""),
+            details={"workspace_diagnostics": diagnostic_payload},
+            payload={"diagnostic_count": len(diagnostic_payload)},
+        )
+    )
+
+
+def finish_main_integration_busy(
+    args: argparse.Namespace,
+    status: dict[str, object],
+    *,
+    timed_out: bool,
+) -> None:
+    payload = {
+        "acquired": False,
+        "status": status,
+        "timed_out": timed_out,
+    }
+    if json_requested(args):
+        print(json.dumps(payload, indent=2))
+        return
+    message = render_main_integration_busy(payload["status"])
+    if timed_out:
+        message = f"{message} timed_out=true"
+    print(message, file=sys.stderr)
+
+
+def main_integration_acquire_preflight(
+    args: argparse.Namespace,
+    config,
+    manager: LockManager,
+    *,
+    run_id: str,
+    task_id: str,
+) -> dict[str, object]:
+    task_locks: list[dict[str, object]] = []
+    matching_lock: dict[str, object] | None = None
+    for lock_metadata in manager.list_locks():
+        if lock_metadata.get("task_id") != task_id:
+            continue
+        task_locks.append(lock_metadata)
+        if lock_metadata.get("run_id") != run_id:
+            continue
+        matching_lock = lock_metadata
+        break
+    if matching_lock is None:
+        if task_locks:
+            return {
+                "error": "owner_mismatch",
+                "message": (
+                    "main-integration acquire refused: active task lock owner "
+                    "does not match"
+                ),
+                "expected": {"run_id": run_id, "task_id": task_id},
+                "active_run_ids": [
+                    value
+                    for value in (
+                        optional_string(lock.get("run_id")) for lock in task_locks
+                    )
+                    if value
+                ],
+                "exit_code": 1,
+            }
+        if args.pid > 0:
+            return {"metadata": {"pid": args.pid, "pid_source": "explicit_cli"}}
+        return {}
+    workspace_error = main_integration_workspace_preflight_error(
+        config,
+        manager,
+        run_id=run_id,
+        task_id=task_id,
+    )
+    if workspace_error is not None:
+        return workspace_error
+    if args.pid > 0:
+        return {"metadata": {"pid": args.pid, "pid_source": "explicit_cli"}}
+    worker_pid = positive_int(matching_lock.get("worker_pid"))
+    if worker_pid is not None:
+        return {
+            "metadata": {
+                "pid": worker_pid,
+                "pid_source": "active_task_lock:worker_pid",
+            }
+        }
+    legacy_pid = positive_int(matching_lock.get("pid"))
+    if legacy_pid is not None:
+        return {"metadata": {"pid": legacy_pid, "pid_source": "active_task_lock:pid"}}
+    return {
+        "error": "missing_worker_pid",
+        "message": (
+            "main-integration acquire refused: active task lock has no "
+            "usable worker pid"
+        ),
+        "expected": {"run_id": run_id, "task_id": task_id},
+        "exit_code": 2,
+    }
+
+
+def main_integration_workspace_preflight_error(
+    config,
     manager: LockManager,
     *,
     run_id: str,
     task_id: str,
 ) -> dict[str, object] | None:
-    if args.pid > 0:
-        return {"pid": args.pid, "pid_source": "explicit_cli"}
-    for lock_metadata in manager.list_locks():
-        if lock_metadata.get("task_id") != task_id:
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    views = build_worker_views(
+        manager,
+        run_store,
+        repo=config.repo,
+        main_branch=config.main_branch,
+    )
+    for view in views:
+        if view.active.task_id != task_id or view.active.run_id != run_id:
             continue
-        if lock_metadata.get("run_id") != run_id:
-            continue
-        worker_pid = positive_int(lock_metadata.get("worker_pid"))
-        if worker_pid is not None:
-            return {
-                "pid": worker_pid,
-                "pid_source": "active_task_lock:worker_pid",
-            }
-        legacy_pid = positive_int(lock_metadata.get("pid"))
-        if legacy_pid is not None:
-            return {"pid": legacy_pid, "pid_source": "active_task_lock:pid"}
+        if view.active.workspace is None or not view.workspace_diagnostics:
+            return None
+        return {
+            "error": "workspace_preflight_failed",
+            "message": (
+                "main-integration acquire refused: claimed workspace is not "
+                "safe for final integration"
+            ),
+            "workspace": view.active.workspace.to_json(),
+            "workspace_git_state": (
+                view.workspace_git_state.to_json()
+                if view.workspace_git_state is not None
+                else None
+            ),
+            "workspace_diagnostics": [
+                diagnostic.to_json() for diagnostic in view.workspace_diagnostics
+            ],
+            "exit_code": 1,
+        }
     return None
+
+
+def optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return parsed
+
+
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def render_main_integration_preflight_error(payload: dict[str, object]) -> str:
+    error = payload.get("error")
+    if error == "workspace_preflight_failed":
+        diagnostics = payload.get("workspace_diagnostics")
+        diagnostic_items = diagnostics if isinstance(diagnostics, list) else []
+        codes = [
+            item.get("code", "")
+            for item in diagnostic_items
+            if isinstance(item, dict) and item.get("code")
+        ]
+        hints = [
+            item.get("recovery_hint", "")
+            for item in diagnostic_items
+            if isinstance(item, dict) and item.get("recovery_hint")
+        ]
+        code_text = ",".join(str(code) for code in codes) or "unknown"
+        hint_text = f"; {hints[0]}" if hints else ""
+        return (
+            "main-integration acquire refused: workspace_preflight_failed "
+            f"codes={code_text}{hint_text}"
+        )
+    if error == "owner_mismatch":
+        active_run_ids = payload.get("active_run_ids")
+        active_text = (
+            ",".join(str(value) for value in active_run_ids)
+            if isinstance(active_run_ids, list)
+            else ""
+        )
+        return (
+            "main-integration acquire refused: owner_mismatch "
+            f"active_run_ids={active_text}"
+        )
+    if error == "missing_worker_pid":
+        return "main-integration acquire refused: missing_worker_pid"
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        return message
+    return "main-integration acquire refused"
 
 
 def json_requested(args: argparse.Namespace) -> bool:

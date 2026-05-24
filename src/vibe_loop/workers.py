@@ -11,12 +11,27 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.locks import MAIN_INTEGRATION_LOCK_NAME, LockManager, TaskLock
+from vibe_loop.locks import (
+    MAIN_INTEGRATION_LOCK_NAME,
+    LockBackendError,
+    LockFencingMismatch,
+    LockManager,
+    TaskLock,
+    fencing_token_value,
+    lock_lease_expired,
+    numeric_value,
+    validate_lock_fencing_token,
+)
 from vibe_loop.runs import (
     RUN_RECORD_TYPE,
+    WORKSPACE_CLAIM_RECORD_TYPE,
+    WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKER_REPORT_RECORD_TYPE,
+    RunLifecycleProgress,
     RunStore,
     WorkerReport,
+    derive_run_lifecycle,
+    empty_run_lifecycle,
     utc_now_iso,
 )
 
@@ -24,7 +39,6 @@ from vibe_loop.runs import (
 ACTIVE_RUN_SCHEMA_VERSION = 1
 ACTIVE_RUN_RECORD_TYPE = "active_run"
 WORKSPACE_CLAIM_SCHEMA_VERSION = 1
-WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_DIAGNOSTIC_SCHEMA_VERSION = 1
 DIRTY_SUMMARY_LIMIT = 200
 
@@ -75,13 +89,19 @@ class WorkspaceClaim:
             current_branch=optional_string(payload.get("current_branch")) or "",
             dirty=optional_bool(payload.get("dirty")),
             dirty_summary=optional_string_tuple(payload.get("dirty_summary")),
-            claimed_at=optional_string(payload.get("claimed_at")) or "",
+            claimed_at=(
+                optional_string(payload.get("claimed_at"))
+                or optional_string(payload.get("occurred_at"))
+                or ""
+            ),
         )
 
     def to_json(self) -> dict[str, object]:
         return {
             "schema_version": WORKSPACE_CLAIM_SCHEMA_VERSION,
             "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+            "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+            "occurred_at": self.claimed_at,
             "task_id": self.task_id,
             "run_id": self.run_id,
             "branch": self.branch,
@@ -111,6 +131,11 @@ class ActiveRunState:
     agent_prompt_dialect_source: str = ""
     agent_skill_ref_prefix: str = ""
     agent_skill_ref_prefix_source: str = ""
+    restart_count: int = 0
+    max_restarts: int = 0
+    lease_seconds: int | float | None = None
+    heartbeat_at: str = ""
+    fencing_token: str = ""
     worker_pid: int | None = None
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
@@ -136,6 +161,8 @@ class ActiveRunState:
         agent_prompt_dialect_source: str = "",
         agent_skill_ref_prefix: str = "",
         agent_skill_ref_prefix_source: str = "",
+        restart_count: int = 0,
+        max_restarts: int = 0,
     ) -> ActiveRunState:
         return cls(
             task_id=task_id,
@@ -152,6 +179,8 @@ class ActiveRunState:
             agent_prompt_dialect_source=agent_prompt_dialect_source,
             agent_skill_ref_prefix=agent_skill_ref_prefix,
             agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+            restart_count=restart_count,
+            max_restarts=max_restarts,
             supervisor_pid=os.getpid(),
         )
 
@@ -202,6 +231,11 @@ class ActiveRunState:
             agent_skill_ref_prefix_source=(
                 optional_string(metadata.get("agent_skill_ref_prefix_source")) or ""
             ),
+            restart_count=optional_int(metadata.get("restart_count")) or 0,
+            max_restarts=optional_int(metadata.get("max_restarts")) or 0,
+            lease_seconds=numeric_value(metadata.get("lease_seconds")),
+            heartbeat_at=optional_string(metadata.get("heartbeat_at")) or "",
+            fencing_token=fencing_token_value(metadata.get("fencing_token")),
             worker_pid=worker_pid,
             pid_source=pid_source,
             pid_scope=(
@@ -242,7 +276,15 @@ class ActiveRunState:
             "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
             "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
+            "restart_count": self.restart_count,
+            "max_restarts": self.max_restarts,
         }
+        if self.lease_seconds is not None:
+            metadata["lease_seconds"] = self.lease_seconds
+        if self.heartbeat_at:
+            metadata["heartbeat_at"] = self.heartbeat_at
+        if self.fencing_token:
+            metadata["fencing_token"] = self.fencing_token
         if self.workspace is not None:
             metadata["workspace"] = self.workspace.to_json()
         return metadata
@@ -331,11 +373,14 @@ class WorkerView:
     result_finished_at: str | None = None
     result_record_type: str | None = None
     result_metadata: dict[str, Any] | None = None
+    lifecycle_progress: RunLifecycleProgress = dataclasses.field(
+        default_factory=empty_run_lifecycle
+    )
     workspace_git_state: WorkspaceGitState | None = None
     workspace_diagnostics: tuple[WorkspaceDiagnostic, ...] = ()
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "task_id": self.active.task_id,
             "run_id": self.active.run_id,
             "state": self.state,
@@ -359,6 +404,11 @@ class WorkerView:
             "agent_prompt_dialect_source": self.active.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.active.agent_skill_ref_prefix,
             "agent_skill_ref_prefix_source": self.active.agent_skill_ref_prefix_source,
+            "restart_count": self.active.restart_count,
+            "max_restarts": self.active.max_restarts,
+            "lease_seconds": self.active.lease_seconds,
+            "heartbeat_at": self.active.heartbeat_at,
+            "fencing_token": self.active.fencing_token,
             "lock": str(self.active.lock_path) if self.active.lock_path else "",
             "workspace": (
                 self.active.workspace.to_json()
@@ -378,6 +428,8 @@ class WorkerView:
             "result_record_type": self.result_record_type,
             "result_metadata": self.result_metadata,
         }
+        payload.update(self.lifecycle_progress.to_json())
+        return payload
 
 
 ProcessExists = Callable[[int], bool]
@@ -402,13 +454,19 @@ def claim_worker_workspace(
     worktree: Path,
     repo: Path,
     base_commit: str = "",
+    fencing_token: str | None = None,
 ) -> WorkspaceClaim:
     if not branch:
         raise WorkspaceClaimError(
             "missing_branch",
             "workspace claim requires a branch",
         )
-    lock = active_task_lock_for_claim(lock_manager, task_id=task_id, run_id=run_id)
+    lock = active_task_lock_for_claim(
+        lock_manager,
+        task_id=task_id,
+        run_id=run_id,
+        fencing_token=fencing_token,
+    )
     worktree_path = resolve_claim_worktree(repo, worktree)
     claim = inspect_workspace_claim(
         task_id=task_id,
@@ -431,6 +489,7 @@ def active_task_lock_for_claim(
     *,
     task_id: str,
     run_id: str,
+    fencing_token: str | None = None,
 ) -> TaskLock:
     matching_task: list[dict[str, object]] = []
     for metadata in lock_manager.list_locks():
@@ -441,6 +500,23 @@ def active_task_lock_for_claim(
             continue
         path = optional_path(metadata.get("path"))
         if path is not None:
+            try:
+                if fencing_token:
+                    validate_lock_fencing_token(
+                        {"fencing_token": fencing_token},
+                        metadata,
+                        path=path,
+                    )
+            except LockFencingMismatch as exc:
+                raise WorkspaceClaimError(
+                    "fencing_token_mismatch",
+                    "workspace claim refused: fencing token mismatch",
+                    details={
+                        "expected_token": exc.expected_token,
+                        "actual_token": exc.actual_token,
+                        "lock_path": str(exc.path),
+                    },
+                ) from exc
             return TaskLock(task_id=task_id, path=path, metadata=metadata)
     if matching_task:
         raise WorkspaceClaimError(
@@ -968,7 +1044,8 @@ def build_worker_views(
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
     process_checker = process_exists if process_exists is not None else pid_exists
-    result_by_run_id = latest_worker_status_by_run_id(run_store.read_records())
+    records = run_store.read_records()
+    result_by_run_id = latest_worker_status_by_run_id(records)
     workspace_context = (
         build_workspace_git_context(repo, main_branch=main_branch)
         if repo is not None
@@ -998,6 +1075,9 @@ def build_worker_views(
         if not active.run_id:
             state = "stale"
             stale_reason = "missing_run_id"
+        elif lock_lease_expired(active.to_lock_metadata()):
+            state = "stale"
+            stale_reason = "lease_expired"
         elif result_status and result_record_type != WORKER_REPORT_RECORD_TYPE:
             state = "stale"
             stale_reason = "result_recorded"
@@ -1028,11 +1108,43 @@ def build_worker_views(
                 result_finished_at=result_finished_at,
                 result_record_type=result_record_type,
                 result_metadata=result_metadata,
+                lifecycle_progress=worker_lifecycle_progress(active, records),
                 workspace_git_state=workspace_git_state,
                 workspace_diagnostics=workspace_diagnostics,
             )
         )
     return views
+
+
+def worker_lifecycle_progress(
+    active: ActiveRunState,
+    records: list[dict[str, Any]],
+) -> RunLifecycleProgress:
+    if not active.run_id:
+        return empty_run_lifecycle()
+    return derive_run_lifecycle(
+        [
+            record
+            for record in records
+            if record_matches_worker_identity(
+                record,
+                run_id=active.run_id,
+                task_id=active.task_id,
+            )
+        ]
+    )
+
+
+def record_matches_worker_identity(
+    record: dict[str, Any],
+    *,
+    run_id: str,
+    task_id: str,
+) -> bool:
+    if record.get("run_id") != run_id:
+        return False
+    record_task_id = optional_string(record.get("task_id"))
+    return record_task_id is None or record_task_id == task_id
 
 
 def classify_process(
@@ -1184,7 +1296,10 @@ def collect_stale_locks(
                 lock_path=lock_path,
                 stale_reason=view.stale_reason or "unknown",
                 kind="task",
-                recovery_command=f"rm -rf {shlex.quote(str(lock_path))}",
+                recovery_command=stale_lock_recovery_command(
+                    lock_manager,
+                    lock_path,
+                ),
             )
         )
 
@@ -1193,15 +1308,20 @@ def collect_stale_locks(
         process_exists=process_exists,
     )
     if integration_status.locked and integration_status.state == "stale":
+        owner_task_id = (
+            optional_string(integration_status.metadata.get("owner_task_id"))
+            or MAIN_INTEGRATION_LOCK_NAME
+        )
         stale.append(
             StaleLock(
-                task_id=MAIN_INTEGRATION_LOCK_NAME,
+                task_id=owner_task_id,
                 run_id=optional_string(integration_status.metadata.get("run_id")) or "",
                 lock_path=integration_status.path,
                 stale_reason=integration_status.stale_reason or "unknown",
                 kind="integration",
-                recovery_command=(
-                    f"rm -rf {shlex.quote(str(integration_status.path))}"
+                recovery_command=stale_lock_recovery_command(
+                    lock_manager,
+                    integration_status.path,
                 ),
             )
         )
@@ -1216,10 +1336,25 @@ class CleanResult:
 
 def clean_stale_locks(
     stale_locks: list[StaleLock],
+    lock_manager: LockManager | None = None,
 ) -> CleanResult:
     cleaned: list[StaleLock] = []
     errors: list[tuple[StaleLock, str]] = []
     for lock in stale_locks:
+        if lock_manager is not None:
+            try:
+                released = lock_manager.release_stale_lock(
+                    task_id=lock.task_id,
+                    run_id=lock.run_id,
+                    path=lock.lock_path,
+                    kind=lock.kind,
+                )
+            except LockBackendError as exc:
+                errors.append((lock, str(exc)))
+                continue
+            if released:
+                cleaned.append(lock)
+            continue
         if not lock.lock_path.exists():
             continue
         if not _lock_metadata_matches(lock):
@@ -1232,6 +1367,12 @@ def clean_stale_locks(
             continue
         cleaned.append(lock)
     return CleanResult(cleaned=cleaned, errors=errors)
+
+
+def stale_lock_recovery_command(lock_manager: LockManager, lock_path: Path) -> str:
+    if lock_manager.uses_directory_backend:
+        return f"rm -rf {shlex.quote(str(lock_path))}"
+    return "vibe-loop workers clean --force"
 
 
 def _lock_metadata_matches(lock: StaleLock) -> bool:

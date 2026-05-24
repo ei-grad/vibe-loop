@@ -18,7 +18,10 @@ from vibe_loop.eval_examples import (
     run_eval_example_grader,
     teardown_eval_example,
 )
+from vibe_loop.locks import LockManager
+from vibe_loop.runs import RunStore
 from vibe_loop.tasks import build_task_source, runnable_tasks
+from vibe_loop.workers import build_worker_views
 
 
 EXPECTED_CASE_IDS = {
@@ -26,11 +29,16 @@ EXPECTED_CASE_IDS = {
     "finite-py-plan-table",
     "generated-roadmap-profile",
     "locked-task-selection",
+    "integration-lock-unavailable",
     "main-advanced-before-merge",
     "main-integration-lock",
     "negative-trigger-set",
     "review-remediation",
     "supervised-worker-report",
+    "workspace-duplicate-worktree",
+    "workspace-foreign-dirty",
+    "workspace-merged-branch",
+    "workspace-missing-worktree",
 }
 REQUIRED_ARTIFACT_ROLES = {
     "prompt",
@@ -122,6 +130,102 @@ class EvalExampleTests(unittest.TestCase):
         self.assertEqual(lock["pid"], os.getpid())
         self.assertEqual(lock["worker_pid"], os.getpid())
         self.assertEqual(lock["pid_source"], "popen")
+
+    def test_materialize_seeds_workspace_ownership_regressions(self) -> None:
+        expected = {
+            "workspace-duplicate-worktree": (
+                "DUP-01",
+                "warning",
+                ["duplicate_branch_worktrees"],
+            ),
+            "workspace-missing-worktree": (
+                "MISS-01",
+                "stale",
+                ["missing_claimed_worktree"],
+            ),
+            "workspace-merged-branch": (
+                "MERGED-01",
+                "warning",
+                ["branch_already_merged"],
+            ),
+            "workspace-foreign-dirty": (
+                "DIRTY-01",
+                "warning",
+                ["foreign_dirty_claimed_worktree"],
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case_id, (task_id, status, codes) in expected.items():
+                with self.subTest(case=case_id):
+                    repo = materialize_eval_example(case_id, root / case_id)
+                    views = build_worker_views(
+                        LockManager(repo / ".vibe-loop" / "locks"),
+                        RunStore(repo / ".vibe-loop" / "runs.jsonl"),
+                        repo=repo,
+                    )
+                    by_task = {view.active.task_id: view for view in views}
+                    view = by_task[task_id]
+                    workspace_state = view.workspace_git_state
+                    if workspace_state is None:
+                        self.fail(f"workspace state missing for {case_id}")
+
+                    self.assertEqual(workspace_state.status, status)
+                    self.assertEqual(
+                        [diagnostic.code for diagnostic in workspace_state.diagnostics],
+                        codes,
+                    )
+                    self.assertEqual(
+                        git_output(repo, "status", "--short").splitlines(),
+                        [f"M .vibe-loop/locks/{task_id}.lock/lock.json"],
+                    )
+
+    def test_materialize_seeds_live_integration_lock_holder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(
+                "integration-lock-unavailable",
+                Path(directory) / "busy",
+            )
+            lock = json.loads(
+                (
+                    repo
+                    / ".vibe-loop"
+                    / "locks"
+                    / "main-integration.lock"
+                    / "lock.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(lock["owner_task_id"], "OTHER-01")
+        self.assertEqual(lock["run_id"], "eval-run-other-live")
+        self.assertEqual(lock["pid"], os.getpid())
+        self.assertEqual(lock["pid_source"], "fixture-live-holder")
+
+    def test_materialize_workspace_case_overwrite_cleans_seed_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "duplicate"
+
+            materialize_eval_example("workspace-duplicate-worktree", destination)
+            workspaces = destination.parent / "duplicate-workspaces"
+            self.assertTrue(workspaces.is_dir())
+
+            materialize_eval_example(
+                "workspace-duplicate-worktree",
+                destination,
+                overwrite=True,
+            )
+            views = build_worker_views(
+                LockManager(destination / ".vibe-loop" / "locks"),
+                RunStore(destination / ".vibe-loop" / "runs.jsonl"),
+                repo=destination,
+            )
+
+            self.assertTrue(workspaces.is_dir())
+            self.assertEqual(len(views), 1)
+            self.assertEqual(
+                [diagnostic.code for diagnostic in views[0].workspace_diagnostics],
+                ["duplicate_branch_worktrees"],
+            )
 
     def test_teardown_refuses_non_fixture_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -638,6 +742,7 @@ def artifact_path(role: str) -> str:
         "structured_result": "run-result.json",
         "grader_outputs": "grader-outputs.json",
         "workflow_events": "workflow-events.json",
+        "workspace_evidence": "workspace-evidence.json",
     }
     return paths.get(role, f"{role}.json")
 

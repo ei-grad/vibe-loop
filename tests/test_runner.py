@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import sys
 import tempfile
 import threading
@@ -12,13 +14,23 @@ from pathlib import Path
 from unittest.mock import patch
 
 import vibe_loop.runner as runner_module
-from vibe_loop.config import AgentConfig, VibeConfig
+from vibe_loop.config import (
+    AgentConfig,
+    CompletionConfig,
+    SpecDiagnosticsConfig,
+    SupervisionConfig,
+    SUPERVISION_DEFAULT_MAX_RESTARTS,
+    VibeConfig,
+)
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
+    SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     SchedulerLockBusy,
     VibeRunner,
     build_batch_selection_prompt,
     build_selection_prompt,
+    build_spec_worker_context,
+    build_worker_prompt,
     deterministic_task_batch,
     parse_selected_task_id,
     parse_selected_task_ids,
@@ -27,6 +39,7 @@ from vibe_loop.runner import (
     validate_selected_task_batch,
 )
 from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
+from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import Task
 from vibe_loop.workers import ActiveRunState
 
@@ -83,6 +96,262 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("LIVE-04", prompt)
         self.assertIn("recent log tail", prompt)
         self.assertIn("Active vibe-loop workers", prompt)
+
+    def test_worker_prompt_includes_bounded_spec_context_and_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = (
+                "# Spec\n\n"
+                "## PRD-SDE-005 Spec-Aware Worker Context\n\n"
+                "Worker prompts include relevant requirement text.\n"
+                + ("Bounded requirement detail.\n" * 600)
+                + "\n## PRD-SDE-999 Unrelated Requirement\n\n"
+                "This unrelated requirement should not be copied.\n"
+            )
+            design_text = (
+                "# Design\n\n## ADR-1\n\nDesign reference body for the worker prompt.\n"
+            )
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
+            fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text.encode("utf-8")),
+                "sha256": hashlib.sha256(spec_text.encode("utf-8")).hexdigest(),
+            }
+            task = Task(
+                task_id="TRACE-01",
+                title="Trace task",
+                status="Next",
+                acceptance="Worker prompts include bounded spec-aware context.",
+                evidence="CLI/runner tests with bounded prompt assertions.",
+                requirement_ids=("PRD-SDE-005",),
+                spec_paths=("docs/spec.md",),
+                design_refs=("docs/design.md#ADR-1",),
+                approval_state="approved",
+                source_fingerprints=(fingerprint,),
+            )
+            config = VibeConfig(
+                repo=repo,
+                specs=SpecDiagnosticsConfig(
+                    require_approved=True,
+                    require_current_fingerprints=True,
+                ),
+                completion=CompletionConfig(
+                    commands=("uv run python -m unittest discover -s tests",),
+                ),
+            )
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn("### Spec-Aware Worker Context", prompt)
+        self.assertIn("Worker prompts include relevant requirement text.", prompt)
+        self.assertIn("Design reference body for the worker prompt.", prompt)
+        self.assertIn('"status": "current"', prompt)
+        self.assertIn('"id": "spec.require_approved"', prompt)
+        self.assertIn('"id": "spec.require_current_fingerprints"', prompt)
+        self.assertIn('"id": "completion.command"', prompt)
+        self.assertIn("...[truncated]", prompt)
+        self.assertNotIn("This unrelated requirement should not be copied.", prompt)
+
+    def test_worker_prompt_skips_secret_like_spec_context_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "secrets").mkdir()
+            (repo / "secrets" / "spec.md").write_text(
+                "TOKEN=secret\nREQ-SECRET must stay hidden.\n",
+                encoding="utf-8",
+            )
+            task = Task(
+                task_id="TRACE-02",
+                title="Secret trace task",
+                status="Next",
+                requirement_ids=("REQ-SECRET",),
+                spec_paths=("secrets/spec.md",),
+                source_fingerprints=(
+                    {
+                        "path": "secrets/spec.md",
+                        "size": 37,
+                        "sha256": "0" * 64,
+                    },
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn('"reason": "unsafe_path"', prompt)
+        self.assertNotIn("secrets/spec.md", prompt)
+        self.assertNotIn("TOKEN=secret", prompt)
+        self.assertNotIn("REQ-SECRET must stay hidden.", prompt)
+
+    def test_worker_prompt_skips_symlinked_spec_context_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "secrets").mkdir()
+            (repo / "secrets" / "spec.md").write_text(
+                "TOKEN=secret\nREQ-SYMLINK must stay hidden.\n",
+                encoding="utf-8",
+            )
+            (repo / "docs" / "spec.md").symlink_to("../secrets/spec.md")
+            task = Task(
+                task_id="TRACE-04",
+                title="Symlink trace task",
+                status="Next",
+                requirement_ids=("REQ-SYMLINK",),
+                spec_paths=("docs/spec.md",),
+            )
+            config = VibeConfig(
+                repo=repo,
+                completion=CompletionConfig(
+                    commands=tuple(
+                        f"pytest {'x' * 1000} --case {index}" for index in range(30)
+                    ),
+                ),
+            )
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn('"reason": "symlink"', prompt)
+        self.assertNotIn("TOKEN=secret", prompt)
+        self.assertNotIn("REQ-SYMLINK must stay hidden.", prompt)
+
+    def test_worker_prompt_reports_stale_and_missing_spec_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = "## REQ-1\n\nCurrent requirement text.\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            task = Task(
+                task_id="TRACE-03",
+                title="Stale trace task",
+                status="Next",
+                requirement_ids=("REQ-1",),
+                spec_paths=("docs/spec.md",),
+                source_fingerprints=(
+                    {
+                        "path": "docs/spec.md",
+                        "size": len(spec_text.encode("utf-8")),
+                        "sha256": "1" * 64,
+                    },
+                    {
+                        "path": "docs/missing.md",
+                        "size": 10,
+                    },
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn("Current requirement text.", prompt)
+        self.assertIn('"status": "stale"', prompt)
+        self.assertIn('"mismatches": [', prompt)
+        self.assertIn('"sha256"', prompt)
+        self.assertIn('"path": "docs/missing.md"', prompt)
+        self.assertIn('"reason": "missing"', prompt)
+
+    def test_worker_prompt_redacts_secret_like_ref_and_fingerprint_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = "## REQ-REF\n\nRequirement text.\n"
+            design_text = "safe design body\n"
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
+            task = Task(
+                task_id="TRACE-06",
+                title="Ref metadata task",
+                status="Next",
+                requirement_ids=("REQ-REF",),
+                spec_paths=("docs/spec.md",),
+                design_refs=(
+                    "docs/design.md#https://hooks.slack.com/services/T/B/C",
+                    "docs/design.md#foo/secrets/token",
+                ),
+                source_fingerprints=(
+                    {
+                        "path": "docs/spec.md",
+                        "size": len(spec_text.encode("utf-8")),
+                        "sha256": "https://hooks.slack.com/services/T/B/C",
+                        "webhook_url": "https://hooks.slack.com/services/T/B/C",
+                        "api_token": "secret-token",
+                    },
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            prompt = build_worker_prompt("$", task, config)
+
+        self.assertIn("docs/design.md#<redacted>", prompt)
+        self.assertIn('"sha256": "<invalid>"', prompt)
+        self.assertNotIn("hooks.slack.com", prompt)
+        self.assertNotIn("foo/secrets/token", prompt)
+        self.assertNotIn("secret-token", prompt)
+        self.assertNotIn("webhook_url", prompt)
+        self.assertNotIn("api_token", prompt)
+
+    def test_spec_worker_context_respects_total_size_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_text = "## REQ-LARGE\n\n" + ("requirement detail\n" * 1000)
+            (repo / "docs" / "spec.md").write_text(spec_text, encoding="utf-8")
+            task = Task(
+                task_id="TRACE-05",
+                title="Large trace task",
+                status="Next",
+                scope="scope " * 1000,
+                acceptance="acceptance " * 1000,
+                evidence="evidence " * 1000,
+                requirement_ids=tuple(f"REQ-{index}" for index in range(50)),
+                spec_paths=("docs/spec.md",),
+                design_refs=tuple(
+                    f"docs/design-{index}.md#ADR-{index}" for index in range(50)
+                ),
+                source_fingerprints=tuple(
+                    {
+                        "path": f"docs/spec-{index}.md",
+                        "size": index,
+                        "sha256": "a" * 64,
+                    }
+                    for index in range(50)
+                ),
+            )
+            config = VibeConfig(repo=repo)
+
+            context = build_spec_worker_context(config, task)
+            context_json = json.dumps(context, indent=2, sort_keys=True)
+
+        self.assertLessEqual(len(context_json), SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS)
+        self.assertIn("...[truncated]", context_json)
+
+    def test_spec_worker_context_bounds_required_scalar_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "spec.md").write_text(
+                "## REQ-SCALAR\n\nRequirement text.\n",
+                encoding="utf-8",
+            )
+            task = Task(
+                task_id="TRACE-" + ("x" * 20000),
+                title="Scalar trace task",
+                status="Next" + ("y" * 20000),
+                priority="P1" + ("z" * 20000),
+                requirement_ids=("REQ-SCALAR",),
+                spec_paths=("docs/spec.md",),
+            )
+            config = VibeConfig(repo=repo)
+
+            context = build_spec_worker_context(config, task)
+            context_json = json.dumps(context, indent=2, sort_keys=True)
+
+        self.assertLessEqual(len(context_json), SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS)
+        self.assertIn("...[truncated]", context_json)
 
     def test_parse_selected_task_id_from_json_only_or_wrapped_output(self) -> None:
         self.assertEqual(
@@ -771,6 +1040,84 @@ class RunnerTests(unittest.TestCase):
             ],
         )
 
+    def test_parallel_refill_rechecks_spec_gate_before_agent_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            spec_path = repo / "docs" / "spec.md"
+            spec_text = "current spec\n"
+            spec_path.write_text(spec_text, encoding="utf-8")
+            fingerprint = {
+                "path": "docs/spec.md",
+                "size": len(spec_text),
+                "sha256": hashlib.sha256(spec_text.encode("utf-8")).hexdigest(),
+            }
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker", selection_command="selector"),
+                    specs=SpecDiagnosticsConfig(require_current_fingerprints=True),
+                )
+            )
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-01",
+                        title="Task 1",
+                        status="Next",
+                        requirement_ids=("REQ-1",),
+                        approval_state="approved",
+                        source_fingerprints=(fingerprint,),
+                        order=1,
+                    ),
+                    Task(
+                        task_id="TASK-02",
+                        title="Task 2",
+                        status="Next",
+                        requirement_ids=("REQ-2",),
+                        approval_state="approved",
+                        source_fingerprints=(fingerprint,),
+                        order=2,
+                    ),
+                    Task(
+                        task_id="TASK-03",
+                        title="Task 3",
+                        status="Next",
+                        requirement_ids=("REQ-3",),
+                        approval_state="approved",
+                        source_fingerprints=(fingerprint,),
+                        order=3,
+                    ),
+                ]
+            )
+            runner._source = source
+            selected_batches: list[list[str]] = []
+
+            def select_one_task(candidates: list[Task], _limit: int) -> list[Task]:
+                selected_batches.append([task.task_id for task in candidates])
+                return [candidates[0]]
+
+            def run_task(task: Task) -> RunResult:
+                source.mark_done(task.task_id)
+                spec_path.write_text("drifted spec\n", encoding="utf-8")
+                return RunResult(
+                    run_id=f"run-{task.task_id}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id}.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.ask_agent_to_select_batch = select_one_task
+            runner.run_task = run_task
+
+            with self.assertRaises(SpecExecutionGateError):
+                runner.run_until_done(ask_agent=True, jobs=2, max_slices=2)
+
+        self.assertEqual(selected_batches, [["TASK-01", "TASK-02", "TASK-03"]])
+
     def test_run_until_done_parallel_excludes_task_locks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1300,6 +1647,92 @@ class RunnerTests(unittest.TestCase):
             finally:
                 manager.release(held_lock)
 
+    def test_main_integration_wait_retries_until_lock_is_released(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            holder = manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+            sleeps: list[float] = []
+
+            def release_holder(delay: float) -> None:
+                sleeps.append(delay)
+                manager.release(holder)
+
+            result = manager.acquire_main_integration_with_wait(
+                task_id="TASK-02",
+                run_id="run-waiter",
+                wait=True,
+                timeout_seconds=10,
+                poll_interval_seconds=0.1,
+                sleep=release_holder,
+            )
+
+        self.assertTrue(result.acquired)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(sleeps, [0.1])
+        self.assertEqual(result.status.metadata["owner_task_id"], "TASK-02")
+
+    def test_main_integration_wait_times_out_without_stealing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+
+            result = manager.acquire_main_integration_with_wait(
+                task_id="TASK-02",
+                run_id="run-waiter",
+                wait=True,
+                timeout_seconds=0,
+            )
+            status = manager.main_integration_status(process_exists=lambda pid: True)
+
+        self.assertFalse(result.acquired)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.status.metadata["owner_task_id"], "TASK-01")
+        self.assertEqual(status.metadata["owner_task_id"], "TASK-01")
+
+    def test_main_integration_wait_retries_available_race(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager = LockManager(Path(directory) / "locks")
+            holder = manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-holder",
+            )
+            original_acquire = manager.acquire_main_integration
+            attempts = 0
+
+            def acquire_with_race(*, task_id, run_id, metadata=None):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    manager.release(holder)
+                    raise LockBusy(holder.path, holder.metadata)
+                return original_acquire(
+                    task_id=task_id,
+                    run_id=run_id,
+                    metadata=metadata,
+                )
+
+            with patch.object(
+                manager,
+                "acquire_main_integration",
+                side_effect=acquire_with_race,
+            ):
+                result = manager.acquire_main_integration_with_wait(
+                    task_id="TASK-02",
+                    run_id="run-waiter",
+                    wait=True,
+                    timeout_seconds=10,
+                )
+
+        self.assertTrue(result.acquired)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result.status.metadata["owner_task_id"], "TASK-02")
+
     def test_streaming_command_forwards_stdout_and_logs_stderr_by_default(
         self,
     ) -> None:
@@ -1578,8 +2011,6 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertEqual(results[-1].classification, "completed")
 
     def test_serial_loop_gives_up_after_max_transient_retries(self) -> None:
-        from vibe_loop.runner import MAX_TRANSIENT_TASK_RETRIES
-
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             runner = VibeRunner(
@@ -1608,14 +2039,118 @@ class TransientWorkerFailureTests(unittest.TestCase):
             with patch("vibe_loop.runner.time.sleep"):
                 results = runner.run_until_done_serial(continue_on_failure=True)
 
-        self.assertEqual(len(results), MAX_TRANSIENT_TASK_RETRIES + 1)
+        self.assertEqual(len(results), SUPERVISION_DEFAULT_MAX_RESTARTS + 1)
         self.assertTrue(all(r.classification == "failed" for r in results))
+        self.assertEqual(
+            results[-1].classification_source,
+            "restart_budget_exhausted",
+        )
+
+    def test_serial_loop_honors_configured_restart_budget_and_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.25,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("Error: 429 rate limit\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                return RunResult(
+                    run_id=f"run-{restart_count}",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            runner.run_task = run_task
+            with patch("vibe_loop.runner.time.sleep") as sleep:
+                results = runner.run_until_done_serial(continue_on_failure=True)
+
+            records = runner.run_store.read_records()
+
+        self.assertEqual([result.restart_count for result in results], [0, 1])
+        self.assertEqual(results[-1].classification_source, "restart_budget_exhausted")
+        sleep.assert_called_once_with(0.25)
+        restart_records = [
+            record for record in records if record.get("record_type") == "task_restart"
+        ]
+        self.assertEqual(len(restart_records), 2)
+        self.assertEqual(restart_records[0]["restart_count"], 1)
+        self.assertFalse(restart_records[0]["exhausted"])
+        self.assertEqual(restart_records[1]["restart_count"], 1)
+        self.assertEqual(restart_records[1]["attempted_restart_count"], 2)
+        self.assertTrue(restart_records[1]["exhausted"])
+        self.assertEqual(restart_records[1]["reason"], "restart_budget_exhausted")
+
+    def test_restart_counts_do_not_accumulate_across_supervisor_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(max_restarts=1, cooldown_seconds=0),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("Error: 503 Service Unavailable\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            run_sequence = 0
+
+            def run_task(task: Task) -> RunResult:
+                nonlocal run_sequence
+                run_sequence += 1
+                restart_count = runner.current_restart_count(task.task_id)
+                return RunResult(
+                    run_id=f"run-{run_sequence}",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            runner.run_task = run_task
+            with patch("vibe_loop.runner.time.sleep"):
+                first = runner.run_until_done_serial(continue_on_failure=True)
+                second = runner.run_until_done_serial(continue_on_failure=True)
+
+        self.assertEqual([result.restart_count for result in first], [0, 1])
+        self.assertEqual([result.restart_count for result in second], [0, 1])
 
     def test_parallel_loop_retries_transient_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             runner = VibeRunner(
-                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(cooldown_seconds=0),
+                )
             )
             log_path = repo / "transient.log"
             log_path.write_text("overloaded, please wait\n", encoding="utf-8")
@@ -1665,6 +2200,249 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertEqual(call_count, 2)
         self.assertEqual(len(results), 2)
         self.assertEqual(results[-1].classification, "completed")
+
+    def test_parallel_loop_honors_configured_restart_budget_and_cooldown(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.25,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            clock = [0.0]
+            sleeps: list[float] = []
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                return RunResult(
+                    run_id=f"run-{restart_count}",
+                    task_id=task.task_id,
+                    classification="failed",
+                    exit_code=1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            def advance_clock(delay: float) -> None:
+                sleeps.append(delay)
+                clock[0] += delay
+
+            runner.run_task = run_task
+            with (
+                patch(
+                    "vibe_loop.runner.time.monotonic",
+                    side_effect=lambda: clock[0],
+                ),
+                patch("vibe_loop.runner.time.sleep", side_effect=advance_clock),
+            ):
+                results = runner.run_until_done_parallel(
+                    ask_agent=False,
+                    max_slices=0,
+                    continue_on_failure=True,
+                    jobs=1,
+                )
+            records = runner.run_store.read_records()
+
+        self.assertEqual([result.restart_count for result in results], [0, 1])
+        self.assertEqual(results[-1].classification, "failed")
+        self.assertEqual(
+            results[-1].classification_source,
+            "restart_budget_exhausted",
+        )
+        self.assertEqual(sleeps, [0.25])
+        restart_records = [
+            record for record in records if record.get("record_type") == "task_restart"
+        ]
+        self.assertEqual(len(restart_records), 2)
+        self.assertFalse(restart_records[0]["exhausted"])
+        self.assertTrue(restart_records[1]["exhausted"])
+
+    def test_parallel_loop_rebuilds_candidates_when_cooldown_expires_during_discovery(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.25,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            clock = [0.0]
+            original_list_candidates = runner.list_candidates
+            discovery_advanced = False
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                if restart_count:
+                    source.mark_done(task.task_id)
+                return RunResult(
+                    run_id=f"run-{restart_count}",
+                    task_id=task.task_id,
+                    classification="completed" if restart_count else "failed",
+                    exit_code=0 if restart_count else 1,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb" if restart_count else "aaa",
+                    restart_count=restart_count,
+                    max_restarts=runner.config.supervision.max_restarts,
+                )
+
+            def list_candidates(exclude: set[str] | None = None) -> list[Task]:
+                nonlocal discovery_advanced
+                candidates = original_list_candidates(exclude=exclude)
+                if (
+                    exclude is not None
+                    and "TASK-01" in exclude
+                    and not discovery_advanced
+                ):
+                    discovery_advanced = True
+                    clock[0] = 0.25
+                return candidates
+
+            runner.run_task = run_task
+            runner.list_candidates = list_candidates
+            with (
+                patch(
+                    "vibe_loop.runner.time.monotonic",
+                    side_effect=lambda: clock[0],
+                ),
+                patch("vibe_loop.runner.time.sleep") as sleep,
+            ):
+                results = runner.run_until_done_parallel(
+                    ask_agent=False,
+                    max_slices=0,
+                    continue_on_failure=False,
+                    jobs=1,
+                )
+
+        self.assertTrue(discovery_advanced)
+        sleep.assert_not_called()
+        self.assertEqual([result.restart_count for result in results], [0, 1])
+        self.assertEqual(results[-1].classification, "completed")
+
+    def test_parallel_loop_requeues_ready_retry_while_other_task_is_running(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=0.01,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [
+                    Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                    Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                ]
+            )
+            runner._source = source
+            retry_started = threading.Event()
+            b_finished = threading.Event()
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                if task.task_id == "TASK-01" and restart_count == 0:
+                    return RunResult(
+                        run_id="run-a-0",
+                        task_id=task.task_id,
+                        classification="failed",
+                        exit_code=1,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                        restart_count=restart_count,
+                        max_restarts=runner.config.supervision.max_restarts,
+                    )
+                if task.task_id == "TASK-01":
+                    retry_started.set()
+                    source.mark_done(task.task_id)
+                    return RunResult(
+                        run_id="run-a-1",
+                        task_id=task.task_id,
+                        classification="completed",
+                        exit_code=0,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="bbb",
+                        restart_count=restart_count,
+                        max_restarts=runner.config.supervision.max_restarts,
+                    )
+                retry_started.wait(timeout=1.0)
+                b_finished.set()
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-b",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "task-b.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+
+            results = runner.run_until_done_parallel(
+                ask_agent=False,
+                max_slices=0,
+                continue_on_failure=False,
+                jobs=2,
+                max_tasks=2,
+            )
+
+        self.assertTrue(retry_started.is_set())
+        self.assertTrue(b_finished.is_set())
+        self.assertEqual(results[0].task_id, "TASK-01")
+        self.assertEqual(results[0].classification, "failed")
+        self.assertCountEqual(
+            [(result.task_id, result.classification) for result in results],
+            [
+                ("TASK-01", "failed"),
+                ("TASK-01", "completed"),
+                ("TASK-02", "completed"),
+            ],
+        )
+        retry_result = next(
+            result
+            for result in results
+            if result.task_id == "TASK-01" and result.classification == "completed"
+        )
+        self.assertEqual(retry_result.restart_count, 1)
 
 
 if __name__ == "__main__":

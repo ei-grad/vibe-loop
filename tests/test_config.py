@@ -10,6 +10,8 @@ from vibe_loop.config import (
     AgentResolutionError,
     GENERATED_TASK_PROFILE_CACHE_FILE,
     PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY,
+    SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
+    SUPERVISION_DEFAULT_MAX_RESTARTS,
     detect_agent_clis,
     load_config,
     planning_analytics_report,
@@ -325,6 +327,183 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "agent.forward_stderr"):
                 load_config(repo)
 
+    def test_supervision_config_defaults_match_legacy_retry_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        self.assertEqual(config.supervision.max_restarts, 3)
+        self.assertEqual(
+            config.supervision.max_restarts,
+            SUPERVISION_DEFAULT_MAX_RESTARTS,
+        )
+        self.assertEqual(config.supervision.cooldown_seconds, 30.0)
+        self.assertEqual(
+            config.supervision.cooldown_seconds,
+            SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
+        )
+        self.assertEqual(config.supervision.explicit_keys, frozenset())
+
+    def test_supervision_config_parses_restart_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nmax_restarts = 1\ncooldown_seconds = 0.25\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.supervision.max_restarts, 1)
+        self.assertEqual(config.supervision.cooldown_seconds, 0.25)
+        self.assertEqual(
+            config.supervision.to_json()["explicit_keys"],
+            ["cooldown_seconds", "max_restarts"],
+        )
+
+    def test_supervision_config_rejects_invalid_values(self) -> None:
+        cases = [
+            ("max_restarts = -1\n", "supervision.max_restarts"),
+            ('cooldown_seconds = "soon"\n', "supervision.cooldown_seconds"),
+            ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
+            ("unsupported = true\n", "unsupported"),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[supervision]\n" + toml,
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, expected):
+                        load_config(repo)
+
+    def test_lock_config_defaults_to_directory_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        self.assertEqual(config.locks.type, "directory")
+        self.assertFalse(config.locks.command_backend)
+        self.assertIsNone(config.locks.lease_seconds)
+        self.assertEqual(config.locks.explicit_keys, frozenset())
+
+    def test_lock_config_parses_lease_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[locks]\nlease_seconds = 30\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.locks.lease_seconds, 30)
+        self.assertEqual(config.locks.to_json()["lease_seconds"], 30)
+
+    def test_lock_config_parses_command_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[locks]\n"
+                'type = "command"\n'
+                'acquire_command = "locks acquire"\n'
+                'release_command = "locks release"\n'
+                'status_command = "locks status"\n'
+                'list_command = "locks list"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertTrue(config.locks.command_backend)
+        self.assertEqual(config.locks.acquire_command, "locks acquire")
+        self.assertEqual(config.locks.release_command, "locks release")
+        self.assertEqual(config.locks.status_command, "locks status")
+        self.assertEqual(config.locks.list_command, "locks list")
+        self.assertEqual(
+            config.locks.to_json()["explicit_keys"],
+            [
+                "acquire_command",
+                "list_command",
+                "release_command",
+                "status_command",
+                "type",
+            ],
+        )
+
+    def test_lock_config_rejects_invalid_command_backend(self) -> None:
+        cases = [
+            ('type = "sqlite"\n', "locks.type"),
+            ("lease_seconds = 0\n", "locks.lease_seconds"),
+            ('lease_seconds = "soon"\n', "locks.lease_seconds"),
+            (
+                'type = "command"\n'
+                'acquire_command = "locks acquire"\n'
+                'release_command = "locks release"\n',
+                "locks.list_command",
+            ),
+            ('acquire_command = "locks acquire"\n', "locks.type"),
+            ('type = "directory"\nunknown = true\n', "unsupported"),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[locks]\n" + toml,
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, expected):
+                        load_config(repo)
+
+    def test_specs_config_parses_execution_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[specs]\n"
+                "require_approved = true\n"
+                "require_current_fingerprints = true\n"
+                "require_requirement_coverage = true\n"
+                "require_completion_evidence = true\n"
+                'approved_states = ["approved", "accepted"]\n'
+                'override_commands = ["make specs-override"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertTrue(config.specs.enforces_execution)
+        self.assertTrue(config.specs.require_approved)
+        self.assertTrue(config.specs.require_current_fingerprints)
+        self.assertTrue(config.specs.require_requirement_coverage)
+        self.assertTrue(config.specs.require_completion_evidence)
+        self.assertEqual(config.specs.approved_states, ("approved", "accepted"))
+        self.assertEqual(config.specs.override_commands, ("make specs-override",))
+        self.assertEqual(
+            config.specs.to_json()["explicit_keys"],
+            [
+                "approved_states",
+                "override_commands",
+                "require_approved",
+                "require_completion_evidence",
+                "require_current_fingerprints",
+                "require_requirement_coverage",
+            ],
+        )
+
+    def test_specs_config_rejects_invalid_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[specs]\nrequire_approved = "yes"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "specs.require_approved"):
+                load_config(repo)
+
     def test_task_source_plan_paths_can_be_configured(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -455,6 +634,9 @@ class ConfigTests(unittest.TestCase):
             {"type": "command"},
             {"parser": {"list": "tracker list --json"}},
             {"task_source": {"probe": "tracker show {task_id} --json"}},
+            {"locks": {"type": "command"}},
+            {"lock_backend": {"acquire_command": "lock acquire"}},
+            {"profile": {"status_command": "lock status"}},
         ]
         for profile in profiles:
             with self.subTest(profile=profile):

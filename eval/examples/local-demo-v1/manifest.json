@@ -34,6 +34,31 @@
       "primary_coverage": ["main-integration lock", "final main verification"]
     },
     {
+      "case_id": "workspace-duplicate-worktree",
+      "positive": true,
+      "primary_coverage": ["workspace ownership", "duplicate branch worktrees"]
+    },
+    {
+      "case_id": "workspace-missing-worktree",
+      "positive": true,
+      "primary_coverage": ["workspace ownership", "missing claimed worktree"]
+    },
+    {
+      "case_id": "workspace-merged-branch",
+      "positive": true,
+      "primary_coverage": ["workspace ownership", "already merged worker branch"]
+    },
+    {
+      "case_id": "workspace-foreign-dirty",
+      "positive": true,
+      "primary_coverage": ["workspace ownership", "foreign dirty worktree preservation"]
+    },
+    {
+      "case_id": "integration-lock-unavailable",
+      "positive": true,
+      "primary_coverage": ["main-integration lock", "blocked live holder"]
+    },
+    {
       "case_id": "negative-trigger-set",
       "positive": false,
       "primary_coverage": ["negative skill triggers", "no workflow activation"]

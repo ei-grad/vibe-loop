@@ -43,11 +43,21 @@ For each coherent work piece:
 
 1. Start a separate branch/worktree from current `main`; do not implement slices
    directly on `main`.
-2. Never leave uncommitted changes at rest. Commit before switching tasks,
+2. When an external supervisor provides advisory workspace ownership, record the
+   claimed branch and worktree immediately after creating or choosing the
+   workspace and before implementation edits. Treat ownership metadata as
+   diagnostic coordination state only; it does not authorize automatic cleanup,
+   branch deletion, resets, lock stealing, or central merge-queue behavior.
+3. Never leave uncommitted changes at rest. Commit before switching tasks,
    review, merge, blocker reports, or moving worktrees; use WIP/checkpoint
    commits when needed.
-3. Verify and independently review the slice.
-4. Merge back to `main` with fast-forward-only integration, then remove the
+4. Verify and independently review the slice.
+5. When an external supervisor provides an advisory integration lock, use its
+   wait/timeout path for the final refresh, verification, fast-forward merge,
+   and immediate `main` verification section. If the lock is unavailable or
+   reports unsafe workspace state, park the slice with the precise blocker
+   instead of entering integration.
+6. Merge back to `main` with fast-forward-only integration, then remove the
    merged worktree and delete the slice branch.
 
 If `main` advanced after a slice passed review:

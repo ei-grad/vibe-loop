@@ -98,6 +98,25 @@ PLANNING_ANALYTICS_DEFAULT_OUTPUTS = {
 }
 PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES = ("diagnostic", "disabled")
 PLANNING_ANALYTICS_DURATION_MODEL_NAMES = ("robust-duration-baseline-v1",)
+SUPERVISION_DEFAULT_MAX_RESTARTS = 3
+SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
+SUPERVISION_CONFIG_KEYS = frozenset({"max_restarts", "cooldown_seconds"})
+LOCK_BACKEND_TYPES = ("directory", "command")
+LOCKS_COMMAND_KEYS = frozenset(
+    {"acquire_command", "release_command", "status_command", "list_command"}
+)
+LOCKS_CONFIG_KEYS = frozenset({"type", "lease_seconds"}) | LOCKS_COMMAND_KEYS
+SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
+SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
+    {
+        "require_approved",
+        "require_current_fingerprints",
+        "require_requirement_coverage",
+        "require_completion_evidence",
+        "approved_states",
+        "override_commands",
+    }
+)
 PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL = {
     "name": "robust-duration-baseline-v1",
     "group_min_sample_count": 2,
@@ -125,6 +144,12 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "next",
         "probe",
         "selection_command",
+        "locks",
+        "lock_backend",
+        "acquire_command",
+        "release_command",
+        "status_command",
+        "list_command",
     }
 )
 
@@ -345,6 +370,53 @@ class CompletionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SupervisionConfig:
+    max_restarts: int = SUPERVISION_DEFAULT_MAX_RESTARTS
+    cooldown_seconds: float = SUPERVISION_DEFAULT_COOLDOWN_SECONDS
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "max_restarts": self.max_restarts,
+            "cooldown_seconds": self.cooldown_seconds,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class LockConfig:
+    type: str = "directory"
+    acquire_command: str | None = None
+    release_command: str | None = None
+    status_command: str | None = None
+    list_command: str | None = None
+    lease_seconds: int | None = None
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def command_backend(self) -> bool:
+        return self.type == "command"
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "type": self.type,
+            "command_backend": self.command_backend,
+            "acquire_command": self.acquire_command,
+            "release_command": self.release_command,
+            "status_command": self.status_command,
+            "list_command": self.list_command,
+            "lease_seconds": self.lease_seconds,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class PlanningAnalyticsOutputs:
     timeline_json: str | None = None
     gantt_html: str | None = None
@@ -409,6 +481,41 @@ class PlanningAnalyticsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class SpecDiagnosticsConfig:
+    require_approved: bool = False
+    require_current_fingerprints: bool = False
+    require_requirement_coverage: bool = False
+    require_completion_evidence: bool = False
+    approved_states: tuple[str, ...] = SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES
+    override_commands: tuple[str, ...] = ()
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def enforces_execution(self) -> bool:
+        return (
+            self.require_approved
+            or self.require_current_fingerprints
+            or self.require_requirement_coverage
+            or self.require_completion_evidence
+        )
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "require_approved": self.require_approved,
+            "require_current_fingerprints": self.require_current_fingerprints,
+            "require_requirement_coverage": self.require_requirement_coverage,
+            "require_completion_evidence": self.require_completion_evidence,
+            "approved_states": list(self.approved_states),
+            "override_commands": list(self.override_commands),
+            "explicit_keys": sorted(self.explicit_keys),
+            "enforces_execution": self.enforces_execution,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class VibeConfig:
     repo: Path
     main_branch: str = "main"
@@ -416,8 +523,15 @@ class VibeConfig:
     agent: AgentConfig = dataclasses.field(default_factory=AgentConfig)
     task_source: TaskSourceConfig = dataclasses.field(default_factory=TaskSourceConfig)
     completion: CompletionConfig = dataclasses.field(default_factory=CompletionConfig)
+    supervision: SupervisionConfig = dataclasses.field(
+        default_factory=SupervisionConfig
+    )
+    locks: LockConfig = dataclasses.field(default_factory=LockConfig)
     planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
         default_factory=PlanningAnalyticsConfig
+    )
+    specs: SpecDiagnosticsConfig = dataclasses.field(
+        default_factory=SpecDiagnosticsConfig
     )
 
     @property
@@ -439,7 +553,10 @@ def load_config(repo: Path) -> VibeConfig:
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
     agent = parse_agent(data.get("agent", {}))
+    supervision = parse_supervision(data.get("supervision", {}))
+    locks = parse_locks(data.get("locks", {}))
     planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
+    specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
         repo=repo,
         main_branch=str(data.get("main_branch") or "main"),
@@ -447,7 +564,10 @@ def load_config(repo: Path) -> VibeConfig:
         agent=agent,
         task_source=task_source,
         completion=completion,
+        supervision=supervision,
+        locks=locks,
         planning_analytics=planning_analytics,
+        specs=specs,
     )
 
 
@@ -856,7 +976,7 @@ def reject_generated_command_adapters(profile: object) -> None:
         fields = ", ".join(forbidden)
         raise ValueError(
             "generated task-source profiles cannot define executable command "
-            f"adapters: {fields}"
+            f"adapters or lock backends: {fields}"
         )
 
 
@@ -901,6 +1021,69 @@ def default_completion_commands(repo: Path) -> tuple[str, ...]:
             "uv run python scripts/generate_gantt.py --coverage-check",
         )
     return ()
+
+
+def parse_supervision(data: object) -> SupervisionConfig:
+    table = expect_table(data, "supervision")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - SUPERVISION_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            f"supervision contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    return SupervisionConfig(
+        max_restarts=nonnegative_int(
+            table.get("max_restarts"),
+            SUPERVISION_DEFAULT_MAX_RESTARTS,
+            "supervision.max_restarts",
+        ),
+        cooldown_seconds=nonnegative_float(
+            table.get("cooldown_seconds"),
+            SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
+            "supervision.cooldown_seconds",
+        ),
+        explicit_keys=explicit_keys,
+    )
+
+
+def parse_locks(data: object) -> LockConfig:
+    table = expect_table(data, "locks")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - LOCKS_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"locks contains unsupported keys: {', '.join(unknown_keys)}")
+    lock_type = optional_nonempty_string(table.get("type")) or "directory"
+    if lock_type not in LOCK_BACKEND_TYPES:
+        allowed = ", ".join(LOCK_BACKEND_TYPES)
+        raise ValueError(f"locks.type must be one of: {allowed}")
+    commands = {
+        key: optional_nonempty_string(table.get(key)) for key in LOCKS_COMMAND_KEYS
+    }
+    configured_command_keys = {
+        key for key, value in commands.items() if value is not None
+    }
+    if lock_type == "directory" and configured_command_keys:
+        keys = ", ".join(sorted(configured_command_keys))
+        raise ValueError(
+            f'locks command adapter keys require locks.type = "command": {keys}'
+        )
+    if lock_type == "command":
+        missing = sorted(key for key, value in commands.items() if value is None)
+        if missing:
+            keys = ", ".join(f"locks.{key}" for key in missing)
+            raise ValueError(f"locks.type command requires {keys}")
+    return LockConfig(
+        type=lock_type,
+        acquire_command=commands["acquire_command"],
+        release_command=commands["release_command"],
+        status_command=commands["status_command"],
+        list_command=commands["list_command"],
+        lease_seconds=optional_positive_int(
+            table.get("lease_seconds"),
+            "locks.lease_seconds",
+        ),
+        explicit_keys=explicit_keys,
+    )
 
 
 def parse_planning_analytics(data: object) -> PlanningAnalyticsConfig:
@@ -1019,6 +1202,46 @@ def parse_planning_analytics_outputs(data: object) -> PlanningAnalyticsOutputs:
     )
 
 
+def parse_specs(data: object) -> SpecDiagnosticsConfig:
+    table = expect_table(data, "specs")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - SPEC_DIAGNOSTICS_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"specs contains unsupported keys: {', '.join(unknown_keys)}")
+    return SpecDiagnosticsConfig(
+        require_approved=optional_bool(
+            table.get("require_approved"), False, "specs.require_approved"
+        ),
+        require_current_fingerprints=optional_bool(
+            table.get("require_current_fingerprints"),
+            False,
+            "specs.require_current_fingerprints",
+        ),
+        require_requirement_coverage=optional_bool(
+            table.get("require_requirement_coverage"),
+            False,
+            "specs.require_requirement_coverage",
+        ),
+        require_completion_evidence=optional_bool(
+            table.get("require_completion_evidence"),
+            False,
+            "specs.require_completion_evidence",
+        ),
+        approved_states=nonempty_string_tuple(
+            table.get("approved_states"),
+            SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES,
+            "specs.approved_states",
+        ),
+        override_commands=nonempty_string_tuple(
+            table.get("override_commands"),
+            (),
+            "specs.override_commands",
+            allow_empty=True,
+        ),
+        explicit_keys=explicit_keys,
+    )
+
+
 def planning_analytics_report(
     config: VibeConfig,
     task_source_runtime: dict[str, object] | None = None,
@@ -1062,7 +1285,8 @@ def planning_analytics_report(
                 "task source completion state",
                 "worker reports with explicit task ids",
                 "project worklog adapter records",
-                "explicit commit refs or Plan-Item trailers",
+                "explicit commit refs, Plan-Item trailers, or Requirement trailers",
+                "worker report metadata requirement_ids and plan_items",
             ],
             "diagnostic_only": [
                 "subject matching",
@@ -1135,8 +1359,35 @@ def optional_bool(value: object, default: bool, name: str) -> bool:
     raise ValueError(f"{name} must be a boolean")
 
 
+def nonempty_string_tuple(
+    value: object,
+    default: tuple[str, ...],
+    name: str,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item.strip() for item in value
+    ):
+        raise ValueError(f"{name} must be an array of non-empty strings")
+    if not value and not allow_empty:
+        raise ValueError(f"{name} must not be empty")
+    return tuple(item.strip() for item in value)
+
+
 def positive_int(value: object, default: int, name: str) -> int:
     parsed = optional_int(value, default, name)
+    if parsed < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return parsed
+
+
+def optional_positive_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    parsed = optional_int(value, 0, name)
     if parsed < 1:
         raise ValueError(f"{name} must be a positive integer")
     return parsed
@@ -1146,6 +1397,20 @@ def nonnegative_int(value: object, default: int, name: str) -> int:
     parsed = optional_int(value, default, name)
     if parsed < 0:
         raise ValueError(f"{name} must be a non-negative integer")
+    return parsed
+
+
+def nonnegative_float(value: object, default: float, name: str) -> float:
+    if value is None:
+        parsed = default
+    elif isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    else:
+        parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{name} must be finite")
+    if parsed < 0.0:
+        raise ValueError(f"{name} must be a non-negative number")
     return parsed
 
 

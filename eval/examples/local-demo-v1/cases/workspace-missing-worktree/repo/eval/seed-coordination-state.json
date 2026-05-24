@@ -1,0 +1,8 @@
+{
+  "workspace": {
+    "task_id": "MISS-01",
+    "run_id": "eval-run-miss-01",
+    "branch": "vibe-loop/MISS-01",
+    "scenario": "missing_claimed_worktree"
+  }
+}

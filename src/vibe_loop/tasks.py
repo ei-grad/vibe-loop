@@ -108,6 +108,7 @@ ROOT_PATH_FILENAMES = {
 MULTILINE_LABEL_TERMS = (
     "acceptance",
     "criteria",
+    "conflict",
     "description",
     "design",
     "detail",
@@ -486,6 +487,11 @@ def spec_tool_preset(source_type: str) -> SpecToolPreset:
                         "pattern": SPEC_TOOL_DEPENDENCY_PATTERN,
                         "none_values": ["none", "-"],
                     },
+                    "resources": {
+                        "label": "Conflict Resources",
+                        "none_values": ["none", "-"],
+                    },
+                    "paths": {"label": "Conflict Paths", "none_values": ["none", "-"]},
                     "acceptance": {"label": "Acceptance"},
                     "evidence": {"label": "Evidence"},
                 },
@@ -522,6 +528,11 @@ def spec_tool_preset(source_type: str) -> SpecToolPreset:
                         "pattern": SPEC_TOOL_DEPENDENCY_PATTERN,
                         "none_values": ["none", "-"],
                     },
+                    "resources": {
+                        "label": "Conflict Resources",
+                        "none_values": ["none", "-"],
+                    },
+                    "paths": {"label": "Conflict Paths", "none_values": ["none", "-"]},
                     "acceptance": {"label": "Acceptance"},
                     "evidence": {"label": "Evidence"},
                 },
@@ -558,6 +569,11 @@ def spec_tool_preset(source_type: str) -> SpecToolPreset:
                         "pattern": SPEC_TOOL_DEPENDENCY_PATTERN,
                         "none_values": ["none", "-"],
                     },
+                    "resources": {
+                        "label": "Conflict Resources",
+                        "none_values": ["none", "-"],
+                    },
+                    "paths": {"label": "Conflict Paths", "none_values": ["none", "-"]},
                     "acceptance": {"label": "Acceptance"},
                     "evidence": {"label": "Evidence"},
                 },

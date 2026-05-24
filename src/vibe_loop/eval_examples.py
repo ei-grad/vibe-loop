@@ -21,6 +21,12 @@ from vibe_loop.config import (
     GENERATED_TASK_PROFILE_SCHEMA_VERSION,
     GENERATED_TASK_PROFILE_CACHE_FILE,
 )
+from vibe_loop.locks import (
+    MAIN_INTEGRATION_LOCK_NAME,
+    MAIN_INTEGRATION_LOCK_RECORD_TYPE,
+    MAIN_INTEGRATION_LOCK_SCHEMA_VERSION,
+)
+from vibe_loop.runs import WORKSPACE_CLAIM_RECORD_TYPE, WORKSPACE_CLAIMED_EVENT_TYPE
 
 
 EXAMPLE_SUITE_ID = "local-demo-v1"
@@ -139,9 +145,10 @@ def materialize_eval_example(
             reference_patch.unlink()
     copy_case_metadata(case, target)
     seed_generated_task_profile_cache(target)
-    refresh_active_lock_metadata(target)
     initialize_git_checkout(target)
     apply_seed_user_state(target)
+    apply_seed_coordination_state(target)
+    refresh_active_lock_metadata(target)
     return target
 
 
@@ -289,6 +296,174 @@ def apply_seed_user_state(target: Path) -> None:
             destination.write_text(content, encoding="utf-8")
 
 
+def apply_seed_coordination_state(target: Path) -> None:
+    seed_path = target / "eval" / "seed-coordination-state.json"
+    if not seed_path.is_file():
+        return
+    with seed_path.open(encoding="utf-8") as handle:
+        seed = json.load(handle)
+    workspace = seed.get("workspace")
+    if isinstance(workspace, dict):
+        apply_seed_workspace_state(target, workspace)
+    integration_lock = seed.get("main_integration_lock")
+    if isinstance(integration_lock, dict):
+        seed_main_integration_lock(target, integration_lock)
+
+
+def apply_seed_workspace_state(target: Path, seed: dict[str, object]) -> None:
+    task_id = required_seed_string(seed, "task_id")
+    run_id = required_seed_string(seed, "run_id")
+    branch = required_seed_string(seed, "branch")
+    scenario = required_seed_string(seed, "scenario")
+    base_commit = run_git_output(target, "rev-parse", "--verify", "HEAD")
+    workspaces_root = workspace_seed_root(target)
+    workspaces_root.mkdir(parents=True, exist_ok=True)
+    write_workspace_seed_marker(workspaces_root)
+    primary = workspaces_root / safe_path_name(task_id)
+    claimed_worktree = primary
+
+    if scenario == "missing_claimed_worktree":
+        run_git(target, "branch", branch, "HEAD")
+        claimed_worktree = workspaces_root / f"{safe_path_name(task_id)}-missing"
+    elif scenario == "duplicate_branch_worktrees":
+        run_git(target, "worktree", "add", "-b", branch, str(primary), "HEAD")
+        duplicate = workspaces_root / f"{safe_path_name(task_id)}-duplicate"
+        run_git(target, "worktree", "add", "--force", str(duplicate), branch)
+    elif scenario == "branch_already_merged":
+        run_git(target, "worktree", "add", "-b", branch, str(primary), "HEAD")
+        write_seeded_file(primary, "docs/merged-worker-note.txt", "merged\n")
+        run_git(primary, "add", "docs/merged-worker-note.txt")
+        run_git(primary, "commit", "-m", "seed merged worker result")
+        run_git(target, "merge", "--ff-only", branch)
+    elif scenario == "foreign_dirty_claimed_worktree":
+        run_git(target, "worktree", "add", "-b", branch, str(primary), "HEAD")
+        write_seeded_file(primary, "docs/foreign-notes.md", "foreign draft\n")
+    else:
+        raise ValueError(f"unsupported seed workspace scenario: {scenario}")
+
+    update_workspace_claim(
+        target,
+        task_id=task_id,
+        run_id=run_id,
+        branch=branch,
+        worktree=claimed_worktree,
+        base_commit=base_commit,
+    )
+
+
+def write_seeded_file(worktree: Path, relative_path: str, content: str) -> None:
+    destination = worktree / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(content, encoding="utf-8")
+
+
+def workspace_seed_root(target: Path) -> Path:
+    return target.parent / f"{target.name}-workspaces"
+
+
+def write_workspace_seed_marker(workspaces_root: Path) -> None:
+    write_json_file(
+        workspaces_root / ".vibe-loop-eval-workspaces.json",
+        {"schema_version": 1, "suite_id": EXAMPLE_SUITE_ID},
+    )
+
+
+def is_workspace_seed_root(path: Path) -> bool:
+    marker = path / ".vibe-loop-eval-workspaces.json"
+    if not marker.is_file():
+        return False
+    try:
+        with marker.open(encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return payload.get("suite_id") == EXAMPLE_SUITE_ID
+
+
+def update_workspace_claim(
+    target: Path,
+    *,
+    task_id: str,
+    run_id: str,
+    branch: str,
+    worktree: Path,
+    base_commit: str,
+) -> None:
+    lock_path = target / ".vibe-loop" / "locks" / f"{task_id}.lock" / "lock.json"
+    metadata = read_json_file(lock_path)
+    head_commit = ""
+    current_branch = ""
+    dirty_summary: tuple[str, ...] = ()
+    if worktree.exists():
+        head_commit = run_git_output(worktree, "rev-parse", "--verify", "HEAD")
+        current_branch = run_git_output(worktree, "branch", "--show-current")
+        status = run_git_output(worktree, "status", "--short")
+        dirty_summary = tuple(line for line in status.splitlines() if line)
+    claimed_at = utc_now()
+    metadata["workspace"] = {
+        "schema_version": 1,
+        "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+        "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+        "occurred_at": claimed_at,
+        "task_id": task_id,
+        "run_id": run_id,
+        "branch": branch,
+        "worktree": str(worktree),
+        "base_commit": base_commit,
+        "head_commit": head_commit,
+        "current_branch": current_branch,
+        "dirty": bool(dirty_summary),
+        "dirty_summary": list(dirty_summary),
+        "claimed_at": claimed_at,
+    }
+    write_json_file(lock_path, metadata)
+
+
+def seed_main_integration_lock(target: Path, seed: dict[str, object]) -> None:
+    lock_path = target / ".vibe-loop" / "locks" / f"{MAIN_INTEGRATION_LOCK_NAME}.lock"
+    lock_path.mkdir(parents=True, exist_ok=True)
+    metadata = {
+        "schema_version": MAIN_INTEGRATION_LOCK_SCHEMA_VERSION,
+        "record_type": MAIN_INTEGRATION_LOCK_RECORD_TYPE,
+        "task_id": MAIN_INTEGRATION_LOCK_NAME,
+        "resource": MAIN_INTEGRATION_LOCK_NAME,
+        "owner_task_id": required_seed_string(seed, "owner_task_id"),
+        "run_id": required_seed_string(seed, "run_id"),
+        "pid": os.getpid(),
+        "pid_source": "fixture-live-holder",
+        "host": socket.gethostname(),
+        "started_at": utc_now(),
+    }
+    write_json_file(lock_path / "lock.json", metadata)
+
+
+def required_seed_string(seed: dict[str, object], key: str) -> str:
+    value = seed.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"seed coordination field is required: {key}")
+    return value
+
+
+def safe_path_name(value: str) -> str:
+    return "".join(char if char.isalnum() or char in "-._" else "_" for char in value)
+
+
+def read_json_file(path: Path) -> dict[str, object]:
+    with path.open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"JSON object expected: {path}")
+    return payload
+
+
+def write_json_file(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def run_git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args],
@@ -301,6 +476,21 @@ def run_git(repo: Path, *args: str) -> None:
         },
         text=True,
     )
+
+
+def run_git_output(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "GIT_CONFIG_NOSYSTEM": "1",
+        },
+        text=True,
+    )
+    return completed.stdout.strip()
 
 
 def utc_now() -> str:
@@ -316,6 +506,7 @@ def teardown_eval_example(path: Path) -> None:
     target = Path(path)
     if not is_materialized_eval_example(target):
         raise ValueError(f"refusing to remove non-eval-example path: {target}")
+    workspaces_root = workspace_seed_root(target)
     if sys.version_info >= (3, 12):
         shutil.rmtree(target, onexc=_rmtree_make_writable)
     else:
@@ -323,6 +514,14 @@ def teardown_eval_example(path: Path) -> None:
             target,
             onerror=lambda f, p, ei: _rmtree_make_writable(f, p, ei[1]),
         )
+    if workspaces_root.is_dir() and is_workspace_seed_root(workspaces_root):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(workspaces_root, onexc=_rmtree_make_writable)
+        else:
+            shutil.rmtree(
+                workspaces_root,
+                onerror=lambda f, p, ei: _rmtree_make_writable(f, p, ei[1]),
+            )
 
 
 def is_materialized_eval_example(path: Path) -> bool:

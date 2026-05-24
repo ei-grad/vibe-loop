@@ -651,6 +651,13 @@ def check_artifact_json_fields(
             diagnostics.append(f"artifact role is not a JSON object: {role}")
             continue
         actual = nested_value(payload, field)
+        contains = item.get("contains")
+        if isinstance(contains, str):
+            if contains not in str(actual):
+                diagnostics.append(
+                    f"{role}.{field} is {actual!r}, expected to contain {contains!r}"
+                )
+            continue
         if actual != expected:
             diagnostics.append(f"{role}.{field} is {actual!r}, expected {expected!r}")
     return diagnostics
