@@ -5784,7 +5784,10 @@ class CliTests(unittest.TestCase):
             def dirty_workspace_and_release(delay: float) -> None:
                 self.assertEqual(delay, 0.1)
                 (repo / "notes.txt").write_text("not committed\n", encoding="utf-8")
-                shutil.rmtree(repo / ".vibe-loop" / "locks" / "main-integration.lock")
+                LockManager(repo / ".vibe-loop" / "locks").release_main_integration(
+                    task_id="TASK-01",
+                    run_id="run-holder",
+                )
 
             with patch(
                 "vibe_loop.cli.time.sleep",

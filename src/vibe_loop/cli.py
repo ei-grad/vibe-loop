@@ -2104,7 +2104,7 @@ def acquire_main_integration_command(
             )
             return 2
         try:
-            manager.acquire_main_integration(
+            integration_lock = manager.acquire_main_integration(
                 task_id=task_id,
                 run_id=run_id,
                 metadata=owner_metadata,
@@ -2142,8 +2142,8 @@ def acquire_main_integration_command(
         )
         if post_acquire_preflight is not None:
             try:
-                manager.release_main_integration(task_id=task_id, run_id=run_id)
-            except (LockOwnerMismatch, LockFencingMismatch, LockBackendError):
+                manager.release(integration_lock)
+            except (LockFencingMismatch, LockBackendError):
                 pass
             record_workspace_preflight_mismatch(
                 run_store,
