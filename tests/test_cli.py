@@ -5731,7 +5731,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(waiter["status"]["owner_task_id"], "TASK-01")
 
     def test_main_integration_acquire_rechecks_workspace_after_wait(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            patch.dict(
+                os.environ,
+                {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1"},
+            ),
+            tempfile.TemporaryDirectory() as directory,
+        ):
             repo = Path(directory) / "repo"
             init_planning_repo(repo, PLAN)
             base_commit = subprocess.run(
@@ -5784,7 +5790,10 @@ class CliTests(unittest.TestCase):
             def dirty_workspace_and_release(delay: float) -> None:
                 self.assertEqual(delay, 0.1)
                 (repo / "notes.txt").write_text("not committed\n", encoding="utf-8")
-                shutil.rmtree(repo / ".vibe-loop" / "locks" / "main-integration.lock")
+                LockManager(repo / ".vibe-loop" / "locks").release_main_integration(
+                    task_id="TASK-01",
+                    run_id="run-holder",
+                )
 
             with patch(
                 "vibe_loop.cli.time.sleep",
@@ -6857,7 +6866,7 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
     repo.mkdir()
     (repo / "PLAN.md").write_text(plan_text, encoding="utf-8")
     subprocess.run(
-        ["git", "init"],
+        ["git", "init", "--initial-branch", "main"],
         cwd=repo,
         check=True,
         stdout=subprocess.PIPE,

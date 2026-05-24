@@ -7,7 +7,7 @@ import shlex
 import shutil
 import socket
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -427,6 +427,7 @@ class WorkspaceGitContext:
     main_branch: str
     worktrees: tuple[GitWorktreeEntry, ...] = ()
     worktree_list_error: str = ""
+    ignored_dirty_paths: tuple[Path, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -582,6 +583,7 @@ def claim_worker_workspace(
     repo: Path,
     base_commit: str = "",
     fencing_token: str | None = None,
+    ignored_dirty_paths: Iterable[Path] = (),
 ) -> WorkspaceClaim:
     if not branch:
         raise WorkspaceClaimError(
@@ -604,6 +606,7 @@ def claim_worker_workspace(
         or optional_string(lock.metadata.get("base_main"))
         or "",
         started_at=optional_string(lock.metadata.get("started_at")) or "",
+        ignored_dirty_paths=ignored_dirty_paths,
     )
     updated_metadata = dict(lock.metadata)
     updated_metadata["workspace"] = claim.to_json()
@@ -677,6 +680,7 @@ def inspect_workspace_claim(
     worktree: Path,
     base_commit: str,
     started_at: str = "",
+    ignored_dirty_paths: Iterable[Path] = (),
 ) -> WorkspaceClaim:
     if not worktree.exists() or not worktree.is_dir():
         raise WorkspaceClaimError(
@@ -696,7 +700,7 @@ def inspect_workspace_claim(
             },
         )
     head_commit = git_text(worktree, "rev-parse", "--verify", "HEAD")
-    status_lines = git_lines(worktree, "status", "--short")
+    status_lines = git_status_lines(worktree, ignored_dirty_paths=ignored_dirty_paths)
     return WorkspaceClaim(
         task_id=task_id,
         run_id=run_id,
@@ -737,6 +741,43 @@ def git_lines(repo: Path, *args: str) -> list[str]:
     return [line for line in text.splitlines() if line]
 
 
+def git_status_lines(
+    repo: Path,
+    *,
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> list[str]:
+    return git_lines(repo, *git_status_args(repo, ignored_dirty_paths))
+
+
+def git_status_args(repo: Path, ignored_dirty_paths: Iterable[Path]) -> tuple[str, ...]:
+    excludes = git_status_exclude_pathspecs(repo, ignored_dirty_paths)
+    if not excludes:
+        return ("status", "--short")
+    return ("status", "--short", "--", ".", *excludes)
+
+
+def git_status_exclude_pathspecs(
+    repo: Path,
+    ignored_dirty_paths: Iterable[Path],
+) -> tuple[str, ...]:
+    repo = repo.resolve()
+    excludes: list[str] = []
+    seen: set[str] = set()
+    for path in (repo / ".vibe-loop", *ignored_dirty_paths):
+        try:
+            relative = path.resolve().relative_to(repo)
+        except ValueError:
+            continue
+        if not relative.parts:
+            continue
+        git_path = relative.as_posix()
+        if git_path in seen:
+            continue
+        seen.add(git_path)
+        excludes.append(f":(exclude){git_path}")
+    return tuple(excludes)
+
+
 def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -760,6 +801,7 @@ def build_workspace_git_context(
     repo: Path,
     *,
     main_branch: str = "main",
+    ignored_dirty_paths: Iterable[Path] = (),
 ) -> WorkspaceGitContext:
     result = run_git_result(repo, "worktree", "list", "--porcelain")
     if result is None:
@@ -767,17 +809,20 @@ def build_workspace_git_context(
             repo=repo,
             main_branch=main_branch,
             worktree_list_error="git could not be executed",
+            ignored_dirty_paths=tuple(ignored_dirty_paths),
         )
     if result.returncode != 0:
         return WorkspaceGitContext(
             repo=repo,
             main_branch=main_branch,
             worktree_list_error=git_error_text(result),
+            ignored_dirty_paths=tuple(ignored_dirty_paths),
         )
     return WorkspaceGitContext(
         repo=repo,
         main_branch=main_branch,
         worktrees=parse_git_worktree_list(result.stdout),
+        ignored_dirty_paths=tuple(ignored_dirty_paths),
     )
 
 
@@ -877,8 +922,7 @@ def inspect_workspace_git_state(
         )
         status_text, status_error = git_optional_text(
             claim.worktree,
-            "status",
-            "--short",
+            *git_status_args(claim.worktree, context.ignored_dirty_paths),
         )
         git_state_error = branch_error or head_error or status_error
         if git_state_error:
@@ -1171,13 +1215,18 @@ def build_worker_views(
     main_branch: str = "main",
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
+    ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
     process_checker = process_exists if process_exists is not None else pid_exists
     records = run_store.read_records()
     result_by_run_id = latest_worker_status_by_run_id(records)
     workspace_context = (
-        build_workspace_git_context(repo, main_branch=main_branch)
+        build_workspace_git_context(
+            repo,
+            main_branch=main_branch,
+            ignored_dirty_paths=ignored_dirty_paths,
+        )
         if repo is not None
         else None
     )
@@ -1433,6 +1482,7 @@ def collect_stale_locks(
     main_branch: str = "main",
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
+    ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[StaleLock]:
     stale: list[StaleLock] = []
     for view in build_worker_views(
@@ -1442,6 +1492,7 @@ def collect_stale_locks(
         main_branch=main_branch,
         current_host=current_host,
         process_exists=process_exists,
+        ignored_dirty_paths=ignored_dirty_paths,
     ):
         if view.state != "stale":
             continue

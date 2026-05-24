@@ -684,6 +684,7 @@ def dispatch(args: argparse.Namespace) -> int:
             runner.run_store,
             repo=config.repo,
             main_branch=config.main_branch,
+            ignored_dirty_paths=(config.state_path,),
         )
         if args.json:
             payloads = []
@@ -751,12 +752,14 @@ def dispatch(args: argparse.Namespace) -> int:
             runner.run_store,
             repo=config.repo,
             main_branch=config.main_branch,
+            ignored_dirty_paths=(config.state_path,),
         )
         stale = collect_stale_locks(
             runner.lock_manager,
             runner.run_store,
             repo=config.repo,
             main_branch=config.main_branch,
+            ignored_dirty_paths=(config.state_path,),
         )
         stale_report = {
             "count": len(stale),
@@ -1200,6 +1203,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 repo=config.repo,
                 base_commit=args.base_commit,
                 fencing_token=fencing_token_from_args(args),
+                ignored_dirty_paths=(config.state_path,),
             )
         except WorkspaceClaimError as exc:
             run_store.append_lifecycle_event(
@@ -1775,6 +1779,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
         runner.run_store,
         repo=config.repo,
         main_branch=config.main_branch,
+        ignored_dirty_paths=(config.state_path,),
     )
     if not stale:
         if args.json:
@@ -2104,7 +2109,7 @@ def acquire_main_integration_command(
             )
             return 2
         try:
-            manager.acquire_main_integration(
+            integration_lock = manager.acquire_main_integration(
                 task_id=task_id,
                 run_id=run_id,
                 metadata=owner_metadata,
@@ -2142,8 +2147,8 @@ def acquire_main_integration_command(
         )
         if post_acquire_preflight is not None:
             try:
-                manager.release_main_integration(task_id=task_id, run_id=run_id)
-            except (LockOwnerMismatch, LockFencingMismatch, LockBackendError):
+                manager.release(integration_lock)
+            except (LockFencingMismatch, LockBackendError):
                 pass
             record_workspace_preflight_mismatch(
                 run_store,
@@ -2348,6 +2353,7 @@ def main_integration_workspace_preflight_error(
         run_store,
         repo=config.repo,
         main_branch=config.main_branch,
+        ignored_dirty_paths=(config.state_path,),
     )
     for view in views:
         if view.active.task_id != task_id or view.active.run_id != run_id:
