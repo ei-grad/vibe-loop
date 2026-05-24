@@ -105,8 +105,8 @@ Related implementation IDs: `PAR-09`, `PAR-11`, `EVAL-09`.
 
 `runs.jsonl` should support additional record types beyond `run_result` and
 `worker_report`. New types include lock events (acquired, released, expired),
-workspace events (claimed, mismatch detected), and run state transitions
-(started, classified).
+run start snapshots, observed agent runtime context, workspace events (claimed,
+mismatch detected), and run state transitions (session observed, classified).
 
 Records must be additive — unknown types are ignored on read, consistent with
 the existing invalid JSON line tolerance. Each record carries `schema_version`,
@@ -116,12 +116,27 @@ run share `run_id`; lock records carry `task_id`.
 Events are diagnostic and inspectable, not authoritative for task status. The
 task source remains the authority for task completion state.
 
+`runs.jsonl` must also be able to expose trailer-ready run context for
+repository-owned tools that persist task evidence in git or project worklogs.
+This context should include bounded, non-secret values such as task IDs suitable
+for `Plan-Item`, resolved `Agent-Kind`, `Run-Id`, `started_at`, observed
+`Session-Id`, prompt dialect metadata, and model provider/model ID/reasoning
+effort only when the agent emits those values during startup or they can be
+safely derived from the runtime command/executable. Each value should carry
+provenance. `vibe-loop` publishes this context; repository-specific
+`prepare-commit-msg`, `commit-msg`, or worklog hooks remain outside the
+`vibe-loop` runtime and are responsible for deciding whether and how to mutate
+commits.
+
 Acceptance must cover new record types appended without breaking existing
 readers, unknown type tolerance, correlation by `run_id` and `task_id`, payload
-schema per type, and the rule that lifecycle events do not replace task-source
-authority.
+schema per type, trailer-ready context availability before worker commits when
+possible, session-observed updates when native session IDs appear, redaction of
+raw command configuration, omission of model metadata that cannot be observed or
+safely inferred, `started_at` on run results and emitted run events, and the rule
+that lifecycle events do not replace task-source authority.
 
-Related implementation IDs: `RT-01`, `RT-05`.
+Related implementation IDs: `RT-01`, `RT-05`, `RT-07`.
 
 ## PRD-WRK-010 Run State Machine
 

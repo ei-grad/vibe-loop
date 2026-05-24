@@ -22,10 +22,15 @@ heuristics.
 
 Acceptance must cover task-source `Done` state, structured worker reports,
 optional worklog adapter records, explicit commit references, `Plan-Item:`
-trailers, diagnostic subject/branch matching, raw log exclusion from coverage,
-and warnings that distinguish attempted work from accepted completion evidence.
+trailers, trailer-ready run context emitted through `runs.jsonl`, diagnostic
+subject/branch matching, raw log exclusion from coverage, and warnings that
+distinguish attempted work from accepted completion evidence. Run context that
+has not been persisted to a worker report, commit trailer, task source, or
+worklog remains diagnostic candidate evidence, not authoritative completion
+evidence. Model fields in that context must come from observed agent startup
+output or safely inferred runtime facts, and must be omitted when unavailable.
 
-Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-05`.
+Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-05`, `RT-07`.
 
 ## PRD-ANL-003 Git Metadata Safety
 

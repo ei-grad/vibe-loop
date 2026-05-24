@@ -53,6 +53,13 @@ failure analysis, elapsed time, and linking worker reports to logs. They are not
 a final project completion ledger because they include failed, blocked, and
 unknown results.
 
+Run-start and agent-context records may expose trailer-ready context such as
+task IDs, run IDs, `started_at`, session IDs, agent kind, prompt dialect, and
+model fields observed from startup output or safely inferred from runtime facts.
+Analytics treats that context as diagnostic candidate evidence until project
+history persists it through a worker report, worklog, task-source state, or git
+trailer.
+
 Final evidence belongs in project worklogs, task-source status, explicit commit
 mappings, or commit trailers. Analytics joins attempts and final evidence, but
 warnings must distinguish "the worker tried this" from "the project recorded

@@ -26,7 +26,14 @@ from vibe_loop.generated_discovery import (
     redact_manifest_text,
 )
 from vibe_loop.generated_profiles import resolve_runtime_task_source
-from vibe_loop.runs import RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE, RunStore
+from vibe_loop.runs import (
+    AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
+    RUN_RECORD_TYPE,
+    RUN_STARTED_RECORD_TYPE,
+    RUN_STATE_TRANSITION_RECORD_TYPE,
+    WORKER_REPORT_RECORD_TYPE,
+    RunStore,
+)
 from vibe_loop.tasks import DONE_STATUS, Task, build_task_source
 
 
@@ -309,7 +316,7 @@ def normalize_run_attempts(
         if not run_id or not task_id:
             continue
         record_type = string_value(record.get("record_type")) or RUN_RECORD_TYPE
-        if record_type not in {RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE}:
+        if not run_attempt_record_is_visible(record, record_type):
             continue
         payload: dict[str, object] = {
             "record_index": index,
@@ -319,14 +326,32 @@ def normalize_run_attempts(
             "status": string_value(record.get("status"))
             or string_value(record.get("classification")),
         }
+        if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
+            payload["status"] = string_value(record.get("to_state"))
+        optional_copy(payload, "started_at", record)
         optional_copy(payload, "finished_at", record)
         optional_copy(payload, "reported_at", record)
+        optional_copy(payload, "occurred_at", record)
         optional_copy(payload, "exit_code", record)
         optional_copy(payload, "session_id", record)
         optional_copy(payload, "session_id_source", record)
+        optional_copy(payload, "agent_kind", record)
+        optional_copy(payload, "agent_kind_source", record)
+        optional_copy(payload, "agent_prompt_dialect", record)
+        optional_copy(payload, "agent_prompt_dialect_source", record)
+        optional_copy(payload, "agent_skill_ref_prefix", record)
+        optional_copy(payload, "agent_skill_ref_prefix_source", record)
+        optional_copy(payload, "model_provider", record)
+        optional_copy(payload, "model_provider_source", record)
+        optional_copy(payload, "model_id", record)
+        optional_copy(payload, "model_id_source", record)
+        optional_copy(payload, "reasoning_effort", record)
+        optional_copy(payload, "reasoning_effort_source", record)
         optional_copy(payload, "classification_source", record)
         optional_copy(payload, "start_main", record)
         optional_copy(payload, "end_main", record)
+        optional_copy_mapping(payload, "trailer_context", record)
+        optional_copy_mapping(payload, "trailer_context_sources", record)
         commit = worker_report_commit(record) or string_value(record.get("commit"))
         if commit:
             payload["commit"] = commit
@@ -339,6 +364,23 @@ def normalize_run_attempts(
             payload["metadata_evidence"] = metadata_payload
         attempts.append(payload)
     return tuple(attempts)
+
+
+def run_attempt_record_is_visible(
+    record: dict[str, Any],
+    record_type: str,
+) -> bool:
+    if record_type in {
+        RUN_RECORD_TYPE,
+        WORKER_REPORT_RECORD_TYPE,
+        RUN_STARTED_RECORD_TYPE,
+        AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
+    }:
+        return True
+    return (
+        record_type == RUN_STATE_TRANSITION_RECORD_TYPE
+        and string_value(record.get("to_state")) == "session_observed"
+    )
 
 
 def collect_worklog_records(
@@ -1699,6 +1741,16 @@ def optional_copy(
 ) -> None:
     value = record.get(key)
     if value is not None and value != "":
+        payload[key] = value
+
+
+def optional_copy_mapping(
+    payload: dict[str, object],
+    key: str,
+    record: dict[str, Any],
+) -> None:
+    value = record.get(key)
+    if isinstance(value, dict) and value:
         payload[key] = value
 
 

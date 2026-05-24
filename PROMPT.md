@@ -76,6 +76,9 @@ surfaces to higher-level PRDs, requirements, and task artifacts.
 - Run attempts are not final project history. Final completion evidence belongs
   in task status, worker reports, commit trailers, worklogs, or future
   spec-trace records.
+- Runtime evidence should be portable enough for repository-owned tooling to
+  persist task and agent provenance in durable project history without making
+  `vibe-loop` the owner of project commit hooks or commit mutation.
 - Planning analytics report on the task/run/evidence graph; they must not become
   a hidden scheduler or completion source.
 - Bundled skills are self-sufficient workflow contracts. They must work when
@@ -121,10 +124,13 @@ audit should remain read-only. S4 intelligence should inform without actuating.
 
 ## Runtime Evolution Direction
 
-- Extend `runs.jsonl` with typed lifecycle events beyond `run_result` and
-  `worker_report`: lock acquisitions and releases, workspace claims, run state
-  transitions, and restart attempts. New record types are additive; readers must
-  tolerate unknown types.
+- Extend runtime records with typed lifecycle events beyond final results:
+  coordination events, workspace observations, run state transitions, and
+  restart attempts. New record types are additive; readers must tolerate unknown
+  types.
+- Publish enough bounded run context for project-owned tooling to bridge
+  transient supervisor state into durable git or worklog evidence, while
+  avoiding raw command leakage and keeping commit hooks outside `vibe-loop`.
 - Make run state transitions explicit and inspectable. A run progresses through
   observable states — scheduled, started, session observed, workspace claimed,
   reported, classified, finalized — recorded as events and derivable from the existing

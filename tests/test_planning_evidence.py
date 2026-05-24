@@ -81,6 +81,29 @@ class PlanningEvidenceTests(unittest.TestCase):
                 )
             )
             run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_started(
+                    run_id="run-3",
+                    task_id="TASK-03",
+                    payload={
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "session_id": "run-3",
+                        "session_id_source": "fallback:run_id",
+                        "agent_kind": "codex",
+                        "model_provider": "openai",
+                        "model_provider_source": "command_executable:codex",
+                        "trailer_context": {
+                            "plan_item_candidates": ["TASK-03"],
+                            "run_id": "run-3",
+                            "session_id": "run-3",
+                        },
+                        "trailer_context_sources": {
+                            "plan_item_candidates": "task_id",
+                            "session_id": "fallback:run_id",
+                        },
+                    },
+                )
+            )
+            run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
                     LOCK_EXPIRED_RECORD_TYPE,
                     run_id="run-stale",
@@ -99,6 +122,18 @@ class PlanningEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(evidence["task_source_origin"], "default_markdown_discovery")
         self.assertEqual(evidence["run_attempts"][0]["record_type"], "worker_report")
+        run_context_attempt = next(
+            attempt
+            for attempt in evidence["run_attempts"]
+            if attempt["record_type"] == "run_started"
+        )
+        self.assertEqual(run_context_attempt["task_id"], "TASK-03")
+        self.assertEqual(run_context_attempt["started_at"], "2026-05-09T00:00:00+00:00")
+        self.assertEqual(run_context_attempt["model_provider"], "openai")
+        self.assertEqual(
+            run_context_attempt["trailer_context"]["plan_item_candidates"],
+            ["TASK-03"],
+        )
         self.assertFalse(
             any(
                 attempt["task_id"] == "BOGUS-LIFECYCLE"

@@ -1189,6 +1189,11 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                     payload={
                         "branch": args.branch,
                         "worktree": str(args.worktree),
+                        "started_at": active_run_started_at(
+                            manager,
+                            task_id=task_id,
+                            run_id=run_id,
+                        ),
                     },
                 )
             )
@@ -1359,6 +1364,11 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
                     payload={
                         "resource": "main-integration",
                         "owner_task_id": task_id,
+                        "started_at": str(
+                            before_status.metadata.get("owner_started_at")
+                            or before_status.metadata.get("started_at")
+                            or ""
+                        ),
                     },
                 )
             )
@@ -1805,7 +1815,10 @@ def record_expired_locks(run_store: RunStore, stale_locks: list[StaleLock]) -> N
                 task_id=stale_lock.task_id,
                 lock_kind=stale_lock.kind,
                 lock_path=stale_lock.lock_path,
-                payload={"stale_reason": stale_lock.stale_reason},
+                payload={
+                    "stale_reason": stale_lock.stale_reason,
+                    "started_at": stale_lock.started_at,
+                },
             )
         )
 
@@ -2108,6 +2121,11 @@ def acquire_main_integration_command(
                 payload={
                     "resource": "main-integration",
                     "owner_task_id": task_id,
+                    "started_at": str(
+                        status.metadata.get("owner_started_at")
+                        or status.metadata.get("started_at")
+                        or ""
+                    ),
                 },
             )
         )
@@ -2157,7 +2175,10 @@ def record_workspace_preflight_mismatch(
             reason="workspace_preflight_failed",
             message=str(preflight.get("message") or ""),
             details={"workspace_diagnostics": diagnostic_payload},
-            payload={"diagnostic_count": len(diagnostic_payload)},
+            payload={
+                "diagnostic_count": len(diagnostic_payload),
+                "started_at": str(preflight.get("started_at") or ""),
+            },
         )
     )
 
@@ -2230,18 +2251,34 @@ def main_integration_acquire_preflight(
     if workspace_error is not None:
         return workspace_error
     if args.pid > 0:
-        return {"metadata": {"pid": args.pid, "pid_source": "explicit_cli"}}
+        return {
+            "metadata": {
+                "pid": args.pid,
+                "pid_source": "explicit_cli",
+                "owner_started_at": optional_string(matching_lock.get("started_at"))
+                or "",
+            }
+        }
     worker_pid = positive_int(matching_lock.get("worker_pid"))
     if worker_pid is not None:
         return {
             "metadata": {
                 "pid": worker_pid,
                 "pid_source": "active_task_lock:worker_pid",
+                "owner_started_at": optional_string(matching_lock.get("started_at"))
+                or "",
             }
         }
     legacy_pid = positive_int(matching_lock.get("pid"))
     if legacy_pid is not None:
-        return {"metadata": {"pid": legacy_pid, "pid_source": "active_task_lock:pid"}}
+        return {
+            "metadata": {
+                "pid": legacy_pid,
+                "pid_source": "active_task_lock:pid",
+                "owner_started_at": optional_string(matching_lock.get("started_at"))
+                or "",
+            }
+        }
     return {
         "error": "missing_worker_pid",
         "message": (
@@ -2287,9 +2324,25 @@ def main_integration_workspace_preflight_error(
             "workspace_diagnostics": [
                 diagnostic.to_json() for diagnostic in view.workspace_diagnostics
             ],
+            "started_at": view.active.started_at,
             "exit_code": 1,
         }
     return None
+
+
+def active_run_started_at(
+    manager: LockManager,
+    *,
+    task_id: str,
+    run_id: str,
+) -> str:
+    for lock_metadata in manager.list_locks():
+        if (
+            lock_metadata.get("task_id") == task_id
+            and lock_metadata.get("run_id") == run_id
+        ):
+            return optional_string(lock_metadata.get("started_at")) or ""
+    return ""
 
 
 def optional_string(value: object) -> str | None:

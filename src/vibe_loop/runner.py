@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import string
 import subprocess
 import sys
@@ -77,7 +78,29 @@ SESSION_ID_RE = re.compile(
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
+AGENT_CONTEXT_RE = re.compile(
+    r"\b(?P<key>model(?:[_ -]?(?:provider|id))?|provider|"
+    r"reasoning[_ -]?effort)\s*[:=]\s*"
+    r"(?P<value>\"[^\"]+\"|'[^']+'|[^\s,;]+)",
+    re.IGNORECASE,
+)
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+AGENT_CONTEXT_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$")
+SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+REASONING_EFFORT_VALUES = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+SECRET_LIKE_CONTEXT_TOKENS = (
+    "api_key",
+    "apikey",
+    "auth",
+    "bearer",
+    "credential",
+    "password",
+    "passwd",
+    "secret",
+    "token",
+)
+AGENT_STARTUP_OBSERVATION_LINE_LIMIT = 80
+AGENT_CONTEXT_VALUE_MAX_CHARS = 160
 RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
 SPEC_WORKER_CONTEXT_SCHEMA_VERSION = 1
 SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS = 12_000
@@ -203,10 +226,95 @@ class SessionIdObservation:
 
 
 @dataclasses.dataclass(frozen=True)
+class AgentRuntimeContext:
+    model_provider: str = ""
+    model_provider_source: str = ""
+    model_id: str = ""
+    model_id_source: str = ""
+    reasoning_effort: str = ""
+    reasoning_effort_source: str = ""
+
+    @property
+    def empty(self) -> bool:
+        return not (self.model_provider or self.model_id or self.reasoning_effort)
+
+    def overlay(self, other: AgentRuntimeContext) -> AgentRuntimeContext:
+        return AgentRuntimeContext(
+            model_provider=other.model_provider or self.model_provider,
+            model_provider_source=(
+                other.model_provider_source or self.model_provider_source
+            ),
+            model_id=other.model_id or self.model_id,
+            model_id_source=other.model_id_source or self.model_id_source,
+            reasoning_effort=other.reasoning_effort or self.reasoning_effort,
+            reasoning_effort_source=(
+                other.reasoning_effort_source or self.reasoning_effort_source
+            ),
+        )
+
+    def missing_delta(self, candidate: AgentRuntimeContext) -> AgentRuntimeContext:
+        return AgentRuntimeContext(
+            model_provider=candidate.model_provider if not self.model_provider else "",
+            model_provider_source=(
+                candidate.model_provider_source
+                if candidate.model_provider and not self.model_provider
+                else ""
+            ),
+            model_id=candidate.model_id if not self.model_id else "",
+            model_id_source=(
+                candidate.model_id_source
+                if candidate.model_id and not self.model_id
+                else ""
+            ),
+            reasoning_effort=(
+                candidate.reasoning_effort if not self.reasoning_effort else ""
+            ),
+            reasoning_effort_source=(
+                candidate.reasoning_effort_source
+                if candidate.reasoning_effort and not self.reasoning_effort
+                else ""
+            ),
+        )
+
+    def to_record_fields(self) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if self.model_provider:
+            payload["model_provider"] = self.model_provider
+            payload["model_provider_source"] = self.model_provider_source
+        if self.model_id:
+            payload["model_id"] = self.model_id
+            payload["model_id_source"] = self.model_id_source
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+            payload["reasoning_effort_source"] = self.reasoning_effort_source
+        return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentRuntimeObservation:
+    session_id: str | None = None
+    session_id_source: str | None = None
+    runtime_context: AgentRuntimeContext = dataclasses.field(
+        default_factory=AgentRuntimeContext
+    )
+
+    @property
+    def empty(self) -> bool:
+        return (
+            self.session_id is None
+            and self.session_id_source is None
+            and self.runtime_context.empty
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class StreamingCommandResult:
     exit_code: int
     session_id: str | None = None
     session_id_source: str | None = None
+    runtime_context: AgentRuntimeContext = dataclasses.field(
+        default_factory=AgentRuntimeContext
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -244,26 +352,67 @@ class SchedulerLockBusy(RuntimeError):
         super().__init__(f"resource scheduler lock is busy: {path}")
 
 
-class SessionIdObserver:
+class AgentOutputObserver:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._observation: SessionIdObservation | None = None
+        self._session_observation: SessionIdObservation | None = None
+        self._runtime_context = AgentRuntimeContext()
+        self._line_count = 0
 
     @property
-    def observation(self) -> SessionIdObservation | None:
+    def observation(self) -> AgentRuntimeObservation:
         with self._lock:
-            return self._observation
+            return AgentRuntimeObservation(
+                session_id=(
+                    self._session_observation.session_id
+                    if self._session_observation is not None
+                    else None
+                ),
+                session_id_source=(
+                    self._session_observation.source
+                    if self._session_observation is not None
+                    else None
+                ),
+                runtime_context=self._runtime_context,
+            )
 
-    def observe_line(self, line: str, stream_name: str) -> None:
+    def observe_line(
+        self,
+        line: str,
+        stream_name: str,
+    ) -> AgentRuntimeObservation | None:
         session_id = parse_worker_session_id(line)
-        if session_id is None:
-            return
+        runtime_context = AgentRuntimeContext()
         with self._lock:
-            if self._observation is None:
-                self._observation = SessionIdObservation(
+            self._line_count += 1
+            should_parse_context = (
+                self._line_count <= AGENT_STARTUP_OBSERVATION_LINE_LIMIT
+            )
+        if should_parse_context:
+            runtime_context = parse_agent_runtime_context_from_line(
+                line,
+                stream_name,
+            )
+        with self._lock:
+            delta_session_id = None
+            delta_session_id_source = None
+            if session_id is not None and self._session_observation is None:
+                self._session_observation = SessionIdObservation(
                     session_id=session_id,
                     source=f"native:{stream_name}",
                 )
+                delta_session_id = session_id
+                delta_session_id_source = f"native:{stream_name}"
+            delta_context = self._runtime_context.missing_delta(runtime_context)
+            if not delta_context.empty:
+                self._runtime_context = self._runtime_context.overlay(delta_context)
+            if delta_session_id is None and delta_context.empty:
+                return None
+            return AgentRuntimeObservation(
+                session_id=delta_session_id,
+                session_id_source=delta_session_id_source,
+                runtime_context=delta_context,
+            )
 
 
 class VibeRunner:
@@ -516,6 +665,13 @@ class VibeRunner:
             repo=self.config.repo,
             log_path=log_path,
         )
+        command_context = parse_agent_runtime_context_from_command(command)
+        agent_kind = self.config.agent.agent_kind
+        agent_kind_source = self.config.agent.agent_kind_source
+        agent_prompt_dialect = self.config.agent.prompt_dialect or ""
+        agent_prompt_dialect_source = self.config.agent.prompt_dialect_source
+        agent_skill_ref_prefix = self.config.agent.skill_ref_prefix or ""
+        agent_skill_ref_prefix_source = self.config.agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
         active_state = ActiveRunState.new(
             task_id=task.task_id,
@@ -526,13 +682,47 @@ class VibeRunner:
             resources=task.resources,
             paths=task.paths,
             conflict_domains_known=task.conflict_domains_known,
-            agent_kind=self.config.agent.agent_kind,
-            agent_prompt_dialect=self.config.agent.prompt_dialect or "",
-            agent_prompt_dialect_source=self.config.agent.prompt_dialect_source,
-            agent_skill_ref_prefix=self.config.agent.skill_ref_prefix or "",
-            agent_skill_ref_prefix_source=self.config.agent.skill_ref_prefix_source,
+            session_id=session_id,
+            session_id_source=session_id_source,
+            agent_kind=agent_kind,
+            agent_prompt_dialect=agent_prompt_dialect,
+            agent_prompt_dialect_source=agent_prompt_dialect_source,
+            agent_skill_ref_prefix=agent_skill_ref_prefix,
+            agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+            model_provider=command_context.model_provider,
+            model_provider_source=command_context.model_provider_source,
+            model_id=command_context.model_id,
+            model_id_source=command_context.model_id_source,
+            reasoning_effort=command_context.reasoning_effort,
+            reasoning_effort_source=command_context.reasoning_effort_source,
             restart_count=restart_count,
             max_restarts=max_restarts,
+        )
+        start_context_payload = build_run_context_payload(
+            task_id=task.task_id,
+            run_id=run_id,
+            started_at=active_state.started_at,
+            session_id=session_id,
+            session_id_source=session_id_source,
+            agent_kind=agent_kind,
+            agent_kind_source=agent_kind_source,
+            agent_prompt_dialect=agent_prompt_dialect,
+            agent_prompt_dialect_source=agent_prompt_dialect_source,
+            agent_skill_ref_prefix=agent_skill_ref_prefix,
+            agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+            runtime_context=command_context,
+        )
+        start_trailer_context = start_context_payload["trailer_context"]
+        start_trailer_context_sources = start_context_payload["trailer_context_sources"]
+        active_state = active_state.with_trailer_context(
+            trailer_context=(
+                start_trailer_context if isinstance(start_trailer_context, dict) else {}
+            ),
+            trailer_context_sources=(
+                start_trailer_context_sources
+                if isinstance(start_trailer_context_sources, dict)
+                else {}
+            ),
         )
         task_lock = self.acquire_scheduled_task_lock(
             task,
@@ -553,19 +743,123 @@ class VibeRunner:
                     "resources": list(task.resources),
                     "paths": list(task.paths),
                     "conflict_domains_known": task.conflict_domains_known,
+                    "started_at": active_state.started_at,
                     "restart_count": restart_count,
                     "max_restarts": max_restarts,
                 },
             )
         )
         self.run_store.append_lifecycle_event(
-            RunLifecycleEvent.run_state_transition(
+            RunLifecycleEvent.run_started(
                 run_id=run_id,
                 task_id=task.task_id,
-                to_state="started",
-                reason="task_lock_acquired",
+                payload={
+                    **start_context_payload,
+                    "log": str(log_path),
+                    "start_main": start_main,
+                    "base_main": base_main,
+                    "resources": list(task.resources),
+                    "paths": list(task.paths),
+                    "conflict_domains_known": task.conflict_domains_known,
+                    "restart_count": restart_count,
+                    "max_restarts": max_restarts,
+                    "reason": "task_lock_acquired",
+                },
             )
         )
+        observation_lock = threading.Lock()
+        observed_output_context = AgentRuntimeContext()
+        observed_session_id = session_id
+        observed_session_id_source = session_id_source
+        session_observed_recorded = False
+
+        def update_active_task_lock() -> None:
+            nonlocal active_state
+            nonlocal task_lock
+            current_metadata = self.lock_manager.status(task.task_id) or {}
+            current_active = ActiveRunState.from_lock_metadata(current_metadata)
+            if current_active is not None and current_active.workspace is not None:
+                active_state = dataclasses.replace(
+                    active_state,
+                    workspace=current_active.workspace,
+                )
+            task_lock = self.lock_manager.update(
+                task_lock,
+                active_state.to_lock_metadata(),
+            )
+
+        def record_agent_observation(observation: AgentRuntimeObservation) -> None:
+            nonlocal active_state
+            nonlocal observed_output_context
+            nonlocal observed_session_id
+            nonlocal observed_session_id_source
+            nonlocal session_observed_recorded
+            with observation_lock:
+                if not observation.runtime_context.empty:
+                    observed_output_context = observed_output_context.overlay(
+                        observation.runtime_context
+                    )
+                if observation.session_id and observation.session_id_source:
+                    observed_session_id = observation.session_id
+                    observed_session_id_source = observation.session_id_source
+                effective_context = command_context.overlay(observed_output_context)
+                context_payload = build_run_context_payload(
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    started_at=active_state.started_at,
+                    session_id=observed_session_id,
+                    session_id_source=observed_session_id_source,
+                    agent_kind=agent_kind,
+                    agent_kind_source=agent_kind_source,
+                    agent_prompt_dialect=agent_prompt_dialect,
+                    agent_prompt_dialect_source=agent_prompt_dialect_source,
+                    agent_skill_ref_prefix=agent_skill_ref_prefix,
+                    agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+                    runtime_context=effective_context,
+                )
+                trailer_context = context_payload["trailer_context"]
+                trailer_context_sources = context_payload["trailer_context_sources"]
+                active_state = active_state.with_trailer_context(
+                    session_id=observed_session_id,
+                    session_id_source=observed_session_id_source,
+                    model_provider=effective_context.model_provider,
+                    model_provider_source=effective_context.model_provider_source,
+                    model_id=effective_context.model_id,
+                    model_id_source=effective_context.model_id_source,
+                    reasoning_effort=effective_context.reasoning_effort,
+                    reasoning_effort_source=effective_context.reasoning_effort_source,
+                    trailer_context=(
+                        trailer_context if isinstance(trailer_context, dict) else {}
+                    ),
+                    trailer_context_sources=(
+                        trailer_context_sources
+                        if isinstance(trailer_context_sources, dict)
+                        else {}
+                    ),
+                )
+                update_active_task_lock()
+                if observation.session_id and not session_observed_recorded:
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.run_state_transition(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            from_state="started",
+                            to_state="session_observed",
+                            reason=observed_session_id_source,
+                            payload=context_payload,
+                        )
+                    )
+                    session_observed_recorded = True
+                    return
+                if not observation.runtime_context.empty:
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.agent_context_observed(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            payload={**context_payload, "reason": "agent_output"},
+                        )
+                    )
+
         try:
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(
@@ -626,12 +920,9 @@ class VibeRunner:
                 report_status("agent command started", log)
 
                 def record_worker_pid(worker_pid: int) -> None:
-                    nonlocal active_state, task_lock
+                    nonlocal active_state
                     active_state = active_state.with_worker_pid(worker_pid)
-                    task_lock = self.lock_manager.update(
-                        task_lock,
-                        active_state.to_lock_metadata(),
-                    )
+                    update_active_task_lock()
                     report_status(
                         "worker process started "
                         f"task={task.task_id} run_id={run_id} pid={worker_pid}",
@@ -645,20 +936,70 @@ class VibeRunner:
                     env=command_env,
                     forward_stderr=self.config.agent.forward_stderr,
                     on_start=record_worker_pid,
+                    on_observation=record_agent_observation,
                 )
                 exit_code = stream_result.exit_code
                 session_id = stream_result.session_id or run_id
                 session_id_source = stream_result.session_id_source or "fallback:run_id"
-                self.run_store.append_lifecycle_event(
-                    RunLifecycleEvent.run_state_transition(
-                        run_id=run_id,
-                        task_id=task.task_id,
-                        from_state="started",
-                        to_state="session_observed",
-                        reason=session_id_source,
-                        payload={"session_id": session_id},
-                    )
+                final_runtime_context = command_context.overlay(
+                    stream_result.runtime_context
                 )
+                final_context_payload = build_run_context_payload(
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    started_at=active_state.started_at,
+                    session_id=session_id,
+                    session_id_source=session_id_source,
+                    agent_kind=agent_kind,
+                    agent_kind_source=agent_kind_source,
+                    agent_prompt_dialect=agent_prompt_dialect,
+                    agent_prompt_dialect_source=agent_prompt_dialect_source,
+                    agent_skill_ref_prefix=agent_skill_ref_prefix,
+                    agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+                    runtime_context=final_runtime_context,
+                )
+                with observation_lock:
+                    if not session_observed_recorded:
+                        self.run_store.append_lifecycle_event(
+                            RunLifecycleEvent.run_state_transition(
+                                run_id=run_id,
+                                task_id=task.task_id,
+                                from_state="started",
+                                to_state="session_observed",
+                                reason=session_id_source,
+                                payload=final_context_payload,
+                            )
+                        )
+                        session_observed_recorded = True
+                    final_trailer_context = final_context_payload["trailer_context"]
+                    final_trailer_context_sources = final_context_payload[
+                        "trailer_context_sources"
+                    ]
+                    active_state = active_state.with_trailer_context(
+                        session_id=session_id,
+                        session_id_source=session_id_source,
+                        model_provider=final_runtime_context.model_provider,
+                        model_provider_source=(
+                            final_runtime_context.model_provider_source
+                        ),
+                        model_id=final_runtime_context.model_id,
+                        model_id_source=final_runtime_context.model_id_source,
+                        reasoning_effort=final_runtime_context.reasoning_effort,
+                        reasoning_effort_source=(
+                            final_runtime_context.reasoning_effort_source
+                        ),
+                        trailer_context=(
+                            final_trailer_context
+                            if isinstance(final_trailer_context, dict)
+                            else {}
+                        ),
+                        trailer_context_sources=(
+                            final_trailer_context_sources
+                            if isinstance(final_trailer_context_sources, dict)
+                            else {}
+                        ),
+                    )
+                    update_active_task_lock()
                 report_status(f"agent command exit_code={exit_code}", log)
                 report_status(f"session_id={session_id}", log)
                 report_status(f"session_id_source={session_id_source}", log)
@@ -694,7 +1035,10 @@ class VibeRunner:
                     from_state="session_observed",
                     to_state="classified",
                     reason=classification.source,
-                    payload={"classification": classification.status},
+                    payload={
+                        "classification": classification.status,
+                        "started_at": active_state.started_at,
+                    },
                 )
             )
             result = RunResult(
@@ -706,6 +1050,7 @@ class VibeRunner:
                 start_main=start_main,
                 end_main=end_main,
                 message=message,
+                started_at=active_state.started_at,
                 session_id=session_id,
                 session_id_source=session_id_source,
                 agent_command_source=self.config.agent.command_source,
@@ -717,6 +1062,25 @@ class VibeRunner:
                 agent_prompt_dialect_source=self.config.agent.prompt_dialect_source,
                 agent_skill_ref_prefix=self.config.agent.skill_ref_prefix or "",
                 agent_skill_ref_prefix_source=self.config.agent.skill_ref_prefix_source,
+                model_provider=final_runtime_context.model_provider,
+                model_provider_source=final_runtime_context.model_provider_source,
+                model_id=final_runtime_context.model_id,
+                model_id_source=final_runtime_context.model_id_source,
+                reasoning_effort=final_runtime_context.reasoning_effort,
+                reasoning_effort_source=final_runtime_context.reasoning_effort_source,
+                trailer_context=(
+                    final_context_payload["trailer_context"]
+                    if isinstance(final_context_payload["trailer_context"], dict)
+                    else {}
+                ),
+                trailer_context_sources=(
+                    final_context_payload["trailer_context_sources"]
+                    if isinstance(
+                        final_context_payload["trailer_context_sources"],
+                        dict,
+                    )
+                    else {}
+                ),
                 classification_source=classification.source,
                 worker_report=(
                     worker_report.to_json() if worker_report is not None else None
@@ -739,6 +1103,7 @@ class VibeRunner:
                     task_id=task.task_id,
                     lock_kind="task",
                     lock_path=task_lock.path,
+                    payload={"started_at": active_state.started_at},
                 )
             )
 
@@ -1155,6 +1520,7 @@ class VibeRunner:
                 ),
                 exhausted=exhausted,
                 attempted_restart_count=attempted_restart_count,
+                started_at=result.started_at,
             )
         )
 
@@ -2427,6 +2793,390 @@ def ensure_scheduler_lock_byte(handle: BinaryIO) -> None:
     handle.seek(0)
 
 
+def parse_agent_runtime_context_from_command(command: str) -> AgentRuntimeContext:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return AgentRuntimeContext()
+    context = AgentRuntimeContext()
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        value = None
+        source = ""
+        if token in {"--model", "-m"} and index + 1 < len(argv):
+            value = argv[index + 1]
+            source = f"command_arg:{token}"
+            index += 1
+        elif token.startswith("--model="):
+            value = token.split("=", 1)[1]
+            source = "command_arg:--model"
+        if value is not None:
+            cleaned = clean_agent_context_value(value)
+            if not cleaned:
+                index += 1
+                continue
+            context = context.overlay(
+                AgentRuntimeContext(
+                    model_id=cleaned,
+                    model_id_source=source,
+                )
+            )
+            index += 1
+            continue
+
+        value = None
+        source = ""
+        if token in {"--model-provider", "--provider"} and index + 1 < len(argv):
+            value = argv[index + 1]
+            source = f"command_arg:{token}"
+            index += 1
+        elif token.startswith("--model-provider="):
+            value = token.split("=", 1)[1]
+            source = "command_arg:--model-provider"
+        elif token.startswith("--provider="):
+            value = token.split("=", 1)[1]
+            source = "command_arg:--provider"
+        if value is not None:
+            cleaned = clean_agent_context_value(value)
+            if not cleaned:
+                index += 1
+                continue
+            context = context.overlay(
+                AgentRuntimeContext(
+                    model_provider=cleaned,
+                    model_provider_source=source,
+                )
+            )
+            index += 1
+            continue
+
+        value = None
+        source = ""
+        if token == "--reasoning-effort" and index + 1 < len(argv):
+            value = argv[index + 1]
+            source = "command_arg:--reasoning-effort"
+            index += 1
+        elif token.startswith("--reasoning-effort="):
+            value = token.split("=", 1)[1]
+            source = "command_arg:--reasoning-effort"
+        if value is not None:
+            cleaned = clean_reasoning_effort_value(value)
+            if not cleaned:
+                index += 1
+                continue
+            context = context.overlay(
+                AgentRuntimeContext(
+                    reasoning_effort=cleaned,
+                    reasoning_effort_source=source,
+                )
+            )
+            index += 1
+            continue
+
+        config_value = None
+        if token in {"--config", "-c"} and index + 1 < len(argv):
+            config_value = argv[index + 1]
+            index += 1
+        elif token.startswith("--config="):
+            config_value = token.split("=", 1)[1]
+        elif token.startswith("-c="):
+            config_value = token.split("=", 1)[1]
+        if config_value is not None:
+            context = context.overlay(
+                parse_agent_runtime_context_from_config_arg(config_value)
+            )
+        index += 1
+
+    if not context.model_provider:
+        provider, source = infer_model_provider_from_command(argv)
+        if provider:
+            context = context.overlay(
+                AgentRuntimeContext(
+                    model_provider=provider,
+                    model_provider_source=source,
+                )
+            )
+    return context
+
+
+def parse_agent_runtime_context_from_config_arg(value: str) -> AgentRuntimeContext:
+    key, separator, raw_value = value.partition("=")
+    if not separator:
+        return AgentRuntimeContext()
+    normalized_key = normalize_agent_context_key(key)
+    source = f"command_config:{normalized_key}"
+    if normalized_key in {"model", "model_id"}:
+        cleaned = clean_agent_context_value(raw_value)
+        if not cleaned:
+            return AgentRuntimeContext()
+        return AgentRuntimeContext(model_id=cleaned, model_id_source=source)
+    if normalized_key in {"model_provider", "provider"}:
+        cleaned = clean_agent_context_value(raw_value)
+        if not cleaned:
+            return AgentRuntimeContext()
+        return AgentRuntimeContext(
+            model_provider=cleaned,
+            model_provider_source=source,
+        )
+    if normalized_key in {"model_reasoning_effort", "reasoning_effort"}:
+        cleaned = clean_reasoning_effort_value(raw_value)
+        if not cleaned:
+            return AgentRuntimeContext()
+        return AgentRuntimeContext(
+            reasoning_effort=cleaned,
+            reasoning_effort_source=source,
+        )
+    return AgentRuntimeContext()
+
+
+def infer_model_provider_from_command(argv: list[str]) -> tuple[str, str]:
+    executable = command_executable_name(argv)
+    if executable == "codex":
+        return "openai", "command_executable:codex"
+    if executable == "claude":
+        return "anthropic", "command_executable:claude"
+    return "", ""
+
+
+def command_executable_name(argv: list[str]) -> str:
+    for token in argv:
+        if SHELL_ASSIGNMENT_RE.match(token):
+            continue
+        return Path(token).name
+    return ""
+
+
+def parse_agent_runtime_context_from_line(
+    line: str,
+    stream_name: str,
+) -> AgentRuntimeContext:
+    source_prefix = f"native:{stream_name}"
+    context = parse_agent_runtime_context_from_json_line(line, source_prefix)
+    return context.overlay(
+        parse_agent_runtime_context_from_text_line(line, source_prefix)
+    )
+
+
+def parse_agent_runtime_context_from_json_line(
+    line: str,
+    source_prefix: str,
+) -> AgentRuntimeContext:
+    text = line.strip()
+    if text.startswith("data:"):
+        text = text.removeprefix("data:").strip()
+    if not text.startswith("{"):
+        return AgentRuntimeContext()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return AgentRuntimeContext()
+    if not isinstance(payload, dict):
+        return AgentRuntimeContext()
+    model_value = payload.get("model")
+    model_mapping = model_value if isinstance(model_value, dict) else {}
+    model_provider = first_clean_agent_context_value(
+        payload.get("model_provider"),
+        model_mapping.get("provider"),
+        payload.get("provider"),
+    )
+    model_id = first_clean_agent_context_value(
+        payload.get("model_id"),
+        model_mapping.get("id"),
+        model_value if isinstance(model_value, str) else None,
+    )
+    reasoning_effort = first_clean_agent_context_value(
+        payload.get("reasoning_effort"),
+        model_mapping.get("reasoning_effort"),
+        clean_value=clean_reasoning_effort_value,
+    )
+    return AgentRuntimeContext(
+        model_provider=model_provider,
+        model_provider_source=(
+            f"{source_prefix}:json.model_provider" if model_provider else ""
+        ),
+        model_id=model_id,
+        model_id_source=f"{source_prefix}:json.model" if model_id else "",
+        reasoning_effort=reasoning_effort,
+        reasoning_effort_source=(
+            f"{source_prefix}:json.reasoning_effort" if reasoning_effort else ""
+        ),
+    )
+
+
+def parse_agent_runtime_context_from_text_line(
+    line: str,
+    source_prefix: str,
+) -> AgentRuntimeContext:
+    context = AgentRuntimeContext()
+    for match in AGENT_CONTEXT_RE.finditer(line):
+        key = normalize_agent_context_key(match.group("key"))
+        value = clean_agent_context_value(match.group("value"))
+        if not value:
+            continue
+        if key in {"model_provider", "provider"}:
+            context = context.overlay(
+                AgentRuntimeContext(
+                    model_provider=value,
+                    model_provider_source=f"{source_prefix}:{key}",
+                )
+            )
+        elif key in {"model", "model_id"}:
+            context = context.overlay(
+                AgentRuntimeContext(
+                    model_id=value,
+                    model_id_source=f"{source_prefix}:{key}",
+                )
+            )
+        elif key == "reasoning_effort":
+            value = clean_reasoning_effort_value(match.group("value"))
+            if not value:
+                continue
+            context = context.overlay(
+                AgentRuntimeContext(
+                    reasoning_effort=value,
+                    reasoning_effort_source=f"{source_prefix}:{key}",
+                )
+            )
+    return context
+
+
+def normalize_agent_context_key(value: str) -> str:
+    return value.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def first_clean_agent_context_value(
+    *values: object,
+    clean_value: Callable[[object], str] | None = None,
+) -> str:
+    cleaner = clean_value or clean_agent_context_value
+    for value in values:
+        cleaned = cleaner(value)
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def clean_agent_context_value(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = value.strip().strip("'\"")
+    if not cleaned or "\0" in cleaned or "\n" in cleaned or "\r" in cleaned:
+        return ""
+    if len(cleaned) > AGENT_CONTEXT_VALUE_MAX_CHARS:
+        return ""
+    if not AGENT_CONTEXT_SAFE_VALUE_RE.fullmatch(cleaned):
+        return ""
+    if agent_context_value_is_secret_like(cleaned):
+        return ""
+    return cleaned
+
+
+def clean_reasoning_effort_value(value: object) -> str:
+    cleaned = clean_agent_context_value(value).lower()
+    return cleaned if cleaned in REASONING_EFFORT_VALUES else ""
+
+
+def agent_context_value_is_secret_like(value: str) -> bool:
+    lowered = value.lower()
+    if lowered.startswith(("sk-", "ghp_", "github_pat_", "xoxb-", "xoxp-")):
+        return True
+    normalized = lowered.replace("-", "_").replace(".", "_")
+    return any(token in normalized for token in SECRET_LIKE_CONTEXT_TOKENS)
+
+
+def build_trailer_context(
+    *,
+    task_id: str,
+    run_id: str,
+    session_id: str,
+    session_id_source: str,
+    agent_kind: str,
+    agent_kind_source: str,
+    agent_prompt_dialect: str,
+    agent_prompt_dialect_source: str,
+    agent_skill_ref_prefix: str,
+    agent_skill_ref_prefix_source: str,
+    runtime_context: AgentRuntimeContext,
+) -> tuple[dict[str, object], dict[str, object]]:
+    context: dict[str, object] = {
+        "plan_item_candidates": [task_id],
+        "run_id": run_id,
+        "session_id": session_id,
+        "session_id_source": session_id_source,
+    }
+    sources: dict[str, object] = {
+        "plan_item_candidates": "task_id",
+        "run_id": "run_id",
+        "session_id": session_id_source,
+        "session_id_source": "session_observation",
+    }
+    if agent_kind:
+        context["agent_kind"] = agent_kind
+        sources["agent_kind"] = agent_kind_source
+    if agent_prompt_dialect:
+        context["agent_prompt_dialect"] = agent_prompt_dialect
+        sources["agent_prompt_dialect"] = agent_prompt_dialect_source
+    if agent_skill_ref_prefix:
+        context["agent_skill_ref_prefix"] = agent_skill_ref_prefix
+        sources["agent_skill_ref_prefix"] = agent_skill_ref_prefix_source
+    if runtime_context.model_provider:
+        context["model_provider"] = runtime_context.model_provider
+        sources["model_provider"] = runtime_context.model_provider_source
+    if runtime_context.model_id:
+        context["model_id"] = runtime_context.model_id
+        sources["model_id"] = runtime_context.model_id_source
+    if runtime_context.reasoning_effort:
+        context["reasoning_effort"] = runtime_context.reasoning_effort
+        sources["reasoning_effort"] = runtime_context.reasoning_effort_source
+    return context, sources
+
+
+def build_run_context_payload(
+    *,
+    task_id: str,
+    run_id: str,
+    started_at: str,
+    session_id: str,
+    session_id_source: str,
+    agent_kind: str,
+    agent_kind_source: str,
+    agent_prompt_dialect: str,
+    agent_prompt_dialect_source: str,
+    agent_skill_ref_prefix: str,
+    agent_skill_ref_prefix_source: str,
+    runtime_context: AgentRuntimeContext,
+) -> dict[str, object]:
+    trailer_context, trailer_context_sources = build_trailer_context(
+        task_id=task_id,
+        run_id=run_id,
+        session_id=session_id,
+        session_id_source=session_id_source,
+        agent_kind=agent_kind,
+        agent_kind_source=agent_kind_source,
+        agent_prompt_dialect=agent_prompt_dialect,
+        agent_prompt_dialect_source=agent_prompt_dialect_source,
+        agent_skill_ref_prefix=agent_skill_ref_prefix,
+        agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+        runtime_context=runtime_context,
+    )
+    payload: dict[str, object] = {
+        "started_at": started_at,
+        "session_id": session_id,
+        "session_id_source": session_id_source,
+        "agent_kind": agent_kind,
+        "agent_kind_source": agent_kind_source,
+        "agent_prompt_dialect": agent_prompt_dialect,
+        "agent_prompt_dialect_source": agent_prompt_dialect_source,
+        "agent_skill_ref_prefix": agent_skill_ref_prefix,
+        "agent_skill_ref_prefix_source": agent_skill_ref_prefix_source,
+        "trailer_context": trailer_context,
+        "trailer_context_sources": trailer_context_sources,
+    }
+    payload.update(runtime_context.to_record_fields())
+    return payload
+
+
 def parse_worker_session_id(line: str) -> str | None:
     match = SESSION_ID_RE.search(line)
     if match is None:
@@ -2486,6 +3236,7 @@ def run_streaming_command(
     env: dict[str, str] | None = None,
     forward_stderr: bool = False,
     on_start: Callable[[int], None] | None = None,
+    on_observation: Callable[[AgentRuntimeObservation], None] | None = None,
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
     process = subprocess.Popen(
@@ -2505,10 +3256,18 @@ def run_streaming_command(
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()
-    session_observer = SessionIdObserver()
+    output_observer = AgentOutputObserver()
     stdout_thread = threading.Thread(
         target=stream_pipe,
-        args=(process.stdout, log, log_lock, True, session_observer, "stdout"),
+        args=(
+            process.stdout,
+            log,
+            log_lock,
+            True,
+            output_observer,
+            "stdout",
+            on_observation,
+        ),
     )
     stderr_thread = threading.Thread(
         target=stream_pipe,
@@ -2517,8 +3276,9 @@ def run_streaming_command(
             log,
             log_lock,
             forward_stderr,
-            session_observer,
+            output_observer,
             "stderr",
+            on_observation,
         ),
     )
     stdout_thread.start()
@@ -2526,11 +3286,12 @@ def run_streaming_command(
     exit_code = process.wait()
     stdout_thread.join()
     stderr_thread.join()
-    observation = session_observer.observation
+    observation = output_observer.observation
     return StreamingCommandResult(
         exit_code=exit_code,
-        session_id=observation.session_id if observation else None,
-        session_id_source=observation.source if observation else None,
+        session_id=observation.session_id,
+        session_id_source=observation.session_id_source,
+        runtime_context=observation.runtime_context,
     )
 
 
@@ -2558,12 +3319,15 @@ def stream_pipe(
     log: TextIO,
     log_lock: threading.Lock,
     forward: bool,
-    session_observer: SessionIdObserver,
+    output_observer: AgentOutputObserver,
     stream_name: str,
+    on_observation: Callable[[AgentRuntimeObservation], None] | None = None,
 ) -> None:
     try:
         for line in pipe:
-            session_observer.observe_line(line, stream_name)
+            observation = output_observer.observe_line(line, stream_name)
+            if observation is not None and on_observation is not None:
+                on_observation(observation)
             if forward:
                 sys.stderr.write(line)
                 sys.stderr.flush()

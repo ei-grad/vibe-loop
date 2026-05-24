@@ -67,6 +67,7 @@ class WorkspaceClaim:
     current_branch: str
     dirty: bool
     dirty_summary: tuple[str, ...]
+    started_at: str = ""
     claimed_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     @classmethod
@@ -89,6 +90,7 @@ class WorkspaceClaim:
             current_branch=optional_string(payload.get("current_branch")) or "",
             dirty=optional_bool(payload.get("dirty")),
             dirty_summary=optional_string_tuple(payload.get("dirty_summary")),
+            started_at=optional_string(payload.get("started_at")) or "",
             claimed_at=(
                 optional_string(payload.get("claimed_at"))
                 or optional_string(payload.get("occurred_at"))
@@ -111,6 +113,7 @@ class WorkspaceClaim:
             "current_branch": self.current_branch,
             "dirty": self.dirty,
             "dirty_summary": list(self.dirty_summary),
+            "started_at": self.started_at,
             "claimed_at": self.claimed_at,
         }
 
@@ -126,11 +129,21 @@ class ActiveRunState:
     resources: tuple[str, ...] = ()
     paths: tuple[str, ...] = ()
     conflict_domains_known: bool = False
+    session_id: str = ""
+    session_id_source: str = ""
     agent_kind: str = ""
     agent_prompt_dialect: str = ""
     agent_prompt_dialect_source: str = ""
     agent_skill_ref_prefix: str = ""
     agent_skill_ref_prefix_source: str = ""
+    model_provider: str = ""
+    model_provider_source: str = ""
+    model_id: str = ""
+    model_id_source: str = ""
+    reasoning_effort: str = ""
+    reasoning_effort_source: str = ""
+    trailer_context: dict[str, Any] = dataclasses.field(default_factory=dict)
+    trailer_context_sources: dict[str, Any] = dataclasses.field(default_factory=dict)
     restart_count: int = 0
     max_restarts: int = 0
     lease_seconds: int | float | None = None
@@ -156,11 +169,21 @@ class ActiveRunState:
         resources: tuple[str, ...] = (),
         paths: tuple[str, ...] = (),
         conflict_domains_known: bool = False,
+        session_id: str = "",
+        session_id_source: str = "",
         agent_kind: str = "",
         agent_prompt_dialect: str = "",
         agent_prompt_dialect_source: str = "",
         agent_skill_ref_prefix: str = "",
         agent_skill_ref_prefix_source: str = "",
+        model_provider: str = "",
+        model_provider_source: str = "",
+        model_id: str = "",
+        model_id_source: str = "",
+        reasoning_effort: str = "",
+        reasoning_effort_source: str = "",
+        trailer_context: dict[str, Any] | None = None,
+        trailer_context_sources: dict[str, Any] | None = None,
         restart_count: int = 0,
         max_restarts: int = 0,
     ) -> ActiveRunState:
@@ -174,11 +197,21 @@ class ActiveRunState:
             resources=resources,
             paths=paths,
             conflict_domains_known=conflict_domains_known,
+            session_id=session_id,
+            session_id_source=session_id_source,
             agent_kind=agent_kind,
             agent_prompt_dialect=agent_prompt_dialect,
             agent_prompt_dialect_source=agent_prompt_dialect_source,
             agent_skill_ref_prefix=agent_skill_ref_prefix,
             agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
+            model_provider=model_provider,
+            model_provider_source=model_provider_source,
+            model_id=model_id,
+            model_id_source=model_id_source,
+            reasoning_effort=reasoning_effort,
+            reasoning_effort_source=reasoning_effort_source,
+            trailer_context=dict(trailer_context or {}),
+            trailer_context_sources=dict(trailer_context_sources or {}),
             restart_count=restart_count,
             max_restarts=max_restarts,
             supervisor_pid=os.getpid(),
@@ -218,6 +251,10 @@ class ActiveRunState:
             conflict_domains_known=optional_bool(
                 metadata.get("conflict_domains_known")
             ),
+            session_id=optional_string(metadata.get("session_id")) or "",
+            session_id_source=(
+                optional_string(metadata.get("session_id_source")) or ""
+            ),
             agent_kind=optional_string(metadata.get("agent_kind")) or "",
             agent_prompt_dialect=(
                 optional_string(metadata.get("agent_prompt_dialect")) or ""
@@ -230,6 +267,20 @@ class ActiveRunState:
             ),
             agent_skill_ref_prefix_source=(
                 optional_string(metadata.get("agent_skill_ref_prefix_source")) or ""
+            ),
+            model_provider=optional_string(metadata.get("model_provider")) or "",
+            model_provider_source=(
+                optional_string(metadata.get("model_provider_source")) or ""
+            ),
+            model_id=optional_string(metadata.get("model_id")) or "",
+            model_id_source=optional_string(metadata.get("model_id_source")) or "",
+            reasoning_effort=optional_string(metadata.get("reasoning_effort")) or "",
+            reasoning_effort_source=(
+                optional_string(metadata.get("reasoning_effort_source")) or ""
+            ),
+            trailer_context=optional_mapping(metadata.get("trailer_context")),
+            trailer_context_sources=optional_mapping(
+                metadata.get("trailer_context_sources")
             ),
             restart_count=optional_int(metadata.get("restart_count")) or 0,
             max_restarts=optional_int(metadata.get("max_restarts")) or 0,
@@ -251,6 +302,62 @@ class ActiveRunState:
     def with_worker_pid(self, worker_pid: int) -> ActiveRunState:
         return dataclasses.replace(self, worker_pid=worker_pid)
 
+    def with_trailer_context(
+        self,
+        *,
+        session_id: str | None = None,
+        session_id_source: str | None = None,
+        model_provider: str | None = None,
+        model_provider_source: str | None = None,
+        model_id: str | None = None,
+        model_id_source: str | None = None,
+        reasoning_effort: str | None = None,
+        reasoning_effort_source: str | None = None,
+        trailer_context: dict[str, Any] | None = None,
+        trailer_context_sources: dict[str, Any] | None = None,
+    ) -> ActiveRunState:
+        return dataclasses.replace(
+            self,
+            session_id=session_id if session_id is not None else self.session_id,
+            session_id_source=(
+                session_id_source
+                if session_id_source is not None
+                else self.session_id_source
+            ),
+            model_provider=(
+                model_provider if model_provider is not None else self.model_provider
+            ),
+            model_provider_source=(
+                model_provider_source
+                if model_provider_source is not None
+                else self.model_provider_source
+            ),
+            model_id=model_id if model_id is not None else self.model_id,
+            model_id_source=(
+                model_id_source if model_id_source is not None else self.model_id_source
+            ),
+            reasoning_effort=(
+                reasoning_effort
+                if reasoning_effort is not None
+                else self.reasoning_effort
+            ),
+            reasoning_effort_source=(
+                reasoning_effort_source
+                if reasoning_effort_source is not None
+                else self.reasoning_effort_source
+            ),
+            trailer_context=(
+                dict(trailer_context)
+                if trailer_context is not None
+                else self.trailer_context
+            ),
+            trailer_context_sources=(
+                dict(trailer_context_sources)
+                if trailer_context_sources is not None
+                else self.trailer_context_sources
+            ),
+        )
+
     def to_lock_metadata(self) -> dict[str, object]:
         metadata: dict[str, object] = {
             "schema_version": ACTIVE_RUN_SCHEMA_VERSION,
@@ -271,11 +378,21 @@ class ActiveRunState:
             "resources": list(self.resources),
             "paths": list(self.paths),
             "conflict_domains_known": self.conflict_domains_known,
+            "session_id": self.session_id,
+            "session_id_source": self.session_id_source,
             "agent_kind": self.agent_kind,
             "agent_prompt_dialect": self.agent_prompt_dialect,
             "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
             "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
+            "model_provider": self.model_provider,
+            "model_provider_source": self.model_provider_source,
+            "model_id": self.model_id,
+            "model_id_source": self.model_id_source,
+            "reasoning_effort": self.reasoning_effort,
+            "reasoning_effort_source": self.reasoning_effort_source,
+            "trailer_context": self.trailer_context,
+            "trailer_context_sources": self.trailer_context_sources,
             "restart_count": self.restart_count,
             "max_restarts": self.max_restarts,
         }
@@ -399,11 +516,21 @@ class WorkerView:
             "resources": list(self.active.resources),
             "paths": list(self.active.paths),
             "conflict_domains_known": self.active.conflict_domains_known,
+            "session_id": self.active.session_id,
+            "session_id_source": self.active.session_id_source,
             "agent_kind": self.active.agent_kind,
             "agent_prompt_dialect": self.active.agent_prompt_dialect,
             "agent_prompt_dialect_source": self.active.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.active.agent_skill_ref_prefix,
             "agent_skill_ref_prefix_source": self.active.agent_skill_ref_prefix_source,
+            "model_provider": self.active.model_provider,
+            "model_provider_source": self.active.model_provider_source,
+            "model_id": self.active.model_id,
+            "model_id_source": self.active.model_id_source,
+            "reasoning_effort": self.active.reasoning_effort,
+            "reasoning_effort_source": self.active.reasoning_effort_source,
+            "trailer_context": self.active.trailer_context,
+            "trailer_context_sources": self.active.trailer_context_sources,
             "restart_count": self.active.restart_count,
             "max_restarts": self.active.max_restarts,
             "lease_seconds": self.active.lease_seconds,
@@ -476,6 +603,7 @@ def claim_worker_workspace(
         base_commit=base_commit
         or optional_string(lock.metadata.get("base_main"))
         or "",
+        started_at=optional_string(lock.metadata.get("started_at")) or "",
     )
     updated_metadata = dict(lock.metadata)
     updated_metadata["workspace"] = claim.to_json()
@@ -548,6 +676,7 @@ def inspect_workspace_claim(
     branch: str,
     worktree: Path,
     base_commit: str,
+    started_at: str = "",
 ) -> WorkspaceClaim:
     if not worktree.exists() or not worktree.is_dir():
         raise WorkspaceClaimError(
@@ -578,6 +707,7 @@ def inspect_workspace_claim(
         current_branch=current_branch,
         dirty=bool(status_lines),
         dirty_summary=tuple(status_lines[:DIRTY_SUMMARY_LIMIT]),
+        started_at=started_at,
     )
 
 
@@ -1226,6 +1356,10 @@ def optional_string_tuple(value: object) -> tuple[str, ...]:
     return tuple(item for item in value if isinstance(item, str) and item)
 
 
+def optional_mapping(value: object) -> dict[str, Any]:
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def result_value(record: dict[str, Any] | None, key: str) -> str | None:
     if record is None:
         return None
@@ -1254,6 +1388,7 @@ class StaleLock:
     stale_reason: str
     kind: str
     recovery_command: str
+    started_at: str = ""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1263,6 +1398,7 @@ class StaleLock:
             "stale_reason": self.stale_reason,
             "kind": self.kind,
             "recovery_command": self.recovery_command,
+            "started_at": self.started_at,
         }
 
 
@@ -1300,6 +1436,7 @@ def collect_stale_locks(
                     lock_manager,
                     lock_path,
                 ),
+                started_at=view.active.started_at,
             )
         )
 
@@ -1322,6 +1459,11 @@ def collect_stale_locks(
                 recovery_command=stale_lock_recovery_command(
                     lock_manager,
                     integration_status.path,
+                ),
+                started_at=(
+                    optional_string(integration_status.metadata.get("owner_started_at"))
+                    or optional_string(integration_status.metadata.get("started_at"))
+                    or ""
                 ),
             )
         )

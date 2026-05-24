@@ -959,14 +959,26 @@ can wait for a live holder with `--wait --timeout N`, but it blocks immediately
 when the worker's claimed workspace has diagnostics that make final integration
 unsafe.
 
-`runs.jsonl` is an append-only stream of versioned run result records. Run
-records include the vibe-loop `run_id`, the resolved worker `session_id`, the
-`session_id_source`, the `agent_command_source` used for the worker command,
-the `agent_selection_command_source`, prompt dialect and skill reference source
-metadata, and the default agent policy source used when commands are
-auto-resolved. `vibe-loop runs list` groups those records by run id and shows
-the latest structured status plus the log path; `vibe-loop runs inspect
-<run-id>` prints the detailed record history for one run.
+`runs.jsonl` is an append-only stream of versioned run records. Run result
+records include the vibe-loop `run_id`, `started_at`, the resolved worker
+`session_id`, the `session_id_source`, the `agent_command_source` used for the
+worker command, the `agent_selection_command_source`, prompt dialect and skill
+reference source metadata, and the default agent policy source used when
+commands are auto-resolved. Lifecycle records such as `run_started`,
+`agent_context_observed`, and `run_state_transition` expose the same start-time
+anchor and bounded trailer-ready context before the final result when possible.
+
+The trailer context includes task IDs suitable for `Plan-Item`, `Run-Id`,
+`Session-Id`, agent kind, prompt dialect/source, and model provider/model
+ID/reasoning effort only when those model values are emitted by the agent during
+startup or can be safely inferred from the runtime command/executable.
+Unobserved model fields are omitted. `vibe-loop` does not install or own commit
+hooks; repository-owned hooks or worklog tooling decide whether to persist this
+candidate context into durable project history.
+
+`vibe-loop runs list` groups records by run id and shows the latest structured
+status plus the log path; `vibe-loop runs inspect <run-id>` prints the detailed
+record history for one run.
 Project worklogs should remain final evidence ledgers. Attempt logs and failed
 runs belong in `.vibe-loop/`, not in project completion records.
 

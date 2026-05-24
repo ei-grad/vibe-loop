@@ -52,11 +52,30 @@ class WorkerStateTests(unittest.TestCase):
                 log_path=log_path,
                 base_main="abc123",
                 command="codex exec '$vibe-loop PAR-02'",
+                session_id="run-1",
+                session_id_source="fallback:run_id",
                 agent_kind="codex",
                 agent_prompt_dialect="codex",
                 agent_prompt_dialect_source="agent.kind:codex",
                 agent_skill_ref_prefix="$",
                 agent_skill_ref_prefix_source="agent.kind:codex",
+                model_provider="openai",
+                model_provider_source="command_executable:codex",
+                model_id="gpt-5.5",
+                model_id_source="native:stdout:json.model",
+                reasoning_effort="high",
+                reasoning_effort_source="native:stdout:json.reasoning_effort",
+                trailer_context={
+                    "plan_item_candidates": ["PAR-02"],
+                    "run_id": "run-1",
+                    "session_id": "run-1",
+                    "model_id": "gpt-5.5",
+                },
+                trailer_context_sources={
+                    "plan_item_candidates": "task_id",
+                    "session_id": "fallback:run_id",
+                    "model_id": "native:stdout:json.model",
+                },
                 workspace=WorkspaceClaim(
                     task_id="PAR-02",
                     run_id="run-1",
@@ -67,6 +86,7 @@ class WorkerStateTests(unittest.TestCase):
                     current_branch="codex/PAR-02",
                     dirty=True,
                     dirty_summary=(" M src/example.py",),
+                    started_at="2026-05-09T00:00:00+00:00",
                     claimed_at="2026-05-09T00:01:00+00:00",
                 ),
             )
@@ -90,11 +110,23 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].log_path, log_path)
         self.assertEqual(loaded[0].base_main, "abc123")
         self.assertEqual(loaded[0].command, "codex exec '$vibe-loop PAR-02'")
+        self.assertEqual(loaded[0].session_id, "run-1")
+        self.assertEqual(loaded[0].session_id_source, "fallback:run_id")
         self.assertEqual(loaded[0].agent_kind, "codex")
         self.assertEqual(loaded[0].agent_prompt_dialect, "codex")
         self.assertEqual(loaded[0].agent_prompt_dialect_source, "agent.kind:codex")
         self.assertEqual(loaded[0].agent_skill_ref_prefix, "$")
         self.assertEqual(loaded[0].agent_skill_ref_prefix_source, "agent.kind:codex")
+        self.assertEqual(loaded[0].model_provider, "openai")
+        self.assertEqual(loaded[0].model_provider_source, "command_executable:codex")
+        self.assertEqual(loaded[0].model_id, "gpt-5.5")
+        self.assertEqual(loaded[0].model_id_source, "native:stdout:json.model")
+        self.assertEqual(loaded[0].reasoning_effort, "high")
+        self.assertEqual(loaded[0].trailer_context["model_id"], "gpt-5.5")
+        self.assertEqual(
+            loaded[0].trailer_context_sources["model_id"],
+            "native:stdout:json.model",
+        )
         self.assertEqual(loaded[0].lock_path, task_lock.path)
         workspace = loaded[0].workspace
         self.assertIsNotNone(workspace)
@@ -104,6 +136,7 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(workspace.worktree, repo)
         self.assertTrue(workspace.dirty)
         self.assertEqual(workspace.dirty_summary, (" M src/example.py",))
+        self.assertEqual(workspace.started_at, "2026-05-09T00:00:00+00:00")
 
     def test_command_lock_backend_delegates_lock_operations(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +245,78 @@ class WorkerStateTests(unittest.TestCase):
 
         self.assertEqual(updated_lock.metadata["worker_pid"], 123)
         self.assertEqual(updated_lock.metadata["fencing_token"], token)
+
+    def test_directory_lock_preserves_observed_runtime_fields_on_stale_update(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            task_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata={
+                    "session_id": "run-1",
+                    "model_id": "",
+                    "trailer_context": {},
+                },
+            )
+            manager.update(
+                task_lock,
+                {
+                    **task_lock.metadata,
+                    "session_id": "native-1",
+                    "session_id_source": "native:stdout",
+                    "model_id": "gpt-5.5",
+                    "model_id_source": "native:stdout:json.model",
+                    "trailer_context": {"session_id": "native-1"},
+                    "workspace": {"branch": "worker/TASK-01"},
+                },
+            )
+
+            stale_update = manager.update(
+                task_lock,
+                {
+                    **task_lock.metadata,
+                    "session_id": "run-1",
+                    "model_id": "",
+                    "trailer_context": {},
+                    "worker_pid": 123,
+                },
+            )
+
+        self.assertEqual(stale_update.metadata["session_id"], "native-1")
+        self.assertEqual(stale_update.metadata["session_id_source"], "native:stdout")
+        self.assertEqual(stale_update.metadata["model_id"], "gpt-5.5")
+        self.assertEqual(
+            stale_update.metadata["model_id_source"],
+            "native:stdout:json.model",
+        )
+        self.assertEqual(
+            stale_update.metadata["trailer_context"],
+            {"session_id": "native-1"},
+        )
+        self.assertEqual(
+            stale_update.metadata["workspace"], {"branch": "worker/TASK-01"}
+        )
+        self.assertEqual(stale_update.metadata["worker_pid"], 123)
+
+    def test_directory_backend_revalidates_fencing_token_during_update(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            first = manager.acquire("TASK-01", "run-1")
+            manager.release(first)
+            manager.acquire("TASK-01", "run-2")
+
+            with self.assertRaises(LockFencingMismatch):
+                manager.backend.update(
+                    first,
+                    {
+                        **first.metadata,
+                        "worker_pid": 123,
+                    },
+                )
 
     def test_directory_lock_fencing_rejects_stale_update_and_release(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

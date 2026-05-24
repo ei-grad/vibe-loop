@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from vibe_loop.runs import (
+    AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
     LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_EXPIRED_RECORD_TYPE,
@@ -13,6 +14,7 @@ from vibe_loop.runs import (
     LIFECYCLE_STATES,
     RUN_RECORD_TYPE,
     RUN_SCHEMA_VERSION,
+    RUN_STARTED_RECORD_TYPE,
     RUN_STATE_TRANSITION_RECORD_TYPE,
     TASK_RESTART_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
@@ -38,6 +40,7 @@ class RunStoreTests(unittest.TestCase):
             log_path=Path("/tmp/run.log"),
             start_main="aaa",
             end_main="bbb",
+            started_at="2026-05-09T00:00:00+00:00",
         )
 
         first = result.to_json()
@@ -45,6 +48,7 @@ class RunStoreTests(unittest.TestCase):
 
         self.assertEqual(first["session_id"], "run-1")
         self.assertEqual(first["session_id_source"], "fallback:run_id")
+        self.assertEqual(first["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(first["finished_at"], second["finished_at"])
 
     def test_run_result_json_can_store_native_session_id(self) -> None:
@@ -170,6 +174,47 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["resources"], ["db"])
         self.assertTrue(payload["occurred_at"])
 
+    def test_run_started_event_writes_trailer_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            store = RunStore(path)
+
+            store.append_lifecycle_event(
+                RunLifecycleEvent.run_started(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    payload={
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "session_id": "run-1",
+                        "session_id_source": "fallback:run_id",
+                        "agent_kind": "codex",
+                        "model_provider": "openai",
+                        "model_provider_source": "command_executable:codex",
+                        "trailer_context": {
+                            "plan_item_candidates": ["TASK-01"],
+                            "run_id": "run-1",
+                            "session_id": "run-1",
+                        },
+                        "trailer_context_sources": {
+                            "plan_item_candidates": "task_id",
+                            "session_id": "fallback:run_id",
+                        },
+                    },
+                )
+            )
+
+            payload = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["schema_version"], LIFECYCLE_EVENT_SCHEMA_VERSION)
+        self.assertEqual(payload["record_type"], RUN_STARTED_RECORD_TYPE)
+        self.assertEqual(payload["status"], "started")
+        self.assertEqual(payload["task_id"], "TASK-01")
+        self.assertEqual(payload["started_at"], "2026-05-09T00:00:00+00:00")
+        self.assertEqual(payload["model_provider"], "openai")
+        self.assertEqual(
+            payload["trailer_context"]["plan_item_candidates"], ["TASK-01"]
+        )
+
     def test_lifecycle_event_rejects_unknown_type(self) -> None:
         with self.assertRaises(ValueError):
             RunLifecycleEvent(record_type="surprise", run_id="run-1")
@@ -193,11 +238,19 @@ class RunStoreTests(unittest.TestCase):
                     lock_kind="task",
                     lock_path=repo / "TASK-01.lock",
                 ).to_record(),
-                RunLifecycleEvent.run_state_transition(
+                RunLifecycleEvent.run_started(
                     run_id="run-1",
                     task_id="TASK-01",
-                    to_state="started",
-                    reason="task_lock_acquired",
+                    payload={"started_at": "2026-05-09T00:00:10+00:00"},
+                ).to_record(),
+                RunLifecycleEvent.agent_context_observed(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    payload={
+                        "started_at": "2026-05-09T00:00:10+00:00",
+                        "model_id": "gpt-5.5",
+                        "model_id_source": "native:stdout:json.model",
+                    },
                 ).to_record(),
                 RunLifecycleEvent.run_state_transition(
                     run_id="run-1",
@@ -245,6 +298,7 @@ class RunStoreTests(unittest.TestCase):
             progress = derive_run_lifecycle(records)
             payload = progress.to_json()
 
+        self.assertEqual(records[2]["record_type"], AGENT_CONTEXT_OBSERVED_RECORD_TYPE)
         self.assertEqual(progress.state, "finalized")
         self.assertEqual(
             [transition["state"] for transition in payload["lifecycle_transitions"]],
@@ -264,6 +318,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(
             by_state["scheduled"]["record_type"], LOCK_ACQUIRED_RECORD_TYPE
         )
+        self.assertEqual(by_state["started"]["record_type"], RUN_STARTED_RECORD_TYPE)
         self.assertEqual(by_state["reported"]["record_type"], WORKER_REPORT_RECORD_TYPE)
         self.assertEqual(by_state["finalized"]["record_type"], RUN_RECORD_TYPE)
 

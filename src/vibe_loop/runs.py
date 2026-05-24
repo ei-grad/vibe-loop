@@ -30,6 +30,8 @@ LIFECYCLE_EVENT_SCHEMA_VERSION = 1
 LOCK_ACQUIRED_RECORD_TYPE = "lock_acquired"
 LOCK_RELEASED_RECORD_TYPE = "lock_released"
 LOCK_EXPIRED_RECORD_TYPE = "lock_expired"
+RUN_STARTED_RECORD_TYPE = "run_started"
+AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
 WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE = "workspace_claim_mismatch"
@@ -40,6 +42,8 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         LOCK_ACQUIRED_RECORD_TYPE,
         LOCK_RELEASED_RECORD_TYPE,
         LOCK_EXPIRED_RECORD_TYPE,
+        RUN_STARTED_RECORD_TYPE,
+        AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
         WORKSPACE_CLAIM_RECORD_TYPE,
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
         RUN_STATE_TRANSITION_RECORD_TYPE,
@@ -80,6 +84,7 @@ class RunResult:
     start_main: str
     end_main: str
     message: str = ""
+    started_at: str = ""
     session_id: str | None = None
     session_id_source: str = "fallback:run_id"
     agent_command_source: str = ""
@@ -91,6 +96,14 @@ class RunResult:
     agent_prompt_dialect_source: str = ""
     agent_skill_ref_prefix: str = ""
     agent_skill_ref_prefix_source: str = ""
+    model_provider: str = ""
+    model_provider_source: str = ""
+    model_id: str = ""
+    model_id_source: str = ""
+    reasoning_effort: str = ""
+    reasoning_effort_source: str = ""
+    trailer_context: dict[str, Any] = dataclasses.field(default_factory=dict)
+    trailer_context_sources: dict[str, Any] = dataclasses.field(default_factory=dict)
     classification_source: str = ""
     worker_report: dict[str, object] | None = None
     restart_count: int = 0
@@ -98,7 +111,7 @@ class RunResult:
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "run_id": self.run_id,
             "session_id": self.session_id or self.run_id,
             "session_id_source": self.session_id_source,
@@ -109,6 +122,7 @@ class RunResult:
             "start_main": self.start_main,
             "end_main": self.end_main,
             "message": self.message,
+            "started_at": self.started_at,
             "agent_command_source": self.agent_command_source,
             "agent_selection_command_source": self.agent_selection_command_source,
             "agent_default_policy_source": self.agent_default_policy_source,
@@ -124,6 +138,23 @@ class RunResult:
             "max_restarts": self.max_restarts,
             "finished_at": self.finished_at,
         }
+        if self.model_provider:
+            payload["model_provider"] = self.model_provider
+        if self.model_provider_source:
+            payload["model_provider_source"] = self.model_provider_source
+        if self.model_id:
+            payload["model_id"] = self.model_id
+        if self.model_id_source:
+            payload["model_id_source"] = self.model_id_source
+        if self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
+        if self.reasoning_effort_source:
+            payload["reasoning_effort_source"] = self.reasoning_effort_source
+        if self.trailer_context:
+            payload["trailer_context"] = self.trailer_context
+        if self.trailer_context_sources:
+            payload["trailer_context_sources"] = self.trailer_context_sources
+        return payload
 
     def to_record(self) -> dict[str, object]:
         record = self.to_json()
@@ -300,6 +331,42 @@ class RunLifecycleEvent:
         )
 
     @classmethod
+    def run_started(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {"status": "started"}
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=RUN_STARTED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=event_payload,
+        )
+
+    @classmethod
+    def agent_context_observed(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {"status": "observed"}
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=event_payload,
+        )
+
+    @classmethod
     def task_restart(
         cls,
         *,
@@ -311,6 +378,7 @@ class RunLifecycleEvent:
         reason: str,
         exhausted: bool = False,
         attempted_restart_count: int | None = None,
+        started_at: str = "",
     ) -> RunLifecycleEvent:
         event_payload: dict[str, Any] = {
             "task_id": task_id,
@@ -320,6 +388,8 @@ class RunLifecycleEvent:
             "reason": reason,
             "exhausted": exhausted,
         }
+        if started_at:
+            event_payload["started_at"] = started_at
         if attempted_restart_count is not None:
             event_payload["attempted_restart_count"] = attempted_restart_count
         return cls(
@@ -387,6 +457,7 @@ class RunHistoryView:
     status: str
     record_type: str
     updated_at: str
+    started_at: str
     log_path: Path | None
     exit_code: int | None
     session_id: str
@@ -397,6 +468,14 @@ class RunHistoryView:
     agent_prompt_dialect_source: str
     agent_skill_ref_prefix: str
     agent_skill_ref_prefix_source: str
+    model_provider: str
+    model_provider_source: str
+    model_id: str
+    model_id_source: str
+    reasoning_effort: str
+    reasoning_effort_source: str
+    trailer_context: dict[str, Any]
+    trailer_context_sources: dict[str, Any]
     classification_source: str
     worker_report: dict[str, Any] | None
     restart_count: int
@@ -421,6 +500,7 @@ class RunHistoryView:
             status=record_status(latest),
             record_type=record_type_label(latest),
             updated_at=record_updated_at(latest),
+            started_at=latest_text(valid_records, "started_at"),
             log_path=latest_log_path(valid_records),
             exit_code=record_exit_code(latest),
             session_id=latest_text(valid_records, "session_id") or run_id,
@@ -440,6 +520,20 @@ class RunHistoryView:
                 valid_records,
                 "agent_skill_ref_prefix_source",
             ),
+            model_provider=latest_text(valid_records, "model_provider"),
+            model_provider_source=latest_text(valid_records, "model_provider_source"),
+            model_id=latest_text(valid_records, "model_id"),
+            model_id_source=latest_text(valid_records, "model_id_source"),
+            reasoning_effort=latest_text(valid_records, "reasoning_effort"),
+            reasoning_effort_source=latest_text(
+                valid_records,
+                "reasoning_effort_source",
+            ),
+            trailer_context=latest_mapping(valid_records, "trailer_context"),
+            trailer_context_sources=latest_mapping(
+                valid_records,
+                "trailer_context_sources",
+            ),
             classification_source=latest_text(valid_records, "classification_source"),
             worker_report=latest_worker_report_payload(valid_records),
             restart_count=latest_int(records, "restart_count") or 0,
@@ -458,6 +552,7 @@ class RunHistoryView:
             "status": self.status,
             "record_type": self.record_type,
             "updated_at": self.updated_at,
+            "started_at": self.started_at,
             "log": str(self.log_path) if self.log_path is not None else "",
             "exit_code": self.exit_code,
             "session_id": self.session_id,
@@ -468,6 +563,14 @@ class RunHistoryView:
             "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
             "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
+            "model_provider": self.model_provider,
+            "model_provider_source": self.model_provider_source,
+            "model_id": self.model_id,
+            "model_id_source": self.model_id_source,
+            "reasoning_effort": self.reasoning_effort,
+            "reasoning_effort_source": self.reasoning_effort_source,
+            "trailer_context": self.trailer_context,
+            "trailer_context_sources": self.trailer_context_sources,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
             "restart_count": self.restart_count,
@@ -664,6 +767,12 @@ def observed_lifecycle_states(record: dict[str, Any]) -> tuple[str, ...]:
         LOCK_EXPIRED_RECORD_TYPE,
     } and lock_record_is_task_scoped(record):
         states.append("scheduled")
+    if record_type == RUN_STARTED_RECORD_TYPE:
+        states.append("started")
+    if record_type == AGENT_CONTEXT_OBSERVED_RECORD_TYPE and string_value(
+        record.get("session_id")
+    ):
+        states.append("session_observed")
     if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
         to_state = string_value(record.get("to_state"))
         if to_state in LIFECYCLE_STATES:
@@ -743,6 +852,10 @@ def record_status(record: dict[str, Any]) -> str:
     record_type = record.get("record_type")
     if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
         return string_value(record.get("to_state"))
+    if record_type == RUN_STARTED_RECORD_TYPE:
+        return "started"
+    if record_type == AGENT_CONTEXT_OBSERVED_RECORD_TYPE:
+        return string_value(record.get("status")) or "observed"
     if record_type == WORKSPACE_CLAIM_RECORD_TYPE:
         return string_value(record.get("event_type")) or WORKSPACE_CLAIMED_EVENT_TYPE
     if record_type == WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE:
@@ -803,6 +916,14 @@ def latest_text(records: list[dict[str, Any]], key: str) -> str:
         if value:
             return value
     return ""
+
+
+def latest_mapping(records: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    for record in reversed(records):
+        value = record.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
 
 
 def latest_int(records: list[dict[str, Any]], key: str) -> int | None:

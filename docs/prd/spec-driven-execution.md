@@ -86,7 +86,15 @@ Acceptance must cover commit trailers or worker-report metadata, planning
 analytics ingestion, spec coverage reports, unmapped commit warnings, and
 distinguishing attempted work from accepted completion evidence.
 
-Related implementation IDs: `GANTT-02`, `GANTT-06`, `SDD-05`.
+`runs.jsonl` should expose enough bounded run context for repository-specific
+tools to create those durable mappings outside one host's state directory. That
+context can include plan/task IDs, run IDs, agent kind, model provider, model
+ID, reasoning effort, and native session IDs when those values are observed from
+agent startup output or safely inferred from runtime facts, but it remains
+candidate evidence until a project-owned hook, commit trailer, worker report,
+task source, or worklog persists it.
+
+Related implementation IDs: `GANTT-02`, `GANTT-06`, `SDD-05`, `RT-07`.
 
 ## PRD-SDE-007 Parallel Spec Task Waves
 

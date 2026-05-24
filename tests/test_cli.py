@@ -264,6 +264,7 @@ class CliTests(unittest.TestCase):
             write_python_executable(
                 bin_dir / "codex",
                 "from pathlib import Path\n"
+                "import json\n"
                 "import sys\n"
                 "if sys.argv[1] != 'exec':\n"
                 "    raise SystemExit(64)\n"
@@ -274,6 +275,8 @@ class CliTests(unittest.TestCase):
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
+                "print(json.dumps({'model': {'provider': 'openai', "
+                "'id': 'gpt-5.5', 'reasoning_effort': 'high'}}))\n"
                 "print('session id: codex-native-123')\n"
                 "print(f'codex out: {sys.argv[2]}')\n",
             )
@@ -298,6 +301,22 @@ class CliTests(unittest.TestCase):
                 for record in run_records
                 if record.get("record_type") == "run_result"
             )
+            run_started = next(
+                record
+                for record in run_records
+                if record.get("record_type") == "run_started"
+            )
+            context_observed = next(
+                record
+                for record in run_records
+                if record.get("record_type") == "agent_context_observed"
+            )
+            session_observed = next(
+                record
+                for record in run_records
+                if record.get("record_type") == "run_state_transition"
+                and record.get("to_state") == "session_observed"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -313,8 +332,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(run_result["session_id"], "codex-native-123")
         self.assertEqual(run_result["session_id_source"], "native:stdout")
         self.assertEqual(run_result["agent_prompt_dialect"], "codex")
+        self.assertEqual(run_result["started_at"], run_started["started_at"])
+        self.assertEqual(run_result["model_provider"], "openai")
+        self.assertEqual(run_result["model_id"], "gpt-5.5")
+        self.assertEqual(run_result["reasoning_effort"], "high")
+        self.assertEqual(
+            run_result["trailer_context"]["plan_item_candidates"],
+            ["TASK-01"],
+        )
+        self.assertEqual(
+            run_result["trailer_context"]["session_id"], "codex-native-123"
+        )
+        self.assertEqual(run_started["session_id"], run_started["run_id"])
+        self.assertEqual(run_started["session_id_source"], "fallback:run_id")
+        self.assertEqual(run_started["model_provider"], "openai")
+        self.assertEqual(
+            run_started["model_provider_source"], "command_executable:codex"
+        )
+        self.assertNotIn("model_id", run_started)
+        self.assertEqual(context_observed["model_id"], "gpt-5.5")
+        self.assertEqual(
+            context_observed["model_id_source"], "native:stdout:json.model"
+        )
+        self.assertEqual(context_observed["started_at"], run_started["started_at"])
+        self.assertEqual(session_observed["session_id"], "codex-native-123")
+        self.assertEqual(session_observed["model_id"], "gpt-5.5")
+        for record in run_records:
+            if record.get("record_type") in {
+                "lock_acquired",
+                "run_started",
+                "agent_context_observed",
+                "run_state_transition",
+                "run_result",
+                "lock_released",
+            }:
+                self.assertEqual(record.get("started_at"), run_started["started_at"])
         self.assertIn(
             "lock_acquired",
+            {record.get("record_type") for record in run_records},
+        )
+        self.assertIn(
+            "run_started",
             {record.get("record_type") for record in run_records},
         )
         self.assertIn(
@@ -4476,6 +4534,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(workspace["worktree"], str(repo.resolve()))
         self.assertEqual(workspace["base_commit"], "base-main")
         self.assertEqual(workspace["event_type"], "workspace_claimed")
+        self.assertEqual(workspace["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(workspace["occurred_at"], workspace["claimed_at"])
         self.assertTrue(workspace["head_commit"])
         self.assertTrue(workspace["dirty"])
@@ -4483,6 +4542,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(metadata["workspace"], workspace)
         self.assertEqual(records[0]["record_type"], "workspace_claim")
         self.assertEqual(records[0]["event_type"], "workspace_claimed")
+        self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(records[0]["occurred_at"], records[0]["claimed_at"])
         self.assertEqual(records[0]["branch"], "worker/TASK-01")
         self.assertEqual(workers_exit, 0)
@@ -4597,6 +4657,7 @@ class CliTests(unittest.TestCase):
                         "schema_version": 1,
                         "task_id": "TASK-01",
                         "run_id": "run-1",
+                        "started_at": "2026-05-09T00:00:00+00:00",
                     }
                 ),
                 encoding="utf-8",
@@ -4624,12 +4685,19 @@ class CliTests(unittest.TestCase):
                 )
 
             payload = json.loads(stdout.getvalue())
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stderr.getvalue(), "")
         self.assertFalse(payload["claimed"])
         self.assertEqual(payload["error"], "branch_worktree_mismatch")
         self.assertEqual(payload["details"]["current_branch"], "worker/TASK-01")
+        self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
 
     def test_workers_and_doctor_json_report_workspace_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5395,6 +5463,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(holder["status"]["run_id"], "run-holder")
         self.assertEqual(holder["status"]["pid"], os.getpid())
         self.assertEqual(holder["status"]["pid_source"], "active_task_lock:worker_pid")
+        self.assertEqual(
+            holder["status"]["metadata"]["owner_started_at"],
+            "2026-05-09T00:00:00+00:00",
+        )
         self.assertEqual(waiter_exit, 1)
         self.assertEqual(waiter_stderr.getvalue(), "")
         self.assertFalse(waiter["acquired"])
@@ -5414,6 +5486,8 @@ class CliTests(unittest.TestCase):
             ["lock_acquired", "lock_released"],
         )
         self.assertEqual(records[0]["lock_kind"], "integration")
+        self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
+        self.assertEqual(records[1]["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(records[1]["owner_task_id"], "TASK-01")
 
     def test_main_integration_release_rejects_fencing_token_mismatch(self) -> None:
@@ -5872,10 +5946,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertFalse(payload["acquired"])
         self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertEqual(payload["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertIn("missing_claimed_worktree", codes)
         self.assertFalse(lock_exists)
         self.assertEqual(records[0]["record_type"], "workspace_claim_mismatch")
         self.assertEqual(records[0]["reason"], "workspace_preflight_failed")
+        self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(
             records[0]["diagnostic_count"],
             len(records[0]["details"]["workspace_diagnostics"]),
@@ -5944,6 +6020,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertFalse(payload["acquired"])
         self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertEqual(payload["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertIn("missing_claimed_worktree", codes)
         self.assertFalse(lock_exists)
 
@@ -6485,7 +6562,11 @@ class CliTests(unittest.TestCase):
             manager.acquire_main_integration(
                 task_id="TASK-01",
                 run_id="run-1",
-                metadata={"pid": 999999999, "host": socket.gethostname()},
+                metadata={
+                    "pid": 999999999,
+                    "host": socket.gethostname(),
+                    "owner_started_at": "2026-05-09T00:00:00+00:00",
+                },
             )
             stdout = StringIO()
             with redirect_stdout(stdout):
@@ -6503,6 +6584,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(records[0]["run_id"], "run-1")
         self.assertEqual(records[0]["task_id"], "TASK-01")
         self.assertEqual(records[0]["lock_kind"], "integration")
+        self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
 
     def test_workers_clean_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

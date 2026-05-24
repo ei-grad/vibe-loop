@@ -11,9 +11,20 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover
+    msvcrt = None
 
 
 MAIN_INTEGRATION_LOCK_NAME = "main-integration"
@@ -428,23 +439,32 @@ class DirectoryLockBackend:
         )
         if metadata is not None:
             lock_metadata.update(metadata)
-        try:
-            path.mkdir()
-        except FileExistsError as exc:
-            raise LockBusy(path, read_metadata(path)) from exc
-        try:
-            lock_metadata["fencing_token"] = next_fencing_token(
-                self.lock_root,
-                task_id,
-            )
-            write_metadata(path, lock_metadata)
-        except OSError:
-            shutil.rmtree(path)
-            raise
+        with metadata_update_lock(path):
+            try:
+                path.mkdir()
+            except FileExistsError as exc:
+                raise LockBusy(path, read_metadata(path)) from exc
+            try:
+                lock_metadata["fencing_token"] = next_fencing_token(
+                    self.lock_root,
+                    task_id,
+                )
+                write_metadata(path, lock_metadata)
+            except OSError:
+                shutil.rmtree(path)
+                raise
         return TaskLock(task_id=task_id, path=path, metadata=lock_metadata)
 
     def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
-        write_metadata(task_lock.path, metadata)
+        with metadata_update_lock(task_lock.path):
+            current = read_metadata(task_lock.path)
+            validate_lock_fencing_token(
+                task_lock.metadata,
+                current,
+                path=task_lock.path,
+            )
+            metadata = preserve_runtime_lock_fields(metadata, current)
+            write_metadata(task_lock.path, metadata)
         return TaskLock(
             task_id=task_lock.task_id,
             path=task_lock.path,
@@ -452,12 +472,19 @@ class DirectoryLockBackend:
         )
 
     def release(self, task_lock: TaskLock) -> None:
-        if task_lock.path.exists():
-            shutil.rmtree(task_lock.path)
+        with metadata_update_lock(task_lock.path):
+            current = read_metadata(task_lock.path)
+            validate_lock_fencing_token(
+                task_lock.metadata,
+                current,
+                path=task_lock.path,
+            )
+            if task_lock.path.exists():
+                shutil.rmtree(task_lock.path)
 
     def status(self, task_id: str) -> dict[str, object] | None:
         path = self.path_for(task_id)
-        if not path.exists():
+        if not path.exists() or not path.is_dir():
             return None
         metadata = read_metadata(path)
         metadata.setdefault("task_id", task_id)
@@ -469,6 +496,8 @@ class DirectoryLockBackend:
             return []
         locks: list[dict[str, object]] = []
         for path in sorted(self.lock_root.glob("*.lock")):
+            if not path.is_dir():
+                continue
             metadata = read_metadata(path)
             if not path.exists():
                 continue
@@ -857,7 +886,45 @@ def preserve_runtime_lock_fields(
     for key in ("fencing_token", "lease_seconds", "heartbeat_at"):
         if key not in updated and key in current:
             updated[key] = current[key]
+    for key in (
+        "workspace",
+        "worker_pid",
+        "pid",
+        "session_id_source",
+        "model_provider",
+        "model_provider_source",
+        "model_id",
+        "model_id_source",
+        "reasoning_effort",
+        "reasoning_effort_source",
+        "trailer_context",
+        "trailer_context_sources",
+    ):
+        if runtime_lock_field_empty(updated.get(key)) and not runtime_lock_field_empty(
+            current.get(key)
+        ):
+            updated[key] = current[key]
+    if (
+        updated.get("session_id") == updated.get("run_id")
+        and not runtime_lock_field_empty(current.get("session_id"))
+        and current.get("session_id") != current.get("run_id")
+    ):
+        updated["session_id"] = current["session_id"]
+    if (
+        updated.get("session_id_source") == "fallback:run_id"
+        and not runtime_lock_field_empty(current.get("session_id_source"))
+        and current.get("session_id_source") != "fallback:run_id"
+    ):
+        updated["session_id_source"] = current["session_id_source"]
     return updated
+
+
+def runtime_lock_field_empty(value: object) -> bool:
+    if value is None or value == "":
+        return True
+    if isinstance(value, dict):
+        return not value
+    return False
 
 
 def next_fencing_token(lock_root: Path, task_id: str) -> str:
@@ -1096,3 +1163,44 @@ def write_metadata(path: Path, metadata: dict[str, object]) -> None:
         encoding="utf-8",
     )
     temp_path.replace(metadata_path)
+
+
+@contextmanager
+def metadata_update_lock(path: Path):
+    lock_path = path.parent / f".{path.name}.metadata-update"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        ensure_metadata_lock_byte(handle)
+        lock_metadata_file(handle)
+        try:
+            yield
+        finally:
+            unlock_metadata_file(handle)
+
+
+def ensure_metadata_lock_byte(handle) -> None:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+    handle.seek(0)
+
+
+def lock_metadata_file(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+    raise LockBackendError("metadata update locking is unsupported on this platform")
+
+
+def unlock_metadata_file(handle) -> None:
+    if fcntl is not None:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)

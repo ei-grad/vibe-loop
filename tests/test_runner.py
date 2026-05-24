@@ -32,6 +32,7 @@ from vibe_loop.runner import (
     build_spec_worker_context,
     build_worker_prompt,
     deterministic_task_batch,
+    parse_agent_runtime_context_from_command,
     parse_selected_task_id,
     parse_selected_task_ids,
     parse_worker_session_id,
@@ -1810,6 +1811,73 @@ class RunnerTests(unittest.TestCase):
                 "session id: native-stdout-123",
                 log_path.read_text(encoding="utf-8"),
             )
+
+    def test_streaming_command_captures_startup_model_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import json\n"
+                "print(json.dumps({'model': {'provider': 'openai', "
+                "'id': 'gpt-5.5', 'reasoning_effort': 'high'}}))\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            observations = []
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                    on_observation=observations.append,
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.runtime_context.model_provider, "openai")
+        self.assertEqual(result.runtime_context.model_id, "gpt-5.5")
+        self.assertEqual(result.runtime_context.reasoning_effort, "high")
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0].runtime_context.model_id, "gpt-5.5")
+
+    def test_streaming_command_ignores_unqualified_reasoning_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import json\n"
+                "print(json.dumps({'model': {'id': 'gpt-5.5'}, "
+                "'reasoning': 'private chain of thought'}))\n"
+                "print('reasoning: secret-token-value')\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.runtime_context.model_id, "gpt-5.5")
+        self.assertEqual(result.runtime_context.reasoning_effort, "")
+
+    def test_command_context_omits_shell_variables_and_wrapper_inference(self) -> None:
+        context = parse_agent_runtime_context_from_command(
+            "python wrapper.py codex exec --model $MODEL --reasoning-effort verbose"
+        )
+
+        self.assertEqual(context.model_provider, "")
+        self.assertEqual(context.model_id, "")
+        self.assertEqual(context.reasoning_effort, "")
+
+    def test_command_context_accepts_direct_executable_and_safe_effort(self) -> None:
+        context = parse_agent_runtime_context_from_command(
+            "OPENAI_API_KEY=redacted codex exec --model gpt-5.5 --reasoning-effort high"
+        )
+
+        self.assertEqual(context.model_provider, "openai")
+        self.assertEqual(context.model_provider_source, "command_executable:codex")
+        self.assertEqual(context.model_id, "gpt-5.5")
+        self.assertEqual(context.reasoning_effort, "high")
 
     def test_streaming_command_reports_started_process_pid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
