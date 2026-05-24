@@ -1614,6 +1614,65 @@ class CliTests(unittest.TestCase):
             "\n".join(payload["agent"]["diagnostics"]),
         )
 
+    def test_doctor_redacts_user_authored_command_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            lock_acquire_command = (
+                f'{sys.executable} -c "import json; '
+                "print(json.dumps({'acquired': False, 'metadata': {}}))\""
+            )
+            lock_release_command = (
+                f'{sys.executable} -c "import json; '
+                "print(json.dumps({'released': True}))\""
+            )
+            lock_status_command = (
+                f'{sys.executable} -c "import json; '
+                "print(json.dumps({'locked': False}))\""
+            )
+            lock_list_command = (
+                f'{sys.executable} -c "import json; print(json.dumps([]))"'
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'list = "PRIVATE_VALUE tracker list"\n'
+                'next = "PRIVATE_VALUE tracker next"\n'
+                'probe = "PRIVATE_VALUE tracker probe"\n'
+                "[locks]\n"
+                'type = "command"\n'
+                f"acquire_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_acquire_command)}\n"
+                f"release_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_release_command)}\n"
+                f"status_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_status_command)}\n"
+                f"list_command = {json.dumps('PRIVATE_VALUE=1 ' + lock_list_command)}\n"
+                "[completion]\n"
+                'commands = ["PRIVATE_VALUE completion"]\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertNotIn("PRIVATE_VALUE", stdout.getvalue())
+        self.assertNotIn("tracker list", stdout.getvalue())
+        self.assertNotIn("locks acquire", stdout.getvalue())
+        self.assertNotIn("PRIVATE_VALUE completion", stdout.getvalue())
+        self.assertNotIn("list_command", payload["task_source"])
+        self.assertTrue(payload["task_source"]["list_command_configured"])
+        self.assertTrue(payload["task_source"]["list_command_redacted"])
+        runtime_source = payload["task_source_runtime"]["task_source"]
+        self.assertNotIn("list_command", runtime_source)
+        self.assertTrue(runtime_source["list_command_configured"])
+        self.assertNotIn("acquire_command", payload["locks"])
+        self.assertTrue(payload["locks"]["acquire_command_configured"])
+        self.assertEqual(payload["completion"]["commands_configured"], 1)
+        self.assertTrue(payload["completion"]["commands_redacted"])
+
     def test_doctor_reports_planning_analytics_readiness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -1749,6 +1808,37 @@ class CliTests(unittest.TestCase):
             specs_payload["diagnostics"][0]["code"],
             "command_task_source_unchecked",
         )
+
+    def test_doctor_command_task_source_without_specs_does_not_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "task_source.py").write_text(
+                "from pathlib import Path\n"
+                "Path('task-source-ran').write_text('ran', encoding='utf-8')\n"
+                "print('{\"tasks\": []}')\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "command"\n'
+                f'list = "{sys.executable} task_source.py"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse((repo / "task-source-ran").exists())
+        self.assertEqual(payload["specs"]["status"], "not_configured")
+        self.assertEqual(payload["specs"]["diagnostics"], [])
+        self.assertEqual(payload["task_source_runtime"]["origin"], "command_output")
 
     def test_specs_check_advisory_diagnostics_do_not_fail_without_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

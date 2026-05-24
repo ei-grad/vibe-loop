@@ -68,8 +68,9 @@ cost before the local suite and SWE-style adapters are stable.
 
 ## Adapter Risks
 
-The first EVAL-07 implementation should treat these as adapter requirements, not
-only benchmark background:
+`EVAL-07` adds the external benchmark eval contract and a manifest-driven smoke
+adapter. Benchmark-specific SWE-style or Terminal-Bench adapters should treat
+these as follow-on adapter requirements, not only benchmark background:
 
 - SWE-bench Pro: preserve the official scaffold, split, and reporting rules when
   claiming comparability; otherwise label results non-leaderboard. Record public

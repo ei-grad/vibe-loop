@@ -353,6 +353,14 @@ a task id, for example
 smoke evidence can be attached with `--external-benchmark-json`; it is recorded
 as optional context and is not required for every bundled skill change.
 
+`eval benchmark --adapter manifest --manifest path/to/benchmark.json` runs an
+explicit external smoke manifest through the same paired-condition harness
+without claiming public leaderboard comparability. Manifest instances record
+dataset, split, sample IDs, image identifiers, harness provenance, and grader
+provenance; setup and grader commands are configured by the manifest rather than
+emitted as raw result fields. Benchmark-specific Docker, storage, network, and
+dataset-term decisions remain outside the bundled release gate.
+
 Workers can explicitly report their final status while the supervisor run is
 active:
 

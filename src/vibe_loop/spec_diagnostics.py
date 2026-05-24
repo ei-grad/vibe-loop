@@ -134,7 +134,7 @@ def command_backed_task_source(task_source: object) -> bool:
 
 def command_backed_source_report(config: VibeConfig) -> dict[str, object]:
     if not config.specs.explicit_keys:
-        return spec_report_from_tasks(config, ())
+        return spec_report_from_tasks(config, (), ())
     diagnostic = SpecDiagnostic(
         code="command_task_source_unchecked",
         severity="error" if config.specs.enforces_execution else "warning",

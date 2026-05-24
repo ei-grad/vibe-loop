@@ -76,4 +76,10 @@ disclosure, dataset and harness provenance, sample IDs, image identifiers where
 relevant, grader provenance, non-leaderboard caveats, and separation from
 bundled skill release requirements.
 
+The first supported adapter may be manifest-driven: repositories provide a
+small, explicit benchmark manifest with instance metadata, setup commands,
+grader commands, image identifiers, and harness provenance. Public
+benchmark-specific adapters can be added later when their dataset terms,
+container requirements, and comparability rules are pinned.
+
 Related implementation IDs: `EVAL-04`, `EVAL-07`.

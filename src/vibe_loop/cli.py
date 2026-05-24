@@ -554,7 +554,12 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--adapter",
         required=True,
-        help="Adapter name (registered adapters: stub)",
+        help="Adapter name (registered adapters: manifest, stub)",
+    )
+    benchmark.add_argument(
+        "--manifest",
+        type=Path,
+        help="JSON manifest for the manifest benchmark adapter",
     )
     benchmark.add_argument(
         "--agent-command",
@@ -761,8 +766,10 @@ def dispatch(args: argparse.Namespace) -> int:
                     "config": config.config_report(),
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
-                    "task_source": config.task_source.to_json(),
-                    "task_source_runtime": task_source_runtime,
+                    "task_source": redacted_task_source_config(config.task_source),
+                    "task_source_runtime": redacted_task_source_report(
+                        task_source_runtime,
+                    ),
                     "generated_task_profile": generated_task_cache_report(config),
                     "planning_analytics": analytics_report,
                     "specs": build_spec_diagnostics_report(
@@ -770,8 +777,8 @@ def dispatch(args: argparse.Namespace) -> int:
                         task_source_runtime=task_source_runtime,
                     ),
                     "agent": config.agent.to_json(),
-                    "locks": config.locks.to_json(),
-                    "completion": config.completion.__dict__,
+                    "locks": redacted_lock_config(config.locks),
+                    "completion": redacted_completion_config(config.completion),
                     "stale_locks": stale_report,
                     "concurrency_diagnostics": concurrency_diagnostics_report(workers),
                     "workspace_diagnostics": workspace_diagnostics_report(workers),
@@ -924,6 +931,49 @@ def dispatch_planning_artifacts(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def redacted_task_source_report(report: dict[str, object]) -> dict[str, object]:
+    payload = dict(report)
+    task_source = payload.get("task_source")
+    if isinstance(task_source, dict):
+        payload["task_source"] = redact_task_source_payload(task_source)
+    return payload
+
+
+def redacted_task_source_config(task_source) -> dict[str, object]:
+    return redact_task_source_payload(task_source.to_json())
+
+
+def redact_task_source_payload(payload: dict[str, object]) -> dict[str, object]:
+    redacted = dict(payload)
+    for key in ("list_command", "next_command", "probe_command"):
+        configured = bool(redacted.pop(key, None))
+        redacted[f"{key}_configured"] = configured
+        redacted[f"{key}_redacted"] = configured
+    return redacted
+
+
+def redacted_lock_config(locks) -> dict[str, object]:
+    payload = dict(locks.to_json())
+    for key in (
+        "acquire_command",
+        "release_command",
+        "status_command",
+        "list_command",
+    ):
+        configured = bool(payload.pop(key, None))
+        payload[f"{key}_configured"] = configured
+        payload[f"{key}_redacted"] = configured
+    return payload
+
+
+def redacted_completion_config(completion) -> dict[str, object]:
+    count = len(completion.commands)
+    return {
+        "commands_configured": count,
+        "commands_redacted": count > 0,
+    }
+
+
 def dispatch_eval(args: argparse.Namespace, config) -> int:
     if args.eval_command == "local-demo":
         output_root = args.output or (config.state_path / "eval-runs")
@@ -981,7 +1031,14 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
     if args.eval_command == "benchmark":
         from vibe_loop.eval_benchmark import BenchmarkEvalConfig, run_benchmark_eval
 
-        adapter = resolve_benchmark_adapter(args.adapter)
+        try:
+            adapter = resolve_benchmark_adapter(
+                args.adapter,
+                manifest_path=args.manifest,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         if adapter is None:
             print(f"unknown benchmark adapter: {args.adapter}", file=sys.stderr)
             return 2
@@ -1039,7 +1096,17 @@ def _parse_benchmark_agent_commands(
     return commands
 
 
-def resolve_benchmark_adapter(name: str) -> object | None:
+def resolve_benchmark_adapter(
+    name: str,
+    *,
+    manifest_path: Path | None = None,
+) -> object | None:
+    if name == "manifest":
+        if manifest_path is None:
+            raise ValueError("manifest benchmark adapter requires --manifest")
+        from vibe_loop.eval_benchmark_manifest import ManifestBenchmarkAdapter
+
+        return ManifestBenchmarkAdapter(manifest_path)
     adapters: dict[str, type] = {}
     try:
         from vibe_loop.eval_benchmark_stub import StubBenchmarkAdapter

@@ -1,6 +1,6 @@
 [project]
 name = "vibe-loop"
-version = "0.1.1"
+version = "0.2.0"
 description = "One-slice AI coding loop runner with pluggable task sources"
 readme = "README.md"
 license = "MIT"

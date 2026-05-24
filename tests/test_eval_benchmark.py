@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from collections.abc import Sequence
 from pathlib import Path
 
+from vibe_loop.cli import main
 from vibe_loop.eval_benchmark import (
     BenchmarkEvalConfig,
     BenchmarkGraderResult,
     BenchmarkInstance,
     run_benchmark_eval,
 )
+from vibe_loop.eval_benchmark_manifest import ManifestBenchmarkAdapter
 
 
 class StubAdapter:
@@ -268,6 +273,127 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertTrue(result["timeout"])
         self.assertIn("grader_result", result)
         self.assertFalse(result["grader_result"]["passed"])
+
+    def test_manifest_adapter_runs_configured_smoke_instance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = root / "fixture"
+            fixture.mkdir()
+            (fixture / "expected.txt").write_text("ok\n", encoding="utf-8")
+            manifest = root / "benchmark.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "name": "swe-style-smoke",
+                        "version": "2026-05-24",
+                        "harness": {
+                            "name": "manifest",
+                            "version": "1",
+                            "provenance": "local fixture",
+                        },
+                        "instances": [
+                            {
+                                "instance_id": "sample-001",
+                                "dataset": "swe-style-public",
+                                "split": "smoke",
+                                "repo": "example/project",
+                                "language": "python",
+                                "image": "registry/example:latest",
+                                "image_digest": "sha256:abc",
+                                "setup": {
+                                    "copy": [
+                                        {"from": "fixture", "to": "fixture"},
+                                    ],
+                                },
+                                "grader": {
+                                    "name": "fixture-grader",
+                                    "provenance": "local",
+                                    "command": (
+                                        "test -f generated.txt && "
+                                        "test -f fixture/expected.txt"
+                                    ),
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            adapter = ManifestBenchmarkAdapter(manifest)
+            payload = run_benchmark_eval(
+                BenchmarkEvalConfig(
+                    adapter=adapter,
+                    output_root=root / "out",
+                    agent_commands={"smoke": "touch generated.txt"},
+                    trials=1,
+                    timeout_seconds=30,
+                )
+            )
+
+        self.assertEqual(payload["adapter"], "swe-style-smoke")
+        self.assertEqual(payload["adapter_version"], "2026-05-24")
+        result = payload["results"][0]
+        self.assertTrue(result["grader_result"]["passed"])
+        self.assertEqual(result["instance"]["dataset"], "swe-style-public")
+        self.assertEqual(result["instance"]["image_digest"], "sha256:abc")
+        self.assertEqual(
+            result["grader_result"]["metadata"]["harness"]["provenance"],
+            "local fixture",
+        )
+
+    def test_cli_runs_manifest_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            manifest = root / "benchmark.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "name": "manifest-cli-smoke",
+                        "instances": [
+                            {
+                                "instance_id": "cli-001",
+                                "dataset": "fixture",
+                                "split": "smoke",
+                                "grader": {
+                                    "command": "test -f generated.txt",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "eval",
+                        "benchmark",
+                        "--repo",
+                        str(repo),
+                        "--output",
+                        str(root / "out"),
+                        "--adapter",
+                        "manifest",
+                        "--manifest",
+                        str(manifest),
+                        "--agent-command",
+                        "smoke=touch generated.txt",
+                        "--timeout",
+                        "30",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["adapter"], "manifest-cli-smoke")
+        self.assertTrue(payload["results"][0]["grader_result"]["passed"])
 
 
 if __name__ == "__main__":
