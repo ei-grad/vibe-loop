@@ -779,7 +779,7 @@ class StaleLockTests(unittest.TestCase):
             )
 
         self.assertEqual(len(stale), 1)
-        self.assertEqual(stale[0].task_id, "main-integration")
+        self.assertEqual(stale[0].task_id, "TASK-01")
         self.assertEqual(stale[0].kind, "integration")
         self.assertEqual(stale[0].stale_reason, "missing_process")
         self.assertIn("rm -rf", stale[0].recovery_command)

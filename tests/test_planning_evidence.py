@@ -10,7 +10,12 @@ from unittest.mock import patch
 
 from vibe_loop.config import load_config
 from vibe_loop.planning_evidence import collect_planning_evidence, run_worklog_command
-from vibe_loop.runs import RunStore, WorkerReport
+from vibe_loop.runs import (
+    LOCK_EXPIRED_RECORD_TYPE,
+    RunLifecycleEvent,
+    RunStore,
+    WorkerReport,
+)
 
 PYTHON = sys.executable.replace("\\", "/")
 
@@ -66,12 +71,23 @@ class PlanningEvidenceTests(unittest.TestCase):
             git(repo, "add", "src/unmapped.py")
             git(repo, "commit", "-m", "unmapped implementation")
             unmapped_commit = git(repo, "rev-parse", "HEAD").stdout.strip()
-            RunStore(repo / ".vibe-loop" / "runs.jsonl").append_report(
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            run_store.append_report(
                 WorkerReport(
                     run_id="run-1",
                     task_id="TASK-01",
                     status="completed",
                     commit=mapped_commit,
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_EXPIRED_RECORD_TYPE,
+                    run_id="run-stale",
+                    task_id="BOGUS-LIFECYCLE",
+                    lock_kind="task",
+                    lock_path=repo / ".vibe-loop" / "locks" / "BOGUS.lock",
+                    payload={"stale_reason": "missing_process"},
                 )
             )
 
@@ -83,6 +99,12 @@ class PlanningEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(evidence["task_source_origin"], "default_markdown_discovery")
         self.assertEqual(evidence["run_attempts"][0]["record_type"], "worker_report")
+        self.assertFalse(
+            any(
+                attempt["task_id"] == "BOGUS-LIFECYCLE"
+                for attempt in evidence["run_attempts"]
+            )
+        )
         mapping_sources = {
             (mapping["task_id"], mapping["commit"], mapping["source"])
             for mapping in evidence["commit_mappings"]
@@ -92,6 +114,14 @@ class PlanningEvidenceTests(unittest.TestCase):
             mapping_sources,
         )
         self.assertIn(("TASK-01", mapped_commit, "worker_report"), mapping_sources)
+        warning_task_ids = {
+            (warning["code"], warning.get("task_id"))
+            for warning in evidence["warnings"]
+        }
+        self.assertNotIn(
+            ("unknown_task_reference", "BOGUS-LIFECYCLE"),
+            warning_task_ids,
+        )
         self.assertTrue(
             any(
                 mapping["task_id"] == "TASK-01"

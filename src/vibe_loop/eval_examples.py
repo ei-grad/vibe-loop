@@ -26,6 +26,7 @@ from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_RECORD_TYPE,
     MAIN_INTEGRATION_LOCK_SCHEMA_VERSION,
 )
+from vibe_loop.runs import WORKSPACE_CLAIM_RECORD_TYPE, WORKSPACE_CLAIMED_EVENT_TYPE
 
 
 EXAMPLE_SUITE_ID = "local-demo-v1"
@@ -398,9 +399,12 @@ def update_workspace_claim(
         current_branch = run_git_output(worktree, "branch", "--show-current")
         status = run_git_output(worktree, "status", "--short")
         dirty_summary = tuple(line for line in status.splitlines() if line)
+    claimed_at = utc_now()
     metadata["workspace"] = {
         "schema_version": 1,
-        "record_type": "workspace_claim",
+        "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+        "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+        "occurred_at": claimed_at,
         "task_id": task_id,
         "run_id": run_id,
         "branch": branch,
@@ -410,7 +414,7 @@ def update_workspace_claim(
         "current_branch": current_branch,
         "dirty": bool(dirty_summary),
         "dirty_summary": list(dirty_summary),
-        "claimed_at": utc_now(),
+        "claimed_at": claimed_at,
     }
     write_json_file(lock_path, metadata)
 

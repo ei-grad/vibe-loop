@@ -8,7 +8,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Mapping
 
 try:
     import fcntl
@@ -26,6 +26,30 @@ RUN_RECORD_TYPE = "run_result"
 WORKER_REPORT_SCHEMA_VERSION = 1
 WORKER_REPORT_RECORD_TYPE = "worker_report"
 WORKER_REPORT_STATUSES = ("completed", "blocked", "failed", "unknown")
+LIFECYCLE_EVENT_SCHEMA_VERSION = 1
+LOCK_ACQUIRED_RECORD_TYPE = "lock_acquired"
+LOCK_RELEASED_RECORD_TYPE = "lock_released"
+LOCK_EXPIRED_RECORD_TYPE = "lock_expired"
+WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
+WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
+WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE = "workspace_claim_mismatch"
+RUN_STATE_TRANSITION_RECORD_TYPE = "run_state_transition"
+LIFECYCLE_RECORD_TYPES = frozenset(
+    {
+        LOCK_ACQUIRED_RECORD_TYPE,
+        LOCK_RELEASED_RECORD_TYPE,
+        LOCK_EXPIRED_RECORD_TYPE,
+        WORKSPACE_CLAIM_RECORD_TYPE,
+        WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+        RUN_STATE_TRANSITION_RECORD_TYPE,
+    }
+)
+KNOWN_RECORD_TYPES = frozenset(
+    {RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE, *LIFECYCLE_RECORD_TYPES}
+)
+LIFECYCLE_PROTECTED_KEYS = frozenset(
+    {"schema_version", "record_type", "occurred_at", "run_id"}
+)
 _APPEND_LOCK = threading.Lock()
 LOCK_POLL_SECONDS = 0.05
 LOCK_TIMEOUT_SECONDS = 30.0
@@ -156,6 +180,114 @@ class WorkerReport:
 
 
 @dataclasses.dataclass(frozen=True)
+class RunLifecycleEvent:
+    record_type: str
+    run_id: str
+    task_id: str = ""
+    payload: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    occurred_at: str = dataclasses.field(default_factory=utc_now_iso)
+
+    def __post_init__(self) -> None:
+        if self.record_type not in LIFECYCLE_RECORD_TYPES:
+            raise ValueError(
+                "lifecycle event record_type must be one of: "
+                f"{', '.join(sorted(LIFECYCLE_RECORD_TYPES))}"
+            )
+        if not self.run_id:
+            raise ValueError("lifecycle event run_id is required")
+        protected = LIFECYCLE_PROTECTED_KEYS.intersection(self.payload)
+        if protected:
+            raise ValueError(
+                "lifecycle event payload cannot override core keys: "
+                f"{', '.join(sorted(protected))}"
+            )
+
+    @classmethod
+    def lock_event(
+        cls,
+        record_type: str,
+        *,
+        run_id: str,
+        task_id: str,
+        lock_kind: str,
+        lock_path: Path | str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "lock_kind": lock_kind,
+            "lock_path": str(lock_path),
+        }
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(record_type=record_type, run_id=run_id, payload=event_payload)
+
+    @classmethod
+    def workspace_claim_mismatch(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        reason: str,
+        message: str,
+        details: Mapping[str, Any] | None = None,
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "reason": reason,
+            "message": message,
+            "details": dict(details or {}),
+        }
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
+    @classmethod
+    def run_state_transition(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        to_state: str,
+        from_state: str = "",
+        reason: str = "",
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "to_state": to_state,
+        }
+        if from_state:
+            event_payload["from_state"] = from_state
+        if reason:
+            event_payload["reason"] = reason
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=RUN_STATE_TRANSITION_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
+    def to_record(self) -> dict[str, object]:
+        record: dict[str, object] = {
+            "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+            "record_type": self.record_type,
+            "occurred_at": self.occurred_at,
+            "run_id": self.run_id,
+        }
+        if self.task_id:
+            record["task_id"] = self.task_id
+        record.update(dict(self.payload))
+        return record
+
+
+@dataclasses.dataclass(frozen=True)
 class RunHistoryView:
     run_id: str
     task_id: str
@@ -237,6 +369,9 @@ class RunStore:
     def append_report(self, report: WorkerReport) -> None:
         self.append_record(report.to_record())
 
+    def append_lifecycle_event(self, event: RunLifecycleEvent) -> None:
+        self.append_record(event.to_record())
+
     def append_record(self, record: dict[str, object]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
@@ -256,7 +391,7 @@ class RunStore:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if isinstance(payload, dict):
+            if isinstance(payload, dict) and is_known_record_type(payload):
                 records.append(payload)
         return records
 
@@ -332,26 +467,50 @@ def build_run_history_views(
     *,
     limit: int = 20,
 ) -> list[RunHistoryView]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    last_indices: dict[str, int] = {}
+    grouped: dict[str, list[tuple[int, dict[str, Any]]]] = {}
     for index, record in enumerate(records):
         run_id = string_value(record.get("run_id"))
         if not run_id:
             continue
-        if not is_run_history_view_record(record):
+        if not is_run_history_record(record):
             continue
-        grouped.setdefault(run_id, []).append(record)
-        last_indices[run_id] = index
-    ordered = sorted(last_indices, key=last_indices.__getitem__, reverse=True)
+        grouped.setdefault(run_id, []).append((index, record))
+    ordered = sorted(
+        grouped,
+        key=lambda run_id: run_history_order_index(grouped[run_id]),
+        reverse=True,
+    )
     ordered = ordered[:limit]
-    return [RunHistoryView.from_records(run_id, grouped[run_id]) for run_id in ordered]
+    return [
+        RunHistoryView.from_records(
+            run_id,
+            [record for _index, record in grouped[run_id]],
+        )
+        for run_id in ordered
+    ]
+
+
+def run_history_order_index(records: list[tuple[int, dict[str, Any]]]) -> int:
+    status_records = [
+        (index, record) for index, record in records if is_run_status_record(record)
+    ]
+    if status_records:
+        return status_records[-1][0]
+    return records[-1][0]
 
 
 def run_history_view_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [record for record in records if is_run_history_view_record(record)]
+    status_records = [record for record in records if is_run_status_record(record)]
+    if status_records:
+        return status_records
+    return [record for record in records if is_lifecycle_event_record(record)]
 
 
-def is_run_history_view_record(record: dict[str, Any]) -> bool:
+def is_run_history_record(record: dict[str, Any]) -> bool:
+    return is_run_status_record(record) or is_lifecycle_event_record(record)
+
+
+def is_run_status_record(record: dict[str, Any]) -> bool:
     record_type = record.get("record_type")
     if record_type in {None, RUN_RECORD_TYPE}:
         return True
@@ -360,20 +519,48 @@ def is_run_history_view_record(record: dict[str, Any]) -> bool:
     return False
 
 
+def is_lifecycle_event_record(record: dict[str, Any]) -> bool:
+    return record.get("record_type") in LIFECYCLE_RECORD_TYPES
+
+
+def is_known_record_type(record: dict[str, Any]) -> bool:
+    record_type = record.get("record_type")
+    return record_type is None or record_type in KNOWN_RECORD_TYPES
+
+
 def record_type_label(record: dict[str, Any]) -> str:
     record_type = string_value(record.get("record_type"))
     return record_type or RUN_RECORD_TYPE
 
 
 def record_status(record: dict[str, Any]) -> str:
-    return string_value(record.get("status")) or string_value(
+    status = string_value(record.get("status")) or string_value(
         record.get("classification")
     )
+    if status:
+        return status
+    record_type = record.get("record_type")
+    if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
+        return string_value(record.get("to_state"))
+    if record_type == WORKSPACE_CLAIM_RECORD_TYPE:
+        return string_value(record.get("event_type")) or WORKSPACE_CLAIMED_EVENT_TYPE
+    if record_type == WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE:
+        return string_value(record.get("reason")) or "mismatch"
+    if record_type in {
+        LOCK_ACQUIRED_RECORD_TYPE,
+        LOCK_RELEASED_RECORD_TYPE,
+        LOCK_EXPIRED_RECORD_TYPE,
+    }:
+        return str(record_type).removeprefix("lock_")
+    return ""
 
 
 def record_updated_at(record: dict[str, Any]) -> str:
-    return string_value(record.get("finished_at")) or string_value(
-        record.get("reported_at")
+    return (
+        string_value(record.get("finished_at"))
+        or string_value(record.get("reported_at"))
+        or string_value(record.get("occurred_at"))
+        or string_value(record.get("claimed_at"))
     )
 
 

@@ -41,7 +41,14 @@ from vibe_loop.retry import (
     is_transient_stderr,
     retry_subprocess_run,
 )
-from vibe_loop.runs import RunResult, RunStore, WorkerReport
+from vibe_loop.runs import (
+    LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
+    RunLifecycleEvent,
+    RunResult,
+    RunStore,
+    WorkerReport,
+)
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import ActiveRunState, WorkerView, build_worker_views
@@ -482,6 +489,28 @@ class VibeRunner:
             run_id,
             active_state,
         )
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_ACQUIRED_RECORD_TYPE,
+                run_id=run_id,
+                task_id=task.task_id,
+                lock_kind="task",
+                lock_path=task_lock.path,
+                payload={
+                    "resources": list(task.resources),
+                    "paths": list(task.paths),
+                    "conflict_domains_known": task.conflict_domains_known,
+                },
+            )
+        )
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task.task_id,
+                to_state="started",
+                reason="task_lock_acquired",
+            )
+        )
         try:
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(
@@ -542,6 +571,16 @@ class VibeRunner:
                 exit_code = stream_result.exit_code
                 session_id = stream_result.session_id or run_id
                 session_id_source = stream_result.session_id_source or "fallback:run_id"
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.run_state_transition(
+                        run_id=run_id,
+                        task_id=task.task_id,
+                        from_state="started",
+                        to_state="session_observed",
+                        reason=session_id_source,
+                        payload={"session_id": session_id},
+                    )
+                )
                 report_status(f"agent command exit_code={exit_code}", log)
                 report_status(f"session_id={session_id}", log)
                 report_status(f"session_id_source={session_id_source}", log)
@@ -569,6 +608,16 @@ class VibeRunner:
                 end_main,
                 message,
                 worker_report,
+            )
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_state_transition(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    from_state="session_observed",
+                    to_state="classified",
+                    reason=classification.source,
+                    payload={"classification": classification.status},
+                )
             )
             result = RunResult(
                 run_id=run_id,
@@ -598,6 +647,15 @@ class VibeRunner:
             return result
         finally:
             self.lock_manager.release(task_lock)
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_RELEASED_RECORD_TYPE,
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    lock_kind="task",
+                    lock_path=task_lock.path,
+                )
+            )
 
     def acquire_scheduled_task_lock(
         self,

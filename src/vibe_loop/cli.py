@@ -61,7 +61,16 @@ from vibe_loop.planning_timeline import (
     read_timeline_file,
 )
 from vibe_loop.runner import VibeRunner
-from vibe_loop.runs import RunResult, RunStore, WorkerReport, WORKER_REPORT_STATUSES
+from vibe_loop.runs import (
+    LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_EXPIRED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
+    RunLifecycleEvent,
+    RunResult,
+    RunStore,
+    WorkerReport,
+    WORKER_REPORT_STATUSES,
+)
 from vibe_loop.skills import install_skills
 from vibe_loop.spec_diagnostics import (
     build_spec_diagnostics_report,
@@ -1072,6 +1081,19 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 base_commit=args.base_commit,
             )
         except WorkspaceClaimError as exc:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_claim_mismatch(
+                    run_id=run_id,
+                    task_id=task_id,
+                    reason=exc.code,
+                    message=str(exc),
+                    details=exc.details,
+                    payload={
+                        "branch": args.branch,
+                        "worktree": str(args.worktree),
+                    },
+                )
+            )
             payload = {
                 "claimed": False,
                 "error": exc.code,
@@ -1102,6 +1124,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
 
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:
     manager = LockManager(config.state_path / "locks")
+    run_store = RunStore(config.state_path / "runs.jsonl")
     if args.main_integration_command == "status":
         status = manager.main_integration_status()
         if json_requested(args):
@@ -1126,11 +1149,13 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
             args,
             config,
             manager,
+            run_store,
             run_id=run_id,
             task_id=task_id,
         )
 
     if args.main_integration_command == "release":
+        before_status = manager.main_integration_status()
         try:
             released = manager.release_main_integration(task_id=task_id, run_id=run_id)
         except LockOwnerMismatch as exc:
@@ -1152,6 +1177,20 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
                 )
             return 1
         status = manager.main_integration_status()
+        if released:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_RELEASED_RECORD_TYPE,
+                    run_id=run_id,
+                    task_id=task_id,
+                    lock_kind="integration",
+                    lock_path=before_status.path,
+                    payload={
+                        "resource": "main-integration",
+                        "owner_task_id": task_id,
+                    },
+                )
+            )
         payload = {"released": released, "status": status.to_json()}
         if json_requested(args):
             print(json.dumps(payload, indent=2))
@@ -1468,6 +1507,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
         return 0
     if args.force:
         result = clean_stale_locks(stale)
+        record_expired_locks(runner.run_store, result.cleaned)
         if args.json:
             print(
                 json.dumps(
@@ -1508,6 +1548,22 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
     return 0
 
 
+def record_expired_locks(run_store: RunStore, stale_locks: list[StaleLock]) -> None:
+    for stale_lock in stale_locks:
+        if not stale_lock.run_id:
+            continue
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_EXPIRED_RECORD_TYPE,
+                run_id=stale_lock.run_id,
+                task_id=stale_lock.task_id,
+                lock_kind=stale_lock.kind,
+                lock_path=stale_lock.lock_path,
+                payload={"stale_reason": stale_lock.stale_reason},
+            )
+        )
+
+
 def render_runs(runs) -> str:
     lines: list[str] = []
     for run in runs:
@@ -1544,7 +1600,22 @@ def render_run_inspection(inspection) -> str:
     for record in payload["records"]:
         record_type = record.get("record_type") or "run_result"
         status = record.get("status") or record.get("classification") or "-"
-        updated = record.get("finished_at") or record.get("reported_at") or "-"
+        if status == "-":
+            if record_type == "run_state_transition":
+                status = record.get("to_state") or "-"
+            elif record_type == "workspace_claim":
+                status = record.get("event_type") or "workspace_claimed"
+            elif record_type == "workspace_claim_mismatch":
+                status = record.get("reason") or "mismatch"
+            elif isinstance(record_type, str) and record_type.startswith("lock_"):
+                status = record_type.removeprefix("lock_")
+        updated = (
+            record.get("finished_at")
+            or record.get("reported_at")
+            or record.get("occurred_at")
+            or record.get("claimed_at")
+            or "-"
+        )
         lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}")
     return "\n".join(lines)
 
@@ -1615,6 +1686,7 @@ def acquire_main_integration_command(
     args: argparse.Namespace,
     config,
     manager: LockManager,
+    run_store: RunStore,
     *,
     run_id: str,
     task_id: str,
@@ -1634,6 +1706,12 @@ def acquire_main_integration_command(
             task_id=task_id,
         )
         if preflight.get("error"):
+            record_workspace_preflight_mismatch(
+                run_store,
+                run_id=run_id,
+                task_id=task_id,
+                preflight=preflight,
+            )
             return finish_main_integration_preflight_error(args, manager, preflight)
         owner_metadata = preflight.get("metadata")
         if not isinstance(owner_metadata, dict):
@@ -1681,9 +1759,23 @@ def acquire_main_integration_command(
                 return 1
             time.sleep(min(args.poll_interval, remaining))
             continue
+        status = manager.main_integration_status()
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_ACQUIRED_RECORD_TYPE,
+                run_id=run_id,
+                task_id=task_id,
+                lock_kind="integration",
+                lock_path=status.path,
+                payload={
+                    "resource": "main-integration",
+                    "owner_task_id": task_id,
+                },
+            )
+        )
         payload = {
             "acquired": True,
-            "status": manager.main_integration_status().to_json(),
+            "status": status.to_json(),
             "timed_out": False,
         }
         if json_requested(args):
@@ -1707,6 +1799,29 @@ def finish_main_integration_preflight_error(
     else:
         print(render_main_integration_preflight_error(payload), file=sys.stderr)
     return int(payload.get("exit_code", 1))
+
+
+def record_workspace_preflight_mismatch(
+    run_store: RunStore,
+    *,
+    run_id: str,
+    task_id: str,
+    preflight: dict[str, object],
+) -> None:
+    if preflight.get("error") != "workspace_preflight_failed":
+        return
+    diagnostics = preflight.get("workspace_diagnostics")
+    diagnostic_payload = diagnostics if isinstance(diagnostics, list) else []
+    run_store.append_lifecycle_event(
+        RunLifecycleEvent.workspace_claim_mismatch(
+            run_id=run_id,
+            task_id=task_id,
+            reason="workspace_preflight_failed",
+            message=str(preflight.get("message") or ""),
+            details={"workspace_diagnostics": diagnostic_payload},
+            payload={"diagnostic_count": len(diagnostic_payload)},
+        )
+    )
 
 
 def finish_main_integration_busy(

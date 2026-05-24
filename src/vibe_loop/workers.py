@@ -14,6 +14,8 @@ from typing import Any
 from vibe_loop.locks import MAIN_INTEGRATION_LOCK_NAME, LockManager, TaskLock
 from vibe_loop.runs import (
     RUN_RECORD_TYPE,
+    WORKSPACE_CLAIM_RECORD_TYPE,
+    WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     RunStore,
     WorkerReport,
@@ -24,7 +26,6 @@ from vibe_loop.runs import (
 ACTIVE_RUN_SCHEMA_VERSION = 1
 ACTIVE_RUN_RECORD_TYPE = "active_run"
 WORKSPACE_CLAIM_SCHEMA_VERSION = 1
-WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_DIAGNOSTIC_SCHEMA_VERSION = 1
 DIRTY_SUMMARY_LIMIT = 200
 
@@ -75,13 +76,19 @@ class WorkspaceClaim:
             current_branch=optional_string(payload.get("current_branch")) or "",
             dirty=optional_bool(payload.get("dirty")),
             dirty_summary=optional_string_tuple(payload.get("dirty_summary")),
-            claimed_at=optional_string(payload.get("claimed_at")) or "",
+            claimed_at=(
+                optional_string(payload.get("claimed_at"))
+                or optional_string(payload.get("occurred_at"))
+                or ""
+            ),
         )
 
     def to_json(self) -> dict[str, object]:
         return {
             "schema_version": WORKSPACE_CLAIM_SCHEMA_VERSION,
             "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+            "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+            "occurred_at": self.claimed_at,
             "task_id": self.task_id,
             "run_id": self.run_id,
             "branch": self.branch,
@@ -1155,9 +1162,13 @@ def collect_stale_locks(
         process_exists=process_exists,
     )
     if integration_status.locked and integration_status.state == "stale":
+        owner_task_id = (
+            optional_string(integration_status.metadata.get("owner_task_id"))
+            or MAIN_INTEGRATION_LOCK_NAME
+        )
         stale.append(
             StaleLock(
-                task_id=MAIN_INTEGRATION_LOCK_NAME,
+                task_id=owner_task_id,
                 run_id=optional_string(integration_status.metadata.get("run_id")) or "",
                 lock_path=integration_status.path,
                 stale_reason=integration_status.stale_reason or "unknown",

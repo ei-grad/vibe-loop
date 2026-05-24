@@ -789,6 +789,9 @@ def add_run_record_evidence(
     warnings: list[PlanningEvidenceWarning],
 ) -> None:
     for index, record in enumerate(records):
+        record_type = string_value(record.get("record_type")) or RUN_RECORD_TYPE
+        if record_type not in {RUN_RECORD_TYPE, WORKER_REPORT_RECORD_TYPE}:
+            continue
         record_task_ids = worker_report_task_ids(record)
         if not record_task_ids:
             continue
@@ -802,13 +805,12 @@ def add_run_record_evidence(
                 unknown_task_reference_warning(
                     task_id,
                     source="worker_report"
-                    if record.get("record_type") == WORKER_REPORT_RECORD_TYPE
+                    if record_type == WORKER_REPORT_RECORD_TYPE
                     else "run_result",
                 )
             )
         if not known_task_ids:
             continue
-        record_type = string_value(record.get("record_type")) or RUN_RECORD_TYPE
         status = string_value(record.get("status")) or string_value(
             record.get("classification")
         )

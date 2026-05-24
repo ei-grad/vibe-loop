@@ -293,6 +293,11 @@ class CliTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
+            run_result = next(
+                record
+                for record in run_records
+                if record.get("record_type") == "run_result"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -301,8 +306,16 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["session_id_source"], "native:stdout")
         self.assertEqual(payload["agent_command_source"], "auto:codex")
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
-        self.assertEqual(run_records[0]["session_id"], "codex-native-123")
-        self.assertEqual(run_records[0]["session_id_source"], "native:stdout")
+        self.assertEqual(run_result["session_id"], "codex-native-123")
+        self.assertEqual(run_result["session_id_source"], "native:stdout")
+        self.assertIn(
+            "lock_acquired",
+            {record.get("record_type") for record in run_records},
+        )
+        self.assertIn(
+            "run_state_transition",
+            {record.get("record_type") for record in run_records},
+        )
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
         self.assertIn("$vibe-loop TASK-01", agent_lines[1])
@@ -3913,11 +3926,15 @@ class CliTests(unittest.TestCase):
         self.assertEqual(workspace["current_branch"], "worker/TASK-01")
         self.assertEqual(workspace["worktree"], str(repo.resolve()))
         self.assertEqual(workspace["base_commit"], "base-main")
+        self.assertEqual(workspace["event_type"], "workspace_claimed")
+        self.assertEqual(workspace["occurred_at"], workspace["claimed_at"])
         self.assertTrue(workspace["head_commit"])
         self.assertTrue(workspace["dirty"])
         self.assertTrue(any("notes.txt" in line for line in workspace["dirty_summary"]))
         self.assertEqual(metadata["workspace"], workspace)
         self.assertEqual(records[0]["record_type"], "workspace_claim")
+        self.assertEqual(records[0]["event_type"], "workspace_claimed")
+        self.assertEqual(records[0]["occurred_at"], records[0]["claimed_at"])
         self.assertEqual(records[0]["branch"], "worker/TASK-01")
         self.assertEqual(workers_exit, 0)
         self.assertEqual(workers_stderr.getvalue(), "")
@@ -3962,12 +3979,22 @@ class CliTests(unittest.TestCase):
                 )
 
             payload = json.loads(stdout.getvalue())
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stderr.getvalue(), "")
         self.assertFalse(payload["claimed"])
         self.assertEqual(payload["error"], "owner_mismatch")
         self.assertEqual(payload["details"]["active_run_ids"], ["run-other"])
+        self.assertEqual(records[0]["record_type"], "workspace_claim_mismatch")
+        self.assertEqual(records[0]["run_id"], "run-1")
+        self.assertEqual(records[0]["task_id"], "TASK-01")
+        self.assertEqual(records[0]["reason"], "owner_mismatch")
 
     def test_worker_claim_workspace_requires_active_task_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4215,6 +4242,16 @@ class CliTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
+            worker_reports = [
+                record
+                for record in records
+                if record.get("record_type") == "worker_report"
+            ]
+            run_results = [
+                record
+                for record in records
+                if record.get("record_type") == "run_result"
+            ]
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -4223,9 +4260,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["worker_report"]["status"], "completed")
         self.assertEqual(payload["worker_report"]["commit"], "reported-commit")
         self.assertEqual(payload["worker_report"]["metadata"], {"source": "agent"})
-        self.assertEqual(records[0]["record_type"], "worker_report")
-        self.assertEqual(records[1]["record_type"], "run_result")
-        self.assertEqual(records[1]["classification_source"], "worker_report")
+        self.assertEqual(len(worker_reports), 1)
+        self.assertEqual(len(run_results), 1)
+        self.assertEqual(run_results[0]["classification_source"], "worker_report")
+        self.assertIn(
+            "lock_released",
+            {record.get("record_type") for record in records},
+        )
         self.assertIn("worker report status=completed", log_text)
         self.assertIn("reported-commit", log_text)
 
@@ -4451,6 +4492,11 @@ class CliTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
+            run_result = next(
+                record
+                for record in run_records
+                if record.get("record_type") == "run_result"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["session_id"], "explicit-native-456")
@@ -4462,8 +4508,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("[vibe-loop] session_id=explicit-native-456", stderr.getvalue())
         self.assertIn("session id: explicit-native-456", log_text)
         self.assertIn("session_id_source=native:stderr", log_text)
-        self.assertEqual(run_records[0]["session_id"], "explicit-native-456")
-        self.assertEqual(run_records[0]["session_id_source"], "native:stderr")
+        self.assertEqual(run_result["session_id"], "explicit-native-456")
+        self.assertEqual(run_result["session_id_source"], "native:stderr")
 
     def test_run_next_supports_configured_claude_prompt_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4503,6 +4549,11 @@ class CliTests(unittest.TestCase):
                 .read_text(encoding="utf-8")
                 .splitlines()
             ]
+            run_result = next(
+                record
+                for record in run_records
+                if record.get("record_type") == "run_result"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["task_id"], "TASK-01")
@@ -4511,8 +4562,8 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("claude err", stderr.getvalue())
         self.assertIn("claude out: $vibe-loop TASK-01", log_text)
         self.assertIn("claude err: $vibe-loop TASK-01", log_text)
-        self.assertEqual(run_records[0]["task_id"], "TASK-01")
-        self.assertEqual(run_records[0]["status"], "completed")
+        self.assertEqual(run_result["task_id"], "TASK-01")
+        self.assertEqual(run_result["status"], "completed")
 
     def test_next_supports_configured_claude_prompt_selection(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4648,6 +4699,12 @@ class CliTests(unittest.TestCase):
             waiter = json.loads(waiter_stdout.getvalue())
             status = json.loads(status_stdout.getvalue())
             release = json.loads(release_stdout.getvalue())
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
         self.assertEqual(holder_exit, 0)
         self.assertEqual(holder_stderr.getvalue(), "")
@@ -4671,6 +4728,12 @@ class CliTests(unittest.TestCase):
         self.assertEqual(release_stderr.getvalue(), "")
         self.assertTrue(release["released"])
         self.assertFalse(release["status"]["locked"])
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            ["lock_acquired", "lock_released"],
+        )
+        self.assertEqual(records[0]["lock_kind"], "integration")
+        self.assertEqual(records[1]["owner_task_id"], "TASK-01")
 
     def test_main_integration_acquire_waits_until_holder_releases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5065,6 +5128,12 @@ class CliTests(unittest.TestCase):
             lock_exists = (
                 repo / ".vibe-loop" / "locks" / "main-integration.lock"
             ).exists()
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stderr.getvalue(), "")
@@ -5072,6 +5141,19 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["error"], "workspace_preflight_failed")
         self.assertIn("missing_claimed_worktree", codes)
         self.assertFalse(lock_exists)
+        self.assertEqual(records[0]["record_type"], "workspace_claim_mismatch")
+        self.assertEqual(records[0]["reason"], "workspace_preflight_failed")
+        self.assertEqual(
+            records[0]["diagnostic_count"],
+            len(records[0]["details"]["workspace_diagnostics"]),
+        )
+        self.assertEqual(
+            {
+                diagnostic["code"]
+                for diagnostic in records[0]["details"]["workspace_diagnostics"]
+            },
+            codes,
+        )
 
     def test_main_integration_acquire_rejects_pid_workspace_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5454,10 +5536,46 @@ class CliTests(unittest.TestCase):
             with redirect_stdout(stdout):
                 exit_code = main(["workers", "--repo", str(repo), "clean", "--force"])
             lock_still_exists = stale_lock.exists()
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
 
         self.assertEqual(exit_code, 0)
         self.assertFalse(lock_still_exists)
         self.assertIn("Removed 1 stale lock(s)", stdout.getvalue())
+        self.assertEqual(records[0]["record_type"], "lock_expired")
+        self.assertEqual(records[0]["run_id"], "run-1")
+        self.assertEqual(records[0]["task_id"], "STALE-01")
+        self.assertEqual(records[0]["stale_reason"], "missing_process")
+
+    def test_workers_clean_force_records_integration_lock_owner_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": 999999999, "host": socket.gethostname()},
+            )
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(["workers", "--repo", str(repo), "clean", "--force"])
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Removed 1 stale lock(s)", stdout.getvalue())
+        self.assertEqual(records[0]["record_type"], "lock_expired")
+        self.assertEqual(records[0]["run_id"], "run-1")
+        self.assertEqual(records[0]["task_id"], "TASK-01")
+        self.assertEqual(records[0]["lock_kind"], "integration")
 
     def test_workers_clean_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5513,6 +5631,15 @@ class CliTests(unittest.TestCase):
             records = [
                 {
                     "schema_version": 1,
+                    "record_type": "lock_acquired",
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                    "lock_kind": "task",
+                    "lock_path": str(repo / ".vibe-loop" / "locks" / "TASK-01.lock"),
+                },
+                {
+                    "schema_version": 1,
                     "record_type": "worker_report",
                     "run_id": "run-1",
                     "task_id": "TASK-01",
@@ -5521,6 +5648,16 @@ class CliTests(unittest.TestCase):
                     "message": "",
                     "metadata": {"source": "worker"},
                     "reported_at": "2026-05-09T00:00:00+00:00",
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": "run_state_transition",
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "occurred_at": "2026-05-09T00:00:30+00:00",
+                    "from_state": "started",
+                    "to_state": "classified",
+                    "reason": "worker_report",
                 },
                 {
                     "schema_version": 3,
@@ -5558,6 +5695,13 @@ class CliTests(unittest.TestCase):
                     "message": "waiting on dependency",
                     "metadata": {},
                     "reported_at": "2026-05-09T00:02:00+00:00",
+                },
+                {
+                    "schema_version": 1,
+                    "record_type": "future_record",
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "occurred_at": "2026-05-09T00:03:00+00:00",
                 },
             ]
             runs_path.write_text(
@@ -5613,15 +5757,19 @@ class CliTests(unittest.TestCase):
             "session: native-1 (native:stdout)\n"
             f"log: {runs_dir / 'run-1.log'}\n"
             "message: -\n"
-            "records: 2\n"
+            "records: 4\n"
             'worker_report: {"commit": "abc123", "message": "", '
             '"metadata": {"source": "worker"}, '
             '"reported_at": "2026-05-09T00:00:00+00:00", '
             '"run_id": "run-1", "status": "completed", '
             '"task_id": "TASK-01"}\n'
             "record_history:\n"
+            "- lock_acquired\tstatus=acquired"
+            "\tupdated=2026-05-09T00:00:00+00:00\n"
             "- worker_report\tstatus=completed"
             "\tupdated=2026-05-09T00:00:00+00:00\n"
+            "- run_state_transition\tstatus=classified"
+            "\tupdated=2026-05-09T00:00:30+00:00\n"
             "- run_result\tstatus=completed"
             "\tupdated=2026-05-09T00:01:00+00:00\n",
         )
