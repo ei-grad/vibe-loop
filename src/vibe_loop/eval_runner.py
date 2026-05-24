@@ -431,6 +431,7 @@ def run_trial(
         repo,
         examples_root=config.examples_root,
         overwrite=False,
+        include_grader_internals=False,
     )
     prompt_text = combined_prompt(repo, case)
     write_text_artifact(trial_root, "prompt", prompt_text)
@@ -461,7 +462,7 @@ def run_trial(
     git_after = collect_git_state(repo)
     write_json_artifact(trial_root, "git_state_after", git_after)
     write_text_artifact(trial_root, "diff", fixture_diff(repo, git_before))
-    deterministic = deterministic_grader_output(repo)
+    deterministic = deterministic_grader_output(repo, grader_repo=case.repo_path)
     transcript_graders = run_transcript_graders(
         config.transcript_graders,
         repo=repo,
@@ -570,7 +571,9 @@ def run_trial(
     )
     write_json(trial_root / "run.json", record)
 
-    artifact_result = artifact_grader_output(repo, trial_root)
+    artifact_result = artifact_grader_output(
+        repo, trial_root, grader_repo=case.repo_path
+    )
     final_graders = [
         deterministic_grader_record(deterministic),
         *[result.to_json() for result in transcript_graders],
@@ -792,6 +795,7 @@ def execute_negative_prompt_set(
             prompt_repo,
             examples_root=examples_root,
             overwrite=False,
+            include_grader_internals=False,
         )
         prompt_text = (prompt_repo / prompt_path).read_text(encoding="utf-8")
         prompt_before = collect_git_state(prompt_repo)
@@ -980,6 +984,7 @@ def execute_agent_command(
     env.update(
         {
             "PYTHONIOENCODING": "utf-8",
+            "VIBE_LOOP_EVAL_ACTIVE": "1",
             "VIBE_LOOP_EVAL_RUN_ID": run_id,
             "VIBE_LOOP_EVAL_CASE_ID": case.case_id,
             "VIBE_LOOP_EVAL_CONDITION": condition,
@@ -1176,8 +1181,12 @@ def write_transcript_if_missing(
     )
 
 
-def deterministic_grader_output(repo: Path) -> dict[str, object]:
-    result = run_eval_example_grader(repo)
+def deterministic_grader_output(
+    repo: Path,
+    *,
+    grader_repo: Path | None = None,
+) -> dict[str, object]:
+    result = run_eval_example_grader(repo, grader_repo=grader_repo)
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -1199,8 +1208,17 @@ def deterministic_grader_output(repo: Path) -> dict[str, object]:
     return payload
 
 
-def artifact_grader_output(repo: Path, artifact_root: Path) -> dict[str, object]:
-    result = run_eval_example_grader(repo, artifact_root=artifact_root)
+def artifact_grader_output(
+    repo: Path,
+    artifact_root: Path,
+    *,
+    grader_repo: Path | None = None,
+) -> dict[str, object]:
+    result = run_eval_example_grader(
+        repo,
+        artifact_root=artifact_root,
+        grader_repo=grader_repo,
+    )
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -1715,7 +1733,7 @@ def write_missing_case_role_artifacts(
         write_json_artifact(
             artifact_root,
             "negative_prompt_results",
-            default_negative_prompt_results(artifact_root, execution),
+            default_negative_prompt_results(artifact_root, execution, case),
             overwrite=False,
         )
     for role in case.expected_artifact_roles:
@@ -1726,11 +1744,12 @@ def write_missing_case_role_artifacts(
 def default_negative_prompt_results(
     artifact_root: Path,
     execution: CommandExecution,
+    case: EvalExampleCase,
 ) -> dict[str, object]:
     response = execution.stdout + execution.stderr
     state = load_json(artifact_path(artifact_root, "git_state_after"))
     repo_changed = bool(isinstance(state, Mapping) and state.get("dirty") is True)
-    spec = load_json(artifact_root / "repo" / "eval" / "expected-artifacts.json")
+    spec = load_json(case.repo_path / "eval" / "expected-artifacts.json")
     prompts = spec.get("negative_prompts") if isinstance(spec, Mapping) else []
     events = workflow_events_for_trial(
         artifact_root,
@@ -2256,6 +2275,8 @@ def source_fingerprints(
         if path_diagnostics("source fingerprint", relative_path):
             continue
         path = repo / relative_path
+        if not path.is_file():
+            path = case.repo_path / relative_path
         if not path.is_file() or is_secret_like_eval_path(relative_path):
             continue
         stat = path.stat()

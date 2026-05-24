@@ -494,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_demo.add_argument("--output", type=Path)
     add_local_demo_eval_arguments(local_demo, default_trials=1)
     local_demo.add_argument("--json", action="store_true")
+    add_nested_eval_override(local_demo)
 
     release_gate = eval_subparsers.add_parser(
         "release-gate",
@@ -549,6 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
         release_gate, default_trials=DEFAULT_RELEASE_GATE_TRIALS
     )
     release_gate.add_argument("--json", action="store_true")
+    add_nested_eval_override(release_gate)
 
     benchmark = eval_subparsers.add_parser(
         "benchmark",
@@ -576,6 +578,7 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--condition", action="append", default=[])
     benchmark.add_argument("--trials", type=int, default=1)
     benchmark.add_argument("--timeout", type=int, default=600)
+    add_nested_eval_override(benchmark)
 
     doctor = subparsers.add_parser("doctor", help="Print resolved configuration")
     add_repo_argument(doctor)
@@ -615,6 +618,14 @@ def add_local_demo_eval_arguments(
     parser.add_argument("--model-provider", default="unknown")
     parser.add_argument("--model-id", default="unknown")
     parser.add_argument("--reasoning-effort", default="")
+
+
+def add_nested_eval_override(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--allow-nested",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
 
 
 def add_repo_argument(parser: argparse.ArgumentParser) -> None:
@@ -983,6 +994,14 @@ def redacted_completion_config(completion) -> dict[str, object]:
 
 
 def dispatch_eval(args: argparse.Namespace, config) -> int:
+    if os.environ.get("VIBE_LOOP_EVAL_ACTIVE") == "1" and not args.allow_nested:
+        print(
+            "refusing nested vibe-loop eval inside an active eval worker "
+            "(set --allow-nested only for explicit harness debugging)",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.eval_command == "local-demo":
         output_root = args.output or (config.state_path / "eval-runs")
         aggregate = run_local_demo_eval(

@@ -131,6 +131,7 @@ def materialize_eval_example(
     examples_root: Path | None = None,
     overwrite: bool = False,
     include_reference_patch: bool = False,
+    include_grader_internals: bool = True,
 ) -> Path:
     case = load_eval_example_case(case_id, examples_root=examples_root)
     target = Path(destination)
@@ -145,11 +146,27 @@ def materialize_eval_example(
             reference_patch.unlink()
     copy_case_metadata(case, target)
     seed_generated_task_profile_cache(target)
+    if not include_grader_internals:
+        remove_grader_internals(target)
     initialize_git_checkout(target)
     apply_seed_user_state(target)
     apply_seed_coordination_state(target)
     refresh_active_lock_metadata(target)
     return target
+
+
+def remove_grader_internals(target: Path) -> None:
+    for relative_path in (
+        "eval/expected-artifacts.json",
+        "eval/reference.patch",
+        "eval/expected-task-source-profile.json",
+    ):
+        path = target / relative_path
+        if path.exists():
+            path.unlink()
+    graders = target / "eval" / "graders"
+    if graders.is_dir():
+        shutil.rmtree(graders)
 
 
 def copy_case_metadata(case: EvalExampleCase, target: Path) -> None:
@@ -545,6 +562,7 @@ def run_eval_example_grader(
     repo: Path,
     *,
     artifact_root: Path | None = None,
+    grader_repo: Path | None = None,
 ) -> EvalExampleGraderResult:
     command = [
         sys.executable,
@@ -555,6 +573,8 @@ def run_eval_example_grader(
     ]
     if artifact_root is not None:
         command.extend(["--artifacts", str(artifact_root)])
+    if grader_repo is not None:
+        command.extend(["--grader-repo", str(grader_repo)])
     completed = subprocess.run(
         command,
         check=False,

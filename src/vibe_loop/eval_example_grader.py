@@ -24,8 +24,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", type=Path, default=Path.cwd())
     parser.add_argument("--artifacts", type=Path)
+    parser.add_argument(
+        "--grader-repo",
+        type=Path,
+        help="Fixture repository containing grader-only eval metadata",
+    )
     args = parser.parse_args(argv)
-    result = grade_repository(args.repo, artifact_root=args.artifacts)
+    result = grade_repository(
+        args.repo,
+        artifact_root=args.artifacts,
+        grader_repo=args.grader_repo,
+    )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0 if result["passed"] else 1
 
@@ -34,12 +43,14 @@ def grade_repository(
     repo: Path,
     *,
     artifact_root: Path | None = None,
+    grader_repo: Path | None = None,
 ) -> dict[str, object]:
     repo = repo.resolve()
-    spec_path = repo / "eval" / "expected-artifacts.json"
+    spec_repo = (grader_repo or repo).resolve()
+    spec_path = spec_repo / "eval" / "expected-artifacts.json"
     with spec_path.open(encoding="utf-8") as handle:
         spec = json.load(handle)
-    case = load_case_metadata(repo)
+    case = load_case_metadata(repo, grader_repo=spec_repo)
     checks = [run_check(repo, check) for check in spec.get("checks", ())]
     if artifact_root is not None:
         checks.extend(run_artifact_checks(repo, artifact_root.resolve(), spec, case))
@@ -52,8 +63,18 @@ def grade_repository(
     }
 
 
-def load_case_metadata(repo: Path) -> dict[str, Any]:
-    for path in (repo / "eval" / "case.json", repo.parent / "case.json"):
+def load_case_metadata(
+    repo: Path, *, grader_repo: Path | None = None
+) -> dict[str, Any]:
+    paths = [repo / "eval" / "case.json", repo.parent / "case.json"]
+    if grader_repo is not None:
+        paths.extend(
+            [
+                grader_repo / "eval" / "case.json",
+                grader_repo.parent / "case.json",
+            ]
+        )
+    for path in paths:
         if path.is_file():
             with path.open(encoding="utf-8") as handle:
                 payload = json.load(handle)

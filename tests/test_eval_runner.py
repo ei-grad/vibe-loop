@@ -72,14 +72,50 @@ class EvalRunnerCliTests(unittest.TestCase):
                 / "trial-1"
             )
             record = json.loads((trial_root / "run.json").read_text(encoding="utf-8"))
+            git_before = json.loads(
+                (trial_root / "git-state-before.json").read_text(encoding="utf-8")
+            )
             run_log_exists = (trial_root / "logs" / "run.log").is_file()
             diff_exists = (trial_root / "diff.patch").is_file()
+            repo = trial_root / "repo"
+            grader_spec_visible = (repo / "eval" / "expected-artifacts.json").exists()
+            grader_dir_visible = (repo / "eval" / "graders").exists()
 
         self.assertEqual(payload["conditions"]["vibe_loop"]["pass_rate"], 1.0)
         self.assertEqual(record["status"], "passed")
         self.assertEqual(record["scoring"]["workflow_score"], 1.0)
+        self.assertEqual(len(git_before["head"]), 40)
+        self.assertFalse(git_before["dirty"])
         self.assertTrue(run_log_exists)
         self.assertTrue(diff_exists)
+        self.assertFalse(grader_spec_visible)
+        self.assertFalse(grader_dir_visible)
+
+    def test_eval_command_refuses_nested_eval_worker(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+        previous = os.environ.get("VIBE_LOOP_EVAL_ACTIVE")
+        os.environ["VIBE_LOOP_EVAL_ACTIVE"] = "1"
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "eval",
+                        "local-demo",
+                        "--case",
+                        "finite-py-plan-table",
+                        "--condition",
+                        "vibe_loop",
+                    ]
+                )
+        finally:
+            if previous is None:
+                os.environ.pop("VIBE_LOOP_EVAL_ACTIVE", None)
+            else:
+                os.environ["VIBE_LOOP_EVAL_ACTIVE"] = previous
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("refusing nested vibe-loop eval", stderr.getvalue())
 
     def test_orchestrated_condition_rejects_labels_without_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

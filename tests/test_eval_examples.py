@@ -107,6 +107,24 @@ class EvalExampleTests(unittest.TestCase):
 
             self.assertFalse(repo.exists())
 
+    def test_materialize_agent_workspace_hides_grader_internals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "finite"
+
+            repo = materialize_eval_example(
+                "finite-py-plan-table",
+                destination,
+                include_grader_internals=False,
+            )
+
+            self.assertTrue((repo / ".git").is_dir())
+            self.assertEqual(len(git_output(repo, "rev-parse", "--verify", "HEAD")), 40)
+            self.assertEqual(git_output(repo, "status", "--short"), "")
+            self.assertTrue((repo / "eval" / "prompt.txt").is_file())
+            self.assertFalse((repo / "eval" / "expected-artifacts.json").exists())
+            self.assertFalse((repo / "eval" / "graders").exists())
+            self.assertFalse((repo / "eval" / "reference.patch").exists())
+
     def test_materialize_seeds_dirty_state_and_live_locks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             dirty = materialize_eval_example(
