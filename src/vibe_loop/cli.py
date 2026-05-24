@@ -699,6 +699,7 @@ def dispatch(args: argparse.Namespace) -> int:
             json.dumps(
                 {
                     "repo": str(config.repo),
+                    "config": config.config_report(),
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
                     "task_source": config.task_source.to_json(),
@@ -1320,17 +1321,23 @@ def read_only_task_source_notice(config) -> str | None:
     cache_notice = read_only_generated_cache_notice(config)
     report = runtime_task_source_report(config)
     origin = report.get("origin")
+    source_notice = None
     if cache_notice:
         if origin == "default_markdown_discovery":
-            return f"{cache_notice}; task discovery source=default_markdown_discovery"
-        return cache_notice
-    if origin == "generated_cache":
-        return f"task discovery source=generated_cache path={report.get('cache_path')}"
-    if origin == "default_markdown_discovery":
-        return "task discovery source=default_markdown_discovery"
-    if origin == "command_output":
-        return "task discovery source=command_output"
-    if origin == "explicit_config":
+            source_notice = (
+                f"{cache_notice}; task discovery source=default_markdown_discovery"
+            )
+        else:
+            source_notice = cache_notice
+    elif origin == "generated_cache":
+        source_notice = (
+            f"task discovery source=generated_cache path={report.get('cache_path')}"
+        )
+    elif origin == "default_markdown_discovery":
+        source_notice = "task discovery source=default_markdown_discovery"
+    elif origin == "command_output":
+        source_notice = "task discovery source=command_output"
+    elif origin == "explicit_config":
         task_source = report.get("task_source")
         keys = []
         if isinstance(task_source, dict):
@@ -1338,8 +1345,20 @@ def read_only_task_source_notice(config) -> str | None:
             if isinstance(explicit_keys, list):
                 keys = [str(key) for key in explicit_keys]
         suffix = f" keys={','.join(keys)}" if keys else ""
-        return f"task discovery source=explicit_config{suffix}"
-    return None
+        source_notice = f"task discovery source=explicit_config{suffix}"
+    return config_fallback_task_notice(config, source_notice)
+
+
+def config_fallback_task_notice(config, source_notice: str | None) -> str | None:
+    warning = None
+    if config.config_source == "main_worktree" and config.config_path is not None:
+        warning = (
+            "warning: using config_source=main_worktree "
+            f"config_path={config.config_path}; tasks_repo={config.repo}"
+        )
+    if warning and source_notice:
+        return f"{warning}; {source_notice}"
+    return warning or source_notice
 
 
 def task_views_for_tasks(config, tasks: list[Task]):

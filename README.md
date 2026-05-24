@@ -466,6 +466,13 @@ disables generated cache as the active task source. Non-source settings such as
 `runnable_statuses` can still override matching generated fields without
 disabling the generated parser.
 
+When `--repo` points at a Git linked worktree that does not have its own
+`.vibe-loop.toml`, `vibe-loop` falls back to the main worktree's local
+`.vibe-loop.toml` if it exists. Read-only task commands warn on stderr with the
+fallback config path and the task repo they are showing. Runtime state, locks,
+logs, generated task-source caches, and planning analytics outputs still live
+under the invoked `--repo` worktree.
+
 Agent commands are resolved independently. Explicit `.vibe-loop.toml` values
 remain authoritative. Omitted worker and selection commands use a deterministic
 Codex-first policy:

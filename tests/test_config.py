@@ -12,6 +12,7 @@ from vibe_loop.config import (
     PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY,
     detect_agent_clis,
     load_config,
+    parse_main_worktree_path,
     planning_analytics_report,
     reject_generated_command_adapters,
 )
@@ -195,6 +196,75 @@ class ConfigTests(unittest.TestCase):
             config = load_config(repo)
 
         self.assertEqual(config.task_source.plan_paths, ("WORK.md", "docs/BACKLOG.md"))
+
+    def test_load_config_falls_back_to_main_worktree_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main_repo = root / "main"
+            linked_repo = root / "linked"
+            main_repo.mkdir()
+            linked_repo.mkdir()
+            main_config = main_repo / ".vibe-loop.toml"
+            main_config.write_text(
+                'state_dir = ".state/vibe-loop"\n'
+                "[task_source]\n"
+                'list = "python list_tasks.py"\n',
+                encoding="utf-8",
+            )
+
+            with patch(
+                "vibe_loop.config.main_worktree_config_path",
+                return_value=main_config,
+            ):
+                config = load_config(linked_repo)
+
+        self.assertEqual(config.config_source, "main_worktree")
+        self.assertEqual(config.config_path, main_config.resolve())
+        self.assertEqual(config.repo, linked_repo.resolve())
+        self.assertEqual(config.task_source.list_command, "python list_tasks.py")
+        self.assertEqual(config.state_path, linked_repo.resolve() / ".state/vibe-loop")
+
+    def test_local_config_wins_over_main_worktree_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            main_repo = root / "main"
+            linked_repo = root / "linked"
+            main_repo.mkdir()
+            linked_repo.mkdir()
+            main_config = main_repo / ".vibe-loop.toml"
+            linked_config = linked_repo / ".vibe-loop.toml"
+            main_config.write_text(
+                '[task_source]\nlist = "python main_tasks.py"\n',
+                encoding="utf-8",
+            )
+            linked_config.write_text(
+                '[task_source]\nlist = "python linked_tasks.py"\n',
+                encoding="utf-8",
+            )
+
+            with patch(
+                "vibe_loop.config.main_worktree_config_path",
+                return_value=main_config,
+            ) as fallback:
+                config = load_config(linked_repo)
+
+        fallback.assert_not_called()
+        self.assertEqual(config.config_source, "repo")
+        self.assertEqual(config.config_path, linked_config.resolve())
+        self.assertEqual(config.task_source.list_command, "python linked_tasks.py")
+
+    def test_parse_main_worktree_path_reads_first_porcelain_record(self) -> None:
+        parsed = parse_main_worktree_path(
+            "worktree /repo/main worktree\n"
+            "HEAD abc123\n"
+            "branch refs/heads/main\n"
+            "\n"
+            "worktree /repo/linked\n"
+            "HEAD def456\n"
+            "branch refs/heads/task\n"
+        )
+
+        self.assertEqual(parsed, Path("/repo/main worktree"))
 
     def test_task_source_defaults_do_not_block_generated_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
