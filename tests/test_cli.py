@@ -5847,6 +5847,7 @@ class CliTests(unittest.TestCase):
                 ),
                 "payload_status": payload.get("status"),
                 "payload_error": payload.get("error"),
+                "payload_workspace_git_state": payload.get("workspace_git_state"),
                 "release_debug": release_debug,
             }
 
