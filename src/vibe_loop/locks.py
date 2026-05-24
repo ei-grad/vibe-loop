@@ -822,7 +822,15 @@ def terminate_lock_command(process: subprocess.Popen[bytes]) -> None:
         except ProcessLookupError:
             pass
     else:
-        process.kill()
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError:
+            process.kill()
     try:
         process.wait(timeout=1)
     except subprocess.TimeoutExpired:
