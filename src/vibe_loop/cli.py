@@ -772,6 +772,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "locks": config.locks.to_json(),
                     "completion": config.completion.__dict__,
                     "stale_locks": stale_report,
+                    "concurrency_diagnostics": concurrency_diagnostics_report(workers),
                     "workspace_diagnostics": workspace_diagnostics_report(workers),
                 },
                 indent=2,
@@ -1584,6 +1585,52 @@ def workspace_diagnostics_report(workers: list[WorkerView]) -> dict[str, object]
             )
             diagnostics.append(payload)
     return {"count": len(diagnostics), "diagnostics": diagnostics}
+
+
+def concurrency_diagnostics_report(workers: list[WorkerView]) -> dict[str, object]:
+    active_lock_count = len(workers)
+    blocked_events = [
+        lock_contention_event(worker)
+        for worker in workers
+        if worker_has_lock_contention(worker)
+    ]
+    return {
+        "wip_count": sum(1 for worker in workers if worker.state == "running"),
+        "blocked_ratio": (
+            len(blocked_events) / active_lock_count if active_lock_count else 0.0
+        ),
+        "active_lock_count": active_lock_count,
+        "lock_contention_events": blocked_events,
+    }
+
+
+def worker_has_lock_contention(worker: WorkerView) -> bool:
+    return worker.state != "running" or worker.result_status in {
+        "blocked",
+        "failed",
+        "unknown",
+    }
+
+
+def lock_contention_event(worker: WorkerView) -> dict[str, object]:
+    return {
+        "task_id": worker.active.task_id,
+        "run_id": worker.active.run_id,
+        "state": worker.state,
+        "process_state": worker.process_state,
+        "reason": lock_contention_reason(worker),
+        "stale_reason": worker.stale_reason,
+        "result_status": worker.result_status,
+        "lock": str(worker.active.lock_path or ""),
+    }
+
+
+def lock_contention_reason(worker: WorkerView) -> str:
+    if worker.state != "running":
+        return worker.stale_reason or worker.state
+    if worker.result_status:
+        return f"result_{worker.result_status}"
+    return ""
 
 
 def render_stale_locks(stale_locks: list[StaleLock]) -> str:

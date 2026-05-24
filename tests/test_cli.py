@@ -5770,6 +5770,149 @@ class CliTests(unittest.TestCase):
         self.assertIn("1 stale lock(s) found.", text_output)
         self.assertIn("vibe-loop workers clean", text_output)
 
+    def test_doctor_json_reports_concurrency_diagnostics_from_worker_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            running_lock = lock_root / "TASK-01.lock"
+            stale_lock = lock_root / "TASK-02.lock"
+            running_lock.mkdir(parents=True)
+            stale_lock.mkdir()
+            (running_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "pid_source": "popen",
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (stale_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-02",
+                        "run_id": "run-2",
+                        "pid": 999999999,
+                        "worker_pid": 999999999,
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:01:00+00:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workers_stdout = StringIO()
+            workers_stderr = StringIO()
+            doctor_stdout = StringIO()
+            doctor_stderr = StringIO()
+
+            with redirect_stdout(workers_stdout), redirect_stderr(workers_stderr):
+                workers_exit = main(["workers", "--repo", str(repo), "--json"])
+            with redirect_stdout(doctor_stdout), redirect_stderr(doctor_stderr):
+                doctor_exit = main(["doctor", "--repo", str(repo), "--json"])
+
+            workers_payload = json.loads(workers_stdout.getvalue())
+            doctor_payload = json.loads(doctor_stdout.getvalue())
+
+        blocked_workers = [
+            worker
+            for worker in workers_payload
+            if worker["state"] != "running"
+            or worker["result_status"] in {"blocked", "failed", "unknown"}
+        ]
+        diagnostics = doctor_payload["concurrency_diagnostics"]
+        self.assertEqual(workers_exit, 0)
+        self.assertEqual(doctor_exit, 0)
+        self.assertEqual(workers_stderr.getvalue(), "")
+        self.assertEqual(doctor_stderr.getvalue(), "")
+        self.assertEqual(diagnostics["active_lock_count"], len(workers_payload))
+        self.assertEqual(
+            diagnostics["wip_count"],
+            sum(1 for worker in workers_payload if worker["state"] == "running"),
+        )
+        self.assertEqual(
+            diagnostics["blocked_ratio"],
+            len(blocked_workers) / len(workers_payload),
+        )
+        self.assertEqual(
+            len(diagnostics["lock_contention_events"]),
+            len(blocked_workers),
+        )
+        self.assertEqual(
+            diagnostics["lock_contention_events"][0]["task_id"],
+            "TASK-02",
+        )
+        self.assertEqual(
+            diagnostics["lock_contention_events"][0]["reason"],
+            "missing_process",
+        )
+        self.assertEqual(
+            diagnostics["lock_contention_events"][0]["stale_reason"],
+            workers_payload[1]["stale_reason"],
+        )
+        self.assertIsNone(diagnostics["lock_contention_events"][0]["result_status"])
+
+    def test_doctor_concurrency_diagnostics_include_blocked_worker_report(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            write_active_run_lock(repo, "TASK-01", "run-1")
+            runs_path = repo / ".vibe-loop" / "runs.jsonl"
+            original_runs = (
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "worker_report",
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "status": "blocked",
+                        "commit": "",
+                        "message": "waiting on dependency",
+                        "metadata": {},
+                        "reported_at": "2026-05-09T00:00:30+00:00",
+                    }
+                )
+                + "\n"
+            )
+            runs_path.parent.mkdir(parents=True, exist_ok=True)
+            runs_path.write_text(original_runs, encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+            after_runs = runs_path.read_text(encoding="utf-8")
+
+        diagnostics = payload["concurrency_diagnostics"]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(diagnostics["active_lock_count"], 1)
+        self.assertEqual(diagnostics["wip_count"], 1)
+        self.assertEqual(diagnostics["blocked_ratio"], 1.0)
+        self.assertEqual(
+            diagnostics["lock_contention_events"][0]["result_status"],
+            "blocked",
+        )
+        self.assertIsNone(diagnostics["lock_contention_events"][0]["stale_reason"])
+        self.assertEqual(
+            diagnostics["lock_contention_events"][0]["reason"],
+            "result_blocked",
+        )
+        self.assertEqual(after_runs, original_runs)
+
     def test_workers_and_doctor_report_expired_lease_as_stale(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
