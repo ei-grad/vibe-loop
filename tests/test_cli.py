@@ -5766,6 +5766,7 @@ class CliTests(unittest.TestCase):
             holder_stderr = StringIO()
             waiter_stdout = StringIO()
             waiter_stderr = StringIO()
+            release_debug: list[dict[str, object]] = []
 
             with redirect_stdout(holder_stdout), redirect_stderr(holder_stderr):
                 holder_exit = main(
@@ -5784,9 +5785,19 @@ class CliTests(unittest.TestCase):
             def dirty_workspace_and_release(delay: float) -> None:
                 self.assertEqual(delay, 0.1)
                 (repo / "notes.txt").write_text("not committed\n", encoding="utf-8")
-                LockManager(repo / ".vibe-loop" / "locks").release_main_integration(
+                release_manager = LockManager(repo / ".vibe-loop" / "locks")
+                before = release_manager.main_integration_status().to_json()
+                released = release_manager.release_main_integration(
                     task_id="TASK-01",
                     run_id="run-holder",
+                )
+                after = release_manager.main_integration_status().to_json()
+                release_debug.append(
+                    {
+                        "released": released,
+                        "before": before,
+                        "after": after,
+                    }
                 )
 
             with patch(
@@ -5836,6 +5847,7 @@ class CliTests(unittest.TestCase):
                 ),
                 "payload_status": payload.get("status"),
                 "payload_error": payload.get("error"),
+                "release_debug": release_debug,
             }
 
         self.assertEqual(holder_exit, 0)
