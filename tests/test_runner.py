@@ -2732,7 +2732,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     def test_worker_exiting_within_grace_is_not_killed(self):
         proc = FakeWatchdogProcess(alive_polls=2)
         killed: list[tuple[int, int]] = []
-        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
             result = wait_with_reap_watchdog(
                 proc,
                 StringIO(),
@@ -2746,7 +2748,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     def test_worker_hung_after_terminal_report_is_reaped(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
         killed: list[tuple[int, int]] = []
-        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
             result = wait_with_reap_watchdog(
                 proc,
                 StringIO(),
@@ -2761,7 +2765,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     def test_not_eligible_keeps_waiting_without_killing(self):
         proc = FakeWatchdogProcess(alive_polls=3)
         killed: list[tuple[int, int]] = []
-        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
             result = wait_with_reap_watchdog(
                 proc,
                 StringIO(),
@@ -2779,7 +2785,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
             raise RuntimeError("flaky report read")
 
         killed: list[tuple[int, int]] = []
-        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
             result = wait_with_reap_watchdog(
                 proc,
                 StringIO(),
