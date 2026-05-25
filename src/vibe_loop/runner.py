@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import string
 import subprocess
 import sys
@@ -934,6 +935,17 @@ class VibeRunner:
                         log,
                     )
 
+                def worker_filed_terminal_report() -> bool:
+                    # A filed report means the worker reached its reporting
+                    # step and intends to exit; if it then hangs (e.g. held by
+                    # orphaned background children) the watchdog reaps it so the
+                    # slot and task lock are released instead of wedging for
+                    # hours.
+                    return (
+                        self.run_store.latest_worker_report(run_id, task.task_id)
+                        is not None
+                    )
+
                 stream_result = run_streaming_command(
                     command,
                     self.config.repo,
@@ -942,6 +954,7 @@ class VibeRunner:
                     forward_stderr=self.config.agent.forward_stderr,
                     on_start=record_worker_pid,
                     on_observation=record_agent_observation,
+                    reap_check=worker_filed_terminal_report,
                 )
                 exit_code = stream_result.exit_code
                 session_id = stream_result.session_id or run_id
@@ -3240,6 +3253,95 @@ def report_status(message: str, log: TextIO | None = None) -> None:
         log.flush()
 
 
+def terminate_worker_process_group(
+    process: subprocess.Popen,
+    log: TextIO,
+    *,
+    sigkill_after_seconds: float = 10.0,
+) -> None:
+    """Terminate a worker's whole process group (SIGTERM, then SIGKILL).
+
+    Used to reap a worker that stays alive after it has already filed its
+    terminal report -- typically held up by orphaned background children that
+    keep its pipes open. Falls back to killing just the process where process
+    groups are unavailable (non-POSIX).
+    """
+    if not hasattr(os, "killpg"):
+        try:
+            process.terminate()
+            try:
+                process.wait(timeout=sigkill_after_seconds)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    except OSError:
+        process.kill()
+        return
+    try:
+        process.wait(timeout=sigkill_after_seconds)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        process.kill()
+
+
+def wait_with_reap_watchdog(
+    process: subprocess.Popen,
+    log: TextIO,
+    *,
+    reap_check: Callable[[], bool] | None,
+    grace_seconds: float,
+    poll_seconds: float,
+) -> int:
+    """Wait for a worker, reaping it if it hangs after becoming reap-eligible.
+
+    When ``reap_check`` is None this is a plain blocking wait. Otherwise the
+    wait polls: once ``reap_check`` first returns True (e.g. the worker filed a
+    terminal report, so it intends to exit) a grace timer starts; if the
+    process is still alive ``grace_seconds`` later, its process group is
+    terminated and the post-kill exit code is returned. A worker that exits on
+    its own within grace is never force-killed.
+    """
+    if reap_check is None:
+        return process.wait()
+    reap_eligible_since: float | None = None
+    while True:
+        try:
+            return process.wait(timeout=poll_seconds)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            eligible = reap_check()
+        # The watchdog must never crash the wait: a flaky report read should
+        # leave the worker running, not abort supervision.
+        except Exception:
+            eligible = False
+        if not eligible:
+            continue
+        now = time.monotonic()
+        if reap_eligible_since is None:
+            reap_eligible_since = now
+            continue
+        if now - reap_eligible_since >= grace_seconds:
+            report_status(
+                f"worker pid={process.pid} still alive "
+                f"{grace_seconds:.0f}s after filing its terminal report; "
+                "reaping process group to release its slot",
+                log,
+            )
+            terminate_worker_process_group(process, log)
+            return process.wait()
+
+
 def run_streaming_command(
     command: str,
     cwd: Path,
@@ -3249,8 +3351,17 @@ def run_streaming_command(
     forward_stderr: bool = False,
     on_start: Callable[[int], None] | None = None,
     on_observation: Callable[[AgentRuntimeObservation], None] | None = None,
+    reap_check: Callable[[], bool] | None = None,
+    reap_grace_seconds: float = 120.0,
+    reap_poll_seconds: float = 10.0,
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
+    popen_kwargs: dict[str, object] = {}
+    if os.name != "nt":
+        # Own session/process group so a worker that hangs after reporting can
+        # be reaped as a unit, including any orphaned background grandchildren
+        # that keep its stdout/stderr pipes open.
+        popen_kwargs["start_new_session"] = True
     process = subprocess.Popen(
         cmd,
         cwd=cwd,
@@ -3262,6 +3373,7 @@ def run_streaming_command(
         errors="replace",
         bufsize=1,
         env=env,
+        **popen_kwargs,
     )
     if on_start is not None:
         on_start(process.pid)
@@ -3295,7 +3407,13 @@ def run_streaming_command(
     )
     stdout_thread.start()
     stderr_thread.start()
-    exit_code = process.wait()
+    exit_code = wait_with_reap_watchdog(
+        process,
+        log,
+        reap_check=reap_check,
+        grace_seconds=reap_grace_seconds,
+        poll_seconds=reap_poll_seconds,
+    )
     stdout_thread.join()
     stderr_thread.join()
     observation = output_observer.observation

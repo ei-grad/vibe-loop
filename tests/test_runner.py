@@ -4,7 +4,9 @@ import dataclasses
 import hashlib
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -40,7 +42,9 @@ from vibe_loop.runner import (
     parse_selected_task_ids,
     parse_worker_session_id,
     run_streaming_command,
+    terminate_worker_process_group,
     validate_selected_task_batch,
+    wait_with_reap_watchdog,
 )
 from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
@@ -2689,6 +2693,118 @@ class StaleLockSelectionDrainingTests(unittest.TestCase):
             candidate_ids = {task.task_id for task in runner.list_candidates()}
 
             self.assertEqual(candidate_ids, {"disjoint"})
+
+
+class FakeWatchdogProcess:
+    """Minimal Popen stand-in for watchdog tests.
+
+    ``wait(timeout=...)`` raises ``TimeoutExpired`` until ``alive_polls`` is
+    exhausted, then returns ``returncode``; ``wait()`` (no timeout) returns
+    immediately so a forced kill resolves.
+    """
+
+    def __init__(self, *, alive_polls: int, pid: int = 4321, returncode: int = 0):
+        self.pid = pid
+        self.returncode = returncode
+        self._remaining = alive_polls
+        self.kill_calls = 0
+
+    def wait(self, timeout=None):
+        if timeout is None:
+            return self.returncode
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+        return self.returncode
+
+    def kill(self):
+        self.kill_calls += 1
+
+
+class WaitWithReapWatchdogTests(unittest.TestCase):
+    def test_no_reap_check_is_a_plain_blocking_wait(self):
+        proc = FakeWatchdogProcess(alive_polls=0, returncode=7)
+        result = wait_with_reap_watchdog(
+            proc, StringIO(), reap_check=None, grace_seconds=120.0, poll_seconds=0.01
+        )
+        self.assertEqual(result, 7)
+
+    def test_worker_exiting_within_grace_is_not_killed(self):
+        proc = FakeWatchdogProcess(alive_polls=2)
+        killed: list[tuple[int, int]] = []
+        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=100.0,
+                poll_seconds=0.001,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(killed, [])
+
+    def test_worker_hung_after_terminal_report_is_reaped(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        killed: list[tuple[int, int]] = []
+        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=0.0,
+                poll_seconds=0.001,
+            )
+        self.assertEqual(result, 0)
+        self.assertTrue(killed)
+        self.assertEqual(killed[0], (proc.pid, signal.SIGTERM))
+
+    def test_not_eligible_keeps_waiting_without_killing(self):
+        proc = FakeWatchdogProcess(alive_polls=3)
+        killed: list[tuple[int, int]] = []
+        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: False,
+                grace_seconds=0.0,
+                poll_seconds=0.001,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(killed, [])
+
+    def test_reap_check_exception_does_not_abort_supervision(self):
+        proc = FakeWatchdogProcess(alive_polls=2)
+
+        def boom() -> bool:
+            raise RuntimeError("flaky report read")
+
+        killed: list[tuple[int, int]] = []
+        with patch.object(runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=boom,
+                grace_seconds=0.0,
+                poll_seconds=0.001,
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(killed, [])
+
+    def test_terminate_sigterm_then_sigkill_when_group_lingers(self):
+        # SIGTERM is sent, the group does not die within the grace, so SIGKILL
+        # follows. alive_polls=1 makes the post-SIGTERM wait(timeout=...) raise
+        # once before the no-timeout wait resolves.
+        proc = FakeWatchdogProcess(alive_polls=1)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            terminate_worker_process_group(
+                proc, StringIO(), sigkill_after_seconds=0.001
+            )
+        self.assertEqual(
+            killed, [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)]
+        )
 
 
 if __name__ == "__main__":
