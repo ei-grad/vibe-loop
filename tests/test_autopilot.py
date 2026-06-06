@@ -367,6 +367,53 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertIsNone(cycle.child_pid)
         self.assertIn("repo_dirty", cycle.blockers)
 
+    def test_cleans_stale_worker_locks_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo, config.state_path / "locks", config.locks
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            active = ActiveRunState.new(
+                task_id="STALE-01",
+                run_id="run-stale",
+                log_path=config.state_path / "runs" / "run-stale.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+            ).with_worker_pid(987654321)
+            manager.acquire(
+                "STALE-01",
+                "run-stale",
+                metadata=active.to_lock_metadata(),
+            )
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                process_exists=lambda pid: False,
+            )
+            stale_lock = manager.status("STALE-01")
+            records = run_store.read_records()
+
+        self.assertTrue(summary.started)
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(stale_lock)
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "completed")
+        self.assertIn("cleaned_stale_locks:1", cycle.actions)
+        self.assertNotIn("stale_locks_present", cycle.blockers)
+        cycle_records = [
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_CYCLE_RECORD_TYPE
+        ]
+        self.assertEqual(cycle_records[-1]["actions"][0], "cleaned_stale_locks:1")
+
     def test_low_ready_queue_is_idle_without_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
