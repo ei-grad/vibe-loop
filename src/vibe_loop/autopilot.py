@@ -283,7 +283,9 @@ def collect_project_status(
             agent_diagnostics=agent_blockers,
         )
     )
-    observations = tuple(project_observations(queue_status=queue_status))
+    observations = tuple(
+        project_observations(queue_status=queue_status, workers=workers)
+    )
     return ProjectStatus(
         repo=config.repo,
         display_name=config.repo.name,
@@ -581,11 +583,29 @@ def project_blockers(
     return blockers
 
 
-def project_observations(*, queue_status: TaskQueueStatus) -> list[str]:
+def project_observations(
+    *,
+    queue_status: TaskQueueStatus,
+    workers: tuple[WorkerView, ...] = (),
+) -> list[str]:
     observations: list[str] = []
     if not queue_status.source_error and queue_status.runnable == 0:
-        observations.append("no_runnable_work")
+        running_workers = active_conflict_worker_count(workers)
+        if running_workers:
+            observations.append(f"waiting_for_active_workers:{running_workers}")
+        else:
+            observations.append("no_runnable_work")
     return observations
+
+
+def active_conflict_worker_count(workers: tuple[WorkerView, ...]) -> int:
+    return sum(1 for worker in workers if worker_holds_active_conflict(worker))
+
+
+def worker_holds_active_conflict(worker: WorkerView) -> bool:
+    if worker.state == "running":
+        return True
+    return worker.state == "unknown" and worker.process_state == "foreign_host"
 
 
 def string_tuple(value: object) -> tuple[str, ...]:
@@ -943,8 +963,15 @@ def execute_autopilot_cycle(
         actions.append("blocked_preflight")
     elif runnable < min_ready:
         cycle_status = "idle"
-        if run_maintenance("planning") is None:
-            actions.append("no_runnable_work")
+        active_conflict_workers = active_conflict_worker_count(status.workers)
+        planning = run_maintenance("planning")
+        if planning is None:
+            if runnable == 0 and active_conflict_workers:
+                actions.append(f"waiting_for_active_workers:{active_conflict_workers}")
+            elif runnable == 0:
+                actions.append("no_runnable_work")
+            else:
+                actions.append(f"low_runnable_work:{runnable}/{min_ready}")
     else:
         child_log = config.state_path / "autopilot" / f"{cycle_id}.log"
         command = autopilot_child_command(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -227,6 +228,77 @@ class AutopilotStatusTests(unittest.TestCase):
 
         self.assertEqual(payload["queue"]["runnable"], 0)
         self.assertIn("no_runnable_work", payload["observations"])
+
+    def test_collect_project_status_reports_active_workers_when_queue_filtered(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            write_plan(repo, [("TASK-01", "Next", "", "ready slice")])
+            commit_all(repo)
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            active = ActiveRunState.new(
+                task_id="ACTIVE-01",
+                run_id="run-active",
+                log_path=config.state_path / "runs" / "run-active.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+                resources=("api",),
+                conflict_domains_known=True,
+            ).with_worker_pid(os.getpid())
+            manager.acquire(
+                "ACTIVE-01",
+                "run-active",
+                metadata=active.to_lock_metadata(),
+            )
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["queue"]["statuses"]["Next"], 1)
+        self.assertEqual(payload["queue"]["runnable"], 0)
+        self.assertIn("waiting_for_active_workers:1", payload["observations"])
+        self.assertNotIn("no_runnable_work", payload["observations"])
+
+    def test_collect_project_status_counts_foreign_host_workers_as_waiting(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            write_plan(repo, [("TASK-01", "Next", "", "ready slice")])
+            commit_all(repo)
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            active = ActiveRunState.new(
+                task_id="ACTIVE-01",
+                run_id="run-active",
+                log_path=config.state_path / "runs" / "run-active.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+                resources=("api",),
+                conflict_domains_known=True,
+            )
+            metadata = active.to_lock_metadata()
+            metadata["host"] = "other-host"
+            manager.acquire("ACTIVE-01", "run-active", metadata=metadata)
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["workers"][0]["state"], "unknown")
+        self.assertEqual(payload["workers"][0]["process_state"], "foreign_host")
+        self.assertEqual(payload["queue"]["runnable"], 0)
+        self.assertIn("waiting_for_active_workers:1", payload["observations"])
+        self.assertNotIn("no_runnable_work", payload["observations"])
 
     def test_collect_project_status_counts_lowercase_queue_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -483,7 +555,55 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertTrue(summary.started)
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
+
+    def test_empty_queue_reports_no_runnable_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Done", "", "finished slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertTrue(summary.started)
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(summary.cycles[0].status, "idle")
         self.assertIn("no_runnable_work", summary.cycles[0].actions)
+
+    def test_low_ready_queue_with_live_worker_reports_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            active = ActiveRunState.new(
+                task_id="ACTIVE-01",
+                run_id="run-active",
+                log_path=config.state_path / "runs" / "run-active.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+                resources=("api",),
+                conflict_domains_known=True,
+            ).with_worker_pid(os.getpid())
+            manager.acquire(
+                "ACTIVE-01",
+                "run-active",
+                metadata=active.to_lock_metadata(),
+            )
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertTrue(summary.started)
+        self.assertEqual(len(calls), 0)
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("waiting_for_active_workers:1", summary.cycles[0].actions)
+        self.assertNotIn("no_runnable_work", summary.cycles[0].actions)
 
     def test_observes_live_supervisor_without_duplicating(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -644,7 +764,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         )
         self.assertEqual([record["kind"] for record in command_records], ["planning"])
 
-    def test_low_ready_without_planning_reports_observation(self) -> None:
+    def test_low_ready_without_planning_reports_low_runnable_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
@@ -660,7 +780,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertIn("no_runnable_work", summary.cycles[0].actions)
+        self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
         self.assertEqual(calls, [])
 
     def test_failed_health_command_blocks_launch(self) -> None:
