@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time as time_module
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -729,6 +731,19 @@ def maintenance_command_env(
     }
 
 
+def kill_command_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        if os.name != "nt" and hasattr(os, "killpg"):
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            return
+    except (ProcessLookupError, OSError):
+        pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+
+
 def run_maintenance_command(
     command: str,
     kind: str,
@@ -741,41 +756,69 @@ def run_maintenance_command(
 ) -> MaintenanceCommandResult:
     """Run a user-authored maintenance command with bounded time and output.
 
-    Output beyond ``max_output_bytes`` is truncated in the recorded result and
-    the command is killed once ``timeout`` elapses, so a misbehaving hook cannot
-    stall or flood the supervisor.
+    Output is captured to a temporary file and the command runs in its own
+    session so a flood (over ``max_output_bytes``) or a stall (over ``timeout``)
+    kills the whole process group rather than orphaning descendants. Recorded
+    output is truncated on a byte boundary.
     """
 
     env = os.environ.copy()
     env.update(env_extra)
+    popen_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
     start = time_module.monotonic()
-    timed_out = False
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=env,
-        )
-        exit_code: int | None = completed.returncode
-        raw = (completed.stdout or "") + (completed.stderr or "")
-    except subprocess.TimeoutExpired as exc:
-        exit_code = None
-        timed_out = True
-        raw = (exc.stdout or "") + (exc.stderr or "")
-    duration = time_module.monotonic() - start
+    with tempfile.TemporaryFile() as buffer:
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                shell=True,
+                stdout=buffer,
+                stderr=subprocess.STDOUT,
+                env=env,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            return MaintenanceCommandResult(
+                kind=kind,
+                cycle_id=cycle_id,
+                exit_code=None,
+                duration_seconds=time_module.monotonic() - start,
+                output=f"could not start: {exc}"[:max_output_bytes],
+                output_truncated=False,
+                timed_out=False,
+            )
+        timed_out = False
+        size_exceeded = False
+        deadline = start + timeout
+        while True:
+            code = process.poll()
+            if code is not None:
+                break
+            buffer.seek(0, os.SEEK_END)
+            if buffer.tell() > max_output_bytes:
+                size_exceeded = True
+                kill_command_process_group(process)
+                process.wait()
+                break
+            if time_module.monotonic() >= deadline:
+                timed_out = True
+                kill_command_process_group(process)
+                process.wait()
+                break
+            time_module.sleep(0.01)
+        duration = time_module.monotonic() - start
+        buffer.seek(0)
+        raw = buffer.read()
+    exit_code = None if (timed_out or size_exceeded) else process.returncode
     return MaintenanceCommandResult(
         kind=kind,
         cycle_id=cycle_id,
         exit_code=exit_code,
         duration_seconds=duration,
-        output=raw[:max_output_bytes],
-        output_truncated=len(raw) > max_output_bytes,
+        output=raw[:max_output_bytes].decode("utf-8", errors="replace"),
+        output_truncated=size_exceeded or len(raw) > max_output_bytes,
         timed_out=timed_out,
     )
 
