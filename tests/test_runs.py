@@ -7,6 +7,8 @@ from pathlib import Path
 
 from vibe_loop.runs import (
     AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
+    AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_RECORD_TYPES,
     LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_EXPIRED_RECORD_TYPE,
@@ -517,6 +519,37 @@ class RunStoreTests(unittest.TestCase):
         self.assertIsNotNone(inspection)
         assert inspection is not None
         self.assertEqual(inspection.view.record_count, 2)
+
+    def test_read_records_keeps_autopilot_records_out_of_run_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                    "cycle_id": "cycle-1",
+                    "repo": directory,
+                    "status": "blocked",
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                    "blockers": ["repo_dirty"],
+                }
+            )
+            store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "unknown_future_record",
+                    "run_id": "run-1",
+                }
+            )
+
+            records = store.read_records()
+            runs = store.list_runs()
+
+        self.assertIn(AUTOPILOT_CYCLE_RECORD_TYPE, AUTOPILOT_RECORD_TYPES)
+        self.assertEqual(
+            [record["record_type"] for record in records], ["autopilot_cycle"]
+        )
+        self.assertEqual(runs, [])
 
     def test_list_runs_ignores_invalid_worker_reports_for_latest_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

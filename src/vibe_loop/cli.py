@@ -2047,6 +2047,10 @@ def validate_report_fencing(args: argparse.Namespace, config) -> int | None:
         print("worker report refused: fencing_token_mismatch", file=sys.stderr)
         return 1
     except LockBackendError as exc:
+        if str(exc).startswith(
+            "active lock not found:"
+        ) and not explicit_fencing_token_from_args(args):
+            return None
         print(f"worker report refused: {exc}", file=sys.stderr)
         return 1
     return None

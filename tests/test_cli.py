@@ -4478,6 +4478,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["record_type"], "worker_report")
 
+    def test_report_refuses_explicit_fencing_token_without_active_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--status",
+                        "blocked",
+                        "--fencing-token",
+                        "stale-token",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("active lock not found", stderr.getvalue())
+
     def test_worker_claim_workspace_updates_lock_and_run_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
