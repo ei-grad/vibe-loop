@@ -35,6 +35,7 @@ from vibe_loop.workers import (
     clean_stale_locks,
     collect_stale_locks,
     pid_exists,
+    record_expired_locks,
 )
 
 RunUntilDoneLauncher = Callable[..., int]
@@ -857,13 +858,17 @@ def execute_autopilot_cycle(
     child_log: Path | None = None
     cleanup_errors = 0
 
-    if status.stale_locks:
+    cleanup_candidates = tuple(
+        lock for lock in status.stale_locks if lock.stale_reason == "missing_process"
+    )
+    if cleanup_candidates:
         lock_manager = build_lock_manager(
             config.repo,
             config.state_path / "locks",
             config.locks,
         )
-        clean_result = clean_stale_locks(list(status.stale_locks), lock_manager)
+        clean_result = clean_stale_locks(list(cleanup_candidates), lock_manager)
+        record_expired_locks(run_store, clean_result.cleaned)
         if clean_result.cleaned:
             actions.append(f"cleaned_stale_locks:{len(clean_result.cleaned)}")
         if clean_result.errors:
