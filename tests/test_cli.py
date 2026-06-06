@@ -7322,8 +7322,11 @@ class AutopilotCliTests(unittest.TestCase):
         proc.wait()
         dead_pid = proc.pid
 
+        # The pid is already dead, so the first poll wakes on it before any
+        # sleep; the short cycle-schedule only bounds the worst case if the OS
+        # were to recycle the pid, so the test can never hang.
         code, out = self._autopilot(
-            "wait", "--pid", str(dead_pid), "--cycle-schedule", "3600", "--json"
+            "wait", "--pid", str(dead_pid), "--cycle-schedule", "2", "--json"
         )
         payload = json.loads(out)
 

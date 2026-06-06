@@ -1351,10 +1351,12 @@ def wait_for_processes(
     wake signals belong in the agent environment, not here.
     """
 
+    watched_pids = list(dict.fromkeys(pids))
+    if not watched_pids and deadline_epoch is None:
+        raise ValueError("wait requires at least one pid or a deadline")
     checker = process_exists if process_exists is not None else pid_exists
     now = wallclock if wallclock is not None else time_module.time
     sleeper = sleep if sleep is not None else time_module.sleep
-    watched_pids = list(dict.fromkeys(pids))
     completed_pids: set[int] = set()
     all_events: list[dict[str, object]] = []
 
