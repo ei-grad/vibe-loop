@@ -18,6 +18,7 @@ from vibe_loop.config import (
 from vibe_loop.locks import LockBusy, build_lock_manager
 from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
+    AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
@@ -674,6 +675,111 @@ def classify_child_exit(exit_code: int) -> str:
     return "restartable"
 
 
+AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES = 128 * 1024
+AUTOPILOT_COMMAND_TIMEOUT_SECONDS = 120.0
+AUTOPILOT_MAINTENANCE_KINDS = ("health", "summary", "troubleshoot", "planning")
+
+
+@dataclasses.dataclass(frozen=True)
+class MaintenanceCommandResult:
+    kind: str
+    cycle_id: str
+    exit_code: int | None
+    duration_seconds: float
+    output: str
+    output_truncated: bool
+    timed_out: bool
+
+    @property
+    def succeeded(self) -> bool:
+        return self.exit_code == 0
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "kind": self.kind,
+            "exit_code": self.exit_code,
+            "duration_seconds": round(self.duration_seconds, 6),
+            "output": self.output,
+            "output_truncated": self.output_truncated,
+            "timed_out": self.timed_out,
+        }
+
+
+MaintenanceRunner = Callable[..., MaintenanceCommandResult]
+
+
+def maintenance_command_env(
+    config: VibeConfig,
+    *,
+    kind: str,
+    cycle_id: str,
+    runnable: int,
+) -> dict[str, str]:
+    return {
+        "VIBE_LOOP_AUTOPILOT_COMMAND_KIND": kind,
+        "VIBE_LOOP_AUTOPILOT_CYCLE_ID": cycle_id,
+        "VIBE_LOOP_REPO": str(config.repo),
+        "VIBE_LOOP_STATE_DIR": str(config.state_path),
+        "VIBE_LOOP_AUTOPILOT_RUNNABLE": str(runnable),
+    }
+
+
+def run_maintenance_command(
+    command: str,
+    kind: str,
+    cycle_id: str,
+    *,
+    cwd: Path,
+    env_extra: dict[str, str],
+    timeout: float,
+    max_output_bytes: int,
+) -> MaintenanceCommandResult:
+    """Run a user-authored maintenance command with bounded time and output.
+
+    Output beyond ``max_output_bytes`` is truncated in the recorded result and
+    the command is killed once ``timeout`` elapses, so a misbehaving hook cannot
+    stall or flood the supervisor.
+    """
+
+    env = os.environ.copy()
+    env.update(env_extra)
+    start = time_module.monotonic()
+    timed_out = False
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=env,
+        )
+        exit_code: int | None = completed.returncode
+        raw = (completed.stdout or "") + (completed.stderr or "")
+    except subprocess.TimeoutExpired as exc:
+        exit_code = None
+        timed_out = True
+        raw = (exc.stdout or "") + (exc.stderr or "")
+    duration = time_module.monotonic() - start
+    return MaintenanceCommandResult(
+        kind=kind,
+        cycle_id=cycle_id,
+        exit_code=exit_code,
+        duration_seconds=duration,
+        output=raw[:max_output_bytes],
+        output_truncated=len(raw) > max_output_bytes,
+        timed_out=timed_out,
+    )
+
+
 def execute_autopilot_cycle(
     config: VibeConfig,
     *,
@@ -687,19 +793,54 @@ def execute_autopilot_cycle(
     next_wake: str,
     process_exists: ProcessExists | None,
     launcher: RunUntilDoneLauncher,
+    run_store: RunStore,
+    maintenance_runner: MaintenanceRunner = run_maintenance_command,
+    command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
+    command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
 ) -> AutopilotCycleResult:
     status = collect_project_status(config, process_exists=process_exists)
-    blockers = tuple(status.blockers)
+    runnable = status.queue.runnable
     actions: list[str] = []
     child_pid: int | None = None
     child_log: Path | None = None
 
+    blocker_list = list(status.blockers)
+    if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
+        blocker_list.remove("repo_dirty")
+        actions.append("repo_dirty_ignored")
+
+    def run_maintenance(kind: str) -> MaintenanceCommandResult | None:
+        command = config.autopilot.maintenance_command(kind)
+        if not command:
+            return None
+        result = maintenance_runner(
+            command,
+            kind,
+            cycle_id,
+            cwd=config.repo,
+            env_extra=maintenance_command_env(
+                config, kind=kind, cycle_id=cycle_id, runnable=runnable
+            ),
+            timeout=command_timeout,
+            max_output_bytes=command_max_output_bytes,
+        )
+        run_store.append_record(result.to_record(config.repo))
+        actions.append(f"ran_{kind}_command:exit={result.exit_code}")
+        return result
+
+    if not blocker_list:
+        health = run_maintenance("health")
+        if health is not None and not health.succeeded:
+            blocker_list.append("autopilot_health_failed")
+
+    blockers = tuple(blocker_list)
     if blockers:
         cycle_status = "blocked"
         actions.append("blocked_preflight")
-    elif status.queue.runnable < min_ready:
+    elif runnable < min_ready:
         cycle_status = "idle"
-        actions.append("no_runnable_work")
+        if run_maintenance("planning") is None:
+            actions.append("no_runnable_work")
     else:
         child_log = config.state_path / "autopilot" / f"{cycle_id}.log"
         command = autopilot_child_command(
@@ -725,6 +866,9 @@ def execute_autopilot_cycle(
         child_pid = observed_pid.get("pid")
         cycle_status = classify_child_exit(exit_code)
         actions.append(f"child_exit:{exit_code}")
+        run_maintenance("summary")
+        if cycle_status in {"restartable", "terminated"}:
+            run_maintenance("troubleshoot")
 
     return AutopilotCycleResult(
         cycle_id=cycle_id,
@@ -755,6 +899,7 @@ def run_autopilot(
     process_exists: ProcessExists | None = None,
     sleep: Sleep | None = None,
     launcher: RunUntilDoneLauncher | None = None,
+    maintenance_runner: MaintenanceRunner = run_maintenance_command,
     should_stop: Callable[[], bool] | None = None,
 ) -> AutopilotRunSummary:
     """Supervise ``run-until-done`` as a foreground persistent loop.
@@ -848,6 +993,8 @@ def run_autopilot(
                 next_wake=next_wake,
                 process_exists=process_exists,
                 launcher=launch,
+                run_store=run_store,
+                maintenance_runner=maintenance_runner,
             )
             result.append_to(run_store)
             cycles.append(result)

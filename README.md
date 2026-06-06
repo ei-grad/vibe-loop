@@ -365,6 +365,19 @@ in-flight `run-until-done` child it spawned and releases the supervisor lock on
 the way out. Autopilot never deletes worktrees, resets branches, steals locks,
 or mutates tracked project files on its own.
 
+`jobs`, `interval_seconds`, and `min_ready` may be set under `[autopilot]` in
+`.vibe-loop.toml`; the matching CLI flags override them when given. `[autopilot]`
+also accepts optional user-authored `health_command`, `summary_command`,
+`troubleshoot_command`, and `planning_command` hooks. These run with bounded
+time and output and append `autopilot_command_result` records; a failing health
+command blocks that cycle's launch, the planning command runs when the runnable
+queue is below `min_ready`, and the summary/troubleshoot commands run after a
+launched child succeeds or fails. The hooks are external checks and planners,
+not recovery agents: their presence never authorizes autopilot to perform
+destructive cleanup, and generated task-source profiles can never introduce
+them. `doctor --json` reports `[autopilot]` settings with command strings
+redacted.
+
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill
 conditions and agent commands, writes per-trial artifacts, and emits
@@ -500,6 +513,24 @@ type = "directory"
 # Optional. When set, locks become stale after this many seconds without a
 # heartbeat update.
 # lease_seconds = 300
+
+[autopilot]
+# Defaults for `autopilot run`; explicit CLI flags override these.
+# jobs = 2
+# interval_seconds = 60.0
+# min_ready = 1
+# When false, a dirty working tree no longer blocks an autopilot cycle.
+require_clean_repo = true
+# Optional user-authored maintenance commands. They run with bounded time and
+# output, append `autopilot_command_result` records, and are redacted in status
+# and doctor JSON. Generated task-source profiles can never introduce them.
+# A failing health command blocks that cycle's launch; planning runs when the
+# runnable queue is below min_ready; summary runs after a launch and
+# troubleshoot runs after a failed child.
+# health_command = "scripts/health.sh"
+# summary_command = "scripts/summary.sh"
+# troubleshoot_command = "scripts/troubleshoot.sh"
+# planning_command = "scripts/plan.sh"
 
 [planning_analytics]
 schedule_policy = "current-runner-parity"

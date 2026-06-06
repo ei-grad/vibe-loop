@@ -344,6 +344,85 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.supervision.explicit_keys, frozenset())
 
+    def test_autopilot_config_parses_section(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot]\n"
+                "jobs = 2\n"
+                "interval_seconds = 30.0\n"
+                "min_ready = 2\n"
+                "require_clean_repo = false\n"
+                'health_command = "scripts/health.sh"\n'
+                'planning_command = "scripts/plan.sh"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.autopilot.jobs, 2)
+        self.assertEqual(config.autopilot.interval_seconds, 30.0)
+        self.assertEqual(config.autopilot.min_ready, 2)
+        self.assertFalse(config.autopilot.require_clean_repo)
+        self.assertEqual(
+            config.autopilot.maintenance_command("health"), "scripts/health.sh"
+        )
+        self.assertEqual(
+            config.autopilot.maintenance_command("planning"), "scripts/plan.sh"
+        )
+        self.assertIsNone(config.autopilot.maintenance_command("summary"))
+        self.assertIsNone(config.autopilot.maintenance_command("troubleshoot"))
+
+    def test_autopilot_config_defaults_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        self.assertIsNone(config.autopilot.jobs)
+        self.assertIsNone(config.autopilot.interval_seconds)
+        self.assertIsNone(config.autopilot.min_ready)
+        self.assertTrue(config.autopilot.require_clean_repo)
+        self.assertEqual(config.autopilot.explicit_keys, frozenset())
+
+    def test_autopilot_config_rejects_invalid_values(self) -> None:
+        cases = [
+            ("jobs = 0\n", "autopilot.jobs"),
+            ("min_ready = -1\n", "autopilot.min_ready"),
+            ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
+            ("unsupported = true\n", "unsupported"),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[autopilot]\n" + toml,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        load_config(repo)
+                    self.assertIn(expected, str(caught.exception))
+
+    def test_autopilot_maintenance_keys_are_forbidden_in_generated_profiles(
+        self,
+    ) -> None:
+        from vibe_loop.config import (
+            GENERATED_TASK_PROFILE_FORBIDDEN_KEYS,
+            find_forbidden_generated_command_keys,
+        )
+
+        for key in (
+            "health_command",
+            "summary_command",
+            "troubleshoot_command",
+            "planning_command",
+            "autopilot",
+        ):
+            self.assertIn(key, GENERATED_TASK_PROFILE_FORBIDDEN_KEYS)
+        forbidden = find_forbidden_generated_command_keys(
+            {"profile": {"planning_command": "do bad"}}
+        )
+        self.assertTrue(any("planning_command" in path for path in forbidden))
+
     def test_supervision_config_parses_restart_overrides(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

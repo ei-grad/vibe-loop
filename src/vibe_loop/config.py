@@ -107,6 +107,18 @@ LOCKS_COMMAND_KEYS = frozenset(
     {"acquire_command", "release_command", "status_command", "list_command"}
 )
 LOCKS_CONFIG_KEYS = frozenset({"type", "lease_seconds"}) | LOCKS_COMMAND_KEYS
+AUTOPILOT_COMMAND_KEYS = frozenset(
+    {
+        "health_command",
+        "summary_command",
+        "troubleshoot_command",
+        "planning_command",
+    }
+)
+AUTOPILOT_CONFIG_KEYS = (
+    frozenset({"jobs", "interval_seconds", "min_ready", "require_clean_repo"})
+    | AUTOPILOT_COMMAND_KEYS
+)
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -151,6 +163,11 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "release_command",
         "status_command",
         "list_command",
+        "autopilot",
+        "health_command",
+        "summary_command",
+        "troubleshoot_command",
+        "planning_command",
     }
 )
 
@@ -388,6 +405,43 @@ class SupervisionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class AutopilotConfig:
+    jobs: int | None = None
+    interval_seconds: float | None = None
+    min_ready: int | None = None
+    require_clean_repo: bool = True
+    health_command: str | None = None
+    summary_command: str | None = None
+    troubleshoot_command: str | None = None
+    planning_command: str | None = None
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def maintenance_command(self, kind: str) -> str | None:
+        return {
+            "health": self.health_command,
+            "summary": self.summary_command,
+            "troubleshoot": self.troubleshoot_command,
+            "planning": self.planning_command,
+        }.get(kind)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "jobs": self.jobs,
+            "interval_seconds": self.interval_seconds,
+            "min_ready": self.min_ready,
+            "require_clean_repo": self.require_clean_repo,
+            "health_command": self.health_command,
+            "summary_command": self.summary_command,
+            "troubleshoot_command": self.troubleshoot_command,
+            "planning_command": self.planning_command,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class LockConfig:
     type: str = "directory"
     acquire_command: str | None = None
@@ -528,6 +582,7 @@ class VibeConfig:
         default_factory=SupervisionConfig
     )
     locks: LockConfig = dataclasses.field(default_factory=LockConfig)
+    autopilot: AutopilotConfig = dataclasses.field(default_factory=AutopilotConfig)
     planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
         default_factory=PlanningAnalyticsConfig
     )
@@ -565,6 +620,7 @@ def load_config(repo: Path) -> VibeConfig:
     agent = parse_agent(data.get("agent", {}))
     supervision = parse_supervision(data.get("supervision", {}))
     locks = parse_locks(data.get("locks", {}))
+    autopilot = parse_autopilot(data.get("autopilot", {}))
     planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
     specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
@@ -578,6 +634,7 @@ def load_config(repo: Path) -> VibeConfig:
         completion=completion,
         supervision=supervision,
         locks=locks,
+        autopilot=autopilot,
         planning_analytics=planning_analytics,
         specs=specs,
     )
@@ -1109,6 +1166,36 @@ def parse_supervision(data: object) -> SupervisionConfig:
     )
 
 
+def parse_autopilot(data: object) -> AutopilotConfig:
+    table = expect_table(data, "autopilot")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - AUTOPILOT_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            f"autopilot contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    return AutopilotConfig(
+        jobs=optional_positive_int(table.get("jobs"), "autopilot.jobs"),
+        interval_seconds=optional_nonnegative_float(
+            table.get("interval_seconds"),
+            "autopilot.interval_seconds",
+        ),
+        min_ready=optional_positive_int(table.get("min_ready"), "autopilot.min_ready"),
+        require_clean_repo=optional_bool(
+            table.get("require_clean_repo"),
+            True,
+            "autopilot.require_clean_repo",
+        ),
+        health_command=optional_nonempty_string(table.get("health_command")),
+        summary_command=optional_nonempty_string(table.get("summary_command")),
+        troubleshoot_command=optional_nonempty_string(
+            table.get("troubleshoot_command")
+        ),
+        planning_command=optional_nonempty_string(table.get("planning_command")),
+        explicit_keys=explicit_keys,
+    )
+
+
 def parse_locks(data: object) -> LockConfig:
     table = expect_table(data, "locks")
     explicit_keys = frozenset(str(key) for key in table)
@@ -1475,6 +1562,12 @@ def nonnegative_float(value: object, default: float, name: str) -> float:
     if parsed < 0.0:
         raise ValueError(f"{name} must be a non-negative number")
     return parsed
+
+
+def optional_nonnegative_float(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    return nonnegative_float(value, 0.0, name)
 
 
 def optional_int(value: object, default: int, name: str) -> int:

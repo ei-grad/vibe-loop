@@ -7,10 +7,12 @@ from pathlib import Path
 
 from vibe_loop.autopilot import (
     AutopilotCycleResult,
+    MaintenanceCommandResult,
     autopilot_child_command,
     collect_project_status,
     collect_supervisor_status,
     run_autopilot,
+    run_maintenance_command,
 )
 from vibe_loop.config import load_config
 from vibe_loop.locks import AUTOPILOT_LOCK_NAME, build_lock_manager
@@ -449,10 +451,240 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(command[command.index("--max-tasks") + 1], "2")
 
 
-def configured_repo(repo: Path, rows: list[tuple[str, str, str, str]]) -> None:
+class AutopilotMaintenanceTests(unittest.TestCase):
+    def _stub_runner(self, exit_codes: dict[str, int | None]):
+        calls: list[dict[str, object]] = []
+
+        def runner(
+            command, kind, cycle_id, *, cwd, env_extra, timeout, max_output_bytes
+        ):
+            calls.append(
+                {"command": command, "kind": kind, "env_extra": dict(env_extra)}
+            )
+            return MaintenanceCommandResult(
+                kind=kind,
+                cycle_id=cycle_id,
+                exit_code=exit_codes.get(kind, 0),
+                duration_seconds=0.0,
+                output=f"{kind}-output",
+                output_truncated=False,
+                timed_out=False,
+            )
+
+        return runner, calls
+
+    def _command_records(self, config) -> list[dict[str, object]]:
+        records = RunStore(config.state_path / "runs.jsonl").read_records()
+        return [
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_COMMAND_RESULT_RECORD_TYPE
+        ]
+
+    def test_low_ready_runs_planning_command_and_records_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml='[autopilot]\nplanning_command = "plan"\n',
+            )
+            config = load_config(repo)
+            runner, calls = self._stub_runner({})
+            launcher_calls: list[object] = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                launcher_calls.append(command)
+                return 0
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                launcher=launcher,
+                maintenance_runner=runner,
+            )
+            command_records = self._command_records(config)
+
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertEqual(len(launcher_calls), 0)
+        self.assertIn("ran_planning_command:exit=0", summary.cycles[0].actions)
+        self.assertEqual([call["kind"] for call in calls], ["planning"])
+        self.assertEqual(
+            calls[0]["env_extra"]["VIBE_LOOP_AUTOPILOT_COMMAND_KIND"], "planning"
+        )
+        self.assertEqual([record["kind"] for record in command_records], ["planning"])
+
+    def test_low_ready_without_planning_reports_observation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            runner, calls = self._stub_runner({})
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                launcher=lambda *a, **k: 0,
+                maintenance_runner=runner,
+            )
+
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("no_runnable_work", summary.cycles[0].actions)
+        self.assertEqual(calls, [])
+
+    def test_failed_health_command_blocks_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml='[autopilot]\nhealth_command = "health"\n',
+            )
+            config = load_config(repo)
+            runner, calls = self._stub_runner({"health": 1})
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                maintenance_runner=runner,
+            )
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertIn("autopilot_health_failed", cycle.blockers)
+        self.assertEqual(len(launched), 0)
+        self.assertEqual([call["kind"] for call in calls], ["health"])
+
+    def test_summary_and_troubleshoot_fire_around_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    'summary_command = "summary"\n'
+                    'troubleshoot_command = "troubleshoot"\n'
+                ),
+            )
+            config = load_config(repo)
+            runner, calls = self._stub_runner({})
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 1,
+                maintenance_runner=runner,
+            )
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "restartable")
+        self.assertEqual([call["kind"] for call in calls], ["summary", "troubleshoot"])
+
+    def test_summary_fires_but_troubleshoot_skipped_on_success(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    'summary_command = "summary"\n'
+                    'troubleshoot_command = "troubleshoot"\n'
+                ),
+            )
+            config = load_config(repo)
+            runner, calls = self._stub_runner({})
+
+            run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 0,
+                maintenance_runner=runner,
+            )
+
+        self.assertEqual([call["kind"] for call in calls], ["summary"])
+
+    def test_require_clean_repo_false_allows_launch_when_dirty(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[autopilot]\nrequire_clean_repo = false\n",
+            )
+            (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+            run(repo, "git", "add", "tracked.txt")
+            config = load_config(repo)
+            launched: list[object] = []
+            runner, _calls = self._stub_runner({})
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                maintenance_runner=runner,
+            )
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "completed")
+        self.assertNotIn("repo_dirty", cycle.blockers)
+        self.assertIn("repo_dirty_ignored", cycle.actions)
+        self.assertEqual(len(launched), 1)
+
+    def test_run_maintenance_command_bounds_output_and_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            ok = run_maintenance_command(
+                "printf 'abcdef'",
+                "summary",
+                "cycle-1",
+                cwd=repo,
+                env_extra={},
+                timeout=10.0,
+                max_output_bytes=3,
+            )
+            failed = run_maintenance_command(
+                "exit 7",
+                "health",
+                "cycle-1",
+                cwd=repo,
+                env_extra={},
+                timeout=10.0,
+                max_output_bytes=1024,
+            )
+            timed = run_maintenance_command(
+                "sleep 5",
+                "troubleshoot",
+                "cycle-1",
+                cwd=repo,
+                env_extra={},
+                timeout=0.2,
+                max_output_bytes=1024,
+            )
+
+        self.assertEqual(ok.exit_code, 0)
+        self.assertEqual(ok.output, "abc")
+        self.assertTrue(ok.output_truncated)
+        self.assertEqual(failed.exit_code, 7)
+        self.assertFalse(failed.succeeded)
+        self.assertIsNone(timed.exit_code)
+        self.assertTrue(timed.timed_out)
+
+
+def configured_repo(
+    repo: Path,
+    rows: list[tuple[str, str, str, str]],
+    *,
+    extra_toml: str = "",
+) -> None:
     init_repo(repo)
     (repo / ".vibe-loop.toml").write_text(
-        '[agent]\ncommand = "codex exec {prompt}"\n',
+        '[agent]\ncommand = "codex exec {prompt}"\n' + extra_toml,
         encoding="utf-8",
     )
     write_plan(repo, rows)

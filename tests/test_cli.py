@@ -7036,6 +7036,68 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(child_log.parent, repo / ".vibe-loop" / "autopilot")
         self.assertTrue(log_exists)
 
+    def test_doctor_reports_redacted_autopilot_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            (repo / ".vibe-loop.toml").write_text(
+                '[autopilot]\njobs = 2\nhealth_command = "secret-health --token abc"\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "config"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            raw = stdout.getvalue()
+            payload = json.loads(raw)
+
+        self.assertEqual(exit_code, 0)
+        autopilot = payload["autopilot"]
+        self.assertEqual(autopilot["jobs"], 2)
+        self.assertTrue(autopilot["health_command_configured"])
+        self.assertTrue(autopilot["health_command_redacted"])
+        self.assertNotIn("health_command", autopilot)
+        self.assertNotIn("secret-health", raw)
+
+    def test_run_once_honors_config_min_ready_without_launching(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "codex exec {prompt}"\n[autopilot]\nmin_ready = 5\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "config"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "run", "--repo", str(repo), "--once"])
+
+            summary = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        cycle = summary["cycles"][0]
+        self.assertEqual(cycle["status"], "idle")
+        self.assertEqual(cycle["child_log"], "")
+
 
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")

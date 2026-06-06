@@ -659,14 +659,20 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--jobs",
         type=int,
-        default=1,
-        help="Worker concurrency passed to the supervised run-until-done child",
+        default=None,
+        help=(
+            "Worker concurrency passed to the supervised run-until-done child "
+            "(overrides [autopilot] jobs; default 1)"
+        ),
     )
     parser.add_argument(
         "--interval",
         type=nonnegative_float,
-        default=0.0,
-        help="Seconds to sleep between supervision cycles in the persistent loop",
+        default=None,
+        help=(
+            "Seconds to sleep between supervision cycles in the persistent loop "
+            "(overrides [autopilot] interval_seconds; default 0)"
+        ),
     )
     parser.add_argument(
         "--once",
@@ -686,8 +692,11 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--min-ready",
         type=int,
-        default=1,
-        help="Minimum runnable tasks required before launching a child",
+        default=None,
+        help=(
+            "Minimum runnable tasks required before launching a child "
+            "(overrides [autopilot] min_ready; default 1)"
+        ),
     )
 
 
@@ -863,6 +872,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     ),
                     "agent": config.agent.to_json(),
                     "locks": redacted_lock_config(config.locks),
+                    "autopilot": redacted_autopilot_config(config.autopilot),
                     "completion": redacted_completion_config(config.completion),
                     "stale_locks": stale_report,
                     "concurrency_diagnostics": concurrency_diagnostics_report(workers),
@@ -1059,6 +1069,20 @@ def redacted_completion_config(completion) -> dict[str, object]:
     }
 
 
+def redacted_autopilot_config(autopilot) -> dict[str, object]:
+    payload = dict(autopilot.to_json())
+    for key in (
+        "health_command",
+        "summary_command",
+        "troubleshoot_command",
+        "planning_command",
+    ):
+        configured = bool(payload.pop(key, None))
+        payload[f"{key}_configured"] = configured
+        payload[f"{key}_redacted"] = configured
+    return payload
+
+
 def dispatch_eval(args: argparse.Namespace, config) -> int:
     if os.environ.get("VIBE_LOOP_EVAL_ACTIVE") == "1" and not args.allow_nested:
         print(
@@ -1202,21 +1226,32 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             print(render_autopilot_status(status))
         return 0
     if command in (None, "run"):
+        ap = config.autopilot
+        jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
+        interval = _first_set(getattr(args, "interval", None), ap.interval_seconds, 0.0)
+        min_ready = _first_set(getattr(args, "min_ready", None), ap.min_ready, 1)
         summary = run_autopilot(
             config,
-            jobs=getattr(args, "jobs", 1),
-            interval=getattr(args, "interval", 0.0),
+            jobs=jobs,
+            interval=interval,
             once=getattr(args, "once", False),
             max_cycles=getattr(args, "max_cycles", 0),
             ask_agent=getattr(args, "ask_agent", False),
             continue_on_failure=getattr(args, "continue_on_failure", False),
             max_slices=getattr(args, "max_slices", 0),
             max_tasks=getattr(args, "max_tasks", 0),
-            min_ready=getattr(args, "min_ready", 1),
+            min_ready=min_ready,
         )
         print(json.dumps(summary.to_json(), indent=2, default=list))
         return summary.exit_code
     raise AssertionError(command)
+
+
+def _first_set(*values: object) -> object:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def render_autopilot_status(status: ProjectStatus) -> str:
