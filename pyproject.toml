@@ -25,6 +25,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+tui = ["textual>=8.0"]
+
 [project.urls]
 Homepage = "https://github.com/ei-grad/vibe-loop"
 Repository = "https://github.com/ei-grad/vibe-loop"
@@ -44,4 +47,5 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.14",
+    "textual>=8.0",
 ]

@@ -279,6 +279,8 @@ vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects list
 vibe-loop autopilot projects status --json
 vibe-loop autopilot projects remove my-project
+vibe-loop autopilot tui --repo .
+vibe-loop autopilot tui --registry
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
@@ -399,6 +401,16 @@ operation never needs the registry. `autopilot projects status [--json]` returns
 one aggregate entry per registered repo, reusing the same `ProjectStatus` payload
 as single-repo status; a repository that cannot be read is reported as an
 isolated error entry so one broken project never hides the others.
+
+`autopilot tui` opens a read-only [Textual](https://textual.textualize.io/)
+dashboard built from the same structured status API — it lists each project's
+queue depth, active workers, supervisor state and pid, blockers, and next wake
+without scraping terminal text, launching workers, or exposing raw commands or
+secrets. `--repo` shows a single repository (the default); `--registry [PATH]`
+shows every registered project. The TUI is an optional extra: install it with
+`pip install vibe-loop[tui]` (or `uv add textual`). When `textual` is not
+installed, `autopilot tui` prints an actionable install hint and exits without
+affecting the rest of the CLI, which keeps zero runtime dependencies.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

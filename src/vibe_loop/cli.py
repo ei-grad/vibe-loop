@@ -380,6 +380,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_registry_argument(projects_status)
     projects_status.add_argument("--json", action="store_true")
+    autopilot_tui = autopilot_subparsers.add_parser(
+        "tui",
+        help="Open the read-only autopilot status dashboard (needs vibe-loop[tui])",
+    )
+    add_repo_argument(autopilot_tui)
+    autopilot_tui.add_argument(
+        "--registry",
+        type=Path,
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "Show all registered projects instead of a single repo; optional path "
+            "overrides the default registry"
+        ),
+    )
 
     worker = subparsers.add_parser("worker", help="Update current worker state")
     add_repo_argument(worker)
@@ -1282,6 +1298,8 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return 0
     if command == "projects":
         return dispatch_autopilot_projects(args)
+    if command == "tui":
+        return dispatch_autopilot_tui(args)
     if command in (None, "run"):
         ap = config.autopilot
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
@@ -1344,6 +1362,27 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.next_wake:
         lines.append(f"next wake: {status.next_wake}")
     return "\n".join(lines)
+
+
+def dispatch_autopilot_tui(args: argparse.Namespace) -> int:
+    try:
+        from vibe_loop.tui import run_tui
+    except ImportError:
+        print(
+            "the autopilot TUI requires the optional 'textual' dependency; "
+            "install it with 'pip install vibe-loop[tui]' (or 'uv add textual').",
+            file=sys.stderr,
+        )
+        return 2
+    registry_arg = getattr(args, "registry", None)
+    if registry_arg is None:
+        run_tui(repo=getattr(args, "repo", Path.cwd()))
+    else:
+        registry_path = (
+            Path(registry_arg) if str(registry_arg) else default_registry_path()
+        )
+        run_tui(registry_path=registry_path)
+    return 0
 
 
 def dispatch_autopilot_projects(args: argparse.Namespace) -> int:

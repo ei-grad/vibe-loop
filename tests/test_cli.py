@@ -22,6 +22,13 @@ import vibe_loop.cli as cli_module
 from vibe_loop.cli import main
 from vibe_loop.locks import LockManager
 
+try:
+    import textual  # noqa: F401
+
+    HAS_TEXTUAL = True
+except ImportError:
+    HAS_TEXTUAL = False
+
 
 @contextmanager
 def temporary_directory_with_cleanup_retry():
@@ -7212,6 +7219,51 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(results["good"]["error"], "")
         self.assertIsNone(results["broken"]["status"])
         self.assertIn("unsupported keys", results["broken"]["error"])
+
+    @unittest.skipUnless(HAS_TEXTUAL, "textual (vibe-loop[tui]) not installed")
+    def test_tui_launches_single_repo_dashboard(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run_tui(*, repo=None, registry_path=None) -> None:
+            calls.append({"repo": repo, "registry_path": registry_path})
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            with patch("vibe_loop.tui.run_tui", fake_run_tui):
+                code, _ = self._autopilot("tui", "--repo", str(repo))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["repo"], repo)
+        self.assertIsNone(calls[0]["registry_path"])
+
+    @unittest.skipUnless(HAS_TEXTUAL, "textual (vibe-loop[tui]) not installed")
+    def test_tui_registry_mode_uses_registry_path(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run_tui(*, repo=None, registry_path=None) -> None:
+            calls.append({"repo": repo, "registry_path": registry_path})
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "projects.json"
+            with patch("vibe_loop.tui.run_tui", fake_run_tui):
+                code, _ = self._autopilot("tui", "--registry", str(registry))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0]["registry_path"], registry)
+        self.assertIsNone(calls[0]["repo"])
+
+    def test_tui_without_textual_reports_install_hint(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+        with patch.dict(sys.modules, {"vibe_loop.tui": None}):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(["autopilot", "tui"])
+
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("vibe-loop[tui]", stderr.getvalue())
 
     def _autopilot(self, *args: str) -> tuple[int, str]:
         stdout = StringIO()
