@@ -23,10 +23,12 @@ from vibe_loop.locks import (
     validate_lock_fencing_token,
 )
 from vibe_loop.runs import (
+    LOCK_EXPIRED_RECORD_TYPE,
     RUN_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKER_REPORT_RECORD_TYPE,
+    RunLifecycleEvent,
     RunLifecycleProgress,
     RunStore,
     WorkerReport,
@@ -1583,6 +1585,25 @@ def clean_stale_locks(
             continue
         cleaned.append(lock)
     return CleanResult(cleaned=cleaned, errors=errors)
+
+
+def record_expired_locks(run_store: RunStore, stale_locks: list[StaleLock]) -> None:
+    for stale_lock in stale_locks:
+        if not stale_lock.run_id:
+            continue
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_EXPIRED_RECORD_TYPE,
+                run_id=stale_lock.run_id,
+                task_id=stale_lock.task_id,
+                lock_kind=stale_lock.kind,
+                lock_path=stale_lock.lock_path,
+                payload={
+                    "stale_reason": stale_lock.stale_reason,
+                    "started_at": stale_lock.started_at,
+                },
+            )
+        )
 
 
 def stale_lock_recovery_command(lock_manager: LockManager, lock_path: Path) -> str:

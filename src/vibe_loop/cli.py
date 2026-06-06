@@ -87,7 +87,6 @@ from vibe_loop.planning_timeline import (
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
-    LOCK_EXPIRED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
@@ -119,6 +118,7 @@ from vibe_loop.workers import (
     claim_worker_workspace,
     clean_stale_locks,
     collect_stale_locks,
+    record_expired_locks,
 )
 
 PACKAGE_NAME = "vibe-loop"
@@ -2333,25 +2333,6 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
         print(f"{len(stale)} stale lock(s) found (dry-run, use --force to remove):")
         print(render_stale_locks(stale))
     return 0
-
-
-def record_expired_locks(run_store: RunStore, stale_locks: list[StaleLock]) -> None:
-    for stale_lock in stale_locks:
-        if not stale_lock.run_id:
-            continue
-        run_store.append_lifecycle_event(
-            RunLifecycleEvent.lock_event(
-                LOCK_EXPIRED_RECORD_TYPE,
-                run_id=stale_lock.run_id,
-                task_id=stale_lock.task_id,
-                lock_kind=stale_lock.kind,
-                lock_path=stale_lock.lock_path,
-                payload={
-                    "stale_reason": stale_lock.stale_reason,
-                    "started_at": stale_lock.started_at,
-                },
-            )
-        )
 
 
 def render_runs(runs) -> str:

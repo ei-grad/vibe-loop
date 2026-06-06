@@ -34,8 +34,10 @@ from vibe_loop.workers import (
     ProcessExists,
     StaleLock,
     WorkerView,
+    clean_stale_locks,
     collect_stale_locks,
     pid_exists,
+    record_expired_locks,
 )
 
 RunUntilDoneLauncher = Callable[..., int]
@@ -883,11 +885,33 @@ def execute_autopilot_cycle(
     actions: list[str] = []
     child_pid: int | None = None
     child_log: Path | None = None
+    cleanup_errors = 0
+
+    cleanup_candidates = tuple(
+        lock for lock in status.stale_locks if lock.stale_reason == "missing_process"
+    )
+    if cleanup_candidates:
+        lock_manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
+        clean_result = clean_stale_locks(list(cleanup_candidates), lock_manager)
+        record_expired_locks(run_store, clean_result.cleaned)
+        if clean_result.cleaned:
+            actions.append(f"cleaned_stale_locks:{len(clean_result.cleaned)}")
+        if clean_result.errors:
+            cleanup_errors = len(clean_result.errors)
+            actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")
+        status = collect_project_status(config, process_exists=process_exists)
+        runnable = status.queue.runnable
 
     blocker_list = list(status.blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
         blocker_list.remove("repo_dirty")
         actions.append("repo_dirty_ignored")
+    if cleanup_errors:
+        blocker_list.append("stale_lock_cleanup_failed")
 
     def run_maintenance(kind: str) -> MaintenanceCommandResult | None:
         command = config.autopilot.maintenance_command(kind)
