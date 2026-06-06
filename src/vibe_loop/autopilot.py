@@ -41,6 +41,8 @@ Sleep = Callable[[float], None]
 
 
 AUTOPILOT_RECORD_SCHEMA_VERSION = 1
+ACTIVE_QUEUE_STATUSES = frozenset({"active"})
+BLOCKED_QUEUE_STATUSES = frozenset({"blocked", "gated", "low"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -334,11 +336,17 @@ def collect_task_queue_status(config: VibeConfig) -> TaskQueueStatus:
     return TaskQueueStatus(
         total=len(tasks),
         runnable=len(runnable),
-        active=statuses.get("Active", 0),
+        active=count_statuses(statuses, ACTIVE_QUEUE_STATUSES),
         done=sum(1 for task in tasks if task.done),
-        blocked=sum(statuses.get(status, 0) for status in ("Gated", "Low")),
+        blocked=count_statuses(statuses, BLOCKED_QUEUE_STATUSES),
         statuses=statuses,
         runnable_tasks=tuple(task_summary(task) for task in runnable),
+    )
+
+
+def count_statuses(statuses: dict[str, int], accepted: frozenset[str]) -> int:
+    return sum(
+        count for status, count in statuses.items() if status.casefold() in accepted
     )
 
 

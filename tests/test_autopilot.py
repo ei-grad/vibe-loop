@@ -222,6 +222,31 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["queue"]["runnable"], 0)
         self.assertIn("no_runnable_work", payload["observations"])
 
+    def test_collect_project_status_counts_lowercase_queue_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            write_plan(
+                repo,
+                [
+                    ("TASK-01", "active", "", "active slice"),
+                    ("TASK-02", "blocked", "", "blocked slice"),
+                    ("TASK-03", "gated", "", "gated slice"),
+                    ("TASK-04", "low", "", "low-priority slice"),
+                    ("TASK-05", "done", "", "finished slice"),
+                    ("TASK-06", "on-hold", "", "operator-held slice"),
+                ],
+            )
+            commit_all(repo)
+            config = load_config(repo)
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["queue"]["active"], 1)
+        self.assertEqual(payload["queue"]["blocked"], 3)
+        self.assertEqual(payload["queue"]["done"], 1)
+        self.assertEqual(payload["queue"]["statuses"]["on-hold"], 1)
+
     def test_collect_project_status_reports_task_source_errors_as_blockers(
         self,
     ) -> None:
