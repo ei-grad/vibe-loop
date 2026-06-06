@@ -360,6 +360,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_registry_argument(projects_list)
     projects_list.add_argument("--json", action="store_true")
+    projects_inspect = projects_subparsers.add_parser(
+        "inspect",
+        help="Show status for one registered repository by name or path",
+    )
+    projects_inspect.add_argument("project")
+    add_registry_argument(projects_inspect)
+    projects_inspect.add_argument("--json", action="store_true")
     projects_remove = projects_subparsers.add_parser(
         "remove",
         help="Remove a repository from the registry by name or path",
@@ -1361,6 +1368,21 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
             print(json.dumps([entry.to_json() for entry in registry.entries], indent=2))
         else:
             print(render_project_registry(registry))
+        return 0
+
+    if command == "inspect":
+        registry = ProjectRegistry.load(registry_path)
+        entry = registry.find(args.project)
+        if entry is None:
+            print(f"not in registry: {args.project}", file=sys.stderr)
+            return 2
+        status = collect_project_status(load_config(entry.repo))
+        if use_json:
+            payload = {"name": entry.name, "repo": str(entry.repo)}
+            payload.update(status.to_json())
+            print(json.dumps(payload, indent=2, default=list))
+        else:
+            print(render_autopilot_status(status))
         return 0
 
     if command == "remove":

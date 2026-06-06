@@ -1081,6 +1081,17 @@ def default_registry_path() -> Path:
     return Path.home() / ".vibe-loop" / "projects.json"
 
 
+def _entry_matches(entry: ProjectEntry, key: str) -> bool:
+    if entry.name == key or str(entry.repo) == key:
+        return True
+    # Match a path-like key against the stored resolved repo path so a relative
+    # or symlinked path resolves to the same entry that register recorded.
+    try:
+        return str(Path(key).resolve()) == str(entry.repo)
+    except OSError:
+        return False
+
+
 @dataclasses.dataclass(frozen=True)
 class ProjectEntry:
     name: str
@@ -1129,7 +1140,7 @@ class ProjectRegistry:
 
     def find(self, key: str) -> ProjectEntry | None:
         for entry in self.entries:
-            if entry.name == key or str(entry.repo) == key:
+            if _entry_matches(entry, key):
                 return entry
         return None
 
@@ -1138,9 +1149,7 @@ class ProjectRegistry:
         return ProjectRegistry(path=self.path, entries=(*kept, entry))
 
     def without(self, key: str) -> tuple[ProjectRegistry, bool]:
-        kept = tuple(
-            item for item in self.entries if item.name != key and str(item.repo) != key
-        )
+        kept = tuple(item for item in self.entries if not _entry_matches(item, key))
         return ProjectRegistry(path=self.path, entries=kept), len(kept) != len(
             self.entries
         )

@@ -7136,6 +7136,47 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(after_code, 0)
         self.assertEqual(json.loads(after_out), [])
 
+    def test_projects_inspect_reports_single_status_and_path_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = base / "projects.json"
+            repo = base / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            self._autopilot(
+                "projects",
+                "register",
+                "--repo",
+                str(repo),
+                "--name",
+                "demo",
+                "--registry",
+                str(registry),
+            )
+
+            inspect_code, inspect_out = self._autopilot(
+                "projects", "inspect", "demo", "--registry", str(registry), "--json"
+            )
+            payload = json.loads(inspect_out)
+
+            missing_code, _ = self._autopilot(
+                "projects", "inspect", "ghost", "--registry", str(registry)
+            )
+            # Removal by resolved repo path (not just by name) must match.
+            remove_code, _ = self._autopilot(
+                "projects", "remove", str(repo.resolve()), "--registry", str(registry)
+            )
+            _, after_out = self._autopilot(
+                "projects", "list", "--registry", str(registry), "--json"
+            )
+
+        self.assertEqual(inspect_code, 0)
+        self.assertEqual(payload["name"], "demo")
+        self.assertEqual(payload["repo"], str(repo))
+        self.assertIn("queue", payload)
+        self.assertEqual(missing_code, 2)
+        self.assertEqual(remove_code, 0)
+        self.assertEqual(json.loads(after_out), [])
+
     def test_projects_status_aggregates_and_isolates_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
