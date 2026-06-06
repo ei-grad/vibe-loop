@@ -8,7 +8,7 @@ import time as time_module
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from vibe_loop.config import (
     VibeConfig,
@@ -643,7 +643,6 @@ def launch_run_until_done(
     popen_kwargs: dict[str, Any] = {}
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
-    log: TextIO
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command,
@@ -657,7 +656,14 @@ def launch_run_until_done(
         )
         if on_start is not None:
             on_start(process.pid)
-        return process.wait()
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            # On interrupt, terminate the worker we spawned rather than orphan
+            # it, then let the supervisor unwind and release its lock.
+            process.terminate()
+            process.wait()
+            raise
 
 
 def classify_child_exit(exit_code: int) -> str:

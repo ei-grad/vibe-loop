@@ -360,8 +360,10 @@ re-checking even across idle or blocked cycles, until `--max-cycles` or an
 interrupt stops it. `--jobs`, `--ask-agent`, `--continue-on-failure`,
 `--max-slices`, and `--max-tasks` are forwarded to each `run-until-done` child;
 `--min-ready` sets the minimum runnable queue depth required before a child is
-launched. Autopilot never deletes worktrees, resets branches, steals locks, or
-mutates tracked project files on its own.
+launched. Interrupting the foreground supervisor (Ctrl-C) terminates the
+in-flight `run-until-done` child it spawned and releases the supervisor lock on
+the way out. Autopilot never deletes worktrees, resets branches, steals locks,
+or mutates tracked project files on its own.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

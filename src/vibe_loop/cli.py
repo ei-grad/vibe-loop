@@ -330,7 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
     autopilot_status.add_argument("--json", action="store_true")
     autopilot_run = autopilot_subparsers.add_parser(
         "run",
-        help="Supervise run-until-done as a child process (launch arrives in AUTO-03)",
+        help="Supervise run-until-done as a foreground child process",
     )
     add_repo_argument(autopilot_run)
     add_autopilot_run_arguments(autopilot_run)
@@ -656,12 +656,6 @@ def add_nested_eval_override(parser: argparse.ArgumentParser) -> None:
 
 
 def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
-    """Document the planned ``autopilot run`` flags.
-
-    The supervisor loop is implemented in AUTO-03; these flags are wired into
-    help and parsing now so the command surface is stable.
-    """
-
     parser.add_argument(
         "--jobs",
         type=int,
