@@ -39,8 +39,36 @@ class WebuiPayloadTests(unittest.TestCase):
         self.assertEqual(len(payload["projects"]), 1)
         project = payload["projects"][0]
         self.assertEqual(project["status"]["queue"]["runnable"], 1)
+        # Cycle history is exposed in the structured payload (empty before any run).
+        self.assertEqual(project["recent_cycles"], [])
         # Agent config is self-redacted in ProjectStatus; no raw command leaks.
         self.assertNotIn("{prompt}", json.dumps(payload))
+
+    def test_payload_exposes_recorded_cycle_history(self) -> None:
+        from vibe_loop.runs import AUTOPILOT_CYCLE_RECORD_TYPE, RunStore
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            write_plan(repo, "TASK-01", "Next")
+            commit_all(repo)
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            for index in (1, 2):
+                run_store.append_record(
+                    {
+                        "schema_version": 1,
+                        "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                        "cycle_id": f"cycle-{index}",
+                        "status": "idle",
+                        "occurred_at": f"2026-06-06T00:0{index}:00+00:00",
+                    }
+                )
+            payload = autopilot_status_payload(repo=repo, generated_at="now")
+
+        cycles = payload["projects"][0]["recent_cycles"]
+        self.assertEqual(
+            [cycle["cycle_id"] for cycle in cycles], ["cycle-1", "cycle-2"]
+        )
 
     def test_status_response_routes_page_api_and_unknown(self) -> None:
         page_code, page_type, page_body = status_response("/", lambda: SAMPLE_PAYLOAD)

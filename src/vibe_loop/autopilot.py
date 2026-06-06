@@ -523,6 +523,33 @@ def latest_cycle_summary(run_store: RunStore) -> CycleSummary | None:
     return None
 
 
+def recent_cycle_summaries(
+    run_store: RunStore,
+    *,
+    limit: int = 20,
+) -> list[CycleSummary]:
+    """Return up to ``limit`` most-recent autopilot cycles, newest last."""
+
+    summaries: list[CycleSummary] = []
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_CYCLE_RECORD_TYPE:
+            continue
+        summaries.append(
+            CycleSummary(
+                cycle_id=str(record.get("cycle_id") or ""),
+                status=str(record.get("status") or ""),
+                occurred_at=str(record.get("occurred_at") or ""),
+                actions=string_tuple(record.get("actions")),
+                blockers=string_tuple(record.get("blockers")),
+                next_wake=str(record.get("next_wake") or ""),
+            )
+        )
+        if len(summaries) >= limit:
+            break
+    summaries.reverse()
+    return summaries
+
+
 def project_blockers(
     *,
     git_status: GitStatus,

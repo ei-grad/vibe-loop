@@ -421,9 +421,12 @@ for a status page and a `GET /api/status` JSON endpoint, and rejects writes — 
 never authors tasks, merges, serves log file contents, or exposes raw commands
 or secrets. The page polls the JSON API (the server stays the single source of
 truth) and shows each project's queue, workers, supervisor state/pid, log path,
-last and next cycle, and blockers. `--repo` serves a single repository (the
-default); `--registry [PATH]` serves every registered project. The server runs
-in the foreground until interrupted.
+last and next cycle, and blockers; the JSON API also carries recent cycle
+history. `--repo` serves a single repository (the default); `--registry [PATH]`
+serves every registered project. The server runs in the foreground until
+interrupted. It binds to localhost; passing `--host 0.0.0.0` exposes status
+(repo paths, pids, log paths, blockers) to the network, so use it only on a
+trusted host.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

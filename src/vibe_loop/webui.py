@@ -15,12 +15,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
-from vibe_loop.autopilot import collect_autopilot_results
+from vibe_loop.autopilot import (
+    collect_autopilot_results,
+    recent_cycle_summaries,
+)
+from vibe_loop.runs import RunStore
 
 StatusProvider = Callable[[], dict[str, object]]
 
 DEFAULT_WEBUI_HOST = "127.0.0.1"
 DEFAULT_WEBUI_PORT = 8765
+RECENT_CYCLE_LIMIT = 20
 
 
 def autopilot_status_payload(
@@ -30,11 +35,26 @@ def autopilot_status_payload(
     generated_at: str = "",
 ) -> dict[str, object]:
     results = collect_autopilot_results(repo=repo, registry_path=registry_path)
+    projects: list[dict[str, object]] = []
+    for result in results:
+        project = result.to_json()
+        # "cycle history" from the append-only records, not just the last cycle.
+        if result.status is not None:
+            run_store = RunStore(result.status.state_dir / "runs.jsonl")
+            project["recent_cycles"] = [
+                summary.to_json()
+                for summary in recent_cycle_summaries(
+                    run_store, limit=RECENT_CYCLE_LIMIT
+                )
+            ]
+        else:
+            project["recent_cycles"] = []
+        projects.append(project)
     return {
         "schema_version": 1,
         "generated_at": generated_at,
         "mode": "registry" if registry_path is not None else "repo",
-        "projects": [result.to_json() for result in results],
+        "projects": projects,
     }
 
 
