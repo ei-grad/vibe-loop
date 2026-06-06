@@ -14,13 +14,18 @@ from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 from vibe_loop.autopilot import (
+    DEFAULT_WAIT_CYCLE_SECONDS,
+    DEFAULT_WAIT_POLL_SECONDS,
     ProjectEntry,
     ProjectRegistry,
     ProjectStatus,
     collect_project_status,
     collect_registry_status,
+    cycle_schedule_deadline,
     default_registry_path,
+    parse_wait_deadline,
     run_autopilot,
+    wait_for_processes,
 )
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
@@ -90,6 +95,7 @@ from vibe_loop.runs import (
     TASK_RESTART_RECORD_TYPE,
     WorkerReport,
     WORKER_REPORT_STATUSES,
+    utc_now_iso,
 )
 from vibe_loop.skills import install_skills
 from vibe_loop.spec_diagnostics import (
@@ -414,6 +420,46 @@ def build_parser() -> argparse.ArgumentParser:
     )
     autopilot_webui.add_argument("--host", default="127.0.0.1")
     autopilot_webui.add_argument("--port", type=int, default=8765)
+    autopilot_wait = autopilot_subparsers.add_parser(
+        "wait",
+        help="Block until a watched process exits or the next cycle boundary",
+    )
+    autopilot_wait.add_argument(
+        "--pid",
+        action="append",
+        type=int,
+        default=[],
+        metavar="PID",
+        help="Wake when this process exits (repeatable)",
+    )
+    autopilot_wait_when = autopilot_wait.add_mutually_exclusive_group()
+    autopilot_wait_when.add_argument(
+        "--deadline",
+        default=None,
+        help="Wake at this ISO-8601 UTC time, e.g. 2026-06-06T17:00:00Z",
+    )
+    autopilot_wait_when.add_argument(
+        "--cycle-schedule",
+        dest="cycle_schedule",
+        nargs="?",
+        const=DEFAULT_WAIT_CYCLE_SECONDS,
+        type=positive_float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Wake at the next UTC */SECONDS wall-clock boundary "
+            f"(default interval {int(DEFAULT_WAIT_CYCLE_SECONDS)}s when no "
+            "deadline is given)"
+        ),
+    )
+    autopilot_wait.add_argument(
+        "--interval",
+        type=positive_float,
+        default=DEFAULT_WAIT_POLL_SECONDS,
+        help="Process poll interval in seconds",
+    )
+    autopilot_wait.add_argument("--mode", choices=("any", "all"), default="any")
+    autopilot_wait.add_argument("--json", action="store_true")
 
     worker = subparsers.add_parser("worker", help="Update current worker state")
     add_repo_argument(worker)
@@ -1320,6 +1366,8 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return dispatch_autopilot_tui(args)
     if command == "webui":
         return dispatch_autopilot_webui(args)
+    if command == "wait":
+        return dispatch_autopilot_wait(args)
     if command in (None, "run"):
         ap = config.autopilot
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
@@ -1402,6 +1450,37 @@ def dispatch_autopilot_tui(args: argparse.Namespace) -> int:
             Path(registry_arg) if str(registry_arg) else default_registry_path()
         )
         run_tui(registry_path=registry_path)
+    return 0
+
+
+def dispatch_autopilot_wait(args: argparse.Namespace) -> int:
+    now = time.time()
+    if args.deadline is not None:
+        deadline_text = args.deadline
+        try:
+            deadline_epoch = parse_wait_deadline(args.deadline)
+        except ValueError as exc:
+            print(f"invalid --deadline: {exc}", file=sys.stderr)
+            return 2
+    else:
+        interval = (
+            args.cycle_schedule
+            if args.cycle_schedule is not None
+            else DEFAULT_WAIT_CYCLE_SECONDS
+        )
+        deadline_text, deadline_epoch = cycle_schedule_deadline(interval, now=now)
+    result = wait_for_processes(
+        pids=args.pid,
+        deadline_epoch=deadline_epoch,
+        deadline_text=deadline_text,
+        mode=args.mode,
+        interval=args.interval,
+    )
+    payload = result.to_json(at=utc_now_iso())
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(" ".join(f"{key}={value}" for key, value in payload.items()))
     return 0
 
 

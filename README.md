@@ -283,6 +283,7 @@ vibe-loop autopilot tui --repo .
 vibe-loop autopilot tui --registry
 vibe-loop autopilot webui --repo .
 vibe-loop autopilot webui --registry --port 8765
+vibe-loop autopilot wait --pid 12345 --cycle-schedule 1800 --json
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
@@ -427,6 +428,17 @@ serves every registered project. The server runs in the foreground until
 interrupted. It binds to localhost; passing `--host 0.0.0.0` exposes status
 (repo paths, pids, log paths, blockers) to the network, so use it only on a
 trusted host.
+
+`autopilot wait` blocks until a watched process exits or a wall-clock deadline
+arrives, so an unattended steward can sleep between cycles instead of busy
+polling. `--pid` (repeatable) wakes on process exit; `--cycle-schedule [SECONDS]`
+wakes at the next UTC `*/SECONDS` boundary (default 1800s when no `--deadline`
+is given); `--deadline` takes an explicit ISO-8601 UTC time; `--mode all` waits
+for every watched PID. It prints `wake_reason` (`pid`, `all_complete`, or
+`deadline`) with a `wake_summary` and the matched events (`--json` for the full
+object). It is deliberately agent-agnostic — it watches OS processes and the
+clock only, so harness-specific wake signals (such as a particular agent's
+subagent completion) stay in the agent environment rather than in vibe-loop.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

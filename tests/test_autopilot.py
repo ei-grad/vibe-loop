@@ -14,8 +14,11 @@ from vibe_loop.autopilot import (
     collect_project_status,
     collect_registry_status,
     collect_supervisor_status,
+    cycle_schedule_deadline,
+    parse_wait_deadline,
     run_autopilot,
     run_maintenance_command,
+    wait_for_processes,
 )
 from vibe_loop.config import load_config
 from vibe_loop.locks import AUTOPILOT_LOCK_NAME, build_lock_manager
@@ -770,6 +773,69 @@ class AutopilotRegistryTests(unittest.TestCase):
         self.assertEqual(by_name["good"].status.queue.runnable, 1)
         self.assertIsNone(by_name["broken"].status)
         self.assertIn("autopilot contains unsupported keys", by_name["broken"].error)
+
+
+class AutopilotWaitTests(unittest.TestCase):
+    def test_cycle_schedule_deadline_aligns_to_utc_buckets(self) -> None:
+        iso, epoch = cycle_schedule_deadline(30.0, now=100.0)
+        self.assertEqual(epoch, 120.0)
+        self.assertTrue(iso.endswith("Z"))
+        with self.assertRaises(ValueError):
+            cycle_schedule_deadline(0.0, now=100.0)
+
+    def test_parse_wait_deadline_handles_z_and_naive(self) -> None:
+        self.assertEqual(
+            parse_wait_deadline("2026-06-06T17:00:00Z"),
+            parse_wait_deadline("2026-06-06T17:00:00+00:00"),
+        )
+        # Naive timestamps are treated as UTC.
+        self.assertEqual(
+            parse_wait_deadline("2026-06-06T17:00:00"),
+            parse_wait_deadline("2026-06-06T17:00:00Z"),
+        )
+
+    def test_wakes_on_pid_exit_in_any_mode(self) -> None:
+        sleeps: list[float] = []
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=10_000.0,
+            mode="any",
+            process_exists=lambda pid: False,
+            wallclock=lambda: 0.0,
+            sleep=sleeps.append,
+        )
+        self.assertEqual(result.wake_reason, "pid")
+        self.assertEqual(result.wake_summary, "pid_exit:123")
+        self.assertEqual(sleeps, [])
+
+    def test_wakes_on_deadline_when_process_stays_alive(self) -> None:
+        clock = iter([0.0, 100.0])
+        sleeps: list[float] = []
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=50.0,
+            deadline_text="2026-06-06T17:00:00Z",
+            mode="any",
+            interval=5.0,
+            process_exists=lambda pid: True,
+            wallclock=lambda: next(clock),
+            sleep=sleeps.append,
+        )
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.wake_summary, "deadline:2026-06-06T17:00:00Z")
+        self.assertEqual(len(sleeps), 1)
+
+    def test_all_mode_waits_for_every_pid(self) -> None:
+        result = wait_for_processes(
+            pids=[1, 2],
+            deadline_epoch=10_000.0,
+            mode="all",
+            process_exists=lambda pid: False,
+            wallclock=lambda: 0.0,
+            sleep=lambda _seconds: None,
+        )
+        self.assertEqual(result.wake_reason, "all_complete")
+        self.assertEqual(sorted(event["pid"] for event in result.events), [1, 2])
 
 
 def configured_repo(

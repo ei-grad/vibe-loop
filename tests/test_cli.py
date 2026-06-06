@@ -7307,6 +7307,45 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(calls[0]["registry_path"], registry)
         self.assertIsNone(calls[0]["repo"])
 
+    def test_wait_wakes_on_past_deadline(self) -> None:
+        code, out = self._autopilot(
+            "wait", "--deadline", "2000-01-01T00:00:00Z", "--json"
+        )
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["wake_reason"], "deadline")
+        self.assertEqual(payload["deadline"], "2000-01-01T00:00:00Z")
+        self.assertEqual(payload["events"], [])
+
+    def test_wait_wakes_on_exited_pid(self) -> None:
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        dead_pid = proc.pid
+
+        code, out = self._autopilot(
+            "wait", "--pid", str(dead_pid), "--cycle-schedule", "3600", "--json"
+        )
+        payload = json.loads(out)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["wake_reason"], "pid")
+        self.assertEqual(payload["events"][0]["pid"], dead_pid)
+
+    def test_wait_rejects_deadline_with_cycle_schedule(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                main(
+                    [
+                        "autopilot",
+                        "wait",
+                        "--deadline",
+                        "2030-01-01T00:00:00Z",
+                        "--cycle-schedule",
+                        "60",
+                    ]
+                )
+        self.assertEqual(caught.exception.code, 2)
+
     def _autopilot(self, *args: str) -> tuple[int, str]:
         stdout = StringIO()
         stderr = StringIO()

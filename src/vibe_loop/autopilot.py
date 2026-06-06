@@ -1259,3 +1259,122 @@ def collect_autopilot_results(
             name=status.display_name, repo=status.repo, status=status
         )
     ]
+
+
+DEFAULT_WAIT_CYCLE_SECONDS = 1800.0
+DEFAULT_WAIT_POLL_SECONDS = 5.0
+WallClock = Callable[[], float]
+
+
+@dataclasses.dataclass(frozen=True)
+class WaitResult:
+    wake_reason: str
+    events: tuple[dict[str, object], ...] = ()
+    deadline: str = ""
+
+    @property
+    def wake_summary(self) -> str:
+        parts: list[str] = []
+        for event in self.events:
+            kind = event.get("kind")
+            if kind == "pid_exit":
+                parts.append(f"pid_exit:{event.get('pid')}")
+            else:
+                parts.append(str(kind or "event"))
+        if parts:
+            return ",".join(parts)
+        if self.wake_reason == "deadline":
+            return f"deadline:{self.deadline}"
+        return self.wake_reason
+
+    def to_json(self, *, at: str) -> dict[str, object]:
+        return {
+            "wake_reason": self.wake_reason,
+            "wake_summary": self.wake_summary,
+            "at": at,
+            "deadline": self.deadline,
+            "events": [dict(event) for event in self.events],
+        }
+
+
+def format_utc_timestamp(epoch: float) -> str:
+    return (
+        datetime.fromtimestamp(epoch, UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def cycle_schedule_deadline(
+    interval_seconds: float,
+    *,
+    now: float,
+) -> tuple[str, float]:
+    """Return the next UTC wall-clock ``*/interval`` boundary as (iso, epoch).
+
+    Aligns to cron-style buckets rather than ``now + interval`` so cycles stay
+    on a stable schedule across restarts.
+    """
+
+    if interval_seconds <= 0:
+        raise ValueError("cycle schedule interval must be positive")
+    deadline_epoch = (int(now // interval_seconds) + 1) * interval_seconds
+    return format_utc_timestamp(deadline_epoch), deadline_epoch
+
+
+def parse_wait_deadline(value: str) -> float:
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+def wait_for_processes(
+    *,
+    pids: list[int],
+    deadline_epoch: float | None,
+    deadline_text: str = "",
+    mode: str = "any",
+    interval: float = DEFAULT_WAIT_POLL_SECONDS,
+    process_exists: ProcessExists | None = None,
+    wallclock: WallClock | None = None,
+    sleep: Sleep | None = None,
+) -> WaitResult:
+    """Block until a watched PID exits or the deadline arrives.
+
+    Agent-agnostic: it watches only OS processes and a wall-clock deadline, so
+    it carries no dependency on any agent's session format. Harness-specific
+    wake signals belong in the agent environment, not here.
+    """
+
+    checker = process_exists if process_exists is not None else pid_exists
+    now = wallclock if wallclock is not None else time_module.time
+    sleeper = sleep if sleep is not None else time_module.sleep
+    watched_pids = list(dict.fromkeys(pids))
+    completed_pids: set[int] = set()
+    all_events: list[dict[str, object]] = []
+
+    while True:
+        events: list[dict[str, object]] = []
+        for pid in watched_pids:
+            if pid not in completed_pids and not checker(pid):
+                completed_pids.add(pid)
+                events.append({"kind": "pid_exit", "pid": pid})
+        all_events.extend(events)
+
+        if mode == "any" and events:
+            return WaitResult(wake_reason="pid", events=tuple(events))
+        if mode == "all" and watched_pids and len(completed_pids) >= len(watched_pids):
+            return WaitResult(wake_reason="all_complete", events=tuple(all_events))
+
+        current = now()
+        if deadline_epoch is not None and current >= deadline_epoch:
+            return WaitResult(wake_reason="deadline", deadline=deadline_text)
+        sleep_for = max(interval, 0.1)
+        if deadline_epoch is not None:
+            sleep_for = min(sleep_for, max(deadline_epoch - current, 0.1))
+        sleeper(sleep_for)
