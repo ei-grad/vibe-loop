@@ -84,15 +84,25 @@ Related implementation IDs: `AUTO-04`.
 ## PRD-AUT-006 Non-Destructive Recovery Boundary
 
 Autopilot recovery must be diagnostic and conservative by default. It must not
-delete worktrees, reset branches, steal locks, kill arbitrary processes, merge,
-push, rebase, edit tracked project files, or mutate task sources. Configured
-maintenance commands are external user-authored checks or planners; their
-presence does not authorize autopilot to perform destructive recovery.
+delete worktrees, reset branches, steal live locks, kill arbitrary processes,
+merge, push, rebase, edit tracked project files, or mutate task sources.
+Configured maintenance commands are external user-authored checks or planners;
+their presence does not authorize autopilot to perform destructive recovery.
 
-Acceptance must cover stale locks, unsafe workspace diagnostics, dirty repo
-state, missing task source, unavailable agent command, no runnable work, and
-child launch failure as explicit blockers or observations rather than
-destructive cleanup triggers.
+One bounded exception is permitted: autopilot may automatically release stale
+worker task locks whose recorded worker process is missing, using the same
+validated release path and `lock_expired` audit records as
+`workers clean --force`. This recovers aborted workers without deleting
+worktrees or branches. It must not release a lock that has not yet observed a
+worker PID (so a just-started worker cannot lose its task lock before its
+launcher writes PID metadata), and it must not take over locks held by live
+processes.
+
+Acceptance must cover unsafe workspace diagnostics, dirty repo state, missing
+task source, unavailable agent command, no runnable work, and child launch
+failure as explicit blockers or observations rather than destructive cleanup
+triggers; stale locks with a still-live or PID-unobserved owner remain blocking,
+while stale locks with a missing worker process are recovered and audited.
 
 Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`.
 

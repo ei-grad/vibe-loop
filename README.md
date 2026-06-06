@@ -284,10 +284,14 @@ starts a worker or mutates state. The `--json` `ProjectStatus` payload is the
 machine-readable boundary shared by every surface below.
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
-and append-records one `autopilot_cycle` per iteration. A cycle is blocked
-(never force-recovered) when preflight diagnostics are unsafe: dirty repo, stale
-locks, unsafe workspace diagnostics, missing task source, or an unavailable
-agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
+and append-records one `autopilot_cycle` per iteration. Before each launch
+decision it cleans only stale worker locks whose recorded worker process is
+missing — the same validated, audited path as `vibe-loop workers clean --force`
+(it emits `lock_expired` records and never deletes worktrees, resets branches,
+steals live locks, or removes a lock that has not yet observed a worker PID).
+A cycle is still blocked (never force-recovered) when preflight diagnostics are
+unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
+task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
 work and exits when a cycle is idle or blocked; with `--interval N` it stays
 resident, sleeping `N` seconds between cycles until `--max-cycles` or an
 interrupt. `--jobs`, `--ask-agent`, `--continue-on-failure`, `--max-slices`, and
