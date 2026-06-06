@@ -6954,37 +6954,87 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertFalse(runs.exists())
         self.assertFalse(any(locks.glob("*.lock")) if locks.exists() else False)
 
-    def test_run_is_wired_but_does_not_launch_a_child(self) -> None:
+    def test_run_once_reports_blockers_without_launching_child(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)
+            (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
             stdout = StringIO()
             stderr = StringIO()
 
             with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = main(["autopilot", "run", "--repo", str(repo)])
+                exit_code = main(["autopilot", "run", "--repo", str(repo), "--once"])
 
-            runs = repo / ".vibe-loop" / "runs.jsonl"
+            summary = json.loads(stdout.getvalue())
 
-        self.assertEqual(exit_code, 2)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("AUTO-03", stderr.getvalue())
-        self.assertIn("autopilot status", stderr.getvalue())
-        self.assertFalse(runs.exists())
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(summary["started"])
+        self.assertEqual(len(summary["cycles"]), 1)
+        cycle = summary["cycles"][0]
+        self.assertEqual(cycle["status"], "blocked")
+        self.assertIsNone(cycle["child_pid"])
+        self.assertIn("repo_dirty", cycle["blockers"])
 
-    def test_bare_autopilot_routes_to_run_placeholder(self) -> None:
+    def test_bare_autopilot_routes_to_run_and_terminates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)
+            (repo / "tracked.txt").write_text("dirty\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
             stdout = StringIO()
             stderr = StringIO()
 
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 exit_code = main(["autopilot", "--repo", str(repo)])
 
-        self.assertEqual(exit_code, 2)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("autopilot run is wired", stderr.getvalue())
+            summary = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 1)
+        self.assertTrue(summary["started"])
+        self.assertEqual(summary["cycles"][0]["status"], "blocked")
+
+    def test_run_once_launches_real_child_and_writes_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            repo = base / "repo"
+            bin_dir = base / "bin"
+            bin_dir.mkdir(parents=True)
+            init_planning_repo(repo, PLAN)
+            write_python_executable(
+                bin_dir / "codex",
+                "import sys, pathlib\n"
+                "if sys.argv[1] != 'exec':\n"
+                "    raise SystemExit(64)\n"
+                "plan = pathlib.Path('PLAN.md')\n"
+                "plan.write_text(\n"
+                "    plan.read_text().replace(\n"
+                "        '| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'\n"
+                "    )\n"
+                ")\n"
+                "print('session id: stub-session')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+            path_value = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+
+            with patch.dict("os.environ", {"PATH": path_value}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        ["autopilot", "run", "--repo", str(repo), "--once"]
+                    )
+
+            summary = json.loads(stdout.getvalue())
+            cycle = summary["cycles"][0]
+            child_log = Path(cycle["child_log"])
+            log_exists = child_log.exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(summary["started"])
+        self.assertEqual(cycle["status"], "completed")
+        self.assertIsNotNone(cycle["child_pid"])
+        self.assertEqual(child_log.parent, repo / ".vibe-loop" / "autopilot")
+        self.assertTrue(log_exists)
 
 
 def write_python_executable(path: Path, body: str) -> None:

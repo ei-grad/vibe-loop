@@ -30,6 +30,9 @@ except ImportError:  # pragma: no cover
 MAIN_INTEGRATION_LOCK_NAME = "main-integration"
 MAIN_INTEGRATION_LOCK_RECORD_TYPE = "main_integration_lock"
 MAIN_INTEGRATION_LOCK_SCHEMA_VERSION = 1
+AUTOPILOT_LOCK_NAME = "autopilot-supervisor"
+AUTOPILOT_LOCK_RECORD_TYPE = "autopilot_supervisor_lock"
+AUTOPILOT_LOCK_SCHEMA_VERSION = 1
 COMMAND_LOCK_MAX_OUTPUT_BYTES = 128 * 1024
 COMMAND_LOCK_TIMEOUT_SECONDS = 30.0
 
@@ -383,6 +386,80 @@ class LockManager:
             current_host=current_host,
             process_exists=process_exists,
         )
+
+    def acquire_autopilot(
+        self,
+        *,
+        run_id: str,
+        metadata: dict[str, object] | None = None,
+    ) -> TaskLock:
+        lock_metadata = dict(metadata or {})
+        lock_metadata.update(
+            {
+                "schema_version": AUTOPILOT_LOCK_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_LOCK_RECORD_TYPE,
+                "task_id": AUTOPILOT_LOCK_NAME,
+                "resource": AUTOPILOT_LOCK_NAME,
+            }
+        )
+        return self.acquire(AUTOPILOT_LOCK_NAME, run_id, metadata=lock_metadata)
+
+    def autopilot_status(
+        self,
+        *,
+        current_host: str | None = None,
+        process_exists: ProcessExists | None = None,
+    ) -> IntegrationLockStatus:
+        path = self.backend.path_for(AUTOPILOT_LOCK_NAME)
+        metadata = self.backend.status(AUTOPILOT_LOCK_NAME)
+        if metadata is None:
+            return IntegrationLockStatus(
+                locked=False,
+                state="available",
+                path=path,
+                metadata={},
+            )
+        metadata.setdefault("task_id", AUTOPILOT_LOCK_NAME)
+        path = path_from_metadata(metadata, path)
+        metadata["path"] = str(path)
+        return classify_integration_lock(
+            path,
+            metadata,
+            current_host=current_host,
+            process_exists=process_exists,
+        )
+
+    def release_autopilot(
+        self,
+        *,
+        run_id: str,
+        fencing_token: str | None = None,
+    ) -> bool:
+        status = self.autopilot_status()
+        if not status.locked:
+            return False
+        owner_run_id = string_value(status.metadata.get("run_id"))
+        if owner_run_id != run_id:
+            raise LockOwnerMismatch(
+                status.path,
+                status.metadata,
+                run_id=run_id,
+                task_id=AUTOPILOT_LOCK_NAME,
+            )
+        if fencing_token:
+            validate_lock_fencing_token(
+                {"fencing_token": fencing_token},
+                status.metadata,
+                path=status.path,
+            )
+        self.release(
+            TaskLock(
+                task_id=AUTOPILOT_LOCK_NAME,
+                path=status.path,
+                metadata=status.metadata,
+            )
+        )
+        return True
 
     def list_locks(self) -> list[dict[str, object]]:
         return self.backend.list_locks()

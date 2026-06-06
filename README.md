@@ -273,6 +273,8 @@ vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
 vibe-loop autopilot status --repo .
 vibe-loop autopilot status --repo . --json
+vibe-loop autopilot run --repo . --once
+vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
@@ -339,10 +341,27 @@ diagnostics, git refs and dirty state, the main-integration lock, supervisor
 state, blockers, observations, and the last recorded autopilot cycle. It prints
 compact human text by default and the stable project-status payload with
 `--json`. It never starts a worker, acquires a lock, or mutates task state.
-`autopilot run` is wired into the command surface with its planned supervision
-flags (`--jobs`, `--interval`, `--once`, `--max-cycles`, `--ask-agent`,
-`--continue-on-failure`, `--max-slices`, `--max-tasks`, `--min-ready`) but does
-not yet launch a persistent supervisor child; that arrives in a later slice.
+
+`autopilot run` is a foreground supervisor that launches `run-until-done` as a
+child process and append-records one `autopilot_cycle` per iteration to
+`.vibe-loop/runs.jsonl`. Each cycle collects project status first; launch is
+blocked, never force-recovered, when preflight diagnostics are unsafe (dirty
+repo, stale locks, unsafe workspace diagnostics, missing task source, or an
+unavailable agent command). With nothing to do it records an idle observation.
+Child stdout and stderr are merged into a log under
+`.vibe-loop/autopilot/<cycle-id>.log`. A single autopilot supervisor lock
+prevents duplicate supervisors: a live supervisor is observed rather than
+duplicated, and a stale supervisor lock is reported without being stolen.
+
+`--once` runs exactly one cycle. Without `--interval`, the supervisor drains
+runnable work and then exits once a cycle is idle or blocked. With
+`--interval N` it stays resident, sleeping `N` seconds between cycles and
+re-checking even across idle or blocked cycles, until `--max-cycles` or an
+interrupt stops it. `--jobs`, `--ask-agent`, `--continue-on-failure`,
+`--max-slices`, and `--max-tasks` are forwarded to each `run-until-done` child;
+`--min-ready` sets the minimum runnable queue depth required before a child is
+launched. Autopilot never deletes worktrees, resets branches, steals locks, or
+mutates tracked project files on its own.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

@@ -13,7 +13,11 @@ from importlib.metadata import distribution as metadata_distribution
 from importlib.metadata import version as metadata_version
 from pathlib import Path
 
-from vibe_loop.autopilot import ProjectStatus, collect_project_status
+from vibe_loop.autopilot import (
+    ProjectStatus,
+    collect_project_status,
+    run_autopilot,
+)
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -1204,13 +1208,20 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             print(render_autopilot_status(status))
         return 0
     if command in (None, "run"):
-        print(
-            "autopilot run is wired but does not yet launch a supervisor child; "
-            "that arrives in AUTO-03. Use 'vibe-loop autopilot status' to inspect "
-            "project state without starting a worker.",
-            file=sys.stderr,
+        summary = run_autopilot(
+            config,
+            jobs=getattr(args, "jobs", 1),
+            interval=getattr(args, "interval", 0.0),
+            once=getattr(args, "once", False),
+            max_cycles=getattr(args, "max_cycles", 0),
+            ask_agent=getattr(args, "ask_agent", False),
+            continue_on_failure=getattr(args, "continue_on_failure", False),
+            max_slices=getattr(args, "max_slices", 0),
+            max_tasks=getattr(args, "max_tasks", 0),
+            min_ready=getattr(args, "min_ready", 1),
         )
-        return 2
+        print(json.dumps(summary.to_json(), indent=2, default=list))
+        return summary.exit_code
     raise AssertionError(command)
 
 

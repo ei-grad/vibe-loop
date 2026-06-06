@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
+import sys
+import time as time_module
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from vibe_loop.config import (
     VibeConfig,
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
-from vibe_loop.locks import build_lock_manager
-from vibe_loop.runner import VibeRunner
+from vibe_loop.locks import LockBusy, build_lock_manager
+from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -27,6 +32,9 @@ from vibe_loop.workers import (
     collect_stale_locks,
     pid_exists,
 )
+
+RunUntilDoneLauncher = Callable[..., int]
+Sleep = Callable[[float], None]
 
 
 AUTOPILOT_RECORD_SCHEMA_VERSION = 1
@@ -556,3 +564,313 @@ def path_value(value: object) -> Path | None:
     if not isinstance(value, str) or not value:
         return None
     return Path(value)
+
+
+@dataclasses.dataclass(frozen=True)
+class AutopilotRunSummary:
+    repo: Path
+    run_id: str
+    started: bool
+    cycles: tuple[AutopilotCycleResult, ...] = ()
+    blocker: str = ""
+    log: Path | None = None
+
+    @property
+    def exit_code(self) -> int:
+        if not self.started:
+            return 2
+        for cycle in self.cycles:
+            if cycle.status in {"restartable", "terminated"} or cycle.blockers:
+                return 1
+        return 0
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "repo": str(self.repo),
+            "run_id": self.run_id,
+            "started": self.started,
+            "blocker": self.blocker,
+            "log": str(self.log) if self.log is not None else "",
+            "cycles": [cycle.to_json() for cycle in self.cycles],
+        }
+
+
+def autopilot_child_command(
+    config: VibeConfig,
+    *,
+    jobs: int,
+    ask_agent: bool,
+    continue_on_failure: bool,
+    max_slices: int,
+    max_tasks: int,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "vibe_loop",
+        "run-until-done",
+        "--repo",
+        str(config.repo),
+        "--jobs",
+        str(jobs),
+    ]
+    if ask_agent:
+        command.append("--ask-agent")
+    if continue_on_failure:
+        command.append("--continue-on-failure")
+    if max_slices:
+        command.extend(["--max-slices", str(max_slices)])
+    if max_tasks:
+        command.extend(["--max-tasks", str(max_tasks)])
+    return command
+
+
+def launch_run_until_done(
+    command: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    on_start: Callable[[int], None] | None = None,
+) -> int:
+    """Run ``run-until-done`` as a child process, streaming output to a log.
+
+    Returns the child exit code. stdout and stderr are merged into the log
+    file under the configured state directory so the supervisor never holds
+    worker output only in memory.
+    """
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    popen_kwargs: dict[str, Any] = {}
+    if hasattr(os, "setsid"):
+        popen_kwargs["start_new_session"] = True
+    log: TextIO
+    with log_path.open("w", encoding="utf-8") as log:
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **popen_kwargs,
+        )
+        if on_start is not None:
+            on_start(process.pid)
+        return process.wait()
+
+
+def classify_child_exit(exit_code: int) -> str:
+    if exit_code == 0:
+        return "completed"
+    if exit_code < 0:
+        return "terminated"
+    return "restartable"
+
+
+def execute_autopilot_cycle(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    jobs: int,
+    ask_agent: bool,
+    continue_on_failure: bool,
+    max_slices: int,
+    max_tasks: int,
+    min_ready: int,
+    next_wake: str,
+    process_exists: ProcessExists | None,
+    launcher: RunUntilDoneLauncher,
+) -> AutopilotCycleResult:
+    status = collect_project_status(config, process_exists=process_exists)
+    blockers = tuple(status.blockers)
+    actions: list[str] = []
+    child_pid: int | None = None
+    child_log: Path | None = None
+
+    if blockers:
+        cycle_status = "blocked"
+        actions.append("blocked_preflight")
+    elif status.queue.runnable < min_ready:
+        cycle_status = "idle"
+        actions.append("no_runnable_work")
+    else:
+        child_log = config.state_path / "autopilot" / f"{cycle_id}.log"
+        command = autopilot_child_command(
+            config,
+            jobs=jobs,
+            ask_agent=ask_agent,
+            continue_on_failure=continue_on_failure,
+            max_slices=max_slices,
+            max_tasks=max_tasks,
+        )
+        observed_pid: dict[str, int] = {}
+
+        def _on_start(pid: int) -> None:
+            observed_pid["pid"] = pid
+
+        actions.append("launched_run_until_done")
+        exit_code = launcher(
+            command,
+            cwd=config.repo,
+            log_path=child_log,
+            on_start=_on_start,
+        )
+        child_pid = observed_pid.get("pid")
+        cycle_status = classify_child_exit(exit_code)
+        actions.append(f"child_exit:{exit_code}")
+
+    return AutopilotCycleResult(
+        cycle_id=cycle_id,
+        repo=config.repo,
+        status=cycle_status,
+        occurred_at=utc_now_iso(),
+        project_status=status,
+        actions=tuple(actions),
+        blockers=blockers,
+        child_pid=child_pid,
+        child_log=child_log,
+        next_wake=next_wake,
+    )
+
+
+def run_autopilot(
+    config: VibeConfig,
+    *,
+    jobs: int = 1,
+    interval: float = 0.0,
+    once: bool = False,
+    max_cycles: int = 0,
+    ask_agent: bool = False,
+    continue_on_failure: bool = False,
+    max_slices: int = 0,
+    max_tasks: int = 0,
+    min_ready: int = 1,
+    process_exists: ProcessExists | None = None,
+    sleep: Sleep | None = None,
+    launcher: RunUntilDoneLauncher | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> AutopilotRunSummary:
+    """Supervise ``run-until-done`` as a foreground persistent loop.
+
+    A single autopilot supervisor lock prevents duplicate supervisors. A live
+    supervisor is observed rather than duplicated, and a stale supervisor lock
+    is reported without being stolen. Each cycle is append-recorded; launch is
+    blocked, never force-recovered, when preflight diagnostics are unsafe.
+    """
+
+    process_checker = process_exists if process_exists is not None else pid_exists
+    sleeper = sleep if sleep is not None else time_module.sleep
+    launch = launcher if launcher is not None else launch_run_until_done
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    lock_manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+    )
+    supervisor_run_id = new_run_id("autopilot")
+
+    existing = lock_manager.autopilot_status(process_exists=process_checker)
+    if existing.locked and existing.state in {"held", "unknown"}:
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": str(existing.metadata.get("run_id") or ""),
+                "pid": existing.metadata.get("pid"),
+                "observed_state": existing.state,
+            }
+        )
+        return AutopilotRunSummary(
+            repo=config.repo,
+            run_id=supervisor_run_id,
+            started=False,
+            blocker="autopilot_supervisor_active",
+        )
+    if existing.locked and existing.state == "stale":
+        return AutopilotRunSummary(
+            repo=config.repo,
+            run_id=supervisor_run_id,
+            started=False,
+            blocker=f"autopilot_supervisor_lock_stale:{existing.stale_reason or 'unknown'}",
+        )
+
+    try:
+        lock = lock_manager.acquire_autopilot(run_id=supervisor_run_id)
+    except LockBusy:
+        return AutopilotRunSummary(
+            repo=config.repo,
+            run_id=supervisor_run_id,
+            started=False,
+            blocker="autopilot_supervisor_active",
+        )
+
+    fencing_token = str(lock.metadata.get("fencing_token") or "")
+    supervisor_log = config.state_path / "autopilot" / f"{supervisor_run_id}.log"
+    run_store.append_record(
+        {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(config.repo),
+            "run_id": supervisor_run_id,
+            "pid": os.getpid(),
+            "log": str(supervisor_log),
+        }
+    )
+
+    cycles: list[AutopilotCycleResult] = []
+    try:
+        cycle_number = 0
+        while True:
+            if should_stop is not None and should_stop():
+                break
+            cycle_number += 1
+            bounded_last = once or (max_cycles > 0 and cycle_number >= max_cycles)
+            next_wake = "" if bounded_last else iso_after(interval)
+            result = execute_autopilot_cycle(
+                config,
+                cycle_id=f"{supervisor_run_id}-c{cycle_number}",
+                jobs=jobs,
+                ask_agent=ask_agent,
+                continue_on_failure=continue_on_failure,
+                max_slices=max_slices,
+                max_tasks=max_tasks,
+                min_ready=min_ready,
+                next_wake=next_wake,
+                process_exists=process_exists,
+                launcher=launch,
+            )
+            result.append_to(run_store)
+            cycles.append(result)
+            if bounded_last:
+                break
+            if interval > 0:
+                # Persistent watch: keep cycling and sleeping until a bound or
+                # signal stops the loop, even across idle or blocked cycles.
+                sleeper(interval)
+                continue
+            # Drain mode (no interval): continue only while cycles can still make
+            # progress; an idle or blocked cycle cannot advance without waiting or
+            # operator intervention, so the supervisor stops instead of spinning.
+            if result.status not in {"completed", "restartable"}:
+                break
+    finally:
+        lock_manager.release_autopilot(
+            run_id=supervisor_run_id,
+            fencing_token=fencing_token,
+        )
+
+    return AutopilotRunSummary(
+        repo=config.repo,
+        run_id=supervisor_run_id,
+        started=True,
+        cycles=tuple(cycles),
+        log=supervisor_log,
+    )
+
+
+def iso_after(seconds: float) -> str:
+    return (datetime.now(UTC) + timedelta(seconds=max(0.0, seconds))).isoformat()
