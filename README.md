@@ -12,7 +12,7 @@ run records. The configured worker agent owns branch/worktree setup,
 implementation, review, and any merge-to-`main` workflow defined by the
 repository instructions.
 
-The runtime is built around three bundled skills — see [Skills](#skills) — which
+The runtime is built around four bundled skills — see [Skills](#skills) — which
 also work on their own in Codex or Claude without the CLI.
 
 > [!WARNING]
@@ -91,7 +91,8 @@ vibe-loop run-until-done --repo . --ask-agent
 
 ## Skills
 
-The package includes three installable skills:
+The package includes four installable skills — three worker skills and one
+operator skill:
 
 - **`vibe-loop`** — one coherent bounded slice. The agent inspects the task,
   edits, verifies, asks for independent review when available, commits,
@@ -102,6 +103,12 @@ The package includes three installable skills:
 - **`orchestrated-vibe-loop`** — multi-agent execution where the main agent keeps
   orchestration state and delegates exploration, implementation, and independent
   review without doing the code or review work itself.
+- **`autopilot`** — unattended stewardship of the loop. The agent drives
+  `vibe-loop run-until-done`, reviews what landed each cycle, troubleshoots
+  worker sessions, replenishes the ready queue by invoking `orchestrated-vibe-loop`
+  to plan and decompose work, recovers the supervisor from evidence, and sleeps
+  between cycles with `vibe-loop wait-helper`. Unlike the worker skills it drives
+  the CLI by design, and it never edits the main worktree itself.
 
 Install them into Codex and/or Claude:
 
@@ -109,10 +116,11 @@ Install them into Codex and/or Claude:
 vibe-loop install-skills --codex --claude
 ```
 
-The skills do not require the CLI; you can invoke them directly for manual
-bounded or unattended work. The CLI exists when a repository already has a task
-source and you want repeatable orchestration: candidate discovery, locks,
-configured worker commands, run logs, completion checks, and run metadata.
+The worker skills do not require the CLI; you can invoke them directly for manual
+bounded or unattended work. The `autopilot` operator skill does drive the CLI.
+The CLI exists when a repository already has a task source and you want
+repeatable orchestration: candidate discovery, locks, configured worker
+commands, run logs, completion checks, and run metadata.
 
 ## Commands
 
@@ -266,7 +274,7 @@ vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects status --json
 vibe-loop autopilot tui --registry
 vibe-loop autopilot webui --registry --port 8765
-vibe-loop autopilot wait --pid 12345 --cycle-schedule 1800 --json
+vibe-loop wait-helper --pid 12345 --cycle-schedule 1800 --json
 ```
 
 **`status`** collects a read-only snapshot — queue counts, runnable tasks, active
@@ -303,13 +311,13 @@ standard-library web server, binding to `127.0.0.1:8765` by default
 rejects writes; `--host 0.0.0.0` exposes status to the network, so use it only on
 a trusted host. Both take `--repo` (single, default) or `--registry [PATH]`.
 
-**`wait`** blocks until a watched process exits or a wall-clock deadline arrives,
-so an unattended steward can sleep between cycles. `--pid` (repeatable) wakes on
-process exit; `--cycle-schedule [SECONDS]` wakes at the next UTC `*/SECONDS`
-boundary (default 1800s); `--deadline` takes an explicit ISO-8601 UTC time;
-`--mode all` waits for every PID. It prints `wake_reason` (`pid`, `all_complete`,
-or `deadline`) with a summary. It watches OS processes and the clock only —
-agent-specific wake signals stay in the agent environment.
+The top-level **`vibe-loop wait-helper`** blocks until a watched process exits or
+a wall-clock deadline arrives, so an unattended steward can sleep between cycles.
+`--pid` (repeatable) wakes on process exit; `--cycle-schedule [SECONDS]` wakes at
+the next UTC `*/SECONDS` boundary (default 1800s); `--deadline` takes an explicit
+ISO-8601 UTC time; `--mode all` waits for every PID. It prints `wake_reason`
+(`pid`, `all_complete`, or `deadline`) with a summary. It watches OS processes and
+the clock only — agent-specific wake signals stay in the agent environment.
 
 ## Configuration
 

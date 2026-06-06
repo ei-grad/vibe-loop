@@ -420,11 +420,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     autopilot_webui.add_argument("--host", default="127.0.0.1")
     autopilot_webui.add_argument("--port", type=int, default=8765)
-    autopilot_wait = autopilot_subparsers.add_parser(
-        "wait",
+    wait_helper = subparsers.add_parser(
+        "wait-helper",
         help="Block until a watched process exits or the next cycle boundary",
     )
-    autopilot_wait.add_argument(
+    wait_helper.add_argument(
         "--pid",
         action="append",
         type=int,
@@ -432,13 +432,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PID",
         help="Wake when this process exits (repeatable)",
     )
-    autopilot_wait_when = autopilot_wait.add_mutually_exclusive_group()
-    autopilot_wait_when.add_argument(
+    wait_helper_when = wait_helper.add_mutually_exclusive_group()
+    wait_helper_when.add_argument(
         "--deadline",
         default=None,
         help="Wake at this ISO-8601 UTC time, e.g. 2026-06-06T17:00:00Z",
     )
-    autopilot_wait_when.add_argument(
+    wait_helper_when.add_argument(
         "--cycle-schedule",
         dest="cycle_schedule",
         nargs="?",
@@ -452,14 +452,14 @@ def build_parser() -> argparse.ArgumentParser:
             "deadline is given)"
         ),
     )
-    autopilot_wait.add_argument(
+    wait_helper.add_argument(
         "--interval",
         type=positive_float,
         default=DEFAULT_WAIT_POLL_SECONDS,
         help="Process poll interval in seconds",
     )
-    autopilot_wait.add_argument("--mode", choices=("any", "all"), default="any")
-    autopilot_wait.add_argument("--json", action="store_true")
+    wait_helper.add_argument("--mode", choices=("any", "all"), default="any")
+    wait_helper.add_argument("--json", action="store_true")
 
     worker = subparsers.add_parser("worker", help="Update current worker state")
     add_repo_argument(worker)
@@ -960,6 +960,9 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "autopilot":
         return dispatch_autopilot(args, config)
 
+    if args.command == "wait-helper":
+        return dispatch_wait_helper(args)
+
     if args.command == "doctor":
         task_source_runtime = runtime_task_source_report(config)
         analytics_report = planning_analytics_report(
@@ -1366,8 +1369,6 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return dispatch_autopilot_tui(args)
     if command == "webui":
         return dispatch_autopilot_webui(args)
-    if command == "wait":
-        return dispatch_autopilot_wait(args)
     if command in (None, "run"):
         ap = config.autopilot
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
@@ -1453,7 +1454,7 @@ def dispatch_autopilot_tui(args: argparse.Namespace) -> int:
     return 0
 
 
-def dispatch_autopilot_wait(args: argparse.Namespace) -> int:
+def dispatch_wait_helper(args: argparse.Namespace) -> int:
     now = time.time()
     if args.deadline is not None:
         deadline_text = args.deadline

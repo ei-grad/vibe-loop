@@ -5,7 +5,12 @@ import shutil
 from pathlib import Path
 
 
-SKILL_NAMES = ("vibe-loop", "infinite-vibe-loop", "orchestrated-vibe-loop")
+SKILL_NAMES = (
+    "vibe-loop",
+    "infinite-vibe-loop",
+    "orchestrated-vibe-loop",
+    "autopilot",
+)
 
 
 def install_skills(codex: bool, claude: bool, home: Path) -> list[Path]:

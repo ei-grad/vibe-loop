@@ -484,25 +484,29 @@ class CliTests(unittest.TestCase):
                 exit_code = main(["install-skills", "--codex", "--home", str(home)])
 
             installed_paths = stdout.getvalue().splitlines()
-            finite = home / ".codex" / "skills" / "vibe-loop" / "SKILL.md"
-            infinite = home / ".codex" / "skills" / "infinite-vibe-loop" / "SKILL.md"
-            orchestrated = (
-                home / ".codex" / "skills" / "orchestrated-vibe-loop" / "SKILL.md"
-            )
+            skills_root = home / ".codex" / "skills"
+            finite = skills_root / "vibe-loop" / "SKILL.md"
+            infinite = skills_root / "infinite-vibe-loop" / "SKILL.md"
+            orchestrated = skills_root / "orchestrated-vibe-loop" / "SKILL.md"
+            autopilot = skills_root / "autopilot" / "SKILL.md"
             finite_text = finite.read_text(encoding="utf-8")
             infinite_text = infinite.read_text(encoding="utf-8")
             orchestrated_text = orchestrated.read_text(encoding="utf-8")
+            autopilot_text = autopilot.read_text(encoding="utf-8")
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(
             installed_paths,
             [
-                str(home / ".codex" / "skills" / "vibe-loop"),
-                str(home / ".codex" / "skills" / "infinite-vibe-loop"),
-                str(home / ".codex" / "skills" / "orchestrated-vibe-loop"),
+                str(skills_root / "vibe-loop"),
+                str(skills_root / "infinite-vibe-loop"),
+                str(skills_root / "orchestrated-vibe-loop"),
+                str(skills_root / "autopilot"),
             ],
         )
+        # The CLI-agnostic contract applies to the WORKER skills: their text must
+        # not bake in CLI commands or env vars, which are injected at runtime.
         for text in (finite_text, infinite_text, orchestrated_text):
             self.assertNotRegex(text, r"\bVIBE_LOOP_[A-Z0-9_]+\b")
             self.assertNotRegex(
@@ -512,6 +516,16 @@ class CliTests(unittest.TestCase):
                 r"run-until-done|workers|runs|planning|doctor|install-skills|"
                 r"specs|eval)\b",
             )
+        # The autopilot OPERATOR skill drives the CLI by design. It steers the
+        # worker pool through `run-until-done`, feeds the queue via the
+        # orchestrated-vibe-loop skill, and sleeps with `wait-helper` — it does
+        # not delegate supervision to `vibe-loop autopilot run`. (Repository
+        # agnosticism is enforced separately by RepoAgnosticGuardTests, which
+        # scans this SKILL.md under src/.)
+        self.assertIn("vibe-loop run-until-done", autopilot_text)
+        self.assertIn("orchestrated-vibe-loop", autopilot_text)
+        self.assertIn("vibe-loop wait-helper", autopilot_text)
+        self.assertNotIn("vibe-loop autopilot run", autopilot_text)
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
@@ -7307,17 +7321,15 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(calls[0]["registry_path"], registry)
         self.assertIsNone(calls[0]["repo"])
 
-    def test_wait_wakes_on_past_deadline(self) -> None:
-        code, out = self._autopilot(
-            "wait", "--deadline", "2000-01-01T00:00:00Z", "--json"
-        )
+    def test_wait_helper_wakes_on_past_deadline(self) -> None:
+        code, out = self._wait_helper("--deadline", "2000-01-01T00:00:00Z", "--json")
         payload = json.loads(out)
         self.assertEqual(code, 0)
         self.assertEqual(payload["wake_reason"], "deadline")
         self.assertEqual(payload["deadline"], "2000-01-01T00:00:00Z")
         self.assertEqual(payload["events"], [])
 
-    def test_wait_wakes_on_exited_pid(self) -> None:
+    def test_wait_helper_wakes_on_exited_pid(self) -> None:
         proc = subprocess.Popen([sys.executable, "-c", "pass"])
         proc.wait()
         dead_pid = proc.pid
@@ -7325,8 +7337,8 @@ class AutopilotCliTests(unittest.TestCase):
         # The pid is already dead, so the first poll wakes on it before any
         # sleep; the short cycle-schedule only bounds the worst case if the OS
         # were to recycle the pid, so the test can never hang.
-        code, out = self._autopilot(
-            "wait", "--pid", str(dead_pid), "--cycle-schedule", "2", "--json"
+        code, out = self._wait_helper(
+            "--pid", str(dead_pid), "--cycle-schedule", "2", "--json"
         )
         payload = json.loads(out)
 
@@ -7334,13 +7346,12 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(payload["wake_reason"], "pid")
         self.assertEqual(payload["events"][0]["pid"], dead_pid)
 
-    def test_wait_rejects_deadline_with_cycle_schedule(self) -> None:
+    def test_wait_helper_rejects_deadline_with_cycle_schedule(self) -> None:
         with self.assertRaises(SystemExit) as caught:
             with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
                 main(
                     [
-                        "autopilot",
-                        "wait",
+                        "wait-helper",
                         "--deadline",
                         "2030-01-01T00:00:00Z",
                         "--cycle-schedule",
@@ -7348,6 +7359,13 @@ class AutopilotCliTests(unittest.TestCase):
                     ]
                 )
         self.assertEqual(caught.exception.code, 2)
+
+    def _wait_helper(self, *args: str) -> tuple[int, str]:
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = main(["wait-helper", *args])
+        return code, stdout.getvalue()
 
     def _autopilot(self, *args: str) -> tuple[int, str]:
         stdout = StringIO()
