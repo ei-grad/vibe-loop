@@ -404,9 +404,9 @@ isolated error entry so one broken project never hides the others.
 
 `autopilot tui` opens a read-only [Textual](https://textual.textualize.io/)
 dashboard built from the same structured status API — it lists each project's
-queue depth, active workers, supervisor state and pid, blockers, and next wake
-without scraping terminal text, launching workers, or exposing raw commands or
-secrets. `--repo` shows a single repository (the default); `--registry [PATH]`
+queue depth, active workers, supervisor state/pid, supervisor log path, last
+and next cycle, and blockers without scraping terminal text, launching workers,
+or exposing raw commands or secrets. `--repo` shows a single repository (the default); `--registry [PATH]`
 shows every registered project. The TUI is an optional extra: install it with
 `pip install vibe-loop[tui]` (or `uv add textual`). When `textual` is not
 installed, `autopilot tui` prints an actionable install hint and exits without

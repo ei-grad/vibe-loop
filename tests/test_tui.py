@@ -48,8 +48,11 @@ class ProjectStatusRowsTests(unittest.TestCase):
         self.assertEqual(rows[0]["project"], "good")
         self.assertEqual(rows[0]["queue"], "1/1 ready")
         self.assertEqual(rows[0]["workers"], "0")
+        self.assertEqual(rows[0]["log"], "—")
+        self.assertEqual(rows[0]["last_cycle"], "—")
         self.assertEqual(rows[1]["project"], "broken")
         self.assertEqual(rows[1]["blockers"], "error: boom")
+        self.assertEqual(rows[1]["last_cycle"], "—")
         # No raw command strings or secrets leak into the rendered rows.
         joined = " ".join(value for row in rows for value in row.values())
         self.assertNotIn("{prompt}", joined)
@@ -65,6 +68,8 @@ class AutopilotTUIRenderTests(unittest.IsolatedAsyncioTestCase):
                 "queue": "2/5 ready",
                 "workers": "1",
                 "supervisor": "idle",
+                "log": "—",
+                "last_cycle": "—",
                 "blockers": "none",
                 "next_wake": "—",
             },
@@ -74,6 +79,8 @@ class AutopilotTUIRenderTests(unittest.IsolatedAsyncioTestCase):
                 "queue": "unavailable",
                 "workers": "0",
                 "supervisor": "running pid=4242",
+                "log": "/repos/beta/.vibe-loop/autopilot/c1.log",
+                "last_cycle": "c1: completed",
                 "blockers": "repo_dirty",
                 "next_wake": "2026-06-06T00:00:00+00:00",
             },

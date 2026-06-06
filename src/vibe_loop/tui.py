@@ -27,6 +27,8 @@ TUI_COLUMNS = (
     "Queue",
     "Workers",
     "Supervisor",
+    "Log",
+    "Last cycle",
     "Blockers",
     "Next wake",
 )
@@ -51,6 +53,8 @@ def project_status_rows(
                     "queue": "—",
                     "workers": "—",
                     "supervisor": "—",
+                    "log": "—",
+                    "last_cycle": "—",
                     "blockers": f"error: {result.error}",
                     "next_wake": "—",
                 }
@@ -70,6 +74,12 @@ def project_status_rows(
         supervisor_text = supervisor.state
         if supervisor.pid:
             supervisor_text += f" pid={supervisor.pid}"
+        last_cycle = status.last_cycle
+        last_cycle_text = (
+            f"{last_cycle.cycle_id}: {last_cycle.status}"
+            if last_cycle is not None
+            else "—"
+        )
         rows.append(
             {
                 "project": result.name,
@@ -77,6 +87,8 @@ def project_status_rows(
                 "queue": queue_text,
                 "workers": str(active_workers),
                 "supervisor": supervisor_text,
+                "log": str(supervisor.log) if supervisor.log is not None else "—",
+                "last_cycle": last_cycle_text,
                 "blockers": ", ".join(status.blockers) if status.blockers else "none",
                 "next_wake": status.next_wake or "—",
             }
@@ -125,6 +137,8 @@ class AutopilotTUIApp(App):
                 row["queue"],
                 row["workers"],
                 row["supervisor"],
+                row["log"],
+                row["last_cycle"],
                 row["blockers"],
                 row["next_wake"],
             )
