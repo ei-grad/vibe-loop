@@ -6889,6 +6889,104 @@ class CliTests(unittest.TestCase):
         self.assertIn("run not found: missing", stderr.getvalue())
 
 
+class AutopilotCliTests(unittest.TestCase):
+    def test_status_text_reports_repo_queue_and_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "status", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 0)
+        output = stdout.getvalue()
+        self.assertIn(f"repo: {repo.name} ({repo})", output)
+        self.assertIn("queue: 3 runnable / 3 total", output)
+        self.assertIn("supervisor: idle", output)
+
+    def test_status_json_emits_stable_project_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "status", "--repo", str(repo), "--json"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(stdout.getvalue())
+        for key in (
+            "repo",
+            "display_name",
+            "state_dir",
+            "main_branch",
+            "git",
+            "queue",
+            "supervisor",
+            "blockers",
+            "observations",
+            "last_cycle",
+            "next_wake",
+        ):
+            self.assertIn(key, payload)
+        self.assertEqual(payload["queue"]["total"], 3)
+        self.assertEqual(payload["queue"]["runnable"], 3)
+        self.assertEqual(payload["supervisor"]["state"], "idle")
+        self.assertIsNone(payload["last_cycle"])
+
+    def test_status_does_not_start_worker_or_record_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "status", "--repo", str(repo)])
+
+            runs = repo / ".vibe-loop" / "runs.jsonl"
+            locks = repo / ".vibe-loop" / "locks"
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(runs.exists())
+        self.assertFalse(any(locks.glob("*.lock")) if locks.exists() else False)
+
+    def test_run_is_wired_but_does_not_launch_a_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "run", "--repo", str(repo)])
+
+            runs = repo / ".vibe-loop" / "runs.jsonl"
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("AUTO-03", stderr.getvalue())
+        self.assertIn("autopilot status", stderr.getvalue())
+        self.assertFalse(runs.exists())
+
+    def test_bare_autopilot_routes_to_run_placeholder(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("autopilot run is wired", stderr.getvalue())
+
+
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")
     path.chmod(0o755)

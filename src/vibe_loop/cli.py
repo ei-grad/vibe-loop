@@ -13,6 +13,7 @@ from importlib.metadata import distribution as metadata_distribution
 from importlib.metadata import version as metadata_version
 from pathlib import Path
 
+from vibe_loop.autopilot import ProjectStatus, collect_project_status
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -307,6 +308,28 @@ def build_parser() -> argparse.ArgumentParser:
     run_all.add_argument("--max-tasks", type=int, default=0)
     run_all.add_argument("--continue-on-failure", action="store_true")
     run_all.add_argument("--jobs", type=int, default=1)
+
+    autopilot = subparsers.add_parser(
+        "autopilot",
+        help="Persistent supervision above run-until-done",
+    )
+    add_repo_argument(autopilot)
+    autopilot_subparsers = autopilot.add_subparsers(
+        dest="autopilot_command",
+        required=False,
+    )
+    autopilot_status = autopilot_subparsers.add_parser(
+        "status",
+        help="Show structured autopilot project status without launching a worker",
+    )
+    add_repo_argument(autopilot_status)
+    autopilot_status.add_argument("--json", action="store_true")
+    autopilot_run = autopilot_subparsers.add_parser(
+        "run",
+        help="Supervise run-until-done as a child process (launch arrives in AUTO-03)",
+    )
+    add_repo_argument(autopilot_run)
+    add_autopilot_run_arguments(autopilot_run)
 
     worker = subparsers.add_parser("worker", help="Update current worker state")
     add_repo_argument(worker)
@@ -628,6 +651,48 @@ def add_nested_eval_override(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
+    """Document the planned ``autopilot run`` flags.
+
+    The supervisor loop is implemented in AUTO-03; these flags are wired into
+    help and parsing now so the command surface is stable.
+    """
+
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=1,
+        help="Worker concurrency passed to the supervised run-until-done child",
+    )
+    parser.add_argument(
+        "--interval",
+        type=nonnegative_float,
+        default=0.0,
+        help="Seconds to sleep between supervision cycles in the persistent loop",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single supervision cycle and exit",
+    )
+    parser.add_argument(
+        "--max-cycles",
+        type=int,
+        default=0,
+        help="Stop after this many cycles (0 means unbounded)",
+    )
+    parser.add_argument("--ask-agent", action="store_true")
+    parser.add_argument("--continue-on-failure", action="store_true")
+    parser.add_argument("--max-slices", type=int, default=0)
+    parser.add_argument("--max-tasks", type=int, default=0)
+    parser.add_argument(
+        "--min-ready",
+        type=int,
+        default=1,
+        help="Minimum runnable tasks required before launching a child",
+    )
+
+
 def add_repo_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", type=Path, default=argparse.SUPPRESS)
 
@@ -749,6 +814,9 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if args.command == "eval":
         return dispatch_eval(args, config)
+
+    if args.command == "autopilot":
+        return dispatch_autopilot(args, config)
 
     if args.command == "doctor":
         task_source_runtime = runtime_task_source_report(config)
@@ -1124,6 +1192,61 @@ def dispatch_specs(args: argparse.Namespace, config) -> int:
         return 1 if int(report["blocking_count"]) else 0
 
     raise AssertionError(args.specs_command)
+
+
+def dispatch_autopilot(args: argparse.Namespace, config) -> int:
+    command = getattr(args, "autopilot_command", None)
+    if command == "status":
+        status = collect_project_status(config)
+        if getattr(args, "json", False):
+            print(json.dumps(status.to_json(), indent=2, default=list))
+        else:
+            print(render_autopilot_status(status))
+        return 0
+    if command in (None, "run"):
+        print(
+            "autopilot run is wired but does not yet launch a supervisor child; "
+            "that arrives in AUTO-03. Use 'vibe-loop autopilot status' to inspect "
+            "project state without starting a worker.",
+            file=sys.stderr,
+        )
+        return 2
+    raise AssertionError(command)
+
+
+def render_autopilot_status(status: ProjectStatus) -> str:
+    lines = [f"repo: {status.display_name} ({status.repo})"]
+    queue = status.queue
+    if queue.source_error:
+        lines.append(f"queue: unavailable ({queue.source_error})")
+    else:
+        lines.append(
+            f"queue: {queue.runnable} runnable / {queue.total} total "
+            f"({queue.active} active, {queue.done} done, {queue.blocked} blocked)"
+        )
+    supervisor = status.supervisor
+    supervisor_line = f"supervisor: {supervisor.state}"
+    if supervisor.pid:
+        supervisor_line += f" pid={supervisor.pid}"
+    lines.append(supervisor_line)
+    if supervisor.log is not None:
+        lines.append(f"log: {supervisor.log}")
+    if status.blockers:
+        lines.append("blockers:")
+        lines.extend(f"  - {blocker}" for blocker in status.blockers)
+    elif status.observations:
+        lines.append("observations:")
+        lines.extend(f"  - {observation}" for observation in status.observations)
+    else:
+        lines.append("blockers: none")
+    if status.last_cycle is not None:
+        cycle = status.last_cycle
+        lines.append(
+            f"last cycle: {cycle.cycle_id} {cycle.status} @ {cycle.occurred_at}"
+        )
+    if status.next_wake:
+        lines.append(f"next wake: {status.next_wake}")
+    return "\n".join(lines)
 
 
 def _parse_benchmark_agent_commands(

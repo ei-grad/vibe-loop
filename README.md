@@ -271,6 +271,8 @@ vibe-loop tasks configure --repo . --promotion-toml
 vibe-loop next --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
+vibe-loop autopilot status --repo .
+vibe-loop autopilot status --repo . --json
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
@@ -330,6 +332,17 @@ failed, blocked, and unknown results do not consume the budget. Both default to
 `0` (unlimited), and whichever limit is reached first ends the loop. Under
 `--jobs`, the parallel scheduler never dispatches more in-flight work than the
 remaining `--max-tasks` budget allows, so completed runs do not overshoot `N`.
+
+`autopilot status` collects a structured, read-only snapshot of one repository:
+task queue counts and runnable tasks, active workers, stale locks, workspace
+diagnostics, git refs and dirty state, the main-integration lock, supervisor
+state, blockers, observations, and the last recorded autopilot cycle. It prints
+compact human text by default and the stable project-status payload with
+`--json`. It never starts a worker, acquires a lock, or mutates task state.
+`autopilot run` is wired into the command surface with its planned supervision
+flags (`--jobs`, `--interval`, `--once`, `--max-cycles`, `--ask-agent`,
+`--continue-on-failure`, `--max-slices`, `--max-tasks`, `--min-ready`) but does
+not yet launch a persistent supervisor child; that arrives in a later slice.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill
