@@ -281,6 +281,8 @@ vibe-loop autopilot projects status --json
 vibe-loop autopilot projects remove my-project
 vibe-loop autopilot tui --repo .
 vibe-loop autopilot tui --registry
+vibe-loop autopilot webui --repo .
+vibe-loop autopilot webui --registry --port 8765
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
@@ -411,6 +413,17 @@ shows every registered project. The TUI is an optional extra: install it with
 `pip install vibe-loop[tui]` (or `uv add textual`). When `textual` is not
 installed, `autopilot tui` prints an actionable install hint and exits without
 affecting the rest of the CLI, which keeps zero runtime dependencies.
+
+`autopilot webui` serves the same read-only status from a local web dashboard
+built on the Python standard library (no extra dependency). It binds to
+`127.0.0.1:8765` by default (`--host`/`--port` to change), answers only `GET`
+for a status page and a `GET /api/status` JSON endpoint, and rejects writes — it
+never authors tasks, merges, serves log file contents, or exposes raw commands
+or secrets. The page polls the JSON API (the server stays the single source of
+truth) and shows each project's queue, workers, supervisor state/pid, log path,
+last and next cycle, and blockers. `--repo` serves a single repository (the
+default); `--registry [PATH]` serves every registered project. The server runs
+in the foreground until interrupted.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

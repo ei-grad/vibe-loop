@@ -1206,3 +1206,29 @@ def collect_registry_status(
                 AggregateProjectStatus(name=entry.name, repo=entry.repo, error=str(exc))
             )
     return results
+
+
+def collect_autopilot_results(
+    *,
+    repo: Path | None = None,
+    registry_path: Path | None = None,
+    process_exists: ProcessExists | None = None,
+) -> list[AggregateProjectStatus]:
+    """Collect status for one repo or every registered project.
+
+    Shared by the TUI and WebUI surfaces so both render the same redacted
+    ``AggregateProjectStatus`` list without a UI dependency.
+    """
+
+    if registry_path is not None:
+        return collect_registry_status(
+            ProjectRegistry.load(registry_path), process_exists=process_exists
+        )
+    status = collect_project_status(
+        load_config(repo or Path.cwd()), process_exists=process_exists
+    )
+    return [
+        AggregateProjectStatus(
+            name=status.display_name, repo=status.repo, status=status
+        )
+    ]

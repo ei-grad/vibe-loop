@@ -396,6 +396,24 @@ def build_parser() -> argparse.ArgumentParser:
             "overrides the default registry"
         ),
     )
+    autopilot_webui = autopilot_subparsers.add_parser(
+        "webui",
+        help="Serve the read-only autopilot status web dashboard on localhost",
+    )
+    add_repo_argument(autopilot_webui)
+    autopilot_webui.add_argument(
+        "--registry",
+        type=Path,
+        nargs="?",
+        const="",
+        default=None,
+        help=(
+            "Show all registered projects instead of a single repo; optional path "
+            "overrides the default registry"
+        ),
+    )
+    autopilot_webui.add_argument("--host", default="127.0.0.1")
+    autopilot_webui.add_argument("--port", type=int, default=8765)
 
     worker = subparsers.add_parser("worker", help="Update current worker state")
     add_repo_argument(worker)
@@ -1300,6 +1318,8 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return dispatch_autopilot_projects(args)
     if command == "tui":
         return dispatch_autopilot_tui(args)
+    if command == "webui":
+        return dispatch_autopilot_webui(args)
     if command in (None, "run"):
         ap = config.autopilot
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
@@ -1382,6 +1402,32 @@ def dispatch_autopilot_tui(args: argparse.Namespace) -> int:
             Path(registry_arg) if str(registry_arg) else default_registry_path()
         )
         run_tui(registry_path=registry_path)
+    return 0
+
+
+def dispatch_autopilot_webui(args: argparse.Namespace) -> int:
+    from vibe_loop.webui import run_webui
+
+    registry_arg = getattr(args, "registry", None)
+    repo = None
+    registry_path = None
+    if registry_arg is None:
+        repo = getattr(args, "repo", Path.cwd())
+    else:
+        registry_path = (
+            Path(registry_arg) if str(registry_arg) else default_registry_path()
+        )
+    print(
+        f"serving autopilot webui on http://{args.host}:{args.port} "
+        "(read-only; Ctrl-C to stop)",
+        file=sys.stderr,
+    )
+    run_webui(
+        repo=repo,
+        registry_path=registry_path,
+        host=args.host,
+        port=args.port,
+    )
     return 0
 
 

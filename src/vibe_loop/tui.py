@@ -15,11 +15,8 @@ from textual.widgets import DataTable, Footer, Header
 
 from vibe_loop.autopilot import (
     AggregateProjectStatus,
-    ProjectRegistry,
-    collect_project_status,
-    collect_registry_status,
+    collect_autopilot_results,
 )
-from vibe_loop.config import load_config
 
 TUI_COLUMNS = (
     "Project",
@@ -101,14 +98,7 @@ def collect_tui_results(
     repo: Path | None = None,
     registry_path: Path | None = None,
 ) -> list[AggregateProjectStatus]:
-    if registry_path is not None:
-        return collect_registry_status(ProjectRegistry.load(registry_path))
-    status = collect_project_status(load_config(repo or Path.cwd()))
-    return [
-        AggregateProjectStatus(
-            name=status.display_name, repo=status.repo, status=status
-        )
-    ]
+    return collect_autopilot_results(repo=repo, registry_path=registry_path)
 
 
 class AutopilotTUIApp(App):

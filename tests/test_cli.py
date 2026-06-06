@@ -7265,6 +7265,48 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("vibe-loop[tui]", stderr.getvalue())
 
+    def test_webui_serves_single_repo_on_localhost_by_default(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run_webui(*, repo=None, registry_path=None, host="", port=0) -> None:
+            calls.append(
+                {
+                    "repo": repo,
+                    "registry_path": registry_path,
+                    "host": host,
+                    "port": port,
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            with patch("vibe_loop.webui.run_webui", fake_run_webui):
+                code, _ = self._autopilot("webui", "--repo", str(repo), "--port", "0")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0]["repo"], repo)
+        self.assertIsNone(calls[0]["registry_path"])
+        self.assertEqual(calls[0]["host"], "127.0.0.1")
+        self.assertEqual(calls[0]["port"], 0)
+
+    def test_webui_registry_mode_uses_registry_path(self) -> None:
+        calls: list[dict[str, object]] = []
+
+        def fake_run_webui(*, repo=None, registry_path=None, host="", port=0) -> None:
+            calls.append({"repo": repo, "registry_path": registry_path})
+
+        with tempfile.TemporaryDirectory() as directory:
+            registry = Path(directory) / "projects.json"
+            with patch("vibe_loop.webui.run_webui", fake_run_webui):
+                code, _ = self._autopilot(
+                    "webui", "--registry", str(registry), "--port", "0"
+                )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls[0]["registry_path"], registry)
+        self.assertIsNone(calls[0]["repo"])
+
     def _autopilot(self, *args: str) -> tuple[int, str]:
         stdout = StringIO()
         stderr = StringIO()
