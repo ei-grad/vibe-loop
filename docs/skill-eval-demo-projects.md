@@ -89,6 +89,19 @@ committed inside the fixture.
 | `main-advanced-before-merge` | Package where the harness advances `main` with a compatible commit before integration | Main advancement inspection, merge from current `main`, after-merge verification | yes |
 | `negative-trigger-set` | Shared lightweight repo plus standalone prompts | Skill silence on ordinary coding, review, and explanation prompts | no |
 
+### Autopilot supervision coverage
+
+Autopilot is a supervisor CLI surface rather than an agent-skill trigger, so it
+is not a paired no-skill/with-skill case. Instead the demo suite reuses a
+generic positive fixture (for example `finite-py-plan-table`) to exercise
+`autopilot status --json` and a single `autopilot run --once` cycle with a high
+`--min-ready`, asserting that the supervisor collects structured status, records
+exactly one append-only `autopilot_cycle`, stays idle or blocked without
+spawning a `run-until-done` child, never mutates the repository, and emits no
+downstream project names or absolute machine paths in its output. A separate
+release check scans shipped source, docs, and fixtures for the same leaks so the
+feature remains repository-agnostic and dashboard-ready.
+
 ## Common Fixture Layout
 
 Each positive demo repository should have this minimum layout:

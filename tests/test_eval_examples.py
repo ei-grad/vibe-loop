@@ -6,8 +6,11 @@ import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 
+from vibe_loop.cli import main
 from vibe_loop.config import TaskSourceConfig
 from vibe_loop.evals import EvalArtifactRef, EvalSourceFingerprint, SkillEvalRunRecord
 from vibe_loop.eval_examples import (
@@ -641,6 +644,55 @@ class EvalExampleTests(unittest.TestCase):
 
     def test_manifest_suite_id_is_stable(self) -> None:
         self.assertEqual(EXAMPLE_SUITE_ID, "local-demo-v1")
+
+    def test_autopilot_status_and_one_cycle_run_on_generic_demo_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(
+                "finite-py-plan-table", Path(directory) / "demo"
+            )
+
+            status_out = StringIO()
+            with redirect_stdout(status_out), redirect_stderr(StringIO()):
+                status_code = main(
+                    ["autopilot", "status", "--repo", str(repo), "--json"]
+                )
+            status = json.loads(status_out.getvalue())
+
+            run_out = StringIO()
+            with redirect_stdout(run_out), redirect_stderr(StringIO()):
+                run_code = main(
+                    [
+                        "autopilot",
+                        "run",
+                        "--repo",
+                        str(repo),
+                        "--once",
+                        "--min-ready",
+                        "999",
+                    ]
+                )
+            summary = json.loads(run_out.getvalue())
+            records = RunStore(repo / ".vibe-loop" / "runs.jsonl").read_records()
+
+        self.assertEqual(status_code, 0)
+        self.assertEqual(status["repo"], str(repo))
+        for key in ("queue", "supervisor", "blockers", "git"):
+            self.assertIn(key, status)
+        self.assertNotIn("faceapp", status_out.getvalue().lower())
+
+        self.assertTrue(summary["started"])
+        self.assertEqual(len(summary["cycles"]), 1)
+        cycle = summary["cycles"][0]
+        # A high --min-ready keeps the supervisor from launching a child, so the
+        # one cycle stays idle (agent available) or blocked (agent absent in CI);
+        # either way it never spawns run-until-done and never mutates the repo.
+        self.assertIn(cycle["status"], {"idle", "blocked"})
+        self.assertEqual(cycle["child_log"], "")
+        self.assertIn(run_code, {0, 1})
+        self.assertTrue(
+            any(record["record_type"] == "autopilot_cycle" for record in records)
+        )
+        self.assertNotIn("faceapp", run_out.getvalue().lower())
 
 
 def apply_reference_patch(repo: Path) -> None:

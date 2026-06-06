@@ -16,7 +16,12 @@ objects, one-cycle result objects, bounded git/task/worker/lock/supervisor
 summaries, text rendering separated from state collection, and no dependency on
 live process memory for read-only status.
 
-Related implementation IDs: `AUTO-01`, `AUTO-02`.
+Autopilot must stay repository-agnostic. Its source, documentation, bundled eval
+fixtures, and command output must not embed downstream project names or absolute
+developer-machine paths, and a release check must assert this so the feature is
+safe to ship and to surface in a future shared dashboard.
+
+Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-05`.
 
 ## PRD-AUT-002 Command Surface
 

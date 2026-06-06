@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -378,6 +379,46 @@ class EvalReleaseTests(unittest.TestCase):
         self.assertEqual(
             written["external_benchmarks"]["records"][0]["status"], "skipped"
         )
+
+
+# Absolute developer-machine paths and downstream/company project names that
+# must never ship inside the package, docs, or eval fixtures. Design references
+# such as "ralphex" and "lightmetrics" are intentionally NOT forbidden.
+FORBIDDEN_REFERENCE_PATTERNS = (
+    re.compile(r"/home/"),
+    re.compile(r"/Users/"),
+    re.compile(r"[A-Za-z]:\\Users\\"),
+    re.compile(r"faceapp", re.IGNORECASE),
+)
+SCANNED_TEXT_SUFFIXES = frozenset(
+    {".py", ".md", ".toml", ".json", ".txt", ".cfg", ".patch", ".html"}
+)
+
+
+class RepoAgnosticGuardTests(unittest.TestCase):
+    def test_shipped_artifacts_have_no_downstream_references(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        targets = [root / "README.md", root / "PLAN.md", root / "PROMPT.md"]
+        for directory in ("src", "docs", "eval"):
+            targets.extend(
+                path
+                for path in (root / directory).rglob("*")
+                if path.is_file() and path.suffix in SCANNED_TEXT_SUFFIXES
+            )
+
+        offenders: list[str] = []
+        for path in targets:
+            if not path.exists():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for pattern in FORBIDDEN_REFERENCE_PATTERNS:
+                if pattern.search(text):
+                    offenders.append(f"{path.relative_to(root)}: {pattern.pattern}")
+
+        self.assertEqual(offenders, [], f"downstream references leaked: {offenders}")
 
 
 def passing_release_aggregate(

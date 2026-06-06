@@ -341,6 +341,14 @@ diagnostics, git refs and dirty state, the main-integration lock, supervisor
 state, blockers, observations, and the last recorded autopilot cycle. It prints
 compact human text by default and the stable project-status payload with
 `--json`. It never starts a worker, acquires a lock, or mutates task state.
+The `--json` payload is the machine-readable boundary for future surfaces: it
+carries project identity (repo, display name, state directory) so a later TUI,
+WebUI, or multi-project dashboard can consume the same `ProjectStatus` shape and
+compose a list of projects without scraping terminal output. The first
+implementation supervises one repository per invocation. Autopilot is
+repository-agnostic — its commands, output, docs, and bundled fixtures carry no
+downstream project names or absolute machine paths, and a release check guards
+against such leaks.
 
 `autopilot run` is a foreground supervisor that launches `run-until-done` as a
 child process and append-records one `autopilot_cycle` per iteration to
