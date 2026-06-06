@@ -382,16 +382,24 @@ class EvalReleaseTests(unittest.TestCase):
 
 
 # Absolute developer-machine paths and downstream/company project names that
-# must never ship inside the package, docs, or eval fixtures. Design references
-# such as "ralphex" and "lightmetrics" are intentionally NOT forbidden.
+# must never ship inside the package, docs, eval fixtures, or tests. Design
+# references such as "ralphex" and "lightmetrics" are intentionally NOT
+# forbidden.
 FORBIDDEN_REFERENCE_PATTERNS = (
     re.compile(r"/home/"),
     re.compile(r"/Users/"),
     re.compile(r"[A-Za-z]:\\Users\\"),
     re.compile(r"faceapp", re.IGNORECASE),
 )
-SCANNED_TEXT_SUFFIXES = frozenset(
-    {".py", ".md", ".toml", ".json", ".txt", ".cfg", ".patch", ".html"}
+SCANNED_REFERENCE_ROOTS = ("src", "docs", "eval", "tests")
+SKIPPED_REFERENCE_DIRS = frozenset({"__pycache__", ".git", ".venv"})
+# These files spell out the forbidden literals on purpose — to define the guard
+# and to assert command output stays clean — so they are exempt from it.
+REFERENCE_GUARD_EXEMPT_FILES = frozenset(
+    {
+        "tests/test_eval_release.py",
+        "tests/test_eval_examples.py",
+    }
 )
 
 
@@ -399,24 +407,29 @@ class RepoAgnosticGuardTests(unittest.TestCase):
     def test_shipped_artifacts_have_no_downstream_references(self) -> None:
         root = Path(__file__).resolve().parents[1]
         targets = [root / "README.md", root / "PLAN.md", root / "PROMPT.md"]
-        for directory in ("src", "docs", "eval"):
-            targets.extend(
-                path
-                for path in (root / directory).rglob("*")
-                if path.is_file() and path.suffix in SCANNED_TEXT_SUFFIXES
-            )
+        for directory in SCANNED_REFERENCE_ROOTS:
+            for path in (root / directory).rglob("*"):
+                if not path.is_file():
+                    continue
+                if SKIPPED_REFERENCE_DIRS.intersection(path.parts):
+                    continue
+                targets.append(path)
 
         offenders: list[str] = []
         for path in targets:
             if not path.exists():
                 continue
+            relative = path.relative_to(root).as_posix()
+            if relative in REFERENCE_GUARD_EXEMPT_FILES:
+                continue
             try:
                 text = path.read_text(encoding="utf-8")
             except (UnicodeDecodeError, OSError):
+                # Binary or unreadable files cannot carry a textual leak.
                 continue
             for pattern in FORBIDDEN_REFERENCE_PATTERNS:
                 if pattern.search(text):
-                    offenders.append(f"{path.relative_to(root)}: {pattern.pattern}")
+                    offenders.append(f"{relative}: {pattern.pattern}")
 
         self.assertEqual(offenders, [], f"downstream references leaked: {offenders}")
 

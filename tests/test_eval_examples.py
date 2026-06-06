@@ -673,6 +673,11 @@ class EvalExampleTests(unittest.TestCase):
                 )
             summary = json.loads(run_out.getvalue())
             records = RunStore(repo / ".vibe-loop" / "runs.jsonl").read_records()
+            # Autopilot writes only untracked .vibe-loop/ runtime state; tracked
+            # project files must be untouched.
+            tracked_unchanged = (
+                subprocess.run(["git", "diff", "--quiet"], cwd=repo).returncode == 0
+            )
 
         self.assertEqual(status_code, 0)
         self.assertEqual(status["repo"], str(repo))
@@ -689,9 +694,11 @@ class EvalExampleTests(unittest.TestCase):
         self.assertIn(cycle["status"], {"idle", "blocked"})
         self.assertEqual(cycle["child_log"], "")
         self.assertIn(run_code, {0, 1})
-        self.assertTrue(
-            any(record["record_type"] == "autopilot_cycle" for record in records)
+        self.assertEqual(
+            sum(1 for record in records if record["record_type"] == "autopilot_cycle"),
+            1,
         )
+        self.assertTrue(tracked_unchanged)
         self.assertNotIn("faceapp", run_out.getvalue().lower())
 
 
