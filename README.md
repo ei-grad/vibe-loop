@@ -275,6 +275,10 @@ vibe-loop autopilot status --repo .
 vibe-loop autopilot status --repo . --json
 vibe-loop autopilot run --repo . --once
 vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
+vibe-loop autopilot projects register --repo . --name my-project
+vibe-loop autopilot projects list
+vibe-loop autopilot projects status --json
+vibe-loop autopilot projects remove my-project
 vibe-loop specs check --repo . --json
 vibe-loop eval local-demo --repo . --trials 3 --agent-command '*=codex exec {prompt}'
 vibe-loop eval release-gate --repo . --overwrite --record-output .vibe-loop/release-readiness.json
@@ -385,6 +389,16 @@ not recovery agents: their presence never authorizes autopilot to perform
 destructive cleanup, and generated task-source profiles can never introduce
 them. `doctor --json` reports `[autopilot]` settings with command strings
 redacted.
+
+`autopilot projects` manages an optional multi-project registry for supervising
+several repositories from one place. `register`, `list`, `remove`, and `status`
+read and write a small JSON file (default `~/.vibe-loop/projects.json`, override
+with `--registry`) that records only repo paths and display names — each project
+keeps its runtime state under its own configured state directory, and single-repo
+operation never needs the registry. `autopilot projects status [--json]` returns
+one aggregate entry per registered repo, reusing the same `ProjectStatus` payload
+as single-repo status; a repository that cannot be read is reported as an
+isolated error entry so one broken project never hides the others.
 
 `eval local-demo` materializes fresh bundled fixture repositories under the
 configured output directory, runs the same prompt across selected skill

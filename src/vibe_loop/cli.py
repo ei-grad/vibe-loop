@@ -14,8 +14,12 @@ from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 from vibe_loop.autopilot import (
+    ProjectEntry,
+    ProjectRegistry,
     ProjectStatus,
     collect_project_status,
+    collect_registry_status,
+    default_registry_path,
     run_autopilot,
 )
 from vibe_loop.config import (
@@ -334,6 +338,41 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_repo_argument(autopilot_run)
     add_autopilot_run_arguments(autopilot_run)
+    autopilot_projects = autopilot_subparsers.add_parser(
+        "projects",
+        help="Manage the optional multi-project autopilot registry",
+    )
+    projects_subparsers = autopilot_projects.add_subparsers(
+        dest="autopilot_projects_command",
+        required=True,
+    )
+    projects_register = projects_subparsers.add_parser(
+        "register",
+        help="Register a repository in the autopilot registry",
+    )
+    add_repo_argument(projects_register)
+    projects_register.add_argument("--name", default="")
+    add_registry_argument(projects_register)
+    projects_register.add_argument("--json", action="store_true")
+    projects_list = projects_subparsers.add_parser(
+        "list",
+        help="List registered repositories",
+    )
+    add_registry_argument(projects_list)
+    projects_list.add_argument("--json", action="store_true")
+    projects_remove = projects_subparsers.add_parser(
+        "remove",
+        help="Remove a repository from the registry by name or path",
+    )
+    projects_remove.add_argument("project")
+    add_registry_argument(projects_remove)
+    projects_remove.add_argument("--json", action="store_true")
+    projects_status = projects_subparsers.add_parser(
+        "status",
+        help="Show aggregate status across all registered repositories",
+    )
+    add_registry_argument(projects_status)
+    projects_status.add_argument("--json", action="store_true")
 
     worker = subparsers.add_parser("worker", help="Update current worker state")
     add_repo_argument(worker)
@@ -702,6 +741,15 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_repo_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--repo", type=Path, default=argparse.SUPPRESS)
+
+
+def add_registry_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--registry",
+        type=Path,
+        default=None,
+        help="Path to the project registry JSON (default: ~/.vibe-loop/projects.json)",
+    )
 
 
 def add_task_filter_arguments(
@@ -1225,6 +1273,8 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         else:
             print(render_autopilot_status(status))
         return 0
+    if command == "projects":
+        return dispatch_autopilot_projects(args)
     if command in (None, "run"):
         ap = config.autopilot
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
@@ -1286,6 +1336,90 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         )
     if status.next_wake:
         lines.append(f"next wake: {status.next_wake}")
+    return "\n".join(lines)
+
+
+def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
+    registry_path = args.registry or default_registry_path()
+    command = args.autopilot_projects_command
+    use_json = getattr(args, "json", False)
+
+    if command == "register":
+        repo = getattr(args, "repo", Path.cwd()).resolve()
+        name = args.name or repo.name
+        entry = ProjectEntry(name=name, repo=repo)
+        ProjectRegistry.load(registry_path).with_entry(entry).save()
+        if use_json:
+            print(json.dumps(entry.to_json(), indent=2))
+        else:
+            print(f"registered {name} -> {repo}")
+        return 0
+
+    if command == "list":
+        registry = ProjectRegistry.load(registry_path)
+        if use_json:
+            print(json.dumps([entry.to_json() for entry in registry.entries], indent=2))
+        else:
+            print(render_project_registry(registry))
+        return 0
+
+    if command == "remove":
+        registry = ProjectRegistry.load(registry_path)
+        updated, removed = registry.without(args.project)
+        if not removed:
+            print(f"not in registry: {args.project}", file=sys.stderr)
+            return 2
+        updated.save()
+        if use_json:
+            print(json.dumps({"removed": args.project}, indent=2))
+        else:
+            print(f"removed {args.project}")
+        return 0
+
+    if command == "status":
+        registry = ProjectRegistry.load(registry_path)
+        results = collect_registry_status(registry)
+        if use_json:
+            print(
+                json.dumps(
+                    [result.to_json() for result in results], indent=2, default=list
+                )
+            )
+        else:
+            print(render_aggregate_status(results))
+        return 1 if any(result.error for result in results) else 0
+
+    raise AssertionError(command)
+
+
+def render_project_registry(registry: ProjectRegistry) -> str:
+    if not registry.entries:
+        return f"no registered projects ({registry.path})"
+    return "\n".join(f"{entry.name}\t{entry.repo}" for entry in registry.entries)
+
+
+def render_aggregate_status(results) -> str:
+    if not results:
+        return "no registered projects"
+    lines: list[str] = []
+    for result in results:
+        if result.error:
+            lines.append(f"{result.name} ({result.repo}): error: {result.error}")
+            continue
+        status = result.status
+        queue = status.queue
+        queue_text = (
+            f"queue unavailable ({queue.source_error})"
+            if queue.source_error
+            else f"{queue.runnable} runnable / {queue.total} total"
+        )
+        blockers = (
+            f"; blockers: {', '.join(status.blockers)}" if status.blockers else ""
+        )
+        lines.append(
+            f"{result.name} ({result.repo}): {queue_text}; "
+            f"supervisor {status.supervisor.state}{blockers}"
+        )
     return "\n".join(lines)
 
 

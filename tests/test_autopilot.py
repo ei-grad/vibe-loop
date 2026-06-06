@@ -8,8 +8,11 @@ from pathlib import Path
 from vibe_loop.autopilot import (
     AutopilotCycleResult,
     MaintenanceCommandResult,
+    ProjectEntry,
+    ProjectRegistry,
     autopilot_child_command,
     collect_project_status,
+    collect_registry_status,
     collect_supervisor_status,
     run_autopilot,
     run_maintenance_command,
@@ -674,6 +677,74 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         self.assertFalse(failed.succeeded)
         self.assertIsNone(timed.exit_code)
         self.assertTrue(timed.timed_out)
+
+
+class AutopilotRegistryTests(unittest.TestCase):
+    def test_register_list_find_remove_roundtrip(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry_path = Path(directory) / "projects.json"
+
+            empty = ProjectRegistry.load(registry_path)
+            self.assertEqual(empty.entries, ())
+
+            registry = empty.with_entry(
+                ProjectEntry(name="alpha", repo=Path("/repos/alpha"))
+            ).with_entry(ProjectEntry(name="beta", repo=Path("/repos/beta")))
+            registry.save()
+
+            reloaded = ProjectRegistry.load(registry_path)
+            self.assertEqual(
+                [entry.name for entry in reloaded.entries], ["alpha", "beta"]
+            )
+            self.assertEqual(reloaded.find("beta").repo, Path("/repos/beta"))
+            self.assertEqual(reloaded.find("/repos/alpha").name, "alpha")
+            self.assertIsNone(reloaded.find("missing"))
+
+            # Re-registering a name replaces the prior entry rather than duplicating.
+            updated = reloaded.with_entry(
+                ProjectEntry(name="alpha", repo=Path("/repos/alpha2"))
+            )
+            self.assertEqual(len(updated.entries), 2)
+            self.assertEqual(updated.find("alpha").repo, Path("/repos/alpha2"))
+
+            without_beta, removed = updated.without("beta")
+            self.assertTrue(removed)
+            self.assertEqual([entry.name for entry in without_beta.entries], ["alpha"])
+            _, removed_missing = without_beta.without("missing")
+            self.assertFalse(removed_missing)
+
+    def test_collect_registry_status_aggregates_and_isolates_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            good = root / "good"
+            good.mkdir()
+            configured_repo(good, [("TASK-01", "Next", "", "ready slice")])
+            broken = root / "broken"
+            broken.mkdir()
+            init_repo(broken)
+            (broken / ".vibe-loop.toml").write_text(
+                "[autopilot]\nunsupported = true\n", encoding="utf-8"
+            )
+            write_plan(broken, [("TASK-09", "Next", "", "ready slice")])
+            run(broken, "git", "add", "PLAN.md", ".vibe-loop.toml")
+            run(broken, "git", "commit", "-m", "initial")
+
+            registry = ProjectRegistry(
+                path=root / "projects.json",
+                entries=(
+                    ProjectEntry(name="good", repo=good),
+                    ProjectEntry(name="broken", repo=broken),
+                ),
+            )
+            results = collect_registry_status(registry)
+
+        by_name = {result.name: result for result in results}
+        self.assertEqual(len(results), 2)
+        self.assertIsNotNone(by_name["good"].status)
+        self.assertEqual(by_name["good"].error, "")
+        self.assertEqual(by_name["good"].status.queue.runnable, 1)
+        self.assertIsNone(by_name["broken"].status)
+        self.assertIn("autopilot contains unsupported keys", by_name["broken"].error)
 
 
 def configured_repo(

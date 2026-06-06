@@ -7098,6 +7098,87 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(cycle["status"], "idle")
         self.assertEqual(cycle["child_log"], "")
 
+    def test_projects_register_list_and_remove(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = base / "projects.json"
+            repo = base / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+
+            self.assertEqual(
+                self._autopilot(
+                    "projects",
+                    "register",
+                    "--repo",
+                    str(repo),
+                    "--name",
+                    "demo",
+                    "--registry",
+                    str(registry),
+                )[0],
+                0,
+            )
+            list_code, list_out = self._autopilot(
+                "projects", "list", "--registry", str(registry), "--json"
+            )
+            entries = json.loads(list_out)
+
+            remove_code, _ = self._autopilot(
+                "projects", "remove", "demo", "--registry", str(registry)
+            )
+            after_code, after_out = self._autopilot(
+                "projects", "list", "--registry", str(registry), "--json"
+            )
+
+        self.assertEqual(list_code, 0)
+        self.assertEqual(entries, [{"name": "demo", "repo": str(repo)}])
+        self.assertEqual(remove_code, 0)
+        self.assertEqual(after_code, 0)
+        self.assertEqual(json.loads(after_out), [])
+
+    def test_projects_status_aggregates_and_isolates_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            registry = base / "projects.json"
+            good = base / "good"
+            init_planning_repo(good, THREE_TASK_PLAN)
+            broken = base / "broken"
+            init_planning_repo(broken, THREE_TASK_PLAN)
+
+            for name, repo in (("good", good), ("broken", broken)):
+                self._autopilot(
+                    "projects",
+                    "register",
+                    "--repo",
+                    str(repo),
+                    "--name",
+                    name,
+                    "--registry",
+                    str(registry),
+                )
+            # Corrupt the project's config only AFTER registration so the
+            # aggregate exercises status-time failure isolation.
+            (broken / ".vibe-loop.toml").write_text(
+                "[autopilot]\nunsupported = true\n", encoding="utf-8"
+            )
+            status_code, status_out = self._autopilot(
+                "projects", "status", "--registry", str(registry), "--json"
+            )
+
+        results = {entry["name"]: entry for entry in json.loads(status_out)}
+        self.assertEqual(status_code, 1)
+        self.assertIsNotNone(results["good"]["status"])
+        self.assertEqual(results["good"]["error"], "")
+        self.assertIsNone(results["broken"]["status"])
+        self.assertIn("unsupported keys", results["broken"]["error"])
+
+    def _autopilot(self, *args: str) -> tuple[int, str]:
+        stdout = StringIO()
+        stderr = StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            code = main(["autopilot", *args])
+        return code, stdout.getvalue()
+
 
 def write_python_executable(path: Path, body: str) -> None:
     path.write_text(f"#!{sys.executable}\n{body}", encoding="utf-8")

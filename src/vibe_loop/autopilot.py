@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import signal
 import subprocess
@@ -14,6 +15,7 @@ from typing import Any
 
 from vibe_loop.config import (
     VibeConfig,
+    load_config,
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
@@ -1070,3 +1072,120 @@ def run_autopilot(
 
 def iso_after(seconds: float) -> str:
     return (datetime.now(UTC) + timedelta(seconds=max(0.0, seconds))).isoformat()
+
+
+PROJECT_REGISTRY_SCHEMA_VERSION = 1
+
+
+def default_registry_path() -> Path:
+    return Path.home() / ".vibe-loop" / "projects.json"
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectEntry:
+    name: str
+    repo: Path
+
+    def to_json(self) -> dict[str, object]:
+        return {"name": self.name, "repo": str(self.repo)}
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectRegistry:
+    """An optional global list of repositories for multi-project autopilot.
+
+    The registry only records repo paths and display names. Each project keeps
+    its runtime state under its own configured state directory, and single-repo
+    operation never requires the registry to exist.
+    """
+
+    path: Path
+    entries: tuple[ProjectEntry, ...] = ()
+
+    @classmethod
+    def load(cls, path: Path) -> ProjectRegistry:
+        if not path.exists():
+            return cls(path=path, entries=())
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise ValueError(f"invalid project registry at {path}: {exc}") from exc
+        raw_projects = data.get("projects", []) if isinstance(data, dict) else []
+        entries: list[ProjectEntry] = []
+        for raw in raw_projects:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "")
+            repo = str(raw.get("repo") or "")
+            if name and repo:
+                entries.append(ProjectEntry(name=name, repo=Path(repo)))
+        return cls(path=path, entries=tuple(entries))
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schema_version": PROJECT_REGISTRY_SCHEMA_VERSION,
+            "projects": [entry.to_json() for entry in self.entries],
+        }
+
+    def find(self, key: str) -> ProjectEntry | None:
+        for entry in self.entries:
+            if entry.name == key or str(entry.repo) == key:
+                return entry
+        return None
+
+    def with_entry(self, entry: ProjectEntry) -> ProjectRegistry:
+        kept = tuple(item for item in self.entries if item.name != entry.name)
+        return ProjectRegistry(path=self.path, entries=(*kept, entry))
+
+    def without(self, key: str) -> tuple[ProjectRegistry, bool]:
+        kept = tuple(
+            item for item in self.entries if item.name != key and str(item.repo) != key
+        )
+        return ProjectRegistry(path=self.path, entries=kept), len(kept) != len(
+            self.entries
+        )
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self.to_json(), indent=2) + "\n", encoding="utf-8"
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class AggregateProjectStatus:
+    name: str
+    repo: Path
+    status: ProjectStatus | None = None
+    error: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "repo": str(self.repo),
+            "status": self.status.to_json() if self.status is not None else None,
+            "error": self.error,
+        }
+
+
+def collect_registry_status(
+    registry: ProjectRegistry,
+    *,
+    process_exists: ProcessExists | None = None,
+) -> list[AggregateProjectStatus]:
+    results: list[AggregateProjectStatus] = []
+    for entry in registry.entries:
+        try:
+            config = load_config(entry.repo)
+            status = collect_project_status(config, process_exists=process_exists)
+            results.append(
+                AggregateProjectStatus(name=entry.name, repo=entry.repo, status=status)
+            )
+        # Per-repo collection can fail many ways (missing/unreadable repo,
+        # malformed config, git or task-source errors); isolate the failure so
+        # one bad project never breaks the rest of the aggregate.
+        except Exception as exc:
+            results.append(
+                AggregateProjectStatus(name=entry.name, repo=entry.repo, error=str(exc))
+            )
+    return results
