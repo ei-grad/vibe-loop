@@ -33,6 +33,7 @@ plan IDs stable when adding PRD coverage.
 | `PRD-ANL-*` | `planning-analytics.md` | Planning evidence, timeline/Gantt artifacts, duration benchmarking, coverage semantics, and `doctor` readiness. |
 | `PRD-EVL-*` | `evals-release.md` | Local skill eval suites, artifact schema, aggregate reporting, external benchmark adapters, and release gates. |
 | `PRD-SDE-*` | `spec-driven-execution.md` | Execution-engine support for spec-driven workflows, task-layer adapters, traceability, gates, drift checks, worker context, and completion evidence. |
+| `PRD-AUT-*` | `autopilot.md` | Persistent autopilot supervision, reusable status core, append-only cycle records, future multi-project management, and TUI/WebUI readiness. |
 
 Plan rows should cite PRD IDs in `Scope`, `Acceptance`, or `Evidence` when a
 slice implements or changes a contract. A single plan row may satisfy multiple

@@ -19,11 +19,11 @@ requirements, designs, approvals, task decomposition, and spec deltas.
 `vibe-loop` should sit below those tools as the execution layer for the task
 artifact they produce.
 
-Full-system PRDs should cover six durable product surfaces: CLI/runtime
+Full-system PRDs should cover seven durable product surfaces: CLI/runtime
 configuration, task-source discovery, worker supervision, bundled workflow
-skills, planning analytics, and skill evaluation/release readiness.
-Spec-driven execution is the cross-cutting direction that connects those
-surfaces to higher-level PRDs, requirements, and task artifacts.
+skills, planning analytics, skill evaluation/release readiness, and autopilot
+operations. Spec-driven execution is the cross-cutting direction that connects
+those surfaces to higher-level PRDs, requirements, and task artifacts.
 
 ## Operating Philosophy
 
@@ -37,6 +37,9 @@ surfaces to higher-level PRDs, requirements, and task artifacts.
   adapters over generated executable behavior.
 - Keep workers finite. Long-running continuation belongs to the supervisor or
   an outer loop, not to a single open-ended agent session.
+- Keep orchestration deterministic: selection, scheduling, retries, recovery,
+  and status should be explainable from repository state, configuration, locks,
+  and event history.
 - Make coordination visible before making it automatic: task locks, worker
   reports, workspace claims, integration locks, and drift diagnostics should be
   inspectable before they become policy gates.
@@ -56,8 +59,9 @@ surfaces to higher-level PRDs, requirements, and task artifacts.
   defaults when available.
 - Markdown skills as reusable workflow contracts for finite and unattended
   coding loops.
-- Deterministic JSON/JSONL records for runs, locks, generated task profiles,
-  planning analytics, evals, and future spec traceability.
+- Append-only event journals for target-project runtime activity, and
+  structured JSON artifacts for generated profiles, analytics, evals, and
+  traceability.
 
 ## Architecture Decisions
 
