@@ -555,6 +555,14 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', CLI_WORKER_ADDENDUM)
         self.assertIn("vibe-loop main-integration acquire", CLI_WORKER_ADDENDUM)
+        self.assertIn("After final review/re-review has passed", CLI_WORKER_ADDENDUM)
+        self.assertIn(
+            "Do not hold the integration lock while waiting", CLI_WORKER_ADDENDUM
+        )
+        self.assertRegex(
+            CLI_WORKER_ADDENDUM,
+            r"release it and\nreacquire it only when the final main merge",
+        )
         self.assertIn("--wait --timeout 300", CLI_WORKER_ADDENDUM)
         self.assertRegex(
             CLI_WORKER_ADDENDUM,

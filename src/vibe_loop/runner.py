@@ -187,8 +187,8 @@ state, while the summary explains what happened.
 
 ### Integration Locking
 
-Before the final fast-forward merge to main, acquire the advisory
-main-integration lock:
+After final review/re-review has passed and immediately before the final
+fast-forward merge to main, acquire the advisory main-integration lock:
 
 ```bash
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \\
@@ -201,6 +201,11 @@ enter the final integration section without the lock. If the lock appears
 stale, or workspace preflight reports unsafe claimed-workspace diagnostics,
 report the run as blocked with the precise integration-lock or workspace reason
 and follow repo policy rather than stealing or cleaning state.
+
+Do not hold the integration lock while waiting for review, re-review, human
+input, long-running checks, remediation, or any other non-integration work. If
+integration cannot proceed immediately after acquiring the lock, release it and
+reacquire it only when the final main merge and main verification can run.
 
 Release the lock after main verification or immediately when integration is
 parked:
