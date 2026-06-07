@@ -943,7 +943,7 @@ def dispatch(args: argparse.Namespace) -> int:
             run_id=args.run_id,
             task_id=args.task_id,
             status=args.status,
-            commit=args.commit,
+            commit=resolve_report_commit(config.repo, args.commit),
             message=args.message,
             metadata=parse_metadata_json(args.metadata_json),
         )
@@ -2519,6 +2519,17 @@ def validate_report_fencing(args: argparse.Namespace, config) -> int | None:
         print(f"worker report refused: {exc}", file=sys.stderr)
         return 1
     return None
+
+
+def resolve_report_commit(repo: Path, commit: str) -> str:
+    value = optional_string(commit)
+    if not value:
+        return ""
+    result = run_git(repo, "rev-parse", "--verify", "--quiet", f"{value}^{{commit}}")
+    if result is None or result.returncode != 0:
+        return value
+    resolved = result.stdout.strip()
+    return resolved or value
 
 
 def print_lock_mutation_refused(
