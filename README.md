@@ -274,7 +274,7 @@ vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects status --json
 vibe-loop autopilot tui --registry
 vibe-loop autopilot webui --registry --port 8765
-vibe-loop wait-helper --pid 12345 --cycle-schedule 1800 --json
+vibe-loop wait-helper --pid 12345 --json
 ```
 
 **`status`** collects a read-only snapshot — queue counts, runnable tasks, active
@@ -296,8 +296,11 @@ work and exits when a cycle is idle or blocked; with `--interval N` it stays
 resident, sleeping `N` seconds between cycles until `--max-cycles` or an
 interrupt. `--jobs`, `--ask-agent`, `--continue-on-failure`, `--max-slices`, and
 `--max-tasks` are forwarded to each child; `--min-ready` sets the minimum
-runnable depth required before launching. A single supervisor lock prevents
-duplicates; Ctrl-C terminates the in-flight child and releases the lock.
+runnable depth required before launching. If the queue is below that depth and
+no explicit `[autopilot] planning_command` is configured, the cycle records
+`planning_unconfigured` with the low/no-runnable observation instead of
+authoring new tasks itself. A single supervisor lock prevents duplicates; Ctrl-C
+terminates the in-flight child and releases the lock.
 
 **`projects`** manages an optional multi-project registry (`register`, `list`,
 `remove`, `status`). It records only repo paths and display names in a small JSON
@@ -318,10 +321,12 @@ a trusted host. Both take `--repo` (single, default) or `--registry [PATH]`.
 The top-level **`vibe-loop wait-helper`** blocks until a watched process exits or
 a wall-clock deadline arrives, so an unattended steward can sleep between cycles.
 `--pid` (repeatable) wakes on process exit; `--cycle-schedule [SECONDS]` wakes at
-the next UTC `*/SECONDS` boundary (default 1800s); `--deadline` takes an explicit
-ISO-8601 UTC time; `--mode all` waits for every PID. It prints `wake_reason`
-(`pid`, `all_complete`, or `deadline`) with a summary. It watches OS processes and
-the clock only — agent-specific wake signals stay in the agent environment.
+the next UTC `*/SECONDS` boundary; omitting both `--deadline` and
+`--cycle-schedule` uses the default 1800s boundary. `--deadline` takes an
+explicit ISO-8601 UTC time; `--mode all` waits for every PID. It prints
+`wake_reason` (`pid`, `all_complete`, or `deadline`) with a summary. It watches
+OS processes and the clock only — agent-specific wake signals stay in the agent
+environment.
 
 ## Configuration
 
@@ -367,8 +372,9 @@ type = "directory"
 require_clean_repo = true   # set false to let a dirty tree run a cycle
 # Optional user-authored maintenance hooks, redacted in status/doctor JSON.
 # A failing health command blocks the launch; planning runs when the runnable
-# queue is below min_ready; summary runs after a launch; troubleshoot after a
-# failed child. Generated profiles can never introduce them.
+# queue is below min_ready; if planning is not configured, the cycle records
+# planning_unconfigured. Summary runs after a launch; troubleshoot runs after a
+# failed child. Generated profiles can never introduce these hooks.
 # health_command = "scripts/health.sh"
 # summary_command = "scripts/summary.sh"
 # troubleshoot_command = "scripts/troubleshoot.sh"

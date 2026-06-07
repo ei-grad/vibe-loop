@@ -969,8 +969,10 @@ def execute_autopilot_cycle(
             if runnable == 0 and active_conflict_workers:
                 actions.append(f"waiting_for_active_workers:{active_conflict_workers}")
             elif runnable == 0:
+                actions.append("planning_unconfigured")
                 actions.append("no_runnable_work")
             else:
+                actions.append("planning_unconfigured")
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
     else:
         child_log = config.state_path / "autopilot" / f"{cycle_id}.log"

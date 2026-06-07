@@ -23,9 +23,9 @@ files and process evidence first and do not revert peer or user changes.
 ## Continuation
 
 Assume an unattended session. Do not stop voluntarily: keep a background wait
-running so you wake on the next cycle boundary or when `run-until-done` exits,
-then run the cycle and continue. Stop only on explicit instruction or session
-end.
+running so you wake on the next UTC 30-minute cycle boundary or when
+`run-until-done` exits, then run the cycle and continue. Stop only on explicit
+instruction or session end.
 
 ## Cycle
 
@@ -78,12 +78,16 @@ recover from the concrete reason before retrying.
 
 ## Wake / Wait
 
-Use `vibe-loop wait-helper` instead of ad hoc polling loops. It wakes on the
-first watched process exit, or at the next UTC cycle boundary:
+Use `vibe-loop wait-helper` instead of ad hoc polling loops. By default it wakes
+on the first watched process exit or at the next UTC 30-minute cycle boundary:
 
 ```bash
-vibe-loop wait-helper --pid <run-until-done-pid> --cycle-schedule 1800 --json
+vibe-loop wait-helper --pid <run-until-done-pid> --json
 ```
+
+Use `--deadline` only when you have an explicit absolute wake time. Use
+`--cycle-schedule SECONDS` only when the repo or user requires a non-default
+wall-clock cadence.
 
 Wake results report `wake_reason`:
 
@@ -107,8 +111,8 @@ Answer from evidence, not process absence alone.
 - Locks and workspaces: trust `vibe-loop doctor` and `vibe-loop workers` before
   adopting work; do not delete scheduler metadata from JSON contents alone.
 - Queue state: zero ready tasks plus no active worker means the supervisor
-  drained the runnable set or cannot select work — that is a planning signal,
-  not a crash.
+  drained the runnable set or cannot select work. That is a planning signal for
+  this operator skill, not a crash and not built-in task authoring by the CLI.
 - A worker log ending with a completed report and released locks is a clean
   completion, not a failure. Repeated review/remediation rounds are
   implementation churn, not supervisor failure, while the worker log keeps

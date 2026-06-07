@@ -555,6 +555,7 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertTrue(summary.started)
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("planning_unconfigured", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
 
     def test_empty_queue_reports_no_runnable_work(self) -> None:
@@ -565,11 +566,19 @@ class AutopilotRunTests(unittest.TestCase):
             launcher, calls = self._recording_launcher()
 
             summary = run_autopilot(config, once=True, launcher=launcher)
+            cycle_records = [
+                record
+                for record in RunStore(config.state_path / "runs.jsonl").read_records()
+                if record.get("record_type") == "autopilot_cycle"
+            ]
 
         self.assertTrue(summary.started)
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("planning_unconfigured", summary.cycles[0].actions)
         self.assertIn("no_runnable_work", summary.cycles[0].actions)
+        self.assertEqual(len(cycle_records), 1)
+        self.assertIn("planning_unconfigured", cycle_records[0]["actions"])
 
     def test_low_ready_queue_with_live_worker_reports_waiting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -603,6 +612,7 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
         self.assertIn("waiting_for_active_workers:1", summary.cycles[0].actions)
+        self.assertNotIn("planning_unconfigured", summary.cycles[0].actions)
         self.assertNotIn("no_runnable_work", summary.cycles[0].actions)
 
     def test_observes_live_supervisor_without_duplicating(self) -> None:
@@ -780,6 +790,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("planning_unconfigured", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
         self.assertEqual(calls, [])
 

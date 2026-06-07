@@ -518,13 +518,14 @@ class CliTests(unittest.TestCase):
             )
         # The autopilot OPERATOR skill drives the CLI by design. It steers the
         # worker pool through `run-until-done`, feeds the queue via the
-        # orchestrated-vibe-loop skill, and sleeps with `wait-helper` — it does
-        # not delegate supervision to `vibe-loop autopilot run`. (Repository
-        # agnosticism is enforced separately by RepoAgnosticGuardTests, which
-        # scans this SKILL.md under src/.)
+        # orchestrated-vibe-loop skill, and sleeps with `wait-helper` defaults.
+        # It does not delegate supervision to `vibe-loop autopilot run`.
+        # Repository agnosticism is enforced separately by
+        # RepoAgnosticGuardTests, which scans this SKILL.md under src/.
         self.assertIn("vibe-loop run-until-done", autopilot_text)
         self.assertIn("orchestrated-vibe-loop", autopilot_text)
         self.assertIn("vibe-loop wait-helper", autopilot_text)
+        self.assertNotIn("--cycle-schedule 1800", autopilot_text)
         self.assertNotIn("vibe-loop autopilot run", autopilot_text)
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
