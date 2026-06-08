@@ -84,27 +84,44 @@ Related implementation IDs: `AUTO-04`.
 ## PRD-AUT-006 Non-Destructive Recovery Boundary
 
 Autopilot recovery must be diagnostic and conservative by default. It must not
-delete worktrees, reset branches, steal live locks, kill arbitrary processes,
-merge, push, rebase, edit tracked project files, or mutate task sources.
-Configured maintenance commands are external user-authored checks or planners;
-their presence does not authorize autopilot to perform destructive recovery.
+reset branches, steal live locks, kill arbitrary processes, merge, push, rebase,
+edit tracked project files, or mutate task sources. It must not delete worktrees
+or branches except under the bounded, evidence-gated worktree-disposition
+exception defined below. Configured maintenance commands are external
+user-authored checks or planners; their presence does not authorize autopilot to
+perform destructive recovery.
 
-One bounded exception is permitted: autopilot may automatically release stale
-worker task locks whose recorded worker process is missing, using the same
-validated release path and `lock_expired` audit records as
-`workers clean --force`. This recovers aborted workers without deleting
-worktrees or branches. It must not release a lock that has not yet observed a
-worker PID (so a just-started worker cannot lose its task lock before its
-launcher writes PID metadata), and it must not take over locks held by live
-processes.
+Two bounded exceptions are permitted, and no others:
+
+1. **Stale-lock release.** Autopilot may automatically release stale worker task
+   locks whose recorded worker process is missing, using the same validated
+   release path and `lock_expired` audit records as `workers clean --force`. This
+   recovers aborted workers without deleting worktrees or branches. It must not
+   release a lock that has not yet observed a worker PID (so a just-started
+   worker cannot lose its task lock before its launcher writes PID metadata), and
+   it must not take over locks held by live processes.
+
+2. **Worktree disposition.** Autopilot may remove a worker-created worktree and
+   delete its branch (`git worktree remove` plus `git branch -d`) only under the
+   evidence-gated, agent-decided contract in `PRD-AUT-010`. This recovers
+   orphaned worktrees left by workers that died before reporting `completed`. It
+   must never force-remove a dirty or unmerged worktree, never touch a worktree
+   claimed by a live run, act only on a per-worktree keep-or-reap decision the
+   read-only analysis agent returned with a reason (no blanket reap), and journal
+   every decision and action to the append-only run store. Salvageable unmerged
+   or dirty work-in-progress must be kept, not reaped.
 
 Acceptance must cover unsafe workspace diagnostics, dirty repo state, missing
 task source, unavailable agent command, no runnable work, and child launch
 failure as explicit blockers or observations rather than destructive cleanup
 triggers; stale locks with a still-live or PID-unobserved owner remain blocking,
-while stale locks with a missing worker process are recovered and audited.
+while stale locks with a missing worker process are recovered and audited; and
+worktree disposition reaps only orphaned, non-dirty, merged-or-disposable,
+non-live-claimed worktrees under the `PRD-AUT-010` guardrails while keeping all
+salvageable work-in-progress.
 
-Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`.
+Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`, `AUTO-13`,
+`AUTO-14`.
 
 ## PRD-AUT-007 Multi-Project Shape
 
@@ -208,7 +225,8 @@ registration of every new native record type in the run store's autopilot and
 known record-type sets, tolerance of unknown record types on read, and a cycle
 action tag (for example `reaped_worktrees:N`) appended for the disposition step.
 
-Related implementation IDs: `AUTO-13`.
+Related implementation IDs: `AUTO-13`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
+`AUTO-17`.
 
 ## PRD-AUT-012 Configuration-Free Generic Cycle
 
@@ -234,5 +252,5 @@ reviewable slice, every native action appearing in the append-only journal
 (`PRD-AUT-011`), and no native behavior performing destructive recovery outside
 its declared evidence-gated guardrails.
 
-Related implementation IDs: `AUTO-12`, `AUTO-13`, `AUTO-14`, `AUTO-15`,
-`AUTO-16`, `AUTO-17`, `AUTO-18`.
+Related implementation IDs: `AUTO-12`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
+`AUTO-17`, `AUTO-18`, `AUTO-19`.
