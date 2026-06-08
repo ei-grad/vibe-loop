@@ -82,6 +82,77 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["agent_default_policy_source"], "codex-first")
         self.assertEqual(payload["agent_default_policy"], "Codex first.")
 
+    def test_run_result_json_records_observed_transcript_path(self) -> None:
+        result = RunResult(
+            run_id="run-1",
+            session_id="session-uuid",
+            session_id_source="observed",
+            transcript_path="/work/u/.claude/projects/p/session-uuid.jsonl",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+        )
+
+        payload = result.to_json()
+
+        self.assertEqual(payload["session_id"], "session-uuid")
+        self.assertEqual(payload["session_id_source"], "observed")
+        self.assertEqual(
+            payload["transcript_path"],
+            "/work/u/.claude/projects/p/session-uuid.jsonl",
+        )
+
+    def test_run_result_json_omits_empty_transcript_path(self) -> None:
+        result = RunResult(
+            run_id="run-1",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+        )
+
+        self.assertNotIn("transcript_path", result.to_json())
+
+    def test_run_history_view_surfaces_transcript_path(self) -> None:
+        from vibe_loop.runs import RunHistoryView
+
+        records = [
+            {
+                "record_type": RUN_STARTED_RECORD_TYPE,
+                "run_id": "run-1",
+                "task_id": "TASK-01",
+                "session_id": "session-uuid",
+                "session_id_source": "observed",
+                "transcript_path": "/work/u/.claude/projects/p/session-uuid.jsonl",
+            },
+            {
+                "record_type": RUN_RECORD_TYPE,
+                "run_id": "run-1",
+                "task_id": "TASK-01",
+                "status": "completed",
+                "session_id": "session-uuid",
+                "session_id_source": "observed",
+                "transcript_path": "/work/u/.claude/projects/p/session-uuid.jsonl",
+            },
+        ]
+
+        view = RunHistoryView.from_records("run-1", records)
+
+        self.assertEqual(view.session_id_source, "observed")
+        self.assertEqual(
+            view.transcript_path,
+            "/work/u/.claude/projects/p/session-uuid.jsonl",
+        )
+        self.assertEqual(
+            view.to_json()["transcript_path"],
+            "/work/u/.claude/projects/p/session-uuid.jsonl",
+        )
+
     def test_append_result_writes_versioned_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"

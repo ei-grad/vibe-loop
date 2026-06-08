@@ -269,25 +269,30 @@ agent session transcript (for Claude,
 `~/.claude/projects/.../<uuid>.jsonl`) is referenced nowhere, so what the agent
 actually did cannot be recovered from a run record.
 
-The worker, selection, and analysis invocations must surface the agent's real
-session id when the agent can provide one, and the run records must persist both
-that id and the resolved transcript path. For Claude this means launching with
-`claude -p --output-format json {prompt}` (parse the JSON envelope's
-`session_id`; this changes stdout from streamed text to a JSON envelope, so the
-selection/parse paths that currently scrape text must adapt) or passing
-`--session-id <uuid>` to force a known id. For Codex the analogous mechanism
-must be determined from the Codex CLI/docs (for example a `codex exec` session
-id or `--output-last-message`); if Codex genuinely surfaces no session id, that
-limitation must be documented rather than silently faked.
+The worker invocation must surface the agent's real session id when the agent
+can provide one, and the run records must persist both that id and the resolved
+transcript path. For Claude the supervisor injects a known `--session-id <uuid>`
+into the worker command (the alternative to `claude -p --output-format json`,
+which would change stdout from streamed text to a JSON envelope and force the
+selection/analysis text-scraping paths to adapt). Injection leaves stdout
+unchanged, so streaming/progress output and the read-only selection/analysis
+paths are untouched; the transcript path is resolved by globbing
+`$CLAUDE_HOME/projects/*/<uuid>.jsonl` after the run, independent of Claude's
+cwd encoding, and is skipped when the command already pins `--session-id`. For
+Codex the CLI was inspected: `codex exec` has no flag to force or print a
+session id without `--json` (which would replace the streamed human-readable
+output the wrapper log and selection/analysis parsing rely on), so Codex worker
+runs retain `fallback:run_id` and this limitation is documented in the README
+rather than silently faked.
 
 Acceptance must cover: a real `session_id` recorded with
 `session_id_source: observed` (distinct from `fallback:run_id`) whenever the
 agent surfaces one; the resolved transcript file path recorded on the
 `run_started` and `run_result`/run context records; `fallback:run_id` retained
 only when the agent genuinely surfaces no session id; preserved
-streaming/progress behavior under the changed stdout format; and a documented
-path from a run record to the agent's transcript file. This contract is
-independent of recovery and may land on its own.
+streaming/progress behavior (the chosen `--session-id` injection leaves stdout
+unchanged); and a documented path from a run record to the agent's transcript
+file. This contract is independent of recovery and may land on its own.
 
 Related implementation IDs: `AUTO-20`.
 

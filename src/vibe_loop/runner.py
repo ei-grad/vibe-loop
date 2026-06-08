@@ -700,10 +700,21 @@ class VibeRunner:
         message = ""
         session_id = run_id
         session_id_source = "fallback:run_id"
+        injected_session_id: str | None = None
+        effective_template = command_template
+        if command_supports_session_capture(
+            command_template, self.config.agent.agent_kind
+        ):
+            injected_session_id = str(uuid.uuid4())
+            effective_template = inject_claude_session_id(
+                command_template, injected_session_id
+            )
+            session_id = injected_session_id
+            session_id_source = SESSION_OBSERVED_SOURCE
         skill_prefix = self.config.agent.require_skill_ref_prefix()
         worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
         validate_worker_prompt_delivery(command_template, task)
-        command = command_template.format(
+        command = effective_template.format(
             prompt=shell_quote(worker_prompt),
             task_id=task.task_id,
             run_id=run_id,
@@ -713,6 +724,20 @@ class VibeRunner:
             task_id=task.task_id,
             repo=self.config.repo,
             log_path=log_path,
+        )
+        claude_home = (
+            resolve_claude_home(command, command_env, self.config.repo)
+            if injected_session_id
+            else None
+        )
+        transcript_path = (
+            str(
+                predicted_claude_transcript(
+                    injected_session_id, self.config.repo, claude_home
+                )
+            )
+            if injected_session_id and claude_home is not None
+            else ""
         )
         command_context = parse_agent_runtime_context_from_command(command)
         agent_kind = self.config.agent.agent_kind
@@ -760,6 +785,7 @@ class VibeRunner:
             agent_skill_ref_prefix=agent_skill_ref_prefix,
             agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
             runtime_context=command_context,
+            transcript_path=transcript_path,
         )
         start_trailer_context = start_context_payload["trailer_context"]
         start_trailer_context_sources = start_context_payload["trailer_context_sources"]
@@ -848,7 +874,11 @@ class VibeRunner:
                     observed_output_context = observed_output_context.overlay(
                         observation.runtime_context
                     )
-                if observation.session_id and observation.session_id_source:
+                if (
+                    injected_session_id is None
+                    and observation.session_id
+                    and observation.session_id_source
+                ):
                     observed_session_id = observation.session_id
                     observed_session_id_source = observation.session_id_source
                 effective_context = command_context.overlay(observed_output_context)
@@ -865,6 +895,7 @@ class VibeRunner:
                     agent_skill_ref_prefix=agent_skill_ref_prefix,
                     agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
                     runtime_context=effective_context,
+                    transcript_path=transcript_path,
                 )
                 trailer_context = context_payload["trailer_context"]
                 trailer_context_sources = context_payload["trailer_context_sources"]
@@ -1000,8 +1031,20 @@ class VibeRunner:
                     reap_check=worker_filed_terminal_report,
                 )
                 exit_code = stream_result.exit_code
-                session_id = stream_result.session_id or run_id
-                session_id_source = stream_result.session_id_source or "fallback:run_id"
+                if injected_session_id is not None:
+                    session_id = injected_session_id
+                    session_id_source = SESSION_OBSERVED_SOURCE
+                    if claude_home is not None:
+                        resolved_transcript = resolve_claude_transcript(
+                            injected_session_id, claude_home
+                        )
+                        if resolved_transcript is not None:
+                            transcript_path = str(resolved_transcript)
+                else:
+                    session_id = stream_result.session_id or run_id
+                    session_id_source = (
+                        stream_result.session_id_source or "fallback:run_id"
+                    )
                 final_runtime_context = command_context.overlay(
                     stream_result.runtime_context
                 )
@@ -1018,6 +1061,7 @@ class VibeRunner:
                     agent_skill_ref_prefix=agent_skill_ref_prefix,
                     agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
                     runtime_context=final_runtime_context,
+                    transcript_path=transcript_path,
                 )
                 with observation_lock:
                     if not session_observed_recorded:
@@ -1064,6 +1108,8 @@ class VibeRunner:
                 report_status(f"agent command exit_code={exit_code}", log)
                 report_status(f"session_id={session_id}", log)
                 report_status(f"session_id_source={session_id_source}", log)
+                if transcript_path:
+                    report_status(f"transcript={transcript_path}", log)
                 worker_report = self.run_store.latest_worker_report(
                     run_id,
                     task.task_id,
@@ -1114,6 +1160,7 @@ class VibeRunner:
                 started_at=active_state.started_at,
                 session_id=session_id,
                 session_id_source=session_id_source,
+                transcript_path=transcript_path,
                 agent_command_source=self.config.agent.command_source,
                 agent_selection_command_source=self.config.agent.selection_command_source,
                 agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
@@ -3027,6 +3074,101 @@ def command_executable_name(argv: list[str]) -> str:
     return ""
 
 
+# Only Claude commands accept a forced --session-id. Codex `exec` has no
+# equivalent injection flag, and its session id is surfaced only via `--json`
+# (which would replace the streamed human-readable output the wrapper log and
+# selection/analysis text parsing rely on); Codex runs therefore keep the
+# run_id fallback. See README "Agent session transcripts".
+SESSION_CAPTURE_AGENT_KINDS = frozenset({"auto", "claude"})
+SESSION_OBSERVED_SOURCE = "observed"
+
+
+def command_specifies_session_id(argv: list[str]) -> bool:
+    return any(
+        token == "--session-id" or token.startswith("--session-id=") for token in argv
+    )
+
+
+def command_supports_session_capture(command: str, agent_kind: str) -> bool:
+    """Whether a known --session-id can be injected into this agent command."""
+    if agent_kind not in SESSION_CAPTURE_AGENT_KINDS:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if command_executable_name(argv) != "claude":
+        return False
+    return not command_specifies_session_id(argv)
+
+
+def inject_claude_session_id(command: str, session_id: str) -> str:
+    """Force a known Claude session id by inserting --session-id before {prompt}.
+
+    The id is a generated uuid (safe, unquoted) so this does not change the
+    streamed stdout format and leaves the {prompt} placeholder intact for the
+    later .format() call.
+    """
+    if "{prompt}" in command:
+        return command.replace("{prompt}", f"--session-id {session_id} {{prompt}}", 1)
+    return f"{command.rstrip()} --session-id {session_id}"
+
+
+def leading_env_assignment(command: str, name: str) -> str | None:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    for token in argv:
+        if not SHELL_ASSIGNMENT_RE.match(token):
+            break
+        key, _, value = token.partition("=")
+        if key == name:
+            return value
+    return None
+
+
+def claude_project_dir_name(cwd: Path) -> str:
+    """Claude Code encodes a session's launch cwd into its project dir name by
+    replacing every non-alphanumeric character with a dash."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(Path(cwd)))
+
+
+def resolve_claude_home(command: str, env: dict[str, str], cwd: Path) -> Path:
+    inline = leading_env_assignment(command, "CLAUDE_HOME")
+    if inline:
+        candidate = Path(inline)
+        return candidate if candidate.is_absolute() else Path(cwd) / candidate
+    env_home = env.get("CLAUDE_HOME")
+    if env_home:
+        return Path(env_home)
+    return Path.home() / ".claude"
+
+
+def predicted_claude_transcript(
+    session_id: str,
+    cwd: Path,
+    claude_home: Path,
+) -> Path:
+    return (
+        Path(claude_home)
+        / "projects"
+        / claude_project_dir_name(cwd)
+        / f"{session_id}.jsonl"
+    )
+
+
+def resolve_claude_transcript(session_id: str, claude_home: Path) -> Path | None:
+    """Find the real transcript by globbing for the unique session id, so the
+    result is correct regardless of the cwd-to-project-dir encoding."""
+    projects = Path(claude_home) / "projects"
+    try:
+        matches = sorted(projects.glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        return None
+    return matches[0] if matches else None
+
+
 def parse_agent_runtime_context_from_line(
     line: str,
     stream_name: str,
@@ -3226,6 +3368,7 @@ def build_run_context_payload(
     agent_skill_ref_prefix: str,
     agent_skill_ref_prefix_source: str,
     runtime_context: AgentRuntimeContext,
+    transcript_path: str = "",
 ) -> dict[str, object]:
     trailer_context, trailer_context_sources = build_trailer_context(
         task_id=task_id,
@@ -3253,6 +3396,8 @@ def build_run_context_payload(
         "trailer_context": trailer_context,
         "trailer_context_sources": trailer_context_sources,
     }
+    if transcript_path:
+        payload["transcript_path"] = transcript_path
     payload.update(runtime_context.to_record_fields())
     return payload
 

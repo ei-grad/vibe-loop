@@ -30,18 +30,26 @@ from vibe_loop.config import (
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+    AgentRuntimeContext,
     SchedulerLockBusy,
     VibeRunner,
     active_lock_conflict_domains,
     build_batch_selection_prompt,
+    build_run_context_payload,
     build_selection_prompt,
     build_spec_worker_context,
     build_worker_prompt,
+    claude_project_dir_name,
+    command_supports_session_capture,
     deterministic_task_batch,
+    inject_claude_session_id,
     parse_agent_runtime_context_from_command,
     parse_selected_task_id,
     parse_selected_task_ids,
     parse_worker_session_id,
+    predicted_claude_transcript,
+    resolve_claude_home,
+    resolve_claude_transcript,
     run_streaming_command,
     terminate_worker_process_group,
     validate_analysis_prompt_delivery,
@@ -2913,6 +2921,145 @@ class AnalysisAgentTests(unittest.TestCase):
             )
             with self.assertRaises(AgentResolutionError):
                 runner.run_analysis_agent("inspect", repo / "decision.json")
+
+
+class SessionIdInjectionTests(unittest.TestCase):
+    def test_supports_capture_for_default_claude_command(self) -> None:
+        self.assertTrue(
+            command_supports_session_capture("claude -p {prompt}", "claude")
+        )
+        self.assertTrue(command_supports_session_capture("claude -p {prompt}", "auto"))
+
+    def test_supports_capture_skips_env_prefixed_claude(self) -> None:
+        self.assertTrue(
+            command_supports_session_capture(
+                "CLAUDE_HOME=.claude claude -p {prompt}", "auto"
+            )
+        )
+
+    def test_does_not_capture_codex_or_explicit_session_id(self) -> None:
+        self.assertFalse(
+            command_supports_session_capture("codex exec {prompt}", "auto")
+        )
+        self.assertFalse(
+            command_supports_session_capture("codex exec {prompt}", "codex")
+        )
+        self.assertFalse(
+            command_supports_session_capture(
+                "claude -p --session-id fixed {prompt}", "claude"
+            )
+        )
+        # An explicit codex kind must not get a Claude flag even if mislabeled.
+        self.assertFalse(
+            command_supports_session_capture("claude -p {prompt}", "codex")
+        )
+
+    def test_inject_inserts_flag_before_prompt(self) -> None:
+        injected = inject_claude_session_id("claude -p {prompt}", "sid-123")
+        self.assertEqual(injected, "claude -p --session-id sid-123 {prompt}")
+        # The {prompt} placeholder survives for the later .format() call.
+        self.assertEqual(
+            injected.format(prompt="'hello world'"),
+            "claude -p --session-id sid-123 'hello world'",
+        )
+
+    def test_inject_appends_when_no_prompt_placeholder(self) -> None:
+        self.assertEqual(
+            inject_claude_session_id("claude -p", "sid-9"),
+            "claude -p --session-id sid-9",
+        )
+
+    def test_project_dir_name_replaces_non_alphanumeric(self) -> None:
+        self.assertEqual(
+            claude_project_dir_name(Path("/work/u/vibe-loop")),
+            "-work-u-vibe-loop",
+        )
+        self.assertEqual(
+            claude_project_dir_name(Path("/a/b.c_d")),
+            "-a-b-c-d",
+        )
+
+    def test_resolve_claude_home_prefers_inline_then_env_then_default(self) -> None:
+        cwd = Path("/repo")
+        self.assertEqual(
+            resolve_claude_home("CLAUDE_HOME=/abs claude -p {prompt}", {}, cwd),
+            Path("/abs"),
+        )
+        self.assertEqual(
+            resolve_claude_home("CLAUDE_HOME=rel claude -p {prompt}", {}, cwd),
+            Path("/repo/rel"),
+        )
+        self.assertEqual(
+            resolve_claude_home("claude -p {prompt}", {"CLAUDE_HOME": "/env"}, cwd),
+            Path("/env"),
+        )
+        self.assertEqual(
+            resolve_claude_home("claude -p {prompt}", {}, cwd),
+            Path.home() / ".claude",
+        )
+
+    def test_resolve_transcript_globs_by_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            project = home / "projects" / "-some-encoded-cwd"
+            project.mkdir(parents=True)
+            transcript = project / "abc-123.jsonl"
+            transcript.write_text("{}\n", encoding="utf-8")
+
+            self.assertEqual(
+                resolve_claude_transcript("abc-123", home),
+                transcript,
+            )
+            self.assertIsNone(resolve_claude_transcript("missing", home))
+
+    def test_predicted_transcript_uses_encoded_cwd(self) -> None:
+        predicted = predicted_claude_transcript(
+            "abc-123",
+            Path("/work/u/repo"),
+            Path("/claude"),
+        )
+        self.assertEqual(
+            predicted,
+            Path("/claude/projects/-work-u-repo/abc-123.jsonl"),
+        )
+
+    def test_run_context_payload_includes_transcript_path_when_present(self) -> None:
+        payload = build_run_context_payload(
+            task_id="T-1",
+            run_id="r-1",
+            started_at="2026-01-01T00:00:00Z",
+            session_id="sid-1",
+            session_id_source="observed",
+            agent_kind="claude",
+            agent_kind_source="explicit",
+            agent_prompt_dialect="claude",
+            agent_prompt_dialect_source="explicit",
+            agent_skill_ref_prefix="/",
+            agent_skill_ref_prefix_source="explicit",
+            runtime_context=AgentRuntimeContext(),
+            transcript_path="/work/u/.claude/projects/p/sid-1.jsonl",
+        )
+        self.assertEqual(
+            payload["transcript_path"],
+            "/work/u/.claude/projects/p/sid-1.jsonl",
+        )
+
+    def test_run_context_payload_omits_empty_transcript_path(self) -> None:
+        payload = build_run_context_payload(
+            task_id="T-1",
+            run_id="r-1",
+            started_at="2026-01-01T00:00:00Z",
+            session_id="r-1",
+            session_id_source="fallback:run_id",
+            agent_kind="codex",
+            agent_kind_source="explicit",
+            agent_prompt_dialect="codex",
+            agent_prompt_dialect_source="explicit",
+            agent_skill_ref_prefix="$",
+            agent_skill_ref_prefix_source="explicit",
+            runtime_context=AgentRuntimeContext(),
+        )
+        self.assertNotIn("transcript_path", payload)
 
 
 if __name__ == "__main__":

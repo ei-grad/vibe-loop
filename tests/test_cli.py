@@ -616,10 +616,75 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["classification"], "completed")
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "-p")
-        self.assertIn("/vibe-loop TASK-01", agent_lines[1])
+        # AUTO-20: a known --session-id is injected before the prompt so the run
+        # records the agent's real session id instead of aliasing the run_id.
+        self.assertEqual(agent_lines[1], "--session-id")
+        self.assertRegex(agent_lines[2], r"^[0-9a-fA-F-]{36}$")
+        self.assertEqual(payload["session_id"], agent_lines[2])
+        self.assertEqual(payload["session_id_source"], "observed")
+        self.assertIn("/vibe-loop TASK-01", agent_args)
         self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:claude", stderr.getvalue())
         self.assertIn("agent_command_source=auto:claude", log_text)
+
+    def test_run_next_records_observed_claude_session_and_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            claude_home = Path(directory) / "claude-home"
+            repo.mkdir()
+            bin_dir.mkdir()
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            write_fake_git(bin_dir)
+            # The fake agent records the real Claude session transcript at the
+            # injected --session-id, mirroring claude's
+            # $CLAUDE_HOME/projects/<slug>/<uuid>.jsonl layout.
+            write_python_executable(
+                bin_dir / "claude",
+                "from pathlib import Path\n"
+                "import os, sys\n"
+                "args = sys.argv[1:]\n"
+                "session_id = args[args.index('--session-id') + 1]\n"
+                "project = Path(os.environ['CLAUDE_HOME']) / 'projects' / 'proj'\n"
+                "project.mkdir(parents=True, exist_ok=True)\n"
+                "(project / f'{session_id}.jsonl').write_text('{}\\n', encoding='utf-8')\n"
+                "plan = Path('docs/PLAN.md')\n"
+                "text = plan.read_text(encoding='utf-8')\n"
+                "plan.write_text(\n"
+                "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "print('done')\n",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict(
+                "os.environ",
+                {"PATH": str(bin_dir), "CLAUDE_HOME": str(claude_home)},
+            ):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = parse_run_result(self, stdout, stderr, exit_code)
+            log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
+
+            # Assert inside the block: the resolved transcript lives under the
+            # temporary CLAUDE_HOME that is removed on block exit.
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(payload["classification"], "completed")
+            self.assertEqual(payload["session_id_source"], "observed")
+            self.assertNotEqual(payload["session_id"], payload["run_id"])
+            self.assertRegex(str(payload["session_id"]), r"^[0-9a-fA-F-]{36}$")
+            transcript = str(payload["transcript_path"])
+            self.assertEqual(
+                Path(transcript),
+                claude_home / "projects" / "proj" / f"{payload['session_id']}.jsonl",
+            )
+            self.assertTrue(Path(transcript).exists())
+            self.assertIn("session_id_source=observed", log_text)
+            self.assertIn(f"transcript={transcript}", log_text)
 
     def test_next_uses_codex_default_selection_when_only_codex_is_available(
         self,

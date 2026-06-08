@@ -106,6 +106,7 @@ class RunResult:
     started_at: str = ""
     session_id: str | None = None
     session_id_source: str = "fallback:run_id"
+    transcript_path: str = ""
     agent_command_source: str = ""
     agent_selection_command_source: str = ""
     agent_default_policy_source: str = ""
@@ -173,6 +174,8 @@ class RunResult:
             payload["trailer_context"] = self.trailer_context
         if self.trailer_context_sources:
             payload["trailer_context_sources"] = self.trailer_context_sources
+        if self.transcript_path:
+            payload["transcript_path"] = self.transcript_path
         return payload
 
     def to_record(self) -> dict[str, object]:
@@ -481,6 +484,7 @@ class RunHistoryView:
     exit_code: int | None
     session_id: str
     session_id_source: str
+    transcript_path: str
     message: str
     agent_kind: str
     agent_prompt_dialect: str
@@ -524,6 +528,7 @@ class RunHistoryView:
             exit_code=record_exit_code(latest),
             session_id=latest_text(valid_records, "session_id") or run_id,
             session_id_source=latest_text(valid_records, "session_id_source"),
+            transcript_path=latest_text(valid_records, "transcript_path"),
             message=latest_text(valid_records, "message"),
             agent_kind=latest_text(valid_records, "agent_kind"),
             agent_prompt_dialect=latest_text(valid_records, "agent_prompt_dialect"),
@@ -576,6 +581,7 @@ class RunHistoryView:
             "exit_code": self.exit_code,
             "session_id": self.session_id,
             "session_id_source": self.session_id_source,
+            "transcript_path": self.transcript_path,
             "message": self.message,
             "agent_kind": self.agent_kind,
             "agent_prompt_dialect": self.agent_prompt_dialect,

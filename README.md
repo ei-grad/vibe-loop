@@ -171,10 +171,27 @@ allows, so completed runs do not overshoot `N`.
 
 `run-next` and `run-until-done` keep their result JSON on stdout; progress and
 mirrored agent stdout go to stderr, and full streams are captured in
-`.vibe-loop/runs/<run-id>.log`. Each result includes a `run_id`. If the worker
-emits a Codex-style `session id: ...` line, `session_id` stores that native id
-(`session_id_source` = `native:stdout`/`native:stderr`); otherwise it falls back
-to `run_id` (`fallback:run_id`).
+`.vibe-loop/runs/<run-id>.log`. Each result includes a `run_id`.
+
+#### Agent session transcripts
+
+For Claude workers the supervisor injects a known `--session-id <uuid>` into the
+worker command, so the run records the agent's real session id
+(`session_id_source` = `observed`) and a `transcript_path` pointing at the
+agent's own transcript (`$CLAUDE_HOME/projects/<encoded-cwd>/<uuid>.jsonl`,
+default `~/.claude`). The path is resolved by globbing for the unique session id
+after the run, so it is correct regardless of how Claude encodes the working
+directory. An operator can go straight from a `runs.jsonl` record (or
+`vibe-loop runs`) to the transcript file to see what the agent actually did.
+Injection is skipped when the command already pins `--session-id`.
+
+Codex `exec` has no equivalent flag to force or print a session id without
+switching stdout to `--json` (which would replace the streamed human-readable
+output the wrapper log and the selection/analysis text parsing rely on), so
+Codex worker runs keep `session_id_source = fallback:run_id` and no
+`transcript_path`. If a worker instead emits a `session id: ...` line on its
+output, that native id is captured with `session_id_source` =
+`native:stdout`/`native:stderr`.
 
 ### Worker-side commands
 
@@ -696,8 +713,9 @@ integration (owner task, run id, host, pid, start time), visible through
 
 **`runs.jsonl`** is an append-only stream of versioned run records: result
 records carry the `run_id`, `started_at`, resolved `session_id` and source, the
-agent command/selection sources, prompt dialect and skill reference sources, and
-the default agent policy source. Lifecycle records (`run_started`,
+agent `transcript_path` when one is resolved, the agent command/selection
+sources, prompt dialect and skill reference sources, and the default agent
+policy source. Lifecycle records (`run_started`,
 `agent_context_observed`, `run_state_transition`) expose the same anchor plus
 bounded trailer-ready context — task IDs for `Plan-Item`/`Run-Id`/`Session-Id`,
 agent kind, prompt dialect, and model provider/ID/reasoning effort when the agent
