@@ -42,11 +42,12 @@ instruction or session end.
    to catch problems faced during implementation. Address findings appropriately
    — update project instructions, or feed them into planning as new tasks.
 4. **Plan**: when the ready queue is shallow, invoke the `orchestrated-vibe-loop`
-   skill to analyze the task ledger, backlog, roadmap, and proposals and to plan
-   and decompose enough reviewed, ready tasks for workers to implement for a
-   couple of cycles. Run that planning/docs work in a worktree with independent
-   review before it merges to `main`, like any other work.
-5. **Maintain**: keep the task ledger and related status docs current.
+   skill to plan from the repository's own planning inputs — the configured task
+   source, design docs, roadmaps, issues, and TODOs — and to decompose enough
+   reviewed, ready tasks for workers to implement for a couple of cycles. Run
+   that planning/docs work in a worktree with independent review before it merges
+   to `main`, like any other work.
+5. **Maintain**: keep the task source and related status docs current.
 6. **Recover**: if the `run-until-done` process has exited, investigate from
    evidence, fix the concrete cause, and relaunch it.
 
