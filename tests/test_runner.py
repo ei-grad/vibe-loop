@@ -2536,6 +2536,50 @@ class TransientWorkerFailureTests(unittest.TestCase):
 
         self.assertIsNone(result)
 
+    def test_recover_unknown_run_defers_on_lock_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "run-1.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            runner._source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                raise LockBusy(repo / "lock", {"task_id": task.task_id})
+
+            runner.run_task = run_task
+            prior = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="unknown",
+                exit_code=0,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+            )
+            result = runner.recover_unknown_run(prior, attempt=1, max_attempts=3)
+            records = runner.run_store.read_records()
+
+        self.assertIsNone(result)
+        launched = [
+            record
+            for record in records
+            if record.get("record_type") == "task_recovery"
+            and record.get("phase") == "launched"
+        ]
+        self.assertEqual(len(launched), 1)
+        outcomes = [
+            record
+            for record in records
+            if record.get("record_type") == "task_recovery"
+            and record.get("phase") == "outcome"
+        ]
+        self.assertEqual(outcomes, [])
+
     def test_parallel_loop_recovers_unknown_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

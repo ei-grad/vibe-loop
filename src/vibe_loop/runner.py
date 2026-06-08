@@ -1601,6 +1601,13 @@ class VibeRunner:
                             "skipping"
                         )
                     if result.classification == "unknown":
+                        # Recovery runs synchronously in the supervisor thread,
+                        # by design: only this drain loop mutates results/
+                        # counters, so a continuation worker cannot race the
+                        # other in-flight workers (which never touch this
+                        # state). It does briefly serialize new-work scheduling
+                        # behind the recovery worker, which is acceptable for a
+                        # bounded recovery.
                         result = self.drive_unknown_recovery(
                             result,
                             attempts=recovery_attempts,
