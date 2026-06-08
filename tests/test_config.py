@@ -79,6 +79,94 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agent.prompt_dialect_source, "auto:claude")
         self.assertEqual(config.agent.skill_ref_prefix, "/")
 
+    def test_codex_only_path_resolves_read_only_analysis_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "codex")
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        self.assertEqual(
+            config.agent.analysis_command,
+            "codex exec --sandbox read-only {prompt}",
+        )
+        self.assertEqual(config.agent.analysis_command_source, "auto:codex")
+        self.assertEqual(
+            config.agent.require_analysis_command(),
+            "codex exec --sandbox read-only {prompt}",
+        )
+
+    def test_claude_only_path_resolves_read_only_analysis_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "claude")
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        self.assertEqual(
+            config.agent.analysis_command,
+            "claude -p --disallowedTools Edit Write NotebookEdit {prompt}",
+        )
+        self.assertEqual(config.agent.analysis_command_source, "auto:claude")
+
+    def test_explicit_analysis_command_is_used(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "codex")
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nanalysis_command = "reviewer --read-only {prompt}"\n',
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        self.assertEqual(config.agent.analysis_command, "reviewer --read-only {prompt}")
+        self.assertEqual(config.agent.analysis_command_source, "explicit")
+
+    def test_missing_cli_leaves_analysis_command_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        self.assertIsNone(config.agent.analysis_command)
+        self.assertEqual(
+            config.agent.analysis_command_source, "unresolved:no-supported-cli"
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "install codex or claude"):
+            config.agent.require_analysis_command()
+
+    def test_agent_to_json_reports_analysis_command_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "codex")
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+
+        payload = config.agent.to_json()
+        self.assertTrue(payload["analysis_command_configured"])
+        self.assertEqual(payload["analysis_command_source"], "auto:codex")
+
     def test_missing_agent_cli_leaves_defaults_unresolved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -415,6 +503,7 @@ class ConfigTests(unittest.TestCase):
             "summary_command",
             "troubleshoot_command",
             "planning_command",
+            "analysis_command",
             "autopilot",
         ):
             self.assertIn(key, GENERATED_TASK_PROFILE_FORBIDDEN_KEYS)

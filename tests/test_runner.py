@@ -20,6 +20,7 @@ from unittest.mock import patch
 import vibe_loop.runner as runner_module
 from vibe_loop.config import (
     AgentConfig,
+    AgentResolutionError,
     CompletionConfig,
     SpecDiagnosticsConfig,
     SupervisionConfig,
@@ -43,6 +44,7 @@ from vibe_loop.runner import (
     parse_worker_session_id,
     run_streaming_command,
     terminate_worker_process_group,
+    validate_analysis_prompt_delivery,
     validate_selected_task_batch,
     wait_with_reap_watchdog,
 )
@@ -2813,6 +2815,104 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(
             killed, [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)]
         )
+
+
+def write_analysis_stub(path: Path, *, stdout: str = "", exit_code: int = 0) -> None:
+    payload = stdout.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n")
+    path.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.stdout.write('{payload}')\n"
+        f"sys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+class AnalysisAgentTests(unittest.TestCase):
+    def test_validate_analysis_prompt_delivery_requires_prompt_field(self) -> None:
+        validate_analysis_prompt_delivery("reviewer --read-only {prompt}")
+        with self.assertRaisesRegex(AgentResolutionError, "must include .prompt."):
+            validate_analysis_prompt_delivery("reviewer --read-only")
+
+    def test_run_analysis_agent_parses_json_and_writes_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stub = repo / "analysis-stub"
+            write_analysis_stub(
+                stub,
+                stdout='thinking...\n{"decision": "keep", "reason": "active WIP"}\n',
+            )
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="worker",
+                        analysis_command=f"{stub} {{prompt}}",
+                    ),
+                )
+            )
+            output_path = repo / "decision.json"
+
+            payload = runner.run_analysis_agent("inspect worktrees", output_path)
+
+            self.assertEqual(payload, {"decision": "keep", "reason": "active WIP"})
+            self.assertTrue(output_path.exists())
+            self.assertEqual(
+                json.loads(output_path.read_text(encoding="utf-8")),
+                {"decision": "keep", "reason": "active WIP"},
+            )
+
+    def test_run_analysis_agent_returns_none_on_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stub = repo / "analysis-stub"
+            write_analysis_stub(stub, stdout='{"decision": "reap"}', exit_code=2)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="worker",
+                        analysis_command=f"{stub} {{prompt}}",
+                    ),
+                )
+            )
+            output_path = repo / "decision.json"
+
+            payload = runner.run_analysis_agent("inspect", output_path)
+
+            self.assertIsNone(payload)
+            self.assertFalse(output_path.exists())
+
+    def test_run_analysis_agent_returns_none_on_non_json_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stub = repo / "analysis-stub"
+            write_analysis_stub(stub, stdout="no structured decision here\n")
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="worker",
+                        analysis_command=f"{stub} {{prompt}}",
+                    ),
+                )
+            )
+            output_path = repo / "decision.json"
+
+            payload = runner.run_analysis_agent("inspect", output_path)
+
+            self.assertIsNone(payload)
+            self.assertFalse(output_path.exists())
+
+    def test_run_analysis_agent_requires_resolved_command(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            with self.assertRaises(AgentResolutionError):
+                runner.run_analysis_agent("inspect", repo / "decision.json")
 
 
 if __name__ == "__main__":

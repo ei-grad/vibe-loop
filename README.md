@@ -341,6 +341,10 @@ state_dir = ".vibe-loop"
 kind = "auto"
 command = "codex exec {prompt}"
 selection_command = "codex exec {prompt}"
+# analysis_command runs a read-only agent for autopilot decisions; the default is
+# read-only by construction (Codex read-only sandbox; Claude with Edit/Write/
+# NotebookEdit disallowed). Override only with another read-only invocation.
+# analysis_command = "codex exec --sandbox read-only {prompt}"
 forward_stderr = false   # agent stderr is log-only by default; set true to mirror it
 
 [task_source]
@@ -455,6 +459,18 @@ their environment; `selection_command` receives a `{prompt}` with the candidate
 list and recent run context. Single-task selection prints JSON with `task_id`;
 batch selection prints `task_ids`. If a task has traceability metadata,
 `agent.command` must include `{prompt}` — task-id-only templates fail fast.
+
+`agent.analysis_command` is a third template used by autopilot for read-only
+analysis and decision steps, distinct from the read-write worker. Its `auto`
+default is read-only by construction — Codex runs in a read-only sandbox
+(`codex exec --sandbox read-only {prompt}`) and Claude disallows
+`Edit`/`Write`/`NotebookEdit` while keeping `Read`/`Grep`/`Glob`
+(`claude -p --disallowedTools Edit Write NotebookEdit {prompt}`) so it can inspect
+work-in-progress without mutating the repository. It resolves through the same
+Codex-first detection as the other commands, must include `{prompt}`, returns a
+strict JSON decision parsed like `selection_command` output, and is never invoked
+by routine read-only status commands. Generated profiles can never introduce an
+`analysis_command`.
 
 ### Locks
 

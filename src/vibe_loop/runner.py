@@ -562,6 +562,44 @@ class VibeRunner:
             return None
         return next((task for task in candidates if task.task_id == task_id), None)
 
+    def run_analysis_agent(
+        self,
+        prompt: str,
+        output_path: Path,
+    ) -> dict[str, object] | None:
+        command_template = self.config.agent.require_analysis_command()
+        report_status(
+            "agent analysis command source: "
+            f"{self.config.agent.analysis_command_source}"
+        )
+        validate_analysis_prompt_delivery(command_template)
+        command_str = command_template.format(prompt=shell_quote(prompt))
+        cmd, use_shell = prepare_shell_command(command_str)
+        try:
+            result = retry_subprocess_run(
+                cmd,
+                cwd=self.config.repo,
+                shell=use_shell,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=900,
+                on_retry=_analysis_retry_callback,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        payload = selection_payload_from_output(result.stdout)
+        if not isinstance(payload, dict):
+            return None
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return payload
+
     def ask_agent_to_select_batch(
         self,
         candidates: list[Task],
@@ -2529,6 +2567,18 @@ def validate_worker_prompt_delivery(command_template: str, task: Task) -> None:
     )
 
 
+def validate_analysis_prompt_delivery(command_template: str) -> None:
+    if command_template_uses_field(command_template, "prompt"):
+        return
+    raise AgentResolutionError(
+        "agent.analysis_command must include {prompt}; otherwise the analysis "
+        "prompt cannot be delivered to the read-only agent. Set "
+        "agent.analysis_command to a prompt-mode template such as "
+        "`codex exec --sandbox read-only {prompt}` or "
+        "`claude -p --disallowedTools Edit Write NotebookEdit {prompt}`."
+    )
+
+
 def command_template_uses_field(command_template: str, field: str) -> bool:
     for (
         _literal_text,
@@ -3488,6 +3538,10 @@ def format_detected_agents(detected: AgentDetection) -> str:
 
 def _selection_retry_callback(attempt: int, delay: float, reason: str) -> None:
     report_status(f"agent selection retry {attempt} after {delay:.1f}s: {reason}")
+
+
+def _analysis_retry_callback(attempt: int, delay: float, reason: str) -> None:
+    report_status(f"agent analysis retry {attempt} after {delay:.1f}s: {reason}")
 
 
 LOG_TAIL_LINES_FOR_TRANSIENT_CHECK = 50

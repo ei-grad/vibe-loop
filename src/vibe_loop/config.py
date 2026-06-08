@@ -168,6 +168,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "summary_command",
         "troubleshoot_command",
         "planning_command",
+        "analysis_command",
     }
 )
 
@@ -184,10 +185,14 @@ AGENT_COMMAND_DEFAULTS = {
     "codex": {
         "command": "codex exec {prompt}",
         "selection_command": "codex exec {prompt}",
+        "analysis_command": "codex exec --sandbox read-only {prompt}",
     },
     "claude": {
         "command": "claude -p {prompt}",
         "selection_command": "claude -p {prompt}",
+        "analysis_command": (
+            "claude -p --disallowedTools Edit Write NotebookEdit {prompt}"
+        ),
     },
 }
 SUPPORTED_AGENT_CLIS = tuple(AGENT_COMMAND_DEFAULTS)
@@ -250,8 +255,10 @@ class AgentPromptDialectResolution:
 class AgentConfig:
     command: str | None = None
     selection_command: str | None = None
+    analysis_command: str | None = None
     command_source: str = "unresolved:no-supported-cli"
     selection_command_source: str = "unresolved:no-supported-cli"
+    analysis_command_source: str = "unresolved:no-supported-cli"
     detected: AgentDetection = dataclasses.field(default_factory=AgentDetection)
     forward_stderr: bool = False
     agent_kind: str = "auto"
@@ -281,6 +288,17 @@ class AgentConfig:
             unresolved_agent_command_message(
                 "agent.selection_command",
                 self.selection_command_source,
+                self.detected,
+            )
+        )
+
+    def require_analysis_command(self) -> str:
+        if self.analysis_command:
+            return self.analysis_command
+        raise AgentResolutionError(
+            unresolved_agent_command_message(
+                "agent.analysis_command",
+                self.analysis_command_source,
                 self.detected,
             )
         )
@@ -328,6 +346,8 @@ class AgentConfig:
             "command_source": self.command_source,
             "selection_command_configured": self.selection_command is not None,
             "selection_command_source": self.selection_command_source,
+            "analysis_command_configured": self.analysis_command is not None,
+            "analysis_command_source": self.analysis_command_source,
             "forward_stderr": self.forward_stderr,
             "agent_kind": self.agent_kind,
             "agent_kind_source": self.agent_kind_source,
@@ -740,6 +760,7 @@ def parse_agent(data: object) -> AgentConfig:
             raise ValueError("agent.kind and agent.skill_ref_prefix disagree")
     configured_command = optional_nonempty_string(table.get("command"))
     configured_selection = optional_nonempty_string(table.get("selection_command"))
+    configured_analysis = optional_nonempty_string(table.get("analysis_command"))
     command, command_source, executable_kind = resolve_agent_command(
         "command",
         configured_command,
@@ -749,6 +770,12 @@ def parse_agent(data: object) -> AgentConfig:
     selection_command, selection_command_source, _ = resolve_agent_command(
         "selection_command",
         configured_selection,
+        agent_kind,
+        detected,
+    )
+    analysis_command, analysis_command_source, _ = resolve_agent_command(
+        "analysis_command",
+        configured_analysis,
         agent_kind,
         detected,
     )
@@ -762,8 +789,10 @@ def parse_agent(data: object) -> AgentConfig:
     return AgentConfig(
         command=command,
         selection_command=selection_command,
+        analysis_command=analysis_command,
         command_source=command_source,
         selection_command_source=selection_command_source,
+        analysis_command_source=analysis_command_source,
         detected=detected,
         forward_stderr=optional_bool(
             table.get("forward_stderr"), False, "agent.forward_stderr"
