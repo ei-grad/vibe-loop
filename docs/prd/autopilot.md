@@ -120,8 +120,12 @@ worktree disposition reaps only orphaned, non-dirty, merged-or-disposable,
 non-live-claimed worktrees under the `PRD-AUT-010` guardrails while keeping all
 salvageable work-in-progress.
 
+Unknown-run recovery (`PRD-AUT-014`) does not breach this boundary: it launches
+a new continuation worker against the existing claimed branch/worktree and never
+deletes, resets, steals, merges, or mutates another worker's committed work.
+
 Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`, `AUTO-13`,
-`AUTO-14`.
+`AUTO-14`, `AUTO-21`.
 
 ## PRD-AUT-007 Multi-Project Shape
 
@@ -254,3 +258,82 @@ its declared evidence-gated guardrails.
 
 Related implementation IDs: `AUTO-12`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
 `AUTO-17`, `AUTO-18`, `AUTO-19`.
+
+## PRD-AUT-013 Observed Agent Session Id And Transcript Linkage
+
+A run record must let an operator find the agent's real session transcript.
+Today the worker is launched with `claude -p {prompt}` in default text mode,
+which never emits its session id, so `runs.jsonl` records
+`session_id_source: fallback:run_id` and only the wrapper-log path. The real
+agent session transcript (for Claude,
+`~/.claude/projects/.../<uuid>.jsonl`) is referenced nowhere, so what the agent
+actually did cannot be recovered from a run record.
+
+The worker, selection, and analysis invocations must surface the agent's real
+session id when the agent can provide one, and the run records must persist both
+that id and the resolved transcript path. For Claude this means launching with
+`claude -p --output-format json {prompt}` (parse the JSON envelope's
+`session_id`; this changes stdout from streamed text to a JSON envelope, so the
+selection/parse paths that currently scrape text must adapt) or passing
+`--session-id <uuid>` to force a known id. For Codex the analogous mechanism
+must be determined from the Codex CLI/docs (for example a `codex exec` session
+id or `--output-last-message`); if Codex genuinely surfaces no session id, that
+limitation must be documented rather than silently faked.
+
+Acceptance must cover: a real `session_id` recorded with
+`session_id_source: observed` (distinct from `fallback:run_id`) whenever the
+agent surfaces one; the resolved transcript file path recorded on the
+`run_started` and `run_result`/run context records; `fallback:run_id` retained
+only when the agent genuinely surfaces no session id; preserved
+streaming/progress behavior under the changed stdout format; and a documented
+path from a run record to the agent's transcript file. This contract is
+independent of recovery and may land on its own.
+
+Related implementation IDs: `AUTO-20`, `AUTO-21`.
+
+## PRD-AUT-014 Unknown-Run Recovery And Continuation
+
+When a worker run ends without a clear terminal report — classified `unknown`,
+or committed on its claimed branch but neither merged nor reported — the work is
+orphaned: the supervisor stops or re-attempts from scratch and the
+committed-but-unmerged-unreported work is left behind. The observed failure mode
+is a worker that did real work, committed to its branch, then *parked* on a
+billable external/authorization gate ("I'll continue when the monitor fires")
+and exited; because `claude -p` is one-shot, the process exit left the run
+`unknown`, never merged and never reported.
+
+`run-until-done` must deterministically launch a bounded continuation worker for
+such runs. The supervisor's deterministic control flow decides *when* to
+recover; the agent does the *work*. Recovery must launch a continuation
+read-write worker agent (the existing worker command path, not the read-only
+analysis agent of `PRD-AUT-009`) with a recovery prompt that conveys the task
+id, the prior `run_id`, the claimed branch and worktree (from the
+`workspace_claim` record), the prior agent transcript path (from
+`PRD-AUT-013`) and the wrapper log, and the instruction: the previous session
+ended `unknown`; investigate what went wrong, finish the work and/or emit a
+proper status (`completed`/`blocked`/`failed`); if blocked on an
+external/authorization gate, report `blocked` with the precise reason — do not
+park.
+
+Recovery must be bounded: cap recovery attempts per task by reusing or extending
+the existing `task_restart` counter/record so an `unknown → recover → unknown`
+cycle cannot loop forever; after the cap, leave a clear `blocked`/`failed`
+terminal record. Every recovery launch and outcome must be journaled
+append-only.
+
+This recovery stays inside the `PRD-AUT-006` non-destructive boundary: it
+launches a *new* worker against the existing claimed branch/worktree and never
+deletes, resets, steals, merges, or otherwise mutates another worker's
+committed work; it neither reclassifies live work nor force-removes workspaces.
+It depends on `PRD-AUT-013` because the recovery prompt must point the
+continuation worker at the prior agent transcript.
+
+Acceptance must cover: deterministic detection of `unknown` (and
+committed-but-unmerged-unreported) runs in `run-until-done`; launch of a
+read-write continuation worker with the recovery prompt context above; a
+per-task recovery attempt cap built on the `task_restart` counter; a clear
+terminal `blocked`/`failed` record once the cap is reached; append-only
+journaling of each recovery launch and outcome; and no destructive action on
+the claimed workspace.
+
+Related implementation IDs: `AUTO-21`.
