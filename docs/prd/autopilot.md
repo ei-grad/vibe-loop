@@ -289,7 +289,7 @@ streaming/progress behavior under the changed stdout format; and a documented
 path from a run record to the agent's transcript file. This contract is
 independent of recovery and may land on its own.
 
-Related implementation IDs: `AUTO-20`, `AUTO-21`.
+Related implementation IDs: `AUTO-20`.
 
 ## PRD-AUT-014 Unknown-Run Recovery And Continuation
 
