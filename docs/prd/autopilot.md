@@ -132,3 +132,107 @@ leakage in UI-ready payloads, no text scraping requirement, and no TUI/WebUI
 runtime dependencies in the first autopilot slice.
 
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-07`, `AUTO-08`.
+
+## PRD-AUT-009 Read-Only Analysis Agent
+
+Autopilot must be able to run a *read-only* analysis agent to make judgement
+calls that the supervisor cannot decide mechanically, while keeping product-code
+authorship limited to the existing read-write worker agent. The analysis agent
+inspects evidence and returns a structured decision; it must never author or
+mutate tracked project files.
+
+The architectural contract is: the agent decides, `vibe-loop` executes
+deterministically within safety guardrails, and every action is recorded to the
+append-only journal so the system stays monitorable and recoverable. Analysis
+and decision steps run a new read-only agent invocation distinct from the
+read-write worker.
+
+Acceptance must cover a per-agent-kind `analysis_command` default that is
+read-only by construction (Claude disallows `Edit`/`Write`/`NotebookEdit` while
+retaining `Read`/`Grep`/`Glob` so it can inspect work-in-progress to judge
+salvageability; Codex uses a read-only sandbox), an `AgentConfig.analysis_command`
+field with a `require_analysis_command()` accessor, parsing of the new config key,
+reuse of the generic key-based command resolution, inclusion of `analysis_command`
+in the generated-task-profile forbidden keys, and a runner entry point that
+launches the analysis agent and parses its strict structured (JSON) decision
+using the same prompt-delivery and shell-preparation validation as the existing
+selection path. The analysis agent must not be granted write/edit tools and must
+not be required for routine read-only status commands.
+
+Related implementation IDs: `AUTO-12`.
+
+## PRD-AUT-010 Native Worktree Disposition Health Step
+
+Autopilot cycles must include a native worktree-disposition health step so that
+orphaned worktrees are reaped without per-project configuration. The root cause
+of orphaned worktrees is that worktrees are created by the read-write worker and
+only cleaned on a `completed` report; a worker that dies first (for example agent
+quota exhaustion or a crash) leaves an orphaned worktree that nothing currently
+reaps.
+
+The step follows the agent-decides / code-executes / guardrails contract:
+`vibe-loop` gathers per-worktree evidence mechanically (path, branch,
+merged-into-main predicate, dirty state, the claiming run and whether its process
+is alive); passes that evidence to the read-only analysis agent
+(`PRD-AUT-009`); receives a per-worktree keep-or-reap decision *with a reason*;
+and executes `git worktree remove` plus `git branch -d` only within safety
+guardrails. There must be no blanket reap: salvageable unmerged or dirty
+work-in-progress must be kept.
+
+Acceptance must cover mechanical evidence gathering that reuses existing
+workers.py helpers (worktree enumeration, merged-branch predicate, dirty-state
+inspection, worker-view claim and liveness), an agent decision per worktree with
+a reason, and code-side execution that never force-removes dirty or unmerged
+worktrees, never removes a worktree claimed by a live run, and records each
+decision and each action to the append-only journal. Side effects (git removal,
+branch deletion) must be dependency-injected so tests do not run real git. The
+step runs unconditionally in the cycle and must not become a destructive default
+that violates the `PRD-AUT-006` non-destructive recovery boundary; it stays
+within the bounded, evidence-gated exception this contract defines.
+
+Related implementation IDs: `AUTO-13`, `AUTO-14`.
+
+## PRD-AUT-011 Full Cycle Action Logging
+
+Every autopilot cycle action, including native worktree disposition, must be
+recorded to the append-only journal so the loop is monitorable and recoverable.
+Each native maintenance behavior added to the cycle must register a typed record
+in the run store's known record-type set so existing readers do not silently drop
+it, and must append a concise action tag to the cycle's `actions` list while
+emitting any detailed payload as a separate dedicated record.
+
+Acceptance must cover a new `autopilot_worktree_reap` record type that mirrors
+the existing maintenance-command-result record shape (schema version, record
+type, occurrence time, repo, cycle id, and reaped/kept/errors/status payload),
+registration of every new native record type in the run store's autopilot and
+known record-type sets, tolerance of unknown record types on read, and a cycle
+action tag (for example `reaped_worktrees:N`) appended for the disposition step.
+
+Related implementation IDs: `AUTO-13`.
+
+## PRD-AUT-012 Configuration-Free Generic Cycle
+
+`vibe-loop autopilot run` must behave like the generic `autopilot` skill cycle
+without per-project configuration. Today the cycle is a supervisor plus
+stale-lock cleaner plus four empty maintenance-command slots (health, summary,
+troubleshoot, planning) that are all unset by default, so with no project config
+the loop never reaps worktrees, checks disk, summarizes what landed, detects
+recurring trouble, or plans new work.
+
+The native generic cycle must provide repository-agnostic defaults for these
+behaviors while preserving the non-destructive recovery boundary
+(`PRD-AUT-006`): native worktree disposition (`PRD-AUT-010`), native disk-health
+checks, a native "what landed" git-log summary, native troubleshoot detection
+derived from `runs.jsonl`, and native planning that invokes the configured agent
+rather than requiring a separate `planning_command` script. Project-authored
+`[autopilot]` maintenance commands (`PRD-AUT-005`) continue to override or
+augment the native behaviors; native behavior is the default, not a replacement
+for explicit configuration.
+
+Acceptance must cover each native behavior landing as an independently
+reviewable slice, every native action appearing in the append-only journal
+(`PRD-AUT-011`), and no native behavior performing destructive recovery outside
+its declared evidence-gated guardrails.
+
+Related implementation IDs: `AUTO-12`, `AUTO-13`, `AUTO-14`, `AUTO-15`,
+`AUTO-16`, `AUTO-17`, `AUTO-18`.
