@@ -176,7 +176,7 @@ using the same prompt-delivery and shell-preparation validation as the existing
 selection path. The analysis agent must not be granted write/edit tools and must
 not be required for routine read-only status commands.
 
-Related implementation IDs: `AUTO-12`.
+Related implementation IDs: `AUTO-12`, `AUTO-18`.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
