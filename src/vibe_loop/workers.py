@@ -1627,3 +1627,394 @@ def _lock_metadata_matches(lock: StaleLock) -> bool:
     if not isinstance(current_run_id, str):
         return True
     return current_run_id == lock.run_id
+
+
+WORKTREE_DISPOSITION_SCHEMA_VERSION = 1
+
+# Guardrail reason codes returned for a worktree that must be kept even if the
+# analysis agent asked to reap it. They implement the bounded, evidence-gated
+# worktree-disposition exception documented in PRD-AUT-006 / PRD-AUT-010.
+KEEP_PRIMARY_WORKTREE = "primary_worktree"
+KEEP_GIT_STATE_UNAVAILABLE = "git_state_unavailable"
+KEEP_LIVE_CLAIM = "live_claim"
+KEEP_DIRTY_WORKTREE = "dirty_worktree"
+KEEP_UNMERGED_WORKTREE = "unmerged_worktree"
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeDispositionEvidence:
+    """Mechanically gathered per-worktree evidence for a keep/reap decision.
+
+    Reuses the same git/worker helpers as the read-only status path so the
+    analysis agent and the executor judge worktrees from one consistent view:
+    ``parse_git_worktree_list`` (via ``build_workspace_git_context``) for
+    enumeration, ``merged_branch_targets`` for the merged predicate,
+    ``git_status_lines`` for dirty state, and ``build_worker_views`` plus
+    ``active_run_is_live`` for the claiming run and its liveness.
+    """
+
+    path: Path
+    branch: str
+    head_commit: str
+    is_primary: bool
+    merged: bool
+    merged_into: tuple[str, ...]
+    dirty: bool
+    dirty_summary: tuple[str, ...]
+    git_state_error: str
+    claiming_run_id: str
+    claiming_task_id: str
+    claim_state: str
+    claim_is_live: bool
+
+    @property
+    def keep_guardrails(self) -> tuple[str, ...]:
+        return worktree_keep_guardrails(self)
+
+    @property
+    def reapable(self) -> bool:
+        return not self.keep_guardrails
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schema_version": WORKTREE_DISPOSITION_SCHEMA_VERSION,
+            "path": str(self.path),
+            "branch": self.branch,
+            "head_commit": self.head_commit,
+            "is_primary": self.is_primary,
+            "merged": self.merged,
+            "merged_into": list(self.merged_into),
+            "dirty": self.dirty,
+            "dirty_summary": list(self.dirty_summary),
+            "git_state_error": self.git_state_error,
+            "claiming_run_id": self.claiming_run_id,
+            "claiming_task_id": self.claiming_task_id,
+            "claim_state": self.claim_state,
+            "claim_is_live": self.claim_is_live,
+            "keep_guardrails": list(self.keep_guardrails),
+            "reapable": self.reapable,
+        }
+
+
+def worktree_keep_guardrails(
+    evidence: WorktreeDispositionEvidence,
+) -> tuple[str, ...]:
+    """Guardrail reasons that force a worktree to be kept regardless of decision.
+
+    The executor enforces these independently of the agent so an erroneous or
+    stale ``reap`` decision can never remove the primary worktree, a worktree
+    whose git state is unreadable, a worktree claimed by a live run, or dirty /
+    unmerged work-in-progress.
+    """
+    reasons: list[str] = []
+    if evidence.is_primary:
+        reasons.append(KEEP_PRIMARY_WORKTREE)
+    if evidence.git_state_error:
+        reasons.append(KEEP_GIT_STATE_UNAVAILABLE)
+    if evidence.claim_is_live:
+        reasons.append(KEEP_LIVE_CLAIM)
+    if evidence.dirty:
+        reasons.append(KEEP_DIRTY_WORKTREE)
+    if not evidence.merged:
+        reasons.append(KEEP_UNMERGED_WORKTREE)
+    return tuple(reasons)
+
+
+def collect_worktree_disposition_evidence(
+    lock_manager: LockManager,
+    run_store: RunStore,
+    *,
+    repo: Path,
+    main_branch: str = "main",
+    current_host: str | None = None,
+    process_exists: ProcessExists | None = None,
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> list[WorktreeDispositionEvidence]:
+    """Enumerate every git worktree with merged/dirty/claim/liveness evidence."""
+    repo = repo.resolve()
+    context = build_workspace_git_context(
+        repo,
+        main_branch=main_branch,
+        ignored_dirty_paths=ignored_dirty_paths,
+    )
+    claims_by_path = worktree_claims_by_path(
+        lock_manager,
+        run_store,
+        repo=repo,
+        main_branch=main_branch,
+        current_host=current_host,
+        process_exists=process_exists,
+        ignored_dirty_paths=ignored_dirty_paths,
+    )
+    evidence: list[WorktreeDispositionEvidence] = []
+    for entry in context.worktrees:
+        path = entry.path
+        is_primary = path == repo
+        dirty, dirty_summary, git_state_error = worktree_dirty_state(
+            path,
+            context.ignored_dirty_paths,
+        )
+        merged_into: tuple[str, ...] = ()
+        if entry.branch and not is_primary:
+            merged_into = merged_branch_targets(repo, entry.branch, main_branch)
+        claim = claims_by_path.get(path)
+        evidence.append(
+            WorktreeDispositionEvidence(
+                path=path,
+                branch=entry.branch,
+                head_commit=entry.head,
+                is_primary=is_primary,
+                merged=bool(merged_into),
+                merged_into=merged_into,
+                dirty=dirty,
+                dirty_summary=dirty_summary,
+                git_state_error=git_state_error,
+                claiming_run_id=claim.run_id if claim is not None else "",
+                claiming_task_id=claim.task_id if claim is not None else "",
+                claim_state=claim.state if claim is not None else "",
+                claim_is_live=claim.is_live if claim is not None else False,
+            )
+        )
+    return evidence
+
+
+@dataclasses.dataclass(frozen=True)
+class _WorktreeClaim:
+    run_id: str
+    task_id: str
+    state: str
+    is_live: bool
+
+
+def worktree_claims_by_path(
+    lock_manager: LockManager,
+    run_store: RunStore,
+    *,
+    repo: Path,
+    main_branch: str = "main",
+    current_host: str | None = None,
+    process_exists: ProcessExists | None = None,
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> dict[Path, _WorktreeClaim]:
+    claims: dict[Path, _WorktreeClaim] = {}
+    for view in build_worker_views(
+        lock_manager,
+        run_store,
+        repo=repo,
+        main_branch=main_branch,
+        current_host=current_host,
+        process_exists=process_exists,
+        ignored_dirty_paths=ignored_dirty_paths,
+    ):
+        claim = view.active.workspace
+        if claim is None:
+            continue
+        claims[claim.worktree.resolve()] = _WorktreeClaim(
+            run_id=view.active.run_id,
+            task_id=view.active.task_id,
+            state=view.state,
+            is_live=active_run_is_live(
+                view.active,
+                current_host=current_host,
+                process_exists=process_exists,
+            ),
+        )
+    return claims
+
+
+def worktree_dirty_state(
+    path: Path,
+    ignored_dirty_paths: Iterable[Path],
+) -> tuple[bool, tuple[str, ...], str]:
+    if not path.exists() or not path.is_dir():
+        return False, (), "claimed worktree path does not exist"
+    status_text, status_error = git_optional_text(
+        path,
+        *git_status_args(path, ignored_dirty_paths),
+    )
+    if status_error:
+        return False, (), status_error
+    dirty_summary = tuple(
+        line for line in status_text.splitlines()[:DIRTY_SUMMARY_LIMIT] if line
+    )
+    return bool(dirty_summary), dirty_summary, ""
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeDispositionDecision:
+    worktree: Path
+    action: str
+    reason: str = ""
+
+    @classmethod
+    def from_json(cls, payload: object) -> WorktreeDispositionDecision | None:
+        if not isinstance(payload, dict):
+            return None
+        worktree = optional_path(payload.get("worktree")) or optional_path(
+            payload.get("path")
+        )
+        action = optional_string(payload.get("action"))
+        if worktree is None or action not in {"reap", "keep"}:
+            return None
+        return cls(
+            worktree=worktree.resolve(),
+            action=action,
+            reason=optional_string(payload.get("reason")) or "",
+        )
+
+
+def parse_worktree_disposition_decisions(
+    payload: object,
+) -> list[WorktreeDispositionDecision]:
+    if isinstance(payload, dict):
+        payload = payload.get("decisions")
+    if not isinstance(payload, list):
+        return []
+    decisions: list[WorktreeDispositionDecision] = []
+    for item in payload:
+        decision = WorktreeDispositionDecision.from_json(item)
+        if decision is not None:
+            decisions.append(decision)
+    return decisions
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeReapAction:
+    kind: str
+    target: str
+    ok: bool
+    error: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "target": self.target,
+            "ok": self.ok,
+            "error": self.error,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeDispositionOutcome:
+    worktree: Path
+    branch: str
+    requested: str
+    applied: str
+    reason: str
+    guardrails: tuple[str, ...]
+    actions: tuple[WorktreeReapAction, ...] = ()
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "schema_version": WORKTREE_DISPOSITION_SCHEMA_VERSION,
+            "worktree": str(self.worktree),
+            "branch": self.branch,
+            "requested": self.requested,
+            "applied": self.applied,
+            "reason": self.reason,
+            "guardrails": list(self.guardrails),
+            "actions": [action.to_json() for action in self.actions],
+        }
+
+
+# Side effects are dependency-injected so tests never run real git. AUTO-14
+# wires the real ``git_worktree_remove`` / ``git_branch_delete`` wrappers below.
+WorktreeRemover = Callable[[Path], str]
+BranchDeleter = Callable[[str], str]
+
+
+def execute_worktree_disposition(
+    evidence: Iterable[WorktreeDispositionEvidence],
+    decisions: Iterable[WorktreeDispositionDecision],
+    *,
+    remove_worktree: WorktreeRemover,
+    delete_branch: BranchDeleter,
+) -> list[WorktreeDispositionOutcome]:
+    """Apply per-worktree keep/reap decisions within the disposition guardrails.
+
+    A ``reap`` decision is honored only when no keep-guardrail applies; otherwise
+    the worktree is refused and kept. Per-decision and per-action outcomes are
+    returned for journaling. Side effects are injected so tests never run git.
+    """
+    decision_by_path = {decision.worktree.resolve(): decision for decision in decisions}
+    outcomes: list[WorktreeDispositionOutcome] = []
+    for item in evidence:
+        decision = decision_by_path.get(item.path.resolve())
+        guardrails = item.keep_guardrails
+        requested = decision.action if decision is not None else "none"
+        reason = decision.reason if decision is not None else ""
+        if requested != "reap":
+            outcomes.append(
+                WorktreeDispositionOutcome(
+                    worktree=item.path,
+                    branch=item.branch,
+                    requested=requested,
+                    applied="kept",
+                    reason=reason,
+                    guardrails=guardrails,
+                )
+            )
+            continue
+        if guardrails:
+            outcomes.append(
+                WorktreeDispositionOutcome(
+                    worktree=item.path,
+                    branch=item.branch,
+                    requested=requested,
+                    applied="refused",
+                    reason=reason,
+                    guardrails=guardrails,
+                )
+            )
+            continue
+        actions: list[WorktreeReapAction] = []
+        remove_error = remove_worktree(item.path)
+        actions.append(
+            WorktreeReapAction(
+                kind="worktree_remove",
+                target=str(item.path),
+                ok=not remove_error,
+                error=remove_error,
+            )
+        )
+        if not remove_error and item.branch:
+            delete_error = delete_branch(item.branch)
+            actions.append(
+                WorktreeReapAction(
+                    kind="branch_delete",
+                    target=item.branch,
+                    ok=not delete_error,
+                    error=delete_error,
+                )
+            )
+        applied = "reaped" if all(action.ok for action in actions) else "failed"
+        outcomes.append(
+            WorktreeDispositionOutcome(
+                worktree=item.path,
+                branch=item.branch,
+                requested=requested,
+                applied=applied,
+                reason=reason,
+                guardrails=guardrails,
+                actions=tuple(actions),
+            )
+        )
+    return outcomes
+
+
+def git_worktree_remove(repo: Path, worktree: Path) -> str:
+    result = run_git_result(repo, "worktree", "remove", str(worktree))
+    if result is None:
+        return "git could not be executed"
+    if result.returncode != 0:
+        return git_error_text(result)
+    return ""
+
+
+def git_branch_delete(repo: Path, branch: str) -> str:
+    result = run_git_result(repo, "branch", "-d", branch)
+    if result is None:
+        return "git could not be executed"
+    if result.returncode != 0:
+        return git_error_text(result)
+    return ""

@@ -24,15 +24,25 @@ from vibe_loop.runs import (
     WorkerReport,
 )
 from vibe_loop.workers import (
+    KEEP_DIRTY_WORKTREE,
+    KEEP_GIT_STATE_UNAVAILABLE,
+    KEEP_LIVE_CLAIM,
+    KEEP_PRIMARY_WORKTREE,
+    KEEP_UNMERGED_WORKTREE,
     ActiveRunState,
     StaleLock,
     WorkspaceClaim,
+    WorktreeDispositionDecision,
+    WorktreeDispositionEvidence,
     build_worker_views,
     classify_process,
     clean_stale_locks,
     collect_stale_locks,
+    collect_worktree_disposition_evidence,
+    execute_worktree_disposition,
     load_active_run_states,
     parse_git_worktree_list,
+    parse_worktree_disposition_decisions,
 )
 
 
@@ -1715,6 +1725,470 @@ def write_command_lock_adapter(path: Path) -> None:
         "    raise SystemExit(f'unsupported operation: {operation}')\n",
         encoding="utf-8",
     )
+
+
+def make_disposition_evidence(
+    path: Path,
+    *,
+    branch: str = "worker/TASK",
+    head_commit: str = "deadbee",
+    is_primary: bool = False,
+    merged: bool = True,
+    merged_into: tuple[str, ...] = ("main",),
+    dirty: bool = False,
+    dirty_summary: tuple[str, ...] = (),
+    git_state_error: str = "",
+    claiming_run_id: str = "",
+    claiming_task_id: str = "",
+    claim_state: str = "",
+    claim_is_live: bool = False,
+) -> WorktreeDispositionEvidence:
+    return WorktreeDispositionEvidence(
+        path=path,
+        branch=branch,
+        head_commit=head_commit,
+        is_primary=is_primary,
+        merged=merged,
+        merged_into=merged_into if merged else (),
+        dirty=dirty,
+        dirty_summary=dirty_summary,
+        git_state_error=git_state_error,
+        claiming_run_id=claiming_run_id,
+        claiming_task_id=claiming_task_id,
+        claim_state=claim_state,
+        claim_is_live=claim_is_live,
+    )
+
+
+class WorktreeDispositionEvidenceTests(unittest.TestCase):
+    def test_evidence_collects_merged_dirty_claim_and_liveness_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+
+            merged_tree = base / "merged"
+            git(
+                repo, "worktree", "add", "-b", "worker/MERGED", str(merged_tree), "main"
+            )
+            (merged_tree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(merged_tree, "add", "feature.txt")
+            git(merged_tree, "commit", "-m", "merged work")
+            git(repo, "merge", "--ff-only", "worker/MERGED")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="MERGED",
+                run_id="run-merged",
+                branch="worker/MERGED",
+                worktree=merged_tree,
+            )
+
+            wip_tree = base / "wip"
+            git(repo, "worktree", "add", "-b", "worker/WIP", str(wip_tree), "main")
+            (wip_tree / "draft.txt").write_text("in progress\n", encoding="utf-8")
+            git(wip_tree, "add", "draft.txt")
+            git(wip_tree, "commit", "-m", "wip work")
+            (wip_tree / "dirty.txt").write_text("uncommitted\n", encoding="utf-8")
+
+            evidence = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: pid == 100,
+            )
+
+        by_path = {item.path: item for item in evidence}
+        self.assertEqual(len(evidence), 3)
+
+        primary = by_path[repo.resolve()]
+        self.assertTrue(primary.is_primary)
+
+        merged = by_path[merged_tree.resolve()]
+        self.assertFalse(merged.is_primary)
+        self.assertTrue(merged.merged)
+        self.assertIn("main", merged.merged_into)
+        self.assertFalse(merged.dirty)
+        self.assertEqual(merged.claiming_run_id, "run-merged")
+        self.assertEqual(merged.claiming_task_id, "MERGED")
+        self.assertTrue(merged.claim_is_live)
+        self.assertFalse(merged.reapable)
+        self.assertIn(KEEP_LIVE_CLAIM, merged.keep_guardrails)
+
+        wip = by_path[wip_tree.resolve()]
+        self.assertFalse(wip.merged)
+        self.assertTrue(wip.dirty)
+        self.assertEqual(wip.claiming_run_id, "")
+        self.assertFalse(wip.claim_is_live)
+        self.assertFalse(wip.reapable)
+        self.assertIn(KEEP_DIRTY_WORKTREE, wip.keep_guardrails)
+        self.assertIn(KEEP_UNMERGED_WORKTREE, wip.keep_guardrails)
+
+    def test_evidence_marks_dead_claim_as_not_live(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+
+            orphan = base / "orphan"
+            git(repo, "worktree", "add", "-b", "worker/ORPHAN", str(orphan), "main")
+            (orphan / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(orphan, "add", "feature.txt")
+            git(orphan, "commit", "-m", "orphan work")
+            git(repo, "merge", "--ff-only", "worker/ORPHAN")
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="worker/ORPHAN",
+                worktree=orphan,
+            )
+
+            evidence = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        by_path = {item.path: item for item in evidence}
+        orphan_evidence = by_path[orphan.resolve()]
+        self.assertEqual(orphan_evidence.claiming_run_id, "run-orphan")
+        self.assertFalse(orphan_evidence.claim_is_live)
+        self.assertTrue(orphan_evidence.reapable)
+
+
+class FakeWorktreeSideEffects:
+    def __init__(self, *, remove_error: str = "", delete_error: str = "") -> None:
+        self.remove_error = remove_error
+        self.delete_error = delete_error
+        self.removed: list[Path] = []
+        self.deleted: list[str] = []
+
+    def remove_worktree(self, worktree: Path) -> str:
+        self.removed.append(worktree)
+        return self.remove_error
+
+    def delete_branch(self, branch: str) -> str:
+        self.deleted.append(branch)
+        return self.delete_error
+
+
+class WorktreeDispositionExecuteTests(unittest.TestCase):
+    def test_reaps_orphaned_merged_clean_worktree(self) -> None:
+        evidence = [
+            make_disposition_evidence(Path("/tmp/orphan"), branch="worker/ORPHAN")
+        ]
+        decisions = [
+            WorktreeDispositionDecision(
+                worktree=Path("/tmp/orphan"),
+                action="reap",
+                reason="worker process missing and branch merged",
+            )
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0].applied, "reaped")
+        self.assertEqual(outcomes[0].requested, "reap")
+        self.assertEqual(effects.removed, [Path("/tmp/orphan")])
+        self.assertEqual(effects.deleted, ["worker/ORPHAN"])
+        kinds = [action.kind for action in outcomes[0].actions]
+        self.assertEqual(kinds, ["worktree_remove", "branch_delete"])
+        self.assertTrue(all(action.ok for action in outcomes[0].actions))
+
+    def test_refuses_to_reap_dirty_worktree(self) -> None:
+        evidence = [
+            make_disposition_evidence(
+                Path("/tmp/dirty"),
+                dirty=True,
+                dirty_summary=(" M src/example.py",),
+            )
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/dirty"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_DIRTY_WORKTREE, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+        self.assertEqual(effects.deleted, [])
+
+    def test_refuses_to_reap_unmerged_worktree(self) -> None:
+        evidence = [make_disposition_evidence(Path("/tmp/wip"), merged=False)]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/wip"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_UNMERGED_WORKTREE, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+
+    def test_refuses_to_reap_live_claimed_worktree(self) -> None:
+        evidence = [
+            make_disposition_evidence(
+                Path("/tmp/live"),
+                claiming_run_id="run-live",
+                claim_state="running",
+                claim_is_live=True,
+            )
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/live"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_LIVE_CLAIM, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+
+    def test_refuses_to_reap_primary_worktree(self) -> None:
+        evidence = [
+            make_disposition_evidence(
+                Path("/tmp/repo"),
+                branch="main",
+                is_primary=True,
+            )
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/repo"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_PRIMARY_WORKTREE, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+
+    def test_keep_decision_and_missing_decision_keep_worktree(self) -> None:
+        evidence = [
+            make_disposition_evidence(Path("/tmp/keep")),
+            make_disposition_evidence(Path("/tmp/no-decision")),
+        ]
+        decisions = [
+            WorktreeDispositionDecision(
+                worktree=Path("/tmp/keep"),
+                action="keep",
+                reason="agent chose to keep",
+            )
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        by_path = {outcome.worktree: outcome for outcome in outcomes}
+        self.assertEqual(by_path[Path("/tmp/keep")].applied, "kept")
+        self.assertEqual(by_path[Path("/tmp/keep")].requested, "keep")
+        self.assertEqual(by_path[Path("/tmp/no-decision")].applied, "kept")
+        self.assertEqual(by_path[Path("/tmp/no-decision")].requested, "none")
+        self.assertEqual(effects.removed, [])
+
+    def test_records_failed_reap_when_side_effect_errors(self) -> None:
+        evidence = [
+            make_disposition_evidence(Path("/tmp/orphan"), branch="worker/ORPHAN")
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/orphan"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects(remove_error="worktree is locked")
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "failed")
+        self.assertEqual(len(outcomes[0].actions), 1)
+        self.assertFalse(outcomes[0].actions[0].ok)
+        self.assertEqual(outcomes[0].actions[0].error, "worktree is locked")
+        self.assertEqual(effects.deleted, [])
+
+    def test_refuses_to_reap_git_unreadable_worktree(self) -> None:
+        evidence = [
+            make_disposition_evidence(
+                Path("/tmp/unreadable"),
+                git_state_error="claimed worktree path does not exist",
+            )
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/unreadable"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_GIT_STATE_UNAVAILABLE, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+
+    def test_records_failed_reap_when_branch_delete_errors(self) -> None:
+        evidence = [
+            make_disposition_evidence(Path("/tmp/orphan"), branch="worker/ORPHAN")
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/orphan"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects(delete_error="branch not fully merged")
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "failed")
+        self.assertEqual(effects.removed, [Path("/tmp/orphan")])
+        self.assertEqual(effects.deleted, ["worker/ORPHAN"])
+        kinds = [action.kind for action in outcomes[0].actions]
+        self.assertEqual(kinds, ["worktree_remove", "branch_delete"])
+        self.assertTrue(outcomes[0].actions[0].ok)
+        self.assertFalse(outcomes[0].actions[1].ok)
+        self.assertEqual(outcomes[0].actions[1].error, "branch not fully merged")
+
+    def test_outcome_round_trips_through_json(self) -> None:
+        evidence = [
+            make_disposition_evidence(Path("/tmp/orphan"), branch="worker/ORPHAN")
+        ]
+        decisions = [
+            WorktreeDispositionDecision(
+                worktree=Path("/tmp/orphan"), action="reap", reason="orphaned"
+            )
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        payload = json.loads(json.dumps(outcomes[0].to_json()))
+        self.assertEqual(payload["worktree"], "/tmp/orphan")
+        self.assertEqual(payload["branch"], "worker/ORPHAN")
+        self.assertEqual(payload["applied"], "reaped")
+        self.assertEqual(payload["reason"], "orphaned")
+        self.assertEqual(
+            [action["kind"] for action in payload["actions"]],
+            ["worktree_remove", "branch_delete"],
+        )
+
+    def test_evidence_serializes_guardrails_and_reapable_to_json(self) -> None:
+        reapable = make_disposition_evidence(
+            Path("/tmp/orphan"), branch="worker/ORPHAN"
+        )
+        kept = make_disposition_evidence(
+            Path("/tmp/wip"),
+            merged=False,
+            dirty=True,
+            dirty_summary=(" M src/example.py",),
+        )
+
+        reapable_payload = json.loads(json.dumps(reapable.to_json()))
+        kept_payload = json.loads(json.dumps(kept.to_json()))
+
+        self.assertEqual(reapable_payload["path"], "/tmp/orphan")
+        self.assertEqual(reapable_payload["keep_guardrails"], [])
+        self.assertTrue(reapable_payload["reapable"])
+        self.assertIn(KEEP_DIRTY_WORKTREE, kept_payload["keep_guardrails"])
+        self.assertIn(KEEP_UNMERGED_WORKTREE, kept_payload["keep_guardrails"])
+        self.assertFalse(kept_payload["reapable"])
+
+
+class WorktreeDispositionDecisionParseTests(unittest.TestCase):
+    def test_parses_decisions_list_and_skips_invalid_entries(self) -> None:
+        decisions = parse_worktree_disposition_decisions(
+            {
+                "decisions": [
+                    {
+                        "worktree": "/tmp/orphan",
+                        "action": "reap",
+                        "reason": "orphaned",
+                    },
+                    {"path": "/tmp/keep", "action": "keep"},
+                    {"worktree": "/tmp/bad", "action": "delete"},
+                    {"action": "reap"},
+                    "not-a-dict",
+                ]
+            }
+        )
+
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(decisions[0].worktree, Path("/tmp/orphan").resolve())
+        self.assertEqual(decisions[0].action, "reap")
+        self.assertEqual(decisions[0].reason, "orphaned")
+        self.assertEqual(decisions[1].worktree, Path("/tmp/keep").resolve())
+        self.assertEqual(decisions[1].action, "keep")
+
+    def test_parses_bare_list_payload(self) -> None:
+        decisions = parse_worktree_disposition_decisions(
+            [{"worktree": "/tmp/orphan", "action": "reap"}]
+        )
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0].action, "reap")
+
+    def test_returns_empty_for_unexpected_payload(self) -> None:
+        self.assertEqual(parse_worktree_disposition_decisions(None), [])
+        self.assertEqual(parse_worktree_disposition_decisions("nope"), [])
 
 
 if __name__ == "__main__":
