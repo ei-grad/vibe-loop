@@ -47,6 +47,8 @@ from vibe_loop.runner import (
     parse_selected_task_id,
     parse_selected_task_ids,
     parse_worker_session_id,
+    RecoveryContext,
+    build_recovery_prompt_section,
     predicted_claude_transcript,
     resolve_claude_home,
     resolve_claude_transcript,
@@ -2227,6 +2229,371 @@ class TransientWorkerFailureTests(unittest.TestCase):
 
         self.assertEqual([result.restart_count for result in first], [0, 1])
         self.assertEqual([result.restart_count for result in second], [0, 1])
+
+    def test_build_recovery_prompt_section_includes_claimed_workspace(self) -> None:
+        recovery = RecoveryContext(
+            task_id="TASK-01",
+            prior_run_id="run-1",
+            prior_classification="unknown",
+            branch="auto-01-branch",
+            worktree="/tmp/auto-01",
+            head_commit="abc123",
+            transcript_path="/tmp/transcript.jsonl",
+            wrapper_log="/tmp/run-1.log",
+            attempt=2,
+            max_attempts=3,
+            workspace_claimed=True,
+        )
+
+        section = build_recovery_prompt_section(recovery)
+
+        self.assertIn("Unknown-Run Recovery", section)
+        self.assertIn("TASK-01", section)
+        self.assertIn("run-1", section)
+        self.assertIn("auto-01-branch", section)
+        self.assertIn("/tmp/auto-01", section)
+        self.assertIn("/tmp/transcript.jsonl", section)
+        self.assertIn("/tmp/run-1.log", section)
+        self.assertIn("attempt 2 of 3", section)
+        self.assertIn("do NOT park", section)
+
+    def test_build_recovery_prompt_section_notes_missing_claim(self) -> None:
+        recovery = RecoveryContext(
+            task_id="TASK-01",
+            prior_run_id="run-1",
+            prior_classification="unknown",
+            branch="",
+            worktree="",
+            head_commit="",
+            transcript_path="",
+            wrapper_log="/tmp/run-1.log",
+            attempt=1,
+            max_attempts=3,
+            workspace_claimed=False,
+        )
+
+        section = build_recovery_prompt_section(recovery)
+
+        self.assertIn("No `workspace_claim` record", section)
+        self.assertIn("transcript: not captured", section)
+
+    def test_serial_loop_recovers_unknown_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "run.log"
+            log_path.write_text("worker parked on external gate\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            calls: list[RecoveryContext | None] = []
+            call_count = 0
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                nonlocal call_count
+                call_count += 1
+                calls.append(recovery)
+                if recovery is None:
+                    return RunResult(
+                        run_id="run-1",
+                        task_id=task.task_id,
+                        classification="unknown",
+                        exit_code=0,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-2",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+            results = runner.run_until_done_serial()
+            records = runner.run_store.read_records()
+
+        self.assertEqual(call_count, 2)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[-1].classification, "completed")
+        self.assertIsNone(calls[0])
+        self.assertIsNotNone(calls[1])
+        assert calls[1] is not None
+        self.assertEqual(calls[1].prior_run_id, "run-1")
+        self.assertEqual(calls[1].attempt, 1)
+        recovery_records = [
+            record for record in records if record.get("record_type") == "task_recovery"
+        ]
+        phases = [record["phase"] for record in recovery_records]
+        self.assertEqual(phases, ["launched", "outcome"])
+        self.assertEqual(recovery_records[1]["outcome"], "completed")
+        restart_records = [
+            record
+            for record in records
+            if record.get("record_type") == "task_restart"
+            and record.get("reason") == "unknown_run_recovery"
+        ]
+        self.assertEqual(len(restart_records), 1)
+
+    def test_serial_loop_recovery_budget_exhausted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(max_restarts=2, cooldown_seconds=0),
+                )
+            )
+            log_path = repo / "run.log"
+            log_path.write_text("still parked\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            recovery_calls = 0
+            run_count = 0
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                nonlocal recovery_calls, run_count
+                run_count += 1
+                if recovery is not None:
+                    recovery_calls += 1
+                return RunResult(
+                    run_id=f"run-{run_count}",
+                    task_id=task.task_id,
+                    classification="unknown",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+            results = runner.run_until_done_serial(continue_on_failure=True)
+            records = runner.run_store.read_records()
+
+        self.assertEqual(recovery_calls, 2)
+        self.assertEqual(results[-1].classification, "failed")
+        self.assertEqual(
+            results[-1].classification_source,
+            "recovery_budget_exhausted",
+        )
+        launched = [
+            record
+            for record in records
+            if record.get("record_type") == "task_recovery"
+            and record.get("phase") == "launched"
+        ]
+        self.assertEqual(len(launched), 2)
+        exhausted = [
+            record
+            for record in records
+            if record.get("record_type") == "task_restart"
+            and record.get("reason") == "recovery_budget_exhausted"
+        ]
+        self.assertEqual(len(exhausted), 1)
+        self.assertTrue(exhausted[0]["exhausted"])
+
+    def test_serial_loop_recovery_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(recover_unknown_runs=False),
+                )
+            )
+            log_path = repo / "run.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            call_count = 0
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                nonlocal call_count
+                call_count += 1
+                return RunResult(
+                    run_id="run-1",
+                    task_id=task.task_id,
+                    classification="unknown",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="aaa",
+                )
+
+            runner.run_task = run_task
+            results = runner.run_until_done_serial(continue_on_failure=True)
+            records = runner.run_store.read_records()
+
+        self.assertEqual(call_count, 1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].classification, "unknown")
+        self.assertFalse(
+            any(record.get("record_type") == "task_recovery" for record in records)
+        )
+
+    def test_recover_unknown_run_carries_workspace_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "run-1.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            runner.run_store.append_record(
+                {
+                    "record_type": "workspace_claim",
+                    "event_type": "workspace_claimed",
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "auto-01-branch",
+                    "worktree": "/tmp/auto-01",
+                    "head_commit": "deadbeef",
+                }
+            )
+            captured: list[RecoveryContext | None] = []
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                captured.append(recovery)
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-2",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+            prior = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="unknown",
+                exit_code=0,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+                transcript_path="/tmp/transcript.jsonl",
+            )
+            result = runner.recover_unknown_run(prior, attempt=1, max_attempts=3)
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.classification, "completed")
+        self.assertEqual(len(captured), 1)
+        recovery = captured[0]
+        assert recovery is not None
+        self.assertTrue(recovery.workspace_claimed)
+        self.assertEqual(recovery.branch, "auto-01-branch")
+        self.assertEqual(recovery.worktree, "/tmp/auto-01")
+        self.assertEqual(recovery.head_commit, "deadbeef")
+        self.assertEqual(recovery.transcript_path, "/tmp/transcript.jsonl")
+        self.assertEqual(recovery.wrapper_log, str(log_path))
+
+    def test_recover_unknown_run_skips_when_task_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "run-1.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            runner._source = MutableTaskSource([])
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                raise AssertionError("run_task should not be called")
+
+            runner.run_task = run_task
+            prior = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="unknown",
+                exit_code=0,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+            )
+            result = runner.recover_unknown_run(prior, attempt=1, max_attempts=3)
+
+        self.assertIsNone(result)
+
+    def test_parallel_loop_recovers_unknown_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(cooldown_seconds=0),
+                )
+            )
+            log_path = repo / "run.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            call_lock = threading.Lock()
+            recovery_calls = 0
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                nonlocal recovery_calls
+                with call_lock:
+                    if recovery is not None:
+                        recovery_calls += 1
+                        is_recovery = True
+                    else:
+                        is_recovery = False
+                if not is_recovery:
+                    return RunResult(
+                        run_id="run-1",
+                        task_id=task.task_id,
+                        classification="unknown",
+                        exit_code=0,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-2",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+            results = runner.run_until_done_parallel(
+                ask_agent=False,
+                max_slices=0,
+                continue_on_failure=False,
+                jobs=1,
+            )
+
+        self.assertEqual(recovery_calls, 1)
+        self.assertEqual(results[-1].classification, "completed")
 
     def test_parallel_loop_retries_transient_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

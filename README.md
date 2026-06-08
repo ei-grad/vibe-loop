@@ -196,6 +196,33 @@ Codex worker runs keep `session_id_source = fallback:run_id` and no
 output, that native id is captured with `session_id_source` =
 `native:stdout`/`native:stderr`.
 
+#### Unknown-run recovery
+
+A worker that does real work, commits to its claimed branch, then exits without
+filing a clear terminal report — for example a one-shot `claude -p` that parks
+on a billable external/authorization gate and quits — leaves the run `unknown`:
+never merged, never reported. Rather than stop or re-attempt the task from
+scratch (which orphans the committed-but-unmerged work), `run-until-done`
+deterministically launches a bounded continuation worker for `unknown` runs.
+
+Recovery uses the normal read-write worker command path (not the read-only
+analysis agent of `--ask-agent`). The continuation worker receives a recovery
+prompt carrying the task id, the prior `run_id`, the claimed branch and worktree
+(from the `workspace_claim` record), the prior agent transcript path and wrapper
+log, and the instruction to investigate, finish the work and/or emit a proper
+status, and report `blocked` with a precise reason instead of parking again. It
+builds on the existing claimed branch/worktree and never deletes, resets,
+steals, or merges another worker's committed work.
+
+Recovery is bounded by the same per-task budget as transient restarts
+(`supervision.max_restarts`): each attempt is counted through the `task_restart`
+record, and once the budget is exhausted the run is left with a terminal
+`failed` record (`classification_source = recovery_budget_exhausted`) so an
+`unknown → recover → unknown` cycle cannot loop. Every recovery launch and its
+outcome are journaled append-only as `task_recovery` records in
+`.vibe-loop/runs.jsonl`. Set `supervision.recover_unknown_runs = false` to
+disable recovery and have the supervisor stop on `unknown` as before.
+
 ### Worker-side commands
 
 Workers can report status, claim a workspace, and serialize final integration
@@ -390,6 +417,7 @@ commands = [
 [supervision]
 max_restarts = 3
 cooldown_seconds = 30.0
+recover_unknown_runs = true   # set false to stop on `unknown` instead of launching a continuation worker
 
 [locks]
 type = "directory"

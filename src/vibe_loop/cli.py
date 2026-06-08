@@ -91,6 +91,7 @@ from vibe_loop.runs import (
     RunLifecycleEvent,
     RunResult,
     RunStore,
+    TASK_RECOVERY_RECORD_TYPE,
     TASK_RESTART_RECORD_TYPE,
     WorkerReport,
     WORKER_REPORT_STATUSES,
@@ -2400,6 +2401,10 @@ def render_run_inspection(inspection) -> str:
                     status = record.get("reason") or "restart_budget_exhausted"
                 else:
                     status = "restart_scheduled"
+            elif record_type == TASK_RECOVERY_RECORD_TYPE:
+                phase = record.get("phase") or "recovery"
+                outcome = record.get("outcome")
+                status = f"{phase}:{outcome}" if outcome else str(phase)
             elif isinstance(record_type, str) and record_type.startswith("lock_"):
                 status = record_type.removeprefix("lock_")
         updated = (

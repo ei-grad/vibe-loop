@@ -20,6 +20,7 @@ from vibe_loop.runs import (
     RUN_SCHEMA_VERSION,
     RUN_STARTED_RECORD_TYPE,
     RUN_STATE_TRANSITION_RECORD_TYPE,
+    TASK_RECOVERY_RECORD_TYPE,
     TASK_RESTART_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
@@ -455,6 +456,113 @@ class RunStoreTests(unittest.TestCase):
         assert report is not None
         self.assertEqual(report.status, "completed")
         self.assertEqual(report.message, "second")
+
+    def test_latest_workspace_claim_record_matches_task_and_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_record(
+                {
+                    "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+                    "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "auto-01-old",
+                    "worktree": "/tmp/old",
+                }
+            )
+            store.append_record(
+                {
+                    "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+                    "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+                    "task_id": "TASK-02",
+                    "run_id": "run-2",
+                    "branch": "auto-02",
+                    "worktree": "/tmp/other",
+                }
+            )
+            store.append_record(
+                {
+                    "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+                    "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "auto-01-new",
+                    "worktree": "/tmp/new",
+                }
+            )
+
+            record = store.latest_workspace_claim_record("TASK-01", "run-1")
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["branch"], "auto-01-new")
+        self.assertEqual(record["worktree"], "/tmp/new")
+
+    def test_latest_workspace_claim_record_returns_none_when_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_record(
+                {
+                    "record_type": WORKSPACE_CLAIM_RECORD_TYPE,
+                    "event_type": WORKSPACE_CLAIMED_EVENT_TYPE,
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "auto-01",
+                    "worktree": "/tmp/wt",
+                }
+            )
+
+            self.assertIsNone(store.latest_workspace_claim_record("TASK-01", "run-2"))
+
+    def test_task_recovery_event_records_launch_and_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_recovery(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    phase="launched",
+                    prior_run_id="run-1",
+                    attempt=1,
+                    max_attempts=3,
+                    branch="auto-01",
+                    worktree="/tmp/wt",
+                    transcript_path="/tmp/transcript.jsonl",
+                    wrapper_log="/tmp/run-1.log",
+                )
+            )
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_recovery(
+                    run_id="run-2",
+                    task_id="TASK-01",
+                    phase="outcome",
+                    prior_run_id="run-1",
+                    attempt=1,
+                    max_attempts=3,
+                    outcome="completed",
+                )
+            )
+            records = store.read_records()
+
+        recovery_records = [
+            record
+            for record in records
+            if record.get("record_type") == TASK_RECOVERY_RECORD_TYPE
+        ]
+        self.assertEqual(len(recovery_records), 2)
+        launched, outcome = recovery_records
+        self.assertEqual(launched["phase"], "launched")
+        self.assertEqual(launched["prior_run_id"], "run-1")
+        self.assertEqual(launched["attempt"], 1)
+        self.assertEqual(launched["branch"], "auto-01")
+        self.assertEqual(launched["transcript_path"], "/tmp/transcript.jsonl")
+        self.assertEqual(launched["reason"], "unknown_run_recovery")
+        self.assertEqual(outcome["phase"], "outcome")
+        self.assertEqual(outcome["outcome"], "completed")
+        self.assertEqual(outcome["run_id"], "run-2")
+
+    def test_task_recovery_record_type_is_known_and_lifecycle(self) -> None:
+        self.assertIn(TASK_RECOVERY_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
     def test_list_runs_groups_records_by_run_and_uses_latest_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

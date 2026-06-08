@@ -37,6 +37,7 @@ WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
 WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE = "workspace_claim_mismatch"
 RUN_STATE_TRANSITION_RECORD_TYPE = "run_state_transition"
 TASK_RESTART_RECORD_TYPE = "task_restart"
+TASK_RECOVERY_RECORD_TYPE = "task_recovery"
 AUTOPILOT_CYCLE_RECORD_TYPE = "autopilot_cycle"
 AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE = "autopilot_supervisor_started"
 AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE = "autopilot_supervisor_observed"
@@ -62,6 +63,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
         RUN_STATE_TRANSITION_RECORD_TYPE,
         TASK_RESTART_RECORD_TYPE,
+        TASK_RECOVERY_RECORD_TYPE,
     }
 )
 KNOWN_RECORD_TYPES = frozenset(
@@ -420,6 +422,50 @@ class RunLifecycleEvent:
             payload=event_payload,
         )
 
+    @classmethod
+    def task_recovery(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        phase: str,
+        prior_run_id: str,
+        attempt: int,
+        max_attempts: int,
+        reason: str = "unknown_run_recovery",
+        branch: str = "",
+        worktree: str = "",
+        transcript_path: str = "",
+        wrapper_log: str = "",
+        outcome: str = "",
+        payload: Mapping[str, Any] | None = None,
+    ) -> RunLifecycleEvent:
+        event_payload: dict[str, Any] = {
+            "task_id": task_id,
+            "phase": phase,
+            "prior_run_id": prior_run_id,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "reason": reason,
+        }
+        if branch:
+            event_payload["branch"] = branch
+        if worktree:
+            event_payload["worktree"] = worktree
+        if transcript_path:
+            event_payload["transcript_path"] = transcript_path
+        if wrapper_log:
+            event_payload["wrapper_log"] = wrapper_log
+        if outcome:
+            event_payload["outcome"] = outcome
+        if payload is not None:
+            event_payload.update(payload)
+        return cls(
+            record_type=TASK_RECOVERY_RECORD_TYPE,
+            run_id=run_id,
+            payload=event_payload,
+        )
+
     def to_record(self) -> dict[str, object]:
         record: dict[str, object] = {
             "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
@@ -678,6 +724,23 @@ class RunStore:
             if task_id is not None and report.task_id != task_id:
                 continue
             return report
+        return None
+
+    def latest_workspace_claim_record(
+        self,
+        task_id: str,
+        run_id: str,
+    ) -> dict[str, Any] | None:
+        for record in reversed(self.read_records()):
+            if record.get("record_type") != WORKSPACE_CLAIM_RECORD_TYPE:
+                continue
+            if not workspace_claim_is_observed(record):
+                continue
+            if string_value(record.get("task_id")) != task_id:
+                continue
+            if string_value(record.get("run_id")) != run_id:
+                continue
+            return record
         return None
 
     def list_runs(self, limit: int = 20) -> list[RunHistoryView]:

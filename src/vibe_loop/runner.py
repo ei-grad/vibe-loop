@@ -64,6 +64,7 @@ from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
 from vibe_loop.workers import (
     ActiveRunState,
     WorkerView,
+    WorkspaceClaim,
     active_run_is_live,
     build_worker_views,
 )
@@ -686,7 +687,12 @@ class VibeRunner:
             return 0
         return max(0, restart_count)
 
-    def run_task(self, task: Task) -> RunResult:
+    def run_task(
+        self,
+        task: Task,
+        *,
+        recovery: RecoveryContext | None = None,
+    ) -> RunResult:
         self.ensure_spec_execution_gate()
         command_template = self.config.agent.require_command()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
@@ -713,6 +719,10 @@ class VibeRunner:
             session_id_source = SESSION_OBSERVED_SOURCE
         skill_prefix = self.config.agent.require_skill_ref_prefix()
         worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
+        if recovery is not None:
+            worker_prompt = (
+                f"{worker_prompt}\n\n{build_recovery_prompt_section(recovery)}"
+            )
         validate_worker_prompt_delivery(command_template, task)
         command = effective_template.format(
             prompt=shell_quote(worker_prompt),
@@ -1358,6 +1368,7 @@ class VibeRunner:
         # candidate remains, so genuinely multi-slice work still progresses.
         yielded: set[str] = set()
         transient_retries: dict[str, int] = {}
+        recovery_attempts: dict[str, int] = {}
         completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
             result = self.run_next(
@@ -1395,6 +1406,20 @@ class VibeRunner:
                 report_status(
                     f"transient retries exhausted for {result.task_id}, skipping"
                 )
+            if result.classification == "unknown":
+                result = self.drive_unknown_recovery(
+                    result,
+                    attempts=recovery_attempts,
+                    results=results,
+                )
+                if result.classification == "completed":
+                    transient_retries.pop(result.task_id, None)
+                    recovery_attempts.pop(result.task_id, None)
+                    yielded.add(result.task_id)
+                    completed_count += 1
+                    if max_tasks > 0 and completed_count >= max_tasks:
+                        break
+                    continue
             skipped.add(result.task_id)
             if not continue_on_failure and result.classification in {
                 "failed",
@@ -1414,6 +1439,7 @@ class VibeRunner:
         results: list[RunResult] = []
         skipped: set[str] = set()
         transient_retries: dict[str, int] = {}
+        recovery_attempts: dict[str, int] = {}
         retry_ready_at: dict[str, float] = {}
         completed_count = 0
         in_flight: dict[Future[RunResult], str] = {}
@@ -1574,6 +1600,20 @@ class VibeRunner:
                             f"transient retries exhausted for {result.task_id}, "
                             "skipping"
                         )
+                    if result.classification == "unknown":
+                        result = self.drive_unknown_recovery(
+                            result,
+                            attempts=recovery_attempts,
+                            results=results,
+                        )
+                        if result.classification == "completed":
+                            transient_retries.pop(result.task_id, None)
+                            retry_ready_at.pop(result.task_id, None)
+                            recovery_attempts.pop(result.task_id, None)
+                            completed_count += 1
+                            if max_tasks > 0 and completed_count >= max_tasks:
+                                stop_after_running = True
+                            continue
                     skipped.add(result.task_id)
                     if result.classification in {"failed", "unknown"}:
                         stop_after_running = not continue_on_failure
@@ -1613,7 +1653,12 @@ class VibeRunner:
         *,
         exhausted: bool,
         attempted_restart_count: int | None = None,
+        reason: str | None = None,
     ) -> None:
+        if reason is None:
+            reason = (
+                "restart_budget_exhausted" if exhausted else "transient_worker_failure"
+            )
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_restart(
                 run_id=result.run_id,
@@ -1621,11 +1666,7 @@ class VibeRunner:
                 restart_count=restart_count,
                 max_restarts=self.config.supervision.max_restarts,
                 cooldown_seconds=self.config.supervision.cooldown_seconds,
-                reason=(
-                    "restart_budget_exhausted"
-                    if exhausted
-                    else "transient_worker_failure"
-                ),
+                reason=reason,
                 exhausted=exhausted,
                 attempted_restart_count=attempted_restart_count,
                 started_at=result.started_at,
@@ -1658,6 +1699,165 @@ class VibeRunner:
         )
         self.record_result(exhausted)
         return exhausted
+
+    def record_recovery_budget_exhausted(
+        self,
+        result: RunResult,
+        attempts_used: int,
+    ) -> RunResult:
+        max_attempts = self.config.supervision.max_restarts
+        self.record_task_restart(
+            result,
+            attempts_used,
+            exhausted=True,
+            attempted_restart_count=attempts_used + 1,
+            reason="recovery_budget_exhausted",
+        )
+        exhausted = dataclasses.replace(
+            result,
+            classification="failed",
+            classification_source="recovery_budget_exhausted",
+            message=(
+                "unknown-run recovery budget exhausted after "
+                f"{attempts_used} attempt(s) for {result.task_id}"
+            ),
+            restart_count=attempts_used,
+            max_restarts=max_attempts,
+        )
+        self.record_result(exhausted)
+        return exhausted
+
+    def drive_unknown_recovery(
+        self,
+        result: RunResult,
+        *,
+        attempts: dict[str, int],
+        results: list[RunResult],
+    ) -> RunResult:
+        """Deterministically recover a run that classified `unknown`.
+
+        Launches bounded read-write continuation workers against the prior
+        claimed workspace until the run reaches a clear terminal status or the
+        per-task recovery budget is exhausted. Each recovery RunResult is
+        appended to ``results``; the final (possibly terminal) result is
+        returned.
+        """
+        if not self.config.supervision.recover_unknown_runs:
+            return result
+        max_attempts = self.config.supervision.max_restarts
+        if max_attempts <= 0:
+            return result
+        current = result
+        while current.classification == "unknown":
+            attempt = attempts.get(current.task_id, 0) + 1
+            if attempt > max_attempts:
+                terminal = self.record_recovery_budget_exhausted(
+                    current,
+                    attempts.get(current.task_id, 0),
+                )
+                results.append(terminal)
+                report_status(
+                    "unknown-run recovery budget exhausted for "
+                    f"{current.task_id} after {max_attempts} attempt(s)"
+                )
+                return terminal
+            attempts[current.task_id] = attempt
+            recovered = self.recover_unknown_run(
+                current,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            if recovered is None:
+                return current
+            results.append(recovered)
+            current = recovered
+        return current
+
+    def recover_unknown_run(
+        self,
+        prior_result: RunResult,
+        *,
+        attempt: int,
+        max_attempts: int,
+    ) -> RunResult | None:
+        task = self.source.probe(prior_result.task_id)
+        if task is None:
+            report_status(
+                "unknown-run recovery skipped: task "
+                f"{prior_result.task_id} no longer present in task source"
+            )
+            return None
+        claim_record = self.run_store.latest_workspace_claim_record(
+            prior_result.task_id,
+            prior_result.run_id,
+        )
+        claim = (
+            WorkspaceClaim.from_json(claim_record) if claim_record is not None else None
+        )
+        recovery = RecoveryContext(
+            task_id=prior_result.task_id,
+            prior_run_id=prior_result.run_id,
+            prior_classification=prior_result.classification,
+            branch=claim.branch if claim is not None else "",
+            worktree=str(claim.worktree) if claim is not None else "",
+            head_commit=claim.head_commit if claim is not None else "",
+            transcript_path=prior_result.transcript_path,
+            wrapper_log=str(prior_result.log_path),
+            attempt=attempt,
+            max_attempts=max_attempts,
+            workspace_claimed=claim is not None,
+        )
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_recovery(
+                run_id=prior_result.run_id,
+                task_id=prior_result.task_id,
+                phase="launched",
+                prior_run_id=prior_result.run_id,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                branch=recovery.branch,
+                worktree=recovery.worktree,
+                transcript_path=recovery.transcript_path,
+                wrapper_log=recovery.wrapper_log,
+            )
+        )
+        report_status(
+            f"launching unknown-run recovery for {prior_result.task_id} "
+            f"(attempt {attempt}/{max_attempts}, prior run {prior_result.run_id})"
+        )
+        try:
+            result = self.run_task(task, recovery=recovery)
+        except LockBusy:
+            report_status(
+                "unknown-run recovery deferred: task locked during acquire: "
+                f"{prior_result.task_id}"
+            )
+            return None
+        # Reuse the task_restart counter/record so the recovery attempt is
+        # visible in runs/workers output and an unknown->recover->unknown cycle
+        # cannot loop past the configured budget.
+        self.record_task_restart(
+            result,
+            attempt,
+            exhausted=False,
+            reason="unknown_run_recovery",
+        )
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_recovery(
+                run_id=result.run_id,
+                task_id=prior_result.task_id,
+                phase="outcome",
+                prior_run_id=prior_result.run_id,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                outcome=result.classification,
+            )
+        )
+        report_status(
+            f"unknown-run recovery for {prior_result.task_id} "
+            f"(attempt {attempt}/{max_attempts}) classified {result.classification}"
+        )
+        return result
 
     def classify(
         self,
@@ -1733,6 +1933,76 @@ def build_batch_selection_prompt(
         f"{json.dumps([task.to_json() for task in candidates], indent=2)}\n\n"
         f"{active_worker_context}\n\n"
         f"{recent_log_context}\n"
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class RecoveryContext:
+    """Bounded context handed to a continuation worker recovering an
+    `unknown` run. Identifies the prior run, its claimed workspace, and the
+    artifacts the continuation worker should inspect before finishing the work
+    or emitting a proper terminal status."""
+
+    task_id: str
+    prior_run_id: str
+    prior_classification: str
+    branch: str
+    worktree: str
+    head_commit: str
+    transcript_path: str
+    wrapper_log: str
+    attempt: int
+    max_attempts: int
+    workspace_claimed: bool
+
+
+def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
+    if recovery.workspace_claimed:
+        workspace_lines = (
+            f"- Claimed branch: `{recovery.branch}`\n"
+            f"- Claimed worktree: `{recovery.worktree}`\n"
+        )
+        if recovery.head_commit:
+            workspace_lines += (
+                f"- Claimed worktree HEAD at claim time: `{recovery.head_commit}`\n"
+            )
+    else:
+        workspace_lines = (
+            "- No `workspace_claim` record was found for the prior run; the "
+            "prior session may have exited before claiming a branch/worktree. "
+            "Inspect the repository and prior run log to determine what, if "
+            "anything, was committed.\n"
+        )
+    transcript_line = (
+        f"- Prior agent transcript: `{recovery.transcript_path}`\n"
+        if recovery.transcript_path
+        else "- Prior agent transcript: not captured for the prior run.\n"
+    )
+    return (
+        "## Unknown-Run Recovery\n\n"
+        f"You are a continuation worker for task `{recovery.task_id}`. The "
+        f"previous run (`{recovery.prior_run_id}`) ended "
+        f"`{recovery.prior_classification}` — it neither merged its work nor "
+        "filed a clear terminal worker report. This is recovery attempt "
+        f"{recovery.attempt} of {recovery.max_attempts}.\n\n"
+        "### Prior run context\n\n"
+        f"- Prior run id: `{recovery.prior_run_id}`\n"
+        f"{workspace_lines}"
+        f"{transcript_line}"
+        f"- Prior wrapper log: `{recovery.wrapper_log}`\n\n"
+        "### What to do\n\n"
+        "1. Investigate what the previous session did and why it ended without "
+        "a proper status: read the prior transcript and wrapper log, and "
+        "inspect the claimed branch/worktree for committed-but-unmerged work.\n"
+        "2. Continue on the existing claimed branch/worktree — do not delete, "
+        "reset, steal, or re-create another worker's workspace; build on the "
+        "committed work rather than discarding it.\n"
+        "3. Finish the slice through review and integration when permitted, "
+        "then emit a proper status (`completed`/`blocked`/`failed`) via the "
+        "worker report protocol.\n"
+        "4. If the work is blocked on an external or authorization gate, report "
+        "`blocked` with the precise reason — do NOT park and exit silently, "
+        "which would leave the run `unknown` again.\n"
     )
 
 

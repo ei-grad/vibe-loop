@@ -430,6 +430,7 @@ class ConfigTests(unittest.TestCase):
             config.supervision.cooldown_seconds,
             SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
         )
+        self.assertTrue(config.supervision.recover_unknown_runs)
         self.assertEqual(config.supervision.explicit_keys, frozenset())
 
     def test_autopilot_config_parses_section(self) -> None:
@@ -524,9 +525,30 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.supervision.max_restarts, 1)
         self.assertEqual(config.supervision.cooldown_seconds, 0.25)
+        self.assertTrue(config.supervision.recover_unknown_runs)
         self.assertEqual(
             config.supervision.to_json()["explicit_keys"],
             ["cooldown_seconds", "max_restarts"],
+        )
+
+    def test_supervision_config_parses_recover_unknown_runs_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nrecover_unknown_runs = false\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertFalse(config.supervision.recover_unknown_runs)
+        self.assertEqual(
+            config.supervision.to_json()["recover_unknown_runs"],
+            False,
+        )
+        self.assertEqual(
+            config.supervision.to_json()["explicit_keys"],
+            ["recover_unknown_runs"],
         )
 
     def test_supervision_config_rejects_invalid_values(self) -> None:
@@ -534,6 +556,7 @@ class ConfigTests(unittest.TestCase):
             ("max_restarts = -1\n", "supervision.max_restarts"),
             ('cooldown_seconds = "soon"\n', "supervision.cooldown_seconds"),
             ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
+            ('recover_unknown_runs = "yes"\n', "supervision.recover_unknown_runs"),
             ("unsupported = true\n", "unsupported"),
         ]
         for toml, expected in cases:
