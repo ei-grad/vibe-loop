@@ -289,6 +289,13 @@ decision it cleans only stale worker locks whose recorded worker process is
 missing — the same validated, audited path as `vibe-loop workers clean --force`
 (it emits `lock_expired` records and never deletes worktrees, resets branches,
 steals live locks, or removes a lock that has not yet observed a worker PID).
+Each cycle then runs a native worktree-disposition step: it gathers per-worktree
+evidence mechanically, asks the read-only analysis agent for a keep-or-reap
+decision per orphaned worktree, and reaps (`git worktree remove` plus
+`git branch -d`) only merged, clean, non-live-claimed leftovers within the
+evidence-gated guardrails — never the primary worktree and never dirty or
+unmerged work-in-progress. It appends a `reaped_worktrees:N` action tag and an
+`autopilot_worktree_reap` journal record every cycle.
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable

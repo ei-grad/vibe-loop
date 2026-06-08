@@ -19,6 +19,7 @@ from vibe_loop.autopilot import (
     parse_wait_deadline,
     run_autopilot,
     run_maintenance_command,
+    run_worktree_disposition,
     wait_for_processes,
 )
 from vibe_loop.config import load_config
@@ -28,6 +29,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RunStore,
 )
 from vibe_loop.workers import ActiveRunState
@@ -1065,6 +1067,159 @@ class AutopilotWaitTests(unittest.TestCase):
         )
         self.assertEqual(result.wake_reason, "all_complete")
         self.assertEqual(sorted(event["pid"] for event in result.events), [1, 2])
+
+
+class WorktreeDispositionCycleTests(unittest.TestCase):
+    def _orphan_repo(self, directory: str) -> tuple[Path, Path]:
+        root = Path(directory)
+        repo = root / "repo"
+        repo.mkdir()
+        configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+        worktree = root / "orphan"
+        run(repo, "git", "worktree", "add", "-b", "orphan", str(worktree), "main")
+        return repo, worktree
+
+    def test_reaps_merged_clean_unclaimed_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(directory)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            removed: list[Path] = []
+            deleted: list[str] = []
+            prompts: list[str] = []
+
+            def analysis_runner(prompt, output_path):
+                prompts.append(prompt)
+                return {
+                    "decisions": [
+                        {
+                            "worktree": str(worktree),
+                            "action": "reap",
+                            "reason": "orphan",
+                        }
+                    ]
+                }
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=analysis_runner,
+                remove_worktree=lambda path: removed.append(path) or "",
+                delete_branch=lambda branch: deleted.append(branch) or "",
+            )
+
+        self.assertTrue(result.agent_invoked)
+        self.assertEqual(result.agent_error, "")
+        self.assertEqual(result.reaped, 1)
+        self.assertEqual(result.errors, 0)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual([path.resolve() for path in removed], [worktree.resolve()])
+        self.assertEqual(deleted, ["orphan"])
+        self.assertEqual(len(prompts), 1)
+        record = result.to_record(config.repo)
+        self.assertEqual(record["record_type"], AUTOPILOT_WORKTREE_REAP_RECORD_TYPE)
+        self.assertEqual(record["reaped"], 1)
+        self.assertEqual(record["status"], "ok")
+
+    def test_keeps_unmerged_worktree_without_invoking_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(directory)
+            (worktree / "wip.txt").write_text("wip\n", encoding="utf-8")
+            run(worktree, "git", "add", "wip.txt")
+            run(worktree, "git", "commit", "-m", "wip")
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            calls: list[str] = []
+
+            def analysis_runner(prompt, output_path):
+                calls.append(prompt)
+                return {"decisions": []}
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=analysis_runner,
+                remove_worktree=lambda path: "",
+                delete_branch=lambda branch: "",
+            )
+
+        self.assertFalse(result.agent_invoked)
+        self.assertEqual(calls, [])
+        self.assertEqual(result.reaped, 0)
+        self.assertEqual(result.status, "ok")
+
+    def test_keeps_dirty_worktree_without_invoking_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(directory)
+            (worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def analysis_runner(prompt, output_path):
+                raise AssertionError("agent must not run for guarded worktrees")
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=analysis_runner,
+                remove_worktree=lambda path: "",
+                delete_branch=lambda branch: "",
+            )
+
+        self.assertFalse(result.agent_invoked)
+        self.assertEqual(result.reaped, 0)
+
+    def test_unavailable_agent_keeps_reapable_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(directory)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=lambda prompt, output_path: None,
+                remove_worktree=lambda path: "",
+                delete_branch=lambda branch: "",
+            )
+
+        self.assertTrue(result.agent_invoked)
+        self.assertNotEqual(result.agent_error, "")
+        self.assertEqual(result.reaped, 0)
+        self.assertEqual(result.status, "agent_error")
+
+    def test_cycle_records_disposition_and_appends_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 0,
+            )
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
+
+        cycle = summary.cycles[0]
+        self.assertIn("reaped_worktrees:0", cycle.actions)
+        self.assertNotIn("worktree_disposition_agent_error", cycle.actions)
+        reap_records = [
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_WORKTREE_REAP_RECORD_TYPE
+        ]
+        self.assertEqual(len(reap_records), 1)
+        self.assertEqual(reap_records[0]["reaped"], 0)
+        self.assertFalse(reap_records[0]["agent_invoked"])
 
 
 def configured_repo(

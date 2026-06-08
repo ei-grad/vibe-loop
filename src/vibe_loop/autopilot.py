@@ -8,12 +8,13 @@ import subprocess
 import sys
 import tempfile
 import time as time_module
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from vibe_loop.config import (
+    AgentResolutionError,
     VibeConfig,
     load_config,
     unresolved_agent_command_message,
@@ -26,6 +27,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RunStore,
     utc_now_iso,
 )
@@ -33,9 +35,16 @@ from vibe_loop.tasks import Task
 from vibe_loop.workers import (
     ProcessExists,
     StaleLock,
+    WorktreeDispositionEvidence,
+    WorktreeDispositionOutcome,
     WorkerView,
     clean_stale_locks,
     collect_stale_locks,
+    collect_worktree_disposition_evidence,
+    execute_worktree_disposition,
+    git_branch_delete,
+    git_worktree_remove,
+    parse_worktree_disposition_decisions,
     pid_exists,
     record_expired_locks,
 )
@@ -882,6 +891,160 @@ def run_maintenance_command(
     )
 
 
+# Returns the parsed JSON decision payload (or ``None``) for a disposition
+# prompt. Defaults to ``VibeRunner.run_analysis_agent`` (PRD-AUT-009); injected
+# in tests so the read-only analysis agent never runs as a real subprocess.
+AnalysisRunner = Callable[[str, Path], dict[str, object] | None]
+
+
+@dataclasses.dataclass(frozen=True)
+class WorktreeDispositionCycleResult:
+    """Outcome of one cycle's native worktree-disposition health step.
+
+    Mirrors ``MaintenanceCommandResult`` so the step journals a single typed
+    ``autopilot_worktree_reap`` record (PRD-AUT-010/011). ``evidence`` and
+    ``outcomes`` carry the mechanical per-worktree evidence and the per-decision
+    keep/reap results for full-cycle action logging.
+    """
+
+    cycle_id: str
+    evidence: tuple[WorktreeDispositionEvidence, ...]
+    outcomes: tuple[WorktreeDispositionOutcome, ...]
+    agent_invoked: bool
+    agent_error: str
+
+    @property
+    def reaped(self) -> int:
+        return sum(1 for outcome in self.outcomes if outcome.applied == "reaped")
+
+    @property
+    def kept(self) -> int:
+        return sum(1 for outcome in self.outcomes if outcome.applied == "kept")
+
+    @property
+    def refused(self) -> int:
+        return sum(1 for outcome in self.outcomes if outcome.applied == "refused")
+
+    @property
+    def errors(self) -> int:
+        return sum(1 for outcome in self.outcomes if outcome.applied == "failed")
+
+    @property
+    def status(self) -> str:
+        if self.agent_error:
+            return "agent_error"
+        if self.errors:
+            return "errors"
+        return "ok"
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "reaped": self.reaped,
+            "kept": self.kept,
+            "refused": self.refused,
+            "errors": self.errors,
+            "agent_invoked": self.agent_invoked,
+            "agent_error": self.agent_error,
+            "evidence": [item.to_json() for item in self.evidence],
+            "outcomes": [outcome.to_json() for outcome in self.outcomes],
+        }
+
+
+WorktreeDispositionRunner = Callable[..., WorktreeDispositionCycleResult]
+
+
+def build_worktree_disposition_prompt(
+    candidates: Iterable[WorktreeDispositionEvidence],
+) -> str:
+    payload = {"worktrees": [item.to_json() for item in candidates]}
+    return (
+        "You are a read-only autopilot analysis agent deciding whether orphaned "
+        "git worktrees may be reaped. Each candidate below already passed the "
+        "mechanical safety guardrails (merged, clean, not claimed by a live "
+        "run); the executor re-checks those guardrails independently, so a reap "
+        "decision is honored only when they still hold. Return ONLY a JSON "
+        'object of the form {"decisions": [{"worktree": "<path>", '
+        '"action": "keep" | "reap", "reason": "<short reason>"}]}. Decide reap '
+        "only for a safe-to-remove leftover of a worker that already finished or "
+        "died; otherwise decide keep.\n\n"
+        f"Candidates:\n{json.dumps(payload, indent=2)}\n"
+    )
+
+
+def run_worktree_disposition(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    run_store: RunStore,
+    process_exists: ProcessExists | None,
+    analysis_runner: AnalysisRunner | None = None,
+    remove_worktree: Callable[[Path], str] | None = None,
+    delete_branch: Callable[[str], str] | None = None,
+) -> WorktreeDispositionCycleResult:
+    """Run the native, evidence-gated worktree-disposition health step.
+
+    Gathers per-worktree evidence (AUTO-13), asks the read-only analysis agent
+    (AUTO-12) for keep/reap decisions only when at least one worktree clears the
+    mechanical guardrails, then executes within those guardrails. Git side
+    effects and the analysis call are dependency-injected so tests never run
+    real git or spawn an agent. Stays inside the bounded PRD-AUT-006 exception.
+    """
+    lock_manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+    )
+    evidence = collect_worktree_disposition_evidence(
+        lock_manager,
+        run_store,
+        repo=config.repo,
+        main_branch=config.main_branch,
+        process_exists=process_exists,
+        ignored_dirty_paths=(config.state_path,),
+    )
+    reapable = [item for item in evidence if item.reapable]
+    agent_invoked = False
+    agent_error = ""
+    decisions = []
+    if reapable:
+        agent_invoked = True
+        runner = analysis_runner or VibeRunner(config).run_analysis_agent
+        output_path = (
+            config.state_path / "autopilot" / f"{cycle_id}-worktree-disposition.json"
+        )
+        try:
+            payload = runner(build_worktree_disposition_prompt(reapable), output_path)
+        except AgentResolutionError as exc:
+            payload = None
+            agent_error = str(exc)
+        if payload is None and not agent_error:
+            agent_error = "analysis agent returned no disposition decisions"
+        decisions = parse_worktree_disposition_decisions(payload)
+    remover = remove_worktree or (
+        lambda worktree: git_worktree_remove(config.repo, worktree)
+    )
+    deleter = delete_branch or (lambda branch: git_branch_delete(config.repo, branch))
+    outcomes = execute_worktree_disposition(
+        evidence,
+        decisions,
+        remove_worktree=remover,
+        delete_branch=deleter,
+    )
+    return WorktreeDispositionCycleResult(
+        cycle_id=cycle_id,
+        evidence=tuple(evidence),
+        outcomes=tuple(outcomes),
+        agent_invoked=agent_invoked,
+        agent_error=agent_error,
+    )
+
+
 def execute_autopilot_cycle(
     config: VibeConfig,
     *,
@@ -897,6 +1060,7 @@ def execute_autopilot_cycle(
     launcher: RunUntilDoneLauncher,
     run_store: RunStore,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
+    worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
 ) -> AutopilotCycleResult:
@@ -925,6 +1089,19 @@ def execute_autopilot_cycle(
             actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")
         status = collect_project_status(config, process_exists=process_exists)
         runnable = status.queue.runnable
+
+    disposition = worktree_disposition_runner(
+        config,
+        cycle_id=cycle_id,
+        run_store=run_store,
+        process_exists=process_exists,
+    )
+    run_store.append_record(disposition.to_record(config.repo))
+    actions.append(f"reaped_worktrees:{disposition.reaped}")
+    if disposition.errors:
+        actions.append(f"worktree_reap_errors:{disposition.errors}")
+    if disposition.agent_error:
+        actions.append("worktree_disposition_agent_error")
 
     blocker_list = list(status.blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
@@ -1033,6 +1210,7 @@ def run_autopilot(
     sleep: Sleep | None = None,
     launcher: RunUntilDoneLauncher | None = None,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
+    worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     should_stop: Callable[[], bool] | None = None,
 ) -> AutopilotRunSummary:
     """Supervise ``run-until-done`` as a foreground persistent loop.
@@ -1128,6 +1306,7 @@ def run_autopilot(
                 launcher=launch,
                 run_store=run_store,
                 maintenance_runner=maintenance_runner,
+                worktree_disposition_runner=worktree_disposition_runner,
             )
             result.append_to(run_store)
             cycles.append(result)

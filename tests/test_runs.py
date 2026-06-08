@@ -9,6 +9,8 @@ from vibe_loop.runs import (
     AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_RECORD_TYPES,
+    AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+    KNOWN_RECORD_TYPES,
     LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_EXPIRED_RECORD_TYPE,
@@ -548,6 +550,38 @@ class RunStoreTests(unittest.TestCase):
         self.assertIn(AUTOPILOT_CYCLE_RECORD_TYPE, AUTOPILOT_RECORD_TYPES)
         self.assertEqual(
             [record["record_type"] for record in records], ["autopilot_cycle"]
+        )
+        self.assertEqual(runs, [])
+
+    def test_worktree_reap_record_type_registered(self) -> None:
+        self.assertEqual(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, "autopilot_worktree_reap")
+        self.assertIn(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, AUTOPILOT_RECORD_TYPES)
+        self.assertIn(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_read_records_keeps_worktree_reap_record_and_out_of_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+                    "cycle_id": "cycle-1",
+                    "repo": directory,
+                    "status": "ok",
+                    "reaped": 1,
+                    "kept": 2,
+                    "refused": 0,
+                    "errors": 0,
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                }
+            )
+
+            records = store.read_records()
+            runs = store.list_runs()
+
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            [AUTOPILOT_WORKTREE_REAP_RECORD_TYPE],
         )
         self.assertEqual(runs, [])
 
