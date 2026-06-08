@@ -179,10 +179,13 @@ For Claude workers the supervisor injects a known `--session-id <uuid>` into the
 worker command, so the run records the agent's real session id
 (`session_id_source` = `observed`) and a `transcript_path` pointing at the
 agent's own transcript (`$CLAUDE_HOME/projects/<encoded-cwd>/<uuid>.jsonl`,
-default `~/.claude`). The path is resolved by globbing for the unique session id
-after the run, so it is correct regardless of how Claude encodes the working
-directory. An operator can go straight from a `runs.jsonl` record (or
-`vibe-loop runs`) to the transcript file to see what the agent actually did.
+default `~/.claude`). The result record's path is resolved by globbing for the
+unique session id after the run, so it is correct regardless of how Claude
+encodes the working directory; the earlier `run_started` record carries a
+predicted path before the transcript exists. An operator can go straight from a
+`runs.jsonl` record (or `vibe-loop runs`) to the transcript file to see what the
+agent actually did. The path is best-effort: if the agent persists no transcript
+(for example `--no-session-persistence`), the recorded path may not exist.
 Injection is skipped when the command already pins `--session-id`.
 
 Codex `exec` has no equivalent flag to force or print a session id without
