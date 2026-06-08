@@ -1123,6 +1123,38 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         self.assertEqual(record["reaped"], 1)
         self.assertEqual(record["status"], "ok")
 
+    def test_failed_git_removal_reports_errors_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(directory)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def analysis_runner(prompt, output_path):
+                return {
+                    "decisions": [
+                        {
+                            "worktree": str(worktree),
+                            "action": "reap",
+                            "reason": "orphan",
+                        }
+                    ]
+                }
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=analysis_runner,
+                remove_worktree=lambda path: "git worktree remove failed",
+                delete_branch=lambda branch: "",
+            )
+
+        self.assertTrue(result.agent_invoked)
+        self.assertEqual(result.reaped, 0)
+        self.assertEqual(result.errors, 1)
+        self.assertEqual(result.status, "errors")
+
     def test_keeps_unmerged_worktree_without_invoking_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo, worktree = self._orphan_repo(directory)
