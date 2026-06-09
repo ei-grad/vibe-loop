@@ -194,7 +194,7 @@ AGENT_COMMAND_DEFAULTS = {
         "command": "claude -p {prompt}",
         "selection_command": "claude -p {prompt}",
         "analysis_command": (
-            "claude -p --disallowedTools Edit Write NotebookEdit {prompt}"
+            "claude -p {prompt} --disallowedTools Edit Write NotebookEdit"
         ),
     },
 }

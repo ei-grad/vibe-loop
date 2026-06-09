@@ -2899,7 +2899,7 @@ def validate_analysis_prompt_delivery(command_template: str) -> None:
         "prompt cannot be delivered to the read-only agent. Set "
         "agent.analysis_command to a prompt-mode template such as "
         "`codex exec --sandbox read-only {prompt}` or "
-        "`claude -p --disallowedTools Edit Write NotebookEdit {prompt}`."
+        "`claude -p {prompt} --disallowedTools Edit Write NotebookEdit`."
     )
 
 

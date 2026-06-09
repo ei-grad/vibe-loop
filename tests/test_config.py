@@ -113,7 +113,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(
             config.agent.analysis_command,
-            "claude -p --disallowedTools Edit Write NotebookEdit {prompt}",
+            "claude -p {prompt} --disallowedTools Edit Write NotebookEdit",
         )
         self.assertEqual(config.agent.analysis_command_source, "auto:claude")
 
