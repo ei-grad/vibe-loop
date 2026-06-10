@@ -28,6 +28,8 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+    RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+    RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     RunStore,
     utc_now_iso,
 )
@@ -518,6 +520,37 @@ def collect_supervisor_status(
             record=record,
         )
     return SupervisorStatus()
+
+
+def collect_external_run_supervisor(
+    run_store: RunStore,
+    *,
+    process_exists: ProcessExists | None = None,
+) -> int | None:
+    """PID of a live run-until-done supervisor, or None.
+
+    run-until-done appends start/exit supervisor records to runs.jsonl. The
+    newest record per PID wins: a started record whose process is still alive
+    marks a live supervisor (whether launched manually or orphaned by a dead
+    autopilot), so the autopilot can observe it instead of launching a
+    duplicate. PIDs with an exit record or a dead process are ignored.
+    """
+    process_checker = process_exists if process_exists is not None else pid_exists
+    seen_pids: set[int] = set()
+    for record in reversed(run_store.read_records()):
+        record_type = record.get("record_type")
+        if record_type not in {
+            RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+            RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+        }:
+            continue
+        pid = int_value(record.get("pid"))
+        if not pid or pid in seen_pids:
+            continue
+        seen_pids.add(pid)
+        if record_type == RUN_SUPERVISOR_STARTED_RECORD_TYPE and process_checker(pid):
+            return pid
+    return None
 
 
 def latest_cycle_summary(run_store: RunStore) -> CycleSummary | None:
@@ -1151,6 +1184,15 @@ def execute_autopilot_cycle(
             else:
                 actions.append("planning_unconfigured")
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
+    elif (
+        external_pid := collect_external_run_supervisor(
+            run_store, process_exists=process_exists
+        )
+    ) is not None:
+        cycle_status = "observing"
+        child_pid = external_pid
+        actions.append(f"observed_external_run_until_done:{external_pid}")
+        run_maintenance("summary")
     else:
         child_log = config.state_path / "autopilot" / f"{cycle_id}.log"
         command = autopilot_child_command(

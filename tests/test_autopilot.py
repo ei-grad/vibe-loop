@@ -12,6 +12,7 @@ from vibe_loop.autopilot import (
     ProjectEntry,
     ProjectRegistry,
     autopilot_child_command,
+    collect_external_run_supervisor,
     collect_project_status,
     collect_registry_status,
     collect_supervisor_status,
@@ -381,6 +382,72 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["cycle_id"], "cycle-1")
 
 
+class ExternalRunSupervisorTests(unittest.TestCase):
+    def _store_with_records(
+        self, directory: str, records: list[dict[str, object]]
+    ) -> RunStore:
+        store = RunStore(Path(directory) / "runs.jsonl")
+        for record in records:
+            store.append_record(record)
+        return store
+
+    def test_live_started_record_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_records(
+                directory,
+                [
+                    {
+                        "record_type": "run_supervisor_started",
+                        "pid": 4321,
+                        "occurred_at": "2026-06-10T00:00:00+00:00",
+                    }
+                ],
+            )
+            pid = collect_external_run_supervisor(
+                store, process_exists=lambda pid: pid == 4321
+            )
+        self.assertEqual(pid, 4321)
+
+    def test_exited_record_clears_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_records(
+                directory,
+                [
+                    {
+                        "record_type": "run_supervisor_started",
+                        "pid": 4321,
+                        "occurred_at": "2026-06-10T00:00:00+00:00",
+                    },
+                    {
+                        "record_type": "run_supervisor_exited",
+                        "pid": 4321,
+                        "occurred_at": "2026-06-10T01:00:00+00:00",
+                    },
+                ],
+            )
+            pid = collect_external_run_supervisor(
+                store, process_exists=lambda pid: True
+            )
+        self.assertIsNone(pid)
+
+    def test_dead_process_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_records(
+                directory,
+                [
+                    {
+                        "record_type": "run_supervisor_started",
+                        "pid": 4321,
+                        "occurred_at": "2026-06-10T00:00:00+00:00",
+                    }
+                ],
+            )
+            pid = collect_external_run_supervisor(
+                store, process_exists=lambda pid: False
+            )
+        self.assertIsNone(pid)
+
+
 class AutopilotRunTests(unittest.TestCase):
     def _recording_launcher(self):
         calls: list[dict[str, object]] = []
@@ -398,6 +465,36 @@ class AutopilotRunTests(unittest.TestCase):
             return 0
 
         return launcher, calls
+
+    def test_observes_external_run_until_done_instead_of_launching(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "record_type": "run_supervisor_started",
+                    "pid": 7777,
+                    "occurred_at": "2026-06-10T00:00:00+00:00",
+                }
+            )
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                process_exists=lambda pid: pid == 7777,
+            )
+
+        self.assertTrue(summary.started)
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(len(calls), 0)
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "observing")
+        self.assertEqual(cycle.child_pid, 7777)
+        self.assertIn("observed_external_run_until_done:7777", cycle.actions)
 
     def test_once_launches_child_and_records_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

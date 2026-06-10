@@ -53,12 +53,16 @@ from vibe_loop.retry import (
     retry_subprocess_run,
 )
 from vibe_loop.runs import (
+    LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
+    RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+    RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
     WorkerReport,
+    utc_now_iso,
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
@@ -1338,20 +1342,42 @@ class VibeRunner:
     ) -> list[RunResult]:
         if jobs < 1:
             raise ValueError("run-until-done --jobs must be at least 1")
-        if jobs == 1:
-            return self.run_until_done_serial(
+        self.run_store.append_record(
+            {
+                "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+                "record_type": RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(self.config.repo),
+                "pid": os.getpid(),
+                "jobs": jobs,
+            }
+        )
+        try:
+            if jobs == 1:
+                return self.run_until_done_serial(
+                    ask_agent=ask_agent,
+                    max_slices=max_slices,
+                    continue_on_failure=continue_on_failure,
+                    max_tasks=max_tasks,
+                )
+            return self.run_until_done_parallel(
                 ask_agent=ask_agent,
                 max_slices=max_slices,
                 continue_on_failure=continue_on_failure,
+                jobs=jobs,
                 max_tasks=max_tasks,
             )
-        return self.run_until_done_parallel(
-            ask_agent=ask_agent,
-            max_slices=max_slices,
-            continue_on_failure=continue_on_failure,
-            jobs=jobs,
-            max_tasks=max_tasks,
-        )
+        finally:
+            self.run_store.append_record(
+                {
+                    "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+                    "record_type": RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+                    "occurred_at": utc_now_iso(),
+                    "repo": str(self.config.repo),
+                    "pid": os.getpid(),
+                    "jobs": jobs,
+                }
+            )
 
     def run_until_done_serial(
         self,
