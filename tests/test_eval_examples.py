@@ -648,7 +648,7 @@ class EvalExampleTests(unittest.TestCase):
     def test_autopilot_status_and_one_cycle_run_on_generic_demo_repo(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = materialize_eval_example(
-                "finite-py-plan-table", Path(directory) / "demo"
+                "finite-py-plan-table", Path(directory).resolve() / "demo"
             )
 
             status_out = StringIO()

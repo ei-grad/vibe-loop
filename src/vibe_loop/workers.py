@@ -20,6 +20,7 @@ from vibe_loop.locks import (
     fencing_token_value,
     lock_lease_expired,
     numeric_value,
+    pid_exists,
     validate_lock_fencing_token,
 )
 from vibe_loop.runs import (
@@ -1385,22 +1386,6 @@ def latest_worker_status_by_run_id(
         if existing is None or existing.get("record_type") == WORKER_REPORT_RECORD_TYPE:
             results[run_id] = report.to_record()
     return results
-
-
-def pid_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        # Windows raises OSError(winerror=87, ERROR_INVALID_PARAMETER) for
-        # non-existent PIDs instead of ProcessLookupError.
-        return False
-    return True
 
 
 def optional_string(value: object) -> str | None:

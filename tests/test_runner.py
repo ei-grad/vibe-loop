@@ -2504,7 +2504,7 @@ class TransientWorkerFailureTests(unittest.TestCase):
         assert recovery is not None
         self.assertTrue(recovery.workspace_claimed)
         self.assertEqual(recovery.branch, "auto-01-branch")
-        self.assertEqual(recovery.worktree, "/tmp/auto-01")
+        self.assertEqual(recovery.worktree, str(Path("/tmp/auto-01")))
         self.assertEqual(recovery.head_commit, "deadbeef")
         self.assertEqual(recovery.transcript_path, "/tmp/transcript.jsonl")
         self.assertEqual(recovery.wrapper_log, str(log_path))
@@ -3257,7 +3257,7 @@ class AnalysisAgentTests(unittest.TestCase):
     def test_run_analysis_agent_parses_json_and_writes_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            stub = repo / "analysis-stub"
+            stub = repo / "analysis-stub.py"
             write_analysis_stub(
                 stub,
                 stdout='thinking...\n{"decision": "keep", "reason": "active WIP"}\n',
@@ -3285,7 +3285,7 @@ class AnalysisAgentTests(unittest.TestCase):
     def test_run_analysis_agent_returns_none_on_nonzero_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            stub = repo / "analysis-stub"
+            stub = repo / "analysis-stub.py"
             write_analysis_stub(stub, stdout='{"decision": "reap"}', exit_code=2)
             runner = VibeRunner(
                 VibeConfig(
@@ -3306,7 +3306,7 @@ class AnalysisAgentTests(unittest.TestCase):
     def test_run_analysis_agent_returns_none_on_non_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            stub = repo / "analysis-stub"
+            stub = repo / "analysis-stub.py"
             write_analysis_stub(stub, stdout="no structured decision here\n")
             runner = VibeRunner(
                 VibeConfig(

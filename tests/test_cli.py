@@ -7099,7 +7099,9 @@ class CliTests(unittest.TestCase):
 class AutopilotCliTests(unittest.TestCase):
     def test_status_text_reports_repo_queue_and_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory) / "project"
+            # Resolved so the assertion matches the CLI's resolved repo path
+            # (macOS /var symlink, Windows 8.3 short names).
+            repo = Path(directory).resolve() / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)
             stdout = StringIO()
             stderr = StringIO()
@@ -7307,7 +7309,7 @@ class AutopilotCliTests(unittest.TestCase):
 
     def test_projects_register_list_and_remove(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             registry = base / "projects.json"
             repo = base / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)
@@ -7345,7 +7347,7 @@ class AutopilotCliTests(unittest.TestCase):
 
     def test_projects_inspect_reports_single_status_and_path_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
+            base = Path(directory).resolve()
             registry = base / "projects.json"
             repo = base / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)

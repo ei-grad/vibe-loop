@@ -899,9 +899,15 @@ def run_maintenance_command(
                 break
             buffer.seek(0, os.SEEK_END)
             if buffer.tell() > max_output_bytes:
-                size_exceeded = True
-                kill_command_process_group(process)
-                process.wait()
+                # Brief grace so a command that already wrote its final output
+                # and is exiting reports its real exit code instead of being
+                # misclassified as a flood; a true flooder is still killed.
+                try:
+                    process.wait(timeout=0.05)
+                except subprocess.TimeoutExpired:
+                    size_exceeded = True
+                    kill_command_process_group(process)
+                    process.wait()
                 break
             if time_module.monotonic() >= deadline:
                 timed_out = True

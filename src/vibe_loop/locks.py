@@ -7,6 +7,7 @@ import signal
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -1183,18 +1184,60 @@ def integration_lock_waitable(status: IntegrationLockStatus) -> bool:
     return status.locked and status.state in {"held", "unknown"}
 
 
-def pid_exists(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
+if sys.platform == "win32":
+
+    def pid_exists(pid: int) -> bool:
+        # os.kill(pid, 0) is unusable here: on Windows any signal other than
+        # CTRL_C_EVENT/CTRL_BREAK_EVENT calls TerminateProcess, so probing
+        # would kill the process, and it reports exited-but-still-open
+        # processes (e.g. a child whose Popen handle is alive) as running.
+        import ctypes
+        from ctypes import wintypes
+
+        if pid <= 0:
+            return False
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        # Explicit signatures: HANDLE is pointer-sized and would otherwise be
+        # truncated through the default c_int return/argument conversion.
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.GetExitCodeProcess.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            return bool(ok) and exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+
+else:
+
+    def pid_exists(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
         return True
-    except OSError:
-        return False
-    return True
 
 
 def string_value(value: object) -> str:

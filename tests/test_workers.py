@@ -2122,7 +2122,7 @@ class WorktreeDispositionExecuteTests(unittest.TestCase):
         )
 
         payload = json.loads(json.dumps(outcomes[0].to_json()))
-        self.assertEqual(payload["worktree"], "/tmp/orphan")
+        self.assertEqual(payload["worktree"], str(Path("/tmp/orphan")))
         self.assertEqual(payload["branch"], "worker/ORPHAN")
         self.assertEqual(payload["applied"], "reaped")
         self.assertEqual(payload["reason"], "orphaned")
@@ -2145,7 +2145,7 @@ class WorktreeDispositionExecuteTests(unittest.TestCase):
         reapable_payload = json.loads(json.dumps(reapable.to_json()))
         kept_payload = json.loads(json.dumps(kept.to_json()))
 
-        self.assertEqual(reapable_payload["path"], "/tmp/orphan")
+        self.assertEqual(reapable_payload["path"], str(Path("/tmp/orphan")))
         self.assertEqual(reapable_payload["keep_guardrails"], [])
         self.assertTrue(reapable_payload["reapable"])
         self.assertIn(KEEP_DIRTY_WORKTREE, kept_payload["keep_guardrails"])

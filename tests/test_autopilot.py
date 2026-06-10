@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -996,10 +997,17 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         self.assertEqual(len(launched), 1)
 
     def test_run_maintenance_command_bounds_output_and_timeout(self) -> None:
+        # Commands run via shell=True on every platform, so use python -c
+        # one-liners that behave identically under sh and cmd.exe.
+        python = f'"{sys.executable}"'
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
+            # os.write + os._exit keeps the write-to-exit window tiny so the
+            # harness observes a completed process with oversized output (the
+            # post-completion truncation path) instead of killing a still
+            # running flood (the size_exceeded path).
             ok = run_maintenance_command(
-                "printf 'abcdef'",
+                f"{python} -c \"import os; os.write(1, b'abcdef'); os._exit(0)\"",
                 "summary",
                 "cycle-1",
                 cwd=repo,
@@ -1008,7 +1016,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 max_output_bytes=3,
             )
             failed = run_maintenance_command(
-                "exit 7",
+                f'{python} -c "raise SystemExit(7)"',
                 "health",
                 "cycle-1",
                 cwd=repo,
@@ -1017,7 +1025,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 max_output_bytes=1024,
             )
             timed = run_maintenance_command(
-                "sleep 5",
+                f'{python} -c "import time; time.sleep(5)"',
                 "troubleshoot",
                 "cycle-1",
                 cwd=repo,
