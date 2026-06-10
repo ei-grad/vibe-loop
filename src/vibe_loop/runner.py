@@ -49,6 +49,7 @@ from vibe_loop.locks import (
 )
 from vibe_loop.retry import (
     is_transient_stderr,
+    parse_quota_reset_delay,
     retry_subprocess_run,
 )
 from vibe_loop.runs import (
@@ -1394,12 +1395,15 @@ class VibeRunner:
                 transient_retries[result.task_id] = count
                 if count <= self.config.supervision.max_restarts:
                     self.record_task_restart(result, count, exhausted=False)
+                    cooldown = transient_failure_cooldown(
+                        result, self.config.supervision.cooldown_seconds
+                    )
                     report_status(
                         f"transient failure for {result.task_id} "
                         f"(restart {count}/{self.config.supervision.max_restarts}), "
-                        f"cooling down {self.config.supervision.cooldown_seconds:.0f}s"
+                        f"cooling down {cooldown:.0f}s"
                     )
-                    time.sleep(self.config.supervision.cooldown_seconds)
+                    time.sleep(cooldown)
                     continue
                 result = self.record_restart_budget_exhausted(result, count)
                 results[-1] = result
@@ -1582,15 +1586,17 @@ class VibeRunner:
                         transient_retries[result.task_id] = count
                         if count <= self.config.supervision.max_restarts:
                             self.record_task_restart(result, count, exhausted=False)
+                            cooldown = transient_failure_cooldown(
+                                result, self.config.supervision.cooldown_seconds
+                            )
                             retry_ready_at[result.task_id] = (
-                                time.monotonic()
-                                + self.config.supervision.cooldown_seconds
+                                time.monotonic() + cooldown
                             )
                             report_status(
                                 f"transient failure for {result.task_id} "
                                 f"(restart {count}/"
                                 f"{self.config.supervision.max_restarts}), "
-                                "will re-enqueue"
+                                f"will re-enqueue after {cooldown:.0f}s"
                             )
                             continue
                         result = self.record_restart_budget_exhausted(result, count)
@@ -3990,6 +3996,30 @@ def is_transient_worker_failure(
     except OSError:
         return False
     return is_transient_stderr(tail)
+
+
+def transient_failure_cooldown(
+    result: RunResult,
+    default_cooldown: float,
+    log_tail_lines: int = LOG_TAIL_LINES_FOR_TRANSIENT_CHECK,
+) -> float:
+    """Cooldown before retrying a transient failure.
+
+    Quota/usage-limit failures advertise a reset time (e.g. "resets 2:40am
+    (UTC)"); retrying before that point burns restart budget for nothing, so
+    the parsed reset delay extends the configured cooldown when present.
+    """
+    log_path = result.log_path
+    if not isinstance(log_path, Path) or not log_path.exists():
+        return default_cooldown
+    try:
+        tail = _read_log_tail(log_path, log_tail_lines)
+    except OSError:
+        return default_cooldown
+    delay = parse_quota_reset_delay(tail)
+    if delay is None:
+        return default_cooldown
+    return max(default_cooldown, delay)
 
 
 def next_retry_delay(retry_ready_at: dict[str, float]) -> float | None:

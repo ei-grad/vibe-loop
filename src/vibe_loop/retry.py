@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import errno
 import random
 import re
@@ -26,6 +27,8 @@ TRANSIENT_STDERR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"resource[_\s]exhausted", re.IGNORECASE),
     re.compile(r"temporarily\s+unavailable", re.IGNORECASE),
     re.compile(r"try\s+again\s+later", re.IGNORECASE),
+    re.compile(r"(session|usage|weekly|5-hour)\s+limit", re.IGNORECASE),
+    re.compile(r"hit your[^\n]{0,40}\blimit\b", re.IGNORECASE),
     re.compile(r"ECONNRESET", re.IGNORECASE),
     re.compile(r"ETIMEDOUT", re.IGNORECASE),
     re.compile(r"connection\s+(reset|refused|timed\s*out)", re.IGNORECASE),
@@ -39,6 +42,47 @@ TRANSIENT_OSERROR_ERRNOS: frozenset[int] = frozenset(
         errno.ENFILE,
     }
 )
+
+QUOTA_RESET_PATTERN = re.compile(
+    r"resets?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*\(?UTC\)?",
+    re.IGNORECASE,
+)
+QUOTA_RESET_MARGIN_SECONDS = 120.0
+QUOTA_RESET_MAX_DELAY_SECONDS = 8 * 3600.0
+
+
+def parse_quota_reset_delay(
+    text: str,
+    *,
+    now: datetime.datetime | None = None,
+) -> float | None:
+    """Seconds until an advertised quota reset (e.g. "resets 2:40am (UTC)").
+
+    Returns None when the text carries no parseable reset time. The delay
+    includes a safety margin and is capped so a misparsed time cannot stall
+    the loop for more than QUOTA_RESET_MAX_DELAY_SECONDS.
+    """
+    match = QUOTA_RESET_PATTERN.search(text)
+    if match is None:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2) or 0)
+    meridiem = (match.group(3) or "").lower()
+    if minute > 59:
+        return None
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    elif hour > 23:
+        return None
+    current = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset <= current:
+        reset += datetime.timedelta(days=1)
+    delay = (reset - current).total_seconds() + QUOTA_RESET_MARGIN_SECONDS
+    return min(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+
 
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = 10.0

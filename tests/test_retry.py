@@ -9,12 +9,65 @@ from vibe_loop.retry import (
     DEFAULT_BASE_DELAY,
     DEFAULT_JITTER,
     DEFAULT_MAX_DELAY,
+    QUOTA_RESET_MARGIN_SECONDS,
+    QUOTA_RESET_MAX_DELAY_SECONDS,
     backoff_delay,
     is_transient_oserror,
     is_transient_stderr,
     is_transient_subprocess_result,
+    parse_quota_reset_delay,
     retry_subprocess_run,
 )
+
+
+class QuotaResetDelayTests(unittest.TestCase):
+    def test_parses_am_pm_reset_time(self) -> None:
+        import datetime
+
+        now = datetime.datetime(2026, 6, 10, 0, 50, tzinfo=datetime.timezone.utc)
+        delay = parse_quota_reset_delay(
+            "You've hit your session limit · resets 2:40am (UTC)", now=now
+        )
+        self.assertIsNotNone(delay)
+        self.assertAlmostEqual(
+            delay, 110 * 60 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
+        )
+
+    def test_parses_hour_only_pm_time(self) -> None:
+        import datetime
+
+        now = datetime.datetime(2026, 6, 10, 20, 0, tzinfo=datetime.timezone.utc)
+        delay = parse_quota_reset_delay("limit resets 11pm (UTC)", now=now)
+        self.assertIsNotNone(delay)
+        self.assertAlmostEqual(
+            delay, 3 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
+        )
+
+    def test_reset_time_already_passed_rolls_to_next_day_capped(self) -> None:
+        import datetime
+
+        now = datetime.datetime(2026, 6, 10, 23, 0, tzinfo=datetime.timezone.utc)
+        delay = parse_quota_reset_delay("resets 1:00am (UTC)", now=now)
+        self.assertIsNotNone(delay)
+        self.assertLessEqual(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+        self.assertAlmostEqual(
+            delay, 2 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
+        )
+
+    def test_far_future_reset_is_capped(self) -> None:
+        import datetime
+
+        now = datetime.datetime(2026, 6, 10, 1, 0, tzinfo=datetime.timezone.utc)
+        delay = parse_quota_reset_delay("resets 11:59pm (UTC)", now=now)
+        self.assertEqual(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+
+    def test_no_reset_time_returns_none(self) -> None:
+        self.assertIsNone(parse_quota_reset_delay("rate limit exceeded"))
+        self.assertIsNone(parse_quota_reset_delay("plain failure output"))
+
+    def test_invalid_times_return_none(self) -> None:
+        self.assertIsNone(parse_quota_reset_delay("resets 13:00pm (UTC)"))
+        self.assertIsNone(parse_quota_reset_delay("resets 25:00 (UTC)"))
 
 
 class TransientStderrDetectionTests(unittest.TestCase):
@@ -40,6 +93,16 @@ class TransientStderrDetectionTests(unittest.TestCase):
         self.assertTrue(is_transient_stderr("overloaded, please wait"))
         self.assertTrue(is_transient_stderr("API throttled"))
         self.assertTrue(is_transient_stderr("resource_exhausted"))
+
+    def test_detects_session_and_usage_limit_patterns(self) -> None:
+        self.assertTrue(
+            is_transient_stderr(
+                "You've hit your session limit · resets 2:40am (UTC)"
+            )
+        )
+        self.assertTrue(is_transient_stderr("usage limit reached"))
+        self.assertTrue(is_transient_stderr("weekly limit will reset"))
+        self.assertTrue(is_transient_stderr("You've hit your 5-hour limit"))
 
     def test_detects_connection_errors(self) -> None:
         self.assertTrue(is_transient_stderr("ECONNRESET"))
