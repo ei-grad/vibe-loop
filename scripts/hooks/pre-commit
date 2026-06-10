@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  echo "pre-commit: $*" >&2
+  exit 1
+}
+
+command -v ruff >/dev/null 2>&1 || fail "ruff is not on PATH"
+
+ruff check || fail "ruff check failed"
+ruff format --check || fail "ruff format --check failed (run: ruff format)"

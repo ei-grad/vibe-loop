@@ -32,14 +32,17 @@ release-gate:
 	  --record-output $(RELEASE_RECORD)
 
 install-hooks:
-	@mkdir -p .git/hooks
-	@if [ -f .git/hooks/pre-push ] && ! grep -q 'scripts/hooks/pre-push' .git/hooks/pre-push; then \
-	  echo ".git/hooks/pre-push already exists and is not managed by this repo" >&2; \
-	  exit 1; \
-	fi
-	@printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' 'exec "$$repo_root/scripts/hooks/pre-push" "$$@"' > .git/hooks/pre-push
-	@chmod +x .git/hooks/pre-push
-	@echo "installed .git/hooks/pre-push"
+	@hooks_dir="$$(git rev-parse --git-common-dir)/hooks"; \
+	mkdir -p "$$hooks_dir"; \
+	for hook in pre-commit pre-push; do \
+	  if [ -f "$$hooks_dir/$$hook" ] && ! grep -q "scripts/hooks/$$hook" "$$hooks_dir/$$hook"; then \
+	    echo "$$hooks_dir/$$hook already exists and is not managed by this repo" >&2; \
+	    exit 1; \
+	  fi; \
+	  printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' "exec \"\$$repo_root/scripts/hooks/$$hook\" \"\$$@\"" > "$$hooks_dir/$$hook"; \
+	  chmod +x "$$hooks_dir/$$hook"; \
+	  echo "installed $$hooks_dir/$$hook"; \
+	done
 
 version-check:
 	@version="$(VERSION)"; \

@@ -851,7 +851,8 @@ make tag
 ```
 
 `make tag` uses the current `uv version --short` value by default; pass
-`VERSION=...` to check or tag an explicit version. The installed `pre-push` hook
+`VERSION=...` to check or tag an explicit version. The installed `pre-commit`
+hook runs `ruff check` and `ruff format --check`; the installed `pre-push` hook
 rejects pushed `v*` tags when `pyproject.toml` or the `vibe-loop` entry in
 `uv.lock` does not match the tag.
 
