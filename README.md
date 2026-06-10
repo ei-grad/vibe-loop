@@ -110,6 +110,31 @@ operator skill:
   between cycles with `vibe-loop wait-helper`. Unlike the worker skills it drives
   the CLI by design, and it never edits the main worktree itself.
 
+The worker skills share one slice lifecycle; the operator skill drives a worker
+pool and delegates to them. They compose rather than transition into each other:
+
+```mermaid
+flowchart TB
+    subgraph workers["Worker skills — carry a slice through its lifecycle"]
+        VL["<b>vibe-loop</b><br/>one bounded slice"]
+        IVL["<b>infinite-vibe-loop</b><br/>unattended continuation"]
+        OVL["<b>orchestrated-vibe-loop</b><br/>roles split across agents"]
+    end
+    subgraph operator["Operator skill — stewards a running loop"]
+        AP["<b>autopilot</b><br/>drives the CLI, never edits main"]
+    end
+
+    IVL -->|each iteration is one| VL
+    OVL -.->|same lifecycle,<br/>states assigned to roles| VL
+    AP -->|supervises or observes| RUD["vibe-loop run-until-done<br/>(CLI worker pool)"]
+    RUD -->|launches workers running| VL
+    AP -->|replenishes ready queue via| OVL
+```
+
+See [docs/skill-work-modes.md](docs/skill-work-modes.md) for the slice-lifecycle
+state machine, the orchestrated swimlane, the autopilot operator cycle, and a
+mode-selection guide.
+
 Install them into Codex and/or Claude:
 
 ```bash
