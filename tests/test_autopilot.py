@@ -1061,7 +1061,7 @@ class AutopilotRegistryTests(unittest.TestCase):
                 [entry.name for entry in reloaded.entries], ["alpha", "beta"]
             )
             self.assertEqual(reloaded.find("beta").repo, Path("/repos/beta"))
-            self.assertEqual(reloaded.find("/repos/alpha").name, "alpha")
+            self.assertEqual(reloaded.find(str(Path("/repos/alpha"))).name, "alpha")
             self.assertIsNone(reloaded.find("missing"))
 
             # Re-registering a name replaces the prior entry rather than duplicating.

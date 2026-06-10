@@ -594,12 +594,16 @@ class VibeRunner:
                 timeout=900,
                 on_retry=_analysis_retry_callback,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            report_status(f"analysis agent failed to start: {exc}")
             return None
         if result.returncode != 0:
+            stderr_tail = (result.stderr or "")[-500:]
+            report_status(f"analysis agent exited {result.returncode}: {stderr_tail}")
             return None
         payload = selection_payload_from_output(result.stdout)
         if not isinstance(payload, dict):
+            report_status("analysis agent output contained no JSON object payload")
             return None
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)

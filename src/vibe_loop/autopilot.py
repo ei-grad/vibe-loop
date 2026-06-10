@@ -833,8 +833,25 @@ def maintenance_command_env(
 
 
 def kill_command_process_group(process: subprocess.Popen[bytes]) -> None:
+    if os.name == "nt":
+        # process.kill() would reap only the shell, orphaning its children
+        # (which then keep the cwd and pipes alive); taskkill /T kills the
+        # whole tree.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                check=False,
+            )
+        except OSError:
+            pass
+        try:
+            process.kill()
+        except OSError:
+            pass
+        return
     try:
-        if os.name != "nt" and hasattr(os, "killpg"):
+        if hasattr(os, "killpg"):
             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
             return
     except (ProcessLookupError, OSError):

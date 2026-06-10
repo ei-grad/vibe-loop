@@ -3150,6 +3150,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         )
         self.assertEqual(result, 7)
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_worker_exiting_within_grace_is_not_killed(self):
         proc = FakeWatchdogProcess(alive_polls=2)
         killed: list[tuple[int, int]] = []
@@ -3166,6 +3169,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(killed, [])
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_worker_hung_after_terminal_report_is_reaped(self):
         proc = FakeWatchdogProcess(alive_polls=10_000)
         killed: list[tuple[int, int]] = []
@@ -3183,6 +3189,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertTrue(killed)
         self.assertEqual(killed[0], (proc.pid, signal.SIGTERM))
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_not_eligible_keeps_waiting_without_killing(self):
         proc = FakeWatchdogProcess(alive_polls=3)
         killed: list[tuple[int, int]] = []
@@ -3199,6 +3208,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(killed, [])
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_reap_check_exception_does_not_abort_supervision(self):
         proc = FakeWatchdogProcess(alive_polls=2)
 
@@ -3219,6 +3231,9 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(killed, [])
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_terminate_sigterm_then_sigkill_when_group_lingers(self):
         # SIGTERM is sent, the group does not die within the grace, so SIGKILL
         # follows. alive_polls=1 makes the post-SIGTERM wait(timeout=...) raise
