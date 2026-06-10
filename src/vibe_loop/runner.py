@@ -1615,9 +1615,7 @@ class VibeRunner:
                             cooldown = transient_failure_cooldown(
                                 result, self.config.supervision.cooldown_seconds
                             )
-                            retry_ready_at[result.task_id] = (
-                                time.monotonic() + cooldown
-                            )
+                            retry_ready_at[result.task_id] = time.monotonic() + cooldown
                             report_status(
                                 f"transient failure for {result.task_id} "
                                 f"(restart {count}/"

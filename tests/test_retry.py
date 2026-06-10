@@ -29,9 +29,7 @@ class QuotaResetDelayTests(unittest.TestCase):
             "You've hit your session limit · resets 2:40am (UTC)", now=now
         )
         self.assertIsNotNone(delay)
-        self.assertAlmostEqual(
-            delay, 110 * 60 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
-        )
+        self.assertAlmostEqual(delay, 110 * 60 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0)
 
     def test_parses_hour_only_pm_time(self) -> None:
         import datetime
@@ -39,9 +37,7 @@ class QuotaResetDelayTests(unittest.TestCase):
         now = datetime.datetime(2026, 6, 10, 20, 0, tzinfo=datetime.timezone.utc)
         delay = parse_quota_reset_delay("limit resets 11pm (UTC)", now=now)
         self.assertIsNotNone(delay)
-        self.assertAlmostEqual(
-            delay, 3 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
-        )
+        self.assertAlmostEqual(delay, 3 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0)
 
     def test_reset_time_already_passed_rolls_to_next_day_capped(self) -> None:
         import datetime
@@ -50,9 +46,7 @@ class QuotaResetDelayTests(unittest.TestCase):
         delay = parse_quota_reset_delay("resets 1:00am (UTC)", now=now)
         self.assertIsNotNone(delay)
         self.assertLessEqual(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
-        self.assertAlmostEqual(
-            delay, 2 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
-        )
+        self.assertAlmostEqual(delay, 2 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0)
 
     def test_far_future_reset_is_capped(self) -> None:
         import datetime
@@ -96,9 +90,7 @@ class TransientStderrDetectionTests(unittest.TestCase):
 
     def test_detects_session_and_usage_limit_patterns(self) -> None:
         self.assertTrue(
-            is_transient_stderr(
-                "You've hit your session limit · resets 2:40am (UTC)"
-            )
+            is_transient_stderr("You've hit your session limit · resets 2:40am (UTC)")
         )
         self.assertTrue(is_transient_stderr("usage limit reached"))
         self.assertTrue(is_transient_stderr("weekly limit will reset"))
