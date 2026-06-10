@@ -25,6 +25,12 @@ def prepare_shell_command(
     parts = _split_windows_command(command)
     resolved = shutil.which(parts[0])
     if resolved is None:
+        # Python 3.12+ shutil.which on Windows matches only PATHEXT
+        # extensions, so an explicit path to a .py script resolves to None;
+        # route it through the interpreter instead of the cmd.exe fallback
+        # (whose .py association runs detached from the captured pipes).
+        if parts[0].lower().endswith(".py") and Path(parts[0]).is_file():
+            return [sys.executable, *parts], False
         return command, True
     if resolved.lower().endswith((".cmd", ".bat")):
         script = _resolve_cmd_wrapper_target(resolved)
