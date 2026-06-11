@@ -1424,9 +1424,11 @@ class VibeRunner:
                 count = transient_retries.get(result.task_id, 0) + 1
                 transient_retries[result.task_id] = count
                 if count <= self.config.supervision.max_restarts:
-                    self.record_task_restart(result, count, exhausted=False)
                     cooldown = transient_failure_cooldown(
                         result, self.config.supervision.cooldown_seconds
+                    )
+                    self.record_task_restart(
+                        result, count, exhausted=False, cooldown_seconds=cooldown
                     )
                     report_status(
                         f"transient failure for {result.task_id} "
@@ -1615,9 +1617,14 @@ class VibeRunner:
                         count = transient_retries.get(result.task_id, 0) + 1
                         transient_retries[result.task_id] = count
                         if count <= self.config.supervision.max_restarts:
-                            self.record_task_restart(result, count, exhausted=False)
                             cooldown = transient_failure_cooldown(
                                 result, self.config.supervision.cooldown_seconds
+                            )
+                            self.record_task_restart(
+                                result,
+                                count,
+                                exhausted=False,
+                                cooldown_seconds=cooldown,
                             )
                             retry_ready_at[result.task_id] = time.monotonic() + cooldown
                             report_status(
@@ -1695,18 +1702,21 @@ class VibeRunner:
         exhausted: bool,
         attempted_restart_count: int | None = None,
         reason: str | None = None,
+        cooldown_seconds: float | None = None,
     ) -> None:
         if reason is None:
             reason = (
                 "restart_budget_exhausted" if exhausted else "transient_worker_failure"
             )
+        if cooldown_seconds is None:
+            cooldown_seconds = self.config.supervision.cooldown_seconds
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_restart(
                 run_id=result.run_id,
                 task_id=result.task_id,
                 restart_count=restart_count,
                 max_restarts=self.config.supervision.max_restarts,
-                cooldown_seconds=self.config.supervision.cooldown_seconds,
+                cooldown_seconds=cooldown_seconds,
                 reason=reason,
                 exhausted=exhausted,
                 attempted_restart_count=attempted_restart_count,
