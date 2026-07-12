@@ -1925,9 +1925,14 @@ class VibeRunner:
         if exit_code != 0 or message:
             return ClassificationResult("failed", "exit_code_or_completion_check")
         task = self.source.probe(task_id)
-        if task and task.status == "Done":
+        # Status comparisons must be case-insensitive: only done-statuses get
+        # canonicalized at parse time (normalize_status), and command task
+        # sources pass the adapter's wire status through verbatim (e.g.
+        # lowercase "done"). A case miss here downgrades a finished run to
+        # "unknown", which spawns a needless recovery worker.
+        if task and task.done:
             return ClassificationResult("completed", "task_probe")
-        if task and task.status == "Gated":
+        if task and task.status.casefold() == "gated":
             return ClassificationResult("blocked", "task_probe")
         if start_main != end_main and task is None:
             return ClassificationResult("completed", "main_change")

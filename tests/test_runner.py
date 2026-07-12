@@ -624,6 +624,36 @@ class RunnerTests(unittest.TestCase):
                         self.assertEqual(result.status, status)
                         self.assertEqual(result.source, "worker_report")
 
+    def test_classify_task_probe_statuses_are_case_insensitive(self) -> None:
+        # Command task sources pass wire statuses through verbatim (e.g. a
+        # loopyard adapter returns lowercase "done"), so the probe fallback
+        # must not depend on canonical capitalization.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+
+            for raw_status, expected in (
+                ("Done", "completed"),
+                ("done", "completed"),
+                ("DONE", "completed"),
+                ("Gated", "blocked"),
+                ("gated", "blocked"),
+                ("GATED", "blocked"),
+            ):
+                with self.subTest(status=raw_status):
+                    runner._source = MutableTaskSource(
+                        [
+                            Task(
+                                task_id="TASK-01",
+                                title="Task 1",
+                                status=raw_status,
+                                order=1,
+                            )
+                        ]
+                    )
+                    result = runner.classify("TASK-01", 0, "aaa", "aaa", "", None)
+                    self.assertEqual(result.status, expected)
+                    self.assertEqual(result.source, "task_probe")
+
     def test_run_until_done_parallel_honors_jobs_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
