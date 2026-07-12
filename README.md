@@ -296,8 +296,6 @@ vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
 vibe-loop doctor --repo . --json
 vibe-loop specs check --repo . --json
-vibe-loop planning artifacts --repo . --check
-vibe-loop planning benchmark-duration --repo . --check
 vibe-loop --version
 ```
 
@@ -344,8 +342,6 @@ vibe-loop autopilot run --repo . --once
 vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects status --json
-vibe-loop autopilot tui --registry
-vibe-loop autopilot webui --registry --port 8765
 vibe-loop wait-helper --pid 12345 --json
 ```
 
@@ -353,7 +349,8 @@ vibe-loop wait-helper --pid 12345 --json
 workers, stale locks, workspace diagnostics, git refs/dirty state, the
 main-integration lock, supervisor state, blockers, and the last cycle. It never
 starts a worker or mutates state. The `--json` `ProjectStatus` payload is the
-machine-readable boundary shared by every surface below.
+machine-readable boundary consumed by external status surfaces such as the
+loopyard web UI (board, agents, and timeline screens).
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch
@@ -388,14 +385,11 @@ project keeps its own state directory. `projects status [--json]` returns one
 aggregate entry per repo, and a repo that cannot be read becomes an isolated
 error entry so one broken project never hides the others.
 
-**`tui`** opens a read-only [Textual](https://textual.textualize.io/) dashboard
-over the status API. It is an optional extra: `pip install vibe-loop[tui]` (or
-`uv add textual`); without `textual` it prints an install hint and exits, keeping
-the CLI dependency-free. **`webui`** serves the same read-only status from a
-standard-library web server, binding to `127.0.0.1:8765` by default
-(`--host`/`--port`). It answers only `GET` (status page + `GET /api/status`) and
-rejects writes; `--host 0.0.0.0` exposes status to the network, so use it only on
-a trusted host. Both take `--repo` (single, default) or `--registry [PATH]`.
+Interactive status dashboards (board, agents, and timeline/Gantt screens) live
+in the [loopyard](https://github.com/ei-grad/loopyard) web UI, which consumes the
+read-only `autopilot status --json` / `projects status --json` boundary. The
+former in-tree `autopilot tui` (Textual) and `autopilot webui` surfaces were
+removed in favor of loopyard.
 
 The top-level **`vibe-loop wait-helper`** blocks until a watched process exits or
 a wall-clock deadline arrives, so an unattended steward can sleep between cycles.
@@ -463,32 +457,12 @@ require_clean_repo = true   # set false to let a dirty tree run a cycle
 # summary_command = "scripts/summary.sh"
 # troubleshoot_command = "scripts/troubleshoot.sh"
 # planning_command = "scripts/plan.sh"
-
-[planning_analytics]
-schedule_policy = "current-runner-parity"
-subject_matching = "diagnostic"
-# worklog_command = "my-worklog export --jsonl"   # optional collector adapter
-
-[planning_analytics.duration_model]
-name = "robust-duration-baseline-v1"
-group_min_sample_count = 2
-similarity_min_score = 0.35
-similarity_max_examples = 3
-similarity_blend_weight = 0.25
-fallback_minutes = 60
-
-[planning_analytics.outputs]
-# Omitted paths write under <state_dir>/planning-analytics.
-# timeline_json = "docs/planning/timeline.json"
-# gantt_html = "docs/planning/gantt.html"
-# benchmark_json = "docs/planning/duration-benchmark.json"
-# benchmark_markdown = "docs/planning/duration-benchmark.md"
 ```
 
 When `--repo` points at a Git linked worktree without its own `.vibe-loop.toml`,
 `vibe-loop` falls back to the main worktree's config (warning on stderr).
-Runtime state, locks, logs, caches, and analytics outputs still live under the
-invoked `--repo` worktree.
+Runtime state, locks, logs, and caches still live under the invoked `--repo`
+worktree.
 
 ### Agent command and prompt dialect
 
@@ -719,26 +693,12 @@ schema, precedence, stale-cache behavior, and degradation states.
 
 ## Planning Analytics
 
-Planning analytics is a reporting boundary over normalized tasks, run records,
-optional worklogs, and bounded git metadata. It does not affect task selection,
-locks, or completion classification. Artifacts default to
-`<state_dir>/planning-analytics`, so analytics never mutate repository docs
-unless you opt in with explicit output paths.
-
-```bash
-vibe-loop planning artifacts --repo .            # timeline JSON + static Gantt HTML
-vibe-loop planning artifacts --repo . --check    # rebuild and fail if stale/missing
-vibe-loop planning benchmark-duration --repo . --check
-```
-
-Coverage uses authoritative mappings only — task-source completion state, worker
-reports, optional worklogs, explicit commit references, and `Plan-Item:` commit
-trailers; subject matching, branch names, and raw logs are diagnostic. Projected
-timelines default to `current-runner-parity` (the runner's dependency readiness
-and deterministic order); `lightmetrics-parity` is available for comparison.
-Duration estimates use robust historical baselines from completed spans.
-`vibe-loop doctor` reports analytics readiness without running a collector. See
-[`docs/planning-analytics.md`](docs/planning-analytics.md) for the full contract.
+Planning timeline and Gantt analytics were removed from vibe-loop; those
+reporting surfaces now live in the [loopyard](https://github.com/ei-grad/loopyard)
+web UI (board, agents, and timeline screens) over the read-only
+`autopilot status --json` boundary. See
+[`docs/planning-analytics.md`](docs/planning-analytics.md) for the superseded
+in-tree contract.
 
 ## Local State
 
@@ -818,7 +778,7 @@ progress instead of relying on one long interactive chat. The main differences:
 
 The current implementation supports generated task-source profiles,
 command-backed sources, dependencies, conflict domains, finite workers, run logs,
-structured reports, planning analytics, and skill evals. Planned spec-driven
+structured reports, and skill evals. Planned spec-driven
 additions stay below the authoring layer:
 
 - parser presets for Spec Kit, Kiro, OpenSpec, and similar artifacts;

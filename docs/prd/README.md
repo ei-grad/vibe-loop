@@ -30,10 +30,10 @@ plan IDs stable when adding PRD coverage.
 | `PRD-TSK-*` | `task-discovery.md` | Task-source normalization, Markdown profiles, generated discovery cache, command adapters, precedence, and degraded states. |
 | `PRD-WRK-*` | `worker-supervision.md` | Worker execution, locks, reports, parallel scheduling, workspace claims, integration locking, and stale state visibility. |
 | `PRD-SKL-*` | `skills.md` | Bundled finite and infinite skills, installation, workflow contracts, review discipline, and skill release readiness. |
-| `PRD-ANL-*` | `planning-analytics.md` | Planning evidence, timeline/Gantt artifacts, duration benchmarking, coverage semantics, and `doctor` readiness. |
+| `PRD-ANL-*` | `planning-analytics.md` | _(Superseded — feature removed; timeline/Gantt now in loopyard.)_ Planning evidence, timeline/Gantt artifacts, duration benchmarking, coverage semantics, and `doctor` readiness. |
 | `PRD-EVL-*` | `evals-release.md` | Local skill eval suites, artifact schema, aggregate reporting, external benchmark adapters, and release gates. |
 | `PRD-SDE-*` | `spec-driven-execution.md` | Execution-engine support for spec-driven workflows, task-layer adapters, traceability, gates, drift checks, worker context, and completion evidence. |
-| `PRD-AUT-*` | `autopilot.md` | Persistent autopilot supervision, reusable status core, append-only cycle records, future multi-project management, and TUI/WebUI readiness. |
+| `PRD-AUT-*` | `autopilot.md` | Persistent autopilot supervision, reusable status core, append-only cycle records, future multi-project management, and status-boundary readiness. _(In-tree TUI/WebUI removed; dashboards now in loopyard.)_ |
 
 Plan rows should cite PRD IDs in `Scope`, `Acceptance`, or `Evidence` when a
 slice implements or changes a contract. A single plan row may satisfy multiple

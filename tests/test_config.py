@@ -9,13 +9,11 @@ from unittest.mock import patch
 from vibe_loop.config import (
     AgentResolutionError,
     GENERATED_TASK_PROFILE_CACHE_FILE,
-    PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY,
     SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
     SUPERVISION_DEFAULT_MAX_RESTARTS,
     detect_agent_clis,
     load_config,
     parse_main_worktree_path,
-    planning_analytics_report,
     reject_generated_command_adapters,
 )
 from vibe_loop.generated_discovery import EvidenceBundle, EvidenceFile, EvidenceLimits
@@ -1138,153 +1136,6 @@ class ConfigTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "task_source.plan_paths"):
-                load_config(repo)
-
-    def test_planning_analytics_defaults_use_state_dir_without_mutating_docs(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory).resolve()
-            docs = repo / "docs"
-            docs.mkdir()
-            plan = docs / "PLAN.md"
-            plan.write_text("# Plan\n", encoding="utf-8")
-
-            config = load_config(repo)
-            report = planning_analytics_report(config)
-            state_dir_exists = (repo / ".vibe-loop").exists()
-            plan_text = plan.read_text(encoding="utf-8")
-
-        self.assertEqual(
-            config.planning_analytics.schedule_policy,
-            PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY,
-        )
-        self.assertEqual(report["schedule_policy_source"], "default")
-        self.assertFalse(report["repo_artifact_outputs_enabled"])
-        self.assertEqual(
-            report["outputs"]["timeline_json"]["path"],
-            str(repo / ".vibe-loop" / "planning-analytics" / "timeline.json"),
-        )
-        self.assertEqual(
-            report["outputs"]["timeline_json"]["source"],
-            "default_state_dir",
-        )
-        self.assertFalse(state_dir_exists)
-        self.assertEqual(plan_text, "# Plan\n")
-
-    def test_planning_analytics_explicit_artifact_paths_are_opt_in(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory).resolve()
-            (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics.outputs]\n"
-                'timeline_json = "docs/planning/timeline.json"\n'
-                'gantt_html = "docs/planning/gantt.html"\n',
-                encoding="utf-8",
-            )
-
-            config = load_config(repo)
-            report = planning_analytics_report(config)
-
-        self.assertTrue(report["repo_artifact_outputs_enabled"])
-        self.assertEqual(
-            report["outputs"]["timeline_json"],
-            {
-                "path": str(repo / "docs" / "planning" / "timeline.json"),
-                "source": "explicit",
-            },
-        )
-        self.assertEqual(
-            report["outputs"]["gantt_html"],
-            {
-                "path": str(repo / "docs" / "planning" / "gantt.html"),
-                "source": "explicit",
-            },
-        )
-        self.assertEqual(
-            report["outputs"]["benchmark_json"]["source"],
-            "default_state_dir",
-        )
-
-    def test_planning_analytics_schedule_policy_is_serialized(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            (repo / ".vibe-loop.toml").write_text(
-                '[planning_analytics]\nschedule_policy = "lightmetrics-parity"\n',
-                encoding="utf-8",
-            )
-
-            config = load_config(repo)
-            report = planning_analytics_report(config)
-
-        self.assertEqual(
-            config.planning_analytics.schedule_policy, "lightmetrics-parity"
-        )
-        self.assertEqual(report["schedule_policy"], "lightmetrics-parity")
-        self.assertEqual(report["schedule_policy_source"], "explicit")
-
-    def test_planning_analytics_duration_model_config_is_serialized(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics.duration_model]\n"
-                "group_min_sample_count = 3\n"
-                "similarity_min_score = 0.5\n"
-                "similarity_max_examples = 2\n"
-                "similarity_blend_weight = 0.1\n"
-                "fallback_minutes = 90\n",
-                encoding="utf-8",
-            )
-
-            config = load_config(repo)
-            report = planning_analytics_report(config)
-
-        self.assertEqual(
-            report["duration_model"],
-            {
-                "name": "robust-duration-baseline-v1",
-                "parameters": {
-                    "group_min_sample_count": 3,
-                    "similarity_min_score": 0.5,
-                    "similarity_max_examples": 2,
-                    "similarity_blend_weight": 0.1,
-                    "fallback_minutes": 90,
-                },
-            },
-        )
-
-    def test_planning_analytics_rejects_invalid_duration_model_config(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics.duration_model]\nsimilarity_blend_weight = 2.0\n",
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "similarity_blend_weight"):
-                load_config(repo)
-
-    def test_planning_analytics_rejects_non_finite_duration_model_float(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            (repo / ".vibe-loop.toml").write_text(
-                "[planning_analytics.duration_model]\nsimilarity_min_score = nan\n",
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "similarity_min_score"):
-                load_config(repo)
-
-    def test_planning_analytics_rejects_paths_outside_repo(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            (repo / ".vibe-loop.toml").write_text(
-                '[planning_analytics.outputs]\ntimeline_json = "../timeline.json"\n',
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "repo-relative path"):
                 load_config(repo)
 
 

@@ -4,6 +4,12 @@ This PRD owns Level 2 contracts for the `vibe-loop` command-line runtime,
 configuration, command output, local state boundaries, and package/release
 surface.
 
+> **Note:** Mentions of planning analytics below (the `planning` subcommands, the
+> `[planning_analytics]` config settings, and planning-analytics state artifacts)
+> are superseded — that feature was removed from vibe-loop. Timeline/Gantt
+> reporting now lives in the [loopyard](https://github.com/ei-grad/loopyard) web
+> UI. See `planning-analytics.md` for the retired contract.
+
 ## PRD-CLI-001 Command Surface
 
 The CLI must expose task inspection, task configuration, single-slice execution,
