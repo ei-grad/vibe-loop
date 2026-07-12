@@ -467,6 +467,7 @@ class VibeRunner:
         tasks = runnable_tasks(
             self.source,
             self.source_resolution.task_source.runnable_statuses,
+            self.source_resolution.task_source.respect_source_order,
         )
         active_domains = active_lock_conflict_domains(self.lock_manager)
         enforce_conflicts = resource_conflicts_enabled(tasks, active_domains)
