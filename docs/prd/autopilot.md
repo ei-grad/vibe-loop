@@ -8,8 +8,8 @@ worker implementation, branch/worktree management, review, merge, or cleanup.
 ## PRD-AUT-001 Reusable Status Core
 
 Autopilot must be implemented as a reusable service/status core with thin CLI
-rendering, so future TUI, WebUI, and multi-project views can consume structured
-state without scraping terminal text.
+rendering, so external views (such as the loopyard web UI) and multi-project
+tooling can consume structured state without scraping terminal text.
 
 Acceptance must cover a dedicated autopilot module, structured project status
 objects, one-cycle result objects, bounded git/task/worker/lock/supervisor
@@ -143,6 +143,12 @@ required for the first implementation.
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-06`.
 
 ## PRD-AUT-008 TUI And WebUI Readiness
+
+> **Superseded (removed from vibe-loop).** The in-tree `autopilot tui` (Textual)
+> and `autopilot webui` surfaces were removed; interactive dashboards now live in
+> the [loopyard](https://github.com/ei-grad/loopyard) web UI. The still-active
+> requirement here is the machine-readable `autopilot status --json` boundary that
+> loopyard consumes; the TUI/WebUI acceptance items below are historical.
 
 TUI and WebUI implementations are future work, but autopilot must expose a
 machine-readable status boundary that makes them straightforward follow-ups.

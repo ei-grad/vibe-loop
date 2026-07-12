@@ -1,5 +1,13 @@
 # Planning Analytics Contract
 
+> **Superseded (removed from vibe-loop).** The in-tree planning-analytics
+> commands (`vibe-loop planning timeline/artifacts/benchmark-duration`),
+> `[planning_analytics]` config, and the timeline/Gantt artifact generators were
+> removed. Timeline and Gantt reporting now live in the
+> [loopyard](https://github.com/ei-grad/loopyard) web UI over the read-only
+> `autopilot status --json` boundary. The contract below is retained for
+> historical reference only.
+
 Planning analytics is a reporting boundary above task discovery and run
 recording. It must not become a scheduler, task selector, or completion source
 for the finite worker loop. The first supported outputs are generated planning

@@ -1,5 +1,14 @@
 # Vibe Loop Plan
 
+> **Superseded features (removed).** The completed rows for the autopilot TUI
+> (`AUTO-07`), autopilot WebUI (`AUTO-08`), and planning timeline/Gantt analytics
+> (`GANTT-01`..`GANTT-07`) describe surfaces that have since been removed from
+> vibe-loop. Status dashboards and timeline/Gantt reporting now live in the
+> [loopyard](https://github.com/ei-grad/loopyard) web UI over the read-only
+> `autopilot status --json` boundary. The rows are kept as Done history; the code,
+> config (`[planning_analytics]`), and `planning` / `autopilot tui|webui` commands
+> they delivered no longer exist.
+
 ## Implementation Order
 
 1. Finish single-worker foundations: run records, flexible plan discovery,
