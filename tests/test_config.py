@@ -708,6 +708,39 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.task_source.plan_paths, ("WORK.md", "docs/BACKLOG.md"))
 
+    def test_task_source_respect_source_order_defaults_false(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text("[task_source]\n", encoding="utf-8")
+
+            config = load_config(repo)
+
+        self.assertFalse(config.task_source.respect_source_order)
+
+    def test_task_source_respect_source_order_can_be_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\nrespect_source_order = true\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertTrue(config.task_source.respect_source_order)
+        self.assertTrue(config.task_source.is_explicit("respect_source_order"))
+
+    def test_task_source_respect_source_order_rejects_non_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nrespect_source_order = "yes"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ValueError):
+                load_config(repo)
+
     def test_load_config_falls_back_to_main_worktree_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

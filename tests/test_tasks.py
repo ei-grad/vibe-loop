@@ -12,6 +12,7 @@ from vibe_loop.tasks import (
     build_task_source,
     runnable_tasks,
     task_from_mapping,
+    task_sort_key,
 )
 from vibe_loop.task_views import build_task_views, render_task_tree
 
@@ -28,6 +29,44 @@ PLAN = """# Plan
 | DEMO-04 | P0 | Planned | DEMO-01 | Planned task. | Works. | Not started. |
 | DEMO-05 | P0 | Gated | DEMO-01 | Gated task. | Works. | Gated. |
 """
+
+
+class RespectSourceOrderTests(unittest.TestCase):
+    @staticmethod
+    def _source(tasks: list[Task]) -> object:
+        class _Source:
+            def list_tasks(self) -> list[Task]:
+                return list(tasks)
+
+            def probe(self, task_id: str) -> None:
+                return None
+
+        return _Source()
+
+    def test_flag_makes_source_order_authoritative(self) -> None:
+        # A low-priority task emitted first (order=0) — the "dragged to top"
+        # case — must dispatch before a high-priority task emitted later.
+        low_first = Task("LOW", "Dragged to top", "ready", priority="low", order=0)
+        high_second = Task(
+            "HIGH", "Higher priority, lower in list", "ready", priority="high", order=1
+        )
+        source = self._source([high_second, low_first])  # unsorted input
+
+        respected = runnable_tasks(source, ("ready",), respect_source_order=True)
+        self.assertEqual([task.task_id for task in respected], ["LOW", "HIGH"])
+
+    def test_default_keeps_priority_leading(self) -> None:
+        low_first = Task("LOW", "Emitted first", "ready", priority="low", order=0)
+        high_second = Task("HIGH", "Emitted second", "ready", priority="high", order=1)
+        source = self._source([low_first, high_second])
+
+        default = runnable_tasks(source, ("ready",))
+        self.assertEqual([task.task_id for task in default], ["HIGH", "LOW"])
+
+    def test_task_sort_key_shapes(self) -> None:
+        task = Task("T", "t", "ready", priority="low", order=3)
+        self.assertEqual(task_sort_key(task, respect_source_order=True), (9, 3))
+        self.assertEqual(task_sort_key(task), (9, 99, 3))
 
 
 class MarkdownPlanTests(unittest.TestCase):

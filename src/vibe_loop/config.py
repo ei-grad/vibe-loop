@@ -382,6 +382,12 @@ class TaskSourceConfig:
     next_command: str | None = None
     probe_command: str | None = None
     runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES
+    # Opt-in: when true, the task source's emitted order is authoritative and
+    # the priority band is dropped from the dispatch sort key (see
+    # tasks.task_sort_key). Default false keeps the historical
+    # (status, priority, order) ordering for every deployment that does not set
+    # it — markdown/spec sources are untouched.
+    respect_source_order: bool = False
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     @property
@@ -405,6 +411,7 @@ class TaskSourceConfig:
             "next_command": self.next_command,
             "probe_command": self.probe_command,
             "runnable_statuses": list(self.runnable_statuses),
+            "respect_source_order": self.respect_source_order,
             "explicit_keys": sorted(self.explicit_keys),
             "explicit_source_keys": list(self.explicit_source_keys),
             "allows_generated_cache": self.allows_generated_cache,
@@ -1087,6 +1094,9 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         candidate_paths = tuple(plan_paths)
     else:
         raise ValueError("task_source.plan_paths must be an array of strings")
+    respect_source_order = table.get("respect_source_order", False)
+    if not isinstance(respect_source_order, bool):
+        raise ValueError("task_source.respect_source_order must be a boolean")
     return TaskSourceConfig(
         type=str(table.get("type") or "markdown-plan"),
         plan_path=optional_string(table.get("plan_path")),
@@ -1096,6 +1106,7 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
         runnable_statuses=runnable,
+        respect_source_order=respect_source_order,
         explicit_keys=explicit_keys,
     )
 

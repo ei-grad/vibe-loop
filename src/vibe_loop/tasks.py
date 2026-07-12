@@ -240,7 +240,11 @@ def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
     raise ValueError(f"unsupported task source type: {config.type}")
 
 
-def runnable_tasks(source: TaskSource, statuses: tuple[str, ...]) -> list[Task]:
+def runnable_tasks(
+    source: TaskSource,
+    statuses: tuple[str, ...],
+    respect_source_order: bool = False,
+) -> list[Task]:
     tasks = source.list_tasks()
     done = {task.task_id for task in tasks if task.done}
     allowed = set(statuses)
@@ -251,11 +255,19 @@ def runnable_tasks(source: TaskSource, statuses: tuple[str, ...]) -> list[Task]:
         and task.status in allowed
         and all(dep in done for dep in task.dependencies)
     ]
-    candidates.sort(key=task_sort_key)
+    candidates.sort(key=lambda task: task_sort_key(task, respect_source_order))
     return candidates
 
 
-def task_sort_key(task: Task) -> tuple[int, int, int]:
+def task_sort_key(
+    task: Task, respect_source_order: bool = False
+) -> tuple[int, int] | tuple[int, int, int]:
+    # respect_source_order drops the priority band so the task source's emitted
+    # order (task.order) is the sole tie-break within the status band — the
+    # source becomes the dispatch authority. A single sort call always uses one
+    # mode, so the two key shapes are never compared against each other.
+    if respect_source_order:
+        return (STATUS_RANK.get(task.status, 9), task.order)
     return (
         STATUS_RANK.get(task.status, 9),
         priority_rank(task.priority),
