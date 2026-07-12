@@ -91,20 +91,6 @@ DEFAULT_RUNNABLE_STATUSES = ("Active", "Next", "Planned")
 GENERATED_TASK_PROFILE_CACHE_FILE = "generated-task-source.json"
 GENERATED_TASK_PROFILE_SCHEMA_VERSION = 1
 GENERATED_TASK_PROFILE_PROMPT_VERSION = 1
-PLANNING_ANALYTICS_ARTIFACT_DIR = "planning-analytics"
-PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY = "current-runner-parity"
-PLANNING_ANALYTICS_SCHEDULE_POLICIES = (
-    "current-runner-parity",
-    "lightmetrics-parity",
-)
-PLANNING_ANALYTICS_DEFAULT_OUTPUTS = {
-    "timeline_json": "timeline.json",
-    "gantt_html": "gantt.html",
-    "benchmark_json": "duration-benchmark.json",
-    "benchmark_markdown": "duration-benchmark.md",
-}
-PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES = ("diagnostic", "disabled")
-PLANNING_ANALYTICS_DURATION_MODEL_NAMES = ("robust-duration-baseline-v1",)
 SUPERVISION_DEFAULT_MAX_RESTARTS = 3
 SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
 SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
@@ -139,14 +125,6 @@ SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
         "override_commands",
     }
 )
-PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL = {
-    "name": "robust-duration-baseline-v1",
-    "group_min_sample_count": 2,
-    "similarity_min_score": 0.35,
-    "similarity_max_examples": 3,
-    "similarity_blend_weight": 0.25,
-    "fallback_minutes": 60,
-}
 TASK_SOURCE_SOURCE_KEYS = frozenset(
     {
         "type",
@@ -503,70 +481,6 @@ class LockConfig:
 
 
 @dataclasses.dataclass(frozen=True)
-class PlanningAnalyticsOutputs:
-    timeline_json: str | None = None
-    gantt_html: str | None = None
-    benchmark_json: str | None = None
-    benchmark_markdown: str | None = None
-    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
-
-    @property
-    def has_explicit_paths(self) -> bool:
-        return any(
-            getattr(self, key) is not None for key in PLANNING_ANALYTICS_DEFAULT_OUTPUTS
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class PlanningAnalyticsDurationModelConfig:
-    name: str = str(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["name"])
-    group_min_sample_count: int = int(
-        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["group_min_sample_count"]
-    )
-    similarity_min_score: float = float(
-        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_min_score"]
-    )
-    similarity_max_examples: int = int(
-        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_max_examples"]
-    )
-    similarity_blend_weight: float = float(
-        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_blend_weight"]
-    )
-    fallback_minutes: int = int(
-        PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["fallback_minutes"]
-    )
-
-    def to_json(self) -> dict[str, object]:
-        return {
-            "name": self.name,
-            "parameters": {
-                "group_min_sample_count": self.group_min_sample_count,
-                "similarity_min_score": self.similarity_min_score,
-                "similarity_max_examples": self.similarity_max_examples,
-                "similarity_blend_weight": self.similarity_blend_weight,
-                "fallback_minutes": self.fallback_minutes,
-            },
-        }
-
-
-@dataclasses.dataclass(frozen=True)
-class PlanningAnalyticsConfig:
-    schedule_policy: str = PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY
-    subject_matching: str = "diagnostic"
-    worklog_command: str | None = None
-    outputs: PlanningAnalyticsOutputs = dataclasses.field(
-        default_factory=PlanningAnalyticsOutputs
-    )
-    duration_model: PlanningAnalyticsDurationModelConfig = dataclasses.field(
-        default_factory=PlanningAnalyticsDurationModelConfig
-    )
-    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
-
-    def is_explicit(self, key: str) -> bool:
-        return key in self.explicit_keys
-
-
-@dataclasses.dataclass(frozen=True)
 class SpecDiagnosticsConfig:
     require_approved: bool = False
     require_current_fingerprints: bool = False
@@ -614,9 +528,6 @@ class VibeConfig:
     )
     locks: LockConfig = dataclasses.field(default_factory=LockConfig)
     autopilot: AutopilotConfig = dataclasses.field(default_factory=AutopilotConfig)
-    planning_analytics: PlanningAnalyticsConfig = dataclasses.field(
-        default_factory=PlanningAnalyticsConfig
-    )
     specs: SpecDiagnosticsConfig = dataclasses.field(
         default_factory=SpecDiagnosticsConfig
     )
@@ -630,10 +541,6 @@ class VibeConfig:
     @property
     def generated_task_profile_path(self) -> Path:
         return self.state_path / GENERATED_TASK_PROFILE_CACHE_FILE
-
-    @property
-    def planning_analytics_state_path(self) -> Path:
-        return self.state_path / PLANNING_ANALYTICS_ARTIFACT_DIR
 
     def config_report(self) -> dict[str, object]:
         return {
@@ -652,7 +559,6 @@ def load_config(repo: Path) -> VibeConfig:
     supervision = parse_supervision(data.get("supervision", {}))
     locks = parse_locks(data.get("locks", {}))
     autopilot = parse_autopilot(data.get("autopilot", {}))
-    planning_analytics = parse_planning_analytics(data.get("planning_analytics", {}))
     specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
         repo=repo,
@@ -666,7 +572,6 @@ def load_config(repo: Path) -> VibeConfig:
         supervision=supervision,
         locks=locks,
         autopilot=autopilot,
-        planning_analytics=planning_analytics,
         specs=specs,
     )
 
@@ -1281,122 +1186,6 @@ def parse_locks(data: object) -> LockConfig:
     )
 
 
-def parse_planning_analytics(data: object) -> PlanningAnalyticsConfig:
-    table = expect_table(data, "planning_analytics")
-    explicit_keys = frozenset(str(key) for key in table)
-    schedule_policy = (
-        optional_nonempty_string(table.get("schedule_policy"))
-        or PLANNING_ANALYTICS_DEFAULT_SCHEDULE_POLICY
-    )
-    if schedule_policy not in PLANNING_ANALYTICS_SCHEDULE_POLICIES:
-        allowed = ", ".join(PLANNING_ANALYTICS_SCHEDULE_POLICIES)
-        raise ValueError(
-            f"planning_analytics.schedule_policy must be one of: {allowed}"
-        )
-    subject_matching = (
-        optional_nonempty_string(table.get("subject_matching")) or "diagnostic"
-    )
-    if subject_matching not in PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES:
-        allowed = ", ".join(PLANNING_ANALYTICS_SUBJECT_MATCHING_MODES)
-        raise ValueError(
-            f"planning_analytics.subject_matching must be one of: {allowed}"
-        )
-    return PlanningAnalyticsConfig(
-        schedule_policy=schedule_policy,
-        subject_matching=subject_matching,
-        worklog_command=optional_nonempty_string(table.get("worklog_command")),
-        outputs=parse_planning_analytics_outputs(table.get("outputs")),
-        duration_model=parse_planning_analytics_duration_model(
-            table.get("duration_model")
-        ),
-        explicit_keys=explicit_keys,
-    )
-
-
-def parse_planning_analytics_duration_model(
-    data: object,
-) -> PlanningAnalyticsDurationModelConfig:
-    table = expect_table(data, "planning_analytics.duration_model")
-    supported_keys = set(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL)
-    unknown_keys = sorted(set(str(key) for key in table) - supported_keys)
-    if unknown_keys:
-        raise ValueError(
-            "planning_analytics.duration_model contains unsupported keys: "
-            f"{', '.join(unknown_keys)}"
-        )
-    name = (
-        optional_nonempty_string(table.get("name"))
-        or PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["name"]
-    )
-    if name not in PLANNING_ANALYTICS_DURATION_MODEL_NAMES:
-        allowed = ", ".join(PLANNING_ANALYTICS_DURATION_MODEL_NAMES)
-        raise ValueError(
-            f"planning_analytics.duration_model.name must be one of: {allowed}"
-        )
-    return PlanningAnalyticsDurationModelConfig(
-        name=str(name),
-        group_min_sample_count=positive_int(
-            table.get("group_min_sample_count"),
-            int(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["group_min_sample_count"]),
-            "planning_analytics.duration_model.group_min_sample_count",
-        ),
-        similarity_min_score=bounded_float(
-            table.get("similarity_min_score"),
-            float(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_min_score"]),
-            "planning_analytics.duration_model.similarity_min_score",
-            minimum=0.0,
-            maximum=1.0,
-        ),
-        similarity_max_examples=nonnegative_int(
-            table.get("similarity_max_examples"),
-            int(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_max_examples"]),
-            "planning_analytics.duration_model.similarity_max_examples",
-        ),
-        similarity_blend_weight=bounded_float(
-            table.get("similarity_blend_weight"),
-            float(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["similarity_blend_weight"]),
-            "planning_analytics.duration_model.similarity_blend_weight",
-            minimum=0.0,
-            maximum=1.0,
-        ),
-        fallback_minutes=positive_int(
-            table.get("fallback_minutes"),
-            int(PLANNING_ANALYTICS_DEFAULT_DURATION_MODEL["fallback_minutes"]),
-            "planning_analytics.duration_model.fallback_minutes",
-        ),
-    )
-
-
-def parse_planning_analytics_outputs(data: object) -> PlanningAnalyticsOutputs:
-    table = expect_table(data, "planning_analytics.outputs")
-    explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(set(explicit_keys) - set(PLANNING_ANALYTICS_DEFAULT_OUTPUTS))
-    if unknown_keys:
-        raise ValueError(
-            "planning_analytics.outputs contains unsupported keys: "
-            f"{', '.join(unknown_keys)}"
-        )
-    return PlanningAnalyticsOutputs(
-        timeline_json=optional_repo_relative_path(
-            table.get("timeline_json"),
-            "planning_analytics.outputs.timeline_json",
-        ),
-        gantt_html=optional_repo_relative_path(
-            table.get("gantt_html"),
-            "planning_analytics.outputs.gantt_html",
-        ),
-        benchmark_json=optional_repo_relative_path(
-            table.get("benchmark_json"),
-            "planning_analytics.outputs.benchmark_json",
-        ),
-        benchmark_markdown=optional_repo_relative_path(
-            table.get("benchmark_markdown"),
-            "planning_analytics.outputs.benchmark_markdown",
-        ),
-        explicit_keys=explicit_keys,
-    )
-
-
 def parse_specs(data: object) -> SpecDiagnosticsConfig:
     table = expect_table(data, "specs")
     explicit_keys = frozenset(str(key) for key in table)
@@ -1435,84 +1224,6 @@ def parse_specs(data: object) -> SpecDiagnosticsConfig:
         ),
         explicit_keys=explicit_keys,
     )
-
-
-def planning_analytics_report(
-    config: VibeConfig,
-    task_source_runtime: dict[str, object] | None = None,
-) -> dict[str, object]:
-    diagnostics: list[str] = []
-    status = "ready"
-    if task_source_runtime is not None and not task_source_runtime.get("usable"):
-        status = "task_source_unusable"
-        diagnostics.append("planning analytics requires a usable task source")
-    if config.planning_analytics.worklog_command is None:
-        diagnostics.append(
-            "project worklog adapter is not configured; authoritative evidence "
-            "will come from task source state, run reports, explicit commit "
-            "mapping, and bounded git metadata"
-        )
-    return {
-        "status": status,
-        "schedule_policy": config.planning_analytics.schedule_policy,
-        "schedule_policy_source": (
-            "explicit"
-            if config.planning_analytics.is_explicit("schedule_policy")
-            else "default"
-        ),
-        "subject_matching": config.planning_analytics.subject_matching,
-        "subject_matching_source": (
-            "explicit"
-            if config.planning_analytics.is_explicit("subject_matching")
-            else "default"
-        ),
-        "worklog_adapter": {
-            "configured": config.planning_analytics.worklog_command is not None,
-            "source": (
-                "explicit"
-                if config.planning_analytics.worklog_command is not None
-                else "none"
-            ),
-        },
-        "duration_model": config.planning_analytics.duration_model.to_json(),
-        "coverage": {
-            "authoritative_evidence": [
-                "task source completion state",
-                "worker reports with explicit task ids",
-                "project worklog adapter records",
-                "explicit commit refs, Plan-Item trailers, or Requirement trailers",
-                "worker report metadata requirement_ids and plan_items",
-            ],
-            "diagnostic_only": [
-                "subject matching",
-                "branch names",
-                "raw run log text",
-            ],
-        },
-        "outputs": planning_analytics_output_report(config),
-        "repo_artifact_outputs_enabled": (
-            config.planning_analytics.outputs.has_explicit_paths
-        ),
-        "diagnostics": diagnostics,
-    }
-
-
-def planning_analytics_output_report(config: VibeConfig) -> dict[str, object]:
-    outputs = config.planning_analytics.outputs
-    report: dict[str, object] = {}
-    for key, default_name in PLANNING_ANALYTICS_DEFAULT_OUTPUTS.items():
-        explicit_path = getattr(outputs, key)
-        if explicit_path is None:
-            path = config.planning_analytics_state_path / default_name
-            source = "default_state_dir"
-        else:
-            path = config.repo / explicit_path
-            source = "explicit"
-        report[key] = {
-            "path": str(path),
-            "source": source,
-        }
-    return report
 
 
 def expect_table(value: object, name: str) -> dict[str, Any]:

@@ -32,7 +32,6 @@ from vibe_loop.config import (
     AGENT_DEFAULT_POLICY_SOURCE,
     AgentResolutionError,
     load_config,
-    planning_analytics_report,
 )
 from vibe_loop.eval_runner import (
     LocalSkillEvalConfig,
@@ -66,24 +65,6 @@ from vibe_loop.locks import (
     build_lock_manager,
 )
 from vibe_loop.locks import integration_lock_waitable
-from vibe_loop.planning_artifacts import (
-    build_planning_artifact_bundle,
-    check_planning_artifacts,
-    inspect_planning_artifacts,
-    planning_artifact_paths,
-    write_planning_artifacts,
-)
-from vibe_loop.planning_benchmark import (
-    build_duration_benchmark,
-    check_duration_benchmark_reports,
-    write_duration_benchmark_reports,
-)
-from vibe_loop.planning_evidence import DEFAULT_GIT_COMMIT_LIMIT
-from vibe_loop.planning_timeline import (
-    build_planning_timeline,
-    lookup_timeline_task,
-    read_timeline_file,
-)
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
@@ -387,40 +368,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_registry_argument(projects_status)
     projects_status.add_argument("--json", action="store_true")
-    autopilot_tui = autopilot_subparsers.add_parser(
-        "tui",
-        help="Open the read-only autopilot status dashboard (needs vibe-loop[tui])",
-    )
-    add_repo_argument(autopilot_tui)
-    autopilot_tui.add_argument(
-        "--registry",
-        type=Path,
-        nargs="?",
-        const="",
-        default=None,
-        help=(
-            "Show all registered projects instead of a single repo; optional path "
-            "overrides the default registry"
-        ),
-    )
-    autopilot_webui = autopilot_subparsers.add_parser(
-        "webui",
-        help="Serve the read-only autopilot status web dashboard on localhost",
-    )
-    add_repo_argument(autopilot_webui)
-    autopilot_webui.add_argument(
-        "--registry",
-        type=Path,
-        nargs="?",
-        const="",
-        default=None,
-        help=(
-            "Show all registered projects instead of a single repo; optional path "
-            "overrides the default registry"
-        ),
-    )
-    autopilot_webui.add_argument("--host", default="127.0.0.1")
-    autopilot_webui.add_argument("--port", type=int, default=8765)
     wait_helper = subparsers.add_parser(
         "wait-helper",
         help="Block until a watched process exits or the next cycle boundary",
@@ -516,52 +463,6 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(runs_inspect)
     runs_inspect.add_argument("run_id")
     runs_inspect.add_argument("--json", action="store_true")
-
-    planning = subparsers.add_parser("planning", help="Generate planning analytics")
-    add_repo_argument(planning)
-    planning_subparsers = planning.add_subparsers(
-        dest="planning_command",
-        required=True,
-    )
-    planning_timeline = planning_subparsers.add_parser(
-        "timeline",
-        help="Generate planning timeline JSON",
-    )
-    add_repo_argument(planning_timeline)
-    planning_timeline.add_argument("--json", action="store_true")
-    planning_timeline.add_argument(
-        "--git-commit-limit",
-        type=int,
-        default=DEFAULT_GIT_COMMIT_LIMIT,
-    )
-    planning_artifacts = planning_subparsers.add_parser(
-        "artifacts",
-        help="Generate timeline JSON and static Gantt artifacts",
-    )
-    add_repo_argument(planning_artifacts)
-    planning_artifacts_mode = planning_artifacts.add_mutually_exclusive_group()
-    planning_artifacts_mode.add_argument("--check", action="store_true")
-    planning_artifacts_mode.add_argument("--inspect", action="store_true")
-    planning_artifacts.add_argument("--json", action="store_true")
-    planning_artifacts.add_argument("--output", type=Path)
-    planning_artifacts.add_argument("--html-output", type=Path)
-    planning_artifacts.add_argument(
-        "--git-commit-limit",
-        type=int,
-        default=DEFAULT_GIT_COMMIT_LIMIT,
-    )
-    planning_benchmark_duration = planning_subparsers.add_parser(
-        "benchmark-duration",
-        help="Benchmark projected duration estimators",
-    )
-    add_repo_argument(planning_benchmark_duration)
-    planning_benchmark_duration.add_argument("--check", action="store_true")
-    planning_benchmark_duration.add_argument("--json", action="store_true")
-    planning_benchmark_duration.add_argument(
-        "--git-commit-limit",
-        type=int,
-        default=DEFAULT_GIT_COMMIT_LIMIT,
-    )
 
     integration = subparsers.add_parser(
         "main-integration",
@@ -909,9 +810,6 @@ def dispatch(args: argparse.Namespace) -> int:
             payloads = []
             for worker in workers:
                 payload = worker.to_json()
-                ref = _timeline_ref_for_task(config, worker.active.task_id)
-                if ref is not None:
-                    payload["timeline_task"] = ref
                 payloads.append(payload)
             print(json.dumps(payloads, indent=2))
         else:
@@ -929,9 +827,6 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if args.command == "runs":
         return dispatch_runs(args, config)
-
-    if args.command == "planning":
-        return dispatch_planning(args, config)
 
     if args.command == "main-integration":
         return dispatch_main_integration(args, config)
@@ -966,11 +861,6 @@ def dispatch(args: argparse.Namespace) -> int:
 
     if args.command == "doctor":
         task_source_runtime = runtime_task_source_report(config)
-        analytics_report = planning_analytics_report(
-            config,
-            task_source_runtime=task_source_runtime,
-        )
-        analytics_report["artifacts"] = inspect_planning_artifacts(config)
         runner = VibeRunner(config)
         workers = build_worker_views(
             runner.lock_manager,
@@ -1004,7 +894,6 @@ def dispatch(args: argparse.Namespace) -> int:
                         task_source_runtime,
                     ),
                     "generated_task_profile": generated_task_cache_report(config),
-                    "planning_analytics": analytics_report,
                     "specs": build_spec_diagnostics_report(
                         config,
                         task_source_runtime=task_source_runtime,
@@ -1053,116 +942,13 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
             print(f"run not found: {args.run_id}", file=sys.stderr)
             return 2
         payload = inspection.to_json()
-        timeline_ref = _timeline_ref_for_task(config, str(payload.get("task_id") or ""))
-        if timeline_ref is not None:
-            payload["timeline_task"] = timeline_ref
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
             print(render_run_inspection(inspection))
-            if timeline_ref:
-                print(
-                    f"timeline: status={timeline_ref.get('status', '-')}"
-                    f" actual={'yes' if timeline_ref.get('has_actual') else 'no'}"
-                    f" projected={'yes' if timeline_ref.get('has_projected') else 'no'}"
-                )
         return 0
 
     raise AssertionError(args.runs_command)
-
-
-def dispatch_planning(args: argparse.Namespace, config) -> int:
-    if args.planning_command == "timeline":
-        timeline = build_planning_timeline(
-            config,
-            git_commit_limit=args.git_commit_limit,
-        )
-        print(json.dumps(timeline, indent=2))
-        return 0
-
-    if args.planning_command == "artifacts":
-        return dispatch_planning_artifacts(args, config)
-
-    if args.planning_command == "benchmark-duration":
-        report = build_duration_benchmark(
-            config,
-            git_commit_limit=args.git_commit_limit,
-        )
-        if args.check:
-            errors = check_duration_benchmark_reports(config, report)
-            if args.json:
-                print(json.dumps({"ok": not errors, "errors": errors}, indent=2))
-            elif errors:
-                for error in errors:
-                    print(error, file=sys.stderr)
-            else:
-                print("duration benchmark reports are up to date")
-            return 0 if not errors else 1
-        json_path, markdown_path = write_duration_benchmark_reports(config, report)
-        if args.json:
-            print(json.dumps(report, indent=2, sort_keys=True))
-        else:
-            print(f"duration benchmark JSON: {json_path}")
-            print(f"duration benchmark Markdown: {markdown_path}")
-        return 0
-
-    raise AssertionError(args.planning_command)
-
-
-def dispatch_planning_artifacts(args: argparse.Namespace, config) -> int:
-    if args.inspect:
-        report = inspect_planning_artifacts(
-            config,
-            output=args.output,
-            html_output=args.html_output,
-        )
-        if args.json:
-            print(json.dumps(report, indent=2))
-        else:
-            print(render_planning_artifact_inspection(report))
-        return 0
-
-    bundle = build_planning_artifact_bundle(
-        config,
-        output=args.output,
-        html_output=args.html_output,
-        git_commit_limit=args.git_commit_limit,
-    )
-    if args.check:
-        errors = check_planning_artifacts(bundle)
-        report = {
-            "ok": not errors,
-            "errors": errors,
-            "paths": bundle.paths.to_json(),
-            "warning_count": bundle.warning_count,
-        }
-        if args.json:
-            print(json.dumps(report, indent=2))
-        elif errors:
-            for error in errors:
-                print(error, file=sys.stderr)
-        else:
-            print("planning artifacts are up to date")
-        return 0 if not errors else 1
-
-    write_planning_artifacts(bundle)
-    report = {
-        "action": "generated",
-        "paths": bundle.paths.to_json(),
-        "warning_count": bundle.warning_count,
-        "artifacts": inspect_planning_artifacts(
-            config,
-            output=args.output,
-            html_output=args.html_output,
-        ),
-    }
-    if args.json:
-        print(json.dumps(report, indent=2))
-    else:
-        print(f"timeline JSON: {bundle.paths.timeline_json}")
-        print(f"gantt HTML: {bundle.paths.gantt_html}")
-        print(f"warnings: {bundle.warning_count}")
-    return 0
 
 
 def redacted_task_source_report(report: dict[str, object]) -> dict[str, object]:
@@ -1366,10 +1152,6 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return 0
     if command == "projects":
         return dispatch_autopilot_projects(args)
-    if command == "tui":
-        return dispatch_autopilot_tui(args)
-    if command == "webui":
-        return dispatch_autopilot_webui(args)
     if command in (None, "run"):
         ap = config.autopilot
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
@@ -1434,27 +1216,6 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     return "\n".join(lines)
 
 
-def dispatch_autopilot_tui(args: argparse.Namespace) -> int:
-    try:
-        from vibe_loop.tui import run_tui
-    except ImportError:
-        print(
-            "the autopilot TUI requires the optional 'textual' dependency; "
-            "install it with 'pip install vibe-loop[tui]' (or 'uv add textual').",
-            file=sys.stderr,
-        )
-        return 2
-    registry_arg = getattr(args, "registry", None)
-    if registry_arg is None:
-        run_tui(repo=getattr(args, "repo", Path.cwd()))
-    else:
-        registry_path = (
-            Path(registry_arg) if str(registry_arg) else default_registry_path()
-        )
-        run_tui(registry_path=registry_path)
-    return 0
-
-
 def dispatch_wait_helper(args: argparse.Namespace) -> int:
     now = time.time()
     if args.deadline is not None:
@@ -1483,32 +1244,6 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
     else:
         print(" ".join(f"{key}={value}" for key, value in payload.items()))
-    return 0
-
-
-def dispatch_autopilot_webui(args: argparse.Namespace) -> int:
-    from vibe_loop.webui import run_webui
-
-    registry_arg = getattr(args, "registry", None)
-    repo = None
-    registry_path = None
-    if registry_arg is None:
-        repo = getattr(args, "repo", Path.cwd())
-    else:
-        registry_path = (
-            Path(registry_arg) if str(registry_arg) else default_registry_path()
-        )
-    print(
-        f"serving autopilot webui on http://{args.host}:{args.port} "
-        "(read-only; Ctrl-C to stop)",
-        file=sys.stderr,
-    )
-    run_webui(
-        repo=repo,
-        registry_path=registry_path,
-        host=args.host,
-        port=args.port,
-    )
     return 0
 
 
@@ -2421,62 +2156,6 @@ def render_run_inspection(inspection) -> str:
             )
         lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}{restart}")
     return "\n".join(lines)
-
-
-def render_planning_artifact_inspection(report: dict[str, object]) -> str:
-    lines: list[str] = []
-    for key, label in (
-        ("timeline_json", "timeline JSON"),
-        ("gantt_html", "gantt HTML"),
-    ):
-        artifact = report.get(key, {})
-        if not isinstance(artifact, dict):
-            continue
-        warning_count = artifact.get("warning_count")
-        warning_text = "-" if warning_count is None else str(warning_count)
-        schema_status = artifact.get("schema_status") or "-"
-        lines.append(
-            f"{label}: {artifact.get('path')}"
-            f"\tsource={artifact.get('source')}"
-            f"\tfreshness={artifact.get('freshness')}"
-            f"\tschema={schema_status}"
-            f"\twarnings={warning_text}"
-        )
-        error = artifact.get("error")
-        if error:
-            lines.append(f"{label} error: {error}")
-    timeline = report.get("timeline_json", {})
-    if isinstance(timeline, dict):
-        warnings = timeline.get("warnings", [])
-        if isinstance(warnings, list) and warnings:
-            lines.append("warnings:")
-            for warning in warnings:
-                if not isinstance(warning, dict):
-                    continue
-                task_id = warning.get("task_id")
-                task_text = f" task={task_id}" if task_id else ""
-                lines.append(
-                    f"- {warning.get('code')}{task_text}: {warning.get('message')}"
-                )
-    commands = report.get("next_repair_commands", [])
-    if isinstance(commands, list) and commands:
-        lines.append("next repair commands:")
-        for command in commands:
-            lines.append(f"- {command}")
-    return "\n".join(lines)
-
-
-def _timeline_ref_for_task(config, target_task_id: str) -> dict[str, object] | None:
-    if not target_task_id:
-        return None
-    try:
-        paths = planning_artifact_paths(config)
-    except (ValueError, OSError):
-        return None
-    timeline = read_timeline_file(paths.timeline_json)
-    if timeline is None:
-        return None
-    return lookup_timeline_task(timeline, target_task_id)
 
 
 def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:
