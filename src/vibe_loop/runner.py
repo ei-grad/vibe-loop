@@ -1889,11 +1889,7 @@ class VibeRunner:
             attempt=attempt,
             max_attempts=max_attempts,
             workspace_claimed=claim is not None,
-            prior_session_id=(
-                prior_result.session_id
-                if prior_result.session_id_source == SESSION_OBSERVED_SOURCE
-                else ""
-            ),
+            prior_session_id=resumable_prior_session_id(prior_result),
         )
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_recovery(
@@ -3553,11 +3549,33 @@ def inject_claude_resume(command: str, session_id: str) -> str:
     """Insert --resume <session_id> before {prompt} to continue a prior session.
 
     The id is a captured uuid (safe, unquoted); the formatted {prompt} becomes
-    the next turn of the resumed conversation.
+    the next turn of the resumed conversation. Relies on the claude CLI contract
+    that `claude -p --resume <id>` continues the SAME session/transcript rather
+    than forking a new id (so repeated recovery attempts keep resuming one
+    session); if a future claude version forks on resume this assumption, and
+    the stable-transcript resolution below, would need revisiting.
     """
     if "{prompt}" in command:
         return command.replace("{prompt}", f"--resume {session_id} {{prompt}}", 1)
     return f"{command.rstrip()} --resume {session_id}"
+
+
+def resumable_prior_session_id(prior_result: RunResult) -> str:
+    """Prior claude session id only when it is safely resumable.
+
+    Requires a vibe-loop-injected ("observed") session whose transcript is
+    actually on disk — this fails closed to the fresh-worker recovery path when
+    the prior run exited before persisting its session, rather than handing
+    `claude -p --resume` a dead id (which errors "No conversation found").
+    """
+    if prior_result.session_id_source != SESSION_OBSERVED_SOURCE:
+        return ""
+    if not prior_result.session_id:
+        return ""
+    transcript = prior_result.transcript_path
+    if not transcript or not Path(transcript).exists():
+        return ""
+    return prior_result.session_id
 
 
 def leading_env_assignment(command: str, name: str) -> str | None:

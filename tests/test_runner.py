@@ -52,6 +52,7 @@ from vibe_loop.runner import (
     parse_selected_task_ids,
     parse_worker_session_id,
     RecoveryContext,
+    resumable_prior_session_id,
     build_recovery_prompt_section,
     predicted_claude_transcript,
     resolve_claude_home,
@@ -726,6 +727,68 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("background", prompt)
         # Must NOT be the from-scratch recovery brief.
         self.assertNotIn("Investigate what the previous session did", prompt)
+
+    def test_resumable_prior_session_id_requires_observed_and_on_disk(self) -> None:
+        base = dict(
+            run_id="r",
+            task_id="T",
+            classification="unknown",
+            exit_code=0,
+            log_path=Path("/l.log"),
+            start_main="a",
+            end_main="a",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "sid.jsonl"
+            transcript.write_text("{}\n", encoding="utf-8")
+            # observed session with a transcript on disk -> resumable.
+            self.assertEqual(
+                resumable_prior_session_id(
+                    RunResult(
+                        **base,
+                        session_id="sid",
+                        session_id_source="observed",
+                        transcript_path=str(transcript),
+                    )
+                ),
+                "sid",
+            )
+            # observed but transcript missing -> fail closed (fresh path).
+            self.assertEqual(
+                resumable_prior_session_id(
+                    RunResult(
+                        **base,
+                        session_id="sid",
+                        session_id_source="observed",
+                        transcript_path=str(Path(directory) / "missing.jsonl"),
+                    )
+                ),
+                "",
+            )
+            # non-observed (stream-derived / fallback) session -> not resumable.
+            self.assertEqual(
+                resumable_prior_session_id(
+                    RunResult(
+                        **base,
+                        session_id="sid",
+                        session_id_source="fallback:run_id",
+                        transcript_path=str(transcript),
+                    )
+                ),
+                "",
+            )
+            # observed but no transcript path recorded -> not resumable.
+            self.assertEqual(
+                resumable_prior_session_id(
+                    RunResult(
+                        **base,
+                        session_id="sid",
+                        session_id_source="observed",
+                        transcript_path="",
+                    )
+                ),
+                "",
+            )
 
     def test_recovery_context_prior_session_id_defaults_empty(self) -> None:
         recovery = RecoveryContext(
