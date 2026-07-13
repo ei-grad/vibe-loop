@@ -675,6 +675,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.source, "limit_wall")
         self.assertEqual(result.detail, "resets 1am (UTC)")
 
+    def test_classify_successful_run_ignores_quoted_limit_phrase(self) -> None:
+        # A completed run (exit 0, no worker report) whose captured output merely
+        # quotes a limit phrase must proceed to the normal completion path, not
+        # be recorded as limit_wall and pause the whole supervisor.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            source.mark_done("TASK-01")
+            runner._source = source
+            result = runner.classify(
+                "TASK-01",
+                0,
+                "aaa",
+                "aaa",
+                "",
+                None,
+                output_tail="You've hit your session limit · resets 1am (UTC)",
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.source, "task_probe")
+
     def test_classify_worker_report_wins_over_limit_wall(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(VibeConfig(repo=Path(directory)))

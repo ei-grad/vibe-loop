@@ -112,6 +112,11 @@ DEFAULT_LIMIT_WALL_PATTERNS: tuple[str, ...] = (
     r"you'?ve hit your session limit",
 )
 LIMIT_WALL_DEFAULT_BACKOFF_SECONDS = 1800.0
+# The advertised reset ("· resets 1am (UTC)") follows the limit phrase in the
+# same message. Scope the reset search to a window right after the matched
+# marker so an unrelated "reset at N" elsewhere in the tail cannot inflate the
+# pause.
+LIMIT_WALL_RESET_WINDOW_CHARS = 200
 
 
 @dataclasses.dataclass(frozen=True)
@@ -169,11 +174,16 @@ def detect_limit_wall(
         match = pattern.search(text)
         if match is None:
             continue
-        reset_match = LIMIT_WALL_RESET_PATTERN.search(text)
+        window = text[match.start() : match.end() + LIMIT_WALL_RESET_WINDOW_CHARS]
+        reset_match = LIMIT_WALL_RESET_PATTERN.search(window)
         return LimitWallSignal(
             marker=match.group(0).strip(),
             reset_text=reset_match.group(0).strip() if reset_match else "",
-            reset_delay=parse_limit_wall_reset_delay(text, now=now),
+            reset_delay=(
+                parse_limit_wall_reset_delay(reset_match.group(0), now=now)
+                if reset_match
+                else None
+            ),
         )
     return None
 

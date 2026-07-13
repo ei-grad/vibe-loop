@@ -1986,8 +1986,14 @@ class VibeRunner:
         # A provider limit wall exits nonzero, so it must be caught before the
         # exit_code branch downgrades it to "failed" and burns restart budget.
         # A worker that filed a terminal report above already made progress, so
-        # only wall-detect a report-less death.
-        if self.config.supervision.limit_wall_detection and output_tail:
+        # only wall-detect a report-less death. The exit_code != 0 gate keeps a
+        # successful run whose output merely quotes a limit phrase (e.g. a worker
+        # implementing limit handling) on the normal completion path.
+        if (
+            self.config.supervision.limit_wall_detection
+            and exit_code != 0
+            and output_tail
+        ):
             signal = detect_limit_wall(
                 output_tail,
                 self.config.supervision.limit_wall_patterns or None,

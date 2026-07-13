@@ -121,6 +121,15 @@ class LimitWallDetectionTests(unittest.TestCase):
         self.assertEqual(signal.reset_text, "")
         self.assertIsNone(signal.reset_delay)
 
+    def test_distant_reset_phrase_is_not_attached(self) -> None:
+        # An unrelated "reset at N" far from the limit phrase must not inflate
+        # the pause: the reset search is scoped to a window after the marker.
+        text = "You've hit your session limit" + ("x" * 300) + " reset at 3pm"
+        signal = detect_limit_wall(text)
+        assert signal is not None
+        self.assertEqual(signal.reset_text, "")
+        self.assertIsNone(signal.reset_delay)
+
     def test_custom_patterns_override_defaults(self) -> None:
         # A custom list fully replaces the defaults: the default phrases no
         # longer match, and the custom phrase does.
