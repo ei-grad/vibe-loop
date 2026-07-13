@@ -1320,6 +1320,10 @@ def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
     board may gain runnable tasks out of band, and sleeping the full interval
     would strand them. Cycles that dispatched, observed, or were blocked keep the
     plain interval sleep.
+
+    An idle cycle with no planning command configured still rechecks: that is
+    deliberate, so out-of-band task additions (a peer or operator filling the
+    board) are picked up without waiting the full interval.
     """
     return result.status == "idle"
 
@@ -1344,11 +1348,21 @@ def recheck_sleep_slices(interval: float, recheck_seconds: float) -> Iterator[fl
 def poll_runnable_count(config: VibeConfig) -> int:
     """Cheap runnable-task poll for the post-planning recheck loop.
 
-    Reuses the same task-source listing as cycle status collection. A task
-    source error is reported as zero runnable so a transient failure keeps the
-    supervisor waiting rather than crashing it.
+    Reuses the same task-source listing as cycle status collection. Any probe
+    failure is reported as zero runnable so a transient error keeps the
+    supervisor waiting rather than crashing it. ``collect_task_queue_status``
+    already folds the parser trio (FileNotFoundError/RuntimeError/ValueError)
+    into ``source_error``, but the production command-backed source shells out
+    with ``check=True``: a nonzero ``loopyard`` exit raises
+    ``subprocess.CalledProcessError`` and a spawn failure raises ``OSError``,
+    neither of which that inner catch covers. This poll runs ~30 times per idle
+    window under exactly the task-source-load conditions the recheck targets, so
+    it must swallow those here too.
     """
-    status = collect_task_queue_status(config)
+    try:
+        status = collect_task_queue_status(config)
+    except (subprocess.SubprocessError, OSError):
+        return 0
     if status.source_error:
         return 0
     return status.runnable

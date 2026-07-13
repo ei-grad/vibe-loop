@@ -482,6 +482,9 @@ class ConfigTests(unittest.TestCase):
             ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
             ("planning_recheck_seconds = 0\n", "autopilot.planning_recheck_seconds"),
             ("planning_recheck_seconds = -5\n", "autopilot.planning_recheck_seconds"),
+            # Below the 5s floor: a misconfigured tiny value could otherwise
+            # generate ~1.8M probes across an interval.
+            ("planning_recheck_seconds = 2.0\n", "at least 5.0 seconds"),
             (
                 'planning_recheck_seconds = "soon"\n',
                 "autopilot.planning_recheck_seconds",

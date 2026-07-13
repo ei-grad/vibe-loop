@@ -1044,6 +1044,21 @@ class AutopilotRecheckTests(unittest.TestCase):
             (repo / "PLAN.md").unlink()
             self.assertEqual(poll_runnable_count(config), 0)
 
+    def test_poll_runnable_count_survives_command_source_nonzero_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                # A command-backed source shells out with check=True, so a
+                # nonzero exit raises CalledProcessError (a SubprocessError, not
+                # in the parser trio collect_task_queue_status catches). The poll
+                # must still report zero rather than crashing the supervisor.
+                extra_toml='[task_source]\nlist = "exit 3"\n',
+            )
+            config = load_config(repo)
+            self.assertEqual(poll_runnable_count(config), 0)
+
     def test_cycle_should_recheck_only_for_idle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

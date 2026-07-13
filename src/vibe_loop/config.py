@@ -1209,6 +1209,7 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             table.get("planning_recheck_seconds"),
             60.0,
             "autopilot.planning_recheck_seconds",
+            minimum=5.0,
         ),
         require_clean_repo=optional_bool(
             table.get("require_clean_repo"),
@@ -1405,8 +1406,12 @@ def optional_nonnegative_float(value: object, name: str) -> float | None:
     return nonnegative_float(value, 0.0, name)
 
 
-def positive_float(value: object, default: float, name: str) -> float:
+def positive_float(
+    value: object, default: float, name: str, *, minimum: float = 0.0
+) -> float:
     parsed = nonnegative_float(value, default, name)
+    if minimum > 0.0 and parsed < minimum:
+        raise ValueError(f"{name} must be at least {minimum} seconds")
     if parsed <= 0.0:
         raise ValueError(f"{name} must be a positive number")
     return parsed
