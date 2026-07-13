@@ -213,6 +213,16 @@ class TaskSource(Protocol):
 
     def probe(self, task_id: str) -> Task | None: ...
 
+    def reset(self, task_id: str) -> bool:
+        """Request the backend return a claimed task to its runnable state.
+
+        Returns True when a reset hook is configured and was invoked, False
+        when no hook exists (leaving backend status untouched). Only the
+        command-backed source can carry a reset command; file-based sources
+        have no hook and return False.
+        """
+        ...
+
 
 def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
     if (
@@ -301,6 +311,9 @@ class MarkdownPlanSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+    def reset(self, task_id: str) -> bool:
+        return False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -395,6 +408,9 @@ class MarkdownProfileSource:
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
 
+    def reset(self, task_id: str) -> bool:
+        return False
+
 
 class RalphexMarkdownSource:
     def __init__(self, repo: Path, paths: tuple[Path, ...]):
@@ -417,6 +433,9 @@ class RalphexMarkdownSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+    def reset(self, task_id: str) -> bool:
+        return False
 
 
 class SpecToolMarkdownSource:
@@ -449,6 +468,9 @@ class SpecToolMarkdownSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+    def reset(self, task_id: str) -> bool:
+        return False
 
 
 def default_markdown_plan_profile(source_paths: tuple[str, ...]) -> dict[str, object]:
@@ -2061,6 +2083,13 @@ class CommandTaskSource:
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
 
+    def reset(self, task_id: str) -> bool:
+        if not self.config.reset_command:
+            return False
+        command = self.config.reset_command.format(task_id=task_id)
+        run_reset_command(self.repo, command)
+        return True
+
 
 def run_json_command(repo: Path, command: str) -> object:
     result = subprocess.run(
@@ -2073,6 +2102,21 @@ def run_json_command(repo: Path, command: str) -> object:
         text=True,
     )
     return json.loads(result.stdout)
+
+
+def run_reset_command(repo: Path, command: str) -> None:
+    # Fire-and-check: the reset hook mutates backend status and is not expected
+    # to emit JSON, so a nonzero exit raises CalledProcessError for the caller
+    # to log non-fatally rather than being parsed as task output.
+    subprocess.run(
+        command,
+        cwd=repo,
+        shell=True,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def task_from_mapping(value: object, order: int) -> Task:

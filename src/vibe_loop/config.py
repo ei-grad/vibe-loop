@@ -153,6 +153,7 @@ TASK_SOURCE_SOURCE_KEYS = frozenset(
         "list",
         "next",
         "probe",
+        "reset",
         "profile",
     }
 )
@@ -163,6 +164,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "list",
         "next",
         "probe",
+        "reset",
         "selection_command",
         "locks",
         "lock_backend",
@@ -379,6 +381,13 @@ class TaskSourceConfig:
     list_command: str | None = None
     next_command: str | None = None
     probe_command: str | None = None
+    # Optional operator wiring: a command that asks a command-backed task
+    # backend to return a claimed task to its runnable state, templated with
+    # {task_id}. The supervisor invokes it when a run hits a provider limit
+    # wall, because the worker transitions the task to a claimed/active status
+    # itself and dies before any terminal transition, and vibe-loop otherwise
+    # never mutates project-owned task status. Absent hook keeps that behavior.
+    reset_command: str | None = None
     runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES
     # Opt-in: when true, the task source's emitted order is authoritative and
     # the priority band is dropped from the dispatch sort key (see
@@ -408,6 +417,7 @@ class TaskSourceConfig:
             "list_command": self.list_command,
             "next_command": self.next_command,
             "probe_command": self.probe_command,
+            "reset_command": self.reset_command,
             "runnable_statuses": list(self.runnable_statuses),
             "respect_source_order": self.respect_source_order,
             "explicit_keys": sorted(self.explicit_keys),
@@ -1042,6 +1052,7 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         list_command=optional_string(table.get("list")),
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
+        reset_command=optional_string(table.get("reset")),
         runnable_statuses=runnable,
         respect_source_order=respect_source_order,
         explicit_keys=explicit_keys,

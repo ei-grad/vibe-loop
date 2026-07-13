@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from vibe_loop.config import TaskSourceConfig
 from vibe_loop.tasks import (
+    CommandTaskSource,
     MarkdownPlanSource,
     MarkdownProfileSource,
     Task,
@@ -837,6 +839,49 @@ class MarkdownPlanTests(unittest.TestCase):
             ],
         )
         self.assertEqual(payload["approval_state"], "approved")
+
+    def test_command_task_source_reset_invokes_hook_with_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            marker = repo / "reset.log"
+            source = CommandTaskSource(
+                repo,
+                TaskSourceConfig(
+                    type="command",
+                    list_command="echo '[]'",
+                    reset_command=f"printf '%s' {{task_id}} > {marker}",
+                ),
+            )
+
+            invoked = source.reset("TASK-42")
+
+            self.assertTrue(invoked)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "TASK-42")
+
+    def test_command_task_source_reset_without_hook_is_noop(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = CommandTaskSource(
+                repo,
+                TaskSourceConfig(type="command", list_command="echo '[]'"),
+            )
+
+            self.assertFalse(source.reset("TASK-42"))
+
+    def test_command_task_source_reset_propagates_command_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = CommandTaskSource(
+                repo,
+                TaskSourceConfig(
+                    type="command",
+                    list_command="echo '[]'",
+                    reset_command="exit 3",
+                ),
+            )
+
+            with self.assertRaises(subprocess.CalledProcessError):
+                source.reset("TASK-42")
 
     def test_profile_table_extracts_traceability_fields(self) -> None:
         profile = work_table_profile()

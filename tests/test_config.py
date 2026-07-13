@@ -956,6 +956,32 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.task_source.explicit_source_keys, ("list", "type"))
         self.assertEqual(config.task_source.list_command, "tracker list --json")
 
+    def test_task_source_reset_hook_is_parsed_and_blocks_generated_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\ntype = "command"\n'
+                'list = "tracker list --json"\n'
+                'reset = "tracker reset {task_id}"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.task_source.reset_command, "tracker reset {task_id}")
+        self.assertFalse(config.task_source.allows_generated_cache)
+        self.assertIn("reset", config.task_source.explicit_source_keys)
+        self.assertTrue(config.task_source.is_explicit("reset"))
+
+    def test_task_source_reset_hook_defaults_to_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text("[task_source]\n", encoding="utf-8")
+
+            config = load_config(repo)
+
+        self.assertIsNone(config.task_source.reset_command)
+
     def test_explicit_statuses_override_generated_without_blocking_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

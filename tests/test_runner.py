@@ -70,10 +70,23 @@ from vibe_loop.workers import ActiveRunState
 
 
 class MutableTaskSource:
-    def __init__(self, tasks: list[Task]):
+    def __init__(
+        self,
+        tasks: list[Task],
+        *,
+        reset_hook: bool = False,
+        reset_error: Exception | None = None,
+    ):
         self._tasks = tasks
         self._done: set[str] = set()
         self._lock = threading.Lock()
+        # reset_hook mirrors an operator-configured command-backed reset: when
+        # true, reset() records the call and reports it as invoked; otherwise
+        # it reports no hook (like a file-based source). reset_error simulates a
+        # failing hook so the runner's non-fatal handling can be exercised.
+        self._reset_hook = reset_hook
+        self._reset_error = reset_error
+        self.reset_calls: list[str] = []
 
     def list_tasks(self) -> list[Task]:
         with self._lock:
@@ -90,6 +103,13 @@ class MutableTaskSource:
             (task for task in self.list_tasks() if task.task_id == task_id),
             None,
         )
+
+    def reset(self, task_id: str) -> bool:
+        with self._lock:
+            self.reset_calls.append(task_id)
+        if self._reset_error is not None:
+            raise self._reset_error
+        return self._reset_hook
 
     def mark_done(self, task_id: str) -> None:
         with self._lock:
@@ -2334,6 +2354,64 @@ class LimitWallLoopTests(unittest.TestCase):
         )
         self.assertEqual(restart_calls, [])
         self.assertEqual(source._done, set())
+
+    def test_limit_wall_invokes_reset_hook_for_claimed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)],
+                reset_hook=True,
+            )
+            calls: list[str] = []
+            runner = self._limit_wall_runner(repo, source, calls)
+
+            results = runner.run_until_done()
+
+        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        # The claimed task is handed back to the backend for re-dispatch.
+        self.assertEqual(source.reset_calls, ["TASK-01"])
+        # It stays runnable (never marked done), so the next cycle can pick it.
+        self.assertNotIn("TASK-01", source._done)
+
+    def test_limit_wall_without_reset_hook_leaves_status_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)],
+                reset_hook=False,
+            )
+            calls: list[str] = []
+            runner = self._limit_wall_runner(repo, source, calls)
+            restart_calls: list[object] = []
+            runner.record_task_restart = (  # type: ignore[method-assign]
+                lambda *args, **kwargs: restart_calls.append((args, kwargs))
+            )
+
+            results = runner.run_until_done()
+
+        # Absent hook: dispatch still pauses without consuming budget, and the
+        # source reports no reset (unchanged behavior).
+        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        self.assertEqual(restart_calls, [])
+        self.assertEqual(source.reset_calls, ["TASK-01"])
+
+    def test_limit_wall_reset_hook_failure_is_non_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)],
+                reset_hook=True,
+                reset_error=subprocess.CalledProcessError(3, "reset-hook"),
+            )
+            calls: list[str] = []
+            runner = self._limit_wall_runner(repo, source, calls)
+
+            # A failing reset hook must not crash the dispatch loop.
+            results = runner.run_until_done()
+
+        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        self.assertEqual(source.reset_calls, ["TASK-01"])
+        self.assertEqual(calls, ["TASK-01"])
 
 
 class TransientWorkerFailureTests(unittest.TestCase):

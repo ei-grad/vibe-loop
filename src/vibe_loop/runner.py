@@ -2030,6 +2030,26 @@ class VibeRunner:
             "without consuming restart budget; supervisor backs off before "
             "the next cycle"
         )
+        # The worker claimed the task (ready -> active) itself and died on the
+        # wall before any terminal transition. The vibe-loop task lock is
+        # already released (run_task's finally), so the task now sits claimed
+        # in the backend with no live lock and would never be re-dispatched.
+        # An operator-configured reset hook returns it to its runnable state.
+        self._reset_task_source_status(result.task_id)
+
+    def _reset_task_source_status(self, task_id: str) -> None:
+        try:
+            reset = self.source.reset(task_id)
+        except (subprocess.SubprocessError, OSError) as exc:
+            report_status(
+                f"task-source reset hook failed for {task_id}: {exc}; "
+                "leaving backend status unchanged"
+            )
+            return
+        if reset:
+            report_status(
+                f"task-source reset hook returned {task_id} to its runnable state"
+            )
 
     def recent_log_context(self, max_runs: int = 5, tail_lines: int = 80) -> str:
         return self.run_store.recent_log_context(max_runs, tail_lines)

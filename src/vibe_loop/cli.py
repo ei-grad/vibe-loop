@@ -965,7 +965,7 @@ def redacted_task_source_config(task_source) -> dict[str, object]:
 
 def redact_task_source_payload(payload: dict[str, object]) -> dict[str, object]:
     redacted = dict(payload)
-    for key in ("list_command", "next_command", "probe_command"):
+    for key in ("list_command", "next_command", "probe_command", "reset_command"):
         configured = bool(redacted.pop(key, None))
         redacted[f"{key}_configured"] = configured
         redacted[f"{key}_redacted"] = configured
