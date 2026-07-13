@@ -620,6 +620,79 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent command source: auto:claude", stderr.getvalue())
         self.assertIn("agent_command_source=auto:claude", log_text)
 
+    def test_run_task_recovery_resumes_prior_claude_session(self) -> None:
+        from vibe_loop.config import load_config
+        from vibe_loop.runner import RecoveryContext, VibeRunner
+        from vibe_loop.tasks import Task
+
+        class _StubSource:
+            def list_tasks(self):
+                return []
+
+            def probe(self, task_id):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_fake_git(bin_dir)
+            write_python_executable(
+                bin_dir / "claude",
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path('agent-args.txt').write_text("
+                "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "print('resumed out')\n",
+            )
+            task = Task(task_id="TASK-01", title="Task 1", status="Next", order=1)
+            recovery = RecoveryContext(
+                task_id="TASK-01",
+                prior_run_id="run-prior",
+                prior_classification="unknown",
+                branch="task-01",
+                worktree=str(repo),
+                head_commit="abc",
+                transcript_path="",
+                wrapper_log="",
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=True,
+                prior_session_id="resume-me-123",
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+                runner = VibeRunner(config)
+                runner._source = _StubSource()
+                runner.run_task(task, recovery=recovery)
+                resumed = (repo / "agent-args.txt").read_text(encoding="utf-8")
+
+                # A second, non-resumable run (resume disabled) must fall back to
+                # a fresh --session-id with the from-scratch recovery brief.
+                import dataclasses
+
+                runner.config = dataclasses.replace(
+                    config,
+                    supervision=dataclasses.replace(
+                        config.supervision, resume_unknown_runs=False
+                    ),
+                )
+                runner._source = _StubSource()
+                runner.run_task(task, recovery=recovery)
+                fresh = (repo / "agent-args.txt").read_text(encoding="utf-8")
+
+        # Resume path: --resume <prior session id>, no fresh --session-id, and the
+        # short continuation nudge (not the from-scratch recovery brief).
+        self.assertIn("--resume\nresume-me-123", resumed)
+        self.assertNotIn("--session-id", resumed)
+        self.assertIn("Continue this run (resumed session)", resumed)
+        self.assertNotIn("Investigate what the previous session did", resumed)
+        # Fallback path: fresh --session-id and the from-scratch recovery brief.
+        self.assertIn("--session-id", fresh)
+        self.assertNotIn("--resume", fresh)
+        self.assertIn("Investigate what the previous session did", fresh)
+
     def test_run_next_records_observed_claude_session_and_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

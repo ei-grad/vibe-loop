@@ -40,8 +40,12 @@ from vibe_loop.runner import (
     build_spec_worker_context,
     build_worker_prompt,
     claude_project_dir_name,
+    command_specifies_resume,
     command_supports_session_capture,
+    command_supports_session_resume,
     deterministic_task_batch,
+    build_resume_continuation_prompt,
+    inject_claude_resume,
     inject_claude_session_id,
     parse_agent_runtime_context_from_command,
     parse_selected_task_id,
@@ -653,6 +657,91 @@ class RunnerTests(unittest.TestCase):
                     result = runner.classify("TASK-01", 0, "aaa", "aaa", "", None)
                     self.assertEqual(result.status, expected)
                     self.assertEqual(result.source, "task_probe")
+
+    def test_inject_claude_resume_inserts_flag_before_prompt(self) -> None:
+        self.assertEqual(
+            inject_claude_resume("claude -p {prompt}", "sid-123"),
+            "claude -p --resume sid-123 {prompt}",
+        )
+        self.assertEqual(
+            inject_claude_resume("claude -p", "sid-123"),
+            "claude -p --resume sid-123",
+        )
+
+    def test_command_supports_session_resume_gating(self) -> None:
+        self.assertTrue(command_supports_session_resume("claude -p {prompt}", "claude"))
+        self.assertTrue(command_supports_session_resume("claude -p {prompt}", "auto"))
+        # Non-claude agent kind / executable cannot resume a claude session.
+        self.assertFalse(command_supports_session_resume("claude -p {prompt}", "codex"))
+        self.assertFalse(
+            command_supports_session_resume("codex exec {prompt}", "claude")
+        )
+        # Operator already pinned a session id or a resume/continue flag.
+        self.assertFalse(
+            command_supports_session_resume(
+                "claude -p --session-id x {prompt}", "claude"
+            )
+        )
+        self.assertFalse(
+            command_supports_session_resume("claude -p --resume x {prompt}", "claude")
+        )
+        self.assertFalse(
+            command_supports_session_resume("claude -p --continue {prompt}", "claude")
+        )
+        # Session persistence disabled: the prior session is not on disk to resume.
+        self.assertFalse(
+            command_supports_session_resume(
+                "claude -p --no-session-persistence {prompt}", "claude"
+            )
+        )
+
+    def test_command_specifies_resume_detects_flags(self) -> None:
+        self.assertTrue(command_specifies_resume(["claude", "--resume", "x"]))
+        self.assertTrue(command_specifies_resume(["claude", "-r", "x"]))
+        self.assertTrue(command_specifies_resume(["claude", "--continue"]))
+        self.assertTrue(command_specifies_resume(["claude", "--resume=x"]))
+        self.assertFalse(command_specifies_resume(["claude", "-p", "{prompt}"]))
+
+    def test_build_resume_continuation_prompt_is_a_short_finish_nudge(self) -> None:
+        recovery = RecoveryContext(
+            task_id="TASK-01",
+            prior_run_id="run-1",
+            prior_classification="unknown",
+            branch="task-01",
+            worktree="/tmp/wt/task-01",
+            head_commit="abc",
+            transcript_path="/t.jsonl",
+            wrapper_log="/w.log",
+            attempt=2,
+            max_attempts=3,
+            workspace_claimed=True,
+            prior_session_id="sid-123",
+        )
+        prompt = build_resume_continuation_prompt(recovery)
+        self.assertIn("resumed session", prompt)
+        self.assertIn("TASK-01", prompt)
+        self.assertIn("attempt 2 of 3", prompt)
+        self.assertIn("/tmp/wt/task-01", prompt)
+        self.assertIn("$VIBE_LOOP_RUN_ID", prompt)
+        self.assertIn("background", prompt)
+        # Must NOT be the from-scratch recovery brief.
+        self.assertNotIn("Investigate what the previous session did", prompt)
+
+    def test_recovery_context_prior_session_id_defaults_empty(self) -> None:
+        recovery = RecoveryContext(
+            task_id="T",
+            prior_run_id="r",
+            prior_classification="unknown",
+            branch="",
+            worktree="",
+            head_commit="",
+            transcript_path="",
+            wrapper_log="",
+            attempt=1,
+            max_attempts=3,
+            workspace_claimed=False,
+        )
+        self.assertEqual(recovery.prior_session_id, "")
 
     def test_run_until_done_parallel_honors_jobs_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

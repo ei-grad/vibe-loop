@@ -718,7 +718,31 @@ class VibeRunner:
         session_id_source = "fallback:run_id"
         injected_session_id: str | None = None
         effective_template = command_template
-        if command_supports_session_capture(
+        resume_session_id = (
+            recovery.prior_session_id
+            if recovery is not None and recovery.prior_session_id
+            else ""
+        )
+        resuming = bool(
+            resume_session_id
+            and self.config.supervision.resume_unknown_runs
+            and command_supports_session_resume(
+                command_template, self.config.agent.agent_kind
+            )
+        )
+        if resuming:
+            # Resume the prior run's captured session so the continuation turn
+            # keeps its full context (e.g. background proofs it launched before
+            # the previous headless turn ended) rather than re-investigating
+            # from scratch. `injected_session_id` is reused by the transcript
+            # resolution below — the id is known, only the flag differs.
+            injected_session_id = resume_session_id
+            effective_template = inject_claude_resume(
+                command_template, resume_session_id
+            )
+            session_id = injected_session_id
+            session_id_source = SESSION_OBSERVED_SOURCE
+        elif command_supports_session_capture(
             command_template, self.config.agent.agent_kind
         ):
             injected_session_id = str(uuid.uuid4())
@@ -728,11 +752,18 @@ class VibeRunner:
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
         skill_prefix = self.config.agent.require_skill_ref_prefix()
-        worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
-        if recovery is not None:
+        if recovery is not None and resuming:
+            # Resumed session already holds the full task/skill context; a short
+            # continuation nudge is enough (and correct — a fresh skill
+            # invocation would fight the existing conversation).
+            worker_prompt = build_resume_continuation_prompt(recovery)
+        elif recovery is not None:
             worker_prompt = (
-                f"{worker_prompt}\n\n{build_recovery_prompt_section(recovery)}"
+                f"{build_worker_prompt(skill_prefix, task, self.config)}\n\n"
+                f"{build_recovery_prompt_section(recovery)}"
             )
+        else:
+            worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
         validate_worker_prompt_delivery(command_template, task)
         command = effective_template.format(
             prompt=shell_quote(worker_prompt),
@@ -1858,6 +1889,11 @@ class VibeRunner:
             attempt=attempt,
             max_attempts=max_attempts,
             workspace_claimed=claim is not None,
+            prior_session_id=(
+                prior_result.session_id
+                if prior_result.session_id_source == SESSION_OBSERVED_SOURCE
+                else ""
+            ),
         )
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_recovery(
@@ -2011,6 +2047,11 @@ class RecoveryContext:
     attempt: int
     max_attempts: int
     workspace_claimed: bool
+    # Captured claude session id of the prior run when it is a real, resumable
+    # session (empty for a fallback id or a non-claude agent). When set and
+    # resume is enabled, the continuation runs `claude -p --resume <id>` to keep
+    # the prior turn's full context instead of a from-scratch fresh worker.
+    prior_session_id: str = ""
 
 
 def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
@@ -2060,6 +2101,43 @@ def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
         "4. If the work is blocked on an external or authorization gate, report "
         "`blocked` with the precise reason — do NOT park and exit silently, "
         "which would leave the run `unknown` again.\n"
+    )
+
+
+def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
+    """Continuation turn for a RESUMED prior session (`claude -p --resume`).
+
+    The resumed conversation already holds the full task/skill context and
+    whatever the prior turn did, so this is a short nudge to finish rather than
+    the from-scratch recovery brief. Common cause of the prior `unknown`: the
+    session launched long-running proofs/checks in the background and the
+    headless turn ended before they finished.
+    """
+    workspace_line = (
+        f"- Your claimed worktree: `{recovery.worktree}`\n" if recovery.worktree else ""
+    )
+    return (
+        "## Continue this run (resumed session)\n\n"
+        f"This is the SAME session for task `{recovery.task_id}`, resumed because "
+        f"the previous turn ended `{recovery.prior_classification}` — it did not "
+        "merge its work or file a terminal worker report. This is recovery "
+        f"attempt {recovery.attempt} of {recovery.max_attempts}.\n\n"
+        "The most likely cause: you launched long-running proofs/checks in the "
+        "background and this headless turn ended before they finished. Do NOT "
+        "restart from scratch.\n\n"
+        f"{workspace_line}"
+        "1. Check the results of any background commands you started (their log "
+        "files / exit status); re-run any remaining required gates in the "
+        "FOREGROUND so this turn does not end before they complete.\n"
+        "2. Finish the slice through review and integration when permitted, "
+        "building on your existing committed work — do not delete, reset, or "
+        "re-create the workspace.\n"
+        "3. Emit a proper terminal status via the worker report protocol, using "
+        "the CURRENT environment run id: `vibe-loop report --repo "
+        '"$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" --task-id '
+        '"$VIBE_LOOP_TASK_ID" --status <completed|blocked|failed> --commit HEAD '
+        '--message "..."`. Report `blocked` with the precise reason if gated; do '
+        "NOT exit silently, which would leave the run `unknown` again.\n"
     )
 
 
@@ -3439,6 +3517,47 @@ def inject_claude_session_id(command: str, session_id: str) -> str:
     if "{prompt}" in command:
         return command.replace("{prompt}", f"--session-id {session_id} {{prompt}}", 1)
     return f"{command.rstrip()} --session-id {session_id}"
+
+
+def command_specifies_resume(argv: list[str]) -> bool:
+    return any(
+        token in ("--resume", "-r", "--continue", "-c") or token.startswith("--resume=")
+        for token in argv
+    )
+
+
+def command_disables_session_persistence(argv: list[str]) -> bool:
+    return "--no-session-persistence" in argv
+
+
+def command_supports_session_resume(command: str, agent_kind: str) -> bool:
+    """Whether `claude -p --resume <id>` can be injected into this command.
+
+    Requires the claude executable with session persistence enabled and no
+    session id / resume flag already pinned by the operator.
+    """
+    if agent_kind not in SESSION_CAPTURE_AGENT_KINDS:
+        return False
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    if command_executable_name(argv) != "claude":
+        return False
+    if command_specifies_session_id(argv) or command_specifies_resume(argv):
+        return False
+    return not command_disables_session_persistence(argv)
+
+
+def inject_claude_resume(command: str, session_id: str) -> str:
+    """Insert --resume <session_id> before {prompt} to continue a prior session.
+
+    The id is a captured uuid (safe, unquoted); the formatted {prompt} becomes
+    the next turn of the resumed conversation.
+    """
+    if "{prompt}" in command:
+        return command.replace("{prompt}", f"--resume {session_id} {{prompt}}", 1)
+    return f"{command.rstrip()} --resume {session_id}"
 
 
 def leading_env_assignment(command: str, name: str) -> str | None:

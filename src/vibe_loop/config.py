@@ -94,8 +94,14 @@ GENERATED_TASK_PROFILE_PROMPT_VERSION = 1
 SUPERVISION_DEFAULT_MAX_RESTARTS = 3
 SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
 SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
+SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS = True
 SUPERVISION_CONFIG_KEYS = frozenset(
-    {"max_restarts", "cooldown_seconds", "recover_unknown_runs"}
+    {
+        "max_restarts",
+        "cooldown_seconds",
+        "recover_unknown_runs",
+        "resume_unknown_runs",
+    }
 )
 LOCK_BACKEND_TYPES = ("directory", "command")
 LOCKS_COMMAND_KEYS = frozenset(
@@ -406,6 +412,7 @@ class SupervisionConfig:
     max_restarts: int = SUPERVISION_DEFAULT_MAX_RESTARTS
     cooldown_seconds: float = SUPERVISION_DEFAULT_COOLDOWN_SECONDS
     recover_unknown_runs: bool = SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS
+    resume_unknown_runs: bool = SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -416,6 +423,7 @@ class SupervisionConfig:
             "max_restarts": self.max_restarts,
             "cooldown_seconds": self.cooldown_seconds,
             "recover_unknown_runs": self.recover_unknown_runs,
+            "resume_unknown_runs": self.resume_unknown_runs,
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1122,6 +1130,11 @@ def parse_supervision(data: object) -> SupervisionConfig:
             table.get("recover_unknown_runs"),
             SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS,
             "supervision.recover_unknown_runs",
+        ),
+        resume_unknown_runs=optional_bool(
+            table.get("resume_unknown_runs"),
+            SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS,
+            "supervision.resume_unknown_runs",
         ),
         explicit_keys=explicit_keys,
     )

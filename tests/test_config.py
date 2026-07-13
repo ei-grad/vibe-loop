@@ -549,12 +549,40 @@ class ConfigTests(unittest.TestCase):
             ["recover_unknown_runs"],
         )
 
+    def test_supervision_config_parses_resume_unknown_runs_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nresume_unknown_runs = false\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        # Defaults on; explicit override turns it off without affecting recovery.
+        self.assertFalse(config.supervision.resume_unknown_runs)
+        self.assertTrue(config.supervision.recover_unknown_runs)
+        self.assertEqual(
+            config.supervision.to_json()["resume_unknown_runs"],
+            False,
+        )
+        self.assertEqual(
+            config.supervision.to_json()["explicit_keys"],
+            ["resume_unknown_runs"],
+        )
+
+    def test_supervision_config_resume_unknown_runs_defaults_true(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+        self.assertTrue(config.supervision.resume_unknown_runs)
+
     def test_supervision_config_rejects_invalid_values(self) -> None:
         cases = [
             ("max_restarts = -1\n", "supervision.max_restarts"),
             ('cooldown_seconds = "soon"\n', "supervision.cooldown_seconds"),
             ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
             ('recover_unknown_runs = "yes"\n', "supervision.recover_unknown_runs"),
+            ('resume_unknown_runs = "yes"\n', "supervision.resume_unknown_runs"),
             ("unsupported = true\n", "unsupported"),
         ]
         for toml, expected in cases:
