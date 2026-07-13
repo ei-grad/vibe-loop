@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time as time_module
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -1308,6 +1308,80 @@ def execute_autopilot_cycle(
     )
 
 
+_RECHECK_EPSILON = 1e-9
+
+
+def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
+    """Whether a finished cycle should poll for freshly planned tasks.
+
+    An idle cycle is one that neither dispatched nor observed a child because
+    runnable work was below ``min_ready``; it is also the only branch that runs
+    the planning command. So an idle status captures exactly the cases where the
+    board may gain runnable tasks out of band, and sleeping the full interval
+    would strand them. Cycles that dispatched, observed, or were blocked keep the
+    plain interval sleep.
+    """
+    return result.status == "idle"
+
+
+def recheck_sleep_slices(interval: float, recheck_seconds: float) -> Iterator[float]:
+    """Partition ``interval`` into poll slices of at most ``recheck_seconds``.
+
+    Yields each slice duration in order; the final slice is shortened so the
+    yielded durations sum to ``interval``. Yields nothing when ``interval`` is
+    non-positive, so a drain-mode (no-interval) supervisor never polls.
+    """
+    if interval <= 0:
+        return
+    step = recheck_seconds if recheck_seconds > 0 else interval
+    remaining = interval
+    while remaining > _RECHECK_EPSILON:
+        current = step if step < remaining else remaining
+        yield current
+        remaining -= current
+
+
+def poll_runnable_count(config: VibeConfig) -> int:
+    """Cheap runnable-task poll for the post-planning recheck loop.
+
+    Reuses the same task-source listing as cycle status collection. A task
+    source error is reported as zero runnable so a transient failure keeps the
+    supervisor waiting rather than crashing it.
+    """
+    status = collect_task_queue_status(config)
+    if status.source_error:
+        return 0
+    return status.runnable
+
+
+def recheck_interval_for_runnable(
+    config: VibeConfig,
+    *,
+    interval: float,
+    recheck_seconds: float,
+    sleeper: Sleep,
+    should_stop: Callable[[], bool] | None = None,
+    runnable_probe: Callable[[VibeConfig], int] | None = None,
+) -> bool:
+    """Sleep up to ``interval`` while polling for newly runnable tasks.
+
+    Sleeps in ``recheck_seconds`` slices through the injected ``sleeper`` and
+    probes the task source between slices. Returns ``True`` as soon as a runnable
+    task appears so the caller can start the next cycle early, and ``False`` when
+    the full interval elapses with none (or a stop is requested). Used after
+    idle/planning cycles so freshly planned work is picked up without waiting the
+    whole interval.
+    """
+    probe = runnable_probe if runnable_probe is not None else poll_runnable_count
+    for slice_seconds in recheck_sleep_slices(interval, recheck_seconds):
+        sleeper(slice_seconds)
+        if should_stop is not None and should_stop():
+            return False
+        if probe(config) > 0:
+            return True
+    return False
+
+
 def run_autopilot(
     config: VibeConfig,
     *,
@@ -1442,7 +1516,26 @@ def run_autopilot(
             if interval > 0:
                 # Persistent watch: keep cycling and sleeping until a bound or
                 # signal stops the loop, even across idle or blocked cycles.
-                sleeper(interval)
+                if cycle_should_recheck(result):
+                    # An idle/planning cycle may gain runnable tasks out of band
+                    # (a detached planning agent filling the queue). Poll the
+                    # task source in recheck slices instead of sleeping the whole
+                    # interval, and start the next cycle as soon as work appears.
+                    woke_early = recheck_interval_for_runnable(
+                        config,
+                        interval=interval,
+                        recheck_seconds=config.autopilot.planning_recheck_seconds,
+                        sleeper=sleeper,
+                        should_stop=should_stop,
+                    )
+                    if woke_early:
+                        print(
+                            "[vibe-loop] autopilot recheck: runnable tasks "
+                            "appeared, starting next cycle early",
+                            flush=True,
+                        )
+                else:
+                    sleeper(interval)
                 continue
             # Drain mode (no interval): continue only while cycles can still make
             # progress; an idle or blocked cycle cannot advance without waiting or

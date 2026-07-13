@@ -123,7 +123,15 @@ AUTOPILOT_COMMAND_KEYS = frozenset(
     }
 )
 AUTOPILOT_CONFIG_KEYS = (
-    frozenset({"jobs", "interval_seconds", "min_ready", "require_clean_repo"})
+    frozenset(
+        {
+            "jobs",
+            "interval_seconds",
+            "min_ready",
+            "require_clean_repo",
+            "planning_recheck_seconds",
+        }
+    )
     | AUTOPILOT_COMMAND_KEYS
 )
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
@@ -448,6 +456,7 @@ class AutopilotConfig:
     interval_seconds: float | None = None
     min_ready: int | None = None
     require_clean_repo: bool = True
+    planning_recheck_seconds: float = 60.0
     health_command: str | None = None
     summary_command: str | None = None
     troubleshoot_command: str | None = None
@@ -471,6 +480,7 @@ class AutopilotConfig:
             "interval_seconds": self.interval_seconds,
             "min_ready": self.min_ready,
             "require_clean_repo": self.require_clean_repo,
+            "planning_recheck_seconds": self.planning_recheck_seconds,
             "health_command": self.health_command,
             "summary_command": self.summary_command,
             "troubleshoot_command": self.troubleshoot_command,
@@ -1195,6 +1205,11 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             "autopilot.interval_seconds",
         ),
         min_ready=optional_positive_int(table.get("min_ready"), "autopilot.min_ready"),
+        planning_recheck_seconds=positive_float(
+            table.get("planning_recheck_seconds"),
+            60.0,
+            "autopilot.planning_recheck_seconds",
+        ),
         require_clean_repo=optional_bool(
             table.get("require_clean_repo"),
             True,
@@ -1388,6 +1403,13 @@ def optional_nonnegative_float(value: object, name: str) -> float | None:
     if value is None:
         return None
     return nonnegative_float(value, 0.0, name)
+
+
+def positive_float(value: object, default: float, name: str) -> float:
+    parsed = nonnegative_float(value, default, name)
+    if parsed <= 0.0:
+        raise ValueError(f"{name} must be a positive number")
+    return parsed
 
 
 def optional_int(value: object, default: int, name: str) -> int:

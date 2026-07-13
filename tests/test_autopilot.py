@@ -19,8 +19,12 @@ from vibe_loop.autopilot import (
     collect_registry_status,
     collect_supervisor_status,
     cycle_schedule_deadline,
+    cycle_should_recheck,
     limit_wall_pause_seconds,
     parse_wait_deadline,
+    poll_runnable_count,
+    recheck_interval_for_runnable,
+    recheck_sleep_slices,
     run_autopilot,
     run_maintenance_command,
     run_worktree_disposition,
@@ -930,6 +934,273 @@ class LimitWallPauseTests(unittest.TestCase):
         self.assertEqual(sleeps, [42.0])
         self.assertEqual(summary.cycles[0].limit_wall_pause_seconds, 42.0)
         self.assertIn("limit_wall_pause:42s", summary.cycles[0].actions)
+
+
+class AutopilotRecheckTests(unittest.TestCase):
+    def _recording_launcher(self):
+        calls: list[list[str]] = []
+
+        def launcher(command, *, cwd, log_path, on_start=None):
+            calls.append(list(command))
+            if on_start is not None:
+                on_start(4242)
+            return 0
+
+        return launcher, calls
+
+    def _planning_runner(self):
+        kinds: list[str] = []
+
+        def runner(
+            command, kind, cycle_id, *, cwd, env_extra, timeout, max_output_bytes
+        ):
+            kinds.append(kind)
+            return MaintenanceCommandResult(
+                kind=kind,
+                cycle_id=cycle_id,
+                exit_code=0,
+                duration_seconds=0.0,
+                output=f"{kind}-output",
+                output_truncated=False,
+                timed_out=False,
+            )
+
+        return runner, kinds
+
+    def _future_limit_wall_result(self, repo: Path) -> RunResult:
+        return RunResult(  # type: ignore[arg-type]
+            run_id="run-limit",
+            task_id="TASK-LW",
+            classification="limit_wall",
+            exit_code=1,
+            log_path=repo / "limit.log",
+            start_main="aaa",
+            end_main="aaa",
+            message="",
+            finished_at="2099-01-01T00:00:00+00:00",
+        )
+
+    def test_recheck_sleep_slices_partition_interval(self) -> None:
+        self.assertEqual(list(recheck_sleep_slices(100.0, 10.0)), [10.0] * 10)
+        self.assertEqual(list(recheck_sleep_slices(25.0, 10.0)), [10.0, 10.0, 5.0])
+        # A non-positive recheck collapses to a single full-interval slice.
+        self.assertEqual(list(recheck_sleep_slices(30.0, 0.0)), [30.0])
+        # A non-positive interval yields nothing so drain mode never polls.
+        self.assertEqual(list(recheck_sleep_slices(0.0, 10.0)), [])
+        self.assertEqual(list(recheck_sleep_slices(-5.0, 10.0)), [])
+
+    def test_recheck_interval_wakes_early_when_runnable_appears(self) -> None:
+        sleeps: list[float] = []
+        probes = iter([0, 0, 1])
+
+        woke_early = recheck_interval_for_runnable(
+            object(),  # config is unused; the runnable probe is injected
+            interval=100.0,
+            recheck_seconds=10.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config: next(probes),
+        )
+
+        self.assertTrue(woke_early)
+        self.assertEqual(sleeps, [10.0, 10.0, 10.0])
+
+    def test_recheck_interval_falls_through_when_no_runnable(self) -> None:
+        sleeps: list[float] = []
+
+        woke_early = recheck_interval_for_runnable(
+            object(),  # config is unused; the runnable probe is injected
+            interval=100.0,
+            recheck_seconds=10.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config: 0,
+        )
+
+        self.assertFalse(woke_early)
+        self.assertEqual(sleeps, [10.0] * 10)
+
+    def test_recheck_interval_stops_when_requested(self) -> None:
+        sleeps: list[float] = []
+
+        woke_early = recheck_interval_for_runnable(
+            object(),  # config is unused; the runnable probe is injected
+            interval=100.0,
+            recheck_seconds=10.0,
+            sleeper=sleeps.append,
+            should_stop=lambda: True,
+            runnable_probe=lambda _config: 0,
+        )
+
+        self.assertFalse(woke_early)
+        self.assertEqual(sleeps, [10.0])
+
+    def test_poll_runnable_count_reports_zero_on_source_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+            config = load_config(repo)
+            self.assertEqual(poll_runnable_count(config), 1)
+            # A task-source failure must be reported as no runnable work, never
+            # crash the poll, so the supervisor keeps waiting.
+            (repo / "PLAN.md").unlink()
+            self.assertEqual(poll_runnable_count(config), 0)
+
+    def test_cycle_should_recheck_only_for_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+            project_status = collect_project_status(load_config(repo))
+
+        def result(status: str) -> AutopilotCycleResult:
+            return AutopilotCycleResult(
+                cycle_id="c1",
+                repo=Path("/tmp"),
+                status=status,
+                occurred_at="",
+                project_status=project_status,
+            )
+
+        self.assertTrue(cycle_should_recheck(result("idle")))
+        for status in (
+            "completed",
+            "restartable",
+            "terminated",
+            "observing",
+            "blocked",
+        ):
+            self.assertFalse(cycle_should_recheck(result(status)))
+
+    def test_idle_planning_cycle_rechecks_and_wakes_early(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "require_clean_repo = false\n"
+                    'planning_command = "plan"\n'
+                ),
+            )
+            config = load_config(repo)
+            runner, kinds = self._planning_runner()
+            launcher, launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            def sleeper(seconds: float) -> None:
+                sleeps.append(seconds)
+                if len(sleeps) == 2:
+                    # A detached planning agent lands a runnable task mid-recheck.
+                    write_plan(
+                        repo,
+                        [
+                            ("TASK-00", "Next", "MISSING", "blocked scope"),
+                            ("TASK-01", "Next", "", "ready scope"),
+                        ],
+                    )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                maintenance_runner=runner,
+                sleep=sleeper,
+            )
+
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("ran_planning_command:exit=0", summary.cycles[0].actions)
+        self.assertEqual(kinds, ["planning"])
+        # Recheck slices, not one full interval; woke on the second poll.
+        self.assertEqual(sleeps, [10.0, 10.0])
+        # The next cycle picked up the freshly planned task and dispatched.
+        self.assertEqual(len(launcher_calls), 1)
+        self.assertEqual(summary.cycles[1].status, "completed")
+
+    def test_idle_cycle_without_new_work_sleeps_full_interval_in_slices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+            )
+            config = load_config(repo)
+            launcher, launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(summary.cycles[0].status, "idle")
+        # No runnable task ever appears, so the recheck loop sleeps the full
+        # interval in recheck-sized slices, then the next cycle begins.
+        self.assertEqual(sleeps, [10.0] * 10)
+        self.assertEqual(len(launcher_calls), 0)
+
+    def test_dispatched_cycle_sleeps_plain_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+            )
+            config = load_config(repo)
+            launcher, launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(summary.cycles[0].status, "completed")
+        # A cycle that dispatched work keeps the single full-interval sleep with
+        # no polling.
+        self.assertEqual(sleeps, [100.0])
+        self.assertEqual(len(launcher_calls), 2)
+
+    def test_limit_wall_pause_takes_precedence_over_recheck(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "[supervision]\n"
+                    "limit_wall_backoff_seconds = 42\n"
+                ),
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_result(self._future_limit_wall_result(repo))
+            launcher, _launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertEqual(summary.cycles[0].limit_wall_pause_seconds, 42.0)
+        # Even though the cycle is idle, the limit-wall backoff replaces the
+        # recheck loop entirely; the recheck slice size never appears.
+        self.assertEqual(sleeps, [42.0])
 
 
 class AutopilotMaintenanceTests(unittest.TestCase):

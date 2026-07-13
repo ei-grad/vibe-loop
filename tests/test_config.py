@@ -439,6 +439,7 @@ class ConfigTests(unittest.TestCase):
                 "jobs = 2\n"
                 "interval_seconds = 30.0\n"
                 "min_ready = 2\n"
+                "planning_recheck_seconds = 45.0\n"
                 "require_clean_repo = false\n"
                 'health_command = "scripts/health.sh"\n'
                 'planning_command = "scripts/plan.sh"\n',
@@ -450,6 +451,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.autopilot.jobs, 2)
         self.assertEqual(config.autopilot.interval_seconds, 30.0)
         self.assertEqual(config.autopilot.min_ready, 2)
+        self.assertEqual(config.autopilot.planning_recheck_seconds, 45.0)
+        self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 45.0)
         self.assertFalse(config.autopilot.require_clean_repo)
         self.assertEqual(
             config.autopilot.maintenance_command("health"), "scripts/health.sh"
@@ -468,6 +471,8 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.autopilot.interval_seconds)
         self.assertIsNone(config.autopilot.min_ready)
         self.assertTrue(config.autopilot.require_clean_repo)
+        self.assertEqual(config.autopilot.planning_recheck_seconds, 60.0)
+        self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 60.0)
         self.assertEqual(config.autopilot.explicit_keys, frozenset())
 
     def test_autopilot_config_rejects_invalid_values(self) -> None:
@@ -475,6 +480,12 @@ class ConfigTests(unittest.TestCase):
             ("jobs = 0\n", "autopilot.jobs"),
             ("min_ready = -1\n", "autopilot.min_ready"),
             ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
+            ("planning_recheck_seconds = 0\n", "autopilot.planning_recheck_seconds"),
+            ("planning_recheck_seconds = -5\n", "autopilot.planning_recheck_seconds"),
+            (
+                'planning_recheck_seconds = "soon"\n',
+                "autopilot.planning_recheck_seconds",
+            ),
             ("unsupported = true\n", "unsupported"),
         ]
         for toml, expected in cases:
