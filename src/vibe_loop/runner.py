@@ -48,6 +48,7 @@ from vibe_loop.locks import (
     fencing_token_value,
 )
 from vibe_loop.retry import (
+    detect_limit_wall,
     is_transient_stderr,
     parse_quota_reset_delay,
     retry_subprocess_run,
@@ -338,6 +339,9 @@ class StreamingCommandResult:
 class ClassificationResult:
     status: str
     source: str
+    # Optional human-readable context for the outcome (e.g. the advertised
+    # reset phrase for a limit_wall), persisted into the run result message.
+    detail: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1178,6 +1182,12 @@ class VibeRunner:
                 elif exit_code == 0:
                     message = self.run_completion_checks(log)
             end_main = git_rev_parse(self.config.repo, "HEAD")
+            try:
+                output_tail = _read_log_tail(
+                    log_path, LOG_TAIL_LINES_FOR_TRANSIENT_CHECK
+                )
+            except OSError:
+                output_tail = ""
             classification = self.classify(
                 task.task_id,
                 exit_code,
@@ -1185,7 +1195,12 @@ class VibeRunner:
                 end_main,
                 message,
                 worker_report,
+                output_tail,
             )
+            if classification.status == "limit_wall" and classification.detail:
+                # Persist the advertised reset phrase so the supervisor can size
+                # its dispatch backoff from the recorded result alone.
+                message = classification.detail
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.run_state_transition(
                     run_id=run_id,
@@ -1452,6 +1467,12 @@ class VibeRunner:
                 if max_tasks > 0 and completed_count >= max_tasks:
                     break
                 continue
+            if result.classification == "limit_wall":
+                # The task stays runnable and keeps its restart budget; stop
+                # dispatching so the supervisor can back off until the reset
+                # instead of tight-looping into the same wall.
+                self._report_limit_wall_pause(result)
+                break
             if is_transient_worker_failure(result):
                 count = transient_retries.get(result.task_id, 0) + 1
                 transient_retries[result.task_id] = count
@@ -1644,6 +1665,13 @@ class VibeRunner:
                         completed_count += 1
                         if max_tasks > 0 and completed_count >= max_tasks:
                             stop_after_running = True
+                        continue
+                    if result.classification == "limit_wall":
+                        # Keep the task runnable and its restart budget intact;
+                        # stop scheduling new work and drain in-flight workers so
+                        # the supervisor can back off before the next cycle.
+                        self._report_limit_wall_pause(result)
+                        stop_after_running = True
                         continue
                     if is_transient_worker_failure(result):
                         count = transient_retries.get(result.task_id, 0) + 1
@@ -1951,9 +1979,23 @@ class VibeRunner:
         end_main: str,
         message: str,
         worker_report: WorkerReport | None = None,
+        output_tail: str = "",
     ) -> ClassificationResult:
         if worker_report is not None:
             return ClassificationResult(worker_report.status, "worker_report")
+        # A provider limit wall exits nonzero, so it must be caught before the
+        # exit_code branch downgrades it to "failed" and burns restart budget.
+        # A worker that filed a terminal report above already made progress, so
+        # only wall-detect a report-less death.
+        if self.config.supervision.limit_wall_detection and output_tail:
+            signal = detect_limit_wall(
+                output_tail,
+                self.config.supervision.limit_wall_patterns or None,
+            )
+            if signal is not None:
+                return ClassificationResult(
+                    "limit_wall", "limit_wall", detail=signal.reset_text
+                )
         if exit_code != 0 or message:
             return ClassificationResult("failed", "exit_code_or_completion_check")
         task = self.source.probe(task_id)
@@ -1973,6 +2015,15 @@ class VibeRunner:
     def record_result(self, result: RunResult) -> None:
         with self._record_lock:
             self.run_store.append_result(result)
+
+    def _report_limit_wall_pause(self, result: RunResult) -> None:
+        detail = (result.message or "").strip()
+        suffix = f" ({detail})" if detail else ""
+        report_status(
+            f"limit wall hit for {result.task_id}{suffix}: stopping dispatch "
+            "without consuming restart budget; supervisor backs off before "
+            "the next cycle"
+        )
 
     def recent_log_context(self, max_runs: int = 5, tail_lines: int = 80) -> str:
         return self.run_store.recent_log_context(max_runs, tail_lines)

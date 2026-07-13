@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from vibe_loop.autopilot import (
     collect_registry_status,
     collect_supervisor_status,
     cycle_schedule_deadline,
+    limit_wall_pause_seconds,
     parse_wait_deadline,
     run_autopilot,
     run_maintenance_command,
@@ -32,6 +34,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+    RunResult,
     RunStore,
 )
 from vibe_loop.workers import ActiveRunState
@@ -808,6 +811,125 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertEqual(command[command.index("--max-slices") + 1], "4")
         self.assertEqual(command[command.index("--max-tasks") + 1], "2")
+
+
+class LimitWallPauseTests(unittest.TestCase):
+    UTC = datetime.timezone.utc
+
+    def _limit_wall_result(
+        self,
+        repo: Path,
+        *,
+        task_id: str = "TASK-01",
+        message: str = "",
+        finished_at: str = "",
+    ) -> RunResult:
+        kwargs: dict[str, object] = {
+            "run_id": f"run-{task_id}",
+            "task_id": task_id,
+            "classification": "limit_wall",
+            "exit_code": 1,
+            "log_path": repo / f"{task_id}.log",
+            "start_main": "aaa",
+            "end_main": "aaa",
+            "message": message,
+        }
+        if finished_at:
+            kwargs["finished_at"] = finished_at
+        return RunResult(**kwargs)  # type: ignore[arg-type]
+
+    def test_no_limit_wall_returns_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            pause = limit_wall_pause_seconds(store, since="", default_backoff=1800.0)
+        self.assertIsNone(pause)
+
+    def test_uses_reset_delay_from_recorded_message(self) -> None:
+        now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=self.UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_result(
+                self._limit_wall_result(repo, message="resets 1am (UTC)")
+            )
+            pause = limit_wall_pause_seconds(
+                store, since="", default_backoff=1800.0, now=now
+            )
+        self.assertIsNotNone(pause)
+        self.assertAlmostEqual(pause, 3600 + 120.0, delta=1.0)
+
+    def test_falls_back_to_default_backoff_without_reset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_result(self._limit_wall_result(repo, message=""))
+            pause = limit_wall_pause_seconds(store, since="", default_backoff=1234.0)
+        self.assertEqual(pause, 1234.0)
+
+    def test_ignores_records_finished_before_since(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_result(
+                self._limit_wall_result(repo, finished_at="2026-07-13T00:00:00+00:00")
+            )
+            pause = limit_wall_pause_seconds(
+                store,
+                since="2026-07-13T01:00:00+00:00",
+                default_backoff=1800.0,
+            )
+        self.assertIsNone(pause)
+
+    def test_takes_longest_pause_across_walls(self) -> None:
+        now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=self.UTC)
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            store.append_result(
+                self._limit_wall_result(repo, task_id="TASK-01", message="")
+            )
+            store.append_result(
+                self._limit_wall_result(
+                    repo, task_id="TASK-02", message="resets 2am (UTC)"
+                )
+            )
+            pause = limit_wall_pause_seconds(
+                store, since="", default_backoff=1800.0, now=now
+            )
+        # 2am reset (2h + margin) beats the 1800s default from the other wall.
+        self.assertAlmostEqual(pause, 2 * 3600 + 120.0, delta=1.0)
+
+    def test_run_autopilot_pauses_dispatch_on_limit_wall(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[supervision]\nlimit_wall_backoff_seconds = 42\n",
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                if on_start is not None:
+                    on_start(4242)
+                run_store.append_result(self._limit_wall_result(Path(cwd)))
+                return 0
+
+            sleeps: list[float] = []
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=5.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+            )
+
+        self.assertTrue(summary.started)
+        # The limit-wall backoff replaces the normal interval between cycles.
+        self.assertEqual(sleeps, [42.0])
+        self.assertEqual(summary.cycles[0].limit_wall_pause_seconds, 42.0)
+        self.assertIn("limit_wall_pause:42s", summary.cycles[0].actions)
 
 
 class AutopilotMaintenanceTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import errno
 import subprocess
 import unittest
@@ -9,12 +10,17 @@ from vibe_loop.retry import (
     DEFAULT_BASE_DELAY,
     DEFAULT_JITTER,
     DEFAULT_MAX_DELAY,
+    LIMIT_WALL_DEFAULT_BACKOFF_SECONDS,
     QUOTA_RESET_MARGIN_SECONDS,
     QUOTA_RESET_MAX_DELAY_SECONDS,
+    LimitWallSignal,
     backoff_delay,
+    detect_limit_wall,
     is_transient_oserror,
     is_transient_stderr,
     is_transient_subprocess_result,
+    limit_wall_backoff_seconds,
+    parse_limit_wall_reset_delay,
     parse_quota_reset_delay,
     retry_subprocess_run,
 )
@@ -62,6 +68,94 @@ class QuotaResetDelayTests(unittest.TestCase):
     def test_invalid_times_return_none(self) -> None:
         self.assertIsNone(parse_quota_reset_delay("resets 13:00pm (UTC)"))
         self.assertIsNone(parse_quota_reset_delay("resets 25:00 (UTC)"))
+
+
+UTC = datetime.timezone.utc
+
+
+class LimitWallDetectionTests(unittest.TestCase):
+    def test_detects_usage_cap_message(self) -> None:
+        signal = detect_limit_wall(
+            "output...\nYou've reached your Fable 5 limit · switch models"
+        )
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.marker, "You've reached your Fable 5 limit")
+
+    def test_detects_session_limit_message(self) -> None:
+        signal = detect_limit_wall("You've hit your session limit · resets 1am (UTC)")
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.marker, "You've hit your session limit")
+
+    def test_ignores_non_limit_output(self) -> None:
+        self.assertIsNone(detect_limit_wall("worker completed the slice; all green"))
+        # A generic "rate limit" 429 is a transient failure, not a limit wall.
+        self.assertIsNone(detect_limit_wall("Error: 429 rate limit exceeded"))
+
+    def test_reset_time_with_utc_is_parsed(self) -> None:
+        now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=UTC)
+        signal = detect_limit_wall(
+            "You've hit your session limit · resets 1am (UTC)", now=now
+        )
+        assert signal is not None
+        self.assertEqual(signal.reset_text, "resets 1am (UTC)")
+        self.assertAlmostEqual(
+            signal.reset_delay, 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
+        )
+
+    def test_reset_time_without_utc_is_parsed(self) -> None:
+        now = datetime.datetime(2026, 7, 13, 13, 0, tzinfo=UTC)
+        signal = detect_limit_wall(
+            "You've reached your limit. Your limit will reset at 3pm", now=now
+        )
+        assert signal is not None
+        self.assertIsNotNone(signal.reset_delay)
+        self.assertAlmostEqual(
+            signal.reset_delay, 2 * 3600 + QUOTA_RESET_MARGIN_SECONDS, delta=1.0
+        )
+
+    def test_unparseable_reset_leaves_delay_none(self) -> None:
+        signal = detect_limit_wall("You've hit your session limit")
+        assert signal is not None
+        self.assertEqual(signal.reset_text, "")
+        self.assertIsNone(signal.reset_delay)
+
+    def test_custom_patterns_override_defaults(self) -> None:
+        # A custom list fully replaces the defaults: the default phrases no
+        # longer match, and the custom phrase does.
+        self.assertIsNone(
+            detect_limit_wall(
+                "You've hit your session limit", ["provider wall reached"]
+            )
+        )
+        signal = detect_limit_wall(
+            "the provider wall reached for now", ["provider wall reached"]
+        )
+        self.assertIsNotNone(signal)
+
+    def test_far_future_reset_is_capped(self) -> None:
+        now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=UTC)
+        delay = parse_limit_wall_reset_delay("reset at 11:59pm", now=now)
+        self.assertEqual(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+
+
+class LimitWallBackoffTests(unittest.TestCase):
+    def test_uses_reset_delay_when_present(self) -> None:
+        signal = LimitWallSignal(
+            marker="wall", reset_text="resets 1am", reset_delay=900.0
+        )
+        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 900.0)
+
+    def test_falls_back_to_default_backoff(self) -> None:
+        signal = LimitWallSignal(marker="wall")
+        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 1800.0)
+
+    def test_default_backoff_constant(self) -> None:
+        signal = LimitWallSignal(marker="wall")
+        self.assertEqual(
+            limit_wall_backoff_seconds(signal), LIMIT_WALL_DEFAULT_BACKOFF_SECONDS
+        )
 
 
 class TransientStderrDetectionTests(unittest.TestCase):

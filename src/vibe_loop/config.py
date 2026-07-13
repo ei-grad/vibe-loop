@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import re
 import shlex
 import shutil
 import subprocess
@@ -95,12 +96,17 @@ SUPERVISION_DEFAULT_MAX_RESTARTS = 3
 SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
 SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
 SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS = True
+SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION = True
+SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
 SUPERVISION_CONFIG_KEYS = frozenset(
     {
         "max_restarts",
         "cooldown_seconds",
         "recover_unknown_runs",
         "resume_unknown_runs",
+        "limit_wall_detection",
+        "limit_wall_backoff_seconds",
+        "limit_wall_patterns",
     }
 )
 LOCK_BACKEND_TYPES = ("directory", "command")
@@ -413,6 +419,11 @@ class SupervisionConfig:
     cooldown_seconds: float = SUPERVISION_DEFAULT_COOLDOWN_SECONDS
     recover_unknown_runs: bool = SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS
     resume_unknown_runs: bool = SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS
+    limit_wall_detection: bool = SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION
+    limit_wall_backoff_seconds: float = SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS
+    # Empty means "use the runner's built-in DEFAULT_LIMIT_WALL_PATTERNS"; a
+    # non-empty tuple fully overrides that default list.
+    limit_wall_patterns: tuple[str, ...] = ()
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -424,6 +435,9 @@ class SupervisionConfig:
             "cooldown_seconds": self.cooldown_seconds,
             "recover_unknown_runs": self.recover_unknown_runs,
             "resume_unknown_runs": self.resume_unknown_runs,
+            "limit_wall_detection": self.limit_wall_detection,
+            "limit_wall_backoff_seconds": self.limit_wall_backoff_seconds,
+            "limit_wall_patterns": list(self.limit_wall_patterns),
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1136,8 +1150,34 @@ def parse_supervision(data: object) -> SupervisionConfig:
             SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS,
             "supervision.resume_unknown_runs",
         ),
+        limit_wall_detection=optional_bool(
+            table.get("limit_wall_detection"),
+            SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION,
+            "supervision.limit_wall_detection",
+        ),
+        limit_wall_backoff_seconds=nonnegative_float(
+            table.get("limit_wall_backoff_seconds"),
+            SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS,
+            "supervision.limit_wall_backoff_seconds",
+        ),
+        limit_wall_patterns=parse_limit_wall_patterns(table.get("limit_wall_patterns")),
         explicit_keys=explicit_keys,
     )
+
+
+def parse_limit_wall_patterns(value: object) -> tuple[str, ...]:
+    patterns = nonempty_string_tuple(
+        value, (), "supervision.limit_wall_patterns", allow_empty=True
+    )
+    for pattern in patterns:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(
+                "supervision.limit_wall_patterns entry is not a valid regex "
+                f"({pattern!r}): {exc}"
+            ) from exc
+    return patterns
 
 
 def parse_autopilot(data: object) -> AutopilotConfig:

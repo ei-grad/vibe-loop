@@ -576,6 +576,46 @@ class ConfigTests(unittest.TestCase):
             config = load_config(Path(directory))
         self.assertTrue(config.supervision.resume_unknown_runs)
 
+    def test_supervision_config_limit_wall_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+        self.assertTrue(config.supervision.limit_wall_detection)
+        self.assertEqual(config.supervision.limit_wall_backoff_seconds, 1800.0)
+        self.assertEqual(config.supervision.limit_wall_patterns, ())
+        self.assertEqual(config.supervision.explicit_keys, frozenset())
+
+    def test_supervision_config_parses_limit_wall_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\n"
+                "limit_wall_detection = false\n"
+                "limit_wall_backoff_seconds = 600\n"
+                'limit_wall_patterns = ["custom wall", "another cap"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertFalse(config.supervision.limit_wall_detection)
+        self.assertEqual(config.supervision.limit_wall_backoff_seconds, 600.0)
+        self.assertEqual(
+            config.supervision.limit_wall_patterns,
+            ("custom wall", "another cap"),
+        )
+        self.assertEqual(
+            config.supervision.to_json()["limit_wall_patterns"],
+            ["custom wall", "another cap"],
+        )
+        self.assertEqual(
+            config.supervision.to_json()["explicit_keys"],
+            [
+                "limit_wall_backoff_seconds",
+                "limit_wall_detection",
+                "limit_wall_patterns",
+            ],
+        )
+
     def test_supervision_config_rejects_invalid_values(self) -> None:
         cases = [
             ("max_restarts = -1\n", "supervision.max_restarts"),
@@ -583,6 +623,16 @@ class ConfigTests(unittest.TestCase):
             ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
             ('recover_unknown_runs = "yes"\n', "supervision.recover_unknown_runs"),
             ('resume_unknown_runs = "yes"\n', "supervision.resume_unknown_runs"),
+            ('limit_wall_detection = "yes"\n', "supervision.limit_wall_detection"),
+            (
+                "limit_wall_backoff_seconds = -1\n",
+                "supervision.limit_wall_backoff_seconds",
+            ),
+            ('limit_wall_patterns = "wall"\n', "supervision.limit_wall_patterns"),
+            (
+                'limit_wall_patterns = ["("]\n',
+                "supervision.limit_wall_patterns",
+            ),
             ("unsupported = true\n", "unsupported"),
         ]
         for toml, expected in cases:

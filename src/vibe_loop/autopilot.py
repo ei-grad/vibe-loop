@@ -21,6 +21,7 @@ from vibe_loop.config import (
     unresolved_prompt_dialect_message,
 )
 from vibe_loop.locks import LockBusy, build_lock_manager
+from vibe_loop.retry import parse_limit_wall_reset_delay
 from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
@@ -214,6 +215,7 @@ class AutopilotCycleResult:
     child_pid: int | None = None
     child_log: Path | None = None
     next_wake: str = ""
+    limit_wall_pause_seconds: float | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -233,6 +235,7 @@ class AutopilotCycleResult:
             "child_pid": self.child_pid,
             "child_log": str(self.child_log) if self.child_log is not None else "",
             "next_wake": self.next_wake,
+            "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
         }
 
     def append_to(self, run_store: RunStore) -> None:
@@ -778,6 +781,42 @@ def classify_child_exit(exit_code: int) -> str:
     return "restartable"
 
 
+LIMIT_WALL_SCAN_MAX_RESULTS = 50
+
+
+def limit_wall_pause_seconds(
+    run_store: RunStore,
+    *,
+    since: str,
+    default_backoff: float,
+    now: datetime | None = None,
+) -> float | None:
+    """Dispatch backoff after a child stopped on a provider limit wall.
+
+    Scans result records finished at or after ``since`` for a ``limit_wall``
+    classification and returns the seconds to pause before the next cycle: the
+    advertised reset delay when the recorded message carries one, otherwise
+    ``default_backoff``. Returns None when no limit wall occurred this cycle, so
+    the supervisor keeps its normal cadence. Pure decision function: it reads
+    recorded state and never sleeps.
+    """
+    pause: float | None = None
+    for record in run_store.recent_result_records(max_runs=LIMIT_WALL_SCAN_MAX_RESULTS):
+        if record.get("classification") != "limit_wall":
+            continue
+        finished_at = str(record.get("finished_at") or "")
+        if since and finished_at and finished_at < since:
+            continue
+        reset_delay = parse_limit_wall_reset_delay(
+            str(record.get("message") or ""), now=now
+        )
+        candidate = (
+            reset_delay if reset_delay is not None else max(0.0, default_backoff)
+        )
+        pause = candidate if pause is None else max(pause, candidate)
+    return pause
+
+
 AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES = 128 * 1024
 AUTOPILOT_COMMAND_TIMEOUT_SECONDS = 120.0
 AUTOPILOT_MAINTENANCE_KINDS = ("health", "summary", "troubleshoot", "planning")
@@ -1120,6 +1159,7 @@ def execute_autopilot_cycle(
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
 ) -> AutopilotCycleResult:
+    cycle_started_at = utc_now_iso()
     status = collect_project_status(config, process_exists=process_exists)
     runnable = status.queue.runnable
     actions: list[str] = []
@@ -1245,6 +1285,14 @@ def execute_autopilot_cycle(
         if cycle_status in {"restartable", "terminated"}:
             run_maintenance("troubleshoot")
 
+    pause_seconds = limit_wall_pause_seconds(
+        run_store,
+        since=cycle_started_at,
+        default_backoff=config.supervision.limit_wall_backoff_seconds,
+    )
+    if pause_seconds is not None:
+        actions.append(f"limit_wall_pause:{pause_seconds:.0f}s")
+
     return AutopilotCycleResult(
         cycle_id=cycle_id,
         repo=config.repo,
@@ -1256,6 +1304,7 @@ def execute_autopilot_cycle(
         child_pid=child_pid,
         child_log=child_log,
         next_wake=next_wake,
+        limit_wall_pause_seconds=pause_seconds,
     )
 
 
@@ -1377,6 +1426,19 @@ def run_autopilot(
             cycles.append(result)
             if bounded_last:
                 break
+            pause_seconds = result.limit_wall_pause_seconds
+            if pause_seconds is not None:
+                # A child stopped on a provider limit wall. Pause dispatch until
+                # the advertised reset (or the configured backoff) instead of
+                # re-dispatching straight into the same wall, in both persistent
+                # and drain modes.
+                print(
+                    f"[vibe-loop] autopilot limit wall: pausing dispatch "
+                    f"{pause_seconds:.0f}s before the next cycle",
+                    flush=True,
+                )
+                sleeper(pause_seconds)
+                continue
             if interval > 0:
                 # Persistent watch: keep cycling and sleeping until a bound or
                 # signal stops the loop, even across idle or blocked cycles.

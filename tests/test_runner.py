@@ -659,6 +659,89 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(result.status, expected)
                     self.assertEqual(result.source, "task_probe")
 
+    def test_classify_detects_limit_wall_before_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            result = runner.classify(
+                "TASK-01",
+                1,
+                "aaa",
+                "aaa",
+                "",
+                None,
+                output_tail="You've hit your session limit · resets 1am (UTC)",
+            )
+        self.assertEqual(result.status, "limit_wall")
+        self.assertEqual(result.source, "limit_wall")
+        self.assertEqual(result.detail, "resets 1am (UTC)")
+
+    def test_classify_worker_report_wins_over_limit_wall(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            result = runner.classify(
+                "TASK-01",
+                1,
+                "aaa",
+                "aaa",
+                "",
+                WorkerReport(run_id="r", task_id="TASK-01", status="completed"),
+                output_tail="You've reached your Fable 5 limit",
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.source, "worker_report")
+
+    def test_classify_limit_wall_disabled_falls_back_to_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=Path(directory),
+                    supervision=SupervisionConfig(limit_wall_detection=False),
+                )
+            )
+            result = runner.classify(
+                "TASK-01",
+                1,
+                "aaa",
+                "aaa",
+                "",
+                None,
+                output_tail="You've hit your session limit",
+            )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.source, "exit_code_or_completion_check")
+
+    def test_classify_honors_custom_limit_wall_patterns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=Path(directory),
+                    supervision=SupervisionConfig(
+                        limit_wall_patterns=("provider wall reached",)
+                    ),
+                )
+            )
+            # The default phrase no longer matches under a custom override.
+            default_phrase = runner.classify(
+                "TASK-01",
+                1,
+                "a",
+                "a",
+                "",
+                None,
+                output_tail="You've hit your session limit",
+            )
+            custom_phrase = runner.classify(
+                "TASK-01",
+                1,
+                "a",
+                "a",
+                "",
+                None,
+                output_tail="the provider wall reached",
+            )
+        self.assertEqual(default_phrase.status, "failed")
+        self.assertEqual(custom_phrase.status, "limit_wall")
+
     def test_inject_claude_resume_inserts_flag_before_prompt(self) -> None:
         self.assertEqual(
             inject_claude_resume("claude -p {prompt}", "sid-123"),
@@ -2153,6 +2236,81 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("ok", log_text)
             self.assertIn("bad", log_text)
             self.assertIn("\ufffd", log_text)
+
+
+class LimitWallLoopTests(unittest.TestCase):
+    def _limit_wall_runner(
+        self,
+        repo: Path,
+        source: MutableTaskSource,
+        calls: list[str],
+    ) -> VibeRunner:
+        runner = VibeRunner(VibeConfig(repo=repo, agent=AgentConfig(command="worker")))
+        runner._source = source
+
+        def run_task(task: Task) -> RunResult:
+            calls.append(task.task_id)
+            return RunResult(
+                run_id=f"run-{task.task_id}-{len(calls)}",
+                task_id=task.task_id,
+                classification="limit_wall",
+                exit_code=1,
+                log_path=repo / f"{task.task_id}.log",
+                start_main="aaa",
+                end_main="aaa",
+                message="resets 1am (UTC)",
+            )
+
+        runner.run_task = run_task
+        return runner
+
+    def test_serial_limit_wall_stops_without_consuming_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            calls: list[str] = []
+            runner = self._limit_wall_runner(repo, source, calls)
+            restart_calls: list[object] = []
+            runner.record_task_restart = (  # type: ignore[method-assign]
+                lambda *args, **kwargs: restart_calls.append((args, kwargs))
+            )
+
+            results = runner.run_until_done()
+
+        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        # Dispatch stops instead of tight-looping into the same wall.
+        self.assertEqual(calls, ["TASK-01"])
+        # No restart/recovery budget is consumed.
+        self.assertEqual(restart_calls, [])
+        # The task remains runnable for the supervisor's next cycle.
+        self.assertNotIn("TASK-01", source._done)
+
+    def test_parallel_limit_wall_stops_without_consuming_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(
+                [
+                    Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                    Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                ]
+            )
+            calls: list[str] = []
+            runner = self._limit_wall_runner(repo, source, calls)
+            restart_calls: list[object] = []
+            runner.record_task_restart = (  # type: ignore[method-assign]
+                lambda *args, **kwargs: restart_calls.append((args, kwargs))
+            )
+
+            results = runner.run_until_done(jobs=2)
+
+        self.assertTrue(results)
+        self.assertTrue(
+            all(result.classification == "limit_wall" for result in results)
+        )
+        self.assertEqual(restart_calls, [])
+        self.assertEqual(source._done, set())
 
 
 class TransientWorkerFailureTests(unittest.TestCase):
