@@ -4034,6 +4034,40 @@ class CliTests(unittest.TestCase):
         )
         self.assertTrue(doctor_payload["task_source_runtime"]["usable"])
 
+    def test_next_json_redacts_command_task_source_runtime_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "list_tasks.py").write_text(
+                "import json\n"
+                "print(json.dumps([{'id':'CMD-01','title':'Command task',"
+                "'status':'Next','dependencies':[]}]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nlist = "python list_tasks.py PRIVATE_DSN_VALUE"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["next", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["id"], "CMD-01")
+        self.assertNotIn("PRIVATE_DSN_VALUE", stdout.getvalue())
+        runtime = payload["task_source_runtime"]
+        runtime_source = runtime["task_source"]
+        self.assertNotIn("list_command", runtime_source)
+        self.assertTrue(runtime_source["list_command_configured"])
+        self.assertTrue(runtime_source["list_command_redacted"])
+        # Redaction must mask only the command strings, not drop useful fields.
+        self.assertEqual(runtime["origin"], "command_output")
+        self.assertTrue(runtime["usable"])
+
     def test_tasks_list_warns_when_using_main_worktree_config_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

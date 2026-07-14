@@ -1869,7 +1869,9 @@ def selected_task_json(config, task: Task) -> dict[str, object]:
     payload = task.to_json()
     payload.update(
         {
-            "task_source_runtime": runtime_task_source_report(config),
+            "task_source_runtime": redacted_task_source_report(
+                runtime_task_source_report(config),
+            ),
             "agent_selection_command_source": config.agent.selection_command_source,
             "agent_default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "agent_default_policy": AGENT_DEFAULT_POLICY,
