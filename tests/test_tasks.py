@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vibe_loop.config import TaskSourceConfig
 from vibe_loop.tasks import (
@@ -882,6 +883,109 @@ class MarkdownPlanTests(unittest.TestCase):
 
             with self.assertRaises(subprocess.CalledProcessError):
                 source.reset("TASK-42")
+
+    def test_command_task_source_list_applies_configured_timeout(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(args[0], 0, stdout="[]", stderr="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    command_timeout_seconds=7.5,
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                self.assertEqual(source.list_tasks(), [])
+
+        self.assertEqual(captured["timeout"], 7.5)
+
+    def test_command_task_source_probe_applies_configured_timeout(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(
+                args[0], 0, stdout='{"id": "TASK-1", "status": "Next"}', stderr=""
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    command_timeout_seconds=9.0,
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                task = source.probe("TASK-1")
+
+        self.assertIsNotNone(task)
+        self.assertEqual(captured["timeout"], 9.0)
+
+    def test_command_task_source_reset_applies_configured_timeout(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            captured.update(kwargs)
+            return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    reset_command="reset {task_id}",
+                    command_timeout_seconds=3.0,
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                self.assertTrue(source.reset("TASK-1"))
+
+        self.assertEqual(captured["timeout"], 3.0)
+
+    def test_command_task_source_surfaces_timeout_as_subprocess_error(self) -> None:
+        # A hung backend command expires as TimeoutExpired — a SubprocessError
+        # (so every caller's (SubprocessError, OSError) fail-safe covers it) but
+        # not a CalledProcessError (so it is never mistaken for a JSON failure).
+        self.assertTrue(
+            issubclass(subprocess.TimeoutExpired, subprocess.SubprocessError)
+        )
+        self.assertFalse(
+            issubclass(subprocess.TimeoutExpired, subprocess.CalledProcessError)
+        )
+
+        def raise_timeout(
+            *args: object, **kwargs: object
+        ) -> subprocess.CompletedProcess:
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs.get("timeout"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            list_source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(type="command", list_command="list-tasks"),
+            )
+            reset_source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    reset_command="reset {task_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", raise_timeout):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    list_source.list_tasks()
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    reset_source.reset("TASK-1")
 
     def test_profile_table_extracts_traceability_fields(self) -> None:
         profile = work_table_profile()

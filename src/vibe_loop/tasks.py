@@ -2062,7 +2062,11 @@ class CommandTaskSource:
             raise ValueError("command task source requires task_source.list")
 
     def list_tasks(self) -> list[Task]:
-        payload = run_json_command(self.repo, self.config.list_command or "")
+        payload = run_json_command(
+            self.repo,
+            self.config.list_command or "",
+            timeout=self.config.command_timeout_seconds,
+        )
         raw_tasks = (
             payload.get("tasks", payload) if isinstance(payload, dict) else payload
         )
@@ -2075,7 +2079,11 @@ class CommandTaskSource:
     def probe(self, task_id: str) -> Task | None:
         if self.config.probe_command:
             command = self.config.probe_command.format(task_id=task_id)
-            payload = run_json_command(self.repo, command)
+            payload = run_json_command(
+                self.repo,
+                command,
+                timeout=self.config.command_timeout_seconds,
+            )
             if payload is None:
                 return None
             return task_from_mapping(payload, 0)
@@ -2087,11 +2095,21 @@ class CommandTaskSource:
         if not self.config.reset_command:
             return False
         command = self.config.reset_command.format(task_id=task_id)
-        run_reset_command(self.repo, command)
+        run_reset_command(
+            self.repo,
+            command,
+            timeout=self.config.command_timeout_seconds,
+        )
         return True
 
 
-def run_json_command(repo: Path, command: str) -> object:
+def run_json_command(
+    repo: Path, command: str, *, timeout: float | None = None
+) -> object:
+    # timeout bounds a hung backend command so it cannot freeze the supervisor.
+    # Expiry raises subprocess.TimeoutExpired — a SubprocessError, but not a
+    # CalledProcessError — so it is not conflated with a JSON parse failure and
+    # is handled identically to a nonzero exit by every caller's fail-safe path.
     result = subprocess.run(
         command,
         cwd=repo,
@@ -2100,14 +2118,19 @@ def run_json_command(repo: Path, command: str) -> object:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=timeout,
     )
     return json.loads(result.stdout)
 
 
-def run_reset_command(repo: Path, command: str) -> None:
+def run_reset_command(
+    repo: Path, command: str, *, timeout: float | None = None
+) -> None:
     # Fire-and-check: the reset hook mutates backend status and is not expected
     # to emit JSON, so a nonzero exit raises CalledProcessError for the caller
-    # to log non-fatally rather than being parsed as task output.
+    # to log non-fatally rather than being parsed as task output. timeout bounds
+    # a hung hook the same way; TimeoutExpired is likewise a SubprocessError the
+    # caller's non-fatal handler already covers.
     subprocess.run(
         command,
         cwd=repo,
@@ -2116,6 +2139,7 @@ def run_reset_command(repo: Path, command: str) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=timeout,
     )
 
 

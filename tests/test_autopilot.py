@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vibe_loop.autopilot import (
     AutopilotCycleResult,
@@ -17,6 +18,7 @@ from vibe_loop.autopilot import (
     collect_external_run_supervisor,
     collect_project_status,
     collect_registry_status,
+    collect_task_queue_status,
     collect_supervisor_status,
     cycle_schedule_deadline,
     cycle_should_recheck,
@@ -1058,6 +1060,54 @@ class AutopilotRecheckTests(unittest.TestCase):
             )
             config = load_config(repo)
             self.assertEqual(poll_runnable_count(config), 0)
+
+    def test_poll_runnable_count_survives_command_source_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml='[task_source]\ntype = "command"\nlist = "list-tasks"\n',
+            )
+            config = load_config(repo)
+
+            def raise_timeout(
+                *args: object, **kwargs: object
+            ) -> subprocess.CompletedProcess:
+                raise subprocess.TimeoutExpired(
+                    cmd=args[0], timeout=kwargs.get("timeout")
+                )
+
+            # A hung task-source command expires as TimeoutExpired instead of
+            # hanging forever; the poll must still report zero runnable so the
+            # supervisor keeps waiting rather than crashing.
+            with mock.patch("vibe_loop.tasks.subprocess.run", raise_timeout):
+                self.assertEqual(poll_runnable_count(config), 0)
+
+    def test_collect_task_queue_status_reports_source_error_on_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml='[task_source]\ntype = "command"\nlist = "list-tasks"\n',
+            )
+            config = load_config(repo)
+
+            def raise_timeout(
+                *args: object, **kwargs: object
+            ) -> subprocess.CompletedProcess:
+                raise subprocess.TimeoutExpired(
+                    cmd=args[0], timeout=kwargs.get("timeout")
+                )
+
+            with mock.patch("vibe_loop.tasks.subprocess.run", raise_timeout):
+                status = collect_task_queue_status(config)
+
+        # The cycle-start list path folds a timeout into source_error (a blocker)
+        # rather than letting it propagate and crash the supervisor.
+        self.assertTrue(status.source_error)
+        self.assertEqual(status.runnable, 0)
 
     def test_cycle_should_recheck_only_for_idle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

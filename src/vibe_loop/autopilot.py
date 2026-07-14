@@ -350,6 +350,15 @@ def collect_task_queue_status(config: VibeConfig) -> TaskQueueStatus:
         runnable = runner.list_candidates()
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         return TaskQueueStatus(source_error=str(exc))
+    except (subprocess.SubprocessError, OSError) as exc:
+        # A command-backed source shells out: a nonzero exit raises
+        # CalledProcessError, a spawn failure raises OSError, and a hung command
+        # now raises TimeoutExpired (see TaskSourceConfig.command_timeout_seconds).
+        # None of these are in the parser trio above, so fold them into
+        # source_error here — this status collection runs every cycle and on the
+        # recheck poll, and a task-source failure must degrade to a blocker
+        # rather than propagate and crash the supervisor.
+        return TaskQueueStatus(source_error=str(exc))
     statuses: dict[str, int] = {}
     for task in tasks:
         statuses[task.status] = statuses.get(task.status, 0) + 1

@@ -679,6 +679,25 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(result.status, expected)
                     self.assertEqual(result.source, "task_probe")
 
+    def test_classify_falls_through_to_unknown_on_probe_failure(self) -> None:
+        # A command-backed probe can fail to shell out, exit nonzero, or hang
+        # past its timeout. None confirm the run's outcome, so classification
+        # must degrade to the safe "unknown" fallback (routed to unknown-run
+        # recovery) rather than propagate — run_next only catches LockBusy.
+        class TimingOutSource(MutableTaskSource):
+            def probe(self, task_id: str) -> Task | None:
+                raise subprocess.TimeoutExpired(cmd="probe", timeout=1.0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            runner._source = TimingOutSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            result = runner.classify("TASK-01", 0, "aaa", "aaa", "", None)
+
+        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.source, "task_probe_error")
+
     def test_classify_detects_limit_wall_before_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(VibeConfig(repo=Path(directory)))
@@ -2373,6 +2392,34 @@ class LimitWallLoopTests(unittest.TestCase):
         # It stays runnable (never marked done), so the next cycle can pick it.
         self.assertNotIn("TASK-01", source._done)
 
+    def test_parallel_limit_wall_invokes_reset_hook_for_claimed_task(self) -> None:
+        # The serial path is covered above; the parallel drain path reaches the
+        # same _report_limit_wall_pause chokepoint, so a reset hook must fire
+        # there too. Locks path-independence of the reset behavior.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            source = MutableTaskSource(
+                [
+                    Task(task_id="TASK-01", title="Task 1", status="Next", order=1),
+                    Task(task_id="TASK-02", title="Task 2", status="Next", order=2),
+                ],
+                reset_hook=True,
+            )
+            calls: list[str] = []
+            runner = self._limit_wall_runner(repo, source, calls)
+
+            results = runner.run_until_done(jobs=2)
+
+        self.assertTrue(results)
+        self.assertTrue(
+            all(result.classification == "limit_wall" for result in results)
+        )
+        # The claimed task(s) are handed back to the backend for re-dispatch and
+        # never marked done, so the next cycle can pick them up.
+        self.assertTrue(source.reset_calls)
+        self.assertTrue(set(source.reset_calls) <= {"TASK-01", "TASK-02"})
+        self.assertEqual(source._done, set())
+
     def test_limit_wall_without_reset_hook_leaves_status_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -2959,6 +3006,40 @@ class TransientWorkerFailureTests(unittest.TestCase):
             log_path = repo / "run-1.log"
             log_path.write_text("parked\n", encoding="utf-8")
             runner._source = MutableTaskSource([])
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                raise AssertionError("run_task should not be called")
+
+            runner.run_task = run_task
+            prior = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="unknown",
+                exit_code=0,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+            )
+            result = runner.recover_unknown_run(prior, attempt=1, max_attempts=3)
+
+        self.assertIsNone(result)
+
+    def test_recover_unknown_run_skips_when_probe_times_out(self) -> None:
+        # Classification falls through to "unknown" on a probe failure, which
+        # routes here; a command-backed probe that keeps failing (timeout, spawn
+        # error, nonzero exit) must skip recovery rather than propagate.
+        class TimingOutSource(MutableTaskSource):
+            def probe(self, task_id: str) -> Task | None:
+                raise subprocess.TimeoutExpired(cmd="probe", timeout=1.0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "run-1.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            runner._source = TimingOutSource([])
 
             def run_task(task: Task, *, recovery: RecoveryContext | None = None):
                 raise AssertionError("run_task should not be called")

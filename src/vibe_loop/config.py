@@ -388,6 +388,14 @@ class TaskSourceConfig:
     # itself and dies before any terminal transition, and vibe-loop otherwise
     # never mutates project-owned task status. Absent hook keeps that behavior.
     reset_command: str | None = None
+    # Wall-clock ceiling applied to every task-source subprocess invocation
+    # (list at cycle start, probe during classification/recovery, and the
+    # reset hook). A hung backend command — a stalled loopyard CLI, a blocked
+    # Postgres query — would otherwise freeze the supervisor synchronously,
+    # because these calls are made inline on the dispatch/status path. Expiry
+    # raises subprocess.TimeoutExpired, a SubprocessError that behaves like any
+    # other command failure at each call site. See tasks.run_json_command.
+    command_timeout_seconds: float = 120.0
     runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES
     # Opt-in: when true, the task source's emitted order is authoritative and
     # the priority band is dropped from the dispatch sort key (see
@@ -418,6 +426,7 @@ class TaskSourceConfig:
             "next_command": self.next_command,
             "probe_command": self.probe_command,
             "reset_command": self.reset_command,
+            "command_timeout_seconds": self.command_timeout_seconds,
             "runnable_statuses": list(self.runnable_statuses),
             "respect_source_order": self.respect_source_order,
             "explicit_keys": sorted(self.explicit_keys),
@@ -1053,6 +1062,12 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
         reset_command=optional_string(table.get("reset")),
+        command_timeout_seconds=positive_float(
+            table.get("command_timeout_seconds"),
+            120.0,
+            "task_source.command_timeout_seconds",
+            minimum=1.0,
+        ),
         runnable_statuses=runnable,
         respect_source_order=respect_source_order,
         explicit_keys=explicit_keys,

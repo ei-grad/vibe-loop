@@ -982,6 +982,58 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsNone(config.task_source.reset_command)
 
+    def test_task_source_command_timeout_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text("[task_source]\n", encoding="utf-8")
+
+            config = load_config(repo)
+
+        self.assertEqual(config.task_source.command_timeout_seconds, 120.0)
+        self.assertEqual(config.task_source.to_json()["command_timeout_seconds"], 120.0)
+
+    def test_task_source_command_timeout_can_be_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\ncommand_timeout_seconds = 45.0\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.task_source.command_timeout_seconds, 45.0)
+        self.assertEqual(config.task_source.to_json()["command_timeout_seconds"], 45.0)
+        self.assertTrue(config.task_source.is_explicit("command_timeout_seconds"))
+        # A tuning knob, not a source selector: it must not block the generated
+        # task-source cache the way an explicit list/type/reset command does.
+        self.assertTrue(config.task_source.allows_generated_cache)
+        self.assertEqual(config.task_source.explicit_source_keys, ())
+
+    def test_task_source_command_timeout_rejects_invalid_values(self) -> None:
+        cases = [
+            ("command_timeout_seconds = 0\n", "task_source.command_timeout_seconds"),
+            ("command_timeout_seconds = -5\n", "task_source.command_timeout_seconds"),
+            # Below the 1s floor: a sub-second ceiling would kill a real backend
+            # command (a loopyard CLI hitting Postgres) mid-flight.
+            ("command_timeout_seconds = 0.5\n", "at least 1.0 seconds"),
+            (
+                'command_timeout_seconds = "soon"\n',
+                "task_source.command_timeout_seconds",
+            ),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[task_source]\n" + toml,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        load_config(repo)
+                    self.assertIn(expected, str(caught.exception))
+
     def test_explicit_statuses_override_generated_without_blocking_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
