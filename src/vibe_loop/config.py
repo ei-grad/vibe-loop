@@ -99,6 +99,11 @@ SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
 SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS = True
 SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION = True
 SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
+# Wall-clock bound on a single worker's agent run. 0 (or absent) means the run
+# is unbounded, preserving the historical behavior; a positive value caps how
+# long one worker can spin before its process group is killed and the task
+# returns to runnable, so a hung worker cannot freeze the whole batch/cycle.
+SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS = 10800.0
 SUPERVISION_CONFIG_KEYS = frozenset(
     {
         "max_restarts",
@@ -108,6 +113,7 @@ SUPERVISION_CONFIG_KEYS = frozenset(
         "limit_wall_detection",
         "limit_wall_backoff_seconds",
         "limit_wall_patterns",
+        "worker_timeout_seconds",
     }
 )
 LOCK_BACKEND_TYPES = ("directory", "command")
@@ -534,6 +540,9 @@ class SupervisionConfig:
     # Empty means "use the runner's built-in DEFAULT_LIMIT_WALL_PATTERNS"; a
     # non-empty tuple fully overrides that default list.
     limit_wall_patterns: tuple[str, ...] = ()
+    # 0.0 means unbounded (historical behavior); a positive value caps a single
+    # worker's wall-clock runtime before its process group is force-killed.
+    worker_timeout_seconds: float = SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -548,6 +557,7 @@ class SupervisionConfig:
             "limit_wall_detection": self.limit_wall_detection,
             "limit_wall_backoff_seconds": self.limit_wall_backoff_seconds,
             "limit_wall_patterns": list(self.limit_wall_patterns),
+            "worker_timeout_seconds": self.worker_timeout_seconds,
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1415,6 +1425,11 @@ def parse_supervision(data: object) -> SupervisionConfig:
             "supervision.limit_wall_backoff_seconds",
         ),
         limit_wall_patterns=parse_limit_wall_patterns(table.get("limit_wall_patterns")),
+        worker_timeout_seconds=nonnegative_float(
+            table.get("worker_timeout_seconds"),
+            SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
+            "supervision.worker_timeout_seconds",
+        ),
         explicit_keys=explicit_keys,
     )
 

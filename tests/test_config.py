@@ -12,6 +12,7 @@ from vibe_loop.config import (
     GENERATED_TASK_PROFILE_CACHE_FILE,
     SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
     SUPERVISION_DEFAULT_MAX_RESTARTS,
+    SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
     VibeConfig,
     detect_agent_clis,
     load_config,
@@ -635,9 +636,56 @@ class ConfigTests(unittest.TestCase):
             ],
         )
 
+    def test_supervision_config_worker_timeout_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+        self.assertEqual(config.supervision.worker_timeout_seconds, 10800.0)
+        self.assertEqual(
+            config.supervision.worker_timeout_seconds,
+            SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(
+            config.supervision.to_json()["worker_timeout_seconds"],
+            10800.0,
+        )
+        self.assertEqual(config.supervision.explicit_keys, frozenset())
+
+    def test_supervision_config_parses_worker_timeout_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nworker_timeout_seconds = 900\n",
+                encoding="utf-8",
+            )
+            config = load_config(repo)
+        self.assertEqual(config.supervision.worker_timeout_seconds, 900.0)
+        self.assertIn("worker_timeout_seconds", config.supervision.explicit_keys)
+
+    def test_supervision_config_worker_timeout_zero_is_unbounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nworker_timeout_seconds = 0\n",
+                encoding="utf-8",
+            )
+            config = load_config(repo)
+        self.assertEqual(config.supervision.worker_timeout_seconds, 0.0)
+        self.assertEqual(
+            config.supervision.to_json()["worker_timeout_seconds"],
+            0.0,
+        )
+
     def test_supervision_config_rejects_invalid_values(self) -> None:
         cases = [
             ("max_restarts = -1\n", "supervision.max_restarts"),
+            (
+                "worker_timeout_seconds = -1\n",
+                "supervision.worker_timeout_seconds",
+            ),
+            (
+                'worker_timeout_seconds = "soon"\n',
+                "supervision.worker_timeout_seconds",
+            ),
             ('cooldown_seconds = "soon"\n', "supervision.cooldown_seconds"),
             ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
             ('recover_unknown_runs = "yes"\n', "supervision.recover_unknown_runs"),

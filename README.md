@@ -437,6 +437,7 @@ commands = [
 max_restarts = 3
 cooldown_seconds = 30.0
 recover_unknown_runs = true   # set false to stop on `unknown` instead of launching a continuation worker
+worker_timeout_seconds = 10800.0  # wall-clock cap per worker; its process group is killed and the task returns to runnable. 0 = unbounded
 
 [locks]
 type = "directory"

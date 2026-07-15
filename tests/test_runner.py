@@ -679,6 +679,37 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(result.status, expected)
                     self.assertEqual(result.source, "task_probe")
 
+    def test_classify_timed_out_wins_over_report_and_exit_code(self) -> None:
+        # A wall-clock kill leaves inconclusive output and a possibly stale
+        # report; the run must classify as timed_out regardless of exit_code or
+        # any partial worker report so dispatch returns the task to runnable.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+
+            result = runner.classify(
+                "TASK-01",
+                0,
+                "aaa",
+                "aaa",
+                "",
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                ),
+                timed_out=True,
+            )
+            self.assertEqual(result.status, "timed_out")
+            self.assertEqual(result.source, "worker_timeout")
+
+    def test_classify_not_timed_out_keeps_normal_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            result = runner.classify(
+                "TASK-01", 7, "aaa", "aaa", "", None, timed_out=False
+            )
+            self.assertEqual(result.status, "failed")
+
     def test_classify_falls_through_to_unknown_on_probe_failure(self) -> None:
         # A command-backed probe can fail to shell out, exit nonzero, or hang
         # past its timeout. None confirm the run's outcome, so classification
@@ -2244,6 +2275,46 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(started_pids), 1)
         self.assertGreater(started_pids[0], 0)
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "detached process groups are POSIX-only"
+    )
+    def test_streaming_command_wall_clock_timeout_reaps_detached_worker(
+        self,
+    ) -> None:
+        # End-to-end proof against a real detached child: a worker that never
+        # exits on its own is reaped by the wall-clock timeout, flagged
+        # timed_out, and its process is actually dead afterward. The child is
+        # killed within the tiny timeout so the test does not block on the sleep.
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "hang.py"
+            script.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+            log_path = Path(directory) / "run.log"
+            started_pids: list[int] = []
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} hang.py",
+                    Path(directory),
+                    log,
+                    on_start=started_pids.append,
+                    timeout_seconds=0.1,
+                    reap_poll_seconds=0.02,
+                )
+
+        self.assertTrue(result.timed_out)
+        # Killed by signal rather than a clean exit.
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(len(started_pids), 1)
+        child_pid = started_pids[0]
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(child_pid, 0)
+
     def test_streaming_command_captures_stderr_session_id_without_forwarding(
         self,
     ) -> None:
@@ -3670,7 +3741,8 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         result = wait_with_reap_watchdog(
             proc, StringIO(), reap_check=None, grace_seconds=120.0, poll_seconds=0.01
         )
-        self.assertEqual(result, 7)
+        self.assertEqual(result.exit_code, 7)
+        self.assertFalse(result.timed_out)
 
     @unittest.skipUnless(
         hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
@@ -3688,7 +3760,8 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
                 grace_seconds=100.0,
                 poll_seconds=0.001,
             )
-        self.assertEqual(result, 0)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
         self.assertEqual(killed, [])
 
     @unittest.skipUnless(
@@ -3707,7 +3780,8 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
                 grace_seconds=0.0,
                 poll_seconds=0.001,
             )
-        self.assertEqual(result, 0)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
         self.assertTrue(killed)
         self.assertEqual(killed[0], (proc.pid, signal.SIGTERM))
 
@@ -3727,7 +3801,8 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
                 grace_seconds=0.0,
                 poll_seconds=0.001,
             )
-        self.assertEqual(result, 0)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
         self.assertEqual(killed, [])
 
     @unittest.skipUnless(
@@ -3750,7 +3825,8 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
                 grace_seconds=0.0,
                 poll_seconds=0.001,
             )
-        self.assertEqual(result, 0)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
         self.assertEqual(killed, [])
 
     @unittest.skipUnless(
@@ -3771,6 +3847,97 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(
             killed, [(proc.pid, signal.SIGTERM), (proc.pid, signal.SIGKILL)]
         )
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_wall_clock_timeout_kills_process_group_and_flags_timed_out(self):
+        # A worker that never becomes reap-eligible but overruns the wall-clock
+        # deadline must be force-killed via its process GROUP (it is launched
+        # detached, so a plain terminate would miss grandchildren) and reported
+        # as timed_out so the caller returns the task to runnable.
+        proc = FakeWatchdogProcess(alive_polls=10_000, returncode=0)
+        clock = FakeMonotonicClock([0.0, 100.0])
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: False,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                timeout_seconds=5.0,
+                monotonic=clock,
+            )
+        self.assertTrue(result.timed_out)
+        self.assertTrue(killed)
+        self.assertEqual(killed[0], (proc.pid, signal.SIGTERM))
+        # The lingering fake group forces the SIGTERM -> SIGKILL escalation.
+        self.assertIn((proc.pid, signal.SIGKILL), killed)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_wall_clock_timeout_fires_without_a_reap_check(self):
+        # The deadline must bound the run even when no reap_check is supplied
+        # (the historical no-reap path was a plain unbounded blocking wait).
+        proc = FakeWatchdogProcess(alive_polls=10_000, returncode=0)
+        clock = FakeMonotonicClock([0.0, 100.0])
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=None,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                timeout_seconds=5.0,
+                monotonic=clock,
+            )
+        self.assertTrue(result.timed_out)
+        self.assertEqual(killed[0], (proc.pid, signal.SIGTERM))
+
+    def test_zero_timeout_is_unbounded_and_never_kills(self):
+        # timeout_seconds=0 (or None) preserves today's unbounded behavior: the
+        # no-reap path stays a plain blocking wait and nothing is killed.
+        proc = FakeWatchdogProcess(alive_polls=0, returncode=3)
+
+        def exploding_clock() -> float:
+            raise AssertionError("monotonic must not be consulted when unbounded")
+
+        result = wait_with_reap_watchdog(
+            proc,
+            StringIO(),
+            reap_check=None,
+            grace_seconds=120.0,
+            poll_seconds=0.001,
+            timeout_seconds=0.0,
+            monotonic=exploding_clock,
+        )
+        self.assertEqual(result.exit_code, 3)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(proc.kill_calls, 0)
+
+
+class FakeMonotonicClock:
+    """Deterministic ``time.monotonic`` stand-in for deadline tests.
+
+    Returns each queued value in turn, then repeats the last value so any
+    surplus calls stay past the deadline instead of raising.
+    """
+
+    def __init__(self, values: list[float]):
+        self._values = list(values)
+        self._last = self._values[0] if self._values else 0.0
+
+    def __call__(self) -> float:
+        if self._values:
+            self._last = self._values.pop(0)
+        return self._last
 
 
 def write_analysis_stub(path: Path, *, stdout: str = "", exit_code: int = 0) -> None:

@@ -334,6 +334,9 @@ class StreamingCommandResult:
     runtime_context: AgentRuntimeContext = dataclasses.field(
         default_factory=AgentRuntimeContext
     )
+    # True when the worker exceeded its configured wall-clock timeout and its
+    # process group was force-killed rather than exiting on its own.
+    timed_out: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -802,6 +805,7 @@ class VibeRunner:
         agent_skill_ref_prefix = agent.skill_ref_prefix or ""
         agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
+        worker_timed_out = False
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -1088,8 +1092,10 @@ class VibeRunner:
                     on_start=record_worker_pid,
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
+                    timeout_seconds=self.config.supervision.worker_timeout_seconds,
                 )
                 exit_code = stream_result.exit_code
+                worker_timed_out = stream_result.timed_out
                 if injected_session_id is not None:
                     session_id = injected_session_id
                     session_id_source = SESSION_OBSERVED_SOURCE
@@ -1201,6 +1207,7 @@ class VibeRunner:
                 message,
                 worker_report,
                 output_tail,
+                timed_out=worker_timed_out,
             )
             if classification.status == "limit_wall" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
@@ -1478,6 +1485,14 @@ class VibeRunner:
                 # instead of tight-looping into the same wall.
                 self._report_limit_wall_pause(result)
                 break
+            if result.classification == "timed_out":
+                # A hung worker was killed. Return the task to runnable and skip
+                # it for the rest of this invocation (so the batch keeps making
+                # progress on other work instead of stalling), then let a later
+                # cycle re-dispatch it.
+                self._report_worker_timeout(result)
+                skipped.add(result.task_id)
+                continue
             if is_transient_worker_failure(result):
                 count = transient_retries.get(result.task_id, 0) + 1
                 transient_retries[result.task_id] = count
@@ -1677,6 +1692,15 @@ class VibeRunner:
                         # the supervisor can back off before the next cycle.
                         self._report_limit_wall_pause(result)
                         stop_after_running = True
+                        continue
+                    if result.classification == "timed_out":
+                        # A hung worker was killed. Return the task to runnable
+                        # and skip it for the rest of this batch, but keep
+                        # scheduling other work: one hung worker must not stall
+                        # the remaining slots or cycles.
+                        self._report_worker_timeout(result)
+                        skipped.add(result.task_id)
+                        retry_ready_at.pop(result.task_id, None)
                         continue
                     if is_transient_worker_failure(result):
                         count = transient_retries.get(result.task_id, 0) + 1
@@ -1996,7 +2020,15 @@ class VibeRunner:
         message: str,
         worker_report: WorkerReport | None = None,
         output_tail: str = "",
+        *,
+        timed_out: bool = False,
     ) -> ClassificationResult:
+        # A wall-clock timeout force-killed the worker mid-run: its output is
+        # inconclusive and any partial report is stale, so the run is neither a
+        # completion nor a budget-consuming failure. Classify it distinctly so
+        # dispatch returns the task to runnable without marking it done.
+        if timed_out:
+            return ClassificationResult("timed_out", "worker_timeout")
         if worker_report is not None:
             return ClassificationResult(worker_report.status, "worker_report")
         # A provider limit wall exits nonzero, so it must be caught before the
@@ -2065,6 +2097,20 @@ class VibeRunner:
         # already released (run_task's finally), so the task now sits claimed
         # in the backend with no live lock and would never be re-dispatched.
         # An operator-configured reset hook returns it to its runnable state.
+        self._reset_task_source_status(result.task_id)
+
+    def _report_worker_timeout(self, result: RunResult) -> None:
+        report_status(
+            f"worker for {result.task_id} exceeded the configured wall-clock "
+            f"timeout and was force-killed (run {result.run_id}); returning the "
+            "task to its runnable state without consuming restart budget so the "
+            "batch and other workers proceed"
+        )
+        # The worker claimed the task (ready -> active) itself and was killed
+        # before any terminal transition. Its vibe-loop lock is already released
+        # (run_task's finally), so the task now sits claimed in the backend with
+        # no live lock and would never be re-dispatched. The reset hook returns
+        # it to its runnable state, mirroring the limit-wall recovery path.
         self._reset_task_source_status(result.task_id)
 
     def _reset_task_source_status(self, task_id: str) -> None:
@@ -4073,6 +4119,13 @@ def terminate_worker_process_group(
         process.kill()
 
 
+@dataclasses.dataclass(frozen=True)
+class WaitOutcome:
+    exit_code: int
+    # True when the wall-clock deadline fired and the process group was killed.
+    timed_out: bool = False
+
+
 def wait_with_reap_watchdog(
     process: subprocess.Popen,
     log: TextIO,
@@ -4080,24 +4133,60 @@ def wait_with_reap_watchdog(
     reap_check: Callable[[], bool] | None,
     grace_seconds: float,
     poll_seconds: float,
-) -> int:
-    """Wait for a worker, reaping it if it hangs after becoming reap-eligible.
+    timeout_seconds: float | None = None,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> WaitOutcome:
+    """Wait for a worker, reaping it if it hangs.
 
-    When ``reap_check`` is None this is a plain blocking wait. Otherwise the
-    wait polls: once ``reap_check`` first returns True (e.g. the worker filed a
-    terminal report, so it intends to exit) a grace timer starts; if the
-    process is still alive ``grace_seconds`` later, its process group is
-    terminated and the post-kill exit code is returned. A worker that exits on
-    its own within grace is never force-killed.
+    Two independent reap conditions apply:
+
+    * Wall-clock deadline (``timeout_seconds``): an absolute upper bound on the
+      run regardless of whether the worker ever filed a report. When it fires
+      the worker's process group is force-killed and ``timed_out=True`` is
+      returned so the caller can classify the run as ``timed_out`` and return
+      the task to runnable. ``None`` or a non-positive value disables it,
+      preserving the historical unbounded behavior.
+    * Report-then-hang grace (``reap_check``): once ``reap_check`` first returns
+      True (e.g. the worker filed a terminal report, so it intends to exit) a
+      grace timer starts; if the process is still alive ``grace_seconds`` later
+      its process group is terminated. A worker that exits on its own within
+      grace is never force-killed.
+
+    ``monotonic`` is injectable so tests can drive the deadline with a fake
+    clock instead of a real wall-clock sleep.
     """
-    if reap_check is None:
-        return process.wait()
+    deadline: float | None = None
+    if timeout_seconds is not None and timeout_seconds > 0:
+        deadline = monotonic() + timeout_seconds
+    if reap_check is None and deadline is None:
+        return WaitOutcome(process.wait())
+
+    def _reap_for_timeout() -> WaitOutcome:
+        report_status(
+            f"worker pid={process.pid} exceeded its "
+            f"{timeout_seconds:.0f}s wall-clock timeout; killing its process "
+            "group so the task returns to runnable and the batch proceeds",
+            log,
+        )
+        terminate_worker_process_group(process, log)
+        return WaitOutcome(process.wait(), timed_out=True)
+
     reap_eligible_since: float | None = None
     while True:
+        wait_for = poll_seconds
+        if deadline is not None:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                return _reap_for_timeout()
+            wait_for = min(poll_seconds, remaining)
         try:
-            return process.wait(timeout=poll_seconds)
+            return WaitOutcome(process.wait(timeout=wait_for))
         except subprocess.TimeoutExpired:
             pass
+        if deadline is not None and monotonic() - deadline >= 0:
+            return _reap_for_timeout()
+        if reap_check is None:
+            continue
         try:
             eligible = reap_check()
         # The watchdog must never crash the wait: a flaky report read should
@@ -4106,7 +4195,7 @@ def wait_with_reap_watchdog(
             eligible = False
         if not eligible:
             continue
-        now = time.monotonic()
+        now = monotonic()
         if reap_eligible_since is None:
             reap_eligible_since = now
             continue
@@ -4118,7 +4207,7 @@ def wait_with_reap_watchdog(
                 log,
             )
             terminate_worker_process_group(process, log)
-            return process.wait()
+            return WaitOutcome(process.wait())
 
 
 def run_streaming_command(
@@ -4133,6 +4222,7 @@ def run_streaming_command(
     reap_check: Callable[[], bool] | None = None,
     reap_grace_seconds: float = 120.0,
     reap_poll_seconds: float = 10.0,
+    timeout_seconds: float | None = None,
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
     popen_kwargs: dict[str, object] = {}
@@ -4186,21 +4276,23 @@ def run_streaming_command(
     )
     stdout_thread.start()
     stderr_thread.start()
-    exit_code = wait_with_reap_watchdog(
+    wait_outcome = wait_with_reap_watchdog(
         process,
         log,
         reap_check=reap_check,
         grace_seconds=reap_grace_seconds,
         poll_seconds=reap_poll_seconds,
+        timeout_seconds=timeout_seconds,
     )
     stdout_thread.join()
     stderr_thread.join()
     observation = output_observer.observation
     return StreamingCommandResult(
-        exit_code=exit_code,
+        exit_code=wait_outcome.exit_code,
         session_id=observation.session_id,
         session_id_source=observation.session_id_source,
         runtime_context=observation.runtime_context,
+        timed_out=wait_outcome.timed_out,
     )
 
 
