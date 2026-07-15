@@ -99,10 +99,11 @@ SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
 SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS = True
 SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION = True
 SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
-# Wall-clock bound on a single worker's agent run. 0 (or absent) means the run
-# is unbounded, preserving the historical behavior; a positive value caps how
-# long one worker can spin before its process group is killed and the task
-# returns to runnable, so a hung worker cannot freeze the whole batch/cycle.
+# Wall-clock bound on a single worker's agent run. When the key is absent it
+# defaults to this 3-hour cap; a hung worker is force-killed at the deadline and
+# its task returns to runnable, so one stuck worker cannot freeze the whole
+# batch/cycle. Only an explicit `worker_timeout_seconds = 0` restores the
+# historical unbounded behavior.
 SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS = 10800.0
 SUPERVISION_CONFIG_KEYS = frozenset(
     {
