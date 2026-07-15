@@ -8,14 +8,19 @@ from unittest.mock import patch
 
 from vibe_loop.config import (
     AgentResolutionError,
+    AgentRoutingRule,
     GENERATED_TASK_PROFILE_CACHE_FILE,
     SUPERVISION_DEFAULT_COOLDOWN_SECONDS,
     SUPERVISION_DEFAULT_MAX_RESTARTS,
+    VibeConfig,
     detect_agent_clis,
     load_config,
     parse_main_worktree_path,
     reject_generated_command_adapters,
+    resolve_task_agent,
+    resolve_task_agent_profile,
 )
+from vibe_loop.tasks import Task
 from vibe_loop.generated_discovery import EvidenceBundle, EvidenceFile, EvidenceLimits
 from vibe_loop.generated_profiles import (
     agent_name_from_config,
@@ -1307,6 +1312,164 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "task_source.plan_paths"):
                 load_config(repo)
+
+
+class AgentProfileRoutingTests(unittest.TestCase):
+    def _load_with_both_clis(self, config_text: str) -> VibeConfig:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_executable(bin_dir / "codex")
+            write_executable(bin_dir / "claude")
+            (repo / ".vibe-loop.toml").write_text(config_text, encoding="utf-8")
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                return load_config(repo)
+
+    def test_absent_profiles_and_routing_leave_defaults_empty(self) -> None:
+        config = self._load_with_both_clis('[agent]\nkind = "codex"\n')
+        self.assertEqual(config.agent_profiles, {})
+        self.assertEqual(config.agent_routing, ())
+
+    def test_profile_resolves_command_through_kind_defaults(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\n\n[agent.profiles.opus]\nkind = "claude"\n'
+        )
+        opus = config.agent_profiles["opus"]
+        self.assertEqual(opus.command, "claude -p {prompt}")
+        self.assertEqual(opus.agent_kind, "claude")
+        self.assertEqual(opus.skill_ref_prefix, "/")
+        # The default [agent] is untouched by the profile.
+        self.assertEqual(config.agent.command, "codex exec {prompt}")
+        self.assertEqual(config.agent.agent_kind, "codex")
+
+    def test_profile_command_override_is_authoritative(self) -> None:
+        config = self._load_with_both_clis(
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n'
+            'command = "claude -p {prompt} --model opus"\n'
+        )
+        self.assertEqual(
+            config.agent_profiles["opus"].command,
+            "claude -p {prompt} --model opus",
+        )
+
+    def test_routing_rule_parses_predicates(self) -> None:
+        config = self._load_with_both_clis(
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n\n'
+            "[[agent.routing]]\n"
+            'profile = "opus"\n'
+            'match_hazards_any = ["abi", "dma"]\n'
+            'match_paths_glob = ["kernel/**"]\n'
+        )
+        self.assertEqual(len(config.agent_routing), 1)
+        rule = config.agent_routing[0]
+        self.assertEqual(rule.profile, "opus")
+        self.assertEqual(rule.match_hazards_any, ("abi", "dma"))
+        self.assertEqual(rule.match_paths_glob, ("kernel/**",))
+
+    def test_routing_rule_referencing_unknown_profile_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not defined in \\[agent.profiles\\]"):
+            self._load_with_both_clis('[[agent.routing]]\nprofile = "missing"\n')
+
+    def test_routing_rule_rejects_unknown_predicate_keys(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported keys: match_hazard"):
+            self._load_with_both_clis(
+                "[agent.profiles.opus]\n"
+                'kind = "claude"\n\n'
+                "[[agent.routing]]\n"
+                'profile = "opus"\n'
+                'match_hazard = ["abi"]\n'
+            )
+
+    def test_routing_rule_rejects_invalid_regex(self) -> None:
+        with self.assertRaisesRegex(ValueError, "match_task_id_regex is not a valid"):
+            self._load_with_both_clis(
+                "[agent.profiles.opus]\n"
+                'kind = "claude"\n\n'
+                "[[agent.routing]]\n"
+                'profile = "opus"\n'
+                'match_task_id_regex = "([unclosed"\n'
+            )
+
+    def test_profile_parse_error_is_labeled(self) -> None:
+        with self.assertRaisesRegex(ValueError, "agent.profiles.bad: agent.kind"):
+            self._load_with_both_clis('[agent.profiles.bad]\nkind = "nope"\n')
+
+    def test_resolve_profile_explicit_field_wins_over_routing(self) -> None:
+        routing = (AgentRoutingRule(profile="routed", match_hazards_any=("abi",)),)
+        task = Task(
+            task_id="T1", title="t", status="Next", agent="explicit", hazards=("abi",)
+        )
+        self.assertEqual(
+            resolve_task_agent_profile(task, routing), ("explicit", "task.agent")
+        )
+
+    def test_resolve_profile_first_matching_rule_wins(self) -> None:
+        routing = (
+            AgentRoutingRule(profile="first", match_hazards_any=("abi",)),
+            AgentRoutingRule(profile="second", match_hazards_any=("abi",)),
+        )
+        task = Task(task_id="T1", title="t", status="Next", hazards=("abi",))
+        name, source = resolve_task_agent_profile(task, routing)
+        self.assertEqual(name, "first")
+        self.assertEqual(source, "agent.routing[0]")
+
+    def test_resolve_profile_hazard_and_path_predicates(self) -> None:
+        routing = (
+            AgentRoutingRule(profile="sec", match_hazards_any=("abi",)),
+            AgentRoutingRule(profile="paths", match_paths_glob=("kernel/*.rs",)),
+        )
+        hazard_task = Task(task_id="H", title="t", status="Next", hazards=("abi",))
+        path_task = Task(
+            task_id="P", title="t", status="Next", paths=("kernel/mem.rs",)
+        )
+        plain_task = Task(task_id="N", title="t", status="Next")
+        self.assertEqual(resolve_task_agent_profile(hazard_task, routing)[0], "sec")
+        self.assertEqual(resolve_task_agent_profile(path_task, routing)[0], "paths")
+        self.assertEqual(
+            resolve_task_agent_profile(plain_task, routing), ("", "default")
+        )
+
+    def test_resolve_profile_all_predicates_must_match(self) -> None:
+        routing = (
+            AgentRoutingRule(
+                profile="strict",
+                match_hazards_any=("abi",),
+                match_priority="P0",
+            ),
+        )
+        # hazard matches but priority does not -> no match (AND within a rule).
+        task = Task(
+            task_id="T", title="t", status="Next", hazards=("abi",), priority="P1"
+        )
+        self.assertEqual(resolve_task_agent_profile(task, routing), ("", "default"))
+
+    def test_resolve_task_agent_returns_profile_config(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\n\n'
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n\n'
+            "[[agent.routing]]\n"
+            'profile = "opus"\n'
+            'match_hazards_any = ["abi"]\n'
+        )
+        routed = Task(task_id="T", title="t", status="Next", hazards=("abi",))
+        default = Task(task_id="D", title="t", status="Next")
+        routed_selection = resolve_task_agent(config, routed)
+        self.assertEqual(routed_selection.profile, "opus")
+        self.assertEqual(routed_selection.config.command, "claude -p {prompt}")
+        default_selection = resolve_task_agent(config, default)
+        self.assertEqual(default_selection.profile, "")
+        self.assertEqual(default_selection.config.command, "codex exec {prompt}")
+
+    def test_resolve_task_agent_unknown_profile_fails_closed(self) -> None:
+        config = VibeConfig(repo=Path("."))
+        task = Task(task_id="T", title="t", status="Next", agent="ghost")
+        with self.assertRaisesRegex(AgentResolutionError, "'ghost'"):
+            resolve_task_agent(config, task)
 
 
 def write_executable(path: Path) -> None:

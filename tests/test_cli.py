@@ -693,6 +693,81 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("--resume", fresh)
         self.assertIn("Investigate what the previous session did", fresh)
 
+    def test_run_task_routes_worker_command_per_task_profile(self) -> None:
+        from vibe_loop.config import load_config
+        from vibe_loop.runner import VibeRunner
+        from vibe_loop.tasks import Task
+
+        class _StubSource:
+            def list_tasks(self):
+                return []
+
+            def probe(self, task_id):
+                return None
+
+        record_and_exit = (
+            "from pathlib import Path\n"
+            "import sys\n"
+            "Path('{name}-args.txt').write_text("
+            "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+            "print('{name} out')\n"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_fake_git(bin_dir)
+            write_python_executable(
+                bin_dir / "codex", record_and_exit.format(name="codex")
+            )
+            write_python_executable(
+                bin_dir / "claude", record_and_exit.format(name="claude")
+            )
+            # Default profile is codex; security-hazard tasks route to a named
+            # claude profile so codex's cyber-content refusals never see them.
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                'kind = "codex"\n\n'
+                "[agent.profiles.claude-opus]\n"
+                'kind = "claude"\n\n'
+                "[[agent.routing]]\n"
+                'profile = "claude-opus"\n'
+                'match_hazards_any = ["abi"]\n',
+                encoding="utf-8",
+            )
+            security_task = Task(
+                task_id="SEC-01",
+                title="Security",
+                status="Next",
+                hazards=("abi",),
+                order=1,
+            )
+            general_task = Task(
+                task_id="GEN-01", title="General", status="Next", order=1
+            )
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                config = load_config(repo)
+                runner = VibeRunner(config)
+                runner._source = _StubSource()
+                runner.run_task(security_task)
+                routed_run = (repo / "claude-args.txt").exists()
+                routed_ran_codex = (repo / "codex-args.txt").exists()
+
+                (repo / "claude-args.txt").unlink()
+                runner._source = _StubSource()
+                runner.run_task(general_task)
+                default_ran_codex = (repo / "codex-args.txt").exists()
+                default_ran_claude = (repo / "claude-args.txt").exists()
+
+        # The abi-hazard task is dispatched to the claude profile, not codex.
+        self.assertTrue(routed_run)
+        self.assertFalse(routed_ran_codex)
+        # The unmatched task falls back to the default codex agent.
+        self.assertTrue(default_ran_codex)
+        self.assertFalse(default_ran_claude)
+
     def test_run_next_records_observed_claude_session_and_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

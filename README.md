@@ -526,6 +526,62 @@ strict JSON decision parsed like `selection_command` output, and is never invoke
 by routine read-only status commands. Generated profiles can never introduce an
 `analysis_command`.
 
+### Per-task agent routing
+
+The default `[agent]` runs every task. When different tasks are better served by
+different agents, define named **agent profiles** and **routing rules** so the
+worker agent is chosen per task at dispatch. The motivating case: Codex refuses
+security-heavy tasks under its cyber-content policy ("flagged for possible
+cybersecurity risk"), while `claude -p --model opus` handles them without
+refusals. Routing keeps Codex as the fast default and sends only the
+security-hazard tasks to Claude.
+
+```toml
+[agent]
+kind = "codex"            # default profile: fast, separate quota
+
+[agent.profiles.claude-opus]
+kind = "claude"
+command = "claude -p {prompt} --model opus"
+
+[[agent.routing]]
+profile = "claude-opus"
+match_hazards_any = ["abi", "dma", "irq"]   # security-sensitive kernel hazards
+match_paths_glob = ["kernel/**"]            # optional extra constraint
+```
+
+Each `[agent.profiles.<name>]` table takes the same fields as `[agent]` (`kind`,
+`command`, `selection_command`, `analysis_command`, dialect fields) and resolves
+through the same machinery — a profile with only `kind = "claude"` gets the
+built-in Claude command default. The top-level `[agent]` remains the default
+profile. With no profiles and no routing, behavior is identical to a single
+`[agent]`.
+
+`[[agent.routing]]` is an ordered list. Each rule names a `profile` and one or
+more match predicates evaluated against the task; a rule matches when **all** of
+its predicates match (AND within a rule), and the **first** matching rule wins
+(OR across rules by order). Predicates (all optional, absent-safe):
+
+| Predicate | Matches when |
+| --- | --- |
+| `match_hazards_any` | the task's `hazards` share any token with this list |
+| `match_paths_glob` | any task `path` matches any glob (`fnmatch`) |
+| `match_task_id_regex` | the regex searches the task id |
+| `match_title_regex` | the regex searches the task title |
+| `match_priority` | the task priority equals this value (case-insensitive) |
+
+Resolution precedence at dispatch: an explicit per-task `agent` field (a profile
+name carried on the task itself) wins over everything; otherwise the first
+matching routing rule; otherwise the default `[agent]`. A routing rule or task
+`agent` field that names an undefined profile is a hard error — routing fails
+closed rather than silently falling back, so a mistyped profile can never send a
+security task to a refusing agent. The resolved profile name is recorded in the
+run metadata alongside the agent kind and model for provenance.
+
+The per-task `agent` and `hazards` fields come from command-backed task sources
+that emit them in their task JSON (`"agent": "claude-opus"`, `"hazards":
+["abi"]`); sources that omit them are unaffected.
+
 ### Locks
 
 Locks default to directory locks under `<state_dir>/locks`. Repos that

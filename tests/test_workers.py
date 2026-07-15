@@ -65,6 +65,7 @@ class WorkerStateTests(unittest.TestCase):
                 session_id="run-1",
                 session_id_source="fallback:run_id",
                 agent_kind="codex",
+                agent_profile="claude-opus",
                 agent_prompt_dialect="codex",
                 agent_prompt_dialect_source="agent.kind:codex",
                 agent_skill_ref_prefix="$",
@@ -123,6 +124,7 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].session_id, "run-1")
         self.assertEqual(loaded[0].session_id_source, "fallback:run_id")
         self.assertEqual(loaded[0].agent_kind, "codex")
+        self.assertEqual(loaded[0].agent_profile, "claude-opus")
         self.assertEqual(loaded[0].agent_prompt_dialect, "codex")
         self.assertEqual(loaded[0].agent_prompt_dialect_source, "agent.kind:codex")
         self.assertEqual(loaded[0].agent_skill_ref_prefix, "$")

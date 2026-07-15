@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import fnmatch
 import math
 import re
 import shlex
@@ -183,6 +184,16 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
 
 AGENT_KIND_VALUES = ("auto", "codex", "claude", "custom")
 AGENT_PROMPT_DIALECTS = ("codex", "claude")
+AGENT_ROUTING_PREDICATE_KEYS = frozenset(
+    {
+        "match_hazards_any",
+        "match_paths_glob",
+        "match_task_id_regex",
+        "match_title_regex",
+        "match_priority",
+    }
+)
+AGENT_ROUTING_RULE_KEYS = frozenset({"profile"}) | AGENT_ROUTING_PREDICATE_KEYS
 AGENT_SKILL_REF_PREFIX = {
     "codex": "$",
     "claude": "/",
@@ -370,6 +381,78 @@ class AgentConfig:
             "default_policy": AGENT_DEFAULT_POLICY,
             "diagnostics": self.diagnostics(),
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentRoutingRule:
+    """One ordered `[[agent.routing]]` rule mapping matching tasks to a profile.
+
+    A rule matches a task when every predicate it *specifies* matches (AND
+    within a rule); ordering across rules provides OR. Predicates left at their
+    empty/None default are simply not evaluated, so a rule with only `profile`
+    is an unconditional catch-all. Matching reads task attributes by name so it
+    stays independent of the tasks module (no import cycle).
+    """
+
+    profile: str
+    match_hazards_any: tuple[str, ...] = ()
+    match_paths_glob: tuple[str, ...] = ()
+    match_task_id_regex: str | None = None
+    match_title_regex: str | None = None
+    match_priority: str | None = None
+
+    def matches(self, task: Any) -> bool:
+        if self.match_hazards_any:
+            hazards = set(getattr(task, "hazards", ()) or ())
+            if hazards.isdisjoint(self.match_hazards_any):
+                return False
+        if self.match_paths_glob:
+            paths = tuple(getattr(task, "paths", ()) or ())
+            if not any(
+                fnmatch.fnmatch(path, pattern)
+                for pattern in self.match_paths_glob
+                for path in paths
+            ):
+                return False
+        if self.match_task_id_regex is not None:
+            if not re.search(self.match_task_id_regex, getattr(task, "task_id", "")):
+                return False
+        if self.match_title_regex is not None:
+            if not re.search(self.match_title_regex, getattr(task, "title", "")):
+                return False
+        if self.match_priority is not None:
+            priority = getattr(task, "priority", "") or ""
+            if priority.casefold() != self.match_priority.casefold():
+                return False
+        return True
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {"profile": self.profile}
+        if self.match_hazards_any:
+            payload["match_hazards_any"] = list(self.match_hazards_any)
+        if self.match_paths_glob:
+            payload["match_paths_glob"] = list(self.match_paths_glob)
+        if self.match_task_id_regex is not None:
+            payload["match_task_id_regex"] = self.match_task_id_regex
+        if self.match_title_regex is not None:
+            payload["match_title_regex"] = self.match_title_regex
+        if self.match_priority is not None:
+            payload["match_priority"] = self.match_priority
+        return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class AgentSelection:
+    """The agent profile resolved for one task at dispatch time.
+
+    `profile` is the empty string for the default `[agent]`, otherwise the named
+    `[agent.profiles.<name>]` chosen by an explicit task field or a routing rule.
+    `source` records how the profile was selected for provenance.
+    """
+
+    config: AgentConfig
+    profile: str
+    source: str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -579,6 +662,8 @@ class VibeConfig:
     main_branch: str = "main"
     state_dir: str = ".vibe-loop"
     agent: AgentConfig = dataclasses.field(default_factory=AgentConfig)
+    agent_profiles: dict[str, AgentConfig] = dataclasses.field(default_factory=dict)
+    agent_routing: tuple[AgentRoutingRule, ...] = ()
     task_source: TaskSourceConfig = dataclasses.field(default_factory=TaskSourceConfig)
     completion: CompletionConfig = dataclasses.field(default_factory=CompletionConfig)
     supervision: SupervisionConfig = dataclasses.field(
@@ -613,7 +698,10 @@ def load_config(repo: Path) -> VibeConfig:
     data = read_config_file(config_path) if config_path is not None else {}
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
-    agent = parse_agent(data.get("agent", {}))
+    agent_table = expect_table(data.get("agent", {}), "agent")
+    agent = parse_agent(agent_table)
+    agent_profiles = parse_agent_profiles(agent_table)
+    agent_routing = parse_agent_routing(agent_table, agent_profiles)
     supervision = parse_supervision(data.get("supervision", {}))
     locks = parse_locks(data.get("locks", {}))
     autopilot = parse_autopilot(data.get("autopilot", {}))
@@ -625,6 +713,8 @@ def load_config(repo: Path) -> VibeConfig:
         main_branch=str(data.get("main_branch") or "main"),
         state_dir=str(data.get("state_dir") or ".vibe-loop"),
         agent=agent,
+        agent_profiles=agent_profiles,
+        agent_routing=agent_routing,
         task_source=task_source,
         completion=completion,
         supervision=supervision,
@@ -780,6 +870,134 @@ def parse_agent(data: object) -> AgentConfig:
         skill_ref_prefix_source=prompt_resolution.skill_ref_prefix_source,
         compatibility_diagnostics=prompt_resolution.diagnostics,
     )
+
+
+def parse_agent_profiles(table: dict[str, Any]) -> dict[str, AgentConfig]:
+    raw = table.get("profiles")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("agent.profiles must be a table of named profile tables")
+    profiles: dict[str, AgentConfig] = {}
+    for raw_name, profile_table in raw.items():
+        name = str(raw_name)
+        label = f"agent.profiles.{name}"
+        if not isinstance(profile_table, dict):
+            raise ValueError(f"{label} must be a table")
+        try:
+            # Each profile is a full [agent]-shaped table, so it resolves through
+            # the same command/kind/prompt-dialect machinery as the default.
+            profiles[name] = parse_agent(profile_table)
+        except ValueError as exc:
+            raise ValueError(f"{label}: {exc}") from exc
+    return profiles
+
+
+def parse_agent_routing(
+    table: dict[str, Any],
+    profiles: dict[str, AgentConfig],
+) -> tuple[AgentRoutingRule, ...]:
+    raw = table.get("routing")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError("agent.routing must be an array of routing tables")
+    rules: list[AgentRoutingRule] = []
+    for index, entry in enumerate(raw):
+        label = f"agent.routing[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be a table")
+        keys = frozenset(str(key) for key in entry)
+        unknown = sorted(keys - AGENT_ROUTING_RULE_KEYS)
+        if unknown:
+            raise ValueError(f"{label} contains unsupported keys: {', '.join(unknown)}")
+        profile = optional_nonempty_string(entry.get("profile"))
+        if profile is None:
+            raise ValueError(f"{label}.profile is required")
+        if profile not in profiles:
+            available = ", ".join(sorted(profiles)) or "none"
+            raise ValueError(
+                f"{label}.profile {profile!r} is not defined in [agent.profiles] "
+                f"(defined: {available})"
+            )
+        rules.append(
+            AgentRoutingRule(
+                profile=profile,
+                match_hazards_any=nonempty_string_tuple(
+                    entry.get("match_hazards_any"),
+                    (),
+                    f"{label}.match_hazards_any",
+                    allow_empty=True,
+                ),
+                match_paths_glob=nonempty_string_tuple(
+                    entry.get("match_paths_glob"),
+                    (),
+                    f"{label}.match_paths_glob",
+                    allow_empty=True,
+                ),
+                match_task_id_regex=routing_regex(
+                    entry.get("match_task_id_regex"),
+                    f"{label}.match_task_id_regex",
+                ),
+                match_title_regex=routing_regex(
+                    entry.get("match_title_regex"),
+                    f"{label}.match_title_regex",
+                ),
+                match_priority=optional_nonempty_string(entry.get("match_priority")),
+            )
+        )
+    return tuple(rules)
+
+
+def routing_regex(value: object, name: str) -> str | None:
+    text = optional_nonempty_string(value)
+    if text is None:
+        return None
+    try:
+        re.compile(text)
+    except re.error as exc:
+        raise ValueError(f"{name} is not a valid regex ({text!r}): {exc}") from exc
+    return text
+
+
+def resolve_task_agent_profile(
+    task: Any,
+    routing: tuple[AgentRoutingRule, ...],
+) -> tuple[str, str]:
+    """Select a profile name for a task from routing rules (pure).
+
+    Returns `(profile_name, source)` where an empty name means the default
+    `[agent]`. An explicit task `agent` field wins over all routing rules; among
+    routing rules the first match wins.
+    """
+    explicit = (getattr(task, "agent", "") or "").strip()
+    if explicit:
+        return explicit, "task.agent"
+    for index, rule in enumerate(routing):
+        if rule.matches(task):
+            return rule.profile, f"agent.routing[{index}]"
+    return "", "default"
+
+
+def resolve_task_agent(config: VibeConfig, task: Any) -> AgentSelection:
+    """Resolve the AgentConfig a task should run under.
+
+    Unknown profile names fail closed with AgentResolutionError rather than
+    falling back to the default: routing a security task to a refusing agent is
+    exactly the failure this feature prevents, so a typo must stop the run.
+    """
+    name, source = resolve_task_agent_profile(task, config.agent_routing)
+    if not name:
+        return AgentSelection(config.agent, "", source)
+    profile = config.agent_profiles.get(name)
+    if profile is None:
+        available = ", ".join(sorted(config.agent_profiles)) or "none"
+        task_id = getattr(task, "task_id", "") or ""
+        raise AgentResolutionError(
+            f"task {task_id!r} routes to agent profile {name!r} ({source}), "
+            f"which is not defined in [agent.profiles] (defined: {available})."
+        )
+    return AgentSelection(profile, name, source)
 
 
 def detect_agent_clis(path: str | None = None) -> AgentDetection:

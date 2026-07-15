@@ -135,6 +135,7 @@ class ActiveRunState:
     session_id: str = ""
     session_id_source: str = ""
     agent_kind: str = ""
+    agent_profile: str = ""
     agent_prompt_dialect: str = ""
     agent_prompt_dialect_source: str = ""
     agent_skill_ref_prefix: str = ""
@@ -175,6 +176,7 @@ class ActiveRunState:
         session_id: str = "",
         session_id_source: str = "",
         agent_kind: str = "",
+        agent_profile: str = "",
         agent_prompt_dialect: str = "",
         agent_prompt_dialect_source: str = "",
         agent_skill_ref_prefix: str = "",
@@ -203,6 +205,7 @@ class ActiveRunState:
             session_id=session_id,
             session_id_source=session_id_source,
             agent_kind=agent_kind,
+            agent_profile=agent_profile,
             agent_prompt_dialect=agent_prompt_dialect,
             agent_prompt_dialect_source=agent_prompt_dialect_source,
             agent_skill_ref_prefix=agent_skill_ref_prefix,
@@ -259,6 +262,7 @@ class ActiveRunState:
                 optional_string(metadata.get("session_id_source")) or ""
             ),
             agent_kind=optional_string(metadata.get("agent_kind")) or "",
+            agent_profile=optional_string(metadata.get("agent_profile")) or "",
             agent_prompt_dialect=(
                 optional_string(metadata.get("agent_prompt_dialect")) or ""
             ),
@@ -384,6 +388,7 @@ class ActiveRunState:
             "session_id": self.session_id,
             "session_id_source": self.session_id_source,
             "agent_kind": self.agent_kind,
+            "agent_profile": self.agent_profile,
             "agent_prompt_dialect": self.agent_prompt_dialect,
             "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.agent_skill_ref_prefix,

@@ -25,6 +25,7 @@ from vibe_loop.config import (
     AgentDetection,
     AgentResolutionError,
     VibeConfig,
+    resolve_task_agent,
     shell_quote,
     prepare_shell_command,
 )
@@ -708,7 +709,10 @@ class VibeRunner:
         recovery: RecoveryContext | None = None,
     ) -> RunResult:
         self.ensure_spec_execution_gate()
-        command_template = self.config.agent.require_command()
+        agent_selection = resolve_task_agent(self.config, task)
+        agent = agent_selection.config
+        agent_profile = agent_selection.profile
+        command_template = agent.require_command()
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
@@ -730,9 +734,7 @@ class VibeRunner:
         resuming = bool(
             resume_session_id
             and self.config.supervision.resume_unknown_runs
-            and command_supports_session_resume(
-                command_template, self.config.agent.agent_kind
-            )
+            and command_supports_session_resume(command_template, agent.agent_kind)
         )
         if resuming:
             # Resume the prior run's captured session so the continuation turn
@@ -746,16 +748,14 @@ class VibeRunner:
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
-        elif command_supports_session_capture(
-            command_template, self.config.agent.agent_kind
-        ):
+        elif command_supports_session_capture(command_template, agent.agent_kind):
             injected_session_id = str(uuid.uuid4())
             effective_template = inject_claude_session_id(
                 command_template, injected_session_id
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
-        skill_prefix = self.config.agent.require_skill_ref_prefix()
+        skill_prefix = agent.require_skill_ref_prefix()
         if recovery is not None and resuming:
             # Resumed session already holds the full task/skill context; a short
             # continuation nudge is enough (and correct — a fresh skill
@@ -795,12 +795,12 @@ class VibeRunner:
             else ""
         )
         command_context = parse_agent_runtime_context_from_command(command)
-        agent_kind = self.config.agent.agent_kind
-        agent_kind_source = self.config.agent.agent_kind_source
-        agent_prompt_dialect = self.config.agent.prompt_dialect or ""
-        agent_prompt_dialect_source = self.config.agent.prompt_dialect_source
-        agent_skill_ref_prefix = self.config.agent.skill_ref_prefix or ""
-        agent_skill_ref_prefix_source = self.config.agent.skill_ref_prefix_source
+        agent_kind = agent.agent_kind
+        agent_kind_source = agent.agent_kind_source
+        agent_prompt_dialect = agent.prompt_dialect or ""
+        agent_prompt_dialect_source = agent.prompt_dialect_source
+        agent_skill_ref_prefix = agent.skill_ref_prefix or ""
+        agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
         active_state = ActiveRunState.new(
             task_id=task.task_id,
@@ -814,6 +814,7 @@ class VibeRunner:
             session_id=session_id,
             session_id_source=session_id_source,
             agent_kind=agent_kind,
+            agent_profile=agent_profile,
             agent_prompt_dialect=agent_prompt_dialect,
             agent_prompt_dialect_source=agent_prompt_dialect_source,
             agent_skill_ref_prefix=agent_skill_ref_prefix,
@@ -840,6 +841,7 @@ class VibeRunner:
             agent_skill_ref_prefix=agent_skill_ref_prefix,
             agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
             runtime_context=command_context,
+            agent_profile=agent_profile,
             transcript_path=transcript_path,
         )
         start_trailer_context = start_context_payload["trailer_context"]
@@ -950,6 +952,7 @@ class VibeRunner:
                     agent_skill_ref_prefix=agent_skill_ref_prefix,
                     agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
                     runtime_context=effective_context,
+                    agent_profile=agent_profile,
                     transcript_path=transcript_path,
                 )
                 trailer_context = context_payload["trailer_context"]
@@ -1003,14 +1006,14 @@ class VibeRunner:
                     command,
                     start_main,
                     run_id,
-                    self.config.agent.command_source,
-                    self.config.agent.selection_command_source,
-                    self.config.agent.detected,
-                    self.config.agent.agent_kind,
-                    self.config.agent.prompt_dialect,
-                    self.config.agent.prompt_dialect_source,
-                    self.config.agent.skill_ref_prefix,
-                    self.config.agent.skill_ref_prefix_source,
+                    agent.command_source,
+                    agent.selection_command_source,
+                    agent.detected,
+                    agent.agent_kind,
+                    agent.prompt_dialect,
+                    agent.prompt_dialect_source,
+                    agent.skill_ref_prefix,
+                    agent.skill_ref_prefix_source,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"run_id={run_id}", log)
@@ -1021,12 +1024,11 @@ class VibeRunner:
                         log,
                     )
                 report_status(
-                    f"agent command source: {self.config.agent.command_source}",
+                    f"agent command source: {agent.command_source}",
                     log,
                 )
                 report_status(
-                    "agent selection command source: "
-                    f"{self.config.agent.selection_command_source}",
+                    f"agent selection command source: {agent.selection_command_source}",
                     log,
                 )
                 report_status(
@@ -1034,22 +1036,24 @@ class VibeRunner:
                     log,
                 )
                 report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}", log)
-                report_status(f"agent kind: {self.config.agent.agent_kind}", log)
                 report_status(
-                    "agent prompt dialect source: "
-                    f"{self.config.agent.prompt_dialect_source}",
+                    f"agent profile: {agent_profile or 'default'} "
+                    f"({agent_selection.source})",
+                    log,
+                )
+                report_status(f"agent kind: {agent.agent_kind}", log)
+                report_status(
+                    f"agent prompt dialect source: {agent.prompt_dialect_source}",
                     log,
                 )
                 report_status(
-                    "agent skill ref prefix source: "
-                    f"{self.config.agent.skill_ref_prefix_source}",
+                    f"agent skill ref prefix source: {agent.skill_ref_prefix_source}",
                     log,
                 )
-                for diagnostic in self.config.agent.compatibility_diagnostics:
+                for diagnostic in agent.compatibility_diagnostics:
                     report_status(f"agent diagnostic: {diagnostic}", log)
                 report_status(
-                    "detected agents: "
-                    f"{format_detected_agents(self.config.agent.detected)}",
+                    f"detected agents: {format_detected_agents(agent.detected)}",
                     log,
                 )
                 report_status("agent command started", log)
@@ -1080,7 +1084,7 @@ class VibeRunner:
                     self.config.repo,
                     log,
                     env=command_env,
-                    forward_stderr=self.config.agent.forward_stderr,
+                    forward_stderr=agent.forward_stderr,
                     on_start=record_worker_pid,
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
@@ -1116,6 +1120,7 @@ class VibeRunner:
                     agent_skill_ref_prefix=agent_skill_ref_prefix,
                     agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
                     runtime_context=final_runtime_context,
+                    agent_profile=agent_profile,
                     transcript_path=transcript_path,
                 )
                 with observation_lock:
@@ -1227,15 +1232,15 @@ class VibeRunner:
                 session_id=session_id,
                 session_id_source=session_id_source,
                 transcript_path=transcript_path,
-                agent_command_source=self.config.agent.command_source,
-                agent_selection_command_source=self.config.agent.selection_command_source,
+                agent_command_source=agent.command_source,
+                agent_selection_command_source=agent.selection_command_source,
                 agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
                 agent_default_policy=AGENT_DEFAULT_POLICY,
-                agent_kind=self.config.agent.agent_kind,
-                agent_prompt_dialect=self.config.agent.prompt_dialect or "",
-                agent_prompt_dialect_source=self.config.agent.prompt_dialect_source,
-                agent_skill_ref_prefix=self.config.agent.skill_ref_prefix or "",
-                agent_skill_ref_prefix_source=self.config.agent.skill_ref_prefix_source,
+                agent_kind=agent.agent_kind,
+                agent_prompt_dialect=agent.prompt_dialect or "",
+                agent_prompt_dialect_source=agent.prompt_dialect_source,
+                agent_skill_ref_prefix=agent.skill_ref_prefix or "",
+                agent_skill_ref_prefix_source=agent.skill_ref_prefix_source,
                 model_provider=final_runtime_context.model_provider,
                 model_provider_source=final_runtime_context.model_provider_source,
                 model_id=final_runtime_context.model_id,
@@ -3886,6 +3891,7 @@ def build_trailer_context(
     agent_skill_ref_prefix: str,
     agent_skill_ref_prefix_source: str,
     runtime_context: AgentRuntimeContext,
+    agent_profile: str = "",
 ) -> tuple[dict[str, object], dict[str, object]]:
     context: dict[str, object] = {
         "plan_item_candidates": [task_id],
@@ -3899,6 +3905,9 @@ def build_trailer_context(
         "session_id": session_id_source,
         "session_id_source": "session_observation",
     }
+    if agent_profile:
+        context["agent_profile"] = agent_profile
+        sources["agent_profile"] = "agent.routing"
     if agent_kind:
         context["agent_kind"] = agent_kind
         sources["agent_kind"] = agent_kind_source
@@ -3934,6 +3943,7 @@ def build_run_context_payload(
     agent_skill_ref_prefix: str,
     agent_skill_ref_prefix_source: str,
     runtime_context: AgentRuntimeContext,
+    agent_profile: str = "",
     transcript_path: str = "",
 ) -> dict[str, object]:
     trailer_context, trailer_context_sources = build_trailer_context(
@@ -3948,6 +3958,7 @@ def build_run_context_payload(
         agent_skill_ref_prefix=agent_skill_ref_prefix,
         agent_skill_ref_prefix_source=agent_skill_ref_prefix_source,
         runtime_context=runtime_context,
+        agent_profile=agent_profile,
     )
     payload: dict[str, object] = {
         "started_at": started_at,
@@ -3962,6 +3973,8 @@ def build_run_context_payload(
         "trailer_context": trailer_context,
         "trailer_context_sources": trailer_context_sources,
     }
+    if agent_profile:
+        payload["agent_profile"] = agent_profile
     if transcript_path:
         payload["transcript_path"] = transcript_path
     payload.update(runtime_context.to_record_fields())
