@@ -36,6 +36,7 @@ AUTOPILOT_LOCK_RECORD_TYPE = "autopilot_supervisor_lock"
 AUTOPILOT_LOCK_SCHEMA_VERSION = 1
 COMMAND_LOCK_MAX_OUTPUT_BYTES = 128 * 1024
 COMMAND_LOCK_TIMEOUT_SECONDS = 30.0
+METADATA_REPLACE_TIMEOUT_SECONDS = 5.0
 
 
 class LockBusy(RuntimeError):
@@ -1290,7 +1291,34 @@ def write_metadata(path: Path, metadata: dict[str, object]) -> None:
         json.dumps(metadata, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    temp_path.replace(metadata_path)
+    try:
+        replace_metadata_file(temp_path, metadata_path)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+        raise
+
+
+def replace_metadata_file(source: Path, target: Path) -> None:
+    # On Windows, replacing a file that another process currently holds open for
+    # reading fails with PermissionError (WinError 5, sharing violation).
+    # Concurrent workers read lock.json without holding the metadata-update lock,
+    # so a reader's open handle can collide with a writer's atomic replace. Retry
+    # briefly to ride out the transient collision; POSIX rename has no such
+    # restriction, so re-raise there immediately.
+    if sys.platform != "win32":
+        source.replace(target)
+        return
+    deadline = time.monotonic() + METADATA_REPLACE_TIMEOUT_SECONDS
+    delay = 0.005
+    while True:
+        try:
+            source.replace(target)
+            return
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.1)
 
 
 @contextmanager

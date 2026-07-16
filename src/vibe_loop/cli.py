@@ -2246,6 +2246,14 @@ def print_lock_mutation_refused(
     return 1
 
 
+def poll_sleep(seconds: float) -> None:
+    # Dedicated seam for the acquire-wait poll loop. Tests patch this instead of
+    # the global time.sleep so they observe only the poll interval and not the
+    # subprocess-internal wait sleeps that load_config's `git worktree list`
+    # triggers on every dispatch.
+    time.sleep(seconds)
+
+
 def acquire_main_integration_command(
     args: argparse.Namespace,
     config,
@@ -2311,7 +2319,7 @@ def acquire_main_integration_command(
                 )
                 return 1
             if deadline is None:
-                time.sleep(args.poll_interval)
+                poll_sleep(args.poll_interval)
                 continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2321,7 +2329,7 @@ def acquire_main_integration_command(
                     timed_out=True,
                 )
                 return 1
-            time.sleep(min(args.poll_interval, remaining))
+            poll_sleep(min(args.poll_interval, remaining))
             continue
         status = manager.main_integration_status()
         post_acquire_preflight = main_integration_workspace_preflight_error(

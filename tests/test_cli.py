@@ -5589,7 +5589,7 @@ class CliTests(unittest.TestCase):
                 sleep_calls.append(delay)
                 shutil.rmtree(repo / ".vibe-loop" / "locks" / "main-integration.lock")
 
-            with patch("vibe_loop.cli.time.sleep", side_effect=release_holder):
+            with patch("vibe_loop.cli.poll_sleep", side_effect=release_holder):
                 with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
                     waiter_exit = main(
                         [
@@ -5651,7 +5651,7 @@ class CliTests(unittest.TestCase):
                         "TASK-01",
                     ]
                 )
-            with patch("vibe_loop.cli.time.sleep") as sleep:
+            with patch("vibe_loop.cli.poll_sleep") as sleep:
                 with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
                     waiter_exit = main(
                         [
@@ -5704,7 +5704,7 @@ class CliTests(unittest.TestCase):
             waiter_stdout = StringIO()
             waiter_stderr = StringIO()
 
-            with patch("vibe_loop.cli.time.sleep") as sleep:
+            with patch("vibe_loop.cli.poll_sleep") as sleep:
                 with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
                     waiter_exit = main(
                         [
@@ -5800,7 +5800,7 @@ class CliTests(unittest.TestCase):
                 )
 
             with patch(
-                "vibe_loop.cli.time.sleep",
+                "vibe_loop.cli.poll_sleep",
                 side_effect=dirty_workspace_and_release,
             ):
                 with redirect_stdout(waiter_stdout), redirect_stderr(waiter_stderr):
