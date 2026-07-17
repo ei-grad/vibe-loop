@@ -2705,8 +2705,25 @@ def parse_metadata_json(value: str | None) -> dict[str, object]:
 
 
 def run_until_done_exit_code(results: list[RunResult]) -> int:
-    if not results:
-        return 0
-    if any(result.classification in {"failed", "unknown"} for result in results):
+    """Batch exit status derived from each task's *final* outcome.
+
+    A single task can appear several times in ``results``: an ``unknown`` run
+    driven back to ``completed`` by recovery, or a transient failure retried to
+    success, both leave their earlier non-terminal results in the list. The exit
+    code must reflect where each task *ended*, not any intermediate state it
+    passed through, so a batch whose every task finished ``completed`` exits 0
+    even after recovery. Scanning the whole list for any ``failed``/``unknown``
+    (the previous behavior) let a recovered task's stale intermediate result
+    force a nonzero exit, which the autopilot then misread as a restartable
+    cycle. Only a task whose *last* result is ``failed`` or ``unknown`` fails the
+    batch.
+    """
+    final_classification: dict[str, str] = {}
+    for result in results:
+        final_classification[result.task_id] = result.classification
+    if any(
+        classification in {"failed", "unknown"}
+        for classification in final_classification.values()
+    ):
         return 1
     return 0

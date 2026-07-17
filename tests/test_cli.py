@@ -7430,5 +7430,76 @@ def write_fake_git(bin_dir: Path) -> None:
     )
 
 
+class RunUntilDoneExitCodeTests(unittest.TestCase):
+    def _result(self, task_id: str, classification: str):
+        from vibe_loop.runs import RunResult
+
+        return RunResult(
+            run_id=f"run-{task_id}-{classification}",
+            task_id=task_id,
+            classification=classification,
+            exit_code=0 if classification == "completed" else 1,
+            log_path=Path("/tmp/run.log"),
+            start_main="a",
+            end_main="b",
+        )
+
+    def test_empty_batch_exits_zero(self) -> None:
+        from vibe_loop.cli import run_until_done_exit_code
+
+        self.assertEqual(run_until_done_exit_code([]), 0)
+
+    def test_all_completed_exits_zero(self) -> None:
+        from vibe_loop.cli import run_until_done_exit_code
+
+        results = [self._result("A", "completed"), self._result("B", "completed")]
+        self.assertEqual(run_until_done_exit_code(results), 0)
+
+    def test_final_failed_task_exits_nonzero(self) -> None:
+        from vibe_loop.cli import run_until_done_exit_code
+
+        results = [self._result("A", "completed"), self._result("B", "failed")]
+        self.assertEqual(run_until_done_exit_code(results), 1)
+
+    def test_recovered_unknown_run_that_completes_exits_zero(self) -> None:
+        # Reproduces the incident batch: one task classified `unknown` on the
+        # fallback path several times, recovered each time, and finally reported
+        # `completed` by the worker. The task's work merged, so the batch must
+        # exit 0 — the earlier `unknown` results are intermediate, not the task's
+        # final outcome. The previous any-in-batch scan returned 1 here, which the
+        # autopilot then misclassified as a restartable cycle.
+        from vibe_loop.cli import run_until_done_exit_code
+
+        results = [
+            self._result("A", "unknown"),
+            self._result("A", "unknown"),
+            self._result("A", "unknown"),
+            self._result("A", "completed"),
+        ]
+        self.assertEqual(run_until_done_exit_code(results), 0)
+
+    def test_task_that_ends_unknown_exits_nonzero(self) -> None:
+        # A task whose *final* result is unknown (recovery never reached a clean
+        # terminal state) still fails the batch, even if an earlier slice of the
+        # same task completed.
+        from vibe_loop.cli import run_until_done_exit_code
+
+        results = [
+            self._result("A", "completed"),
+            self._result("A", "unknown"),
+        ]
+        self.assertEqual(run_until_done_exit_code(results), 1)
+
+    def test_one_task_recovers_while_another_ends_failed(self) -> None:
+        from vibe_loop.cli import run_until_done_exit_code
+
+        results = [
+            self._result("A", "unknown"),
+            self._result("A", "completed"),
+            self._result("B", "failed"),
+        ]
+        self.assertEqual(run_until_done_exit_code(results), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
