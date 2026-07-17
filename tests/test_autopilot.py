@@ -1035,6 +1035,80 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertFalse(woke_early)
         self.assertEqual(sleeps, [10.0])
 
+    def test_recheck_interval_requires_min_ready_to_wake_early(self) -> None:
+        # A steady below-threshold runnable count (1 task, dispatch needs 2)
+        # never wakes the recheck early: the next cycle could not dispatch it, so
+        # waking only re-runs planning and spins. The full interval elapses in
+        # slices instead.
+        sleeps: list[float] = []
+        woke_early = recheck_interval_for_runnable(
+            object(),  # config is unused; the runnable probe is injected
+            interval=100.0,
+            recheck_seconds=10.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config: 1,
+            min_ready=2,
+        )
+        self.assertFalse(woke_early)
+        self.assertEqual(sleeps, [10.0] * 10)
+
+    def test_recheck_interval_wakes_when_min_ready_reached(self) -> None:
+        # Once enough runnable work appears to cross the dispatch threshold the
+        # recheck wakes early so the next cycle dispatches.
+        sleeps: list[float] = []
+        probes = iter([1, 1, 2])
+        woke_early = recheck_interval_for_runnable(
+            object(),  # config is unused; the runnable probe is injected
+            interval=100.0,
+            recheck_seconds=10.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config: next(probes),
+            min_ready=2,
+        )
+        self.assertTrue(woke_early)
+        self.assertEqual(sleeps, [10.0, 10.0, 10.0])
+
+    def test_below_threshold_runnable_does_not_spin_recheck(self) -> None:
+        # A phantom / below-dispatch-threshold runnable count must not leave the
+        # supervisor spinning early cycles without ever backing off: planning
+        # still fires on each idle cycle, and the recheck sleeps the full
+        # interval in slices rather than waking early on a count the dispatch
+        # gate would reject.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    'planning_command = "plan"\n'
+                ),
+            )
+            config = load_config(repo)
+            runner, kinds = self._planning_runner()
+            launcher, launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                min_ready=2,
+                launcher=launcher,
+                maintenance_runner=runner,
+                sleep=sleeps.append,
+            )
+
+        # One ready task with min_ready=2 stays idle: the cycle never dispatches.
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertEqual(len(launcher_calls), 0)
+        # Planning fires on every idle cycle (it is never starved) ...
+        self.assertEqual(kinds, ["planning", "planning"])
+        # ... and the recheck does not wake early on the below-threshold count;
+        # it sleeps the full interval in slices instead of spinning.
+        self.assertEqual(sleeps, [10.0] * 10)
+
     def test_poll_runnable_count_reports_zero_on_source_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

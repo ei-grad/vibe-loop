@@ -1385,22 +1385,33 @@ def recheck_interval_for_runnable(
     sleeper: Sleep,
     should_stop: Callable[[], bool] | None = None,
     runnable_probe: Callable[[VibeConfig], int] | None = None,
+    min_ready: int = 1,
 ) -> bool:
-    """Sleep up to ``interval`` while polling for newly runnable tasks.
+    """Sleep up to ``interval`` while polling for enough runnable work to dispatch.
 
     Sleeps in ``recheck_seconds`` slices through the injected ``sleeper`` and
-    probes the task source between slices. Returns ``True`` as soon as a runnable
-    task appears so the caller can start the next cycle early, and ``False`` when
-    the full interval elapses with none (or a stop is requested). Used after
-    idle/planning cycles so freshly planned work is picked up without waiting the
-    whole interval.
+    probes the task source between slices. Returns ``True`` as soon as at least
+    ``min_ready`` runnable tasks are present so the caller can start the next
+    cycle early, and ``False`` when the full interval elapses without them (or a
+    stop is requested). Used after idle/planning cycles so freshly planned work
+    is picked up without waiting the whole interval.
+
+    The ``min_ready`` threshold mirrors the dispatch gate
+    (``runnable < min_ready`` is idle in :func:`execute_autopilot_cycle`). Waking
+    on any ``runnable > 0`` count the next cycle still could not dispatch only
+    starts another idle cycle, and a probe that keeps reporting a below-threshold
+    count then spins the supervisor, re-running the planning command every slice
+    instead of backing off for the full interval. Requiring the dispatch
+    threshold keeps a below-threshold (or phantom) count from starving the
+    interval backoff.
     """
     probe = runnable_probe if runnable_probe is not None else poll_runnable_count
+    threshold = max(1, min_ready)
     for slice_seconds in recheck_sleep_slices(interval, recheck_seconds):
         sleeper(slice_seconds)
         if should_stop is not None and should_stop():
             return False
-        if probe(config) > 0:
+        if probe(config) >= threshold:
             return True
     return False
 
@@ -1550,6 +1561,7 @@ def run_autopilot(
                         recheck_seconds=config.autopilot.planning_recheck_seconds,
                         sleeper=sleeper,
                         should_stop=should_stop,
+                        min_ready=min_ready,
                     )
                     if woke_early:
                         print(
