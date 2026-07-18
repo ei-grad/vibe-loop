@@ -1,6 +1,6 @@
 # External Benchmark Fit
 
-Last researched: 2026-05-09.
+Last researched: 2026-07-18.
 
 This note evaluates external benchmarks as optional context for bundled
 `vibe-loop` skill evals. It is not a leaderboard plan. Public benchmarks are
@@ -108,3 +108,62 @@ Every external run must record:
 External benchmark results must not replace the local release gate. They are
 diagnostic context for adapter quality and broad agent capability, while local
 demo fixtures remain the authoritative test for bundled skill behavior.
+
+## Pinned SWE-rebench V2 Smoke
+
+`eval/benchmarks/swe-rebench-v2-smoke.json` is the optional post-`0.2.0`
+follow-up for EVAL-10. It pins 24 `train` instances from
+`nebius/SWE-rebench-V2` revision
+`475dd5e8703bb5fb22dd3c60b5d038b019eba1e0`: four each for Go, Java,
+JavaScript, Python, Rust, and TypeScript. Every selected row has a pre-built
+image identifier, at least one fail-to-pass test, complete intent metadata,
+LLM metadata code `A`, no detected `B1`-`B6` flags, and no recorded test
+alignment issues. The manifest retains the instance id, source row, repository,
+language, base commit, license signal, image tag, test counts, and selection
+metadata.
+
+The manifest uses the upstream evaluator at pinned harness revision
+`c71902a8cf8d2b725f63d51f199f4d3e56f68d2d`. Execution is deliberately not
+self-starting: the operator must provide a matching 24-task JSON export, the
+pinned upstream harness checkout, and pre-pulled images. This prevents an
+ordinary release check from initiating a large dataset download or consuming
+Docker storage unexpectedly.
+
+Before each trial, the adapter verifies the harness checkout's exact `HEAD` and
+executes a temporary `git archive` snapshot of that revision, so dirty or
+untracked checkout files cannot alter the harness code. It also verifies the
+export's exact 24-instance ID set and a canonical SHA-256 fingerprint of every
+complete task record. The fingerprints bind the operator-supplied export to the
+selected records from the declared dataset revision; a different row, extra
+task, or missing task is an infrastructure failure rather than benchmark
+evidence.
+
+The agent command receives `VIBE_LOOP_BENCHMARK_INSTANCE_ID`,
+`VIBE_LOOP_BENCHMARK_DATASET`, `VIBE_LOOP_BENCHMARK_SPLIT`,
+`VIBE_LOOP_BENCHMARK_REPO`, `VIBE_LOOP_BENCHMARK_LANGUAGE`, and
+`VIBE_LOOP_BENCHMARK_IMAGE`. Its wrapper must select the matching task from the
+pinned export and write `patches.json` in the trial workspace using the upstream
+evaluator's patch-list format. The file must contain exactly one entry for the
+current instance with a non-empty `patch`; this prevents the upstream
+evaluator's missing-override behavior from substituting the dataset gold patch.
+Run the smoke with:
+
+```bash
+SWE_REBENCH_V2_HARNESS=/path/to/SWE-rebench-V2 \
+SWE_REBENCH_V2_TASKS_JSON=/path/to/pinned-24-task-export.json \
+vibe-loop eval benchmark \
+  --adapter manifest \
+  --manifest eval/benchmarks/swe-rebench-v2-smoke.json \
+  --output .vibe-loop/eval-runs/swe-rebench-v2 \
+  --agent-command 'vibe_loop=your-swe-rebench-agent-wrapper' \
+  --timeout 7200
+```
+
+The benchmark wrapper reads the upstream JSON report: explicit evaluator
+`error` outcomes, Docker exit 125, and inconsistent or missing reports are
+infrastructure failures, while a valid fail-to-pass mismatch is an agent failure. Setup and
+grader infrastructure failures therefore remain separate from agent command,
+timeout, patch-contract, or test-outcome failures. Image tags are preserved exactly,
+but the upstream dataset does not provide registry digests; resolve and record
+digests separately before treating repeated runs as stable comparisons. These
+results remain non-leaderboard evidence even when all tasks pass.

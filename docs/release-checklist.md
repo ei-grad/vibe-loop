@@ -96,6 +96,14 @@ The release gate stores the summary file path, size, SHA-256, benchmark name,
 status, and selected summary fields. Do not attach raw benchmark logs or
 transcripts to the release-readiness record.
 
+The pinned SWE-rebench V2 multilingual smoke is a post-`0.2.0` follow-up, not a
+`0.2.0` release blocker and not a replacement for the local-demo matrix. Its
+result is absent by default and is recorded only when the operator intentionally
+passes the generated `swe-rebench-v2-multilingual-smoke-results.json` with
+`--external-benchmark-json`. Treat `infrastructure_failed` separately from
+`agent_failed` when interpreting the optional summary, and retain the manifest's
+non-leaderboard caveat in release evidence.
+
 `docs/examples/release-readiness-dry-run.json` shows the expected record shape
 with local-suite evidence and optional external smoke evidence.
 

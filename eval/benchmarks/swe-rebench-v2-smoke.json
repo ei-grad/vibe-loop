@@ -1,0 +1,472 @@
+{
+  "name": "swe-rebench-v2-multilingual-smoke",
+  "version": "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+  "metadata": {
+    "benchmark": "SWE-rebench V2 multilingual smoke",
+    "dataset": "nebius/SWE-rebench-V2",
+    "dataset_revision": "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+    "dataset_revision_date": "2026-05-12T14:00:30Z",
+    "split": "train",
+    "languages": [
+      "go",
+      "java",
+      "js",
+      "python",
+      "rust",
+      "ts"
+    ],
+    "non_leaderboard": true,
+    "caveats": [
+      "This curated training-data sample is directional smoke evidence, not a public leaderboard submission.",
+      "Operators must verify upstream dataset, image, repository, and harness terms before execution or redistribution.",
+      "Image tags are upstream identifiers rather than immutable registry digests; verify resolved digests before a stable comparison."
+    ],
+    "selection": {
+      "sample_size": 24,
+      "instances_per_language": 4,
+      "required_image_name": true,
+      "minimum_fail_to_pass_tests": 1,
+      "required_llm_metadata_code": "A",
+      "required_intent_completeness": "complete",
+      "required_test_alignment_issues": [],
+      "excluded_detected_issues": [
+        "B1",
+        "B2",
+        "B3",
+        "B4",
+        "B5",
+        "B6"
+      ]
+    },
+    "task_record_sha256": {
+      "elastic__synthetics-316": "4e7fc2ba73ba1862748ecb4d303ca8f29f946edc0cd4b4cdf7b08426d9445801",
+      "webpack-contrib__copy-webpack-plugin-590": "1f92a7c75797c4ad86a7cdb763906bdc2c60d4a6f76cd3798f21fa3398cec933",
+      "crawler-commons__crawler-commons-227": "c1c927fa02b10cff971046dcd4f24f6bfaf9749ffc8cb5099501aee55b079d9e",
+      "filecoin-project__specs-actors-592": "ecb2b0c4e74bebc9bcfdfe0e108e0450f812bf1b1a36bf52a273139b51d7d019",
+      "awslabs__aws-embedded-metrics-node-19": "4932f179cf407718fa5c11e97f07b8b177b6983bc2c35a41d4ce65e64f805237",
+      "aws-cloudformation__cfn-lint-3965": "d8a5141d631550b2acbbb8b8f11700f0978474c71a67445615e42f1c498af394",
+      "bbc__psammead-1362": "fa29dfaa93e72d44be26c44d0afcafffd3f00cf0a2bbb407c04c80e7d33276f2",
+      "editorconfig-checker__editorconfig-checker-360": "56c22ff96f4f36c1d02d2ad1726553cac4b275fd41ac0db4b74e6ba7bf680652",
+      "d5__tengo-221": "743542a85ed828e786f1e6b804ee9fe4d7d9dc974ad8b40f80a5c8c6e501d88c",
+      "sindresorhus__execa-490": "e2b38a253a21ef975aa9e2f3108e1d9906e9bfe11b09e81e523e371b486bf167",
+      "projectfluent__fluent-rs-143": "ae4a45e41c087f736549783e979254ab541834418eae8a0de8cd901de1e6bb8d",
+      "mozilla-services__cliquet-203": "299a2bcdb8a34c61272d7fc20e09637d43f72366c0f3446d525900d5dc710d19",
+      "peternator7__strum-220": "9ae6bdaa95055c3ccc996711f1f39ecfa79ac9582d1c4f738ea647b034617cc5",
+      "gfx-rs__naga-823": "f2e8d8b92df66cea01ad76da472c8e43e49237e174895e10f74669f8c31fdbf6",
+      "clap-rs__clap-1975": "5143e5144476502a768d898fd47aaba09b7b348928977dd1767330e45e40192a",
+      "pallets__werkzeug-2583": "482bc4dcf48c02b5a8052af8d73fca14bb90a63a0b196469ff5077a7296a990a",
+      "typedorm__typedorm-111": "543a5ff12fba5d89c149a7c1bd84fbff924cc91900d66225aac24a518b8569c1",
+      "ember-cli__ember-cli-7874": "bbdeb47882bd5f3757c09bcffbb3eb4dcba3b8d42aea03eebb93ec8e64a544fd",
+      "pytest-dev__pyfakefs-916": "5e2a35c29ba3efe6898bab1199cf96aa8d449880358af94bfc45678c1b56bbfe",
+      "salsita__node-pg-migrate-671": "e74ea8044636d858c877d625d8380137345d66a163f062b97318b6feac7fc947",
+      "weaveworks__eksctl-3810": "a47a6474883fe916cf53db6549c8ec6dcf3660c1628e0dbcb7fdc5d189bc4585",
+      "xlate__staedi-130": "20acb2cd51f5102680e232edc3a46e2f4227447e51602692f6519c316213859f",
+      "projectlombok__lombok-3578": "db4cd77426bb93432f6ce69fed70512ab3cad084b36d0fdd96b02467229d1be4",
+      "amzn__ion-java-289": "df818d3d3bdd84f24278fe10b83a8b57d54a1f5dea28aa9c0a30e9a8b2fc551b"
+    }
+  },
+  "harness": {
+    "name": "SWE-rebench-V2 scripts/eval.py",
+    "revision": "c71902a8cf8d2b725f63d51f199f4d3e56f68d2d",
+    "provenance": "https://github.com/SWE-rebench/SWE-rebench-V2",
+    "resource_cost": "Requires Docker, pre-pulled per-instance images, substantial storage, and an operator-supplied pinned task JSON export."
+  },
+  "defaults": {
+    "timeout_seconds": 7200,
+    "setup": {
+      "command": "\"$VIBE_LOOP_BENCHMARK_PYTHON\" -m vibe_loop.eval_benchmark_swe_rebench validate"
+    },
+    "grader": {
+      "name": "SWE-rebench-V2 fail-to-pass grader",
+      "provenance": "SWE-rebench/SWE-rebench-V2 scripts/eval.py@c71902a8cf8d2b725f63d51f199f4d3e56f68d2d",
+      "command": "\"$VIBE_LOOP_BENCHMARK_PYTHON\" -m vibe_loop.eval_benchmark_swe_rebench grade",
+      "infrastructure_exit_codes": [2]
+    }
+  },
+  "instances": [
+    {
+      "instance_id": "elastic__synthetics-316",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "elastic/synthetics",
+      "language": "ts",
+      "image": "docker.io/swerebenchv2/elastic-synthetics:316-f52f0bf",
+      "metadata": {
+        "source_row_index": 0,
+        "base_commit": "f52f0bf3d18ca418d1eec4afd1370751fdd914ce",
+        "license": "MIT",
+        "fail_to_pass_count": 1,
+        "pass_to_pass_count": 83,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "webpack-contrib__copy-webpack-plugin-590",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "webpack-contrib/copy-webpack-plugin",
+      "language": "js",
+      "image": "docker.io/swerebenchv2/webpack-contrib-copy-webpack-plugin:590-a9b06a6",
+      "metadata": {
+        "source_row_index": 2,
+        "base_commit": "a9b06a635a7d3458c8e2ed2b10cc3fd1e02b5f37",
+        "license": "MIT",
+        "fail_to_pass_count": 21,
+        "pass_to_pass_count": 197,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "crawler-commons__crawler-commons-227",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "crawler-commons/crawler-commons",
+      "language": "java",
+      "image": "docker.io/swerebenchv2/crawler-commons-crawler-commons:227-ab9e33a",
+      "metadata": {
+        "source_row_index": 3,
+        "base_commit": "ab9e33a5f9fdb02c57141412867a4ec985135aa7",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 2,
+        "pass_to_pass_count": 11,
+        "confounders": {"code": "A", "confidence": 0.87, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "filecoin-project__specs-actors-592",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "filecoin-project/specs-actors",
+      "language": "go",
+      "image": "docker.io/swerebenchv2/filecoin-project-specs-actors:592-db0bbaa",
+      "metadata": {
+        "source_row_index": 12,
+        "base_commit": "db0bbaa5c604fd8efdd4618de47d4c1205097ce5",
+        "license": "custom-check-github",
+        "fail_to_pass_count": 3,
+        "pass_to_pass_count": 347,
+        "confounders": {"code": "A", "confidence": 0.98, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "awslabs__aws-embedded-metrics-node-19",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "awslabs/aws-embedded-metrics-node",
+      "language": "ts",
+      "image": "docker.io/swerebenchv2/awslabs-aws-embedded-metrics-node:19-4e3b12e",
+      "metadata": {
+        "source_row_index": 13,
+        "base_commit": "4e3b12e7fd262a118c6e967814fcf8a402917a09",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 23,
+        "pass_to_pass_count": 57,
+        "confounders": {"code": "A", "confidence": 0.93, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "aws-cloudformation__cfn-lint-3965",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "aws-cloudformation/cfn-lint",
+      "language": "python",
+      "image": "docker.io/swerebenchv2/aws-cloudformation-cfn-lint:3965-b4d790d",
+      "metadata": {
+        "source_row_index": 15,
+        "base_commit": "b4d790dd57b324c20ea9031b4769ba4d75ecd691",
+        "license": "MIT-0",
+        "fail_to_pass_count": 1,
+        "pass_to_pass_count": 1,
+        "confounders": {"code": "A", "confidence": 0.99, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "bbc__psammead-1362",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "bbc/psammead",
+      "language": "js",
+      "image": "docker.io/swerebenchv2/bbc-psammead:1362-14583a2",
+      "metadata": {
+        "source_row_index": 16,
+        "base_commit": "14583a2522eeeedf8207c817bddcd2b2212e23a0",
+        "license": "custom-check-github",
+        "fail_to_pass_count": 4,
+        "pass_to_pass_count": 201,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "editorconfig-checker__editorconfig-checker-360",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "editorconfig-checker/editorconfig-checker",
+      "language": "go",
+      "image": "docker.io/swerebenchv2/editorconfig-checker-editorconfig-checker:360-6116ec6",
+      "metadata": {
+        "source_row_index": 20,
+        "base_commit": "6116ec6685b33652e9e25def9b8897ed4b015c7d",
+        "license": "MIT",
+        "fail_to_pass_count": 13,
+        "pass_to_pass_count": 28,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "d5__tengo-221",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "d5/tengo",
+      "language": "go",
+      "image": "docker.io/swerebenchv2/d5-tengo:221-2e74690",
+      "metadata": {
+        "source_row_index": 21,
+        "base_commit": "2e74690f5ec73e6707606fd92bca02f7f17c452f",
+        "license": "MIT",
+        "fail_to_pass_count": 2,
+        "pass_to_pass_count": 153,
+        "confounders": {"code": "A", "confidence": 0.96, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "sindresorhus__execa-490",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "sindresorhus/execa",
+      "language": "js",
+      "image": "docker.io/swerebenchv2/sindresorhus-execa:490-e4b9295",
+      "metadata": {
+        "source_row_index": 22,
+        "base_commit": "e4b929547ade335b0dd9d7afe1a35989e19fbc8a",
+        "license": "MIT",
+        "fail_to_pass_count": 2,
+        "pass_to_pass_count": 207,
+        "confounders": {"code": "A", "confidence": 0.92, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "projectfluent__fluent-rs-143",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "projectfluent/fluent-rs",
+      "language": "rust",
+      "image": "docker.io/swerebenchv2/projectfluent-fluent-rs:143-0ceff86",
+      "metadata": {
+        "source_row_index": 23,
+        "base_commit": "0ceff863d16612e232b3bcd0dd230cbeee6b02a7",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 8,
+        "pass_to_pass_count": 3,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "mozilla-services__cliquet-203",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "mozilla-services/cliquet",
+      "language": "python",
+      "image": "docker.io/swerebenchv2/mozilla-services-cliquet:203-41a48da",
+      "metadata": {
+        "source_row_index": 32,
+        "base_commit": "41a48da66062b4e948ef1f6ce5183d2752304ecf",
+        "license": "custom-check-github",
+        "fail_to_pass_count": 1,
+        "pass_to_pass_count": 13,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "peternator7__strum-220",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "Peternator7/strum",
+      "language": "rust",
+      "image": "docker.io/swerebenchv2/peternator7-strum:220-054df84",
+      "metadata": {
+        "source_row_index": 36,
+        "base_commit": "054df849e19fb686d9c4c42366bc8baa99f41d48",
+        "license": "MIT",
+        "fail_to_pass_count": 73,
+        "pass_to_pass_count": 0,
+        "confounders": {"code": "A", "confidence": 0.96, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "gfx-rs__naga-823",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "gfx-rs/naga",
+      "language": "rust",
+      "image": "docker.io/swerebenchv2/gfx-rs-naga:823-9fe75ed",
+      "metadata": {
+        "source_row_index": 63,
+        "base_commit": "9fe75ed7f1cf54f52c0b00763039f15712f4f398",
+        "license": "custom-check-github",
+        "fail_to_pass_count": 11,
+        "pass_to_pass_count": 24,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "clap-rs__clap-1975",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "clap-rs/clap",
+      "language": "rust",
+      "image": "docker.io/swerebenchv2/clap-rs-clap:1975-8145717",
+      "metadata": {
+        "source_row_index": 78,
+        "base_commit": "81457178fa7e055775867ca659b37798b5ae9584",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 279,
+        "pass_to_pass_count": 0,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "pallets__werkzeug-2583",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "pallets/werkzeug",
+      "language": "python",
+      "image": "docker.io/swerebenchv2/pallets-werkzeug:2583-1ce57f6",
+      "metadata": {
+        "source_row_index": 80,
+        "base_commit": "1ce57f64c9fecb655856dd1f3098c7bf7a1d37fa",
+        "license": "BSD-3-Clause",
+        "fail_to_pass_count": 1,
+        "pass_to_pass_count": 114,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "typedorm__typedorm-111",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "typedorm/typedorm",
+      "language": "ts",
+      "image": "docker.io/swerebenchv2/typedorm-typedorm:111-6ccc93e",
+      "metadata": {
+        "source_row_index": 81,
+        "base_commit": "6ccc93e376905a82412f09d7bb62f29bb5ea57fb",
+        "license": "MIT",
+        "fail_to_pass_count": 190,
+        "pass_to_pass_count": 24,
+        "confounders": {"code": "A", "confidence": 0.99, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "ember-cli__ember-cli-7874",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "ember-cli/ember-cli",
+      "language": "js",
+      "image": "docker.io/swerebenchv2/ember-cli-ember-cli:7874-a289431",
+      "metadata": {
+        "source_row_index": 84,
+        "base_commit": "a289431bad1431444118d197440cfa7c9211818b",
+        "license": "MIT",
+        "fail_to_pass_count": 2,
+        "pass_to_pass_count": 833,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "pytest-dev__pyfakefs-916",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "pytest-dev/pyfakefs",
+      "language": "python",
+      "image": "docker.io/swerebenchv2/pytest-dev-pyfakefs:916-95b2de3",
+      "metadata": {
+        "source_row_index": 87,
+        "base_commit": "95b2de37ae7ea2cde50b23dfd657938a4cf60d25",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 1,
+        "pass_to_pass_count": 102,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "salsita__node-pg-migrate-671",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "salsita/node-pg-migrate",
+      "language": "ts",
+      "image": "docker.io/swerebenchv2/salsita-node-pg-migrate:671-92503ef",
+      "metadata": {
+        "source_row_index": 93,
+        "base_commit": "92503efc2a886c5dc62f701fd2946216a99b5dcf",
+        "license": "MIT",
+        "fail_to_pass_count": 3,
+        "pass_to_pass_count": 54,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "weaveworks__eksctl-3810",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "weaveworks/eksctl",
+      "language": "go",
+      "image": "docker.io/swerebenchv2/weaveworks-eksctl:3810-d89ad1e",
+      "metadata": {
+        "source_row_index": 94,
+        "base_commit": "d89ad1ef9f01f2c6b69268adc3ddcee5d8972b6b",
+        "license": "custom-check-github",
+        "fail_to_pass_count": 3,
+        "pass_to_pass_count": 101,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "xlate__staedi-130",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "xlate/staedi",
+      "language": "java",
+      "image": "docker.io/swerebenchv2/xlate-staedi:130-0281246",
+      "metadata": {
+        "source_row_index": 97,
+        "base_commit": "02812464183cae841778e98ea4e130de5a8bd590",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 41,
+        "pass_to_pass_count": 0,
+        "confounders": {"code": "A", "confidence": 0.96, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "projectlombok__lombok-3578",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "projectlombok/lombok",
+      "language": "java",
+      "image": "docker.io/swerebenchv2/projectlombok-lombok:3578-0089374",
+      "metadata": {
+        "source_row_index": 116,
+        "base_commit": "00893744eb56d0e44fa7f59ea28dd3e0da8ff0e8",
+        "license": "custom-check-github",
+        "fail_to_pass_count": 3,
+        "pass_to_pass_count": 1145,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "medium", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    },
+    {
+      "instance_id": "amzn__ion-java-289",
+      "dataset": "nebius/SWE-rebench-V2",
+      "split": "train",
+      "repo": "amzn/ion-java",
+      "language": "java",
+      "image": "docker.io/swerebenchv2/amzn-ion-java:289-89add66",
+      "metadata": {
+        "source_row_index": 137,
+        "base_commit": "89add66178d8b276fa5b50bf58e23d0894054686",
+        "license": "Apache-2.0",
+        "fail_to_pass_count": 1,
+        "pass_to_pass_count": 96,
+        "confounders": {"code": "A", "confidence": 0.97, "detected_issues": {"B1": false, "B2": false, "B3": false, "B4": false, "B5": false, "B6": false}, "difficulty": "easy", "intent_completeness": "complete", "test_alignment_issues": []}
+      }
+    }
+  ]
+}

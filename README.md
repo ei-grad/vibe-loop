@@ -329,6 +329,18 @@ harness without claiming public leaderboard comparability. See
 [`docs/skill-evaluation-strategy.md`](docs/skill-evaluation-strategy.md) and
 [`docs/external-benchmark-fit.md`](docs/external-benchmark-fit.md).
 
+The optional post-`0.2.0` SWE-rebench V2 follow-up uses
+`eval/benchmarks/swe-rebench-v2-smoke.json`. Its 24 pinned multilingual
+instances require an operator-supplied matching task export, pinned upstream
+harness checkout, pre-pulled Docker images, and an agent wrapper that writes
+one matching, non-empty patch in `patches.json`. The adapter executes an archive
+of the pinned harness revision and verifies complete task-record fingerprints, then
+uses the upstream report to distinguish `agent_failed` from
+`infrastructure_failed`; neither category changes the local release gate.
+These status fields are part of benchmark result schema version 2.
+External results enter a release-readiness record only when its path is passed
+explicitly with `eval release-gate --external-benchmark-json ...`.
+
 The release matrix includes default table discovery, generated heading profiles,
 explicit list profiles, Spec Kit, Kiro, OpenSpec, and command-backed task/lock
 stories. Aggregate and release-readiness records retain compact trial links but

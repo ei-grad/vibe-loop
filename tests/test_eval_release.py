@@ -76,6 +76,61 @@ class EvalReleaseTests(unittest.TestCase):
             },
         )
 
+    def test_swe_rebench_evidence_is_attached_only_when_intentionally_supplied(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            aggregate_path = root / "aggregate.json"
+            external_path = root / "swe-rebench-v2-smoke.json"
+            aggregate = passing_release_aggregate()
+            write_json(aggregate_path, aggregate)
+            write_json(
+                external_path,
+                {
+                    "benchmark": "SWE-rebench V2 multilingual smoke",
+                    "dataset": "nebius/SWE-rebench-V2",
+                    "dataset_revision": "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+                    "split": "train",
+                    "sample_size": 24,
+                    "languages": ["go", "java", "js", "python", "rust", "ts"],
+                    "non_leaderboard": True,
+                    "caveats": ["directional smoke evidence only"],
+                    "status": "completed",
+                    "summary": {
+                        "passed": 18,
+                        "agent_failed": 4,
+                        "infrastructure_failed": 2,
+                    },
+                },
+            )
+
+            omitted = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+            )
+            attached = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                external_benchmarks=load_external_benchmark_evidence([external_path]),
+            )
+
+        self.assertEqual(
+            omitted["external_benchmarks"]["status"], "optional_not_provided"
+        )
+        self.assertEqual(omitted["external_benchmarks"]["records"], [])
+        evidence = attached["external_benchmarks"]["records"][0]
+        self.assertEqual(evidence["summary"]["sample_size"], 24)
+        self.assertTrue(evidence["summary"]["non_leaderboard"])
+        self.assertEqual(
+            evidence["summary"]["dataset_revision"],
+            "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0",
+        )
+        self.assertEqual(evidence["summary"]["summary"]["agent_failed"], 4)
+        self.assertEqual(evidence["summary"]["summary"]["infrastructure_failed"], 2)
+
     def test_workflow_regression_blocks_until_parked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             aggregate_path = Path(directory) / "aggregate.json"

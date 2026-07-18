@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import subprocess
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -9,7 +11,10 @@ from pathlib import Path
 from typing import Protocol
 
 
-BENCHMARK_EVAL_SCHEMA_VERSION = 1
+BENCHMARK_EVAL_SCHEMA_VERSION = 2
+BENCHMARK_STATUS_PASSED = "passed"
+BENCHMARK_STATUS_AGENT_FAILED = "agent_failed"
+BENCHMARK_STATUS_INFRASTRUCTURE_FAILED = "infrastructure_failed"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -46,6 +51,7 @@ class BenchmarkGraderResult:
     log: str = ""
     failure_reason: str = ""
     metadata: Mapping[str, object] = dataclasses.field(default_factory=dict)
+    infrastructure_failure: bool = False
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -57,6 +63,7 @@ class BenchmarkGraderResult:
             "log": self.log,
             "failure_reason": self.failure_reason,
             "metadata": dict(self.metadata),
+            "infrastructure_failure": self.infrastructure_failure,
         }
 
 
@@ -72,6 +79,10 @@ class BenchmarkTrialResult:
     duration_seconds: float
     artifact_root: str = ""
     timeout: bool = False
+    status: str = BENCHMARK_STATUS_PASSED
+    agent_status: str = "succeeded"
+    agent_exit_code: int | None = None
+    failure_phase: str = ""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -85,6 +96,10 @@ class BenchmarkTrialResult:
             "duration_seconds": round(self.duration_seconds, 6),
             "artifact_root": self.artifact_root,
             "timeout": self.timeout,
+            "status": self.status,
+            "agent_status": self.agent_status,
+            "agent_exit_code": self.agent_exit_code,
+            "failure_phase": self.failure_phase,
         }
 
 
@@ -118,14 +133,27 @@ class BenchmarkEvalConfig:
 
 
 def run_benchmark_eval(config: BenchmarkEvalConfig) -> dict[str, object]:
+    if config.trials < 1:
+        raise ValueError("benchmark trials must be at least 1")
+    if config.timeout_seconds < 1:
+        raise ValueError("benchmark timeout must be at least 1 second")
     instances = config.adapter.list_instances()
     if config.instances:
         allowed = set(config.instances)
+        known = {instance.instance_id for instance in instances}
+        unknown = sorted(allowed - known)
+        if unknown:
+            raise ValueError(f"unknown benchmark instances: {', '.join(unknown)}")
         instances = [i for i in instances if i.instance_id in allowed]
 
     conditions = list(config.agent_commands.keys())
     if config.conditions:
         allowed_conditions = set(config.conditions)
+        unknown_conditions = sorted(allowed_conditions - set(conditions))
+        if unknown_conditions:
+            raise ValueError(
+                f"unknown benchmark conditions: {', '.join(unknown_conditions)}"
+            )
         conditions = [c for c in conditions if c in allowed_conditions]
 
     results: list[dict[str, object]] = []
@@ -141,29 +169,65 @@ def run_benchmark_eval(config: BenchmarkEvalConfig) -> dict[str, object]:
                 condition_results.append(trial_result)
                 results.append(trial_result.to_json())
 
-        passed = sum(1 for r in condition_results if r.grader_result.passed)
+        passed = sum(
+            1 for r in condition_results if r.status == BENCHMARK_STATUS_PASSED
+        )
+        agent_failures = sum(
+            1 for r in condition_results if r.status == BENCHMARK_STATUS_AGENT_FAILED
+        )
+        infrastructure_failures = sum(
+            1
+            for r in condition_results
+            if r.status == BENCHMARK_STATUS_INFRASTRUCTURE_FAILED
+        )
         condition_summaries[condition] = {
             "trials": len(condition_results),
             "passed": passed,
+            "agent_failures": agent_failures,
+            "infrastructure_failures": infrastructure_failures,
             "pass_rate": round(passed / len(condition_results), 4)
             if condition_results
             else 0.0,
             "agent_command": command,
         }
 
-    return {
+    adapter_metadata = benchmark_adapter_metadata(config.adapter)
+    selected_languages = sorted(
+        {instance.language for instance in instances if instance.language}
+    )
+    if "languages" in adapter_metadata:
+        adapter_metadata["languages"] = selected_languages
+    status_counts = benchmark_status_counts(results)
+    payload = {
         "schema_version": BENCHMARK_EVAL_SCHEMA_VERSION,
+        "benchmark": string_metadata_value(adapter_metadata, "benchmark")
+        or config.adapter.name,
         "adapter": config.adapter.name,
         "adapter_version": config.adapter.version,
         "generated_at": datetime.now(UTC).isoformat(),
+        "status": "completed",
+        "sample_size": len(instances),
         "instances_total": len(instances),
         "resource_budget": {
             "timeout_seconds": config.timeout_seconds,
             "trials": config.trials,
         },
+        "summary": status_counts,
+        "adapter_metadata": adapter_metadata,
         "conditions": condition_summaries,
         "results": results,
     }
+    for key in (
+        "dataset",
+        "dataset_revision",
+        "split",
+        "languages",
+        "non_leaderboard",
+        "caveats",
+    ):
+        if key in adapter_metadata:
+            payload[key] = adapter_metadata[key]
+    return payload
 
 
 def _run_trial(
@@ -202,6 +266,7 @@ def _run_trial(
             started_at,
             start_time,
             f"setup failed: {exc}",
+            failure_phase="setup",
         )
 
     # shell=True is intentional: agent commands are user-supplied CLI strings
@@ -212,6 +277,7 @@ def _run_trial(
             command,
             cwd=workdir,
             shell=True,
+            env=benchmark_instance_environment(instance),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -231,6 +297,7 @@ def _run_trial(
             started_at,
             start_time,
             f"agent command failed: {exc}",
+            failure_phase="agent",
         )
 
     try:
@@ -243,6 +310,7 @@ def _run_trial(
             exit_code=-1,
             duration_seconds=0.0,
             failure_reason=f"grader error: {exc}",
+            infrastructure_failure=True,
         )
 
     finished_at = datetime.now(UTC).isoformat()
@@ -261,6 +329,27 @@ def _run_trial(
     except Exception:
         pass
 
+    agent_exit_code = agent_result.returncode if agent_result is not None else None
+    if timeout:
+        agent_status = "timed_out"
+    elif agent_exit_code != 0:
+        agent_status = "failed"
+    else:
+        agent_status = "succeeded"
+
+    if grader_result.infrastructure_failure:
+        status = BENCHMARK_STATUS_INFRASTRUCTURE_FAILED
+        failure_phase = "grader"
+    elif agent_status != "succeeded":
+        status = BENCHMARK_STATUS_AGENT_FAILED
+        failure_phase = "agent"
+    elif grader_result.passed:
+        status = BENCHMARK_STATUS_PASSED
+        failure_phase = ""
+    else:
+        status = BENCHMARK_STATUS_AGENT_FAILED
+        failure_phase = "grader"
+
     return BenchmarkTrialResult(
         instance=instance,
         condition=condition,
@@ -272,6 +361,10 @@ def _run_trial(
         duration_seconds=duration,
         artifact_root=str(trial_dir),
         timeout=timeout,
+        status=status,
+        agent_status=agent_status,
+        agent_exit_code=agent_exit_code,
+        failure_phase=failure_phase,
     )
 
 
@@ -283,6 +376,8 @@ def _error_trial(
     started_at: str,
     start_time: float,
     error_message: str,
+    *,
+    failure_phase: str,
 ) -> BenchmarkTrialResult:
     return BenchmarkTrialResult(
         instance=instance,
@@ -295,9 +390,56 @@ def _error_trial(
             exit_code=-1,
             duration_seconds=0.0,
             failure_reason=error_message,
+            infrastructure_failure=True,
         ),
         agent_command=command,
         started_at=started_at,
         finished_at=datetime.now(UTC).isoformat(),
         duration_seconds=time.monotonic() - start_time,
+        status=BENCHMARK_STATUS_INFRASTRUCTURE_FAILED,
+        agent_status="not_run",
+        failure_phase=failure_phase,
     )
+
+
+def benchmark_instance_environment(instance: BenchmarkInstance) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "VIBE_LOOP_BENCHMARK_INSTANCE_ID": instance.instance_id,
+            "VIBE_LOOP_BENCHMARK_DATASET": instance.dataset,
+            "VIBE_LOOP_BENCHMARK_SPLIT": instance.split,
+            "VIBE_LOOP_BENCHMARK_REPO": instance.repo,
+            "VIBE_LOOP_BENCHMARK_LANGUAGE": instance.language,
+            "VIBE_LOOP_BENCHMARK_IMAGE": instance.image,
+            "VIBE_LOOP_BENCHMARK_IMAGE_DIGEST": instance.image_digest,
+            "VIBE_LOOP_BENCHMARK_PYTHON": sys.executable,
+        }
+    )
+    return environment
+
+
+def benchmark_adapter_metadata(adapter: BenchmarkAdapter) -> dict[str, object]:
+    metadata = getattr(adapter, "metadata", {})
+    if not isinstance(metadata, Mapping):
+        return {}
+    return dict(metadata)
+
+
+def benchmark_status_counts(results: Sequence[Mapping[str, object]]) -> dict[str, int]:
+    counts = {
+        BENCHMARK_STATUS_PASSED: 0,
+        BENCHMARK_STATUS_AGENT_FAILED: 0,
+        BENCHMARK_STATUS_INFRASTRUCTURE_FAILED: 0,
+    }
+    for result in results:
+        status = result.get("status")
+        if isinstance(status, str) and status in counts:
+            counts[status] += 1
+    counts["total"] = len(results)
+    return counts
+
+
+def string_metadata_value(metadata: Mapping[str, object], key: str) -> str:
+    value = metadata.get(key)
+    return value.strip() if isinstance(value, str) else ""

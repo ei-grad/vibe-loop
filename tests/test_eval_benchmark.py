@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from collections import Counter
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from collections.abc import Sequence
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe_loop.cli import main
 from vibe_loop.eval_benchmark import (
+    BENCHMARK_STATUS_AGENT_FAILED,
+    BENCHMARK_STATUS_INFRASTRUCTURE_FAILED,
     BenchmarkEvalConfig,
     BenchmarkGraderResult,
     BenchmarkInstance,
@@ -63,6 +67,43 @@ class StubAdapter:
 
 
 class BenchmarkEvalTests(unittest.TestCase):
+    def test_pinned_swe_rebench_v2_manifest_preserves_selection_contract(self) -> None:
+        manifest = (
+            Path(__file__).resolve().parents[1]
+            / "eval"
+            / "benchmarks"
+            / "swe-rebench-v2-smoke.json"
+        )
+        adapter = ManifestBenchmarkAdapter(manifest)
+        instances = adapter.list_instances()
+
+        self.assertEqual(adapter.version, "475dd5e8703bb5fb22dd3c60b5d038b019eba1e0")
+        self.assertEqual(len(instances), 24)
+        self.assertEqual(
+            Counter(instance.language for instance in instances),
+            Counter(
+                {
+                    "go": 4,
+                    "java": 4,
+                    "js": 4,
+                    "python": 4,
+                    "rust": 4,
+                    "ts": 4,
+                }
+            ),
+        )
+        self.assertTrue(adapter.metadata["non_leaderboard"])
+        for instance in instances:
+            self.assertTrue(instance.repo)
+            self.assertTrue(instance.image.startswith("docker.io/swerebenchv2/"))
+            self.assertTrue(instance.metadata["base_commit"])
+            self.assertGreaterEqual(instance.metadata["fail_to_pass_count"], 1)
+            confounders = instance.metadata["confounders"]
+            self.assertEqual(confounders["code"], "A")
+            self.assertEqual(confounders["intent_completeness"], "complete")
+            self.assertEqual(confounders["test_alignment_issues"], [])
+            self.assertFalse(any(confounders["detected_issues"].values()))
+
     def test_runs_paired_conditions_across_instances(self) -> None:
         instances = [
             BenchmarkInstance(
@@ -94,7 +135,7 @@ class BenchmarkEvalTests(unittest.TestCase):
             )
             payload = run_benchmark_eval(config)
 
-        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["schema_version"], 2)
         self.assertEqual(payload["adapter"], "stub-benchmark")
         self.assertEqual(payload["adapter_version"], "1.0.0")
         self.assertEqual(payload["instances_total"], 2)
@@ -137,6 +178,62 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(len(payload["results"]), 1)
         self.assertIn("no_skill", payload["conditions"])
         self.assertNotIn("with_skill", payload["conditions"])
+
+    def test_rejects_unknown_selectors_and_invalid_resource_limits(self) -> None:
+        adapter = StubAdapter(
+            [BenchmarkInstance(instance_id="known", dataset="d", split="s")]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = {
+                "adapter": adapter,
+                "output_root": root,
+                "agent_commands": {"known-condition": "true"},
+            }
+            invalid_configs = (
+                BenchmarkEvalConfig(**base, instances=("unknown",)),
+                BenchmarkEvalConfig(**base, conditions=("unknown",)),
+                BenchmarkEvalConfig(**base, trials=0),
+                BenchmarkEvalConfig(**base, timeout_seconds=0),
+            )
+            for config in invalid_configs:
+                with self.subTest(config=config), self.assertRaises(ValueError):
+                    run_benchmark_eval(config)
+
+    def test_selected_languages_match_selected_instances(self) -> None:
+        instances = [
+            BenchmarkInstance(
+                instance_id="python-task",
+                dataset="d",
+                split="s",
+                language="python",
+            ),
+            BenchmarkInstance(
+                instance_id="rust-task",
+                dataset="d",
+                split="s",
+                language="rust",
+            ),
+        ]
+
+        class MetadataAdapter(StubAdapter):
+            @property
+            def metadata(self):
+                return {"languages": ["python", "rust"]}
+
+        adapter = MetadataAdapter(instances, {"python-task": True})
+        with tempfile.TemporaryDirectory() as directory:
+            payload = run_benchmark_eval(
+                BenchmarkEvalConfig(
+                    adapter=adapter,
+                    output_root=Path(directory),
+                    agent_commands={"test": "true"},
+                    instances=("python-task",),
+                )
+            )
+
+        self.assertEqual(payload["languages"], ["python"])
+        self.assertEqual(payload["adapter_metadata"]["languages"], ["python"])
 
     def test_records_grader_provenance(self) -> None:
         instances = [
@@ -193,6 +290,12 @@ class BenchmarkEvalTests(unittest.TestCase):
         result = payload["results"][0]
         self.assertFalse(result["grader_result"]["passed"])
         self.assertIn("setup failed", result["grader_result"]["failure_reason"])
+        self.assertEqual(result["status"], BENCHMARK_STATUS_INFRASTRUCTURE_FAILED)
+        self.assertEqual(result["failure_phase"], "setup")
+        self.assertEqual(result["agent_status"], "not_run")
+        self.assertEqual(payload["summary"]["infrastructure_failed"], 1)
+        self.assertEqual(payload["conditions"]["test"]["agent_failures"], 0)
+        self.assertEqual(payload["conditions"]["test"]["infrastructure_failures"], 1)
 
     def test_multiple_trials(self) -> None:
         instances = [
@@ -273,6 +376,165 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertTrue(result["timeout"])
         self.assertIn("grader_result", result)
         self.assertFalse(result["grader_result"]["passed"])
+        self.assertEqual(result["status"], BENCHMARK_STATUS_AGENT_FAILED)
+        self.assertEqual(result["agent_status"], "timed_out")
+
+    def test_agent_command_failure_is_separate_from_infrastructure_failure(
+        self,
+    ) -> None:
+        instances = [BenchmarkInstance(instance_id="failed", dataset="d", split="s")]
+        adapter = StubAdapter(instances, {"failed": True})
+        with tempfile.TemporaryDirectory() as directory:
+            payload = run_benchmark_eval(
+                BenchmarkEvalConfig(
+                    adapter=adapter,
+                    output_root=Path(directory),
+                    agent_commands={"test": "exit 9"},
+                    trials=1,
+                    timeout_seconds=30,
+                )
+            )
+
+        result = payload["results"][0]
+        self.assertTrue(result["grader_result"]["passed"])
+        self.assertEqual(result["status"], BENCHMARK_STATUS_AGENT_FAILED)
+        self.assertEqual(result["agent_status"], "failed")
+        self.assertEqual(result["agent_exit_code"], 9)
+        self.assertEqual(payload["summary"]["agent_failed"], 1)
+        self.assertEqual(payload["summary"]["infrastructure_failed"], 0)
+
+    def test_grader_infrastructure_failure_remains_distinct_from_agent_exit(
+        self,
+    ) -> None:
+        class BrokenGraderAdapter(StubAdapter):
+            def grade_instance(self, instance, workdir):
+                raise RuntimeError("grader unavailable")
+
+        instances = [BenchmarkInstance(instance_id="failed", dataset="d", split="s")]
+        adapter = BrokenGraderAdapter(instances)
+        with tempfile.TemporaryDirectory() as directory:
+            payload = run_benchmark_eval(
+                BenchmarkEvalConfig(
+                    adapter=adapter,
+                    output_root=Path(directory),
+                    agent_commands={"test": "exit 9"},
+                    trials=1,
+                    timeout_seconds=30,
+                )
+            )
+
+        result = payload["results"][0]
+        self.assertEqual(result["status"], BENCHMARK_STATUS_INFRASTRUCTURE_FAILED)
+        self.assertEqual(result["failure_phase"], "grader")
+        self.assertEqual(result["agent_status"], "failed")
+        self.assertEqual(payload["summary"]["agent_failed"], 0)
+        self.assertEqual(payload["summary"]["infrastructure_failed"], 1)
+
+    def test_manifest_defaults_metadata_and_instance_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "benchmark.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "name": "environment-smoke",
+                        "version": "pinned-revision",
+                        "metadata": {
+                            "benchmark": "SWE-rebench V2 smoke",
+                            "dataset": "nebius/SWE-rebench-V2",
+                            "dataset_revision": "abc123",
+                            "split": "train",
+                            "languages": ["python"],
+                            "non_leaderboard": True,
+                        },
+                        "defaults": {
+                            "timeout_seconds": 30,
+                            "setup": {
+                                "command": (
+                                    'test "$VIBE_LOOP_BENCHMARK_INSTANCE_ID" = env-001 '
+                                    "&& touch setup.txt"
+                                )
+                            },
+                            "grader": {
+                                "name": "environment-grader",
+                                "provenance": "test fixture",
+                                "command": (
+                                    'test "$VIBE_LOOP_BENCHMARK_REPO" = example/project '
+                                    "&& test -f setup.txt && test -f agent.txt"
+                                ),
+                            },
+                        },
+                        "instances": [
+                            {
+                                "instance_id": "env-001",
+                                "dataset": "nebius/SWE-rebench-V2",
+                                "split": "train",
+                                "repo": "example/project",
+                                "language": "python",
+                                "image": "registry/example:pinned",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = run_benchmark_eval(
+                BenchmarkEvalConfig(
+                    adapter=ManifestBenchmarkAdapter(manifest),
+                    output_root=root / "out",
+                    agent_commands={
+                        "smoke": (
+                            'test "$VIBE_LOOP_BENCHMARK_LANGUAGE" = python '
+                            "&& touch agent.txt"
+                        )
+                    },
+                    trials=1,
+                    timeout_seconds=30,
+                )
+            )
+
+        self.assertEqual(payload["benchmark"], "SWE-rebench V2 smoke")
+        self.assertEqual(payload["dataset_revision"], "abc123")
+        self.assertEqual(payload["sample_size"], 1)
+        self.assertTrue(payload["non_leaderboard"])
+        self.assertEqual(payload["summary"]["passed"], 1)
+        self.assertEqual(payload["results"][0]["status"], "passed")
+
+    def test_manifest_infrastructure_exit_code_is_not_an_agent_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "benchmark.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "name": "infrastructure-exit",
+                        "defaults": {
+                            "grader": {
+                                "command": "exit 2",
+                                "infrastructure_exit_codes": [2],
+                            }
+                        },
+                        "instances": [
+                            {
+                                "instance_id": "task-1",
+                                "dataset": "fixture",
+                                "split": "smoke",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            payload = run_benchmark_eval(
+                BenchmarkEvalConfig(
+                    adapter=ManifestBenchmarkAdapter(manifest),
+                    output_root=root / "out",
+                    agent_commands={"test": "true"},
+                )
+            )
+
+        self.assertEqual(payload["summary"]["infrastructure_failed"], 1)
+        self.assertEqual(payload["summary"]["agent_failed"], 0)
 
     def test_manifest_adapter_runs_configured_smoke_instance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -394,6 +656,104 @@ class BenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(stderr.getvalue(), "")
         self.assertEqual(payload["adapter"], "manifest-cli-smoke")
         self.assertTrue(payload["results"][0]["grader_result"]["passed"])
+
+    def test_cli_records_missing_swe_rebench_prerequisites_as_infrastructure(
+        self,
+    ) -> None:
+        manifest = (
+            Path(__file__).resolve().parents[1]
+            / "eval"
+            / "benchmarks"
+            / "swe-rebench-v2-smoke.json"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+            with (
+                patch.dict(
+                    "os.environ",
+                    {
+                        "SWE_REBENCH_V2_HARNESS": "",
+                        "SWE_REBENCH_V2_TASKS_JSON": "",
+                    },
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main(
+                    [
+                        "eval",
+                        "benchmark",
+                        "--repo",
+                        str(root),
+                        "--output",
+                        str(root / "out"),
+                        "--adapter",
+                        "manifest",
+                        "--manifest",
+                        str(manifest),
+                        "--instance",
+                        "elastic__synthetics-316",
+                        "--agent-command",
+                        "smoke=true",
+                    ]
+                )
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["sample_size"], 1)
+        self.assertTrue(payload["non_leaderboard"])
+        self.assertEqual(payload["summary"]["infrastructure_failed"], 1)
+        self.assertEqual(payload["summary"]["agent_failed"], 0)
+        self.assertEqual(payload["results"][0]["failure_phase"], "setup")
+
+    def test_cli_rejects_unknown_benchmark_selector(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "benchmark.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "name": "selector-smoke",
+                        "instances": [
+                            {
+                                "instance_id": "known",
+                                "dataset": "fixture",
+                                "split": "smoke",
+                                "grader": {"command": "true"},
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "eval",
+                        "benchmark",
+                        "--repo",
+                        str(root),
+                        "--output",
+                        str(root / "out"),
+                        "--adapter",
+                        "manifest",
+                        "--manifest",
+                        str(manifest),
+                        "--instance",
+                        "unknown",
+                        "--agent-command",
+                        "smoke=true",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("unknown benchmark instances: unknown", stderr.getvalue())
 
 
 if __name__ == "__main__":

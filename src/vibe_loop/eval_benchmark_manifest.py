@@ -9,7 +9,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.eval_benchmark import BenchmarkGraderResult, BenchmarkInstance
+from vibe_loop.eval_benchmark import (
+    BenchmarkGraderResult,
+    BenchmarkInstance,
+    benchmark_instance_environment,
+)
 
 
 MANIFEST_ADAPTER_VERSION = "1.0.0"
@@ -23,6 +27,7 @@ class ManifestInstance:
     grader_command: str | None = None
     grader_name: str = "manifest-command"
     grader_provenance: str = ""
+    grader_infrastructure_exit_codes: tuple[int, ...] = ()
     timeout_seconds: int = 600
 
 
@@ -33,6 +38,7 @@ class ManifestBenchmarkAdapter:
         self._name = string_value(payload.get("name")) or "manifest"
         self._version = string_value(payload.get("version")) or MANIFEST_ADAPTER_VERSION
         self._harness = mapping_value(payload.get("harness"))
+        self._metadata = mapping_value(payload.get("metadata"))
         self._instances = tuple(parse_manifest_instances(payload, self.manifest_path))
 
     @property
@@ -42,6 +48,10 @@ class ManifestBenchmarkAdapter:
     @property
     def version(self) -> str:
         return self._version
+
+    @property
+    def metadata(self) -> Mapping[str, object]:
+        return dict(self._metadata)
 
     def list_instances(self) -> Sequence[BenchmarkInstance]:
         return [item.instance for item in self._instances]
@@ -60,6 +70,7 @@ class ManifestBenchmarkAdapter:
                 item.setup_command,
                 cwd=workdir,
                 shell=True,
+                env=self._command_environment(instance),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -86,6 +97,7 @@ class ManifestBenchmarkAdapter:
                 duration_seconds=0.0,
                 failure_reason="manifest instance has no grader_command",
                 metadata=self._grader_metadata(item),
+                infrastructure_failure=True,
             )
         start = time.monotonic()
         try:
@@ -93,6 +105,7 @@ class ManifestBenchmarkAdapter:
                 item.grader_command,
                 cwd=workdir,
                 shell=True,
+                env=self._command_environment(instance),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -111,6 +124,7 @@ class ManifestBenchmarkAdapter:
                 log=(exc.stdout or "") + (exc.stderr or ""),
                 failure_reason="grader timeout",
                 metadata=self._grader_metadata(item),
+                infrastructure_failure=True,
             )
         return BenchmarkGraderResult(
             instance_id=instance.instance_id,
@@ -121,6 +135,9 @@ class ManifestBenchmarkAdapter:
             log=f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             failure_reason="" if completed.returncode == 0 else "grader command failed",
             metadata=self._grader_metadata(item),
+            infrastructure_failure=(
+                completed.returncode in item.grader_infrastructure_exit_codes
+            ),
         )
 
     def teardown_instance(self, instance: BenchmarkInstance, workdir: Path) -> None:
@@ -139,6 +156,16 @@ class ManifestBenchmarkAdapter:
             "grader_provenance": item.grader_provenance,
             "grader_command_configured": item.grader_command is not None,
         }
+
+    def _command_environment(self, instance: BenchmarkInstance) -> dict[str, str]:
+        environment = benchmark_instance_environment(instance)
+        environment.update(
+            {
+                "VIBE_LOOP_BENCHMARK_MANIFEST": str(self.manifest_path),
+                "VIBE_LOOP_BENCHMARK_MANIFEST_DIR": str(self.manifest_path.parent),
+            }
+        )
+        return environment
 
 
 def load_manifest_payload(path: Path) -> Mapping[str, object]:
@@ -159,16 +186,24 @@ def parse_manifest_instances(
     if not isinstance(raw_instances, Sequence) or isinstance(raw_instances, str):
         raise ValueError("benchmark manifest requires an instances array")
     base = manifest_path.parent
+    defaults = mapping_value(payload.get("defaults"))
+    default_setup = mapping_value(defaults.get("setup"))
+    default_grader = mapping_value(defaults.get("grader"))
+    default_timeout = integer_value(defaults.get("timeout_seconds")) or 600
     parsed = []
+    instance_ids: set[str] = set()
     for index, raw in enumerate(raw_instances, start=1):
         table = mapping_value(raw)
         if not table:
             raise ValueError(f"benchmark manifest instance {index} must be an object")
         instance_id = required_string(table, "instance_id", index)
+        if instance_id in instance_ids:
+            raise ValueError(f"duplicate benchmark manifest instance_id: {instance_id}")
+        instance_ids.add(instance_id)
         dataset = required_string(table, "dataset", index)
         split = required_string(table, "split", index)
-        setup = mapping_value(table.get("setup"))
-        grader = mapping_value(table.get("grader"))
+        setup = merged_mapping(default_setup, mapping_value(table.get("setup")))
+        grader = merged_mapping(default_grader, mapping_value(table.get("grader")))
         parsed.append(
             ManifestInstance(
                 instance=BenchmarkInstance(
@@ -186,7 +221,11 @@ def parse_manifest_instances(
                 grader_command=optional_string(grader.get("command")),
                 grader_name=string_value(grader.get("name")) or "manifest-command",
                 grader_provenance=string_value(grader.get("provenance")),
-                timeout_seconds=integer_value(table.get("timeout_seconds")) or 600,
+                grader_infrastructure_exit_codes=integer_sequence(
+                    grader.get("infrastructure_exit_codes")
+                ),
+                timeout_seconds=integer_value(table.get("timeout_seconds"))
+                or default_timeout,
             )
         )
     return parsed
@@ -248,7 +287,27 @@ def integer_value(value: object) -> int | None:
     return value
 
 
+def integer_sequence(value: object) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError("benchmark manifest integer lists must be arrays")
+    parsed = []
+    for item in value:
+        parsed_item = integer_value(item)
+        if parsed_item is None:
+            raise ValueError("benchmark manifest integer lists cannot contain null")
+        parsed.append(parsed_item)
+    return tuple(parsed)
+
+
 def mapping_value(value: object) -> Mapping[str, Any]:
     if isinstance(value, Mapping):
         return value
     return {}
+
+
+def merged_mapping(
+    defaults: Mapping[str, Any], overrides: Mapping[str, Any]
+) -> Mapping[str, Any]:
+    return {**defaults, **overrides}

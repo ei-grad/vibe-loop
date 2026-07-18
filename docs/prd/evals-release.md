@@ -85,4 +85,4 @@ grader commands, image identifiers, and harness provenance. Public
 benchmark-specific adapters can be added later when their dataset terms,
 container requirements, and comparability rules are pinned.
 
-Related implementation IDs: `EVAL-04`, `EVAL-07`.
+Related implementation IDs: `EVAL-04`, `EVAL-07`, `EVAL-10`.

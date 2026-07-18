@@ -1137,7 +1137,11 @@ def dispatch_eval(args: argparse.Namespace, config) -> int:
             trials=args.trials,
             timeout_seconds=args.timeout,
         )
-        payload = run_benchmark_eval(bench_config)
+        try:
+            payload = run_benchmark_eval(bench_config)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         output_path = args.output / f"{adapter.name}-results.json"
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
