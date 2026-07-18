@@ -777,18 +777,13 @@ class VibeRunner:
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
         skill_prefix = agent.require_skill_ref_prefix()
-        if recovery is not None and resuming:
-            # Resumed session already holds the full task/skill context; a short
-            # continuation nudge is enough (and correct — a fresh skill
-            # invocation would fight the existing conversation).
-            worker_prompt = build_resume_continuation_prompt(recovery)
-        elif recovery is not None:
-            worker_prompt = (
-                f"{build_worker_prompt(skill_prefix, task, self.config)}\n\n"
-                f"{build_recovery_prompt_section(recovery)}"
-            )
-        else:
-            worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
+        worker_prompt = build_run_worker_prompt(
+            skill_prefix,
+            task,
+            self.config,
+            recovery=recovery,
+            resuming=resuming,
+        )
         validate_worker_prompt_delivery(command_template, task)
         command = format_agent_command(
             effective_template,
@@ -2312,31 +2307,73 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
     )
 
 
+def build_run_worker_prompt(
+    skill_prefix: str,
+    task: Task,
+    config: VibeConfig,
+    *,
+    recovery: RecoveryContext | None,
+    resuming: bool,
+) -> str:
+    if recovery is not None and resuming:
+        return append_worker_prompt_extension(
+            build_resume_continuation_prompt(recovery),
+            config,
+        )
+    if recovery is not None:
+        prompt = (
+            f"{build_worker_prompt(skill_prefix, task, config, include_repo_extension=False)}\n\n"
+            f"{build_recovery_prompt_section(recovery)}"
+        )
+        return append_worker_prompt_extension(prompt, config)
+    return build_worker_prompt(skill_prefix, task, config)
+
+
 def build_worker_prompt(
     skill_prefix: str,
     task: Task,
     config: VibeConfig | None = None,
+    *,
+    include_repo_extension: bool = True,
 ) -> str:
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
-    if not task.has_traceability:
+    if task.has_traceability:
+        prompt = (
+            f"{prompt}\n\n"
+            "### Normalized Task Traceability\n\n"
+            "This task includes optional traceability metadata from the task source:\n\n"
+            "```json\n"
+            f"{json.dumps(worker_traceability_json(task), indent=2, sort_keys=True)}\n"
+            "```\n"
+        )
+        if config is not None:
+            prompt = (
+                f"{prompt}\n\n"
+                "### Spec-Aware Worker Context\n\n"
+                "Bounded repo-local spec context for this task:\n\n"
+                "```json\n"
+                f"{json.dumps(build_spec_worker_context(config, task), indent=2, sort_keys=True)}\n"
+                "```\n"
+            )
+    if not include_repo_extension:
         return prompt
-    prompt = (
-        f"{prompt}\n\n"
-        "### Normalized Task Traceability\n\n"
-        "This task includes optional traceability metadata from the task source:\n\n"
-        "```json\n"
-        f"{json.dumps(worker_traceability_json(task), indent=2, sort_keys=True)}\n"
-        "```\n"
-    )
-    if config is None:
+    return append_worker_prompt_extension(prompt, config)
+
+
+def append_worker_prompt_extension(
+    prompt: str,
+    config: VibeConfig | None,
+) -> str:
+    if config is None or config.worker_prompt_extra is None:
         return prompt
     return (
         f"{prompt}\n\n"
-        "### Spec-Aware Worker Context\n\n"
-        "Bounded repo-local spec context for this task:\n\n"
-        "```json\n"
-        f"{json.dumps(build_spec_worker_context(config, task), indent=2, sort_keys=True)}\n"
-        "```\n"
+        "## Repository Worker Prompt Extension\n\n"
+        "The following repository-defined instructions from "
+        "`[agent].worker_prompt_extra` in `.vibe-loop.toml` OVERRIDE the "
+        "generic vibe-loop CLI coordination protocol above wherever they "
+        "conflict:\n\n"
+        f"{config.worker_prompt_extra}"
     )
 
 

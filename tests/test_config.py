@@ -420,6 +420,46 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "agent.forward_stderr"):
                 load_config(repo)
 
+    def test_agent_worker_prompt_extra_is_repo_wide_plain_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\n"
+                "worker_prompt_extra = '''Never merge to main.\n"
+                "Leave the reviewed branch for the orchestrator.'''\n"
+                "\n"
+                "[agent.profiles.claude]\n"
+                'kind = "claude"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(
+            config.worker_prompt_extra,
+            "Never merge to main.\nLeave the reviewed branch for the orchestrator.",
+        )
+
+    def test_agent_worker_prompt_extra_defaults_to_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        self.assertIsNone(config.worker_prompt_extra)
+
+    def test_agent_worker_prompt_extra_rejects_non_string_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\nworker_prompt_extra = true\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "agent.worker_prompt_extra must be a string",
+            ):
+                load_config(repo)
+
     def test_supervision_config_defaults_match_legacy_retry_behavior(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(Path(directory))

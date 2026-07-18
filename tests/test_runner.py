@@ -20,6 +20,7 @@ from unittest.mock import patch
 import vibe_loop.runner as runner_module
 from vibe_loop.config import (
     AgentConfig,
+    AgentRoutingRule,
     AgentResolutionError,
     CompletionConfig,
     SpecDiagnosticsConfig,
@@ -31,6 +32,7 @@ from vibe_loop.config import (
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
+    CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     AgentRuntimeContext,
     SchedulerLockBusy,
@@ -38,6 +40,7 @@ from vibe_loop.runner import (
     active_lock_conflict_domains,
     build_batch_selection_prompt,
     build_run_context_payload,
+    build_run_worker_prompt,
     build_selection_prompt,
     build_spec_worker_context,
     build_worker_prompt,
@@ -153,6 +156,116 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("LIVE-04", prompt)
         self.assertIn("recent log tail", prompt)
         self.assertIn("Active vibe-loop workers", prompt)
+
+    def test_worker_prompt_appends_repo_extension_for_both_dialects(self) -> None:
+        task = Task(task_id="POLICY-01", title="Respect repo policy", status="Next")
+        extension = (
+            "Never merge to main.\nLeave the reviewed branch for the orchestrator."
+        )
+        config = VibeConfig(repo=Path("."), worker_prompt_extra=extension)
+
+        for skill_prefix in ("$", "/"):
+            with self.subTest(skill_prefix=skill_prefix):
+                prompt = build_worker_prompt(skill_prefix, task, config)
+
+                self.assertTrue(prompt.startswith(f"{skill_prefix}vibe-loop POLICY-01"))
+                self.assertIn("## Repository Worker Prompt Extension", prompt)
+                self.assertIn(
+                    "OVERRIDE the generic vibe-loop CLI coordination protocol",
+                    prompt,
+                )
+                self.assertTrue(prompt.endswith(extension))
+                self.assertGreater(
+                    prompt.index("## Repository Worker Prompt Extension"),
+                    prompt.index("### Integration Locking"),
+                )
+
+    def test_worker_prompt_extension_applies_after_profile_routing(self) -> None:
+        extension = "Repository integration policy wins."
+        config = VibeConfig(
+            repo=Path("."),
+            agent=AgentConfig(skill_ref_prefix="$"),
+            agent_profiles={
+                "claude": AgentConfig(
+                    agent_kind="claude",
+                    prompt_dialect="claude",
+                    skill_ref_prefix="/",
+                )
+            },
+            agent_routing=(
+                AgentRoutingRule(
+                    profile="claude",
+                    match_task_id_regex="^CLAUDE-",
+                ),
+            ),
+            worker_prompt_extra=extension,
+        )
+
+        for task_id, expected_prefix, expected_profile in (
+            ("CODEX-01", "$", ""),
+            ("CLAUDE-01", "/", "claude"),
+        ):
+            with self.subTest(task_id=task_id):
+                task = Task(task_id=task_id, title="Routed task", status="Next")
+                selection = resolve_task_agent(config, task)
+                prompt = build_worker_prompt(
+                    selection.config.require_skill_ref_prefix(),
+                    task,
+                    config,
+                )
+
+                self.assertEqual(selection.profile, expected_profile)
+                self.assertTrue(prompt.startswith(f"{expected_prefix}vibe-loop"))
+                self.assertTrue(prompt.endswith(extension))
+
+    def test_worker_prompt_extension_is_last_for_recovery_prompts(self) -> None:
+        task = Task(task_id="POLICY-03", title="Recovery policy", status="Next")
+        extension = "Never integrate this branch."
+        config = VibeConfig(repo=Path("."), worker_prompt_extra=extension)
+        recovery = RecoveryContext(
+            task_id=task.task_id,
+            prior_run_id="run-1",
+            prior_classification="unknown",
+            branch="policy-03",
+            worktree="/tmp/policy-03",
+            head_commit="abc123",
+            transcript_path="/tmp/transcript.jsonl",
+            wrapper_log="/tmp/run-1.log",
+            attempt=1,
+            max_attempts=3,
+            workspace_claimed=True,
+            prior_session_id="session-1",
+        )
+
+        for resuming, branch_marker in (
+            (False, "## Unknown-Run Recovery"),
+            (True, "## Continue this run (resumed session)"),
+        ):
+            with self.subTest(resuming=resuming):
+                prompt = build_run_worker_prompt(
+                    "$",
+                    task,
+                    config,
+                    recovery=recovery,
+                    resuming=resuming,
+                )
+
+                self.assertIn(branch_marker, prompt)
+                self.assertGreater(
+                    prompt.index("## Repository Worker Prompt Extension"),
+                    prompt.index(branch_marker),
+                )
+                self.assertTrue(prompt.endswith(extension))
+
+    def test_worker_prompt_omits_repo_extension_when_unset(self) -> None:
+        task = Task(task_id="POLICY-02", title="Default policy", status="Next")
+        expected = f"$vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
+
+        for config in (None, VibeConfig(repo=Path("."))):
+            with self.subTest(config=config):
+                prompt = build_worker_prompt("$", task, config)
+
+                self.assertEqual(prompt, expected)
 
     def test_worker_prompt_includes_bounded_spec_context_and_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -514,6 +514,16 @@ kind = "claude"
 command = "CLAUDE_HOME=.claude claude -p {prompt}"
 selection_command = "CLAUDE_HOME=.claude claude -p {prompt}"
 
+# Appended to every worker prompt, after the generic CLI coordination protocol.
+worker_prompt_extra = '''
+Never merge to main or transition the task to done.
+Leave the reviewed branch for the repository orchestrator.
+'''
+```
+
+Custom launchers can select their worker prompt dialect independently:
+
+```toml
 [agent]
 kind = "custom"
 command = "my-worker --prompt {prompt}"
@@ -526,6 +536,14 @@ prompt_dialect = "claude"   # maps to /vibe-loop; "codex" maps to $vibe-loop
 configuration error, not an implicit Codex default. Legacy configs that set
 `agent.command` without `agent.kind` still run; set one of the dialect fields to
 clear the migration diagnostic.
+
+`agent.worker_prompt_extra` is a repository-wide, plain-text policy extension
+for generated worker prompts. It applies to Codex and Claude dialects, every
+agent profile, and recovery runs, but not to selection or read-only analysis
+prompts. The generated section states that these repository instructions
+override the generic CLI coordination protocol wherever they conflict. Keep the
+value non-secret because it is sent to worker sessions. When the setting is
+absent, generated prompts are unchanged.
 
 `agent.command` receives `{task_id}`, `{run_id}`, a shell-quoted `{prompt}`
 (skill reference, normalized task context, CLI addendum), and a shell-quoted
@@ -574,14 +592,16 @@ match_hazards_any = ["abi", "dma", "irq"]   # security-sensitive kernel hazards
 match_paths_glob = ["kernel/**"]            # optional extra constraint
 ```
 
-Each `[agent.profiles.<name>]` table takes the same fields as `[agent]` (`kind`,
-`model`, `command`, `selection_command`, `analysis_command`, dialect fields) and
-resolves through the same machinery. A profile with `kind = "claude"` and
-`model = "opus"` gets `claude -p --model {model} {prompt}` without an explicit
-command; omitting `model` preserves the bare `claude -p {prompt}` default. Codex
-uses `codex exec -m {model} {prompt}`. The top-level `[agent]` remains the
-default profile. With no profiles and no routing, behavior is identical to a
-single `[agent]`.
+Each `[agent.profiles.<name>]` table takes the agent-selection fields from
+`[agent]` (`kind`, `model`, `command`, `selection_command`, `analysis_command`,
+and dialect fields) and resolves through the same machinery.
+`worker_prompt_extra` remains top-level repository policy rather than a
+profile-specific field. A profile with `kind = "claude"` and `model = "opus"`
+gets `claude -p --model {model} {prompt}` without an explicit command; omitting
+`model` preserves the bare `claude -p {prompt}` default. Codex uses
+`codex exec -m {model} {prompt}`. The top-level `[agent]` remains the default
+profile. With no profiles and no routing, behavior is identical to a single
+`[agent]`.
 
 `[[agent.routing]]` is an ordered list. Each rule names a `profile` and one or
 more match predicates evaluated against the task; a rule matches when **all** of

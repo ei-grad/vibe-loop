@@ -692,6 +692,7 @@ class VibeConfig:
     )
     config_path: Path | None = None
     config_source: str = "default"
+    worker_prompt_extra: str | None = None
 
     @property
     def state_path(self) -> Path:
@@ -728,6 +729,10 @@ def load_config(repo: Path) -> VibeConfig:
         config_source=config_source,
         main_branch=str(data.get("main_branch") or "main"),
         state_dir=str(data.get("state_dir") or ".vibe-loop"),
+        worker_prompt_extra=optional_text(
+            agent_table.get("worker_prompt_extra"),
+            "agent.worker_prompt_extra",
+        ),
         agent=agent,
         agent_profiles=agent_profiles,
         agent_routing=agent_routing,
@@ -1677,6 +1682,16 @@ def optional_nonempty_string(value: object) -> str | None:
     if not text:
         return None
     return text
+
+
+def optional_text(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if not value:
+        return None
+    return value
 
 
 def optional_repo_relative_path(value: object, name: str) -> str | None:

@@ -83,10 +83,14 @@ authoritative executable templates. `command` receives `{prompt}`, `{model}`,
 template references it but neither task nor profile configuration resolves a
 model. Templates that omit `{model}` remain unchanged. The worker prompt is
 constructed from the selected skill reference syntax, the normalized task, and
-the runner's worker addendum; selection prompts do not use the worker skill
-reference syntax. A worker command for a task with traceability metadata must
-include `{prompt}`; task-id-only compatibility templates must fail clearly rather
-than silently dropping spec-aware worker context.
+the runner's worker addendum. An optional top-level
+`agent.worker_prompt_extra` plain-text value is appended to every generated
+worker prompt, independently of the selected agent profile, with explicit
+precedence over conflicting generic worker protocol. Selection and analysis
+prompts do not receive the extension or use the worker skill reference syntax.
+A worker command for a task with traceability metadata must include `{prompt}`;
+task-id-only compatibility templates must fail clearly rather than silently
+dropping spec-aware worker context.
 
 Acceptance must cover Codex-only, Claude-only, both-present, neither-present,
 explicit `kind`, explicit prompt dialect or skill prefix, explicit command
@@ -96,9 +100,12 @@ and without explicit prompt syntax, legacy unkinded explicit commands, worker
 interpolation, shell quoting, command-source diagnostics, prompt-dialect/source
 diagnostics, prompt-required diagnostics for traceable tasks, and clear failure
 when no supported agent command or required custom prompt syntax is available.
+Prompt extension acceptance must cover Codex and Claude dialects, routed agent
+profiles, recovery runs, explicit conflict precedence, and unchanged prompts
+when the setting is absent.
 
 Related implementation IDs: `AGENT-01`, `AGENT-02`, `AGENT-04`, `AGENT-05`,
-`AGENT-06`.
+`AGENT-06`, `vl-worker-prompt-extension`.
 
 ## PRD-CLI-005 Output And Logging Contract
 
