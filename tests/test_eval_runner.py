@@ -15,12 +15,40 @@ from vibe_loop.eval_runner import (
     build_aggregate,
     build_eval_prompt,
     render_aggregate_markdown,
+    write_task_source_evidence,
     workflow_taxonomy_labels,
 )
+from vibe_loop.eval_examples import materialize_eval_example
+from vibe_loop.config import load_config
 from vibe_loop.evals import EVAL_FAILURE_TAXONOMY
 
 
 class EvalRunnerCliTests(unittest.TestCase):
+    def test_task_source_evidence_uses_default_and_generated_runtime_resolution(
+        self,
+    ) -> None:
+        expected = {
+            "finite-py-plan-table": ("default_markdown_discovery", "FPY-01"),
+            "generated-roadmap-profile": ("generated_cache", "ROAD-02"),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case_id, (origin, task_id) in expected.items():
+                with self.subTest(case=case_id):
+                    repo = materialize_eval_example(case_id, root / case_id)
+                    artifact_root = root / f"{case_id}-artifacts"
+                    artifact_root.mkdir()
+
+                    write_task_source_evidence(artifact_root, load_config(repo))
+                    evidence = json.loads(
+                        (artifact_root / "task-source-evidence.json").read_text(
+                            encoding="utf-8"
+                        )
+                    )
+
+                    self.assertEqual(evidence["origin"], origin)
+                    self.assertEqual(evidence["selected_task"]["id"], task_id)
+
     def test_negative_case_passes_and_matches_golden_aggregate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -90,6 +118,77 @@ class EvalRunnerCliTests(unittest.TestCase):
         self.assertTrue(diff_exists)
         self.assertFalse(grader_spec_visible)
         self.assertFalse(grader_dir_visible)
+
+    def test_command_backend_case_uses_configured_lock_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agent = root / "command_hooks_agent.py"
+            write_command_hooks_agent(agent)
+
+            payload = run_eval(
+                root,
+                "--case",
+                "command-hooks-task-source",
+                "--condition",
+                "vibe_loop_cli",
+                "--agent-command",
+                f"vibe_loop_cli={agent}",
+            )
+            trial_root = (
+                root
+                / "eval-runs"
+                / "local-demo-v1"
+                / "cases"
+                / "command-hooks-task-source"
+                / "vibe_loop_cli"
+                / "trial-1"
+            )
+            lock_evidence = json.loads(
+                (trial_root / "lock-evidence.json").read_text(encoding="utf-8")
+            )
+            task_source_evidence = json.loads(
+                (trial_root / "task-source-evidence.json").read_text(encoding="utf-8")
+            )
+            hook_evidence = json.loads(
+                (trial_root / "hook-evidence.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(payload["conditions"]["vibe_loop_cli"]["pass_rate"], 1.0)
+        self.assertEqual(lock_evidence["before"]["task_id"], "HOOK-02")
+        self.assertEqual(lock_evidence["before"]["run_id"], "eval-run-command-hooks")
+        selected = task_source_evidence["selected_task"]
+        self.assertEqual(selected["id"], "HOOK-02")
+        self.assertEqual(selected["status"], "Planned")
+        self.assertEqual(
+            selected["requirement_ids"],
+            ["PRD-TSK-001", "PRD-TSK-003", "PRD-WRK-011"],
+        )
+        self.assertEqual(
+            [event["kind"] for event in hook_evidence["events"]],
+            ["completion", "worklog", "planning"],
+        )
+        self.assertEqual(
+            [
+                (result["kind"], result["index"], result["exit_code"])
+                for result in hook_evidence["results"]
+            ],
+            [
+                ("completion", 1, 0),
+                ("completion", 2, 0),
+                ("planning", 1, 0),
+            ],
+        )
+        encoded = json.dumps(
+            {
+                "locks": lock_evidence,
+                "tasks": task_source_evidence,
+                "hooks": hook_evidence,
+            }
+        )
+        self.assertNotIn("scripts/lock_adapter.py", encoded)
+        self.assertNotIn("scripts/task_adapter.py", encoded)
+        self.assertNotIn("scripts/completion_hook.py", encoded)
+        self.assertNotIn("scripts/planning_hook.py", encoded)
 
     def test_eval_command_refuses_nested_eval_worker(self) -> None:
         stdout = StringIO()
@@ -1117,6 +1216,59 @@ class EvalRunnerCliTests(unittest.TestCase):
             "cases/finite-py-plan-table/vibe_loop/trial-0",
         )
 
+    def test_prior_run_regression_records_redact_raw_hook_commands(self) -> None:
+        sentinel = "RAW_HOOK_COMMAND_MUST_NOT_LEAK"
+        records = load_skill_quality_records()
+        previous = {
+            "generated_at": "2026-05-08T00:00:00+00:00",
+            "skill_quality": {
+                "conditions": {
+                    "vibe_loop": {
+                        "pass_rate": 1.0,
+                        "task_score_mean": 1.0,
+                        "workflow_score_mean": 1.0,
+                        "trigger_score_mean": 1.0,
+                        "workflow_violation_rate": 0.0,
+                        "trigger_miss_rate": 0.0,
+                        "latency_seconds_mean": 1.0,
+                        "command_count_mean": 1.0,
+                        "records": [
+                            {
+                                "run_id": "prior-hook-run",
+                                "case_id": "command-hooks-task-source",
+                                "condition": "vibe_loop",
+                                "trial": 1,
+                                "artifact_root": "cases/prior-hook-run",
+                                "failure_taxonomy": [],
+                                "harness": {"command": sentinel},
+                                "task_source": {"list_command": sentinel},
+                                "locks": {"acquire_command": sentinel},
+                                "completion": {"commands": [sentinel]},
+                                "autopilot": {"planning_command": sentinel},
+                                "worklog": {"command": sentinel},
+                            }
+                        ],
+                    }
+                }
+            },
+        }
+
+        aggregate = build_aggregate(
+            [
+                TrialResult(record=record, artifact_root=Path("."), repo=Path("."))
+                for record in records
+            ],
+            output_root=Path("/tmp/eval-runs/local-demo-v1"),
+            previous_aggregate=previous,
+        )
+
+        encoded = json.dumps(aggregate)
+        self.assertNotIn(sentinel, encoded)
+        regression = aggregate["skill_quality"]["prior_run_regressions"][0]
+        previous_ref = regression["previous_records"][0]
+        self.assertEqual(previous_ref["run_id"], "prior-hook-run")
+        self.assertEqual(previous_ref["artifact_root"], "cases/prior-hook-run")
+
     def test_workflow_taxonomy_labels_are_derived_from_artifact_messages(self) -> None:
         self.assertEqual(
             workflow_taxonomy_labels(
@@ -1746,6 +1898,39 @@ def write_finite_agent(path: Path, *, pass_trial: bool) -> None:
         "        json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
         "    )\n"
         "print('finite agent finished')\n",
+    )
+
+
+def write_command_hooks_agent(path: Path) -> None:
+    write_python_executable(
+        path,
+        "import json\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "repo = Path(os.environ['VIBE_LOOP_EVAL_REPO'])\n"
+        "artifact = Path(os.environ['VIBE_LOOP_EVAL_ARTIFACT_DIR'])\n"
+        "tasks_path = repo / 'tasks.json'\n"
+        "payload = json.loads(tasks_path.read_text(encoding='utf-8'))\n"
+        "for task in payload['tasks']:\n"
+        "    if task['id'] == 'HOOK-02':\n"
+        "        task['status'] = 'Done'\n"
+        "tasks_path.write_text(json.dumps(payload, indent=2) + '\\n', encoding='utf-8')\n"
+        "story = repo / 'docs' / 'selected-story.md'\n"
+        "story.write_text('# HOOK-02\\n\\nRequirements: PRD-TSK-001, PRD-TSK-003, PRD-WRK-011\\n', encoding='utf-8')\n"
+        "events = [\n"
+        "    'skill_activated',\n"
+        "    'task_source_inspected',\n"
+        "    'task_lock_acquired',\n"
+        "    'branch_or_worktree_created',\n"
+        "    'verification_ran',\n"
+        "    'review_requested',\n"
+        "    'commit_created',\n"
+        "    'main_fast_forwarded',\n"
+        "]\n"
+        "(artifact / 'workflow-events.json').write_text(\n"
+        "    json.dumps({'events': events}) + '\\n', encoding='utf-8'\n"
+        ")\n"
+        "print('command hook agent finished')\n",
     )
 
 

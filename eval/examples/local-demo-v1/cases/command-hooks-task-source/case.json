@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "command-hooks-task-source",
+  "title": "Command-backed task and hook fixture",
+  "task_id": "HOOK-02",
+  "domain": "task_discovery",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli", "orchestrated_vibe_loop"],
+  "budget": {"timeout_seconds": 1500, "max_commands": 75, "max_output_bytes": 8388608, "network": false},
+  "expected_artifact_roles": ["prompt", "run_log", "transcript", "diff", "final_repo_state", "structured_result", "grader_outputs", "lock_evidence", "test_results", "workflow_events", "task_source_evidence", "hook_evidence"],
+  "task_source": {
+    "type": "command",
+    "list_command": "python scripts/task_adapter.py list",
+    "probe_command": "python scripts/task_adapter.py probe {task_id}",
+    "runnable_statuses": ["Planned"]
+  }
+}

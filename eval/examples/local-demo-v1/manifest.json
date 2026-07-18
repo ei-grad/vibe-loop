@@ -19,6 +19,31 @@
       "primary_coverage": ["generated task discovery", "profile cache reuse", "bounded evidence"]
     },
     {
+      "case_id": "explicit-list-profile",
+      "positive": true,
+      "primary_coverage": ["explicit task-source profile", "Markdown list parsing", "story metadata preservation"]
+    },
+    {
+      "case_id": "spec-kit-user-story",
+      "positive": true,
+      "primary_coverage": ["Spec Kit task source", "story metadata preservation"]
+    },
+    {
+      "case_id": "kiro-user-story",
+      "positive": true,
+      "primary_coverage": ["Kiro task source", "story metadata preservation"]
+    },
+    {
+      "case_id": "openspec-user-story",
+      "positive": true,
+      "primary_coverage": ["OpenSpec task source", "active story selection"]
+    },
+    {
+      "case_id": "command-hooks-task-source",
+      "positive": true,
+      "primary_coverage": ["command task source", "command lock backend", "completion and planning hooks", "task-source completion authority"]
+    },
+    {
       "case_id": "locked-task-selection",
       "positive": true,
       "primary_coverage": ["task locks", "safe task selection"]

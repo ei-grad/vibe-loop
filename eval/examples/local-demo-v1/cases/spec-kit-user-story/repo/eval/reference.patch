@@ -1,0 +1,14 @@
+diff --git a/specs/checkout/tasks.md b/specs/checkout/tasks.md
+--- a/specs/checkout/tasks.md
++++ b/specs/checkout/tasks.md
+@@ -10,1 +10,1 @@
+-- [ ] T002 [US1] Preserve checkout story metadata (depends on T001)
++- [x] T002 [US1] Preserve checkout story metadata (depends on T001)
+diff --git a/docs/selected-story.md b/docs/selected-story.md
+new file mode 100644
+--- /dev/null
++++ b/docs/selected-story.md
+@@ -0,0 +1,3 @@
++# checkout:T002
++
++Selected checkout story: preserve metadata from the Spec Kit task.

@@ -1,0 +1,14 @@
+diff --git a/.kiro/specs/session-refresh/tasks.md b/.kiro/specs/session-refresh/tasks.md
+--- a/.kiro/specs/session-refresh/tasks.md
++++ b/.kiro/specs/session-refresh/tasks.md
+@@ -7,1 +7,1 @@
+-- [ ] 2. Preserve the session refresh story (depends on 1)
++- [x] 2. Preserve the session refresh story (depends on 1)
+diff --git a/docs/selected-story.md b/docs/selected-story.md
+new file mode 100644
+--- /dev/null
++++ b/docs/selected-story.md
+@@ -0,0 +1,3 @@
++# session-refresh:2
++
++The repository constraint from the Kiro story is preserved.

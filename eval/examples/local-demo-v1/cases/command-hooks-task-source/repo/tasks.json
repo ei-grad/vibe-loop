@@ -1,0 +1,38 @@
+{
+  "tasks": [
+    {
+      "id": "HOOK-01",
+      "title": "Establish command adapter state",
+      "status": "Done",
+      "dependencies": [],
+      "scope": "Provide a deterministic command-backed task ledger.",
+      "acceptance": "The predecessor is complete.",
+      "evidence": "tasks.json"
+    },
+    {
+      "id": "HOOK-02",
+      "title": "Preserve command-backed story metadata",
+      "status": "Planned",
+      "priority": "P0",
+      "dependencies": ["HOOK-01"],
+      "resources": ["task-ledger"],
+      "paths": ["tasks.json", "docs/selected-story.md"],
+      "scope": "Record the selected command-backed story before completing its authoritative task record.",
+      "acceptance": "The task ledger is Done and the result preserves its traceability metadata.",
+      "evidence": "python -m unittest discover",
+      "requirement_ids": ["PRD-TSK-001", "PRD-TSK-003", "PRD-WRK-011"],
+      "spec_paths": ["docs/command-story.md"],
+      "design_refs": ["command-hooks"],
+      "approval_state": "approved"
+    },
+    {
+      "id": "HOOK-03",
+      "title": "Dependent follow-up",
+      "status": "Planned",
+      "dependencies": ["HOOK-02"],
+      "scope": "Remain untouched during HOOK-02.",
+      "acceptance": "The task remains planned.",
+      "evidence": "tasks.json"
+    }
+  ]
+}

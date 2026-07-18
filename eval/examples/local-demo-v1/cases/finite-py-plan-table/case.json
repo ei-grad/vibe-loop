@@ -25,7 +25,8 @@
     "git_state_before",
     "git_state_after",
     "test_results",
-    "workflow_events"
+    "workflow_events",
+    "task_source_evidence"
   ],
   "task_source": {
     "type": "markdown-plan",

@@ -16,8 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from vibe_loop.config import prepare_shell_command, shell_quote
-from vibe_loop.locks import LockManager
+from vibe_loop.config import VibeConfig, load_config, prepare_shell_command, shell_quote
+from vibe_loop.locks import LockManager, build_lock_manager
 
 from vibe_loop.eval_examples import (
     EXAMPLE_SUITE_ID,
@@ -30,6 +30,7 @@ from vibe_loop.eval_reporting import (
     build_skill_quality_report,
     render_skill_quality_markdown,
 )
+from vibe_loop.generated_profiles import resolve_runtime_task_source
 from vibe_loop.evals import (
     CLI_CONDITIONS,
     EVAL_CONDITIONS,
@@ -44,6 +45,7 @@ from vibe_loop.evals import (
     validate_skill_eval_run_record,
 )
 from vibe_loop.runs import RunStore, WORKER_REPORT_STATUSES
+from vibe_loop.tasks import build_task_source, runnable_tasks
 from vibe_loop.workers import build_worker_views
 
 
@@ -73,6 +75,8 @@ ROLE_PATHS = {
     "budget_evidence": "budget-evidence.json",
     "negative_prompt_results": "negative-prompt-results.json",
     "command_results": "command-results.json",
+    "task_source_evidence": "task-source-evidence.json",
+    "hook_evidence": "hook-evidence.json",
 }
 UNSAFE_COMMAND_FRAGMENTS = (
     "git reset --hard",
@@ -437,7 +441,15 @@ def run_trial(
     write_text_artifact(trial_root, "prompt", prompt_text)
     git_before = collect_git_state(repo)
     write_json_artifact(trial_root, "git_state_before", git_before)
-    lock_before = collect_lock_state(repo, case.task_id)
+    repo_config = load_config(repo)
+    lock_manager = build_lock_manager(
+        repo,
+        repo_config.state_path / "locks",
+        repo_config.locks,
+    )
+    if "task_source_evidence" in case.expected_artifact_roles:
+        write_task_source_evidence(trial_root, repo_config)
+    lock_before = collect_lock_state(lock_manager, case.task_id)
     run_id = seeded_run_id(lock_before) or (
         f"{EXAMPLE_SUITE_ID}-{case.case_id}-{condition}-trial-{trial}"
     )
@@ -457,12 +469,22 @@ def run_trial(
     )
     execution = agent_batch.execution
     command = execution.command
+    hook_results: list[dict[str, object]] = []
+    if "hook_evidence" in case.expected_artifact_roles:
+        hook_results = run_configured_fixture_hooks(repo_config, budgets)
     write_run_log(trial_root, case, condition, run_id, execution)
     write_transcript_if_missing(trial_root, execution)
     git_after = collect_git_state(repo)
     write_json_artifact(trial_root, "git_state_after", git_after)
     write_text_artifact(trial_root, "diff", fixture_diff(repo, git_before))
     deterministic = deterministic_grader_output(repo, grader_repo=case.repo_path)
+    if "hook_evidence" in case.expected_artifact_roles:
+        write_hook_evidence(
+            trial_root,
+            repo,
+            repo_config,
+            hook_results=hook_results,
+        )
     transcript_graders = run_transcript_graders(
         config.transcript_graders,
         repo=repo,
@@ -497,11 +519,16 @@ def run_trial(
             extra_events=agent_batch.workflow_events,
         )
     write_json_artifact(trial_root, "workflow_events", {"events": workflow_events})
-    lock_after = collect_lock_state(repo, case.task_id)
-    write_lock_evidence(trial_root, lock_before, lock_after, repo=repo)
+    lock_after = collect_lock_state(lock_manager, case.task_id)
+    write_lock_evidence(
+        trial_root,
+        lock_before,
+        lock_after,
+        lock_manager=lock_manager,
+    )
     latest_report = latest_worker_report(repo, case.task_id)
     write_report_evidence(trial_root, latest_report)
-    write_workspace_evidence(trial_root, repo)
+    write_workspace_evidence(trial_root, repo, lock_manager=lock_manager)
     write_generated_profile_artifact(trial_root, repo)
     write_missing_case_role_artifacts(trial_root, case, deterministic, execution)
     command_results = list(agent_batch.command_results) + [
@@ -2370,11 +2397,104 @@ def local_branch_heads(repo: Path) -> dict[str, str]:
     return heads
 
 
-def collect_lock_state(repo: Path, task_id: str | None) -> dict[str, object]:
+def write_task_source_evidence(artifact_root: Path, config: VibeConfig) -> None:
+    resolution = resolve_runtime_task_source(config)
+    source = build_task_source(config.repo, resolution.task_source)
+    tasks = source.list_tasks()
+    runnable = runnable_tasks(source, resolution.task_source.runnable_statuses)
+    write_json_artifact(
+        artifact_root,
+        "task_source_evidence",
+        {
+            "origin": resolution.origin,
+            "backend_type": resolution.task_source.type,
+            "task_ids": [task.task_id for task in tasks],
+            "runnable_task_ids": [task.task_id for task in runnable],
+            "selected_task": runnable[0].to_json() if runnable else None,
+            "tasks": [task.to_json() for task in tasks],
+        },
+    )
+
+
+def run_configured_fixture_hooks(
+    config: VibeConfig,
+    budgets: Mapping[str, int],
+) -> list[dict[str, object]]:
+    commands = [
+        ("completion", index, command)
+        for index, command in enumerate(config.completion.commands, start=1)
+    ]
+    if config.autopilot.planning_command:
+        commands.append(("planning", 1, config.autopilot.planning_command))
+    results: list[dict[str, object]] = []
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    for kind, index, command in commands:
+        _stdout, _stderr, exit_code, timeout, truncated = run_process_with_budgets(
+            command,
+            cwd=config.repo,
+            env=env,
+            timeout_seconds=min(30, budgets["timeout_seconds"]),
+            max_output_bytes=min(65536, budgets["max_output_bytes"]),
+        )
+        results.append(
+            {
+                "kind": kind,
+                "index": index,
+                "exit_code": exit_code,
+                "timeout": timeout,
+                "output_truncated": truncated,
+            }
+        )
+    return results
+
+
+def write_hook_evidence(
+    artifact_root: Path,
+    repo: Path,
+    config: VibeConfig,
+    *,
+    hook_results: Sequence[Mapping[str, object]],
+) -> None:
+    events_path = repo / ".vibe-loop" / "hook-events.jsonl"
+    events: list[dict[str, object]] = []
+    if events_path.is_file():
+        for line in events_path.read_text(
+            encoding="utf-8", errors="replace"
+        ).splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                events.append(
+                    {
+                        "kind": event.get("kind")
+                        if isinstance(event.get("kind"), str)
+                        else "",
+                        "task_id": event.get("task_id")
+                        if isinstance(event.get("task_id"), str)
+                        else "",
+                    }
+                )
+    write_json_artifact(
+        artifact_root,
+        "hook_evidence",
+        {
+            "completion_commands_configured": len(config.completion.commands),
+            "planning_command_configured": bool(config.autopilot.planning_command),
+            "results": [dict(result) for result in hook_results],
+            "events": events,
+        },
+    )
+
+
+def collect_lock_state(
+    lock_manager: LockManager, task_id: str | None
+) -> dict[str, object]:
     if not task_id:
         return {}
-    lock_path = repo / ".vibe-loop" / "locks" / f"{task_id}.lock" / "lock.json"
-    payload = load_json(lock_path)
+    payload = lock_manager.status(task_id)
     return dict(payload) if isinstance(payload, Mapping) else {}
 
 
@@ -2388,13 +2508,13 @@ def write_lock_evidence(
     before: Mapping[str, object],
     after: Mapping[str, object],
     *,
-    repo: Path,
+    lock_manager: LockManager,
 ) -> None:
     existing = load_json(artifact_path(artifact_root, "lock_evidence"))
     evidence = dict(existing) if isinstance(existing, Mapping) else {}
     evidence["before"] = dict(before)
     evidence["after"] = dict(after)
-    evidence["main_integration_status"] = main_integration_status(repo)
+    evidence["main_integration_status"] = main_integration_status(lock_manager)
     write_json_artifact(artifact_root, "lock_evidence", evidence)
 
 
@@ -2435,15 +2555,18 @@ def worker_report_status(report: Mapping[str, object] | None) -> str | None:
     return status if status in WORKER_REPORT_STATUSES else None
 
 
-def main_integration_status(repo: Path) -> dict[str, object]:
-    manager = LockManager(repo / ".vibe-loop" / "locks")
-    return manager.main_integration_status().to_json()
+def main_integration_status(lock_manager: LockManager) -> dict[str, object]:
+    return lock_manager.main_integration_status().to_json()
 
 
-def write_workspace_evidence(artifact_root: Path, repo: Path) -> None:
-    manager = LockManager(repo / ".vibe-loop" / "locks")
+def write_workspace_evidence(
+    artifact_root: Path,
+    repo: Path,
+    *,
+    lock_manager: LockManager,
+) -> None:
     run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
-    views = build_worker_views(manager, run_store, repo=repo)
+    views = build_worker_views(lock_manager, run_store, repo=repo)
     workers = [view.to_json() for view in views]
     by_task: dict[str, object] = {}
     for worker in workers:

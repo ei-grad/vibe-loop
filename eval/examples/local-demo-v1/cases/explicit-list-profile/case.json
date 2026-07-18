@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "explicit-list-profile",
+  "title": "Explicit Markdown list profile fixture",
+  "task_id": "LIST-02",
+  "domain": "task_discovery",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli", "orchestrated_vibe_loop"],
+  "budget": {
+    "timeout_seconds": 1200,
+    "max_commands": 60,
+    "max_output_bytes": 5242880,
+    "network": false
+  },
+  "expected_artifact_roles": [
+    "prompt", "run_log", "transcript", "diff", "final_repo_state",
+    "structured_result", "grader_outputs", "test_results", "workflow_events", "task_source_evidence"
+  ],
+  "task_source": {
+    "type": "markdown-profile",
+    "profile": {
+      "kind": "markdown_list",
+      "source_paths": ["WORK.md"],
+      "stable_ids": true,
+      "fields": {
+        "id": {"pattern": "^(?P<id>LIST-[0-9]+)\\b", "strategy": "heading_text"},
+        "title": {"pattern": "^LIST-[0-9]+\\s+(?P<title>.+)$", "strategy": "heading_text"},
+        "status": {"strategy": "checkbox_status"},
+        "dependencies": {"label": "Dependencies", "none_values": ["none"]},
+        "scope": {"label": "Scope"},
+        "acceptance": {"label": "Acceptance"},
+        "evidence": {"label": "Evidence"},
+        "requirement_ids": {"label": "Requirements", "none_values": ["none"]}
+      },
+      "status_map": {
+        "done": ["Done"],
+        "runnable": ["Planned"],
+        "blocked": ["Blocked"]
+      }
+    },
+    "runnable_statuses": ["Planned"]
+  }
+}

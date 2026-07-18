@@ -17,7 +17,7 @@ from vibe_loop.evals import (
     path_diagnostics,
     validate_skill_eval_run_record,
 )
-from vibe_loop.tasks import build_task_source
+from vibe_loop.tasks import build_task_source, runnable_tasks
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -228,18 +228,59 @@ def task_source_parse(
     config = TaskSourceConfig(
         type=str(config_payload.get("type", "markdown-plan")),
         plan_path=config_payload.get("plan_path"),
+        plan_paths=tuple(string_list(config_payload.get("plan_paths")))
+        or TaskSourceConfig().plan_paths,
         profile=config_payload.get("profile"),
+        list_command=optional_string(config_payload.get("list_command")),
+        probe_command=optional_string(config_payload.get("probe_command")),
         runnable_statuses=tuple(runnable_statuses)
         if runnable_statuses
         else TaskSourceConfig().runnable_statuses,
     )
-    tasks = build_task_source(repo, config).list_tasks()
+    source = build_task_source(repo, config)
+    tasks = source.list_tasks()
     expected_ids = string_list(check.get("task_ids"))
     actual_ids = [task.task_id for task in tasks]
     if actual_ids != expected_ids:
         return failed(
             check_id, f"task ids are {actual_ids!r}, expected {expected_ids!r}"
         )
+    expected_tasks = check.get("tasks")
+    if expected_tasks is not None:
+        if not isinstance(expected_tasks, Sequence) or isinstance(
+            expected_tasks, (str, bytes)
+        ):
+            return failed(check_id, "tasks must be an array")
+        by_id = {task.task_id: task.to_json() for task in tasks}
+        for expected_task in expected_tasks:
+            if not isinstance(expected_task, Mapping):
+                return failed(check_id, "task expectations must be objects")
+            task_id = expected_task.get("id")
+            if not isinstance(task_id, str) or task_id not in by_id:
+                return failed(check_id, f"expected task is missing: {task_id!r}")
+            actual = by_id[task_id]
+            for field, expected_value in expected_task.items():
+                if actual.get(field) != expected_value:
+                    return failed(
+                        check_id,
+                        f"{task_id}.{field} is {actual.get(field)!r}, "
+                        f"expected {expected_value!r}",
+                    )
+    expected_runnable = check.get("runnable_task_ids")
+    if expected_runnable is not None:
+        if not isinstance(expected_runnable, Sequence) or isinstance(
+            expected_runnable, (str, bytes)
+        ):
+            return failed(check_id, "runnable_task_ids must be an array")
+        actual_runnable = [
+            task.task_id for task in runnable_tasks(source, config.runnable_statuses)
+        ]
+        if actual_runnable != list(expected_runnable):
+            return failed(
+                check_id,
+                f"runnable task ids are {actual_runnable!r}, "
+                f"expected {list(expected_runnable)!r}",
+            )
     return passed(check_id)
 
 
@@ -366,9 +407,90 @@ def run_artifact_checks(
         artifact_orchestrated_delegation(artifact_root, record, spec),
         artifact_case_contract(repo, artifact_root, spec),
     ]
+    required_roles = set(string_list(case.get("expected_artifact_roles")))
+    if "task_source_evidence" in required_roles:
+        checks.append(artifact_task_source_evidence(artifact_root, record, case))
+    if "hook_evidence" in required_roles:
+        checks.append(artifact_hook_evidence(artifact_root, record))
     if spec.get("negative_prompts") is not None:
         checks.append(artifact_negative_prompt_results(artifact_root, record, spec))
     return checks
+
+
+def artifact_task_source_evidence(
+    artifact_root: Path,
+    record: Mapping[str, Any],
+    case: Mapping[str, Any],
+) -> dict[str, object]:
+    path = artifact_path_for_role(artifact_root, record, "task_source_evidence")
+    payload = safe_load_json(path) if path is not None else None
+    if not isinstance(payload, Mapping):
+        return failed("artifact-task-source-evidence", "evidence must be an object")
+    selected = payload.get("selected_task")
+    if not isinstance(selected, Mapping):
+        return failed("artifact-task-source-evidence", "selected_task is required")
+    task_id = case.get("task_id")
+    if selected.get("id") != task_id:
+        return failed(
+            "artifact-task-source-evidence",
+            f"selected task is {selected.get('id')!r}, expected {task_id!r}",
+        )
+    for field in ("title", "acceptance"):
+        if not isinstance(selected.get(field), str) or not selected[field]:
+            return failed(
+                "artifact-task-source-evidence",
+                f"selected_task.{field} is required",
+            )
+    if task_id not in string_list(payload.get("runnable_task_ids")):
+        return failed(
+            "artifact-task-source-evidence",
+            "selected task is missing from pre-run runnable task IDs",
+        )
+    expected_origins = {
+        "finite-py-plan-table": "default_markdown_discovery",
+        "generated-roadmap-profile": "generated_cache",
+    }
+    expected_origin = expected_origins.get(str(case.get("case_id")))
+    if expected_origin is not None and payload.get("origin") != expected_origin:
+        return failed(
+            "artifact-task-source-evidence",
+            f"task source origin is {payload.get('origin')!r}, "
+            f"expected {expected_origin!r}",
+        )
+    return passed("artifact-task-source-evidence")
+
+
+def artifact_hook_evidence(
+    artifact_root: Path,
+    record: Mapping[str, Any],
+) -> dict[str, object]:
+    path = artifact_path_for_role(artifact_root, record, "hook_evidence")
+    payload = safe_load_json(path) if path is not None else None
+    if not isinstance(payload, Mapping):
+        return failed("artifact-hook-evidence", "evidence must be an object")
+    if payload.get("completion_commands_configured") != 2:
+        return failed(
+            "artifact-hook-evidence", "two completion commands must be configured"
+        )
+    if payload.get("planning_command_configured") is not True:
+        return failed("artifact-hook-evidence", "planning command must be configured")
+    events = list_of_mappings(payload.get("events"))
+    kinds = [event.get("kind") for event in events]
+    for kind in ("completion", "worklog", "planning"):
+        if kind not in kinds:
+            return failed("artifact-hook-evidence", f"hook event is missing: {kind}")
+    results = list_of_mappings(payload.get("results"))
+    if [(item.get("kind"), item.get("index")) for item in results] != [
+        ("completion", 1),
+        ("completion", 2),
+        ("planning", 1),
+    ]:
+        return failed(
+            "artifact-hook-evidence", "configured hook results are incomplete"
+        )
+    if any(item.get("exit_code") != 0 for item in results):
+        return failed("artifact-hook-evidence", "a configured hook failed")
+    return passed("artifact-hook-evidence")
 
 
 def artifact_identity(
@@ -861,6 +983,10 @@ def string_list(value: object) -> list[str]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return []
     return [item for item in value if isinstance(item, str)]
+
+
+def optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def list_of_mappings(value: object) -> list[Mapping[str, Any]]:

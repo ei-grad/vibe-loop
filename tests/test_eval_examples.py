@@ -11,7 +11,7 @@ from io import StringIO
 from pathlib import Path
 
 from vibe_loop.cli import main
-from vibe_loop.config import TaskSourceConfig
+from vibe_loop.config import TaskSourceConfig, load_config
 from vibe_loop.evals import EvalArtifactRef, EvalSourceFingerprint, SkillEvalRunRecord
 from vibe_loop.eval_examples import (
     EXAMPLE_SUITE_ID,
@@ -21,23 +21,34 @@ from vibe_loop.eval_examples import (
     run_eval_example_grader,
     teardown_eval_example,
 )
-from vibe_loop.locks import LockManager
+from vibe_loop.locks import (
+    LockBusy,
+    LockFencingMismatch,
+    LockManager,
+    TaskLock,
+    build_lock_manager,
+)
 from vibe_loop.runs import RunStore
 from vibe_loop.tasks import build_task_source, runnable_tasks
 from vibe_loop.workers import build_worker_views
 
 
 EXPECTED_CASE_IDS = {
+    "command-hooks-task-source",
     "dirty-main-worktree",
+    "explicit-list-profile",
     "finite-py-plan-table",
     "generated-roadmap-profile",
+    "kiro-user-story",
     "locked-task-selection",
     "integration-lock-unavailable",
     "main-advanced-before-merge",
     "main-integration-lock",
     "negative-trigger-set",
+    "openspec-user-story",
     "review-remediation",
     "supervised-worker-report",
+    "spec-kit-user-story",
     "workspace-duplicate-worktree",
     "workspace-foreign-dirty",
     "workspace-merged-branch",
@@ -345,6 +356,119 @@ class EvalExampleTests(unittest.TestCase):
         self.assertEqual(cache["status"], "profile")
         self.assertEqual(cache["source_fingerprints"][0]["path"], "docs/roadmap.md")
         self.assertEqual([task.task_id for task in tasks], ["ROAD-01", "ROAD-02"])
+
+    def test_release_user_story_sources_select_expected_runnable_task(self) -> None:
+        expected = {
+            "explicit-list-profile": ("LIST-02", ("PRD-TSK-001", "PRD-TSK-002")),
+            "spec-kit-user-story": ("checkout:T002", ()),
+            "kiro-user-story": ("session-refresh:2", ()),
+            "openspec-user-story": ("checkout-mutation:1.2", ()),
+            "command-hooks-task-source": (
+                "HOOK-02",
+                ("PRD-TSK-001", "PRD-TSK-003", "PRD-WRK-011"),
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for case_id, (task_id, requirement_ids) in expected.items():
+                with self.subTest(case=case_id):
+                    repo = materialize_eval_example(case_id, root / case_id)
+                    config = load_config(repo)
+                    source = build_task_source(repo, config.task_source)
+
+                    selected = runnable_tasks(
+                        source, config.task_source.runnable_statuses
+                    )
+
+                    self.assertEqual([task.task_id for task in selected], [task_id])
+                    task = selected[0]
+                    self.assertTrue(task.title)
+                    self.assertTrue(task.acceptance)
+                    self.assertTrue(task.evidence)
+                    self.assertEqual(task.requirement_ids, requirement_ids)
+
+    def test_command_story_hooks_require_authoritative_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = materialize_eval_example(
+                "command-hooks-task-source",
+                Path(directory) / "command-hooks",
+                include_reference_patch=True,
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            seeded = manager.status("HOOK-02")
+            with self.assertRaises(LockBusy):
+                manager.acquire("HOOK-02", "second-run")
+            preserved = manager.status("HOOK-02")
+            lock = manager.acquire("HOOK-02", "eval-run-command-hooks")
+            locked = manager.status("HOOK-02")
+            listed = manager.list_locks()
+            stale_lock = TaskLock(
+                task_id=lock.task_id,
+                path=lock.path,
+                metadata={**lock.metadata, "fencing_token": "stale"},
+            )
+            with self.assertRaises(LockFencingMismatch):
+                manager.release(stale_lock)
+            preserved_after_stale_release = manager.status("HOOK-02")
+            completion_before = [
+                subprocess.run(
+                    command,
+                    cwd=repo,
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                for command in config.completion.commands
+            ]
+            planning_command = config.autopilot.planning_command
+            if planning_command is None:
+                self.fail("planning command is not configured")
+            planning = subprocess.run(
+                planning_command,
+                cwd=repo,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            initial_result = run_eval_example_grader(repo)
+
+            apply_reference_patch(repo)
+            completion_after = [
+                subprocess.run(
+                    command,
+                    cwd=repo,
+                    shell=True,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                for command in config.completion.commands
+            ]
+            manager.release(lock)
+            released = manager.status("HOOK-02")
+            result = run_eval_example_grader(repo)
+
+        self.assertEqual(seeded["run_id"], "eval-run-command-hooks")
+        self.assertEqual(preserved["run_id"], "eval-run-command-hooks")
+        self.assertEqual(
+            preserved_after_stale_release["fencing_token"],
+            lock.metadata["fencing_token"],
+        )
+        self.assertIsNotNone(locked)
+        self.assertEqual([item["task_id"] for item in listed], ["HOOK-02"])
+        self.assertTrue(all(result.returncode != 0 for result in completion_before))
+        self.assertEqual(planning.returncode, 0)
+        self.assertFalse(initial_result.passed)
+        self.assertTrue(all(result.returncode == 0 for result in completion_after))
+        self.assertIsNone(released)
+        self.assertTrue(result.passed, result.stdout + result.stderr)
 
     def test_generated_cache_rejects_unsafe_source_fingerprint_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -731,7 +855,7 @@ def write_artifact_bundle(
     root.mkdir()
     artifacts: list[EvalArtifactRef] = []
     for role in case.expected_artifact_roles:
-        content = artifact_content(role, workflow_events)
+        content = artifact_content(role, workflow_events, case=case)
         relative_path = artifact_path(role)
         path = root / relative_path
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -824,9 +948,34 @@ def artifact_path(role: str) -> str:
     return paths.get(role, f"{role}.json")
 
 
-def artifact_content(role: str, workflow_events: list[str]) -> str:
+def artifact_content(
+    role: str,
+    workflow_events: list[str],
+    *,
+    case: EvalExampleCase,
+) -> str:
     if role == "workflow_events":
         return json.dumps({"events": workflow_events}, sort_keys=True) + "\n"
+    if role == "task_source_evidence":
+        origin = {
+            "finite-py-plan-table": "default_markdown_discovery",
+            "generated-roadmap-profile": "generated_cache",
+        }.get(case.case_id, "explicit_config")
+        return (
+            json.dumps(
+                {
+                    "origin": origin,
+                    "runnable_task_ids": [case.task_id],
+                    "selected_task": {
+                        "id": case.task_id,
+                        "title": case.title,
+                        "acceptance": "fixture acceptance",
+                    },
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
     if role == "transcript":
         return "{}\n"
     if role == "diff":

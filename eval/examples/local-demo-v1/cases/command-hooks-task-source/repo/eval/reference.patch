@@ -1,0 +1,14 @@
+diff --git a/tasks.json b/tasks.json
+--- a/tasks.json
++++ b/tasks.json
+@@ -14,1 +14,1 @@
+-      "status": "Planned",
++      "status": "Done",
+diff --git a/docs/selected-story.md b/docs/selected-story.md
+new file mode 100644
+--- /dev/null
++++ b/docs/selected-story.md
+@@ -0,0 +1,3 @@
++# HOOK-02
++
++Requirements: PRD-TSK-001, PRD-TSK-003, PRD-WRK-011

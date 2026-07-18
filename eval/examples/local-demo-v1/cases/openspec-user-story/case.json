@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "suite_id": "local-demo-v1",
+  "case_id": "openspec-user-story",
+  "title": "OpenSpec user-story fixture",
+  "task_id": "checkout-mutation:1.2",
+  "domain": "task_discovery",
+  "positive": true,
+  "prompt_paths": ["eval/prompt.txt"],
+  "conditions": ["no_skill", "vibe_loop", "vibe_loop_cli", "orchestrated_vibe_loop"],
+  "budget": {"timeout_seconds": 1200, "max_commands": 60, "max_output_bytes": 5242880, "network": false},
+  "expected_artifact_roles": ["prompt", "run_log", "transcript", "diff", "final_repo_state", "structured_result", "grader_outputs", "test_results", "workflow_events", "task_source_evidence"],
+  "task_source": {"type": "openspec", "plan_path": "openspec/changes/checkout-mutation/tasks.md"}
+}

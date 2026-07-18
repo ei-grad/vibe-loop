@@ -282,12 +282,8 @@ def prior_run_regressions(
                 "previous_generated_at": previous_aggregate.get("generated_at", ""),
                 "deltas": deltas,
                 "regression_flags": flags,
-                "previous_records": list(previous.get("records", []))
-                if isinstance(previous.get("records"), list)
-                else [],
-                "records": list(current.get("records", []))
-                if isinstance(current.get("records"), list)
-                else [],
+                "previous_records": normalized_record_refs(previous.get("records")),
+                "records": normalized_record_refs(current.get("records")),
             }
         )
     return regressions
@@ -634,6 +630,12 @@ def record_ref(record: Mapping[str, object]) -> dict[str, object]:
         "artifact_root": artifact_root,
         "failure_taxonomy": sorted(record_labels(record)),
     }
+
+
+def normalized_record_refs(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    return [record_ref(record) for record in value if isinstance(record, Mapping)]
 
 
 def record_domain(record: Mapping[str, object]) -> str:

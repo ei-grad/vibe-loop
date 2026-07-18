@@ -151,6 +151,7 @@ def materialize_eval_example(
     initialize_git_checkout(target)
     apply_seed_user_state(target)
     apply_seed_coordination_state(target)
+    apply_seed_command_lock_state(target)
     refresh_active_lock_metadata(target)
     return target
 
@@ -325,6 +326,31 @@ def apply_seed_coordination_state(target: Path) -> None:
     integration_lock = seed.get("main_integration_lock")
     if isinstance(integration_lock, dict):
         seed_main_integration_lock(target, integration_lock)
+
+
+def apply_seed_command_lock_state(target: Path) -> None:
+    seed_path = target / "eval" / "seed-command-lock.json"
+    if not seed_path.is_file():
+        return
+    seed = read_json_file(seed_path)
+    task_id = required_seed_string(seed, "task_id")
+    run_id = required_seed_string(seed, "run_id")
+    metadata = {
+        "schema_version": 1,
+        "record_type": "active_run",
+        "task_id": task_id,
+        "run_id": run_id,
+        "pid": os.getpid(),
+        "worker_pid": os.getpid(),
+        "pid_source": "fixture-live-holder",
+        "host": socket.gethostname(),
+        "started_at": utc_now(),
+        "log": str(target / ".vibe-loop" / "runs" / f"{run_id}.log"),
+    }
+    write_json_file(
+        target / ".vibe-loop" / "command-locks.json",
+        {task_id: metadata},
+    )
 
 
 def apply_seed_workspace_state(target: Path, seed: dict[str, object]) -> None:

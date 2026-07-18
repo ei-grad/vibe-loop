@@ -319,7 +319,7 @@ task failures from workflow-contract failures and compares against any previous
 aggregate.
 
 `eval release-gate` is the bundled skill release-readiness check. Without
-`--aggregate`/`--dry-run` it runs a 16-trial release matrix and writes a
+`--aggregate`/`--dry-run` it runs a 21-trial release matrix and writes a
 `skill_release_readiness` record. It requires required trials to pass and blocks
 unresolved `workflow_contract_regression` findings; a regression is accepted only
 when parked with a task id (e.g.
@@ -328,6 +328,11 @@ runs an explicit external smoke manifest through the same paired-condition
 harness without claiming public leaderboard comparability. See
 [`docs/skill-evaluation-strategy.md`](docs/skill-evaluation-strategy.md) and
 [`docs/external-benchmark-fit.md`](docs/external-benchmark-fit.md).
+
+The release matrix includes default table discovery, generated heading profiles,
+explicit list profiles, Spec Kit, Kiro, OpenSpec, and command-backed task/lock
+stories. Aggregate and release-readiness records retain compact trial links but
+exclude raw task-source, lock, completion, planning, and worklog command strings.
 
 ## Autopilot
 
