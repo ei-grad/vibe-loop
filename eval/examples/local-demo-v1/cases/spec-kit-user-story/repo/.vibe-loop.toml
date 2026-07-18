@@ -1,0 +1,3 @@
+[task_source]
+type = "spec-kit"
+plan_path = "specs/checkout/tasks.md"
