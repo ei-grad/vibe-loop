@@ -24,6 +24,7 @@ from vibe_loop.autopilot import (
     cycle_should_recheck,
     limit_wall_pause_seconds,
     parse_wait_deadline,
+    poll_wait_message_command,
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
@@ -31,6 +32,7 @@ from vibe_loop.autopilot import (
     run_maintenance_command,
     run_worktree_disposition,
     wait_for_processes,
+    WaitMessageAdapterError,
 )
 from vibe_loop.config import load_config
 from vibe_loop.locks import AUTOPILOT_LOCK_NAME, build_lock_manager
@@ -1704,6 +1706,105 @@ class AutopilotWaitTests(unittest.TestCase):
         )
         self.assertEqual(result.wake_reason, "all_complete")
         self.assertEqual(sorted(event["pid"] for event in result.events), [1, 2])
+
+    def test_wakes_immediately_on_user_message(self) -> None:
+        sleeps: list[float] = []
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=10_000.0,
+            process_exists=lambda _pid: True,
+            wallclock=lambda: 0.0,
+            sleep=sleeps.append,
+            message_poller=lambda: {
+                "kind": "user_message",
+                "id": 7,
+                "text": "change direction",
+            },
+            session_ref="run-7",
+        )
+        self.assertEqual(result.wake_reason, "message")
+        self.assertEqual(result.wake_summary, "message:1")
+        self.assertEqual(result.events[0]["text"], "change direction")
+        self.assertEqual(result.session_ref, "run-7")
+        self.assertEqual(sleeps, [])
+
+    def test_empty_message_poll_sleeps_before_later_message(self) -> None:
+        polls = iter(
+            [
+                None,
+                {"kind": "user_message", "id": 8, "text": "continue"},
+            ]
+        )
+        sleeps: list[float] = []
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=10_000.0,
+            interval=2.0,
+            process_exists=lambda _pid: True,
+            wallclock=lambda: 0.0,
+            sleep=sleeps.append,
+            message_poller=lambda: next(polls),
+        )
+        self.assertEqual(result.wake_reason, "message")
+        self.assertEqual(sleeps, [2.0])
+
+    def test_dead_pid_wins_without_polling_messages(self) -> None:
+        polls: list[bool] = []
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=10_000.0,
+            process_exists=lambda _pid: False,
+            wallclock=lambda: 0.0,
+            sleep=lambda _seconds: None,
+            message_poller=lambda: polls.append(True),
+        )
+        self.assertEqual(result.wake_reason, "pid")
+        self.assertEqual(polls, [])
+
+    def test_message_command_maps_valid_envelope_and_session_environment(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args="adapter",
+            returncode=0,
+            stdout=(
+                '{"received":true,"message":{"id":3,"content":"continue",'
+                '"sender_name":"operator","created_at":"2026-07-18T00:00:00Z"}}'
+            ),
+            stderr="",
+        )
+        with mock.patch(
+            "vibe_loop.autopilot.subprocess.run", return_value=completed
+        ) as run:
+            event = poll_wait_message_command(
+                "adapter --json", session_ref="run;literal", timeout=3.0
+            )
+        self.assertEqual(
+            event,
+            {
+                "kind": "user_message",
+                "id": 3,
+                "text": "continue",
+                "at": "2026-07-18T00:00:00Z",
+                "sender": "operator",
+            },
+        )
+        self.assertEqual(
+            run.call_args.kwargs["env"]["VIBE_LOOP_WAIT_SESSION_REF"],
+            "run;literal",
+        )
+
+    def test_message_command_rejects_invalid_schema(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args="adapter",
+            returncode=0,
+            stdout='{"received":true,"message":{"id":3}}',
+            stderr="",
+        )
+        with (
+            mock.patch("vibe_loop.autopilot.subprocess.run", return_value=completed),
+            self.assertRaises(WaitMessageAdapterError) as caught,
+        ):
+            poll_wait_message_command("adapter", session_ref="run-1", timeout=3.0)
+        self.assertEqual(caught.exception.category, "invalid_schema")
 
 
 class WorktreeDispositionCycleTests(unittest.TestCase):

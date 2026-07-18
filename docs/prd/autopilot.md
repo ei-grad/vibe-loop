@@ -348,3 +348,26 @@ journaling of each recovery launch and outcome; and no destructive action on
 the claimed workspace.
 
 Related implementation IDs: `AUTO-21`.
+
+## PRD-AUT-015 Direct User Message Wake
+
+`wait-helper` may poll a trusted external message adapter in addition to its
+default process and wall-clock signals. The integration is explicit through
+`--message-command`; vibe-loop does not import, detect, or infer a task backend.
+The recipient is `--session-ref`, falling back only to `VIBE_LOOP_RUN_ID`, and
+is passed to the adapter as `VIBE_LOOP_WAIT_SESSION_REF` without shell
+interpolation.
+
+The adapter prints one JSON document with `received` and `message`. A received
+message must include a stable `id` and non-blank `content`; optional sender and
+timestamp fields are preserved as structured data. A message wakes regardless
+of PID `--mode`. Already-satisfied PID/deadline conditions retain precedence
+and do not invoke the adapter. Nonzero exits, timeouts, or invalid JSON/schema
+produce a safe `adapter_error` result and never silently degrade to clock-only
+waiting or echo adapter stdout/stderr.
+
+Acceptance must cover immediate and delayed messages, PID precedence, session
+resolution, literal environment delivery, schema validation, bounded command
+execution, safe errors, and unchanged behavior when no adapter is configured.
+
+Related implementation IDs: `AUTO-22`.

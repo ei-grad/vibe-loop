@@ -190,6 +190,7 @@ stateDiagram-v2
 
     Wait --> Cycle: wake_reason = deadline (cycle boundary)
     Wait --> Recover: wake_reason = pid (supervisor exited)
+    Wait --> Cycle: wake_reason = message (user redirect)
 
     state Cycle {
         [*] --> Health

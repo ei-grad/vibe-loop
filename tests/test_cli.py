@@ -7224,6 +7224,98 @@ class AutopilotCliTests(unittest.TestCase):
                 )
         self.assertEqual(caught.exception.code, 2)
 
+    def test_wait_helper_wakes_on_message_adapter_result(self) -> None:
+        event = {
+            "kind": "user_message",
+            "id": 17,
+            "text": "focus on the API contract",
+            "sender": "operator",
+        }
+        with patch.object(
+            cli_module, "poll_wait_message_command", return_value=event
+        ) as poll:
+            code, out = self._wait_helper(
+                "--deadline",
+                "2030-01-01T00:00:00Z",
+                "--message-command",
+                "message-adapter",
+                "--session-ref",
+                "run-17",
+                "--json",
+            )
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["wake_reason"], "message")
+        self.assertEqual(payload["wake_summary"], "message:1")
+        self.assertEqual(payload["session_ref"], "run-17")
+        self.assertEqual(payload["events"], [event])
+        poll.assert_called_once_with(
+            "message-adapter", session_ref="run-17", timeout=5.0
+        )
+
+    def test_wait_helper_message_adapter_uses_run_id_environment(self) -> None:
+        event = {"kind": "user_message", "id": "m1", "text": "continue"}
+        with (
+            patch.dict(os.environ, {"VIBE_LOOP_RUN_ID": "environment-run"}),
+            patch.object(
+                cli_module, "poll_wait_message_command", return_value=event
+            ) as poll,
+        ):
+            code, out = self._wait_helper(
+                "--deadline",
+                "2030-01-01T00:00:00Z",
+                "--message-command",
+                "message-adapter",
+                "--json",
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["session_ref"], "environment-run")
+        poll.assert_called_once_with(
+            "message-adapter", session_ref="environment-run", timeout=5.0
+        )
+
+    def test_wait_helper_message_adapter_requires_session(self) -> None:
+        with patch.dict(os.environ, {"VIBE_LOOP_RUN_ID": ""}):
+            stdout = StringIO()
+            stderr = StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = main(
+                    [
+                        "wait-helper",
+                        "--message-command",
+                        "message-adapter",
+                        "--json",
+                    ]
+                )
+        self.assertEqual(code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("requires --session-ref", stderr.getvalue())
+
+    def test_wait_helper_message_adapter_error_is_safe_json(self) -> None:
+        with patch.object(
+            cli_module,
+            "poll_wait_message_command",
+            side_effect=cli_module.WaitMessageAdapterError("invalid_json"),
+        ):
+            code, out = self._wait_helper(
+                "--deadline",
+                "2030-01-01T00:00:00Z",
+                "--message-command",
+                "secret-bearing-command",
+                "--session-ref",
+                "run-18",
+                "--json",
+            )
+        payload = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["wake_reason"], "adapter_error")
+        self.assertEqual(payload["wake_summary"], "message_adapter_error")
+        self.assertEqual(
+            payload["events"],
+            [{"kind": "message_adapter_error", "category": "invalid_json"}],
+        )
+        self.assertNotIn("secret-bearing-command", out)
+
     def _wait_helper(self, *args: str) -> tuple[int, str]:
         stdout = StringIO()
         stderr = StringIO()

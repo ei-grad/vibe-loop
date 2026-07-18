@@ -17,6 +17,7 @@ from vibe_loop.config import (
     AgentResolutionError,
     VibeConfig,
     load_config,
+    prepare_shell_command,
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
@@ -1725,6 +1726,13 @@ def collect_registry_status(
 DEFAULT_WAIT_CYCLE_SECONDS = 1800.0
 DEFAULT_WAIT_POLL_SECONDS = 5.0
 WallClock = Callable[[], float]
+WaitMessagePoller = Callable[[], dict[str, object] | None]
+
+
+class WaitMessageAdapterError(RuntimeError):
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1732,6 +1740,7 @@ class WaitResult:
     wake_reason: str
     events: tuple[dict[str, object], ...] = ()
     deadline: str = ""
+    session_ref: str = ""
 
     @property
     def wake_summary(self) -> str:
@@ -1740,22 +1749,99 @@ class WaitResult:
             kind = event.get("kind")
             if kind == "pid_exit":
                 parts.append(f"pid_exit:{event.get('pid')}")
+            elif kind == "user_message":
+                continue
             else:
                 parts.append(str(kind or "event"))
+        message_count = sum(
+            event.get("kind") == "user_message" for event in self.events
+        )
+        if message_count:
+            return f"message:{message_count}"
         if parts:
             return ",".join(parts)
         if self.wake_reason == "deadline":
             return f"deadline:{self.deadline}"
+        if self.wake_reason == "adapter_error":
+            return "message_adapter_error"
         return self.wake_reason
 
     def to_json(self, *, at: str) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "wake_reason": self.wake_reason,
             "wake_summary": self.wake_summary,
             "at": at,
             "deadline": self.deadline,
             "events": [dict(event) for event in self.events],
         }
+        if self.session_ref:
+            payload["session_ref"] = self.session_ref
+        return payload
+
+
+def poll_wait_message_command(
+    command: str,
+    *,
+    session_ref: str,
+    timeout: float,
+) -> dict[str, object] | None:
+    """Run one trusted message adapter poll and validate its JSON envelope."""
+    environment = os.environ.copy()
+    environment["VIBE_LOOP_WAIT_SESSION_REF"] = session_ref
+    prepared, use_shell = prepare_shell_command(command)
+    try:
+        completed = subprocess.run(
+            prepared,
+            shell=use_shell,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=environment,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise WaitMessageAdapterError("timeout") from exc
+    except OSError as exc:
+        raise WaitMessageAdapterError("execution_error") from exc
+    if completed.returncode != 0:
+        raise WaitMessageAdapterError("nonzero_exit")
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise WaitMessageAdapterError("invalid_json") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("received"), bool):
+        raise WaitMessageAdapterError("invalid_schema")
+    message = payload.get("message")
+    if not payload["received"]:
+        if message is not None:
+            raise WaitMessageAdapterError("invalid_schema")
+        return None
+    if not isinstance(message, dict):
+        raise WaitMessageAdapterError("invalid_schema")
+    message_id = message.get("id")
+    content = message.get("content")
+    if isinstance(message_id, bool) or not isinstance(message_id, (int, str)):
+        raise WaitMessageAdapterError("invalid_schema")
+    if not isinstance(content, str) or not content.strip():
+        raise WaitMessageAdapterError("invalid_schema")
+    event: dict[str, object] = {
+        "kind": "user_message",
+        "id": message_id,
+        "text": content,
+    }
+    for source, target in (
+        ("created_at", "at"),
+        ("sender_name", "sender"),
+        ("sender_actor_id", "sender_actor_id"),
+        ("session_ref", "session_ref"),
+    ):
+        value = message.get(source)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            event[target] = value
+    return event
 
 
 def format_utc_timestamp(epoch: float) -> str:
@@ -1804,13 +1890,10 @@ def wait_for_processes(
     process_exists: ProcessExists | None = None,
     wallclock: WallClock | None = None,
     sleep: Sleep | None = None,
+    message_poller: WaitMessagePoller | None = None,
+    session_ref: str = "",
 ) -> WaitResult:
-    """Block until a watched PID exits or the deadline arrives.
-
-    Agent-agnostic: it watches only OS processes and a wall-clock deadline, so
-    it carries no dependency on any agent's session format. Harness-specific
-    wake signals belong in the agent environment, not here.
-    """
+    """Block until a watched PID exits, deadline, or external message."""
 
     watched_pids = list(dict.fromkeys(pids))
     if not watched_pids and deadline_epoch is None:
@@ -1837,6 +1920,15 @@ def wait_for_processes(
         current = now()
         if deadline_epoch is not None and current >= deadline_epoch:
             return WaitResult(wake_reason="deadline", deadline=deadline_text)
+        if message_poller is not None:
+            message_event = message_poller()
+            if message_event is not None:
+                return WaitResult(
+                    wake_reason="message",
+                    events=tuple([*all_events, message_event]),
+                    deadline=deadline_text,
+                    session_ref=session_ref,
+                )
         sleep_for = max(interval, 0.1)
         if deadline_epoch is not None:
             sleep_for = min(sleep_for, max(deadline_epoch - current, 0.1))

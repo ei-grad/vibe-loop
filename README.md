@@ -391,15 +391,29 @@ read-only `autopilot status --json` / `projects status --json` boundary. The
 former in-tree `autopilot tui` (Textual) and `autopilot webui` surfaces were
 removed in favor of loopyard.
 
-The top-level **`vibe-loop wait-helper`** blocks until a watched process exits or
-a wall-clock deadline arrives, so an unattended steward can sleep between cycles.
+The top-level **`vibe-loop wait-helper`** blocks until a watched process exits,
+a wall-clock deadline arrives, or an optional message adapter returns a direct
+user instruction, so an unattended steward can sleep between cycles.
 `--pid` (repeatable) wakes on process exit; `--cycle-schedule [SECONDS]` wakes at
 the next UTC `*/SECONDS` boundary; omitting both `--deadline` and
 `--cycle-schedule` uses the default 1800s boundary. `--deadline` takes an
 explicit ISO-8601 UTC time; `--mode all` waits for every PID. It prints
-`wake_reason` (`pid`, `all_complete`, or `deadline`) with a summary. It watches
-OS processes and the clock only — agent-specific wake signals stay in the agent
-environment.
+`wake_reason` (`pid`, `all_complete`, `deadline`, or `message`) with a summary.
+
+`--message-command COMMAND` polls a trusted command that emits
+`{"received":false,"message":null}` or a received message containing `id` and
+`content`. The recipient comes from `--session-ref` or `VIBE_LOOP_RUN_ID` and is
+passed literally as `VIBE_LOOP_WAIT_SESSION_REF`; `--message-timeout` bounds
+each poll. For Loopyard-backed projects, the matching adapter is:
+
+```bash
+vibe-loop wait-helper --pid 12345 --message-command \
+  'loopyard vibe session-message-receive' --session-ref <run-id> --json
+```
+
+Loopyard messages are consumed atomically and delivered at most once after the
+receive transaction commits. Adapter failures return `wake_reason=adapter_error`
+without including command output in the result.
 
 ## Configuration
 

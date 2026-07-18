@@ -24,8 +24,11 @@ from vibe_loop.autopilot import (
     cycle_schedule_deadline,
     default_registry_path,
     parse_wait_deadline,
+    poll_wait_message_command,
     run_autopilot,
     wait_for_processes,
+    WaitMessageAdapterError,
+    WaitResult,
 )
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
@@ -405,6 +408,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=positive_float,
         default=DEFAULT_WAIT_POLL_SECONDS,
         help="Process poll interval in seconds",
+    )
+    wait_helper.add_argument(
+        "--message-command",
+        default=None,
+        metavar="COMMAND",
+        help="Poll a trusted JSON message adapter and wake when it returns a message",
+    )
+    wait_helper.add_argument(
+        "--session-ref",
+        default=None,
+        metavar="REF",
+        help="Message recipient session (defaults to VIBE_LOOP_RUN_ID)",
+    )
+    wait_helper.add_argument(
+        "--message-timeout",
+        type=positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Maximum duration of one message-adapter poll (default: 5)",
     )
     wait_helper.add_argument("--mode", choices=("any", "all"), default="any")
     wait_helper.add_argument("--json", action="store_true")
@@ -1217,6 +1239,28 @@ def render_autopilot_status(status: ProjectStatus) -> str:
 
 
 def dispatch_wait_helper(args: argparse.Namespace) -> int:
+    if args.session_ref is not None and args.message_command is None:
+        print("--session-ref requires --message-command", file=sys.stderr)
+        return 2
+    session_ref = ""
+    message_poller = None
+    if args.message_command is not None:
+        session_ref = args.session_ref or os.environ.get("VIBE_LOOP_RUN_ID", "")
+        if not session_ref:
+            print(
+                "--message-command requires --session-ref or VIBE_LOOP_RUN_ID",
+                file=sys.stderr,
+            )
+            return 2
+
+        def poll_message() -> dict[str, object] | None:
+            return poll_wait_message_command(
+                args.message_command,
+                session_ref=session_ref,
+                timeout=args.message_timeout,
+            )
+
+        message_poller = poll_message
     now = time.time()
     if args.deadline is not None:
         deadline_text = args.deadline
@@ -1232,13 +1276,29 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             else DEFAULT_WAIT_CYCLE_SECONDS
         )
         deadline_text, deadline_epoch = cycle_schedule_deadline(interval, now=now)
-    result = wait_for_processes(
-        pids=args.pid,
-        deadline_epoch=deadline_epoch,
-        deadline_text=deadline_text,
-        mode=args.mode,
-        interval=args.interval,
-    )
+    try:
+        result = wait_for_processes(
+            pids=args.pid,
+            deadline_epoch=deadline_epoch,
+            deadline_text=deadline_text,
+            mode=args.mode,
+            interval=args.interval,
+            message_poller=message_poller,
+            session_ref=session_ref,
+        )
+    except WaitMessageAdapterError as exc:
+        result = WaitResult(
+            wake_reason="adapter_error",
+            events=({"kind": "message_adapter_error", "category": exc.category},),
+            deadline=deadline_text,
+            session_ref=session_ref,
+        )
+        payload = result.to_json(at=utc_now_iso())
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(" ".join(f"{key}={value}" for key, value in payload.items()))
+        return 1
     payload = result.to_json(at=utc_now_iso())
     if args.json:
         print(json.dumps(payload, indent=2))

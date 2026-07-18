@@ -94,13 +94,17 @@ Wake results report `wake_reason`:
 
 - `pid`: the supervisor exited — investigate and likely recover.
 - `deadline`: the cycle boundary arrived — run the full cycle.
+- `message`: a user instruction arrived — read the structured `user_message`
+  event and apply it as a redirect before continuing the cycle.
+- `adapter_error`: message polling failed — inspect the adapter directly before
+  waiting again; do not silently disable it.
 
 After every wake, state the exact `wake_reason`/`wake_summary`, run the health
 checks, then decide whether to recover, summarize, troubleshoot, plan, or keep
-waiting. `vibe-loop wait-helper` watches OS processes and the clock only; if
-your agent harness exposes a richer wake signal (such as completion of one of
-your own subagents), combine it with the wait however your environment supports
-rather than expecting `vibe-loop` to know about it.
+waiting. When the repository exposes a trusted direct-message adapter, add
+`--message-command` and identify the recipient with `--session-ref` (or
+`VIBE_LOOP_RUN_ID`). Keep harness-specific wake signals, such as completion of
+one of your own subagents, in the agent environment.
 
 ## Investigate Loop Termination
 
