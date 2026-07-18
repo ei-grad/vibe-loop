@@ -1310,48 +1310,56 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertEqual(sleeps, [100.0])
         self.assertEqual(len(launcher_calls), 2)
 
-    def test_drained_completed_cycle_reaches_planning_after_one_recheck(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            configured_repo(
-                repo,
-                [("TASK-01", "Next", "", "ready scope")],
-                extra_toml=(
-                    "[autopilot]\n"
-                    "planning_recheck_seconds = 10.0\n"
-                    "require_clean_repo = false\n"
-                    'planning_command = "plan"\n'
-                ),
+    def test_drained_dispatched_cycle_reaches_planning_after_one_recheck(self) -> None:
+        for exit_code, expected_status in (
+            (0, "completed"),
+            (1, "restartable"),
+            (-15, "terminated"),
+        ):
+            with (
+                self.subTest(exit_code=exit_code),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repo = Path(directory)
+                configured_repo(
+                    repo,
+                    [("TASK-01", "Next", "", "ready scope")],
+                    extra_toml=(
+                        "[autopilot]\n"
+                        "planning_recheck_seconds = 10.0\n"
+                        "require_clean_repo = false\n"
+                        'planning_command = "plan"\n'
+                    ),
+                )
+                config = load_config(repo)
+                runner, kinds = self._planning_runner()
+                sleeps: list[float] = []
+                launcher_calls = 0
+
+                def draining_launcher(command, *, cwd, log_path, on_start=None):
+                    nonlocal launcher_calls
+                    launcher_calls += 1
+                    if on_start is not None:
+                        on_start(4242)
+                    write_plan(repo, [("TASK-01", "Done", "", "finished scope")])
+                    return exit_code
+
+                summary = run_autopilot(
+                    config,
+                    max_cycles=2,
+                    interval=100.0,
+                    launcher=draining_launcher,
+                    maintenance_runner=runner,
+                    sleep=sleeps.append,
+                )
+
+            self.assertEqual(
+                [cycle.status for cycle in summary.cycles], [expected_status, "idle"]
             )
-            config = load_config(repo)
-            runner, kinds = self._planning_runner()
-            sleeps: list[float] = []
-            launcher_calls = 0
-
-            def draining_launcher(command, *, cwd, log_path, on_start=None):
-                nonlocal launcher_calls
-                launcher_calls += 1
-                if on_start is not None:
-                    on_start(4242)
-                write_plan(repo, [("TASK-01", "Done", "", "finished scope")])
-                return 0
-
-            summary = run_autopilot(
-                config,
-                max_cycles=2,
-                interval=100.0,
-                launcher=draining_launcher,
-                maintenance_runner=runner,
-                sleep=sleeps.append,
-            )
-
-        self.assertEqual(
-            [cycle.status for cycle in summary.cycles], ["completed", "idle"]
-        )
-        self.assertIn("post_cycle_runnable:0/1", summary.cycles[0].actions)
-        self.assertEqual(sleeps, [10.0])
-        self.assertEqual(kinds, ["planning"])
-        self.assertEqual(launcher_calls, 1)
+            self.assertIn("post_cycle_runnable:0/1", summary.cycles[0].actions)
+            self.assertEqual(sleeps, [10.0])
+            self.assertEqual(kinds, ["planning"])
+            self.assertEqual(launcher_calls, 1)
 
     def test_limit_wall_pause_takes_precedence_over_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

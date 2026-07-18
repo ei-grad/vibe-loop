@@ -1536,7 +1536,7 @@ def run_autopilot(
             if (
                 not bounded_last
                 and interval > 0
-                and result.status == "completed"
+                and "launched_run_until_done" in result.actions
                 and result.limit_wall_pause_seconds is None
             ):
                 post_cycle_runnable = poll_runnable_count(config)
