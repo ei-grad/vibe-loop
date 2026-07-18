@@ -21,6 +21,19 @@ from vibe_loop.eval_release import (
 
 
 class EvalReleaseTests(unittest.TestCase):
+    def test_default_release_matrix_includes_user_story_fixtures(self) -> None:
+        matrix = release_gate_case_conditions()
+
+        self.assertEqual(sum(len(conditions) for conditions in matrix.values()), 21)
+        for case_id in (
+            "explicit-list-profile",
+            "kiro-user-story",
+            "openspec-user-story",
+            "spec-kit-user-story",
+        ):
+            self.assertEqual(matrix[case_id], ("vibe_loop",))
+        self.assertEqual(matrix["command-hooks-task-source"], ("vibe_loop_cli",))
+
     def test_release_record_passes_with_full_suite_and_optional_external_smoke(
         self,
     ) -> None:
@@ -99,6 +112,68 @@ class EvalReleaseTests(unittest.TestCase):
             parked["workflow_contract_regressions"]["parked"][0]["parked_task_ids"],
             ["EVAL-99"],
         )
+
+    def test_workflow_regression_records_redact_raw_hook_commands(self) -> None:
+        sentinel = "RAW_HOOK_COMMAND_MUST_NOT_LEAK"
+        with tempfile.TemporaryDirectory() as directory:
+            aggregate_path = Path(directory) / "aggregate.json"
+            aggregate = passing_release_aggregate(workflow_regression=True)
+            comparison = aggregate["skill_quality"]["condition_comparisons"][
+                "vibe_loop"
+            ]
+            full_record = {
+                "run_id": "current-run",
+                "case_id": "command-hooks-task-source",
+                "condition": "vibe_loop",
+                "trial": 1,
+                "reproducibility": {"artifact_root": "cases/current"},
+                "failure_taxonomy": ["workflow_contract"],
+                "harness": {"command": sentinel},
+                "task_source": {"list_command": sentinel},
+                "locks": {"acquire_command": sentinel},
+                "completion": {"commands": [sentinel]},
+                "autopilot": {"planning_command": sentinel},
+                "worklog": {"command": sentinel},
+            }
+            comparison["condition_records"] = [full_record]
+            comparison["baseline_records"] = [
+                {**full_record, "run_id": "baseline-run", "condition": "no_skill"}
+            ]
+            aggregate["skill_quality"]["prior_run_regressions"] = [
+                {
+                    "condition": "vibe_loop",
+                    "regression_flags": ["workflow_contract_regression"],
+                    "deltas": {
+                        "workflow_score_mean": {"command": sentinel},
+                        "workflow_violation_rate": 0.5,
+                    },
+                    "records": [full_record],
+                    "previous_records": [{**full_record, "run_id": "previous-run"}],
+                }
+            ]
+            write_json(aggregate_path, aggregate)
+
+            record = build_release_readiness_record(
+                aggregate,
+                aggregate_path=aggregate_path,
+                dry_run=True,
+                generated_at="2026-05-09T00:00:00+00:00",
+            )
+
+        encoded = json.dumps(record)
+        self.assertNotIn(sentinel, encoded)
+        unresolved = record["workflow_contract_regressions"]["unresolved"]
+        current = next(
+            item
+            for item in unresolved
+            if item["id"] == "condition_comparison:vibe_loop"
+        )
+        prior = next(
+            item for item in unresolved if item["source"] == "prior_run_regression"
+        )
+        self.assertEqual(current["records"][0]["run_id"], "current-run")
+        self.assertEqual(current["records"][0]["artifact_root"], "cases/current")
+        self.assertNotIn("workflow_score_mean", prior["deltas"])
 
     def test_coverage_gaps_block_release_gate_for_required_matrix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

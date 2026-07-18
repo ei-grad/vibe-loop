@@ -14,16 +14,21 @@ RELEASE_READINESS_RECORD_TYPE = "skill_release_readiness"
 WORKFLOW_REGRESSION_FLAG = "workflow_contract_regression"
 DEFAULT_RELEASE_GATE_TRIALS = 1
 RELEASE_GATE_CASE_CONDITIONS: Mapping[str, tuple[str, ...]] = {
+    "command-hooks-task-source": ("vibe_loop_cli",),
     "dirty-main-worktree": ("vibe_loop",),
+    "explicit-list-profile": ("vibe_loop",),
     "finite-py-plan-table": ("vibe_loop", "orchestrated_vibe_loop"),
     "generated-roadmap-profile": ("vibe_loop",),
     "integration-lock-unavailable": ("vibe_loop_cli",),
+    "kiro-user-story": ("vibe_loop",),
     "locked-task-selection": ("vibe_loop",),
     "main-advanced-before-merge": ("vibe_loop",),
     "main-integration-lock": ("vibe_loop_cli",),
     "negative-trigger-set": ("vibe_loop",),
+    "openspec-user-story": ("vibe_loop",),
     "review-remediation": ("vibe_loop", "orchestrated_vibe_loop"),
     "supervised-worker-report": ("vibe_loop_cli",),
+    "spec-kit-user-story": ("vibe_loop",),
     "workspace-duplicate-worktree": ("vibe_loop_cli",),
     "workspace-foreign-dirty": ("vibe_loop_cli",),
     "workspace-merged-branch": ("vibe_loop_cli",),
@@ -393,8 +398,10 @@ def workflow_contract_regressions(
                 "condition": str(condition),
                 "flag": WORKFLOW_REGRESSION_FLAG,
                 "deltas": workflow_delta_summary(comparison.get("deltas")),
-                "records": sequence_value(comparison.get("condition_records")),
-                "baseline_records": sequence_value(comparison.get("baseline_records")),
+                "records": release_record_refs(comparison.get("condition_records")),
+                "baseline_records": release_record_refs(
+                    comparison.get("baseline_records")
+                ),
             }
         )
 
@@ -415,8 +422,10 @@ def workflow_contract_regressions(
                     regression.get("previous_generated_at")
                 ),
                 "deltas": workflow_delta_summary(regression.get("deltas")),
-                "records": sequence_value(regression.get("records")),
-                "previous_records": sequence_value(regression.get("previous_records")),
+                "records": release_record_refs(regression.get("records")),
+                "previous_records": release_record_refs(
+                    regression.get("previous_records")
+                ),
             }
         )
     return regressions
@@ -794,6 +803,42 @@ def workflow_delta_summary(value: object) -> dict[str, object]:
         key: deltas[key]
         for key in ("workflow_score_mean", "workflow_violation_rate")
         if key in deltas
+        and (
+            deltas[key] is None
+            or (
+                isinstance(deltas[key], (int, float))
+                and not isinstance(deltas[key], bool)
+            )
+        )
+    }
+
+
+def release_record_refs(value: object) -> list[dict[str, object]]:
+    return [
+        release_record_ref(item)
+        for item in sequence_value(value)
+        if isinstance(item, Mapping)
+    ]
+
+
+def release_record_ref(record: Mapping[str, object]) -> dict[str, object]:
+    artifact_root = string_value(record.get("artifact_root"))
+    reproducibility = record.get("reproducibility")
+    if isinstance(reproducibility, Mapping):
+        artifact_root = (
+            string_value(reproducibility.get("artifact_root")) or artifact_root
+        )
+    labels = set(string_list(record.get("failure_taxonomy")))
+    scoring = record.get("scoring")
+    if isinstance(scoring, Mapping):
+        labels.update(string_list(scoring.get("failure_taxonomy")))
+    return {
+        "run_id": record.get("run_id"),
+        "case_id": record.get("case_id"),
+        "condition": record.get("condition"),
+        "trial": record.get("trial"),
+        "artifact_root": artifact_root,
+        "failure_taxonomy": sorted(labels),
     }
 
 

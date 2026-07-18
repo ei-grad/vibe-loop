@@ -61,7 +61,13 @@
     "minimum_trials_per_case_condition": 1,
     "name": "bundled_skill_release_readiness",
     "required_case_conditions": {
+      "command-hooks-task-source": [
+        "vibe_loop_cli"
+      ],
       "dirty-main-worktree": [
+        "vibe_loop"
+      ],
+      "explicit-list-profile": [
         "vibe_loop"
       ],
       "finite-py-plan-table": [
@@ -73,6 +79,9 @@
       ],
       "integration-lock-unavailable": [
         "vibe_loop_cli"
+      ],
+      "kiro-user-story": [
+        "vibe_loop"
       ],
       "locked-task-selection": [
         "vibe_loop"
@@ -86,12 +95,18 @@
       "negative-trigger-set": [
         "vibe_loop"
       ],
+      "openspec-user-story": [
+        "vibe_loop"
+      ],
       "review-remediation": [
         "vibe_loop",
         "orchestrated_vibe_loop"
       ],
       "supervised-worker-report": [
         "vibe_loop_cli"
+      ],
+      "spec-kit-user-story": [
+        "vibe_loop"
       ],
       "workspace-duplicate-worktree": [
         "vibe_loop_cli"
@@ -115,15 +130,21 @@
     "artifact_root": ".vibe-loop/eval-runs/local-demo-v1",
     "conditions": {
       "orchestrated_vibe_loop": 2,
-      "vibe_loop": 7,
-      "vibe_loop_cli": 7
+      "vibe_loop": 11,
+      "vibe_loop_cli": 8
     },
     "coverage_gaps": [],
     "coverage_status": "passed",
     "generated_at": "2026-05-09T00:00:00+00:00",
     "mode": "existing_aggregate",
     "required_case_conditions": {
+      "command-hooks-task-source": [
+        "vibe_loop_cli"
+      ],
       "dirty-main-worktree": [
+        "vibe_loop"
+      ],
+      "explicit-list-profile": [
         "vibe_loop"
       ],
       "finite-py-plan-table": [
@@ -135,6 +156,9 @@
       ],
       "integration-lock-unavailable": [
         "vibe_loop_cli"
+      ],
+      "kiro-user-story": [
+        "vibe_loop"
       ],
       "locked-task-selection": [
         "vibe_loop"
@@ -148,12 +172,18 @@
       "negative-trigger-set": [
         "vibe_loop"
       ],
+      "openspec-user-story": [
+        "vibe_loop"
+      ],
       "review-remediation": [
         "vibe_loop",
         "orchestrated_vibe_loop"
       ],
       "supervised-worker-report": [
         "vibe_loop_cli"
+      ],
+      "spec-kit-user-story": [
+        "vibe_loop"
       ],
       "workspace-duplicate-worktree": [
         "vibe_loop_cli"
@@ -169,7 +199,7 @@
       ]
     },
     "suite_id": "local-demo-v1",
-    "total_trials": 16
+    "total_trials": 21
   },
   "record_type": "skill_release_readiness",
   "schema_version": 1,

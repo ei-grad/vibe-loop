@@ -1,0 +1,21 @@
+[task_source]
+type = "command"
+list = "python scripts/task_adapter.py list"
+probe = "python scripts/task_adapter.py probe {task_id}"
+runnable_statuses = ["Planned"]
+
+[locks]
+type = "command"
+acquire_command = "python scripts/lock_adapter.py"
+release_command = "python scripts/lock_adapter.py"
+status_command = "python scripts/lock_adapter.py"
+list_command = "python scripts/lock_adapter.py"
+
+[completion]
+commands = [
+  "python scripts/completion_hook.py",
+  "python scripts/record_worklog.py",
+]
+
+[autopilot]
+planning_command = "python scripts/planning_hook.py"

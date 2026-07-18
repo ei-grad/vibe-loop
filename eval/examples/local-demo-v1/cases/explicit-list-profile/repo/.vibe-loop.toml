@@ -1,0 +1,41 @@
+[task_source]
+type = "markdown-profile"
+runnable_statuses = ["Planned"]
+
+[task_source.profile]
+kind = "markdown_list"
+source_paths = ["WORK.md"]
+stable_ids = true
+
+[task_source.profile.fields.id]
+pattern = "^(?P<id>LIST-[0-9]+)\\b"
+strategy = "heading_text"
+
+[task_source.profile.fields.title]
+pattern = "^LIST-[0-9]+\\s+(?P<title>.+)$"
+strategy = "heading_text"
+
+[task_source.profile.fields.status]
+strategy = "checkbox_status"
+
+[task_source.profile.fields.dependencies]
+label = "Dependencies"
+none_values = ["none"]
+
+[task_source.profile.fields.scope]
+label = "Scope"
+
+[task_source.profile.fields.acceptance]
+label = "Acceptance"
+
+[task_source.profile.fields.evidence]
+label = "Evidence"
+
+[task_source.profile.fields.requirement_ids]
+label = "Requirements"
+none_values = ["none"]
+
+[task_source.profile.status_map]
+done = ["Done"]
+runnable = ["Planned"]
+blocked = ["Blocked"]

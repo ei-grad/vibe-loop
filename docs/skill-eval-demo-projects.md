@@ -76,6 +76,11 @@ committed inside the fixture.
 | --- | --- | --- | --- |
 | `finite-py-plan-table` | Small Python package with a standard `PLAN.md` table | Finite slice execution, branch/worktree setup, commit, local `main` integration | yes |
 | `generated-roadmap-profile` | Python package with nonstandard roadmap headings and no explicit task-source config | Generated task discovery, non-executable profile cache, bounded evidence | yes |
+| `explicit-list-profile` | Repository with an explicit Markdown-list task profile | Explicit profile authority, list parsing, story metadata preservation | yes |
+| `spec-kit-user-story` | Spec Kit repository with tasks under `specs/` | Built-in Spec Kit task discovery and prefixed IDs | yes |
+| `kiro-user-story` | Kiro repository with tasks under `.kiro/specs/` | Built-in Kiro task discovery and dependencies | yes |
+| `openspec-user-story` | OpenSpec repository with active tasks under `openspec/changes/` | Built-in OpenSpec discovery and active story selection | yes |
+| `command-hooks-task-source` | Repository with command task and lock backends plus configured hooks | Command contracts, completion authority, hook redaction | yes |
 | `review-remediation` | Validation library with a deliberately subtle edge case | Independent review, remediation, re-review, test evidence | yes |
 | `dirty-main-worktree` | Docs/code project with unrelated seeded user changes in the main checkout | Worktree discipline, unrelated-change preservation, conservative git behavior | yes |
 | `supervised-worker-report` | Fixture launched with supervisor run metadata and local `.vibe-loop/` state | Worker reporting, run result records, task lock ownership | yes |
@@ -288,6 +293,33 @@ Artifacts:
 - `skipped-evidence.json`.
 
 Budget: generated discovery or worker-state case.
+
+### Task-source user stories
+
+Five release cases complement the default table and generated-heading cases:
+
+- `explicit-list-profile` uses an explicit `.vibe-loop.toml` Markdown-list
+  profile and requires the selected story's scope, acceptance, evidence, and
+  requirement IDs to survive normalization.
+- `spec-kit-user-story`, `kiro-user-story`, and `openspec-user-story` use the
+  built-in presets and their canonical repository paths. Their graders assert
+  prefixed stable IDs, dependency readiness, status mapping, title, acceptance,
+  and the exact selected story.
+- `command-hooks-task-source` uses explicit command task and lock backends,
+  completion validation, a worklog recorder configured as a completion command,
+  and an autopilot planning hook. The command task ledger remains authoritative:
+  hook success cannot satisfy the grader while the selected task is runnable.
+
+The user-story cases add `task_source_evidence`, captured before implementation,
+with normalized tasks, runnable IDs, and the selected task. The command case also
+adds redacted `hook_evidence` containing configured-hook booleans and normalized
+completion/worklog events without command strings.
+
+All five cases remain offline and paired across the standard conditions. The
+compact release matrix selects one release-relevant skill condition per case.
+Raw user-authored hook commands remain available in the fixture and raw trial
+audit evidence, but aggregate and release-readiness records contain only compact
+run references and normalized outcomes.
 
 ### `review-remediation`
 

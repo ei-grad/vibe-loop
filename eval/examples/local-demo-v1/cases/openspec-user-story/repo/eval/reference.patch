@@ -1,0 +1,14 @@
+diff --git a/openspec/changes/checkout-mutation/tasks.md b/openspec/changes/checkout-mutation/tasks.md
+--- a/openspec/changes/checkout-mutation/tasks.md
++++ b/openspec/changes/checkout-mutation/tasks.md
+@@ -7,1 +7,1 @@
+-- [-] 1.2 Preserve the active checkout story
++- [x] 1.2 Preserve the active checkout story
+diff --git a/docs/selected-story.md b/docs/selected-story.md
+new file mode 100644
+--- /dev/null
++++ b/docs/selected-story.md
+@@ -0,0 +1,3 @@
++# checkout-mutation:1.2
++
++The active OpenSpec story preserves the idempotency constraint.

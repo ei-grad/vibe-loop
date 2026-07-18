@@ -24,7 +24,8 @@
     "grader_outputs",
     "generated_profile",
     "test_results",
-    "workflow_events"
+    "workflow_events",
+    "task_source_evidence"
   ],
   "task_source": {
     "type": "markdown-profile",
