@@ -704,7 +704,13 @@ class VibeRunner:
         previous = getattr(self._restart_context, "value", None)
         self._restart_context.value = (task.task_id, restart_count)
         try:
-            return self.run_task(task)
+            try:
+                return self.run_task(task)
+            except AgentResolutionError as exc:
+                explicit_agent = (task.agent or "").strip()
+                if not explicit_agent or explicit_agent in self.config.agent_profiles:
+                    raise
+                return self.record_agent_resolution_failure(task, exc)
         finally:
             if previous is None:
                 try:
@@ -713,6 +719,40 @@ class VibeRunner:
                     pass
             else:
                 self._restart_context.value = previous
+
+    def record_agent_resolution_failure(
+        self,
+        task: Task,
+        error: AgentResolutionError,
+    ) -> RunResult:
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        run_id = new_run_id(task.task_id)
+        log_path = self.runs_dir / f"{run_id}.log"
+        started_at = utc_now_iso()
+        start_main = git_rev_parse(self.config.repo, "HEAD")
+        message = str(error)
+        with log_path.open("w", encoding="utf-8") as log:
+            report_status(
+                f"agent resolution failed for {task.task_id}: {message}",
+                log,
+            )
+        result = RunResult(
+            run_id=run_id,
+            task_id=task.task_id,
+            classification="failed",
+            exit_code=1,
+            log_path=log_path,
+            start_main=start_main,
+            end_main=git_rev_parse(self.config.repo, "HEAD"),
+            message=message,
+            started_at=started_at,
+            classification_source="agent_resolution",
+            restart_count=self.current_restart_count(task.task_id),
+            max_restarts=self.config.supervision.max_restarts,
+        )
+        self.record_result(result)
+        report_status(f"recorded failed result for {task.task_id}: {log_path}")
+        return result
 
     def current_restart_count(self, task_id: str) -> int:
         value = getattr(self._restart_context, "value", None)

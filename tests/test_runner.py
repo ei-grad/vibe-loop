@@ -1215,6 +1215,68 @@ class RunnerTests(unittest.TestCase):
             ["TASK-01", "TASK-02"],
         )
 
+    def test_unknown_explicit_agent_fails_task_without_aborting_batch(self) -> None:
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    runner = VibeRunner(
+                        VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                    )
+                    source = MutableTaskSource(
+                        [
+                            Task(
+                                task_id="TASK-BAD",
+                                title="Bad route",
+                                status="Next",
+                                agent="typo",
+                                order=1,
+                            ),
+                            Task(
+                                task_id="TASK-GOOD",
+                                title="Good route",
+                                status="Next",
+                                order=2,
+                            ),
+                        ]
+                    )
+                    runner._source = source
+                    original_run_task = runner.run_task
+
+                    def run_task(task: Task) -> RunResult:
+                        if task.task_id == "TASK-BAD":
+                            return original_run_task(task)
+                        source.mark_done(task.task_id)
+                        return RunResult(
+                            run_id="run-good",
+                            task_id=task.task_id,
+                            classification="completed",
+                            exit_code=0,
+                            log_path=repo / "good.log",
+                            start_main="aaa",
+                            end_main="aaa",
+                        )
+
+                    runner.run_task = run_task
+                    with patch("vibe_loop.runner.git_rev_parse", return_value="aaa"):
+                        results = runner.run_until_done(
+                            jobs=jobs,
+                            continue_on_failure=True,
+                        )
+
+                    by_task = {result.task_id: result for result in results}
+                    failed = by_task["TASK-BAD"]
+                    self.assertTrue(failed.log_path.is_file())
+                    failed_log = failed.log_path.read_text(encoding="utf-8")
+
+                self.assertEqual(set(by_task), {"TASK-BAD", "TASK-GOOD"})
+                self.assertEqual(by_task["TASK-GOOD"].classification, "completed")
+                self.assertEqual(failed.classification, "failed")
+                self.assertEqual(failed.exit_code, 1)
+                self.assertEqual(failed.classification_source, "agent_resolution")
+                self.assertIn("agent profile 'typo'", failed.message)
+                self.assertIn("agent resolution failed", failed_log)
+
     def test_run_until_done_serial_stops_after_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
