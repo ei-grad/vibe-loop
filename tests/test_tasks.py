@@ -802,34 +802,43 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertFalse(unknown.conflict_domains_known)
         self.assertTrue(empty.conflict_domains_known)
 
-    def test_command_task_source_parses_agent_and_hazards(self) -> None:
+    def test_command_task_source_parses_agent_model_and_hazards(self) -> None:
         task = task_from_mapping(
             {
                 "id": "CMD-04",
                 "title": "Security task",
                 "status": "Next",
                 "agent": "claude-opus",
+                "model": "opus",
                 "hazards": ["abi", "abi", "  dma  ", ""],
             },
             0,
         )
 
         self.assertEqual(task.agent, "claude-opus")
+        self.assertEqual(task.model, "opus")
         self.assertEqual(task.hazards, ("abi", "dma"))
         payload = task.to_json()
         self.assertEqual(payload["agent"], "claude-opus")
+        self.assertEqual(payload["model"], "opus")
         self.assertEqual(payload["hazards"], ["abi", "dma"])
 
-    def test_command_task_source_agent_and_hazards_are_absent_safe(self) -> None:
+    def test_command_task_source_agent_model_and_hazards_are_absent_safe(self) -> None:
         task = task_from_mapping(
             {"id": "CMD-05", "title": "Plain task", "status": "Next"}, 0
         )
 
         self.assertEqual(task.agent, "")
+        self.assertEqual(task.model, "")
         self.assertEqual(task.hazards, ())
         payload = task.to_json()
         self.assertNotIn("agent", payload)
+        self.assertNotIn("model", payload)
         self.assertNotIn("hazards", payload)
+
+    def test_command_task_source_rejects_non_string_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "task model must be a string"):
+            task_from_mapping({"id": "CMD-06", "status": "Next", "model": 42}, 0)
 
     def test_command_task_source_rejects_non_string_hazards(self) -> None:
         with self.assertRaisesRegex(ValueError, "task hazards"):

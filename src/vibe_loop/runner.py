@@ -7,7 +7,6 @@ import os
 import re
 import shlex
 import signal
-import string
 import subprocess
 import sys
 import threading
@@ -25,8 +24,9 @@ from vibe_loop.config import (
     AgentDetection,
     AgentResolutionError,
     VibeConfig,
+    command_template_uses_field,
+    format_agent_command,
     resolve_task_agent,
-    shell_quote,
     prepare_shell_command,
 )
 from vibe_loop.generated_profiles import (
@@ -553,7 +553,11 @@ class VibeRunner:
         )
         report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
         report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
-        command_str = command_template.format(prompt=shell_quote(prompt))
+        command_str = format_agent_command(
+            command_template,
+            prompt=prompt,
+            model=self.config.agent.model,
+        )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
             result = retry_subprocess_run(
@@ -588,7 +592,11 @@ class VibeRunner:
             f"{self.config.agent.analysis_command_source}"
         )
         validate_analysis_prompt_delivery(command_template)
-        command_str = command_template.format(prompt=shell_quote(prompt))
+        command_str = format_agent_command(
+            command_template,
+            prompt=prompt,
+            model=self.config.agent.model,
+        )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
             result = retry_subprocess_run(
@@ -637,7 +645,11 @@ class VibeRunner:
         )
         report_status(f"agent default policy source: {AGENT_DEFAULT_POLICY_SOURCE}")
         report_status(f"agent default policy: {AGENT_DEFAULT_POLICY}")
-        command_str = command_template.format(prompt=shell_quote(prompt))
+        command_str = format_agent_command(
+            command_template,
+            prompt=prompt,
+            model=self.config.agent.model,
+        )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
             result = retry_subprocess_run(
@@ -772,8 +784,12 @@ class VibeRunner:
         else:
             worker_prompt = build_worker_prompt(skill_prefix, task, self.config)
         validate_worker_prompt_delivery(command_template, task)
-        command = effective_template.format(
-            prompt=shell_quote(worker_prompt),
+        command = format_agent_command(
+            effective_template,
+            prompt=worker_prompt,
+            model=agent.model,
+            task=task,
+            profile=agent_profile,
             task_id=task.task_id,
             run_id=run_id,
         )
@@ -3178,18 +3194,6 @@ def validate_analysis_prompt_delivery(command_template: str) -> None:
         "`codex exec --sandbox read-only {prompt}` or "
         "`claude -p {prompt} --disallowedTools Edit Write NotebookEdit`."
     )
-
-
-def command_template_uses_field(command_template: str, field: str) -> bool:
-    for (
-        _literal_text,
-        field_name,
-        _format_spec,
-        _conversion,
-    ) in string.Formatter().parse(command_template):
-        if field_name == field:
-            return True
-    return False
 
 
 def selection_worker_json(worker: WorkerView) -> dict[str, object]:

@@ -731,7 +731,8 @@ class CliTests(unittest.TestCase):
                 "[agent]\n"
                 'kind = "codex"\n\n'
                 "[agent.profiles.claude-opus]\n"
-                'kind = "claude"\n\n'
+                'kind = "claude"\n'
+                'model = "opus"\n\n'
                 "[[agent.routing]]\n"
                 'profile = "claude-opus"\n'
                 'match_hazards_any = ["abi"]\n',
@@ -753,6 +754,7 @@ class CliTests(unittest.TestCase):
                 runner._source = _StubSource()
                 runner.run_task(security_task)
                 routed_run = (repo / "claude-args.txt").exists()
+                routed_args = (repo / "claude-args.txt").read_text(encoding="utf-8")
                 routed_ran_codex = (repo / "codex-args.txt").exists()
 
                 (repo / "claude-args.txt").unlink()
@@ -763,6 +765,7 @@ class CliTests(unittest.TestCase):
 
         # The abi-hazard task is dispatched to the claude profile, not codex.
         self.assertTrue(routed_run)
+        self.assertIn("--model\nopus", routed_args)
         self.assertFalse(routed_ran_codex)
         # The unmatched task falls back to the default codex agent.
         self.assertTrue(default_ran_codex)

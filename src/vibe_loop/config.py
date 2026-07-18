@@ -6,6 +6,7 @@ import math
 import re
 import shlex
 import shutil
+import string
 import subprocess
 import sys
 import tomllib
@@ -283,9 +284,11 @@ class AgentConfig:
     command: str | None = None
     selection_command: str | None = None
     analysis_command: str | None = None
+    model: str | None = None
     command_source: str = "unresolved:no-supported-cli"
     selection_command_source: str = "unresolved:no-supported-cli"
     analysis_command_source: str = "unresolved:no-supported-cli"
+    model_source: str = "default:none"
     detected: AgentDetection = dataclasses.field(default_factory=AgentDetection)
     forward_stderr: bool = False
     agent_kind: str = "auto"
@@ -375,6 +378,8 @@ class AgentConfig:
             "selection_command_source": self.selection_command_source,
             "analysis_command_configured": self.analysis_command is not None,
             "analysis_command_source": self.analysis_command_source,
+            "model": self.model,
+            "model_source": self.model_source,
             "forward_stderr": self.forward_stderr,
             "agent_kind": self.agent_kind,
             "agent_kind_source": self.agent_kind_source,
@@ -799,6 +804,8 @@ def read_config_file(path: Path) -> dict[str, Any]:
 def parse_agent(data: object) -> AgentConfig:
     table = expect_table(data, "agent")
     detected = detect_agent_clis()
+    model = optional_nonempty_string(table.get("model"))
+    model_source = "explicit" if model is not None else "default:none"
     agent_kind = optional_nonempty_string(table.get("kind")) or "auto"
     if agent_kind not in AGENT_KIND_VALUES:
         allowed = ", ".join(AGENT_KIND_VALUES)
@@ -841,18 +848,21 @@ def parse_agent(data: object) -> AgentConfig:
         configured_command,
         agent_kind,
         detected,
+        model,
     )
     selection_command, selection_command_source, _ = resolve_agent_command(
         "selection_command",
         configured_selection,
         agent_kind,
         detected,
+        model,
     )
     analysis_command, analysis_command_source, _ = resolve_agent_command(
         "analysis_command",
         configured_analysis,
         agent_kind,
         detected,
+        model,
     )
     prompt_resolution = resolve_agent_prompt_dialect(
         agent_kind,
@@ -865,9 +875,11 @@ def parse_agent(data: object) -> AgentConfig:
         command=command,
         selection_command=selection_command,
         analysis_command=analysis_command,
+        model=model,
         command_source=command_source,
         selection_command_source=selection_command_source,
         analysis_command_source=analysis_command_source,
+        model_source=model_source,
         detected=detected,
         forward_stderr=optional_bool(
             table.get("forward_stderr"), False, "agent.forward_stderr"
@@ -999,16 +1011,42 @@ def resolve_task_agent(config: VibeConfig, task: Any) -> AgentSelection:
     """
     name, source = resolve_task_agent_profile(task, config.agent_routing)
     if not name:
-        return AgentSelection(config.agent, "", source)
-    profile = config.agent_profiles.get(name)
-    if profile is None:
-        available = ", ".join(sorted(config.agent_profiles)) or "none"
-        task_id = getattr(task, "task_id", "") or ""
-        raise AgentResolutionError(
-            f"task {task_id!r} routes to agent profile {name!r} ({source}), "
-            f"which is not defined in [agent.profiles] (defined: {available})."
+        profile = config.agent
+    else:
+        profile = config.agent_profiles.get(name)
+        if profile is None:
+            available = ", ".join(sorted(config.agent_profiles)) or "none"
+            task_id = getattr(task, "task_id", "") or ""
+            raise AgentResolutionError(
+                f"task {task_id!r} routes to agent profile {name!r} ({source}), "
+                f"which is not defined in [agent.profiles] (defined: {available})."
+            )
+    task_model = (getattr(task, "model", "") or "").strip()
+    if task_model:
+        profile = dataclasses.replace(
+            profile,
+            model=task_model,
+            model_source="task.model",
         )
+        profile = apply_model_to_inferred_commands(profile, task_model)
     return AgentSelection(profile, name, source)
+
+
+def apply_model_to_inferred_commands(
+    config: AgentConfig,
+    model: str,
+) -> AgentConfig:
+    agent_kind = config.executable_kind
+    if agent_kind not in SUPPORTED_AGENT_CLIS:
+        return config
+    replacements: dict[str, str] = {}
+    for key in ("command", "selection_command", "analysis_command"):
+        source = getattr(config, f"{key}_source")
+        if source != "explicit" and getattr(config, key) is not None:
+            replacements[key] = default_agent_command(agent_kind, key, model)
+    if not replacements:
+        return config
+    return dataclasses.replace(config, **replacements)
 
 
 def detect_agent_clis(path: str | None = None) -> AgentDetection:
@@ -1023,6 +1061,7 @@ def resolve_agent_command(
     configured: str | None,
     agent_kind: str,
     detected: AgentDetection,
+    model: str | None,
 ) -> tuple[str | None, str, str | None]:
     if configured is not None:
         return configured, "explicit", None
@@ -1031,7 +1070,7 @@ def resolve_agent_command(
     if agent_kind in SUPPORTED_AGENT_CLIS:
         if detected.path_for(agent_kind):
             return (
-                AGENT_COMMAND_DEFAULTS[agent_kind][key],
+                default_agent_command(agent_kind, key, model),
                 f"agent.kind:{agent_kind}",
                 agent_kind,
             )
@@ -1042,16 +1081,69 @@ def resolve_agent_command(
         if len(available) > 1:
             source = f"auto:codex:{AGENT_DEFAULT_POLICY_SOURCE}"
         return (
-            AGENT_COMMAND_DEFAULTS[AGENT_PREFERRED_CLI][key],
+            default_agent_command(AGENT_PREFERRED_CLI, key, model),
             source,
             AGENT_PREFERRED_CLI,
         )
     if len(available) == 1:
         agent_name = available[0]
-        return AGENT_COMMAND_DEFAULTS[agent_name][key], f"auto:{agent_name}", agent_name
+        return (
+            default_agent_command(agent_name, key, model),
+            f"auto:{agent_name}",
+            agent_name,
+        )
     if not available:
         return None, "unresolved:no-supported-cli", None
     return None, "unresolved:multiple-supported-clis", None
+
+
+def default_agent_command(agent_kind: str, key: str, model: str | None) -> str:
+    command = AGENT_COMMAND_DEFAULTS[agent_kind][key]
+    if model is None:
+        return command
+    if agent_kind == "codex":
+        return command.replace("codex exec", "codex exec -m {model}", 1)
+    return command.replace("claude -p", "claude -p --model {model}", 1)
+
+
+def format_agent_command(
+    command_template: str,
+    *,
+    prompt: str,
+    model: str | None,
+    task: Any | None = None,
+    profile: str = "",
+    **format_fields: str,
+) -> str:
+    if not model and command_template_uses_field(command_template, "model"):
+        task_context = ""
+        if task is not None:
+            task_id = getattr(task, "task_id", "") or ""
+            task_context = f"task {task_id!r} "
+        profile_name = profile or "default"
+        model_setting = f"agent.profiles.{profile}.model" if profile else "agent.model"
+        raise AgentResolutionError(
+            f"{task_context}agent profile {profile_name!r} command template "
+            f"references {{model}}, but no model is resolved; set task.model "
+            f"or {model_setting}."
+        )
+    return command_template.format(
+        prompt=shell_quote(prompt),
+        model=shell_quote(model or ""),
+        **format_fields,
+    )
+
+
+def command_template_uses_field(command_template: str, field: str) -> bool:
+    for (
+        _literal_text,
+        field_name,
+        _format_spec,
+        _conversion,
+    ) in string.Formatter().parse(command_template):
+        if field_name == field:
+            return True
+    return False
 
 
 def resolve_agent_prompt_dialect(

@@ -158,11 +158,11 @@ class Task:
     approval_state: str = ""
     source_fingerprints: tuple[dict[str, object], ...] = ()
     order: int = 0
-    # Per-task agent routing inputs. `agent` is an explicit profile-name override
-    # (highest precedence at dispatch); `hazards` feeds routing predicates. Both
-    # are absent-safe: they default empty and only populate when the task source
-    # supplies them, so existing task sources are unaffected.
+    # Per-task agent routing inputs. `agent` selects a profile, `model` overrides
+    # that profile's model, and `hazards` feeds routing predicates. They are
+    # absent-safe so existing task sources are unaffected.
     agent: str = ""
+    model: str = ""
     hazards: tuple[str, ...] = ()
 
     @property
@@ -213,6 +213,8 @@ class Task:
             ]
         if self.agent:
             payload["agent"] = self.agent
+        if self.model:
+            payload["model"] = self.model
         if self.hazards:
             payload["hazards"] = list(self.hazards)
         return payload
@@ -2180,6 +2182,7 @@ def task_from_mapping(value: object, order: int) -> Task:
     design_refs = parse_task_string_array(value.get("design_refs"), "design_refs")
     hazards = parse_task_string_array(value.get("hazards"), "hazards")
     agent = optional_task_string(value.get("agent"), "agent")
+    model = optional_task_string(value.get("model"), "model")
     approval_state = optional_task_string(value.get("approval_state"), "approval_state")
     source_fingerprints = normalize_source_fingerprints(
         value.get("source_fingerprints"),
@@ -2212,6 +2215,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         source_fingerprints=source_fingerprints,
         order=order,
         agent=agent,
+        model=model,
         hazards=dedupe_preserving_order(
             hazard.strip() for hazard in hazards if hazard.strip()
         ),

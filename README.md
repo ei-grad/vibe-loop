@@ -412,6 +412,7 @@ state_dir = ".vibe-loop"
 [agent]
 # Optional when kind = "auto" and Codex or Claude is available on PATH.
 kind = "auto"
+# model = "gpt-5.4"  # optional; inferred commands add the kind-specific flag
 command = "codex exec {prompt}"
 selection_command = "codex exec {prompt}"
 # analysis_command runs a read-only agent for autopilot decisions; the default is
@@ -507,8 +508,11 @@ configuration error, not an implicit Codex default. Legacy configs that set
 `agent.command` without `agent.kind` still run; set one of the dialect fields to
 clear the migration diagnostic.
 
-`agent.command` receives `{task_id}`, `{run_id}`, and a shell-quoted `{prompt}`
-(skill reference, normalized task context, CLI addendum). Workers also get
+`agent.command` receives `{task_id}`, `{run_id}`, a shell-quoted `{prompt}`
+(skill reference, normalized task context, CLI addendum), and a shell-quoted
+`{model}` when `agent.model` or the task's `model` field resolves one. A template
+that references `{model}` fails before launch when no model is resolved. Workers
+also get
 `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in
 their environment; `selection_command` receives a `{prompt}` with the candidate
 list and recent run context. Single-task selection prints JSON with `task_id`;
@@ -543,7 +547,7 @@ kind = "codex"            # default profile: fast, separate quota
 
 [agent.profiles.claude-opus]
 kind = "claude"
-command = "claude -p {prompt} --model opus"
+model = "opus"
 
 [[agent.routing]]
 profile = "claude-opus"
@@ -552,11 +556,13 @@ match_paths_glob = ["kernel/**"]            # optional extra constraint
 ```
 
 Each `[agent.profiles.<name>]` table takes the same fields as `[agent]` (`kind`,
-`command`, `selection_command`, `analysis_command`, dialect fields) and resolves
-through the same machinery — a profile with only `kind = "claude"` gets the
-built-in Claude command default. The top-level `[agent]` remains the default
-profile. With no profiles and no routing, behavior is identical to a single
-`[agent]`.
+`model`, `command`, `selection_command`, `analysis_command`, dialect fields) and
+resolves through the same machinery. A profile with `kind = "claude"` and
+`model = "opus"` gets `claude -p --model {model} {prompt}` without an explicit
+command; omitting `model` preserves the bare `claude -p {prompt}` default. Codex
+uses `codex exec -m {model} {prompt}`. The top-level `[agent]` remains the
+default profile. With no profiles and no routing, behavior is identical to a
+single `[agent]`.
 
 `[[agent.routing]]` is an ordered list. Each rule names a `profile` and one or
 more match predicates evaluated against the task; a rule matches when **all** of
@@ -579,8 +585,10 @@ closed rather than silently falling back, so a mistyped profile can never send a
 security task to a refusing agent. The resolved profile name is recorded in the
 run metadata alongside the agent kind and model for provenance.
 
-The per-task `agent` and `hazards` fields come from command-backed task sources
-that emit them in their task JSON (`"agent": "claude-opus"`, `"hazards":
+After profile selection, an explicit per-task `model` overrides the selected
+profile's model; otherwise the profile model is used. The per-task `agent`,
+`model`, and `hazards` fields come from command-backed task sources that emit
+them in task JSON (`"agent": "claude-opus"`, `"model": "sonnet"`, `"hazards":
 ["abi"]`); sources that omit them are unaffected.
 
 ### Locks

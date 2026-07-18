@@ -1379,6 +1379,37 @@ class AgentProfileRoutingTests(unittest.TestCase):
         config = self._load_with_both_clis('[agent]\nkind = "codex"\n')
         self.assertEqual(config.agent_profiles, {})
         self.assertEqual(config.agent_routing, ())
+        self.assertIsNone(config.agent.model)
+
+    def test_agent_and_profile_parse_model(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\nmodel = "gpt-5.4"\n\n'
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n'
+            'model = "opus"\n'
+        )
+
+        self.assertEqual(config.agent.model, "gpt-5.4")
+        self.assertEqual(config.agent.model_source, "explicit")
+        self.assertEqual(config.agent_profiles["opus"].model, "opus")
+        self.assertEqual(config.agent_profiles["opus"].model_source, "explicit")
+
+    def test_kind_defaults_include_configured_model(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\nmodel = "gpt-5.4"\n\n'
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n'
+            'model = "opus"\n'
+        )
+
+        self.assertEqual(
+            config.agent.command,
+            "codex exec -m {model} {prompt}",
+        )
+        self.assertEqual(
+            config.agent_profiles["opus"].command,
+            "claude -p --model {model} {prompt}",
+        )
 
     def test_profile_resolves_command_through_kind_defaults(self) -> None:
         config = self._load_with_both_clis(
@@ -1386,6 +1417,7 @@ class AgentProfileRoutingTests(unittest.TestCase):
         )
         opus = config.agent_profiles["opus"]
         self.assertEqual(opus.command, "claude -p {prompt}")
+        self.assertIsNone(opus.model)
         self.assertEqual(opus.agent_kind, "claude")
         self.assertEqual(opus.skill_ref_prefix, "/")
         # The default [agent] is untouched by the profile.
@@ -1512,6 +1544,68 @@ class AgentProfileRoutingTests(unittest.TestCase):
         default_selection = resolve_task_agent(config, default)
         self.assertEqual(default_selection.profile, "")
         self.assertEqual(default_selection.config.command, "codex exec {prompt}")
+
+    def test_resolve_task_agent_model_precedence(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent.profiles.opus]\nkind = "claude"\nmodel = "opus"\n'
+        )
+
+        inherited = resolve_task_agent(
+            config,
+            Task(task_id="T1", title="t", status="Next", agent="opus"),
+        )
+        overridden = resolve_task_agent(
+            config,
+            Task(
+                task_id="T2",
+                title="t",
+                status="Next",
+                agent="opus",
+                model="sonnet",
+            ),
+        )
+
+        self.assertEqual(inherited.config.model, "opus")
+        self.assertEqual(inherited.config.model_source, "explicit")
+        self.assertEqual(overridden.config.model, "sonnet")
+        self.assertEqual(overridden.config.model_source, "task.model")
+        self.assertEqual(overridden.profile, "opus")
+
+    def test_task_only_model_updates_inferred_but_not_explicit_command(self) -> None:
+        config = self._load_with_both_clis(
+            "[agent.profiles.inferred]\n"
+            'kind = "claude"\n\n'
+            "[agent.profiles.explicit]\n"
+            'kind = "claude"\n'
+            'command = "worker {prompt}"\n'
+        )
+
+        inferred = resolve_task_agent(
+            config,
+            Task(
+                task_id="T1",
+                title="t",
+                status="Next",
+                agent="inferred",
+                model="sonnet",
+            ),
+        )
+        explicit = resolve_task_agent(
+            config,
+            Task(
+                task_id="T2",
+                title="t",
+                status="Next",
+                agent="explicit",
+                model="sonnet",
+            ),
+        )
+
+        self.assertEqual(
+            inferred.config.command,
+            "claude -p --model {model} {prompt}",
+        )
+        self.assertEqual(explicit.config.command, "worker {prompt}")
 
     def test_resolve_task_agent_unknown_profile_fails_closed(self) -> None:
         config = VibeConfig(repo=Path("."))

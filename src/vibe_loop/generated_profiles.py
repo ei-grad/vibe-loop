@@ -17,8 +17,8 @@ from vibe_loop.config import (
     AgentResolutionError,
     TaskSourceConfig,
     VibeConfig,
+    format_agent_command,
     reject_generated_command_adapters,
-    shell_quote,
     prepare_shell_command,
 )
 from vibe_loop.generated_discovery import (
@@ -417,7 +417,11 @@ def configure_generated_task_source(
         )
 
     prompt = build_generated_task_source_prompt(bundle)
-    command_str = command_template.format(prompt=shell_quote(prompt))
+    command_str = format_agent_command(
+        command_template,
+        prompt=prompt,
+        model=config.agent.model,
+    )
     cmd, use_shell = prepare_shell_command(command_str)
     try:
         result = retry_subprocess_run(

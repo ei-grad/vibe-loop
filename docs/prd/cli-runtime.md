@@ -69,10 +69,19 @@ from a simple command shape, or fall back to the legacy Codex-style prefix, but
 diagnostics must identify that the prompt dialect came from legacy inference or
 legacy defaulting and tell the user how to make it explicit.
 
-Executable command resolution and prompt dialect resolution are independent.
+Executable command resolution, model resolution, and prompt dialect resolution
+are independent. `[agent]` and each named agent profile may set an optional
+`model`. Omitted built-in commands include the kind-specific model flag only
+when a model is resolved: Codex uses `-m`, while Claude uses `--model`. A task's
+optional `model` overrides the selected profile's model without changing how
+that profile is selected.
+
 Explicit user-authored `command` and `selection_command` values remain
-authoritative executable templates. `command` receives `{prompt}`, `{task_id}`,
-and `{run_id}`; `selection_command` receives `{prompt}`. The worker prompt is
+authoritative executable templates. `command` receives `{prompt}`, `{model}`,
+`{task_id}`, and `{run_id}`; `selection_command` receives `{prompt}` and
+`{model}`. `{model}` is shell-quoted and fails closed before launch when the
+template references it but neither task nor profile configuration resolves a
+model. Templates that omit `{model}` remain unchanged. The worker prompt is
 constructed from the selected skill reference syntax, the normalized task, and
 the runner's worker addendum; selection prompts do not use the worker skill
 reference syntax. A worker command for a task with traceability metadata must

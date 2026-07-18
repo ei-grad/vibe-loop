@@ -26,6 +26,8 @@ from vibe_loop.config import (
     SupervisionConfig,
     SUPERVISION_DEFAULT_MAX_RESTARTS,
     VibeConfig,
+    resolve_task_agent,
+    shell_quote,
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
@@ -44,6 +46,7 @@ from vibe_loop.runner import (
     command_supports_session_capture,
     command_supports_session_resume,
     deterministic_task_batch,
+    format_agent_command,
     build_resume_continuation_prompt,
     inject_claude_resume,
     inject_claude_session_id,
@@ -4036,6 +4039,105 @@ class AnalysisAgentTests(unittest.TestCase):
             )
             with self.assertRaises(AgentResolutionError):
                 runner.run_analysis_agent("inspect", repo / "decision.json")
+
+
+class AgentCommandModelTests(unittest.TestCase):
+    def test_built_command_uses_resolved_profile_and_task_model(self) -> None:
+        config = VibeConfig(
+            repo=Path("."),
+            agent_profiles={
+                "opus": AgentConfig(
+                    command="worker --model {model} {prompt}",
+                    model="opus",
+                )
+            },
+        )
+
+        for task_model, expected_model in (("", "opus"), ("sonnet", "sonnet")):
+            with self.subTest(task_model=task_model):
+                task = Task(
+                    task_id="TASK-01",
+                    title="Task",
+                    status="Next",
+                    agent="opus",
+                    model=task_model,
+                )
+                selection = resolve_task_agent(config, task)
+                command = format_agent_command(
+                    selection.config.require_command(),
+                    prompt="inspect repo",
+                    model=selection.config.model,
+                    task=task,
+                    profile=selection.profile,
+                )
+
+                self.assertEqual(
+                    command,
+                    f"worker --model {expected_model} {shell_quote('inspect repo')}",
+                )
+
+    def test_format_agent_command_substitutes_shell_quoted_model(self) -> None:
+        command = format_agent_command(
+            "worker --model {model} {prompt}",
+            prompt="inspect repo",
+            model="model with spaces",
+            task_id="TASK-01",
+            profile="opus",
+        )
+
+        self.assertEqual(
+            command,
+            f"worker --model {shell_quote('model with spaces')} "
+            f"{shell_quote('inspect repo')}",
+        )
+
+    def test_format_agent_command_without_model_field_is_unchanged(self) -> None:
+        expected = f"worker {shell_quote('inspect repo')}"
+        for model in (None, "opus"):
+            with self.subTest(model=model):
+                self.assertEqual(
+                    format_agent_command(
+                        "worker {prompt}",
+                        prompt="inspect repo",
+                        model=model,
+                        task_id="TASK-01",
+                        profile="opus",
+                    ),
+                    expected,
+                )
+
+    def test_run_task_model_field_without_resolved_model_does_not_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent_profiles={
+                        "opus": AgentConfig(
+                            command="worker --model {model} {prompt}",
+                            prompt_dialect="codex",
+                            skill_ref_prefix="$",
+                        )
+                    },
+                )
+            )
+            task = Task(
+                task_id="TASK-01",
+                title="Task",
+                status="Next",
+                agent="opus",
+            )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc"):
+                    with patch("vibe_loop.runner.run_streaming_command") as launch:
+                        with self.assertRaisesRegex(
+                            AgentResolutionError,
+                            "task 'TASK-01'.*profile 'opus'.*no model",
+                        ):
+                            runner.run_task(task)
+
+            launch.assert_not_called()
 
 
 class SessionIdInjectionTests(unittest.TestCase):
