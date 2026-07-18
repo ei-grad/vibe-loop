@@ -1939,11 +1939,12 @@ class VibeRunner:
     ) -> RunResult | None:
         try:
             task = self.source.probe(prior_result.task_id)
-        except (subprocess.SubprocessError, OSError) as exc:
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
             # The classification probe falls through to "unknown" on a probe
             # failure, which routes here; a command-backed probe that keeps
-            # failing (nonzero exit, spawn error, or timeout) must skip recovery
-            # rather than propagate, mirroring the task-absent skip below.
+            # failing (nonzero exit, spawn error, timeout, or invalid JSON) must
+            # skip recovery rather than propagate, mirroring the task-absent
+            # skip below.
             report_status(
                 "unknown-run recovery skipped: task-source probe failed for "
                 f"{prior_result.task_id}: {exc}"
@@ -2071,10 +2072,11 @@ class VibeRunner:
             return ClassificationResult("failed", "exit_code_or_completion_check")
         try:
             task = self.source.probe(task_id)
-        except (subprocess.SubprocessError, OSError) as exc:
+        except (subprocess.SubprocessError, OSError, ValueError) as exc:
             # A command-backed probe can fail to shell out (OSError), exit
             # nonzero (CalledProcessError), or hang past its timeout
-            # (TimeoutExpired). None of these confirm the run's outcome, so fall
+            # (TimeoutExpired), while malformed JSON or task data raises
+            # ValueError. None of these confirm the run's outcome, so fall
             # through to the same "unknown" fallback an indeterminate probe
             # already yields: the run is reconciled by unknown-run recovery
             # instead of crashing the dispatch loop (run_next only catches

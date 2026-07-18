@@ -851,6 +851,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "unknown")
         self.assertEqual(result.source, "task_probe_error")
 
+    def test_classify_falls_through_to_unknown_on_malformed_probe_json(self) -> None:
+        class MalformedJsonSource(MutableTaskSource):
+            def probe(self, task_id: str) -> Task | None:
+                raise ValueError("malformed task-source JSON")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            runner._source = MalformedJsonSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            result = runner.classify("TASK-01", 0, "aaa", "aaa", "", None)
+
+        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.source, "task_probe_error")
+
     def test_classify_detects_limit_wall_before_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(VibeConfig(repo=Path(directory)))
@@ -3247,6 +3262,31 @@ class TransientWorkerFailureTests(unittest.TestCase):
                 start_main="aaa",
                 end_main="aaa",
             )
+            result = runner.recover_unknown_run(prior, attempt=1, max_attempts=3)
+
+        self.assertIsNone(result)
+
+    def test_recover_unknown_run_skips_when_probe_json_is_malformed(self) -> None:
+        class MalformedJsonSource(MutableTaskSource):
+            def probe(self, task_id: str) -> Task | None:
+                raise ValueError("malformed task-source JSON")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            runner._source = MalformedJsonSource([])
+            prior = RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="unknown",
+                exit_code=0,
+                log_path=repo / "run-1.log",
+                start_main="aaa",
+                end_main="aaa",
+            )
+
             result = runner.recover_unknown_run(prior, attempt=1, max_attempts=3)
 
         self.assertIsNone(result)
