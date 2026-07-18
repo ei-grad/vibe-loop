@@ -19,3 +19,4 @@ commands = [
 
 [autopilot]
 planning_command = "python scripts/planning_hook.py"
+require_clean_repo = false

@@ -8,6 +8,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -16,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from vibe_loop.autopilot import execute_autopilot_cycle, run_maintenance_command
 from vibe_loop.config import VibeConfig, load_config, prepare_shell_command, shell_quote
 from vibe_loop.locks import LockManager, build_lock_manager
 
@@ -45,6 +47,7 @@ from vibe_loop.evals import (
     validate_skill_eval_run_record,
 )
 from vibe_loop.runs import RunStore, WORKER_REPORT_STATUSES
+from vibe_loop.runner import VibeRunner
 from vibe_loop.tasks import build_task_source, runnable_tasks
 from vibe_loop.workers import build_worker_views
 
@@ -470,8 +473,14 @@ def run_trial(
     execution = agent_batch.execution
     command = execution.command
     hook_results: list[dict[str, object]] = []
+    hook_runtime: dict[str, object] = {}
     if "hook_evidence" in case.expected_artifact_roles:
-        hook_results = run_configured_fixture_hooks(repo_config, budgets)
+        hook_results, hook_runtime = run_configured_fixture_hooks(
+            repo_config,
+            budgets,
+            task_id=case.task_id,
+            run_id=run_id,
+        )
     write_run_log(trial_root, case, condition, run_id, execution)
     write_transcript_if_missing(trial_root, execution)
     git_after = collect_git_state(repo)
@@ -484,6 +493,7 @@ def run_trial(
             repo,
             repo_config,
             hook_results=hook_results,
+            runtime=hook_runtime,
         )
     transcript_graders = run_transcript_graders(
         config.transcript_graders,
@@ -2419,31 +2429,94 @@ def write_task_source_evidence(artifact_root: Path, config: VibeConfig) -> None:
 def run_configured_fixture_hooks(
     config: VibeConfig,
     budgets: Mapping[str, int],
-) -> list[dict[str, object]]:
-    commands = [
-        ("completion", index, command)
-        for index, command in enumerate(config.completion.commands, start=1)
-    ]
-    if config.autopilot.planning_command:
-        commands.append(("planning", 1, config.autopilot.planning_command))
+    *,
+    task_id: str,
+    run_id: str,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+    runner = VibeRunner(config)
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as completion_log:
+        completion_message = runner.run_completion_checks(completion_log)
+        completion_log.seek(0)
+        results = completion_results_from_runtime_log(completion_log.read())
+    head = git_output(config.repo, "rev-parse", "--verify", "HEAD")
+    classification = runner.classify(
+        task_id,
+        0,
+        head,
+        head,
+        completion_message,
+    )
+
+    planning_results = []
+
+    def maintenance_runner(*args, **kwargs):
+        result = run_maintenance_command(*args, **kwargs)
+        planning_results.append(result)
+        return result
+
+    def refuse_worker_launch(*args, **kwargs):
+        raise RuntimeError("fixture planning cycle unexpectedly launched a worker")
+
+    cycle = execute_autopilot_cycle(
+        config,
+        cycle_id=f"{run_id}-planning",
+        jobs=1,
+        ask_agent=False,
+        continue_on_failure=False,
+        max_slices=1,
+        max_tasks=1,
+        min_ready=2,
+        next_wake="",
+        process_exists=lambda _pid: True,
+        launcher=refuse_worker_launch,
+        run_store=RunStore(config.state_path / "runs.jsonl"),
+        maintenance_runner=maintenance_runner,
+        command_timeout=min(30, budgets["timeout_seconds"]),
+        command_max_output_bytes=min(65536, budgets["max_output_bytes"]),
+    )
+    results.extend(
+        {
+            "kind": result.kind,
+            "index": index,
+            "exit_code": result.exit_code,
+            "timeout": result.timed_out,
+            "output_truncated": result.output_truncated,
+        }
+        for index, result in enumerate(planning_results, start=1)
+    )
+    return results, {
+        "completion_classification": classification.status,
+        "completion_classification_source": classification.source,
+        "planning_cycle_status": cycle.status,
+        "planning_actions": [
+            action
+            for action in cycle.actions
+            if action.startswith("ran_planning_command:")
+        ],
+    }
+
+
+def completion_results_from_runtime_log(log: str) -> list[dict[str, object]]:
+    prefix = "completion check exit_code="
     results: list[dict[str, object]] = []
-    env = os.environ.copy()
-    env["PYTHONIOENCODING"] = "utf-8"
-    for kind, index, command in commands:
-        _stdout, _stderr, exit_code, timeout, truncated = run_process_with_budgets(
-            command,
-            cwd=config.repo,
-            env=env,
-            timeout_seconds=min(30, budgets["timeout_seconds"]),
-            max_output_bytes=min(65536, budgets["max_output_bytes"]),
-        )
+    for line in log.splitlines():
+        _before, separator, remainder = line.partition(prefix)
+        if not separator:
+            continue
+        exit_code_text, separator, _command = remainder.partition(":")
+        if not separator:
+            continue
+        try:
+            exit_code = int(exit_code_text)
+        except ValueError:
+            continue
         results.append(
             {
-                "kind": kind,
-                "index": index,
+                "kind": "completion",
+                "index": len(results) + 1,
                 "exit_code": exit_code,
-                "timeout": timeout,
-                "output_truncated": truncated,
+                "timeout": False,
+                "output_truncated": False,
             }
         )
     return results
@@ -2455,6 +2528,7 @@ def write_hook_evidence(
     config: VibeConfig,
     *,
     hook_results: Sequence[Mapping[str, object]],
+    runtime: Mapping[str, object],
 ) -> None:
     events_path = repo / ".vibe-loop" / "hook-events.jsonl"
     events: list[dict[str, object]] = []
@@ -2484,6 +2558,7 @@ def write_hook_evidence(
             "completion_commands_configured": len(config.completion.commands),
             "planning_command_configured": bool(config.autopilot.planning_command),
             "results": [dict(result) for result in hook_results],
+            "runtime": dict(runtime),
             "events": events,
         },
     )

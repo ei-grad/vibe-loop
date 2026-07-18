@@ -309,6 +309,9 @@ Five release cases complement the default table and generated-heading cases:
   completion validation, a worklog recorder configured as a completion command,
   and an autopilot planning hook. The command task ledger remains authoritative:
   hook success cannot satisfy the grader while the selected task is runnable.
+  The harness invokes the production completion/classification path and an idle
+  production autopilot cycle, so regressions in task probing or planning-hook
+  dispatch fail the case instead of being masked by eval-only command execution.
 
 The user-story cases add `task_source_evidence`, captured before implementation,
 with normalized tasks, runnable IDs, and the selected task. The command case also

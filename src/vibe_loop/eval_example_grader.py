@@ -490,6 +490,28 @@ def artifact_hook_evidence(
         )
     if any(item.get("exit_code") != 0 for item in results):
         return failed("artifact-hook-evidence", "a configured hook failed")
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, Mapping):
+        return failed("artifact-hook-evidence", "runtime evidence must be an object")
+    if runtime.get("completion_classification") != "completed":
+        return failed(
+            "artifact-hook-evidence",
+            "production completion classification did not complete the task",
+        )
+    if runtime.get("completion_classification_source") != "task_probe":
+        return failed(
+            "artifact-hook-evidence",
+            "production completion did not use task-source authority",
+        )
+    if runtime.get("planning_cycle_status") != "idle":
+        return failed(
+            "artifact-hook-evidence", "production planning cycle was not idle"
+        )
+    if runtime.get("planning_actions") != ["ran_planning_command:exit=0"]:
+        return failed(
+            "artifact-hook-evidence",
+            "production planning dispatch did not succeed",
+        )
     return passed("artifact-hook-evidence")
 
 
