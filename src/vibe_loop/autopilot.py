@@ -1328,8 +1328,9 @@ def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
     runnable work was below ``min_ready``; it is also the only branch that runs
     the planning command. So an idle status captures exactly the cases where the
     board may gain runnable tasks out of band, and sleeping the full interval
-    would strand them. Cycles that dispatched, observed, or were blocked keep the
-    plain interval sleep.
+    would strand them. Completed dispatch cycles use a separate fresh queue poll
+    to detect a drained board; observing and blocked cycles keep the plain
+    interval sleep.
 
     An idle cycle with no planning command configured still rechecks: that is
     deliberate, so out-of-band task additions (a peer or operator filling the
@@ -1356,7 +1357,7 @@ def recheck_sleep_slices(interval: float, recheck_seconds: float) -> Iterator[fl
 
 
 def poll_runnable_count(config: VibeConfig) -> int:
-    """Cheap runnable-task poll for the post-planning recheck loop.
+    """Cheap runnable-task poll for post-planning and post-dispatch rechecks.
 
     Reuses the same task-source listing as cycle status collection. Any probe
     failure is reported as zero runnable so a transient error keeps the
@@ -1531,6 +1532,33 @@ def run_autopilot(
                 maintenance_runner=maintenance_runner,
                 worktree_disposition_runner=worktree_disposition_runner,
             )
+            post_cycle_planning_delay: float | None = None
+            if (
+                not bounded_last
+                and interval > 0
+                and result.status == "completed"
+                and result.limit_wall_pause_seconds is None
+            ):
+                post_cycle_runnable = poll_runnable_count(config)
+                threshold = max(1, min_ready)
+                post_cycle_action = (
+                    f"post_cycle_runnable:{post_cycle_runnable}/{threshold}"
+                )
+                if post_cycle_runnable < threshold:
+                    post_cycle_planning_delay = min(
+                        interval,
+                        config.autopilot.planning_recheck_seconds,
+                    )
+                    result = dataclasses.replace(
+                        result,
+                        actions=(*result.actions, post_cycle_action),
+                        next_wake=iso_after(post_cycle_planning_delay),
+                    )
+                else:
+                    result = dataclasses.replace(
+                        result,
+                        actions=(*result.actions, post_cycle_action),
+                    )
             result.append_to(run_store)
             cycles.append(result)
             if bounded_last:
@@ -1570,6 +1598,14 @@ def run_autopilot(
                             "appeared, starting next cycle early",
                             flush=True,
                         )
+                elif post_cycle_planning_delay is not None:
+                    print(
+                        "[vibe-loop] autopilot post-dispatch recheck: queue "
+                        "below min-ready, starting the next cycle after "
+                        f"{post_cycle_planning_delay:.0f}s",
+                        flush=True,
+                    )
+                    sleeper(post_cycle_planning_delay)
                 else:
                     sleeper(interval)
                 continue
