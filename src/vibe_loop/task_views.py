@@ -5,10 +5,9 @@ from collections import defaultdict
 
 from vibe_loop.tasks import (
     DEFAULT_RUNNABLE_STATUSES,
-    DONE_STATUS,
-    STATUS_RANK,
     Task,
     priority_rank,
+    status_rank,
 )
 
 
@@ -30,7 +29,7 @@ def build_task_views(
     locked_ids: set[str],
     runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES,
 ) -> list[TaskView]:
-    done = {task.task_id for task in tasks if task.status == DONE_STATUS}
+    done = {task.task_id for task in tasks if task.done}
     runnable = set(runnable_statuses)
     return [
         TaskView(
@@ -54,7 +53,7 @@ def filter_views(
     for view in views:
         if statuses is not None and view.task.status not in statuses:
             continue
-        if statuses is None and not include_done and view.task.status == DONE_STATUS:
+        if statuses is None and not include_done and view.task.done:
             continue
         if ready_only and not view.ready:
             continue
@@ -64,7 +63,7 @@ def filter_views(
 
 def view_sort_key(view: TaskView) -> tuple[int, int, int]:
     return (
-        STATUS_RANK.get(view.task.status, 9),
+        status_rank(view.task.status),
         priority_rank(view.task.priority),
         view.task.order,
     )

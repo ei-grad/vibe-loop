@@ -67,7 +67,13 @@ from vibe_loop.runs import (
     utc_now_iso,
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
-from vibe_loop.tasks import Task, TaskSource, build_task_source, runnable_tasks
+from vibe_loop.tasks import (
+    BLOCKED_FAMILY_STATUSES,
+    Task,
+    TaskSource,
+    build_task_source,
+    runnable_tasks,
+)
 from vibe_loop.workers import (
     ActiveRunState,
     WorkerView,
@@ -2090,7 +2096,7 @@ class VibeRunner:
         # "unknown", which spawns a needless recovery worker.
         if task and task.done:
             return ClassificationResult("completed", "task_probe")
-        if task and task.status.casefold() == "gated":
+        if task and task.status.casefold() in BLOCKED_FAMILY_STATUSES:
             return ClassificationResult("blocked", "task_probe")
         if start_main != end_main and task is None:
             return ClassificationResult("completed", "main_change")

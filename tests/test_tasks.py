@@ -17,7 +17,7 @@ from vibe_loop.tasks import (
     task_from_mapping,
     task_sort_key,
 )
-from vibe_loop.task_views import build_task_views, render_task_tree
+from vibe_loop.task_views import build_task_views, filter_views, render_task_tree
 
 
 PLAN = """# Plan
@@ -71,6 +71,28 @@ class RespectSourceOrderTests(unittest.TestCase):
         self.assertEqual(task_sort_key(task, respect_source_order=True), (9, 3))
         self.assertEqual(task_sort_key(task), (9, 99, 3))
 
+    def test_status_rank_is_case_insensitive(self) -> None:
+        tasks = [
+            Task("PLANNED", "Planned", "Planned", order=0),
+            Task("ACTIVE", "Active", "active", order=1),
+            Task("NEXT", "Next", "NEXT", order=2),
+        ]
+
+        ordered = sorted(tasks, key=task_sort_key)
+
+        self.assertEqual(
+            [task.task_id for task in ordered], ["ACTIVE", "NEXT", "PLANNED"]
+        )
+
+    def test_runnable_status_allowlist_is_case_sensitive(self) -> None:
+        source = self._source([Task("LOWER", "Lowercase", "active")])
+
+        self.assertEqual(runnable_tasks(source, ("Active",)), [])
+        self.assertEqual(
+            [task.task_id for task in runnable_tasks(source, ("active",))],
+            ["LOWER"],
+        )
+
 
 class MarkdownPlanTests(unittest.TestCase):
     def test_task_json_omits_empty_traceability_fields(self) -> None:
@@ -112,6 +134,39 @@ class MarkdownPlanTests(unittest.TestCase):
 
         runnable = runnable_tasks(_Source(), ("ready",))
         self.assertEqual([task.task_id for task in runnable], ["GATED"])
+
+    def test_lowercase_done_status_resolves_task_views_and_is_hidden(self) -> None:
+        done_task = Task("DEP", "Dependency", "done")
+        dependent = Task(
+            "DEPENDENT",
+            "Dependent",
+            "Next",
+            dependencies=("DEP",),
+        )
+
+        views = build_task_views([done_task, dependent], locked_ids=set())
+
+        by_id = {view.task.task_id: view for view in views}
+        self.assertTrue(by_id["DEPENDENT"].ready)
+        self.assertEqual(
+            [view.task.task_id for view in filter_views(views, include_done=False)],
+            ["DEPENDENT"],
+        )
+
+    def test_task_views_sort_status_bands_case_insensitively(self) -> None:
+        views = build_task_views(
+            [
+                Task("PLANNED", "Planned", "Planned", order=0),
+                Task("ACTIVE", "Active", "active", order=1),
+            ],
+            locked_ids=set(),
+            runnable_statuses=("active", "Planned"),
+        )
+
+        self.assertEqual(
+            [view.task.task_id for view in filter_views(views)],
+            ["ACTIVE", "PLANNED"],
+        )
 
     def test_plan_tasks_include_section_for_tree_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

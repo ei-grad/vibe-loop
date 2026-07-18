@@ -18,7 +18,11 @@ from vibe_loop.config import (
 
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
+BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
 STATUS_RANK = {"Active": 0, "Next": 1, "Planned": 2}
+_STATUS_RANK_CASEFOLDED = {
+    status.casefold(): rank for status, rank in STATUS_RANK.items()
+}
 DEFAULT_TASK_TABLE_COLUMNS = (
     "ID",
     "Priority",
@@ -289,12 +293,16 @@ def task_sort_key(
     # source becomes the dispatch authority. A single sort call always uses one
     # mode, so the two key shapes are never compared against each other.
     if respect_source_order:
-        return (STATUS_RANK.get(task.status, 9), task.order)
+        return (status_rank(task.status), task.order)
     return (
-        STATUS_RANK.get(task.status, 9),
+        status_rank(task.status),
         priority_rank(task.priority),
         task.order,
     )
+
+
+def status_rank(status: str) -> int:
+    return _STATUS_RANK_CASEFOLDED.get(status.casefold(), 9)
 
 
 def priority_rank(priority: str) -> int:

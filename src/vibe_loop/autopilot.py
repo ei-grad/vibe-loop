@@ -35,7 +35,7 @@ from vibe_loop.runs import (
     RunStore,
     utc_now_iso,
 )
-from vibe_loop.tasks import Task
+from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
 from vibe_loop.workers import (
     ProcessExists,
     StaleLock,
@@ -59,7 +59,7 @@ Sleep = Callable[[float], None]
 
 AUTOPILOT_RECORD_SCHEMA_VERSION = 1
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
-BLOCKED_QUEUE_STATUSES = frozenset({"blocked", "gated", "low"})
+BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
 
 
 @dataclasses.dataclass(frozen=True)

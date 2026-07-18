@@ -656,6 +656,12 @@ non-runnable) before the next pass — `vibe-loop` deliberately keeps no private
 task-state channel, so agents and humans working without the CLI advance the
 same backlog.
 
+Completion checks, built-in status-band ordering, and blocked-family
+classification are case-insensitive. Configured `runnable_statuses` entries are
+matched exactly against the task source's wire values; adapters that emit
+lowercase statuses should configure lowercase entries. This keeps an explicit
+allowlist from silently accepting additional status spellings.
+
 Setting any explicit source key — `type`, `plan_path`, `plan_paths`, `profile`,
 `list`, `next`, `probe`, `reset` — disables generated cache as the active
 source. Non-source settings such as `runnable_statuses` still override matching

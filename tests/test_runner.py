@@ -663,9 +663,15 @@ class RunnerTests(unittest.TestCase):
                 ("Done", "completed"),
                 ("done", "completed"),
                 ("DONE", "completed"),
+                ("Blocked", "blocked"),
+                ("blocked", "blocked"),
+                ("BLOCKED", "blocked"),
                 ("Gated", "blocked"),
                 ("gated", "blocked"),
                 ("GATED", "blocked"),
+                ("Low", "blocked"),
+                ("low", "blocked"),
+                ("LOW", "blocked"),
             ):
                 with self.subTest(status=raw_status):
                     runner._source = MutableTaskSource(

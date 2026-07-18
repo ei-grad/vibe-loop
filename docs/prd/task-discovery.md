@@ -88,8 +88,10 @@ are done, and local locks do not block execution.
 
 Acceptance must cover default runnable statuses `Active`, `Next`, and
 `Planned`; deterministic ordering by status rank, priority rank, and source
-order; lock exclusion; agent-assisted selection validation; and conflict-domain
-filtering when parallel scheduling is active.
+order; case-insensitive semantic done, rank, and blocked-family comparisons;
+exact-case configured runnable-status allowlists; lock exclusion; agent-assisted
+selection validation; and conflict-domain filtering when parallel scheduling is
+active.
 
 Related implementation IDs: `CORE-02`, `DISC-10`, `PAR-01`, `PAR-07`,
 `PAR-08`.
