@@ -15,6 +15,8 @@ from importlib.metadata import version as metadata_version
 from pathlib import Path
 
 from vibe_loop.autopilot import (
+    AUTOPILOT_RUNTIME_CONTEXT_FD_ENV,
+    AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES,
     DEFAULT_WAIT_CYCLE_SECONDS,
     DEFAULT_WAIT_POLL_SECONDS,
     ProjectEntry,
@@ -29,6 +31,7 @@ from vibe_loop.autopilot import (
     redact_runtime_context_payload,
     redact_runtime_context_text,
     run_autopilot,
+    start_detached_autopilot,
     wait_for_processes,
     WaitMessageAdapterError,
     WaitResult,
@@ -333,6 +336,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_repo_argument(autopilot_run)
     add_autopilot_run_arguments(autopilot_run)
+    autopilot_start = autopilot_subparsers.add_parser(
+        "start",
+        help="Start and verify a detached POSIX autopilot supervisor",
+    )
+    add_repo_argument(autopilot_start)
+    add_autopilot_run_arguments(autopilot_start)
+    autopilot_start.add_argument("--json", action="store_true")
     autopilot_projects = autopilot_subparsers.add_parser(
         "projects",
         help="Manage the optional multi-project autopilot registry",
@@ -807,7 +817,10 @@ def add_task_filter_arguments(
 
 
 def dispatch(args: argparse.Namespace) -> int:
-    config = load_config(args.repo)
+    config = load_config(
+        args.repo,
+        runtime_context=inherited_runtime_context(),
+    )
     if args.command == "tasks":
         return dispatch_tasks(args, config)
 
@@ -972,6 +985,23 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     raise AssertionError(args.command)
+
+
+def inherited_runtime_context() -> object:
+    fd_text = os.environ.pop(AUTOPILOT_RUNTIME_CONTEXT_FD_ENV, None)
+    if fd_text is None:
+        return None
+    try:
+        fd = int(fd_text)
+        if fd < 3:
+            raise ValueError("invalid runtime context descriptor")
+        with os.fdopen(fd, "rb") as context_file:
+            encoded = context_file.read(AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES + 1)
+        if len(encoded) > AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES:
+            raise ValueError("runtime context exceeds transport limit")
+        return json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid detached autopilot runtime context") from exc
 
 
 def dispatch_runs(args: argparse.Namespace, config) -> int:
@@ -1209,7 +1239,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return 0
     if command == "projects":
         return dispatch_autopilot_projects(args)
-    if command in (None, "run"):
+    if command in (None, "run", "start"):
         ap = config.autopilot
         worktree_disposition = getattr(args, "worktree_disposition", None)
         if worktree_disposition is not None:
@@ -1221,6 +1251,24 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
         interval = _first_set(getattr(args, "interval", None), ap.interval_seconds, 0.0)
         min_ready = _first_set(getattr(args, "min_ready", None), ap.min_ready, 1)
+        if command == "start":
+            launch = start_detached_autopilot(
+                config,
+                jobs=jobs,
+                interval=interval,
+                once=getattr(args, "once", False),
+                max_cycles=getattr(args, "max_cycles", 0),
+                ask_agent=getattr(args, "ask_agent", False),
+                continue_on_failure=getattr(args, "continue_on_failure", False),
+                max_slices=getattr(args, "max_slices", 0),
+                max_tasks=getattr(args, "max_tasks", 0),
+                min_ready=min_ready,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(launch.to_json(), indent=2))
+            else:
+                print(render_detached_autopilot_launch(launch))
+            return launch.exit_code
         summary = run_autopilot(
             config,
             jobs=jobs,
@@ -1243,6 +1291,21 @@ def _first_set(*values: object) -> object:
         if value is not None:
             return value
     return None
+
+
+def render_detached_autopilot_launch(launch) -> str:
+    if not launch.started:
+        message = f"autopilot not started: {launch.blocker or 'unknown'}"
+        if launch.pid is not None:
+            message += f" pid={launch.pid}"
+        if launch.log is not None:
+            message += f" log={launch.log}"
+        return message
+    return (
+        f"autopilot started pid={launch.pid} "
+        f"process_group={launch.process_group_id} session={launch.session_id} "
+        f"run_id={launch.run_id} log={launch.log}"
+    )
 
 
 def render_autopilot_status(status: ProjectStatus) -> str:

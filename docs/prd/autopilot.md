@@ -32,7 +32,8 @@ Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-05`.
 ## PRD-AUT-002 Command Surface
 
 The CLI must expose autopilot through a subcommand group:
-`vibe-loop autopilot run` and `vibe-loop autopilot status`. The bare
+`vibe-loop autopilot run`, `vibe-loop autopilot start`, and
+`vibe-loop autopilot status`. The bare
 `vibe-loop autopilot` command may remain as a shorthand for `run`, but command
 semantics must be explicit in help and tests.
 
@@ -74,6 +75,21 @@ configured state directory, pid/log observation, no duplicate supervisor
 launch, one-cycle mode, bounded cycle counts, foreground interval sleeping,
 signal behavior, and classification of clean drain versus restartable exit
 versus blocked state.
+
+`autopilot run` remains the foreground supervisor contract. On POSIX systems,
+`autopilot start` must provide the supported detached lifecycle by starting
+that same supervisor in a new session with standard streams disconnected or
+redirected. It must not report success until the process is live and owns the
+matching autopilot lock. The launch result and append-only supervisor
+observation must correlate the run ID, PID, process-group or session identity,
+and real log path. Concurrent starts remain lock-fenced. Acceptance includes a
+regression test in which the launcher caller exits while the supervisor remains
+live. A supervisor lock with a configured lease must be heartbeated while the
+foreground supervisor is running, including during child cycles longer than the
+lease. Acceptance also includes documentation that this mechanism is not reboot
+persistence and that platform service managers are required for restart
+policies and non-POSIX hosts. Plain `nohup` is not a sufficient supported
+lifecycle in harnesses that reap child jobs.
 
 Related implementation IDs: `AUTO-03`.
 

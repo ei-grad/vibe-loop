@@ -1,14 +1,15 @@
 ---
 name: autopilot
-description: Use for unattended stewardship of an autonomous vibe-loop development loop. The agent keeps `vibe-loop run-until-done` running and healthy, reviews what landed, replenishes the ready queue by running planning through the orchestrated-vibe-loop skill, and recovers the supervisor, running until stopped.
+description: Use for unattended stewardship of an autonomous vibe-loop development loop. The agent keeps the detached autopilot supervisor running and healthy, reviews what landed, replenishes the ready queue by running planning through the orchestrated-vibe-loop skill, and recovers the supervisor, running until stopped.
 ---
 
 # Autopilot
 
 Use this skill to steward an autonomous `vibe-loop` development loop. The agent
-drives `vibe-loop run-until-done` as the worker pool and adds the judgement a
-plain loop cannot: reviewing landed work, troubleshooting worker sessions,
-planning to keep the ready queue fed, and deciding when to recover or stop.
+keeps the CLI autopilot supervisor healthy while it drives
+`vibe-loop run-until-done` as the worker pool, and adds the judgement a plain
+loop cannot: reviewing landed work, troubleshooting worker sessions, planning
+to keep the ready queue fed, and deciding when to recover or stop.
 
 This is an operator skill, not a worker skill. It drives the `vibe-loop` CLI and
 delegates analysis, planning, and any code/docs work to subagents and skills. It
@@ -63,20 +64,23 @@ Before launching, confirm:
 - no other `vibe-loop run-until-done` supervisor is already active for this
   repository.
 
-Start the supervisor in the background and capture its pid and log path, for
-example:
+Use the supported detached launcher on POSIX systems:
 
 ```bash
-mkdir -p .vibe-loop/_logs
-ts=$(date -u +%Y%m%dT%H%M%SZ)
-nohup vibe-loop run-until-done --jobs 2 \
-  > ".vibe-loop/_logs/run-$ts.log" 2>&1 &
-printf 'run-until-done pid=%s log=%s\n' "$!" ".vibe-loop/_logs/run-$ts.log"
+vibe-loop autopilot start --interval 60 --jobs 2 --json
 ```
 
-After a short delay, verify the process still exists, the log advanced, and at
-least one task/workspace is claimed. If it exits immediately, read the log and
-recover from the concrete reason before retrying.
+`start` creates a new POSIX session, redirects standard input and output, and
+returns only after the supervisor process and matching autopilot lock are both
+live. Retain its run ID, PID, process-group/session IDs, and log path. If launch
+verification fails, inspect the reported blocker and log before retrying.
+
+This detached path survives normal caller exit but is not a boot service. Use a
+platform service manager such as systemd, launchd, or a container orchestrator
+when restart-on-failure, reboot persistence, resource limits, or non-POSIX
+operation is required. Do not substitute a plain `nohup ... &` launch in job
+harnesses that reap child jobs; it has no verified lock handoff or durable
+session identity.
 
 ## Wake / Wait
 

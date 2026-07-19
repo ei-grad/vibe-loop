@@ -3,9 +3,11 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -32,11 +34,17 @@ from vibe_loop.autopilot import (
     run_autopilot,
     run_maintenance_command,
     run_worktree_disposition,
+    start_detached_autopilot,
     wait_for_processes,
     WaitMessageAdapterError,
 )
-from vibe_loop.config import load_config
-from vibe_loop.locks import AUTOPILOT_LOCK_NAME, build_lock_manager
+from vibe_loop.config import load_config, normalize_registry_runtime_context
+from vibe_loop.locks import (
+    AUTOPILOT_LOCK_NAME,
+    LockBackendError,
+    LockManager,
+    build_lock_manager,
+)
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
@@ -47,6 +55,32 @@ from vibe_loop.runs import (
     RunStore,
 )
 from vibe_loop.workers import ActiveRunState
+
+
+def stop_test_process_group(pid: int, process_group_id: int) -> None:
+    for stop_signal, timeout in (
+        (signal.SIGINT, 5.0),
+        (signal.SIGTERM, 2.0),
+        (signal.SIGKILL, 2.0),
+    ):
+        try:
+            os.killpg(process_group_id, stop_signal)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+            else:
+                if waited_pid == pid:
+                    return
+            time.sleep(0.05)
+    raise AssertionError(f"test process did not stop: pid={pid}")
 
 
 class AutopilotStatusTests(unittest.TestCase):
@@ -673,6 +707,267 @@ class AutopilotRunTests(unittest.TestCase):
                 for record in policy_records
             )
         )
+
+    def test_heartbeats_supervisor_lock_during_long_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[locks]\nlease_seconds = 1\n",
+            )
+            config = load_config(repo)
+            observed_status = None
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal observed_status
+                if on_start is not None:
+                    on_start(4242)
+                time.sleep(1.2)
+                manager = build_lock_manager(
+                    config.repo,
+                    config.state_path / "locks",
+                    config.locks,
+                )
+                observed_status = manager.autopilot_status()
+                return 0
+
+            summary = run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertEqual(summary.exit_code, 0)
+        self.assertIsNotNone(observed_status)
+        self.assertEqual(observed_status.state, "held")
+        self.assertGreater(
+            observed_status.metadata["heartbeat_at"],
+            observed_status.metadata["started_at"],
+        )
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "setsid"),
+        "detached autopilot start is POSIX-only",
+    )
+    def test_start_cleans_candidate_when_lock_verification_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Done", "", "finished slice")])
+            config = load_config(repo)
+            real_status = LockManager.autopilot_status
+            calls = 0
+
+            def flaky_status(manager, *, process_exists=None):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise LockBackendError("injected status failure")
+                return real_status(manager, process_exists=process_exists)
+
+            with mock.patch.object(LockManager, "autopilot_status", flaky_status):
+                launch = start_detached_autopilot(config, interval=30)
+
+            self.assertFalse(launch.started)
+            self.assertIn("verification_failed:LockBackendError", launch.blocker)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(launch.pid, 0)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "setsid"),
+        "detached autopilot start is POSIX-only",
+    )
+    def test_start_cleans_candidate_when_observation_append_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Done", "", "finished slice")])
+            config = load_config(repo)
+
+            with mock.patch.object(
+                RunStore,
+                "append_record",
+                side_effect=OSError("injected journal failure"),
+            ):
+                launch = start_detached_autopilot(config, interval=30)
+
+            self.assertFalse(launch.started)
+            self.assertIn("verification_failed:OSError", launch.blocker)
+            with self.assertRaises(ProcessLookupError):
+                os.kill(launch.pid, 0)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "setsid"),
+        "detached autopilot start is POSIX-only",
+    )
+    def test_start_preserves_command_lock_runtime_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            command = f"{sys.executable} adapter.py"
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    "[locks]\n"
+                    'type = "command"\n'
+                    f"acquire_command = {json.dumps(command)}\n"
+                    f"release_command = {json.dumps(command)}\n"
+                    f"status_command = {json.dumps(command)}\n"
+                    f"list_command = {json.dumps(command)}\n"
+                    "[autopilot]\n"
+                    f"health_command = {json.dumps(f'{sys.executable} env_probe.py maintenance-env.json')}\n"
+                ),
+            )
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    'command = "codex exec {prompt}"',
+                    f"command = {json.dumps(f'{sys.executable} agent.py')}",
+                ),
+                encoding="utf-8",
+            )
+            (repo / "adapter.py").write_text(
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "selector = os.environ['PROJECT_SELECTOR']\n"
+                "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
+                "task_id = os.environ['VIBE_LOOP_LOCK_TASK_ID']\n"
+                "run_id = os.environ['VIBE_LOOP_LOCK_RUN_ID']\n"
+                "metadata = json.loads(os.environ['VIBE_LOOP_LOCK_METADATA_JSON'])\n"
+                "root = Path(os.environ['VIBE_LOOP_LOCK_ROOT'])\n"
+                "root.mkdir(parents=True, exist_ok=True)\n"
+                "path = root / f'{selector}-{task_id}.json'\n"
+                "if operation == 'acquire':\n"
+                "    if path.exists():\n"
+                "        print(json.dumps({'acquired': False, 'metadata': json.loads(path.read_text())}))\n"
+                "    else:\n"
+                "        path.write_text(json.dumps(metadata))\n"
+                "        print(json.dumps({'acquired': True, 'metadata': metadata}))\n"
+                "elif operation == 'update':\n"
+                "    current = json.loads(path.read_text())\n"
+                "    if current['run_id'] != run_id:\n"
+                "        raise SystemExit(9)\n"
+                "    path.write_text(json.dumps(metadata))\n"
+                "    print(json.dumps({'updated': True, 'metadata': metadata}))\n"
+                "elif operation == 'release':\n"
+                "    current = json.loads(path.read_text())\n"
+                "    if current['run_id'] != run_id:\n"
+                "        raise SystemExit(9)\n"
+                "    path.unlink()\n"
+                "    print(json.dumps({'released': True}))\n"
+                "elif operation == 'status':\n"
+                "    print(json.dumps({'locked': path.exists(), 'metadata': json.loads(path.read_text()) if path.exists() else {}}))\n"
+                "elif operation == 'list':\n"
+                "    locks = [json.loads(item.read_text()) for item in root.glob(f'{selector}-*.json')]\n"
+                "    print(json.dumps(locks))\n",
+                encoding="utf-8",
+            )
+            (repo / "env_probe.py").write_text(
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "Path(sys.argv[1]).write_text(json.dumps({\n"
+                "    'selector': 'PROJECT_SELECTOR' in os.environ,\n"
+                "    'transport': 'VIBE_LOOP_AUTOPILOT_RUNTIME_CONTEXT_FD' in os.environ,\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            (repo / "agent.py").write_text(
+                "import json, os\n"
+                "from pathlib import Path\n"
+                "Path('worker-env.json').write_text(json.dumps({\n"
+                "    'selector': 'PROJECT_SELECTOR' in os.environ,\n"
+                "    'transport': 'VIBE_LOOP_AUTOPILOT_RUNTIME_CONTEXT_FD' in os.environ,\n"
+                "}))\n"
+                "plan = Path('PLAN.md')\n"
+                "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'))\n",
+                encoding="utf-8",
+            )
+            run(
+                repo,
+                "git",
+                "add",
+                "adapter.py",
+                "env_probe.py",
+                "agent.py",
+                ".vibe-loop.toml",
+            )
+            run(repo, "git", "commit", "-m", "adapters")
+            selector = "detached-runtime-selector"
+            config = load_config(
+                repo,
+                runtime_context={"PROJECT_SELECTOR": selector},
+            )
+            launch = start_detached_autopilot(config, interval=30)
+            try:
+                deadline = time.monotonic() + 10.0
+                maintenance_probe = repo / "maintenance-env.json"
+                worker_probe = repo / "worker-env.json"
+                while time.monotonic() < deadline and not (
+                    maintenance_probe.exists() and worker_probe.exists()
+                ):
+                    time.sleep(0.05)
+                status = collect_project_status(config)
+                payload = json.dumps(status.to_json(), ensure_ascii=False)
+                self.assertTrue(launch.started, launch.blocker)
+                self.assertTrue(maintenance_probe.is_file())
+                self.assertTrue(worker_probe.is_file())
+                self.assertEqual(
+                    json.loads(maintenance_probe.read_text(encoding="utf-8")),
+                    {"selector": False, "transport": False},
+                )
+                self.assertEqual(
+                    json.loads(worker_probe.read_text(encoding="utf-8")),
+                    {"selector": False, "transport": False},
+                )
+                self.assertEqual(status.supervisor.state, "running")
+                self.assertEqual(status.supervisor.pid, launch.pid)
+                self.assertEqual(status.supervisor.run_id, launch.run_id)
+                self.assertNotIn(selector, payload)
+            finally:
+                stop_test_process_group(launch.pid, launch.process_group_id)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "setsid"),
+        "detached autopilot start is POSIX-only",
+    )
+    def test_start_accepts_near_limit_unicode_runtime_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Done", "", "finished slice")])
+            value = "😀" * 1018
+            runtime_context = normalize_registry_runtime_context(
+                {
+                    "A_PROJECT": value,
+                    "B_PROJECT": value,
+                    "C_PROJECT": value,
+                    "D_PROJECT": value,
+                }
+            )
+            config = load_config(repo, runtime_context=dict(runtime_context))
+
+            launch = start_detached_autopilot(config, interval=30)
+            try:
+                self.assertTrue(launch.started, launch.blocker)
+                status = collect_project_status(config)
+                self.assertEqual(status.supervisor.pid, launch.pid)
+                payload = json.dumps(status.to_json(), ensure_ascii=False)
+                self.assertNotIn(value, payload)
+            finally:
+                stop_test_process_group(launch.pid, launch.process_group_id)
 
     def test_blocks_launch_when_repo_is_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

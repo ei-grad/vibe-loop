@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import signal
 import shlex
 import shutil
 import socket
@@ -20,7 +21,7 @@ from unittest.mock import patch
 
 import vibe_loop.cli as cli_module
 from vibe_loop.cli import main
-from vibe_loop.locks import LockManager
+from vibe_loop.locks import AUTOPILOT_LOCK_NAME, LockManager
 
 
 @contextmanager
@@ -55,6 +56,32 @@ def remove_tree_with_windows_retries(path: Path) -> None:
             if attempt == attempts - 1:
                 raise
         time.sleep(delay)
+
+
+def stop_test_process_group(pid: int, process_group_id: int) -> None:
+    for stop_signal, timeout in (
+        (signal.SIGINT, 5.0),
+        (signal.SIGTERM, 2.0),
+        (signal.SIGKILL, 2.0),
+    ):
+        try:
+            os.killpg(process_group_id, stop_signal)
+        except ProcessLookupError:
+            return
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                waited_pid, _status = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return
+            else:
+                if waited_pid == pid:
+                    return
+            time.sleep(0.05)
+    raise AssertionError(f"test process did not stop: pid={pid}")
 
 
 def toml_string(value: str) -> str:
@@ -510,16 +537,18 @@ class CliTests(unittest.TestCase):
                 r"specs|eval)\b",
             )
         # The autopilot OPERATOR skill drives the CLI by design. It steers the
-        # worker pool through `run-until-done`, feeds the queue via the
-        # orchestrated-vibe-loop skill, and sleeps with `wait-helper` defaults.
-        # It does not delegate supervision to `vibe-loop autopilot run`.
+        # worker pool through the detached autopilot supervisor, feeds the queue
+        # via the orchestrated-vibe-loop skill, and sleeps with `wait-helper`
+        # defaults.
         # Repository agnosticism is enforced separately by
         # RepoAgnosticGuardTests, which scans this SKILL.md under src/.
         self.assertIn("vibe-loop run-until-done", autopilot_text)
+        self.assertIn("vibe-loop autopilot start", autopilot_text)
         self.assertIn("orchestrated-vibe-loop", autopilot_text)
         self.assertIn("vibe-loop wait-helper", autopilot_text)
         self.assertNotIn("--cycle-schedule 1800", autopilot_text)
         self.assertNotIn("vibe-loop autopilot run", autopilot_text)
+        self.assertNotRegex(autopilot_text, r"\bnohup\s+vibe-loop\b")
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
@@ -7059,6 +7088,109 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIsNotNone(cycle["child_pid"])
         self.assertEqual(child_log.parent, repo / ".vibe-loop" / "autopilot")
         self.assertTrue(log_exists)
+
+    @unittest.skipUnless(
+        os.name == "posix" and hasattr(os, "setsid"),
+        "detached autopilot start is POSIX-only",
+    )
+    def test_start_survives_caller_exit_and_remains_duplicate_fenced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(
+                repo,
+                PLAN.replace("| TASK-01 | P0 | Next |", "| TASK-01 | P0 | Done |"),
+            )
+            start = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "vibe_loop",
+                    "autopilot",
+                    "start",
+                    "--repo",
+                    str(repo),
+                    "--interval",
+                    "30",
+                    "--json",
+                ],
+                cwd=repo,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(start.returncode, 0, start.stderr)
+            launch = json.loads(start.stdout)
+            pid = launch["pid"]
+            process_group_id = launch["process_group_id"]
+            session_id = launch["session_id"]
+
+            try:
+                os.kill(pid, 0)
+                self.assertEqual(process_group_id, pid)
+                self.assertEqual(session_id, pid)
+                self.assertTrue(Path(launch["log"]).is_file())
+
+                status = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "status",
+                        "--repo",
+                        str(repo),
+                        "--json",
+                    ],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                supervisor = json.loads(status.stdout)["supervisor"]
+                self.assertEqual(supervisor["state"], "running")
+                self.assertEqual(supervisor["pid"], pid)
+                self.assertEqual(supervisor["run_id"], launch["run_id"])
+                self.assertEqual(supervisor["log"], launch["log"])
+                self.assertEqual(
+                    supervisor["record"]["process_group_id"], process_group_id
+                )
+                self.assertEqual(supervisor["record"]["session_id"], session_id)
+
+                duplicate = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "start",
+                        "--repo",
+                        str(repo),
+                        "--interval",
+                        "30",
+                        "--json",
+                    ],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(duplicate.returncode, 2)
+                duplicate_payload = json.loads(duplicate.stdout)
+                self.assertFalse(duplicate_payload["started"])
+                self.assertEqual(
+                    duplicate_payload["blocker"], "autopilot_supervisor_active"
+                )
+                self.assertEqual(duplicate_payload["pid"], pid)
+            finally:
+                stop_test_process_group(pid, process_group_id)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            deadline = time.monotonic() + 2.0
+            while (
+                manager.status(AUTOPILOT_LOCK_NAME) is not None
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+            self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
 
     def test_doctor_reports_redacted_autopilot_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

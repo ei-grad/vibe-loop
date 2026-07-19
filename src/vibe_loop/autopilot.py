@@ -7,14 +7,17 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time as time_module
 from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from vibe_loop.config import (
     AgentResolutionError,
+    REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES,
+    REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES,
     VibeConfig,
     load_config,
     normalize_registry_runtime_context,
@@ -23,7 +26,16 @@ from vibe_loop.config import (
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
-from vibe_loop.locks import IntegrationLockStatus, LockBusy, build_lock_manager
+from vibe_loop.locks import (
+    AUTOPILOT_LOCK_NAME,
+    IntegrationLockStatus,
+    LockBackendError,
+    LockBusy,
+    LockFencingMismatch,
+    LockManager,
+    LockOwnerMismatch,
+    build_lock_manager,
+)
 from vibe_loop.retry import parse_limit_wall_reset_delay
 from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
@@ -60,6 +72,12 @@ Sleep = Callable[[float], None]
 
 
 AUTOPILOT_RECORD_SCHEMA_VERSION = 1
+AUTOPILOT_RUNTIME_CONTEXT_FD_ENV = "VIBE_LOOP_AUTOPILOT_RUNTIME_CONTEXT_FD"
+AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
+    6 * REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES
+    + 6 * REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES
+    + 2
+)
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
 BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
 
@@ -816,6 +834,34 @@ class AutopilotRunSummary:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class DetachedAutopilotLaunch:
+    repo: Path
+    started: bool
+    run_id: str = ""
+    pid: int | None = None
+    process_group_id: int | None = None
+    session_id: int | None = None
+    log: Path | None = None
+    blocker: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.started else 2
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "repo": str(self.repo),
+            "started": self.started,
+            "run_id": self.run_id,
+            "pid": self.pid,
+            "process_group_id": self.process_group_id,
+            "session_id": self.session_id,
+            "log": str(self.log) if self.log is not None else "",
+            "blocker": self.blocker,
+        }
+
+
 def autopilot_child_command(
     config: VibeConfig,
     *,
@@ -846,12 +892,358 @@ def autopilot_child_command(
     return command
 
 
+def detached_autopilot_command(
+    config: VibeConfig,
+    *,
+    jobs: int,
+    interval: float,
+    once: bool,
+    max_cycles: int,
+    ask_agent: bool,
+    continue_on_failure: bool,
+    max_slices: int,
+    max_tasks: int,
+    min_ready: int,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "vibe_loop",
+        "autopilot",
+        "run",
+        "--repo",
+        str(config.repo),
+        "--jobs",
+        str(jobs),
+        "--interval",
+        str(interval),
+        "--min-ready",
+        str(min_ready),
+        "--worktree-disposition",
+        config.autopilot.worktree_disposition,
+    ]
+    if once:
+        command.append("--once")
+    if max_cycles:
+        command.extend(["--max-cycles", str(max_cycles)])
+    if ask_agent:
+        command.append("--ask-agent")
+    if continue_on_failure:
+        command.append("--continue-on-failure")
+    if max_slices:
+        command.extend(["--max-slices", str(max_slices)])
+    if max_tasks:
+        command.extend(["--max-tasks", str(max_tasks)])
+    return command
+
+
+def start_detached_autopilot(
+    config: VibeConfig,
+    *,
+    jobs: int = 1,
+    interval: float = 0.0,
+    once: bool = False,
+    max_cycles: int = 0,
+    ask_agent: bool = False,
+    continue_on_failure: bool = False,
+    max_slices: int = 0,
+    max_tasks: int = 0,
+    min_ready: int = 1,
+    verification_timeout: float = 5.0,
+    verification_interval: float = 0.05,
+) -> DetachedAutopilotLaunch:
+    """Start and verify a detached POSIX autopilot supervisor."""
+
+    if os.name != "posix" or not hasattr(os, "setsid"):
+        return DetachedAutopilotLaunch(
+            repo=config.repo,
+            started=False,
+            blocker=f"detached_autopilot_unsupported_platform:{sys.platform}",
+        )
+
+    lock_manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+        runtime_context=config.runtime_environment,
+    )
+    existing = lock_manager.autopilot_status()
+    if existing.locked:
+        blocker = "autopilot_supervisor_active"
+        if existing.state == "stale":
+            blocker = (
+                f"autopilot_supervisor_lock_stale:{existing.stale_reason or 'unknown'}"
+            )
+        return DetachedAutopilotLaunch(
+            repo=config.repo,
+            started=False,
+            run_id=str(existing.metadata.get("run_id") or ""),
+            pid=int_value(existing.metadata.get("pid")),
+            blocker=blocker,
+        )
+
+    launch_id = new_run_id("autopilot-detached")
+    log_path = config.state_path / "autopilot" / f"{launch_id}.log"
+    command = detached_autopilot_command(
+        config,
+        jobs=jobs,
+        interval=interval,
+        once=once,
+        max_cycles=max_cycles,
+        ask_agent=ask_agent,
+        continue_on_failure=continue_on_failure,
+        max_slices=max_slices,
+        max_tasks=max_tasks,
+        min_ready=min_ready,
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    child_environment, context_file = runtime_context_subprocess_transport(
+        config.runtime_context
+    )
+    pass_fds = (context_file.fileno(),) if context_file is not None else ()
+    try:
+        with log_path.open("x", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                command,
+                cwd=config.repo,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=True,
+                close_fds=True,
+                env=child_environment,
+                pass_fds=pass_fds,
+            )
+    except OSError as exc:
+        return DetachedAutopilotLaunch(
+            repo=config.repo,
+            started=False,
+            log=log_path,
+            blocker=f"detached_autopilot_launch_failed:{exc}",
+        )
+    finally:
+        if context_file is not None:
+            context_file.close()
+
+    try:
+        process_group_id = os.getpgid(process.pid)
+        session_id = os.getsid(process.pid)
+    except OSError:
+        process_group_id = None
+        session_id = None
+
+    deadline = time_module.monotonic() + max(0.0, verification_timeout)
+    blocker = "detached_autopilot_verification_timeout"
+    verified = False
+    try:
+        while True:
+            status = lock_manager.autopilot_status()
+            lock_run_id = str(status.metadata.get("run_id") or "")
+            lock_pid = int_value(status.metadata.get("pid"))
+            if (
+                status.locked
+                and status.state in {"held", "unknown"}
+                and lock_pid == process.pid
+                and lock_run_id
+            ):
+                if (
+                    process.poll() is not None
+                    or process_group_id != process.pid
+                    or session_id != process.pid
+                ):
+                    blocker = "detached_autopilot_process_identity_unverified"
+                    break
+                RunStore(config.state_path / "runs.jsonl").append_record(
+                    {
+                        "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                        "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+                        "occurred_at": utc_now_iso(),
+                        "repo": str(config.repo),
+                        "run_id": lock_run_id,
+                        "pid": process.pid,
+                        "process_group_id": process_group_id,
+                        "session_id": session_id,
+                        "log": str(log_path),
+                        "observed_state": status.state,
+                        "launch_mode": "detached_posix_session",
+                        "worktree_disposition_policy": (
+                            config.autopilot.worktree_disposition
+                        ),
+                    }
+                )
+                verified = True
+                return DetachedAutopilotLaunch(
+                    repo=config.repo,
+                    started=True,
+                    run_id=lock_run_id,
+                    pid=process.pid,
+                    process_group_id=process_group_id,
+                    session_id=session_id,
+                    log=log_path,
+                )
+            if status.locked and lock_pid != process.pid:
+                blocker = "autopilot_supervisor_active"
+                break
+            exit_code = process.poll()
+            if exit_code is not None:
+                blocker = f"detached_autopilot_exited_before_verification:{exit_code}"
+                break
+            if time_module.monotonic() >= deadline:
+                break
+            time_module.sleep(max(0.0, verification_interval))
+    # Verification crosses pluggable lock backends and the append-only run store;
+    # their operational exception sets are not closed over third-party adapters.
+    except Exception as exc:
+        detail = redact_runtime_context_text(str(exc), config.runtime_context)
+        blocker = (
+            f"detached_autopilot_verification_failed:{type(exc).__name__}:{detail}"
+        )
+    finally:
+        if not verified:
+            cleanup_error = cleanup_detached_candidate(
+                process,
+                lock_manager=lock_manager,
+            )
+            if cleanup_error:
+                cleanup_error = redact_runtime_context_text(
+                    cleanup_error,
+                    config.runtime_context,
+                )
+                blocker = f"{blocker};cleanup_failed:{cleanup_error}"
+    return DetachedAutopilotLaunch(
+        repo=config.repo,
+        started=False,
+        pid=process.pid,
+        process_group_id=process_group_id,
+        session_id=session_id,
+        log=log_path,
+        blocker=blocker,
+    )
+
+
+def cleanup_detached_candidate(
+    process: subprocess.Popen[str],
+    *,
+    lock_manager: LockManager,
+) -> str:
+    errors: list[str] = []
+    try:
+        if process.poll() is None:
+            try:
+                process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5.0)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+    except (OSError, ChildProcessError) as exc:
+        errors.append(f"{type(exc).__name__}:{exc}")
+    try:
+        status = lock_manager.autopilot_status()
+        lock_pid = int_value(status.metadata.get("pid"))
+        lock_run_id = str(status.metadata.get("run_id") or "")
+        if status.locked and lock_pid == process.pid and lock_run_id:
+            lock_manager.release_autopilot(
+                run_id=lock_run_id,
+                fencing_token=str(status.metadata.get("fencing_token") or ""),
+            )
+    # Cleanup must preserve the original actionable verification failure even
+    # when a third-party lock adapter has an unenumerated operational failure.
+    except Exception as exc:
+        errors.append(f"{type(exc).__name__}:{exc}")
+    return ";".join(errors)
+
+
+def runtime_context_subprocess_transport(
+    runtime_context: tuple[tuple[str, str], ...],
+) -> tuple[dict[str, str], BinaryIO | None]:
+    environment = os.environ.copy()
+    environment.pop(AUTOPILOT_RUNTIME_CONTEXT_FD_ENV, None)
+    for name, _value in runtime_context:
+        environment.pop(name, None)
+    if not runtime_context:
+        return environment, None
+    encoded = json.dumps(
+        dict(runtime_context),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded) > AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES:
+        raise ValueError("autopilot runtime context exceeds transport limit")
+    context_file = tempfile.TemporaryFile(mode="w+b")
+    context_file.write(encoded)
+    context_file.seek(0)
+    environment[AUTOPILOT_RUNTIME_CONTEXT_FD_ENV] = str(context_file.fileno())
+    return environment, context_file
+
+
+class AutopilotLockHeartbeat:
+    def __init__(
+        self,
+        lock_manager: LockManager,
+        *,
+        run_id: str,
+        fencing_token: str,
+        lease_seconds: int | None,
+    ) -> None:
+        self.lock_manager = lock_manager
+        self.run_id = run_id
+        self.fencing_token = fencing_token
+        self.interval = (
+            max(0.1, min(30.0, lease_seconds / 3))
+            if lease_seconds is not None
+            else None
+        )
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.interval is None:
+            return
+        self.thread = threading.Thread(
+            target=self._run,
+            name=f"autopilot-heartbeat-{self.run_id}",
+            daemon=True,
+        )
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join()
+
+    def _run(self) -> None:
+        assert self.interval is not None
+        while not self.stop_event.wait(self.interval):
+            try:
+                self.lock_manager.heartbeat(
+                    task_id=AUTOPILOT_LOCK_NAME,
+                    run_id=self.run_id,
+                    fencing_token=self.fencing_token,
+                )
+            except (LockOwnerMismatch, LockFencingMismatch):
+                return
+            except (LockBackendError, OSError):
+                continue
+
+
 def launch_run_until_done(
     command: list[str],
     *,
     cwd: Path,
     log_path: Path,
     on_start: Callable[[int], None] | None = None,
+    runtime_context: tuple[tuple[str, str], ...] = (),
 ) -> int:
     """Run ``run-until-done`` as a child process, streaming output to a log.
 
@@ -864,27 +1256,37 @@ def launch_run_until_done(
     popen_kwargs: dict[str, Any] = {}
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
-    with log_path.open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            **popen_kwargs,
-        )
-        if on_start is not None:
-            on_start(process.pid)
-        try:
-            return process.wait()
-        except KeyboardInterrupt:
-            # On interrupt, terminate the worker we spawned rather than orphan
-            # it, then let the supervisor unwind and release its lock.
-            process.terminate()
-            process.wait()
-            raise
+    child_environment, context_file = runtime_context_subprocess_transport(
+        runtime_context
+    )
+    if context_file is not None:
+        popen_kwargs["pass_fds"] = (context_file.fileno(),)
+    try:
+        with log_path.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                command,
+                cwd=cwd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=child_environment,
+                **popen_kwargs,
+            )
+    finally:
+        if context_file is not None:
+            context_file.close()
+    if on_start is not None:
+        on_start(process.pid)
+    try:
+        return process.wait()
+    except KeyboardInterrupt:
+        # On interrupt, terminate the worker we spawned rather than orphan
+        # it, then let the supervisor unwind and release its lock.
+        process.terminate()
+        process.wait()
+        raise
 
 
 def classify_child_exit(exit_code: int) -> str:
@@ -1615,7 +2017,25 @@ def run_autopilot(
 
     process_checker = process_exists if process_exists is not None else pid_exists
     sleeper = sleep if sleep is not None else time_module.sleep
-    launch = launcher if launcher is not None else launch_run_until_done
+    if launcher is None:
+
+        def launch(
+            command: list[str],
+            *,
+            cwd: Path,
+            log_path: Path,
+            on_start: Callable[[int], None] | None = None,
+        ) -> int:
+            return launch_run_until_done(
+                command,
+                cwd=cwd,
+                log_path=log_path,
+                on_start=on_start,
+                runtime_context=config.runtime_context,
+            )
+
+    else:
+        launch = launcher
     run_store = RunStore(config.state_path / "runs.jsonl")
     lock_manager = build_lock_manager(
         config.repo,
@@ -1665,21 +2085,27 @@ def run_autopilot(
 
     fencing_token = str(lock.metadata.get("fencing_token") or "")
     supervisor_log = config.state_path / "autopilot" / f"{supervisor_run_id}.log"
-    run_store.append_record(
-        {
-            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
-            "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
-            "occurred_at": utc_now_iso(),
-            "repo": str(config.repo),
-            "run_id": supervisor_run_id,
-            "pid": os.getpid(),
-            "log": str(supervisor_log),
-            "worktree_disposition_policy": config.autopilot.worktree_disposition,
-        }
+    heartbeat = AutopilotLockHeartbeat(
+        lock_manager,
+        run_id=supervisor_run_id,
+        fencing_token=fencing_token,
+        lease_seconds=int_value(lock.metadata.get("lease_seconds")),
     )
-
     cycles: list[AutopilotCycleResult] = []
+    heartbeat.start()
     try:
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": supervisor_run_id,
+                "pid": os.getpid(),
+                "log": str(supervisor_log),
+                "worktree_disposition_policy": (config.autopilot.worktree_disposition),
+            }
+        )
         cycle_number = 0
         while True:
             if should_stop is not None and should_stop():
@@ -1786,6 +2212,7 @@ def run_autopilot(
             if result.status not in {"completed", "restartable"}:
                 break
     finally:
+        heartbeat.stop()
         lock_manager.release_autopilot(
             run_id=supervisor_run_id,
             fencing_token=fencing_token,
