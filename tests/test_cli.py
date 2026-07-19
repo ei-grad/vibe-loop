@@ -5510,6 +5510,438 @@ class CliTests(unittest.TestCase):
         self.assertEqual(records[1]["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(records[1]["owner_task_id"], "TASK-01")
 
+    def test_main_integration_allows_clean_main_equivalent_no_commit_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            base_commit = git_test_head(repo)
+            main_head = commit_test_file(
+                repo,
+                "external.txt",
+                "main advanced\n",
+                "advance main",
+            )
+            worktree = repo.parent / "worker"
+            add_test_worktree(repo, worktree, "worker/TASK-01")
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace={
+                    "schema_version": 1,
+                    "record_type": "workspace_claim",
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(worktree),
+                    "base_commit": base_commit,
+                    "head_commit": main_head,
+                    "current_branch": "worker/TASK-01",
+                    "dirty": False,
+                    "dirty_summary": [],
+                    "claimed_at": "2026-05-09T00:01:00+00:00",
+                },
+            )
+            acquire_stdout = StringIO()
+            acquire_stderr = StringIO()
+            release_stdout = StringIO()
+            release_stderr = StringIO()
+            report_stdout = StringIO()
+            report_stderr = StringIO()
+
+            with redirect_stdout(acquire_stdout), redirect_stderr(acquire_stderr):
+                acquire_exit = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+            with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": ""}):
+                with redirect_stdout(release_stdout), redirect_stderr(release_stderr):
+                    release_exit = main(
+                        [
+                            "main-integration",
+                            "release",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-1",
+                            "--task-id",
+                            "TASK-01",
+                            "--json",
+                        ]
+                    )
+            with redirect_stdout(report_stdout), redirect_stderr(report_stderr):
+                report_exit = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--status",
+                        "completed",
+                        "--metadata-json",
+                        '{"no_commits":true}',
+                    ]
+                )
+
+            acquired = json.loads(acquire_stdout.getvalue())
+            released = json.loads(release_stdout.getvalue())
+            report = json.loads(report_stdout.getvalue())
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+
+        self.assertEqual(acquire_exit, 0)
+        self.assertEqual(acquire_stderr.getvalue(), "")
+        self.assertTrue(acquired["acquired"])
+        self.assertEqual(release_exit, 0)
+        self.assertEqual(release_stderr.getvalue(), "")
+        self.assertTrue(released["released"])
+        self.assertEqual(report_exit, 0)
+        self.assertEqual(report_stderr.getvalue(), "")
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["commit"], "")
+        self.assertEqual(report["metadata"], {"no_commits": True})
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            ["lock_acquired", "lock_released", "worker_report"],
+        )
+
+    def test_main_integration_rejects_main_equivalent_claim_owner_mismatch(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            base_commit = git_test_head(repo)
+            main_head = commit_test_file(
+                repo,
+                "external.txt",
+                "main advanced\n",
+                "advance main",
+            )
+            worktree = repo.parent / "worker"
+            add_test_worktree(repo, worktree, "worker/TASK-01")
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace={
+                    "schema_version": 1,
+                    "record_type": "workspace_claim",
+                    "task_id": "TASK-OTHER",
+                    "run_id": "run-other",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(worktree),
+                    "base_commit": base_commit,
+                    "head_commit": main_head,
+                    "current_branch": "worker/TASK-01",
+                    "dirty": False,
+                    "dirty_summary": [],
+                    "claimed_at": "2026-05-09T00:01:00+00:00",
+                },
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+            records_path = repo / ".vibe-loop" / "runs.jsonl"
+            records = [
+                json.loads(line)
+                for line in records_path.read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertFalse(lock_exists)
+        self.assertNotIn("lock_acquired", {record["record_type"] for record in records})
+
+    def test_run_next_completes_main_equivalent_no_commit_task_lifecycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            source_path = Path(__file__).resolve().parents[1] / "src"
+            state_path = repo / ".vibe-loop" / "task-state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps({"status": "ready", "history": ["ready"]}),
+                encoding="utf-8",
+            )
+            task_source_script = repo / "task_source.py"
+            write_python_executable(
+                task_source_script,
+                "from pathlib import Path\n"
+                "import json\n"
+                "import sys\n"
+                "state = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))\n"
+                "task = {\n"
+                "    'id': 'TASK-01',\n"
+                "    'title': 'No-commit task',\n"
+                "    'status': state['status'],\n"
+                "    'dependencies': [],\n"
+                "    'resources': [],\n"
+                "    'paths': [],\n"
+                "    'conflict_domains_known': True,\n"
+                "}\n"
+                "if sys.argv[2] == 'list':\n"
+                "    print(json.dumps([task]))\n"
+                "elif len(sys.argv) > 3 and sys.argv[3] == task['id']:\n"
+                "    print(json.dumps(task))\n"
+                "else:\n"
+                "    print('null')\n",
+            )
+            agent_script = repo / "agent.py"
+            write_python_executable(
+                agent_script,
+                "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
+                "import subprocess\n"
+                "import sys\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "from vibe_loop.cli import main\n"
+                "repo = Path.cwd()\n"
+                "state_path = Path(sys.argv[2])\n"
+                "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
+                "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "branch = f'worker/{task_id}'\n"
+                "worktree = repo.parent / 'no-commit-worker'\n"
+                "(repo / 'external.txt').write_text('main advanced\\n', encoding='utf-8')\n"
+                "subprocess.run(['git', 'add', 'external.txt'], cwd=repo, check=True)\n"
+                "subprocess.run(\n"
+                "    ['git', 'commit', '-m', 'advance main'],\n"
+                "    cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+                ")\n"
+                "subprocess.run(\n"
+                "    ['git', 'worktree', 'add', '-b', branch, str(worktree), 'main'],\n"
+                "    cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+                ")\n"
+                "steps = [\n"
+                "    ['worker', 'claim-workspace', '--repo', str(repo), '--run-id', run_id, '--task-id', task_id, '--branch', branch, '--worktree', str(worktree)],\n"
+                "]\n"
+                "for step in steps:\n"
+                "    if main(step) != 0:\n"
+                "        raise SystemExit(1)\n"
+                "state_path.write_text(\n"
+                "    json.dumps({'status': 'review', 'history': ['ready', 'review']}),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "if main(['main-integration', 'acquire', '--repo', str(repo), '--run-id', run_id, '--task-id', task_id]) != 0:\n"
+                "    raise SystemExit(1)\n"
+                "if main(['main-integration', 'release', '--repo', str(repo), '--run-id', run_id, '--task-id', task_id]) != 0:\n"
+                "    raise SystemExit(1)\n"
+                "state_path.write_text(\n"
+                "    json.dumps({'status': 'done', 'history': ['ready', 'review', 'done'], 'no_commits': True}),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "raise SystemExit(main([\n"
+                "    'report', '--repo', str(repo), '--run-id', run_id,\n"
+                "    '--task-id', task_id, '--status', 'completed',\n"
+                "    '--metadata-json', '{\"no_commits\":true}',\n"
+                "]))\n",
+            )
+            list_command = shell_command(
+                sys.executable,
+                str(task_source_script),
+                str(state_path),
+                "list",
+            )
+            probe_command = shell_command(
+                sys.executable,
+                str(task_source_script),
+                str(state_path),
+                "probe",
+                "{task_id}",
+            )
+            agent_command = shell_command(
+                sys.executable,
+                str(agent_script),
+                str(source_path),
+                str(state_path),
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = "
+                + json.dumps(agent_command)
+                + '\n[task_source]\ntype = "command"\nlist = '
+                + json.dumps(list_command)
+                + "\nprobe = "
+                + json.dumps(probe_command)
+                + '\nrunnable_statuses = ["ready"]\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+            inspect_stdout = StringIO()
+            inspect_stderr = StringIO()
+            with redirect_stdout(inspect_stdout), redirect_stderr(inspect_stderr):
+                inspect_exit = main(
+                    [
+                        "tasks",
+                        "inspect",
+                        "--repo",
+                        str(repo),
+                        "--json",
+                        "TASK-01",
+                    ]
+                )
+            task_payload = json.loads(inspect_stdout.getvalue())
+            task_state = json.loads(state_path.read_text(encoding="utf-8"))
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            integration_events = [
+                record["record_type"]
+                for record in records
+                if record.get("lock_kind") == "integration"
+            ]
+            task_lock_exists = (repo / ".vibe-loop" / "locks" / "TASK-01.lock").exists()
+            integration_lock_exists = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock"
+            ).exists()
+            retained_worktree_exists = (repo.parent / "no-commit-worker").exists()
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["classification"], "completed")
+        self.assertEqual(payload["classification_source"], "worker_report")
+        self.assertEqual(payload["worker_report"]["commit"], "")
+        self.assertEqual(
+            payload["worker_report"]["metadata"],
+            {"no_commits": True},
+        )
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(task_payload["status"], "done")
+        self.assertFalse(task_payload["ready"])
+        self.assertEqual(task_state["status"], "done")
+        self.assertEqual(task_state["history"], ["ready", "review", "done"])
+        self.assertTrue(task_state["no_commits"])
+        self.assertEqual(integration_events, ["lock_acquired", "lock_released"])
+        self.assertIn("workspace_claim", {record["record_type"] for record in records})
+        self.assertIn("worker_report", {record["record_type"] for record in records})
+        self.assertIn("run_result", {record["record_type"] for record in records})
+        self.assertFalse(task_lock_exists)
+        self.assertFalse(integration_lock_exists)
+        self.assertTrue(retained_worktree_exists)
+
+    def test_main_integration_rejects_merged_branch_behind_main(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            base_commit = git_test_head(repo)
+            worktree = repo.parent / "worker"
+            add_test_worktree(repo, worktree, "worker/TASK-01")
+            branch_head = commit_test_file(
+                worktree,
+                "feature.txt",
+                "done\n",
+                "branch work",
+            )
+            subprocess.run(
+                ["git", "merge", "--ff-only", "worker/TASK-01"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            commit_test_file(
+                repo,
+                "later.txt",
+                "later main work\n",
+                "advance main again",
+            )
+            write_active_run_lock(
+                repo,
+                "TASK-01",
+                "run-1",
+                workspace={
+                    "schema_version": 1,
+                    "record_type": "workspace_claim",
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "branch": "worker/TASK-01",
+                    "worktree": str(worktree),
+                    "base_commit": base_commit,
+                    "head_commit": branch_head,
+                    "current_branch": "worker/TASK-01",
+                    "dirty": False,
+                    "dirty_summary": [],
+                    "claimed_at": "2026-05-09T00:01:00+00:00",
+                },
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "main-integration",
+                        "acquire",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            codes = {
+                diagnostic["code"] for diagnostic in payload["workspace_diagnostics"]
+            }
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["acquired"])
+        self.assertEqual(payload["error"], "workspace_preflight_failed")
+        self.assertEqual(codes, {"branch_already_merged"})
+
     def test_main_integration_release_rejects_fencing_token_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -7565,6 +7997,40 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
     subprocess.run(["git", "add", "PLAN.md"], cwd=repo, check=True)
     subprocess.run(
         ["git", "commit", "-m", "baseline"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def git_test_head(repo: Path) -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--verify", "HEAD"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    ).stdout.strip()
+
+
+def commit_test_file(repo: Path, path: str, content: str, message: str) -> str:
+    (repo / path).write_text(content, encoding="utf-8")
+    subprocess.run(["git", "add", path], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-m", message],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return git_test_head(repo)
+
+
+def add_test_worktree(repo: Path, worktree: Path, branch: str) -> None:
+    subprocess.run(
+        ["git", "worktree", "add", "-b", branch, str(worktree), "main"],
         cwd=repo,
         check=True,
         stdout=subprocess.PIPE,

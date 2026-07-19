@@ -85,7 +85,11 @@ results are missing or ambiguous.
 - `main-integration acquire` performs the same claimed-workspace sanity check
   for the acquiring worker before the final integration section. A claim with
   stale or warning diagnostics blocks acquisition and returns the diagnostic
-  payload with manual recovery hints.
+  payload with manual recovery hints. The sole exception is a clean, correctly
+  claimed worktree whose current head exactly equals local `main`: an
+  `branch_already_merged` warning is then a safe no-op integration case, so a
+  reviewed slice that required no repository commit can finish without a fake
+  commit.
 
 ## Non-Goals
 

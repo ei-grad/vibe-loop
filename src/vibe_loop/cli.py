@@ -2693,6 +2693,12 @@ def main_integration_workspace_preflight_error(
             continue
         if view.active.workspace is None or not view.workspace_diagnostics:
             return None
+        if main_equivalent_workspace_is_integration_noop(
+            view,
+            repo=config.repo,
+            main_branch=config.main_branch,
+        ):
+            return None
         return {
             "error": "workspace_preflight_failed",
             "message": (
@@ -2712,6 +2718,45 @@ def main_integration_workspace_preflight_error(
             "exit_code": 1,
         }
     return None
+
+
+def main_equivalent_workspace_is_integration_noop(
+    view: WorkerView,
+    *,
+    repo: Path,
+    main_branch: str,
+) -> bool:
+    if (
+        len(view.workspace_diagnostics) != 1
+        or view.workspace_diagnostics[0].code != "branch_already_merged"
+    ):
+        return False
+    claim = view.active.workspace
+    state = view.workspace_git_state
+    if (
+        claim is None
+        or state is None
+        or claim.task_id != view.active.task_id
+        or claim.run_id != view.active.run_id
+        or not state.worktree_exists
+        or not state.worktree_listed
+        or state.dirty
+        or state.current_branch != claim.branch
+        or not state.head_commit
+    ):
+        return False
+    result = run_git(
+        repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{main_branch}^{{commit}}",
+    )
+    return bool(
+        result is not None
+        and result.returncode == 0
+        and result.stdout.strip() == state.head_commit
+    )
 
 
 def active_run_started_at(
