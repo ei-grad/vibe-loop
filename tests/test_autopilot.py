@@ -394,6 +394,43 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["pid"], 999)
         self.assertEqual(payload["cycle_id"], "cycle-1")
 
+    def test_project_status_redacts_unrecorded_supervisor_fencing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            token_root = config.state_path / "locks" / ".fencing-tokens"
+            token_root.mkdir(parents=True)
+            (token_root / "autopilot-supervisor.token").write_text(
+                "876543210123456788\n", encoding="utf-8"
+            )
+            holder = manager.acquire_autopilot(
+                run_id="autopilot-1",
+                metadata={"pid": 999, "host": "test-host"},
+            )
+            fencing_token = str(holder.metadata["fencing_token"])
+            try:
+                payload = collect_project_status(
+                    config,
+                    process_exists=lambda pid: pid == 999,
+                ).to_json()
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=fencing_token,
+                )
+
+        rendered = json.dumps(payload)
+        self.assertEqual(payload["supervisor"]["state"], "observed")
+        self.assertEqual(payload["supervisor"]["run_id"], "autopilot-1")
+        self.assertEqual(payload["supervisor"]["record"]["fencing_token"], "<redacted>")
+        self.assertNotIn(fencing_token, rendered)
+
     def test_project_status_keeps_live_supervisor_across_pidless_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

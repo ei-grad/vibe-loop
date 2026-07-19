@@ -47,6 +47,21 @@ from vibe_loop.workers import (
 
 
 class WorkerStateTests(unittest.TestCase):
+    def test_fencing_mismatch_exception_message_redacts_tokens(self) -> None:
+        expected_token = "expected-exception-fencing-canary"
+        actual_token = "actual-exception-fencing-canary"
+
+        mismatch = LockFencingMismatch(
+            Path("lock-path"),
+            {"fencing_token": actual_token},
+            expected_token=expected_token,
+            actual_token=actual_token,
+        )
+
+        self.assertNotIn(expected_token, str(mismatch))
+        self.assertNotIn(actual_token, str(mismatch))
+        self.assertIn("fencing token mismatch", str(mismatch))
+
     def test_active_state_round_trips_through_lock_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -468,6 +483,79 @@ class WorkerStateTests(unittest.TestCase):
                 "locks.status_command exited with status 17: adapter unavailable",
             ):
                 manager.is_locked("TASK-01")
+
+    def test_command_lock_backend_failure_redacts_fencing_metadata(self) -> None:
+        fencing_token = "987654321012345679"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            failing = repo / "failing_lock_adapter.py"
+            failing.write_text(
+                "import os\n"
+                "import sys\n"
+                "print('adapter unavailable metadata=' + "
+                "os.environ['VIBE_LOOP_LOCK_METADATA_JSON'], file=sys.stderr)\n"
+                "raise SystemExit(17)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} {json.dumps(str(failing))}"
+            lock_root = repo / ".vibe-loop" / "locks"
+            token_root = lock_root / ".fencing-tokens"
+            token_root.mkdir(parents=True)
+            (token_root / "TASK-01.token").write_text(
+                "987654321012345678\n", encoding="utf-8"
+            )
+            manager = build_lock_manager(
+                repo,
+                lock_root,
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            with self.assertRaises(LockBackendError) as raised:
+                manager.acquire("TASK-01", "run-1")
+
+        diagnostic = str(raised.exception)
+        self.assertIn("locks.acquire_command exited with status 17", diagnostic)
+        self.assertIn("adapter unavailable", diagnostic)
+        self.assertIn('"fencing_token":"<redacted>"', diagnostic)
+        self.assertNotIn(fencing_token, diagnostic)
+
+    def test_command_lock_backend_redaction_preserves_low_entropy_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            failing = repo / "failing_lock_adapter.py"
+            failing.write_text(
+                "import os\n"
+                "import sys\n"
+                "print('adapter unavailable task=TASK-01 attempt=1 metadata=' + "
+                "os.environ['VIBE_LOOP_LOCK_METADATA_JSON'], file=sys.stderr)\n"
+                "raise SystemExit(17)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} {json.dumps(str(failing))}"
+            manager = build_lock_manager(
+                repo,
+                repo / ".vibe-loop" / "locks",
+                LockConfig(
+                    type="command",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            with self.assertRaises(LockBackendError) as raised:
+                manager.acquire("TASK-01", "run-1")
+
+        diagnostic = str(raised.exception)
+        self.assertIn("task=TASK-01 attempt=1", diagnostic)
+        self.assertIn('"fencing_token":"<redacted>"', diagnostic)
 
     def test_command_lock_backend_rejects_invalid_json_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

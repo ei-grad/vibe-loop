@@ -297,6 +297,11 @@ diagnostics make integration unsafe. Worktree and branch handling stay outside
 the CLI runtime — put that policy in repository instructions or the agent
 command.
 
+Fencing tokens remain internal lock capabilities. CLI JSON, worker/status
+views, troubleshooting output, and persisted run diagnostics replace fencing
+fields with `<redacted>` while retaining stable mismatch reasons and safe
+owner/path context.
+
 ### Status and diagnostics
 
 ```bash

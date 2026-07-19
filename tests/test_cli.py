@@ -4273,6 +4273,49 @@ class CliTests(unittest.TestCase):
         self.assertEqual(records[0]["record_type"], "worker_report")
         self.assertEqual(records[0]["status"], "blocked")
 
+    def test_report_redacts_fencing_fields_in_output_and_storage(self) -> None:
+        expected_token = "report-expected-fencing-canary"
+        actual_token = "report-actual-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "report",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--status",
+                        "blocked",
+                        "--metadata-json",
+                        json.dumps(
+                            {
+                                "expected_token": expected_token,
+                                "nested": {"actual_token": actual_token},
+                                "owner": "run-1",
+                            }
+                        ),
+                    ]
+                )
+
+            stored = (repo / ".vibe-loop" / "runs.jsonl").read_text(encoding="utf-8")
+            payload = json.loads(stdout.getvalue())
+
+        rendered = stdout.getvalue() + stderr.getvalue() + stored
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["metadata"]["expected_token"], "<redacted>")
+        self.assertEqual(payload["metadata"]["nested"]["actual_token"], "<redacted>")
+        self.assertEqual(payload["metadata"]["owner"], "run-1")
+        self.assertNotIn(expected_token, rendered)
+        self.assertNotIn(actual_token, rendered)
+
     def test_report_resolves_head_commit_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -4630,6 +4673,138 @@ class CliTests(unittest.TestCase):
         self.assertEqual(records[0]["run_id"], "run-1")
         self.assertEqual(records[0]["task_id"], "TASK-01")
         self.assertEqual(records[0]["reason"], "owner_mismatch")
+
+    def test_worker_claim_workspace_redacts_fencing_token_mismatch(self) -> None:
+        expected_token = "expected-workspace-fencing-canary"
+        actual_token = "actual-workspace-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "fencing_token": actual_token,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "worker",
+                        "claim-workspace",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--branch",
+                        "worker/TASK-01",
+                        "--worktree",
+                        str(repo),
+                        "--fencing-token",
+                        expected_token,
+                        "--json",
+                    ]
+                )
+
+            payload = json.loads(stdout.getvalue())
+            records_text = (repo / ".vibe-loop" / "runs.jsonl").read_text(
+                encoding="utf-8"
+            )
+            records = [json.loads(line) for line in records_text.splitlines()]
+
+        rendered = stdout.getvalue() + stderr.getvalue() + records_text
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertFalse(payload["claimed"])
+        self.assertEqual(payload["error"], "fencing_token_mismatch")
+        self.assertEqual(payload["details"], {"lock_path": str(active_lock)})
+        self.assertEqual(records[0]["reason"], "fencing_token_mismatch")
+        self.assertNotIn(expected_token, rendered)
+        self.assertNotIn(actual_token, rendered)
+
+    def test_worker_heartbeat_and_status_redact_fencing_tokens(self) -> None:
+        expected_token = "expected-heartbeat-fencing-canary"
+        actual_token = "actual-heartbeat-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "fencing_token": actual_token,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            heartbeat_stdout = StringIO()
+            heartbeat_stderr = StringIO()
+            locks_stdout = StringIO()
+            workers_stdout = StringIO()
+            doctor_stdout = StringIO()
+
+            with redirect_stdout(heartbeat_stdout), redirect_stderr(heartbeat_stderr):
+                heartbeat_exit = main(
+                    [
+                        "worker",
+                        "heartbeat",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--fencing-token",
+                        expected_token,
+                        "--json",
+                    ]
+                )
+            with redirect_stdout(locks_stdout):
+                locks_exit = main(["tasks", "locks", "--repo", str(repo), "--json"])
+            with redirect_stdout(workers_stdout):
+                workers_exit = main(["workers", "--repo", str(repo), "--json"])
+            with redirect_stdout(doctor_stdout):
+                doctor_exit = main(["doctor", "--repo", str(repo), "--json"])
+
+            heartbeat = json.loads(heartbeat_stdout.getvalue())
+            locks = json.loads(locks_stdout.getvalue())
+            workers = json.loads(workers_stdout.getvalue())
+
+        rendered = (
+            heartbeat_stdout.getvalue()
+            + heartbeat_stderr.getvalue()
+            + locks_stdout.getvalue()
+            + workers_stdout.getvalue()
+            + doctor_stdout.getvalue()
+        )
+        self.assertEqual(heartbeat_exit, 1)
+        self.assertEqual(heartbeat_stderr.getvalue(), "")
+        self.assertEqual(heartbeat["error"], "fencing_token_mismatch")
+        self.assertEqual(heartbeat["metadata"]["fencing_token"], "<redacted>")
+        self.assertNotIn("expected_token", heartbeat)
+        self.assertNotIn("actual_token", heartbeat)
+        self.assertEqual(locks_exit, 0)
+        self.assertEqual(locks[0]["fencing_token"], "<redacted>")
+        self.assertEqual(workers_exit, 0)
+        self.assertEqual(workers[0]["fencing_token"], "<redacted>")
+        self.assertEqual(doctor_exit, 0)
+        self.assertNotIn(expected_token, rendered)
+        self.assertNotIn(actual_token, rendered)
 
     def test_worker_claim_workspace_requires_active_task_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6137,6 +6312,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(codes, {"branch_already_merged"})
 
     def test_main_integration_release_rejects_fencing_token_mismatch(self) -> None:
+        expected_token = "expected-integration-fencing-canary"
+        actual_token = "actual-integration-fencing-canary"
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             write_active_run_lock(repo, "TASK-01", "run-holder")
@@ -6159,6 +6336,16 @@ class CliTests(unittest.TestCase):
                         "--json",
                     ]
                 )
+            integration_metadata_path = (
+                repo / ".vibe-loop" / "locks" / "main-integration.lock" / "lock.json"
+            )
+            integration_metadata = json.loads(
+                integration_metadata_path.read_text(encoding="utf-8")
+            )
+            integration_metadata["fencing_token"] = actual_token
+            integration_metadata_path.write_text(
+                json.dumps(integration_metadata), encoding="utf-8"
+            )
             with redirect_stdout(release_stdout), redirect_stderr(release_stderr):
                 release_exit = main(
                     [
@@ -6171,7 +6358,7 @@ class CliTests(unittest.TestCase):
                         "--task-id",
                         "TASK-01",
                         "--fencing-token",
-                        "stale-token",
+                        expected_token,
                         "--json",
                     ]
                 )
@@ -6186,7 +6373,13 @@ class CliTests(unittest.TestCase):
         self.assertEqual(release_stderr.getvalue(), "")
         self.assertFalse(released["released"])
         self.assertEqual(released["error"], "fencing_token_mismatch")
+        self.assertNotIn("expected_token", released)
+        self.assertNotIn("actual_token", released)
+        self.assertEqual(released["status"]["fencing_token"], "<redacted>")
+        self.assertEqual(released["status"]["metadata"]["fencing_token"], "<redacted>")
         self.assertTrue(released["status"]["locked"])
+        self.assertNotIn(expected_token, release_stdout.getvalue())
+        self.assertNotIn(actual_token, release_stdout.getvalue())
 
     def test_main_integration_acquire_waits_until_holder_releases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7470,6 +7663,62 @@ class CliTests(unittest.TestCase):
             "- run_result\tstatus=completed"
             "\tupdated=2026-05-09T00:01:00+00:00\n",
         )
+
+    def test_runs_json_redacts_legacy_fencing_token_fields(self) -> None:
+        expected_token = "legacy-expected-fencing-canary"
+        actual_token = "legacy-actual-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runs_path = repo / ".vibe-loop" / "runs.jsonl"
+            runs_path.parent.mkdir(parents=True)
+            runs_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "record_type": "workspace_claim_mismatch",
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "reason": "fencing_token_mismatch",
+                        "message": "workspace claim refused",
+                        "details": {
+                            "expected_token": expected_token,
+                            "actual_token": actual_token,
+                            "lock_path": str(
+                                repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+                            ),
+                        },
+                        "occurred_at": "2026-05-09T00:00:00+00:00",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            list_stdout = StringIO()
+            inspect_stdout = StringIO()
+
+            with redirect_stdout(list_stdout):
+                list_exit = main(["runs", "list", "--repo", str(repo), "--json"])
+            with redirect_stdout(inspect_stdout):
+                inspect_exit = main(
+                    ["runs", "inspect", "run-1", "--repo", str(repo), "--json"]
+                )
+
+            list_payload = json.loads(list_stdout.getvalue())
+            inspect_payload = json.loads(inspect_stdout.getvalue())
+
+        rendered = list_stdout.getvalue() + inspect_stdout.getvalue()
+        self.assertEqual(list_exit, 0)
+        self.assertEqual(inspect_exit, 0)
+        self.assertEqual(
+            list_payload[0]["latest_record"]["details"]["expected_token"],
+            "<redacted>",
+        )
+        self.assertEqual(
+            inspect_payload["records"][0]["details"]["actual_token"],
+            "<redacted>",
+        )
+        self.assertNotIn(expected_token, rendered)
+        self.assertNotIn(actual_token, rendered)
 
     def test_runs_inspect_returns_not_found_without_plan_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

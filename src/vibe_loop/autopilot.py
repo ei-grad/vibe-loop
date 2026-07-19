@@ -23,7 +23,12 @@ from vibe_loop.config import (
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
-from vibe_loop.locks import IntegrationLockStatus, LockBusy, build_lock_manager
+from vibe_loop.locks import (
+    IntegrationLockStatus,
+    LockBusy,
+    build_lock_manager,
+    redact_fencing_token_payload,
+)
 from vibe_loop.retry import parse_limit_wall_reset_delay
 from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
@@ -129,7 +134,7 @@ class SupervisorStatus:
     record: dict[str, Any] | None = None
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "state": self.state,
             "pid": self.pid,
             "log": str(self.log) if self.log is not None else "",
@@ -138,6 +143,9 @@ class SupervisorStatus:
             "observed_at": self.observed_at,
             "record": self.record or {},
         }
+        redacted = redact_fencing_token_payload(payload)
+        assert isinstance(redacted, dict)
+        return redacted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,7 +219,9 @@ class ProjectStatus:
         }
         redacted = redact_runtime_context_payload(payload, self.runtime_context)
         assert isinstance(redacted, dict)
-        return redacted
+        fencing_redacted = redact_fencing_token_payload(redacted)
+        assert isinstance(fencing_redacted, dict)
+        return fencing_redacted
 
 
 @dataclasses.dataclass(frozen=True)

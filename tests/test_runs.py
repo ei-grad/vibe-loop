@@ -250,6 +250,37 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["resources"], ["db"])
         self.assertTrue(payload["occurred_at"])
 
+    def test_append_record_redacts_nested_fencing_token_fields(self) -> None:
+        expected_token = "persisted-expected-fencing-canary"
+        actual_token = "persisted-actual-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            store = RunStore(path)
+
+            store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "reason": "fencing_token_mismatch",
+                    "details": {
+                        "expected_token": expected_token,
+                        "nested": {"actual_token": actual_token},
+                        "lock_path": "/safe/lock/path",
+                    },
+                }
+            )
+
+            raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+
+        self.assertNotIn(expected_token, raw)
+        self.assertNotIn(actual_token, raw)
+        self.assertEqual(payload["details"]["expected_token"], "<redacted>")
+        self.assertEqual(payload["details"]["nested"]["actual_token"], "<redacted>")
+        self.assertEqual(payload["details"]["lock_path"], "/safe/lock/path")
+
     def test_run_started_event_writes_trailer_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"

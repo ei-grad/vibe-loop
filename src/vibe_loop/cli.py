@@ -70,6 +70,7 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     build_lock_manager,
+    redact_fencing_token_payload,
 )
 from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.runner import VibeRunner
@@ -1661,8 +1662,6 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 args,
                 "fencing_token_mismatch",
                 exc.metadata,
-                expected_token=exc.expected_token,
-                actual_token=exc.actual_token,
             )
         except LockBackendError as exc:
             return print_lock_mutation_refused(args, "lock_unavailable", {}, str(exc))
@@ -1671,7 +1670,9 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             "task_id": task_id,
             "run_id": run_id,
             "heartbeat_at": task_lock.metadata.get("heartbeat_at"),
-            "fencing_token": task_lock.metadata.get("fencing_token"),
+            "fencing_token": "<redacted>"
+            if task_lock.metadata.get("fencing_token")
+            else "",
         }
         if json_requested(args):
             print(json.dumps(payload, indent=2))
@@ -1747,13 +1748,11 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
                     file=sys.stderr,
                 )
             return 1
-        except LockFencingMismatch as exc:
+        except LockFencingMismatch:
             status = manager.main_integration_status()
             payload = {
                 "released": False,
                 "error": "fencing_token_mismatch",
-                "expected_token": exc.expected_token,
-                "actual_token": exc.actual_token,
                 "status": status.to_json(),
             }
             if json_requested(args):
@@ -1823,7 +1822,8 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
 
     if args.tasks_command == "locks":
         runner = VibeRunner(config)
-        locks = runner.lock_manager.list_locks()
+        locks = redact_fencing_token_payload(runner.lock_manager.list_locks())
+        assert isinstance(locks, list)
         if args.json:
             print(json.dumps(locks, indent=2))
         else:
@@ -2369,21 +2369,15 @@ def print_lock_mutation_refused(
     error: str,
     metadata: dict[str, object],
     message: str = "",
-    *,
-    expected_token: str = "",
-    actual_token: str = "",
 ) -> int:
     payload: dict[str, object] = {
         "heartbeat": False,
         "updated": False,
         "error": error,
-        "metadata": metadata,
+        "metadata": redact_fencing_token_payload(metadata),
     }
     if message:
         payload["message"] = message
-    if expected_token or actual_token:
-        payload["expected_token"] = expected_token
-        payload["actual_token"] = actual_token
     if json_requested(args):
         print(json.dumps(payload, indent=2))
     else:
