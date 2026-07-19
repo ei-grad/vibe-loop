@@ -757,10 +757,10 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-tasks", type=int, default=0)
     parser.add_argument(
         "--min-ready",
-        type=int,
+        type=positive_int_argument,
         default=None,
         help=(
-            "Minimum runnable tasks required before launching a child "
+            "Positive minimum runnable tasks required before launching a child "
             "(overrides [autopilot] min_ready; default 1)"
         ),
     )
@@ -2789,6 +2789,16 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def positive_int_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
 
 

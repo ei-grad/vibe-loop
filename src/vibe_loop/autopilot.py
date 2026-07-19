@@ -1344,6 +1344,7 @@ def execute_autopilot_cycle(
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
 ) -> AutopilotCycleResult:
+    min_ready = require_positive_min_ready(min_ready)
     cycle_started_at = utc_now_iso()
     status = collect_project_status(config, process_exists=process_exists)
     runnable = status.queue.runnable
@@ -1499,6 +1500,12 @@ def execute_autopilot_cycle(
 _RECHECK_EPSILON = 1e-9
 
 
+def require_positive_min_ready(min_ready: int) -> int:
+    if isinstance(min_ready, bool) or not isinstance(min_ready, int) or min_ready < 1:
+        raise ValueError("min_ready must be a positive integer")
+    return min_ready
+
+
 def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
     """Whether a finished cycle should poll for freshly planned tasks.
 
@@ -1586,7 +1593,7 @@ def recheck_interval_for_runnable(
     interval backoff.
     """
     probe = runnable_probe if runnable_probe is not None else poll_runnable_count
-    threshold = max(1, min_ready)
+    threshold = require_positive_min_ready(min_ready)
     for slice_seconds in recheck_sleep_slices(interval, recheck_seconds):
         sleeper(slice_seconds)
         if should_stop is not None and should_stop():
@@ -1622,6 +1629,7 @@ def run_autopilot(
     is reported without being stolen. Each cycle is append-recorded; launch is
     blocked, never force-recovered, when preflight diagnostics are unsafe.
     """
+    min_ready = require_positive_min_ready(min_ready)
 
     process_checker = process_exists if process_exists is not None else pid_exists
     sleeper = sleep if sleep is not None else time_module.sleep
@@ -1721,7 +1729,7 @@ def run_autopilot(
                 and result.limit_wall_pause_seconds is None
             ):
                 post_cycle_runnable = poll_runnable_count(config)
-                threshold = max(1, min_ready)
+                threshold = min_ready
                 post_cycle_action = (
                     f"post_cycle_runnable:{post_cycle_runnable}/{threshold}"
                 )

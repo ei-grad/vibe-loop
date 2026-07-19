@@ -843,6 +843,20 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertIn("planning_unconfigured", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
 
+    def test_zero_min_ready_is_rejected_without_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            with self.assertRaisesRegex(
+                ValueError, "min_ready must be a positive integer"
+            ):
+                run_autopilot(config, once=True, min_ready=0, launcher=launcher)
+
+        self.assertEqual(calls, [])
+
     def test_empty_queue_reports_no_runnable_work(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1229,6 +1243,21 @@ class AutopilotRecheckTests(unittest.TestCase):
         )
         self.assertFalse(woke_early)
         self.assertEqual(sleeps, [10.0] * 10)
+
+    def test_recheck_interval_rejects_zero_min_ready_before_sleeping(self) -> None:
+        sleeps: list[float] = []
+
+        with self.assertRaisesRegex(ValueError, "min_ready must be a positive integer"):
+            recheck_interval_for_runnable(
+                object(),
+                interval=100.0,
+                recheck_seconds=10.0,
+                sleeper=sleeps.append,
+                runnable_probe=lambda _config: 0,
+                min_ready=0,
+            )
+
+        self.assertEqual(sleeps, [])
 
     def test_recheck_interval_wakes_when_min_ready_reached(self) -> None:
         # Once enough runnable work appears to cross the dispatch threshold the

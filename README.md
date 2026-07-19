@@ -415,8 +415,10 @@ work and exits when a cycle is idle or blocked; with `--interval N` it stays
 resident, sleeping `N` seconds between cycles until `--max-cycles` or an
 interrupt. `--jobs`, `--ask-agent`, `--continue-on-failure`, `--max-slices`, and
 `--max-tasks` are forwarded to each child; `--min-ready` sets the minimum
-runnable depth required before launching. If the queue is below that depth and
-no explicit `[autopilot] planning_command` is configured, the cycle records
+runnable depth required before launching. The value must be a positive integer;
+zero is rejected so an empty queue can never satisfy the launch gate. If the
+queue is below that depth and no explicit `[autopilot] planning_command` is
+configured, the cycle records
 `planning_unconfigured` with the low/no-runnable observation instead of
 authoring new tasks itself. A single supervisor lock prevents duplicates; Ctrl-C
 terminates the in-flight child and releases the lock.
@@ -517,7 +519,7 @@ type = "directory"
 # Defaults for `autopilot run`; explicit CLI flags override these.
 # jobs = 2
 # interval_seconds = 60.0
-# min_ready = 1
+# min_ready = 1              # positive integer; zero is invalid
 require_clean_repo = true   # set false to let a dirty tree run a cycle
 # Safe default: inspect and journal eligible worktrees without removing them.
 # Set to "reap" only as an explicit operator opt-in; existing safety guards remain.

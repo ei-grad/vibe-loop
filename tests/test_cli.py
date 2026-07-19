@@ -7875,6 +7875,16 @@ class AutopilotCliTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, 2)
 
+    def test_run_rejects_zero_min_ready(self) -> None:
+        stderr = StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                main(["autopilot", "run", "--min-ready", "0"])
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--min-ready", stderr.getvalue())
+        self.assertIn("must be a positive integer", stderr.getvalue())
+
     def test_bare_autopilot_routes_to_run_and_terminates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
