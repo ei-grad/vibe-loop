@@ -1794,9 +1794,8 @@ class VibeRunner:
                     continue
 
                 if not in_flight:
-                    retry_delay = next_retry_delay(retry_ready_at)
                     if (
-                        retry_delay is not None
+                        retry_ready_at
                         and not stop_after_running
                         and (
                             max_slices <= 0
@@ -1807,8 +1806,25 @@ class VibeRunner:
                             or completed_count + len(in_flight) < max_tasks
                         )
                     ):
-                        time.sleep(retry_delay)
-                        continue
+                        now = time.monotonic()
+                        cooling_down = {
+                            task_id
+                            for task_id, ready_at in retry_ready_at.items()
+                            if ready_at > now
+                        }
+                        candidates = self.list_candidates(
+                            exclude=skipped | set(scheduled) | cooling_down
+                        )
+                        candidates = filter_scheduled_conflicts(
+                            candidates,
+                            list(scheduled.values()),
+                        )
+                        if candidates or discard_ready_retries(retry_ready_at):
+                            continue
+                        retry_delay = next_retry_delay(retry_ready_at)
+                        if retry_delay is not None:
+                            time.sleep(retry_delay)
+                            continue
                     break
 
                 wait_timeout = None
