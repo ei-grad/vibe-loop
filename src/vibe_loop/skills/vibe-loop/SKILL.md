@@ -48,7 +48,7 @@ cross-slice backlog.
 6. Address findings with code, tests, or docs; re-review, preferably with the
    same reviewer, until no material findings remain or remediation is tracked.
 7. Commit the reviewed slice, integrate it to `main` when permitted, verify on
-   `main`, clean up the slice worktree/branch, and stop.
+   `main`, apply the cleanup authorization rule below, and stop.
 
 ## Task Source State
 
@@ -116,8 +116,20 @@ worktree.
 
 When repo/user policy permits local full-cycle delivery, this skill includes
 permission to create the slice branch/worktree, commit the slice, fast-forward
-merge it to `main`, verify on `main`, then remove the merged worktree and local
-branch. Do not push, force-push, reset, or bypass repo/user policy.
+merge it to `main`, and verify on `main`. Do not push, force-push, reset, or
+bypass repo/user policy.
+
+Cleanup is a separate, potentially destructive action. Apply effective user and
+repository instructions before removing a worktree, deleting a local branch, or
+deleting files: an explicit no-delete or confirmation-required instruction
+overrides this skill's general cleanup workflow. A request to run the loop,
+integrate the task, or report completion is not cleanup approval. When approval
+is absent or deletion is prohibited, leave the merged worktree and branch
+intact, report the exact worktree path and local branch name, and still record
+the task as completed with commit provenance. When cleanup is expressly
+authorized and repo policy permits it, remove only a clean, merged worktree and
+its local branch after verifying ownership and that no active agent still uses
+it.
 
 If repo/user policy forbids local integration or requires missing approval, stop
 with the precise blocker after the reviewed slice is committed.

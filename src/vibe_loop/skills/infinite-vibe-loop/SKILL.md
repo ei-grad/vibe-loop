@@ -57,8 +57,20 @@ For each coherent work piece:
    and immediate `main` verification section. If the lock is unavailable or
    reports unsafe workspace state, park the slice with the precise blocker
    instead of entering integration.
-6. Merge back to `main` with fast-forward-only integration, then remove the
-   merged worktree and delete the slice branch.
+6. Merge back to `main` with fast-forward-only integration, then apply the
+   cleanup authorization rule below.
+
+Cleanup is a separate, potentially destructive action. Apply effective user and
+repository instructions before removing a worktree, deleting a local branch, or
+deleting files: an explicit no-delete or confirmation-required instruction
+overrides this skill's general cleanup workflow. A request to run the loop,
+integrate the task, or report completion is not cleanup approval. When approval
+is absent or deletion is prohibited, leave the merged worktree and branch
+intact, report the exact worktree path and local branch name, and still record
+the task as completed with commit provenance before continuing. When cleanup is
+expressly authorized and repo policy permits it, remove only a clean, merged
+worktree and its local branch after verifying ownership and that no active agent
+still uses it.
 
 If `main` advanced after a slice passed review:
 
@@ -91,7 +103,7 @@ non-fast-forward merge for an infinite-loop slice.
 7. Address findings with code, tests, or docs; re-review, preferably with the
    same reviewer, until no material findings remain or remediation is tracked.
 8. Merge the slice back to `main` with fast-forward-only integration, verify
-   `main`, remove the merged slice worktree and branch, record a concise status
+   `main`, apply the cleanup authorization rule, record a concise status
    summary, select the next actionable item, and continue.
 
 ## Review

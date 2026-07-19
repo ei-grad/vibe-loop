@@ -131,9 +131,8 @@ flowchart TB
     AP -->|replenishes ready queue via| OVL
 ```
 
-See [docs/skill-work-modes.md](docs/skill-work-modes.md) for the slice-lifecycle
-state machine, the orchestrated swimlane, the autopilot operator cycle, and a
-mode-selection guide.
+See [docs/skill-work-modes.md](docs/skill-work-modes.md) for the orchestrated
+swimlane, the autopilot operator cycle, and a mode-selection guide.
 
 Install them into Codex and/or Claude:
 
@@ -146,6 +145,16 @@ bounded or unattended work. The `autopilot` operator skill does drive the CLI.
 The CLI exists when a repository already has a task source and you want
 repeatable orchestration: candidate discovery, locks, configured worker
 commands, run logs, completion checks, and run metadata.
+
+All three worker skills treat post-integration cleanup as separate from running
+the loop, integrating a task, or reporting completion. Effective user and
+repository instructions control deletion: an explicit no-delete or
+confirmation-required instruction means the worker retains the merged worktree
+and local branch, reports the exact worktree path and local branch name, and
+still records completion with commit provenance. Only express cleanup
+authorization permits removal, and the worker must still verify that the
+worktree is clean and merged, ownership is clear, no active agent uses it, and
+repository policy permits cleanup.
 
 ## Commands
 

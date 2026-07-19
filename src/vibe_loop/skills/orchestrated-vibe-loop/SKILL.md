@@ -98,7 +98,7 @@ agent configuration.
    with a reason, or a blocker requires user input.
 10. Integrate reviewed work through the main orchestrator gate. Merge only
     reviewed work, verify it landed, update active branches/workspaces when the
-    integration branch advances, then clean up merged branches/workspaces.
+    integration branch advances, then apply the cleanup authorization rule.
 11. Finalize only after implementation evidence, review status, integration
     result, and cleanup status are known. Report completed work, agents used,
     verification evidence, review result, unresolved risks, and any blocker.
@@ -145,10 +145,17 @@ ledger, and either send it back to the original worker on the new base or park i
 with the precise dependency. Do not merge unreviewed or stale work just because
 text conflicts are absent.
 
-Clean up branches/workspaces only after verifying the landed commit is contained
-in the integration branch, the worktree is clean, no active agent still owns it,
-and repo policy permits cleanup. If any precondition is missing, leave it in
-place and report the reason.
+Cleanup is a separate, potentially destructive action. Apply effective user and
+repository instructions before removing a worktree, deleting a local branch, or
+deleting files: an explicit no-delete or confirmation-required instruction
+overrides this skill's general cleanup workflow. A request to run the loop,
+integrate the task, or report completion is not cleanup approval. When approval
+is absent or deletion is prohibited, leave the merged worktree and branch
+intact, report the exact worktree path and local branch name, and still record
+the task as completed with commit provenance. When cleanup is expressly
+authorized and repo policy permits it, remove only a clean, merged worktree and
+its local branch after verifying the landed commit is contained in the
+integration branch, ownership is clear, and no active agent still uses it.
 
 ## Prompt Requirements
 
