@@ -17,6 +17,8 @@ from vibe_loop.config import (
     AgentResolutionError,
     VibeConfig,
     load_config,
+    normalize_registry_runtime_context,
+    normalize_registry_runtime_context_assignments,
     prepare_shell_command,
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
@@ -180,9 +182,10 @@ class ProjectStatus:
     observations: tuple[str, ...] = ()
     last_cycle: CycleSummary | None = None
     next_wake: str = ""
+    runtime_context: tuple[tuple[str, str], ...] = ()
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "repo": str(self.repo),
             "display_name": self.display_name,
             "state_dir": str(self.state_dir),
@@ -206,6 +209,9 @@ class ProjectStatus:
             ),
             "next_wake": self.next_wake,
         }
+        redacted = redact_runtime_context_payload(payload, self.runtime_context)
+        assert isinstance(redacted, dict)
+        return redacted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -259,6 +265,7 @@ def collect_project_status(
         config.repo,
         config.state_path / "locks",
         config.locks,
+        runtime_context=config.runtime_environment,
     )
     run_store = RunStore(config.state_path / "runs.jsonl")
     workers = tuple(
@@ -332,6 +339,7 @@ def collect_project_status(
         observations=observations,
         last_cycle=last_cycle,
         next_wake=last_cycle.next_wake if last_cycle is not None else "",
+        runtime_context=config.runtime_context,
     )
 
 
@@ -345,6 +353,7 @@ def collect_worker_views(
         config.repo,
         config.state_path / "locks",
         config.locks,
+        runtime_context=config.runtime_environment,
     )
     from vibe_loop.workers import build_worker_views
 
@@ -1236,6 +1245,7 @@ def run_worktree_disposition(
         config.repo,
         config.state_path / "locks",
         config.locks,
+        runtime_context=config.runtime_environment,
     )
     evidence = collect_worktree_disposition_evidence(
         lock_manager,
@@ -1340,6 +1350,7 @@ def execute_autopilot_cycle(
             config.repo,
             config.state_path / "locks",
             config.locks,
+            runtime_context=config.runtime_environment,
         )
         clean_result = clean_stale_locks(list(cleanup_candidates), lock_manager)
         record_expired_locks(run_store, clean_result.cleaned)
@@ -1610,6 +1621,7 @@ def run_autopilot(
         config.repo,
         config.state_path / "locks",
         config.locks,
+        runtime_context=config.runtime_environment,
     )
     supervisor_run_id = new_run_id("autopilot")
 
@@ -1793,10 +1805,42 @@ def iso_after(seconds: float) -> str:
 
 
 PROJECT_REGISTRY_SCHEMA_VERSION = 1
+RUNTIME_CONTEXT_REDACTION = "<runtime-context-redacted>"
 
 
 def default_registry_path() -> Path:
     return Path.home() / ".vibe-loop" / "projects.json"
+
+
+def redact_runtime_context_text(
+    value: str,
+    runtime_context: tuple[tuple[str, str], ...],
+) -> str:
+    redacted = value
+    context_values = sorted(
+        (context_value for _name, context_value in runtime_context if context_value),
+        key=len,
+        reverse=True,
+    )
+    for context_value in context_values:
+        redacted = redacted.replace(context_value, RUNTIME_CONTEXT_REDACTION)
+    return redacted
+
+
+def redact_runtime_context_payload(
+    value: object,
+    runtime_context: tuple[tuple[str, str], ...],
+) -> object:
+    if isinstance(value, str):
+        return redact_runtime_context_text(value, runtime_context)
+    if isinstance(value, dict):
+        return {
+            key: redact_runtime_context_payload(item, runtime_context)
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_runtime_context_payload(item, runtime_context) for item in value]
+    return value
 
 
 def _entry_matches(entry: ProjectEntry, key: str) -> bool:
@@ -1814,17 +1858,37 @@ def _entry_matches(entry: ProjectEntry, key: str) -> bool:
 class ProjectEntry:
     name: str
     repo: Path
+    runtime_context: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "runtime_context",
+            normalize_registry_runtime_context_assignments(self.runtime_context),
+        )
 
     def to_json(self) -> dict[str, object]:
-        return {"name": self.name, "repo": str(self.repo)}
+        payload = redact_runtime_context_payload(
+            {"name": self.name, "repo": str(self.repo)},
+            self.runtime_context,
+        )
+        assert isinstance(payload, dict)
+        return payload
+
+    def to_registry_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {"name": self.name, "repo": str(self.repo)}
+        if self.runtime_context:
+            payload["context"] = dict(self.runtime_context)
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
 class ProjectRegistry:
     """An optional global list of repositories for multi-project autopilot.
 
-    The registry only records repo paths and display names. Each project keeps
-    its runtime state under its own configured state directory, and single-repo
+    Each entry records a repo path, display name, and optional validated runtime
+    selectors for command task-source and lock adapters. Each project keeps its
+    runtime state under its own configured state directory, and single-repo
     operation never requires the registry to exist.
     """
 
@@ -1847,13 +1911,28 @@ class ProjectRegistry:
             name = str(raw.get("name") or "")
             repo = str(raw.get("repo") or "")
             if name and repo:
-                entries.append(ProjectEntry(name=name, repo=Path(repo)))
+                try:
+                    if "context" in raw and raw["context"] is None:
+                        raise ValueError("registry entry context must be an object")
+                    entries.append(
+                        ProjectEntry(
+                            name=name,
+                            repo=Path(repo),
+                            runtime_context=normalize_registry_runtime_context(
+                                raw.get("context")
+                            ),
+                        )
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"invalid project registry entry {name!r}: {exc}"
+                    ) from exc
         return cls(path=path, entries=tuple(entries))
 
     def to_json(self) -> dict[str, object]:
         return {
             "schema_version": PROJECT_REGISTRY_SCHEMA_VERSION,
-            "projects": [entry.to_json() for entry in self.entries],
+            "projects": [entry.to_registry_json() for entry in self.entries],
         }
 
     def find(self, key: str) -> ProjectEntry | None:
@@ -1885,14 +1964,18 @@ class AggregateProjectStatus:
     repo: Path
     status: ProjectStatus | None = None
     error: str = ""
+    runtime_context: tuple[tuple[str, str], ...] = ()
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "name": self.name,
             "repo": str(self.repo),
             "status": self.status.to_json() if self.status is not None else None,
             "error": self.error,
         }
+        redacted = redact_runtime_context_payload(payload, self.runtime_context)
+        assert isinstance(redacted, dict)
+        return redacted
 
 
 def collect_registry_status(
@@ -1903,17 +1986,30 @@ def collect_registry_status(
     results: list[AggregateProjectStatus] = []
     for entry in registry.entries:
         try:
-            config = load_config(entry.repo)
+            config = load_config(
+                entry.repo,
+                runtime_context=dict(entry.runtime_context),
+            )
             status = collect_project_status(config, process_exists=process_exists)
             results.append(
-                AggregateProjectStatus(name=entry.name, repo=entry.repo, status=status)
+                AggregateProjectStatus(
+                    name=entry.name,
+                    repo=entry.repo,
+                    status=status,
+                    runtime_context=entry.runtime_context,
+                )
             )
         # Per-repo collection can fail many ways (missing/unreadable repo,
         # malformed config, git or task-source errors); isolate the failure so
         # one bad project never breaks the rest of the aggregate.
         except Exception as exc:
             results.append(
-                AggregateProjectStatus(name=entry.name, repo=entry.repo, error=str(exc))
+                AggregateProjectStatus(
+                    name=entry.name,
+                    repo=entry.repo,
+                    error=redact_runtime_context_text(str(exc), entry.runtime_context),
+                    runtime_context=entry.runtime_context,
+                )
             )
     return results
 

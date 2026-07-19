@@ -10,6 +10,7 @@ import string
 import subprocess
 import sys
 import tomllib
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,81 @@ DEFAULT_RUNNABLE_STATUSES = ("Active", "Next", "Planned")
 GENERATED_TASK_PROFILE_CACHE_FILE = "generated-task-source.json"
 GENERATED_TASK_PROFILE_SCHEMA_VERSION = 1
 GENERATED_TASK_PROFILE_PROMPT_VERSION = 1
+REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES = 16
+REGISTRY_RUNTIME_CONTEXT_MAX_VALUE_BYTES = 4096
+REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024
+REGISTRY_RUNTIME_CONTEXT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+REGISTRY_RUNTIME_CONTEXT_FORBIDDEN_NAMES = frozenset(
+    {
+        "BASH_ENV",
+        "CDPATH",
+        "CLASSPATH",
+        "ENV",
+        "GCONV_PATH",
+        "GEM_HOME",
+        "GEM_PATH",
+        "GLOBIGNORE",
+        "IFS",
+        "JAVA_TOOL_OPTIONS",
+        "NODE_OPTIONS",
+        "PATH",
+        "PERL5LIB",
+        "PERL5OPT",
+        "PROMPT_COMMAND",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "RUBYOPT",
+        "SHELLOPTS",
+        "ZDOTDIR",
+        "_JAVA_OPTIONS",
+    }
+)
+REGISTRY_RUNTIME_CONTEXT_FORBIDDEN_PREFIXES = ("DYLD_", "LD_", "VIBE_LOOP_")
+REGISTRY_RUNTIME_CONTEXT_SELECTOR_SUFFIXES = frozenset(
+    {
+        "BOARD",
+        "CONTEXT",
+        "INSTANCE",
+        "NAMESPACE",
+        "ORG",
+        "ORGANIZATION",
+        "PROJECT",
+        "PROJECT_ID",
+        "PROJECT_KEY",
+        "REPO",
+        "REPOSITORY",
+        "SELECTOR",
+        "SITE",
+        "TEAM",
+        "TENANT",
+        "WORKSPACE",
+    }
+)
+REGISTRY_RUNTIME_CONTEXT_SECRET_NAME_TOKENS = frozenset(
+    {
+        "APIKEY",
+        "AUTH",
+        "BEARER",
+        "COOKIE",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "DSN",
+        "PASSWD",
+        "PASSWORD",
+        "PRIVATE",
+        "SECRET",
+        "TOKEN",
+    }
+)
+REGISTRY_RUNTIME_CONTEXT_SECRET_VALUE_PREFIXES = (
+    "ghp_",
+    "github_pat_",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+)
 SUPERVISION_DEFAULT_MAX_RESTARTS = 3
 SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
 SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
@@ -697,6 +773,7 @@ class VibeConfig:
     config_path: Path | None = None
     config_source: str = "default"
     worker_prompt_extra: str | None = None
+    runtime_context: tuple[tuple[str, str], ...] = ()
 
     @property
     def state_path(self) -> Path:
@@ -706,6 +783,10 @@ class VibeConfig:
     def generated_task_profile_path(self) -> Path:
         return self.state_path / GENERATED_TASK_PROFILE_CACHE_FILE
 
+    @property
+    def runtime_environment(self) -> dict[str, str]:
+        return dict(self.runtime_context)
+
     def config_report(self) -> dict[str, object]:
         return {
             "source": self.config_source,
@@ -713,7 +794,11 @@ class VibeConfig:
         }
 
 
-def load_config(repo: Path) -> VibeConfig:
+def load_config(
+    repo: Path,
+    *,
+    runtime_context: object = None,
+) -> VibeConfig:
     repo = repo.resolve()
     config_path, config_source = resolve_config_file(repo)
     data = read_config_file(config_path) if config_path is not None else {}
@@ -746,6 +831,115 @@ def load_config(repo: Path) -> VibeConfig:
         locks=locks,
         autopilot=autopilot,
         specs=specs,
+        runtime_context=normalize_registry_runtime_context(runtime_context),
+    )
+
+
+def normalize_registry_runtime_context(
+    value: object,
+) -> tuple[tuple[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Mapping):
+        raise ValueError("registry entry context must be an object")
+    return normalize_registry_runtime_context_assignments(value.items())
+
+
+def normalize_registry_runtime_context_assignments(
+    value: object,
+) -> tuple[tuple[str, str], ...]:
+    if isinstance(value, (str, bytes)):
+        raise ValueError("registry entry context assignments must be pairs")
+    try:
+        raw_entries = iter(value)
+    except TypeError as exc:
+        raise ValueError("registry entry context assignments must be pairs") from exc
+
+    entries: list[tuple[str, str]] = []
+    normalized_names: set[str] = set()
+    total_bytes = 0
+    for raw_entry in raw_entries:
+        if not isinstance(raw_entry, (tuple, list)) or len(raw_entry) != 2:
+            raise ValueError("registry entry context assignments must be pairs")
+        name, context_value = raw_entry
+        if len(entries) >= REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES:
+            raise ValueError(
+                "registry entry context has too many entries "
+                f"(maximum {REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES})"
+            )
+        if not isinstance(name, str):
+            raise ValueError("registry entry context names must be strings")
+        if not REGISTRY_RUNTIME_CONTEXT_NAME_RE.fullmatch(name):
+            raise ValueError(
+                f"registry entry context name {name!r} is not a valid "
+                "environment variable name"
+            )
+        normalized_name = name.upper()
+        if normalized_name in normalized_names:
+            raise ValueError(
+                f"registry entry context name {name!r} is duplicated case-insensitively"
+            )
+        if registry_runtime_context_name_is_dangerous(normalized_name):
+            raise ValueError(f"registry entry context name {name!r} is prohibited")
+        if not registry_runtime_context_name_is_selector(normalized_name):
+            suffixes = ", ".join(
+                f"_{suffix}"
+                for suffix in sorted(REGISTRY_RUNTIME_CONTEXT_SELECTOR_SUFFIXES)
+            )
+            raise ValueError(
+                f"registry entry context name {name!r} is not selector-shaped; "
+                f"use a selector suffix such as {suffixes}"
+            )
+        if not isinstance(context_value, str):
+            raise ValueError(
+                f"registry entry context value for {name!r} must be a string"
+            )
+        if "\0" in context_value:
+            raise ValueError(
+                f"registry entry context value for {name!r} contains a null byte"
+            )
+        value_bytes = len(context_value.encode("utf-8"))
+        if value_bytes > REGISTRY_RUNTIME_CONTEXT_MAX_VALUE_BYTES:
+            raise ValueError(
+                f"registry entry context value for {name!r} is too large "
+                f"(maximum {REGISTRY_RUNTIME_CONTEXT_MAX_VALUE_BYTES} bytes)"
+            )
+        if (
+            context_value.strip()
+            .lower()
+            .startswith(REGISTRY_RUNTIME_CONTEXT_SECRET_VALUE_PREFIXES)
+        ):
+            raise ValueError(
+                f"registry entry context value for {name!r} looks secret-like"
+            )
+        total_bytes += len(name.encode("utf-8")) + value_bytes
+        if total_bytes > REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES:
+            raise ValueError(
+                "registry entry context is too large "
+                f"(maximum {REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES} bytes)"
+            )
+        normalized_names.add(normalized_name)
+        entries.append((name, context_value))
+    return tuple(sorted(entries))
+
+
+def registry_runtime_context_name_is_dangerous(normalized_name: str) -> bool:
+    if normalized_name in REGISTRY_RUNTIME_CONTEXT_FORBIDDEN_NAMES:
+        return True
+    if normalized_name.startswith(REGISTRY_RUNTIME_CONTEXT_FORBIDDEN_PREFIXES):
+        return True
+    tokens = frozenset(part for part in normalized_name.split("_") if part)
+    if tokens & REGISTRY_RUNTIME_CONTEXT_SECRET_NAME_TOKENS:
+        return True
+    if "API_KEY" in normalized_name or "PRIVATE_KEY" in normalized_name:
+        return True
+    return False
+
+
+def registry_runtime_context_name_is_selector(normalized_name: str) -> bool:
+    return any(
+        normalized_name == suffix or normalized_name.endswith(f"_{suffix}")
+        for suffix in REGISTRY_RUNTIME_CONTEXT_SELECTOR_SUFFIXES
     )
 
 

@@ -11,7 +11,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -597,6 +597,7 @@ class CommandLockBackend:
         status_command: str,
         list_command: str,
         lease_seconds: int | None = None,
+        runtime_context: Mapping[str, str] | None = None,
     ):
         self.repo = repo
         self.lock_root = lock_root
@@ -605,6 +606,7 @@ class CommandLockBackend:
         self.status_command = status_command
         self.list_command = list_command
         self.lease_seconds = lease_seconds
+        self.runtime_context = dict(runtime_context or {})
 
     def path_for(self, task_id: str) -> Path:
         return self.lock_root / f"{safe_name(task_id)}.lock"
@@ -798,6 +800,7 @@ class CommandLockBackend:
         metadata: dict[str, object],
     ) -> object:
         env = os.environ.copy()
+        env.update(self.runtime_context)
         env.update(
             {
                 "VIBE_LOOP_LOCK_OPERATION": operation,
@@ -836,7 +839,9 @@ class CommandLockBackend:
                 stdout = read_command_output(stdout_file, setting_name, "stdout")
                 stderr = read_command_output(stderr_file, setting_name, "stderr")
         if returncode != 0:
-            detail = truncate_diagnostic(stderr.strip())
+            detail = truncate_diagnostic(
+                redact_runtime_context_values(stderr.strip(), self.runtime_context)
+            )
             suffix = f": {detail}" if detail else ""
             raise LockBackendError(
                 f"{setting_name} exited with status {returncode}{suffix}"
@@ -847,6 +852,21 @@ class CommandLockBackend:
             raise LockBackendError(
                 f"{setting_name} must write valid JSON to stdout: {exc.msg}"
             ) from exc
+
+
+def redact_runtime_context_values(
+    diagnostic: str,
+    runtime_context: Mapping[str, str],
+) -> str:
+    redacted = diagnostic
+    values = sorted(
+        (value for value in runtime_context.values() if value),
+        key=len,
+        reverse=True,
+    )
+    for value in values:
+        redacted = redacted.replace(value, "<runtime-context-redacted>")
+    return redacted
 
 
 def wait_for_lock_command(
@@ -917,7 +937,13 @@ def terminate_lock_command(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def build_lock_manager(repo: Path, lock_root: Path, lock_config: object) -> LockManager:
+def build_lock_manager(
+    repo: Path,
+    lock_root: Path,
+    lock_config: object,
+    *,
+    runtime_context: Mapping[str, str] | None = None,
+) -> LockManager:
     lock_type = getattr(lock_config, "type", "directory")
     if lock_type == "command":
         return LockManager(
@@ -930,6 +956,7 @@ def build_lock_manager(repo: Path, lock_root: Path, lock_config: object) -> Lock
                 status_command=str(getattr(lock_config, "status_command")),
                 list_command=str(getattr(lock_config, "list_command")),
                 lease_seconds=getattr(lock_config, "lease_seconds", None),
+                runtime_context=runtime_context,
             ),
         )
     return LockManager(

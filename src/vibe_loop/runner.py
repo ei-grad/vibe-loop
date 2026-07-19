@@ -455,6 +455,7 @@ class VibeRunner:
             config.repo,
             config.state_path / "locks",
             config.locks,
+            runtime_context=config.runtime_environment,
         )
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
@@ -473,6 +474,7 @@ class VibeRunner:
             self._source = build_task_source(
                 self.config.repo,
                 self.source_resolution.task_source,
+                runtime_context=self.config.runtime_environment,
             )
         return self._source
 

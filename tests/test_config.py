@@ -16,6 +16,7 @@ from vibe_loop.config import (
     VibeConfig,
     detect_agent_clis,
     load_config,
+    normalize_registry_runtime_context,
     parse_main_worktree_path,
     reject_generated_command_adapters,
     resolve_task_agent,
@@ -30,6 +31,94 @@ from vibe_loop.generated_profiles import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_registry_runtime_context_is_bounded_and_literal(self) -> None:
+        context = normalize_registry_runtime_context(
+            {
+                "LOOPYARD_PROJECT": "vibe-loop; printf not-shell",
+                "TASK_BOARD": "alpha beta",
+            }
+        )
+
+        self.assertEqual(
+            dict(context),
+            {
+                "LOOPYARD_PROJECT": "vibe-loop; printf not-shell",
+                "TASK_BOARD": "alpha beta",
+            },
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory), runtime_context=dict(context))
+        self.assertEqual(config.runtime_environment, dict(context))
+        self.assertNotIn("runtime_context", config.config_report())
+
+    def test_registry_runtime_context_rejects_malformed_and_dangerous_values(
+        self,
+    ) -> None:
+        invalid_contexts = (
+            ["LOOPYARD_PROJECT=vibe-loop"],
+            {"1PROJECT": "vibe-loop"},
+            {"LOOPYARD_PROJECT": 4},
+            {"SELECTOR": "a", "selector": "b"},
+            {"API_TOKEN": "not-stored"},
+            {"LOOPYARD_DSN": "postgresql://example"},
+            {"LD_PRELOAD": "/tmp/library.so"},
+            {"PYTHONPATH": "/tmp/module"},
+            {"BASH_ENV": "/tmp/profile"},
+            {"JDK_JAVA_OPTIONS": "-javaagent:/tmp/agent.jar"},
+            {"NODE_PATH": "/tmp/module"},
+            {"RUBYLIB": "/tmp/module"},
+            {"PERLLIB": "/tmp/module"},
+            {"VIBE_LOOP_RUN_ID": "other-run"},
+            {"AWS_ACCESS_KEY_ID": "example"},
+            {"AWS_PROFILE": "example"},
+            {"DOCKER_CONFIG": "/tmp/docker"},
+            {"KUBECONFIG": "/tmp/kubeconfig"},
+            {"SELECTOR": "sk-example"},
+            {f"SELECTOR_{index}": "value" for index in range(17)},
+            {"SELECTOR": "x" * 4097},
+        )
+
+        for context in invalid_contexts:
+            with self.subTest(context_type=type(context).__name__):
+                with self.assertRaises(ValueError):
+                    normalize_registry_runtime_context(context)
+
+    def test_registry_runtime_context_accepts_exact_limits_and_rejects_overflow(
+        self,
+    ) -> None:
+        exact_entries = {f"P{index}_PROJECT": "" for index in range(16)}
+        self.assertEqual(
+            len(normalize_registry_runtime_context(exact_entries)),
+            16,
+        )
+        self.assertEqual(
+            dict(normalize_registry_runtime_context({"PROJECT": "x" * 4096})),
+            {"PROJECT": "x" * 4096},
+        )
+
+        exact_total = {
+            "A_PROJECT": "a" * 4096,
+            "B_PROJECT": "b" * 4096,
+            "C_PROJECT": "c" * 4096,
+            "D_PROJECT": "d" * 4060,
+        }
+        self.assertEqual(
+            sum(
+                len(name.encode()) + len(value.encode())
+                for name, value in exact_total.items()
+            ),
+            16 * 1024,
+        )
+        self.assertEqual(
+            dict(normalize_registry_runtime_context(exact_total)),
+            exact_total,
+        )
+
+        over_total = dict(exact_total)
+        over_total["D_PROJECT"] += "d"
+        with self.assertRaises(ValueError):
+            normalize_registry_runtime_context(over_total)
+
     def test_detect_agent_clis_reports_supported_binaries_on_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             bin_dir = Path(directory)

@@ -154,6 +154,21 @@ operator can distinguish report-only inspection from an explicit reaping opt-in.
 Per-repo state stays under that repo's configured state directory; no global
 registry is required for the first implementation.
 
+Registry entries may carry an optional bounded `context` object for non-secret
+runtime selectors required by command-backed task-source and lock adapters, for
+example `LOOPYARD_PROJECT`. The context is copied into each adapter subprocess
+environment without mutating the supervisor environment or interpolating values
+into shell commands. It does not apply to worker-agent or maintenance commands.
+Entries are limited to 16 variables, 4 KiB per value, and 16 KiB total. Secret-
+like names and values, process-loader variables, shell startup controls, command
+lookup paths, credential/config selectors, and `VIBE_LOOP_*` protocol variables
+are rejected. Names must be selector-shaped, using a suffix such as `_PROJECT`,
+`_BOARD`, `_TENANT`, `_WORKSPACE`, `_NAMESPACE`, `_REPO`, `_TEAM`, or
+`_SELECTOR`; arbitrary environment controls are not accepted. Context values are
+persisted only in the registry and recursively redacted from project list,
+inspect, and aggregate status output, including adapter-derived payloads and
+diagnostics.
+
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-06`.
 
 ## PRD-AUT-008 TUI And WebUI Readiness

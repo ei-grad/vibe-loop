@@ -369,6 +369,8 @@ vibe-loop autopilot run --repo . --once
 vibe-loop autopilot run --repo . --once --worktree-disposition reap
 vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 vibe-loop autopilot projects register --repo . --name my-project
+vibe-loop autopilot projects register --repo . --name tasks \
+  --context LOOPYARD_PROJECT=vibe-loop
 vibe-loop autopilot projects status --json
 vibe-loop wait-helper --pid 12345 --json
 ```
@@ -415,11 +417,23 @@ authoring new tasks itself. A single supervisor lock prevents duplicates; Ctrl-C
 terminates the in-flight child and releases the lock.
 
 **`projects`** manages an optional multi-project registry (`register`, `list`,
-`remove`, `status`). It records only repo paths and display names in a small JSON
-file (default `~/.vibe-loop/projects.json`, `--registry` to override); each
-project keeps its own state directory. `projects status [--json]` returns one
-aggregate entry per repo, and a repo that cannot be read becomes an isolated
-error entry so one broken project never hides the others.
+`remove`, `status`). It records repo paths and display names in a small JSON file
+(default `~/.vibe-loop/projects.json`, `--registry` to override); each project
+keeps its own state directory. A repeated `register --context NAME=VALUE` option
+adds bounded, non-secret selectors for repositories whose command-backed task
+source or lock adapter needs distinct context such as `LOOPYARD_PROJECT`.
+Selectors are copied literally into only those subprocess environments, never
+shell-interpolated or added to global `os.environ`. Names must be selector-
+shaped, with suffixes such as `_PROJECT`, `_BOARD`, `_TENANT`, `_WORKSPACE`,
+`_NAMESPACE`, `_REPO`, `_TEAM`, or `_SELECTOR`. Secret-like names/values,
+loader and shell-startup controls, command lookup paths, credential/config
+selectors, and `VIBE_LOOP_*` protocol variables are rejected. Context values
+remain only in the registry; `projects list`, `inspect`, and `status` recursively
+redact them even if an adapter echoes one in a valid payload or diagnostic.
+Existing registry entries without `context` remain valid.
+`projects status [--json]` returns one aggregate entry per repo, and a repo that
+cannot be read becomes an isolated error entry so one broken project never hides
+the others.
 
 Interactive status dashboards (board, agents, and timeline/Gantt screens) live
 in the [loopyard](https://github.com/ei-grad/loopyard) web UI, which consumes the

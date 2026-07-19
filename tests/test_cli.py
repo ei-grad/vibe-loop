@@ -7161,6 +7161,148 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(after_code, 0)
         self.assertEqual(json.loads(after_out), [])
 
+    def test_projects_register_context_is_persisted_but_redacted_from_output(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            registry = base / "projects.json"
+            repo = base / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            selector = "vibe-loop; printf not-shell"
+
+            register_code, register_out = self._autopilot(
+                "projects",
+                "register",
+                "--repo",
+                str(repo),
+                "--name",
+                "demo",
+                "--context",
+                f"LOOPYARD_PROJECT={selector}",
+                "--registry",
+                str(registry),
+                "--json",
+            )
+            list_code, list_out = self._autopilot(
+                "projects", "list", "--registry", str(registry), "--json"
+            )
+            persisted = registry.read_text(encoding="utf-8")
+
+        self.assertEqual(register_code, 0)
+        self.assertEqual(list_code, 0)
+        self.assertNotIn(selector, register_out)
+        self.assertNotIn(selector, list_out)
+        self.assertIn(selector, persisted)
+        self.assertEqual(
+            json.loads(persisted)["projects"][0]["context"],
+            {"LOOPYARD_PROJECT": selector},
+        )
+
+    def test_projects_register_rejects_secret_context_without_value_disclosure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            registry = base / "projects.json"
+            repo = base / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(
+                    [
+                        "autopilot",
+                        "projects",
+                        "register",
+                        "--repo",
+                        str(repo),
+                        "--context",
+                        "API_TOKEN=must-not-be-printed",
+                        "--registry",
+                        str(registry),
+                    ]
+                )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(registry.exists())
+        self.assertNotIn("must-not-be-printed", stderr.getvalue())
+
+    def test_projects_status_redacts_context_echoed_by_task_adapter(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            registry = base / "projects.json"
+            repo = base / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            selector = "selector-value-from-adapter"
+            (repo / "adapter.py").write_text(
+                "import json, os\n"
+                "selector = os.environ['PROJECT_SELECTOR']\n"
+                "print(json.dumps([{'id': 'TASK-SELECTED', 'title': selector, "
+                "'status': 'ready', 'source': selector}]))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "command"\n'
+                f"list = {json.dumps(f'{sys.executable} adapter.py')}\n"
+                'runnable_statuses = ["ready"]\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "adapter.py", ".vibe-loop.toml"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "command adapter"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            register_code, _register_out = self._autopilot(
+                "projects",
+                "register",
+                "--repo",
+                str(repo),
+                "--name",
+                "demo",
+                "--context",
+                f"PROJECT_SELECTOR={selector}",
+                "--registry",
+                str(registry),
+            )
+            outputs = []
+            for command_args in (
+                ("projects", "inspect", "demo", "--registry", str(registry)),
+                (
+                    "projects",
+                    "inspect",
+                    "demo",
+                    "--registry",
+                    str(registry),
+                    "--json",
+                ),
+                ("projects", "status", "--registry", str(registry)),
+                (
+                    "projects",
+                    "status",
+                    "--registry",
+                    str(registry),
+                    "--json",
+                ),
+            ):
+                code, output = self._autopilot(*command_args)
+                self.assertEqual(code, 0)
+                outputs.append(output)
+
+        self.assertEqual(register_code, 0)
+        for output in outputs:
+            self.assertNotIn(selector, output)
+        self.assertTrue(any("runtime-context-redacted" in output for output in outputs))
+
     def test_projects_inspect_reports_single_status_and_path_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()

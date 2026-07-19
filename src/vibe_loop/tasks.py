@@ -5,7 +5,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -240,14 +240,19 @@ class TaskSource(Protocol):
         ...
 
 
-def build_task_source(repo: Path, config: TaskSourceConfig) -> TaskSource:
+def build_task_source(
+    repo: Path,
+    config: TaskSourceConfig,
+    *,
+    runtime_context: Mapping[str, str] | None = None,
+) -> TaskSource:
     if (
         config.type == "command"
         or config.list_command
         or config.next_command
         or config.probe_command
     ):
-        return CommandTaskSource(repo, config)
+        return CommandTaskSource(repo, config, runtime_context=runtime_context)
     if config.type in {"markdown-plan", "markdown-profile"}:
         if config.profile is not None:
             return MarkdownProfileSource(repo, config.profile)
@@ -2075,9 +2080,16 @@ def contains_task_table(path: Path) -> bool:
 
 
 class CommandTaskSource:
-    def __init__(self, repo: Path, config: TaskSourceConfig):
+    def __init__(
+        self,
+        repo: Path,
+        config: TaskSourceConfig,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ):
         self.repo = repo
         self.config = config
+        self.runtime_context = dict(runtime_context or {})
         if not config.list_command:
             raise ValueError("command task source requires task_source.list")
 
@@ -2086,6 +2098,7 @@ class CommandTaskSource:
             self.repo,
             self.config.list_command or "",
             timeout=self.config.command_timeout_seconds,
+            runtime_context=self.runtime_context,
         )
         raw_tasks = (
             payload.get("tasks", payload) if isinstance(payload, dict) else payload
@@ -2103,6 +2116,7 @@ class CommandTaskSource:
                 self.repo,
                 command,
                 timeout=self.config.command_timeout_seconds,
+                runtime_context=self.runtime_context,
             )
             if payload is None:
                 return None
@@ -2119,17 +2133,24 @@ class CommandTaskSource:
             self.repo,
             command,
             timeout=self.config.command_timeout_seconds,
+            runtime_context=self.runtime_context,
         )
         return True
 
 
 def run_json_command(
-    repo: Path, command: str, *, timeout: float | None = None
+    repo: Path,
+    command: str,
+    *,
+    timeout: float | None = None,
+    runtime_context: Mapping[str, str] | None = None,
 ) -> object:
     # timeout bounds a hung backend command so it cannot freeze the supervisor.
     # Expiry raises subprocess.TimeoutExpired — a SubprocessError, but not a
     # CalledProcessError — so it is not conflated with a JSON parse failure and
     # is handled identically to a nonzero exit by every caller's fail-safe path.
+    environment = os.environ.copy()
+    environment.update(runtime_context or {})
     result = subprocess.run(
         command,
         cwd=repo,
@@ -2139,18 +2160,25 @@ def run_json_command(
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
+        env=environment,
     )
     return json.loads(result.stdout)
 
 
 def run_reset_command(
-    repo: Path, command: str, *, timeout: float | None = None
+    repo: Path,
+    command: str,
+    *,
+    timeout: float | None = None,
+    runtime_context: Mapping[str, str] | None = None,
 ) -> None:
     # Fire-and-check: the reset hook mutates backend status and is not expected
     # to emit JSON, so a nonzero exit raises CalledProcessError for the caller
     # to log non-fatally rather than being parsed as task output. timeout bounds
     # a hung hook the same way; TimeoutExpired is likewise a SubprocessError the
     # caller's non-fatal handler already covers.
+    environment = os.environ.copy()
+    environment.update(runtime_context or {})
     subprocess.run(
         command,
         cwd=repo,
@@ -2160,6 +2188,7 @@ def run_reset_command(
         stderr=subprocess.PIPE,
         text=True,
         timeout=timeout,
+        env=environment,
     )
 
 

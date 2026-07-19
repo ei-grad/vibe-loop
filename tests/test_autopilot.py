@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import subprocess
 import sys
@@ -1799,6 +1800,212 @@ class AutopilotRegistryTests(unittest.TestCase):
             self.assertEqual([entry.name for entry in without_beta.entries], ["alpha"])
             _, removed_missing = without_beta.without("missing")
             self.assertFalse(removed_missing)
+
+    def test_registry_context_roundtrips_without_public_disclosure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            registry_path = Path(directory) / "projects.json"
+            secret_marker = "selector-value-not-for-status"
+            registry = ProjectRegistry(
+                path=registry_path,
+                entries=(
+                    ProjectEntry(
+                        name="alpha",
+                        repo=Path("/repos/alpha"),
+                        runtime_context=(("LOOPYARD_PROJECT", secret_marker),),
+                    ),
+                ),
+            )
+            registry.save()
+
+            persisted = registry_path.read_text(encoding="utf-8")
+            reloaded = ProjectRegistry.load(registry_path)
+
+        self.assertIn(secret_marker, persisted)
+        self.assertEqual(
+            dict(reloaded.entries[0].runtime_context),
+            {"LOOPYARD_PROJECT": secret_marker},
+        )
+        self.assertNotIn(secret_marker, json.dumps(reloaded.entries[0].to_json()))
+
+    def test_registry_context_rejects_duplicate_assignments_consistently(self) -> None:
+        duplicates = (
+            (("PROJECT_SELECTOR", "first"), ("PROJECT_SELECTOR", "second")),
+            (("PROJECT_SELECTOR", "first"), ("project_selector", "second")),
+        )
+        for runtime_context in duplicates:
+            with self.subTest(runtime_context=runtime_context):
+                with self.assertRaises(ValueError) as caught:
+                    ProjectEntry(
+                        name="alpha",
+                        repo=Path("/repos/alpha"),
+                        runtime_context=runtime_context,
+                    )
+            self.assertNotIn("first", str(caught.exception))
+            self.assertNotIn("second", str(caught.exception))
+
+    def test_registry_rejects_malformed_or_prohibited_context(self) -> None:
+        invalid_contexts = (
+            None,
+            ["LOOPYARD_PROJECT=vibe-loop"],
+            {"API_TOKEN": "must-not-appear-in-error"},
+            {"LD_PRELOAD": "/tmp/library.so"},
+        )
+        for context in invalid_contexts:
+            with self.subTest(context_type=type(context).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    registry_path = Path(directory) / "projects.json"
+                    registry_path.write_text(
+                        json.dumps(
+                            {
+                                "projects": [
+                                    {
+                                        "name": "alpha",
+                                        "repo": "/repos/alpha",
+                                        "context": context,
+                                    }
+                                ]
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        ProjectRegistry.load(registry_path)
+
+                self.assertNotIn("must-not-appear-in-error", str(caught.exception))
+
+    def test_collect_registry_status_isolates_three_command_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entries = []
+            expected_queues = {}
+            selectors = (
+                ("alpha", "selector-one; printf not-shell"),
+                ("beta", "selector-two"),
+                ("gamma", "selector-three"),
+            )
+            for name, selector in selectors:
+                repo = root / name
+                repo.mkdir()
+                init_repo(repo)
+                queue_id = f"QUEUE-{name.upper()}"
+                expected_queues[name] = queue_id
+                (repo / "expected.json").write_text(
+                    json.dumps({"selector": selector, "queue_id": queue_id}),
+                    encoding="utf-8",
+                )
+                (repo / "adapter.py").write_text(
+                    "import json, os, sys\n"
+                    "from pathlib import Path\n"
+                    "expected = json.loads(Path('expected.json').read_text())\n"
+                    "if os.environ.get('PROJECT_SELECTOR') != expected['selector']:\n"
+                    "    raise SystemExit(7)\n"
+                    "if sys.argv[1] == 'tasks':\n"
+                    "    print(json.dumps([{'id': expected['queue_id'], "
+                    "'title': expected['selector'], 'status': 'ready', "
+                    "'source': expected['selector']}]))\n"
+                    "elif os.environ.get('VIBE_LOOP_LOCK_OPERATION') == 'list':\n"
+                    "    print('[]')\n"
+                    "else:\n"
+                    "    print(json.dumps({'locked': False}))\n",
+                    encoding="utf-8",
+                )
+                command = f"{sys.executable} adapter.py locks"
+                (repo / ".vibe-loop.toml").write_text(
+                    "[task_source]\n"
+                    'type = "command"\n'
+                    f"list = {json.dumps(f'{sys.executable} adapter.py tasks')}\n"
+                    'runnable_statuses = ["ready"]\n'
+                    "[locks]\n"
+                    'type = "command"\n'
+                    f"acquire_command = {json.dumps(command)}\n"
+                    f"release_command = {json.dumps(command)}\n"
+                    f"status_command = {json.dumps(command)}\n"
+                    f"list_command = {json.dumps(command)}\n",
+                    encoding="utf-8",
+                )
+                run(
+                    repo,
+                    "git",
+                    "add",
+                    "adapter.py",
+                    "expected.json",
+                    ".vibe-loop.toml",
+                )
+                run(repo, "git", "commit", "-m", "initial")
+                entries.append(
+                    ProjectEntry(
+                        name=name,
+                        repo=repo,
+                        runtime_context=(("PROJECT_SELECTOR", selector),),
+                    )
+                )
+
+            registry = ProjectRegistry(
+                path=root / "projects.json",
+                entries=tuple(entries),
+            )
+            with mock.patch.dict(os.environ, {"PROJECT_SELECTOR": "host-default"}):
+                results = collect_registry_status(registry)
+                inherited_after = os.environ["PROJECT_SELECTOR"]
+
+        self.assertEqual(inherited_after, "host-default")
+        self.assertEqual(
+            [result.name for result in results], ["alpha", "beta", "gamma"]
+        )
+        for result, (_name, selector) in zip(results, selectors, strict=True):
+            self.assertEqual(result.error, "")
+            self.assertIsNotNone(result.status)
+            self.assertEqual(
+                result.status.queue.runnable_tasks[0]["id"],
+                expected_queues[result.name],
+            )
+            self.assertNotIn(selector, json.dumps(result.status.to_json()))
+        status_payload = json.dumps([result.to_json() for result in results])
+        for _name, selector in selectors:
+            self.assertNotIn(selector, status_payload)
+
+    def test_registry_context_is_redacted_from_lock_adapter_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "project"
+            repo.mkdir()
+            init_repo(repo)
+            write_plan(repo, [("TASK-01", "Next", "", "ready slice")])
+            selector = "selector-value-must-not-leak"
+            (repo / "adapter.py").write_text(
+                "import os, sys\n"
+                "sys.stderr.write(os.environ['PROJECT_SELECTOR'])\n"
+                "raise SystemExit(3)\n",
+                encoding="utf-8",
+            )
+            command = f"{sys.executable} adapter.py"
+            (repo / ".vibe-loop.toml").write_text(
+                "[locks]\n"
+                'type = "command"\n'
+                f"acquire_command = {json.dumps(command)}\n"
+                f"release_command = {json.dumps(command)}\n"
+                f"status_command = {json.dumps(command)}\n"
+                f"list_command = {json.dumps(command)}\n",
+                encoding="utf-8",
+            )
+            run(repo, "git", "add", "PLAN.md", "adapter.py", ".vibe-loop.toml")
+            run(repo, "git", "commit", "-m", "initial")
+            registry = ProjectRegistry(
+                path=root / "projects.json",
+                entries=(
+                    ProjectEntry(
+                        name="project",
+                        repo=repo,
+                        runtime_context=(("PROJECT_SELECTOR", selector),),
+                    ),
+                ),
+            )
+
+            result = collect_registry_status(registry)[0]
+
+        self.assertIsNone(result.status)
+        self.assertIn("runtime-context-redacted", result.error)
+        self.assertNotIn(selector, result.error)
 
     def test_collect_registry_status_aggregates_and_isolates_failures(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

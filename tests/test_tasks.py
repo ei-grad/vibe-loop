@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -1048,6 +1049,57 @@ class MarkdownPlanTests(unittest.TestCase):
                 self.assertTrue(source.reset("TASK-1"))
 
         self.assertEqual(captured["timeout"], 3.0)
+
+    def test_command_task_source_context_covers_list_probe_and_reset(self) -> None:
+        calls: list[tuple[str, dict[str, str], int]] = []
+
+        def fake_run(
+            command: str, **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            environment = kwargs["env"]
+            assert isinstance(environment, dict)
+            calls.append((command, dict(environment), id(environment)))
+            environment["PROJECT_SELECTOR"] = "mutated-copy"
+            if command == "list-tasks":
+                stdout = "[]"
+            elif command == "probe TASK-1":
+                stdout = '{"id": "TASK-1", "status": "Next"}'
+            else:
+                stdout = ""
+            return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    reset_command="reset {task_id}",
+                ),
+                runtime_context={"PROJECT_SELECTOR": "entry-selector"},
+            )
+            with mock.patch.dict(os.environ, {"PROJECT_SELECTOR": "host-selector"}):
+                with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                    self.assertEqual(source.list_tasks(), [])
+                    self.assertEqual(source.probe("TASK-1").task_id, "TASK-1")
+                    self.assertTrue(source.reset("TASK-1"))
+                inherited_after = os.environ["PROJECT_SELECTOR"]
+
+        self.assertEqual(inherited_after, "host-selector")
+        self.assertEqual(
+            [command for command, _environment, _identity in calls],
+            ["list-tasks", "probe TASK-1", "reset TASK-1"],
+        )
+        self.assertTrue(
+            all(
+                environment["PROJECT_SELECTOR"] == "entry-selector"
+                for _command, environment, _identity in calls
+            )
+        )
+        self.assertEqual(
+            len({identity for _command, _environment, identity in calls}), 3
+        )
 
     def test_command_task_source_surfaces_timeout_as_subprocess_error(self) -> None:
         # A hung backend command expires as TimeoutExpired — a SubprocessError

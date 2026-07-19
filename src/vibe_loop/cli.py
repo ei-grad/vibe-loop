@@ -26,6 +26,8 @@ from vibe_loop.autopilot import (
     default_registry_path,
     parse_wait_deadline,
     poll_wait_message_command,
+    redact_runtime_context_payload,
+    redact_runtime_context_text,
     run_autopilot,
     wait_for_processes,
     WaitMessageAdapterError,
@@ -345,6 +347,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_repo_argument(projects_register)
     projects_register.add_argument("--name", default="")
+    projects_register.add_argument(
+        "--context",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        type=parse_registry_context_assignment,
+        help=(
+            "Set a non-secret runtime selector for this registry entry "
+            "(repeatable; passed only to command task-source and lock adapters)"
+        ),
+    )
     add_registry_argument(projects_register)
     projects_register.add_argument("--json", action="store_true")
     projects_list = projects_subparsers.add_parser(
@@ -772,6 +785,13 @@ def add_registry_argument(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Path to the project registry JSON (default: ~/.vibe-loop/projects.json)",
     )
+
+
+def parse_registry_context_assignment(value: str) -> tuple[str, str]:
+    name, separator, context_value = value.partition("=")
+    if not separator or not name:
+        raise argparse.ArgumentTypeError("context must use NAME=VALUE")
+    return name, context_value
 
 
 def add_task_filter_arguments(
@@ -1338,12 +1358,21 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
     if command == "register":
         repo = getattr(args, "repo", Path.cwd()).resolve()
         name = args.name or repo.name
-        entry = ProjectEntry(name=name, repo=repo)
+        context_pairs = list(args.context)
+        entry = ProjectEntry(
+            name=name,
+            repo=repo,
+            runtime_context=tuple(context_pairs),
+        )
         ProjectRegistry.load(registry_path).with_entry(entry).save()
         if use_json:
             print(json.dumps(entry.to_json(), indent=2))
         else:
-            print(f"registered {name} -> {repo}")
+            print(
+                redact_runtime_context_text(
+                    f"registered {name} -> {repo}", entry.runtime_context
+                )
+            )
         return 0
 
     if command == "list":
@@ -1360,13 +1389,28 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
         if entry is None:
             print(f"not in registry: {args.project}", file=sys.stderr)
             return 2
-        status = collect_project_status(load_config(entry.repo))
+        status = collect_project_status(
+            load_config(
+                entry.repo,
+                runtime_context=dict(entry.runtime_context),
+            )
+        )
         if use_json:
             payload = {"name": entry.name, "repo": str(entry.repo)}
             payload.update(status.to_json())
-            print(json.dumps(payload, indent=2, default=list))
+            print(
+                json.dumps(
+                    redact_runtime_context_payload(payload, entry.runtime_context),
+                    indent=2,
+                    default=list,
+                )
+            )
         else:
-            print(render_autopilot_status(status))
+            print(
+                redact_runtime_context_text(
+                    render_autopilot_status(status), entry.runtime_context
+                )
+            )
         return 0
 
     if command == "remove":
@@ -1401,7 +1445,12 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
 def render_project_registry(registry: ProjectRegistry) -> str:
     if not registry.entries:
         return f"no registered projects ({registry.path})"
-    return "\n".join(f"{entry.name}\t{entry.repo}" for entry in registry.entries)
+    return "\n".join(
+        redact_runtime_context_text(
+            f"{entry.name}\t{entry.repo}", entry.runtime_context
+        )
+        for entry in registry.entries
+    )
 
 
 def render_aggregate_status(results) -> str:
@@ -1410,7 +1459,12 @@ def render_aggregate_status(results) -> str:
     lines: list[str] = []
     for result in results:
         if result.error:
-            lines.append(f"{result.name} ({result.repo}): error: {result.error}")
+            lines.append(
+                redact_runtime_context_text(
+                    f"{result.name} ({result.repo}): error: {result.error}",
+                    result.runtime_context,
+                )
+            )
             continue
         status = result.status
         queue = status.queue
@@ -1423,8 +1477,11 @@ def render_aggregate_status(results) -> str:
             f"; blockers: {', '.join(status.blockers)}" if status.blockers else ""
         )
         lines.append(
-            f"{result.name} ({result.repo}): {queue_text}; "
-            f"supervisor {status.supervisor.state}{blockers}"
+            redact_runtime_context_text(
+                f"{result.name} ({result.repo}): {queue_text}; "
+                f"supervisor {status.supervisor.state}{blockers}",
+                result.runtime_context,
+            )
         )
     return "\n".join(lines)
 
