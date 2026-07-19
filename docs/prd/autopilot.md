@@ -32,9 +32,9 @@ semantics must be explicit in help and tests.
 
 Acceptance must cover `--repo`, `--jobs`, `--interval`, `--once`,
 `--max-cycles`, `--ask-agent`, `--continue-on-failure`, `--max-slices`,
-`--max-tasks`, `--min-ready`, and `--json` where scriptable output is promised.
-Human cycle output should be compact by default: repo, queue, supervisor state,
-blockers or actions, log path, and next wake.
+`--max-tasks`, `--min-ready`, `--worktree-disposition`, and `--json` where
+scriptable output is promised. Human cycle output should be compact by default:
+repo, queue, supervisor state, blockers or actions, log path, and next wake.
 
 Related implementation IDs: `AUTO-02`, `AUTO-03`.
 
@@ -49,7 +49,10 @@ Records include `autopilot_cycle`, `autopilot_supervisor_started`,
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
-Existing run readers must keep tolerating unknown record types.
+Cycle and supervisor records also carry the configured worktree-disposition
+policy. Worktree-disposition records carry that policy plus candidate counts,
+evidence, reasons, and outcomes. Existing run readers must keep tolerating
+unknown record types.
 
 Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`.
 
@@ -101,24 +104,27 @@ Two bounded exceptions are permitted, and no others:
    worker cannot lose its task lock before its launcher writes PID metadata), and
    it must not take over locks held by live processes.
 
-2. **Worktree disposition.** Autopilot may remove a worker-created worktree and
-   delete its branch (`git worktree remove` plus `git branch -d`) only under the
-   evidence-gated, agent-decided contract in `PRD-AUT-010`. This recovers
-   orphaned worktrees left by workers that died before reporting `completed`. It
-   must never force-remove a dirty or unmerged worktree, never touch a worktree
-   claimed by a live run, act only on a per-worktree keep-or-reap decision the
-   read-only analysis agent returned with a reason (no blanket reap), and journal
-   every decision and action to the append-only run store. Salvageable unmerged
-   or dirty work-in-progress must be kept, not reaped.
+2. **Worktree disposition.** The default policy is `report-only`; merely starting
+   autopilot authorizes evidence collection and journaling, not removal. Autopilot
+   may remove a worker-created worktree and delete its branch (`git worktree
+   remove` plus `git branch -d`) only after an operator explicitly selects the
+   bounded `reap` policy and under the evidence-gated, agent-decided contract in
+   `PRD-AUT-010`. It must never force-remove a dirty or unmerged worktree, never
+   touch a worktree claimed by a live run, act only on a per-worktree reap
+   decision the read-only analysis agent returned with a reason (no blanket
+   reap), and journal the policy, evidence, decision, and action to the
+   append-only run store. Salvageable unmerged or dirty work-in-progress must be
+   kept, not reaped.
 
 Acceptance must cover unsafe workspace diagnostics, dirty repo state, missing
 task source, unavailable agent command, no runnable work, and child launch
 failure as explicit blockers or observations rather than destructive cleanup
 triggers; stale locks with a still-live or PID-unobserved owner remain blocking,
 while stale locks with a missing worker process are recovered and audited; and
-worktree disposition reaps only orphaned, non-dirty, merged-or-disposable,
-non-live-claimed worktrees under the `PRD-AUT-010` guardrails while keeping all
-salvageable work-in-progress.
+default worktree disposition reports eligible candidates without deletion, and
+explicit `reap` disposition removes only orphaned, non-dirty,
+merged-or-disposable, non-live-claimed worktrees under the `PRD-AUT-010`
+guardrails while keeping all salvageable work-in-progress.
 
 Unknown-run recovery (`PRD-AUT-014`) does not breach this boundary: it launches
 a new continuation worker against the existing claimed branch/worktree and never
@@ -137,8 +143,10 @@ dashboards.
 Acceptance must cover stable fields for repo, display name, state directory,
 current main ref, dirty state, queue counts, active workers, stale locks,
 workspace diagnostics, supervisor, blockers, last cycle, and next wake. Per-repo
-state stays under that repo's configured state directory; no global registry is
-required for the first implementation.
+status also exposes the configured worktree-disposition policy so a multi-project
+operator can distinguish report-only inspection from an explicit reaping opt-in.
+Per-repo state stays under that repo's configured state directory; no global
+registry is required for the first implementation.
 
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-06`.
 
@@ -191,13 +199,14 @@ Related implementation IDs: `AUTO-12`, `AUTO-18`.
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
 Autopilot cycles must include a native worktree-disposition health step so that
-orphaned worktrees are reaped without per-project configuration. The root cause
-of orphaned worktrees is that worktrees are created by the read-write worker and
-only cleaned on a `completed` report; a worker that dies first (for example agent
-quota exhaustion or a crash) leaves an orphaned worktree that nothing currently
-reaps.
+orphaned worktrees are visible without per-project configuration. The safe
+default is `report-only`: it identifies and journals otherwise reapable
+worktrees without invoking the analysis agent or mutating git. Automatic reaping
+requires an explicit, bounded operator opt-in through configuration or the CLI;
+starting autopilot alone is not approval.
 
-The step follows the agent-decides / code-executes / guardrails contract:
+Under the explicit `reap` policy, the step follows the agent-decides /
+code-executes / guardrails contract:
 `vibe-loop` gathers per-worktree evidence mechanically (path, branch,
 merged-into-main predicate, dirty state, the claiming run and whether its process
 is alive); passes that evidence to the read-only analysis agent
@@ -208,14 +217,15 @@ work-in-progress must be kept.
 
 Acceptance must cover mechanical evidence gathering that reuses existing
 workers.py helpers (worktree enumeration, merged-branch predicate, dirty-state
-inspection, worker-view claim and liveness), an agent decision per worktree with
-a reason, and code-side execution that never force-removes dirty or unmerged
-worktrees, never removes a worktree claimed by a live run, and records each
-decision and each action to the append-only journal. Side effects (git removal,
-branch deletion) must be dependency-injected so tests do not run real git. The
-step runs unconditionally in the cycle and must not become a destructive default
-that violates the `PRD-AUT-006` non-destructive recovery boundary; it stays
-within the bounded, evidence-gated exception this contract defines.
+inspection, worker-view claim and liveness); report-only behavior that records
+eligible candidates and performs no deletion; validation that rejects unknown
+policy modes; an explicit-reap agent decision per worktree with a reason; and
+code-side execution that never force-removes dirty or unmerged worktrees, never
+removes a worktree claimed by a live run, and records the configured policy,
+candidate, reasons, and result in the append-only journal. Side effects (git
+removal, branch deletion) must be dependency-injected so tests do not run real
+git. The step runs unconditionally, but starting autopilot must not authorize
+the bounded destructive exception.
 
 Related implementation IDs: `AUTO-13`, `AUTO-14`.
 
@@ -230,10 +240,12 @@ emitting any detailed payload as a separate dedicated record.
 
 Acceptance must cover a new `autopilot_worktree_reap` record type that mirrors
 the existing maintenance-command-result record shape (schema version, record
-type, occurrence time, repo, cycle id, and reaped/kept/errors/status payload),
+type, occurrence time, repo, cycle id, configured policy, candidates, evidence,
+reasoned outcomes, and reaped/kept/errors/status payload),
 registration of every new native record type in the run store's autopilot and
 known record-type sets, tolerance of unknown record types on read, and a cycle
-action tag (for example `reaped_worktrees:N`) appended for the disposition step.
+action tag for the policy, candidate count, and reap count appended for the
+disposition step.
 
 Related implementation IDs: `AUTO-13`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
 `AUTO-17`.
@@ -244,12 +256,13 @@ Related implementation IDs: `AUTO-13`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
 without per-project configuration. Today the cycle is a supervisor plus
 stale-lock cleaner plus four empty maintenance-command slots (health, summary,
 troubleshoot, planning) that are all unset by default, so with no project config
-the loop never reaps worktrees, checks disk, summarizes what landed, detects
-recurring trouble, or plans new work.
+the loop never inspects orphaned worktrees, checks disk, summarizes what landed,
+detects recurring trouble, or plans new work.
 
 The native generic cycle must provide repository-agnostic defaults for these
 behaviors while preserving the non-destructive recovery boundary
-(`PRD-AUT-006`): native worktree disposition (`PRD-AUT-010`), native disk-health
+(`PRD-AUT-006`): native report-only worktree disposition with an explicit reaping
+opt-in (`PRD-AUT-010`), native disk-health
 checks, a native "what landed" git-log summary, native troubleshoot detection
 derived from `runs.jsonl`, and native planning that invokes the configured agent
 rather than requiring a separate `planning_command` script. Project-authored

@@ -536,6 +536,25 @@ class AutopilotRunTests(unittest.TestCase):
         types = [record["record_type"] for record in records]
         self.assertIn(AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE, types)
         self.assertIn(AUTOPILOT_CYCLE_RECORD_TYPE, types)
+        policy_records = [
+            record
+            for record in records
+            if record["record_type"]
+            in {
+                AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                AUTOPILOT_CYCLE_RECORD_TYPE,
+                AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+            }
+        ]
+        self.assertTrue(policy_records)
+        self.assertTrue(
+            all(
+                record["worktree_disposition_policy"] == "report-only"
+                if record["record_type"] != AUTOPILOT_WORKTREE_REAP_RECORD_TYPE
+                else record["policy"] == "report-only"
+                for record in policy_records
+            )
+        )
 
     def test_blocks_launch_when_repo_is_dirty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -749,10 +768,12 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(summary.exit_code, 2)
         self.assertEqual(summary.blocker, "autopilot_supervisor_active")
         self.assertEqual(len(calls), 0)
-        self.assertIn(
-            AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
-            [record["record_type"] for record in records],
+        observed = next(
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE
         )
+        self.assertEqual(observed["worktree_disposition_policy"], "report-only")
 
     def test_reports_stale_supervisor_lock_without_stealing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1859,11 +1880,24 @@ class AutopilotWaitTests(unittest.TestCase):
 
 
 class WorktreeDispositionCycleTests(unittest.TestCase):
-    def _orphan_repo(self, directory: str) -> tuple[Path, Path]:
+    def _orphan_repo(
+        self,
+        directory: str,
+        *,
+        worktree_disposition: str | None = "reap",
+    ) -> tuple[Path, Path]:
         root = Path(directory)
         repo = root / "repo"
         repo.mkdir()
-        configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+        configured_repo(
+            repo,
+            [("TASK-01", "Next", "", "ready slice")],
+            extra_toml=(
+                f'[autopilot]\nworktree_disposition = "{worktree_disposition}"\n'
+                if worktree_disposition is not None
+                else ""
+            ),
+        )
         worktree = root / "orphan"
         run(repo, "git", "worktree", "add", "-b", "orphan", str(worktree), "main")
         return repo, worktree
@@ -1909,8 +1943,55 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         self.assertEqual(len(prompts), 1)
         record = result.to_record(config.repo)
         self.assertEqual(record["record_type"], AUTOPILOT_WORKTREE_REAP_RECORD_TYPE)
+        self.assertEqual(record["policy"], "reap")
+        self.assertEqual(record["candidates"], 1)
         self.assertEqual(record["reaped"], 1)
         self.assertEqual(record["status"], "ok")
+
+    def test_report_only_default_journals_candidate_without_side_effects(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(
+                directory,
+                worktree_disposition=None,
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=lambda prompt, output_path: (_ for _ in ()).throw(
+                    AssertionError("report-only policy must not invoke the agent")
+                ),
+                remove_worktree=lambda path: (_ for _ in ()).throw(
+                    AssertionError("report-only policy must not remove worktrees")
+                ),
+                delete_branch=lambda branch: (_ for _ in ()).throw(
+                    AssertionError("report-only policy must not delete branches")
+                ),
+            )
+
+        self.assertFalse(result.agent_invoked)
+        self.assertEqual(result.policy, "report-only")
+        self.assertEqual(result.candidates, 1)
+        self.assertEqual(result.reaped, 0)
+        candidate = next(
+            outcome
+            for outcome in result.outcomes
+            if outcome.worktree.resolve() == worktree.resolve()
+        )
+        self.assertEqual(candidate.requested, "keep")
+        self.assertEqual(candidate.applied, "kept")
+        self.assertEqual(
+            candidate.reason,
+            "worktree disposition policy is report-only",
+        )
+        record = result.to_record(config.repo)
+        self.assertEqual(record["policy"], "report-only")
+        self.assertEqual(record["candidates"], 1)
+        self.assertEqual(record["reaped"], 0)
 
     def test_failed_git_removal_reports_errors_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2017,6 +2098,114 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         self.assertEqual(result.reaped, 0)
         self.assertEqual(result.status, "agent_error")
 
+    def test_reap_policy_rejects_agent_decision_without_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree = self._orphan_repo(directory)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=lambda prompt, output_path: {
+                    "decisions": [
+                        {
+                            "worktree": str(worktree),
+                            "action": "reap",
+                        }
+                    ]
+                },
+                remove_worktree=lambda path: (_ for _ in ()).throw(
+                    AssertionError("unreasoned decision must not remove worktrees")
+                ),
+                delete_branch=lambda branch: (_ for _ in ()).throw(
+                    AssertionError("unreasoned decision must not delete branches")
+                ),
+            )
+
+        self.assertTrue(result.agent_invoked)
+        self.assertEqual(
+            result.agent_error,
+            "analysis agent returned an invalid or unreasoned decision",
+        )
+        self.assertEqual(result.reaped, 0)
+        candidate = next(
+            outcome
+            for outcome in result.outcomes
+            if outcome.worktree.resolve() == worktree.resolve()
+        )
+        self.assertEqual(candidate.requested, "keep")
+        self.assertEqual(candidate.applied, "kept")
+        self.assertEqual(
+            candidate.reason,
+            "analysis disposition response was rejected",
+        )
+
+    def test_reap_policy_rejects_partial_multi_candidate_response(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, first_worktree = self._orphan_repo(directory)
+            second_worktree = Path(directory) / "orphan-2"
+            run(
+                repo,
+                "git",
+                "worktree",
+                "add",
+                "-b",
+                "orphan-2",
+                str(second_worktree),
+                "main",
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            result = run_worktree_disposition(
+                config,
+                cycle_id="c1",
+                run_store=run_store,
+                process_exists=lambda pid: False,
+                analysis_runner=lambda prompt, output_path: {
+                    "decisions": [
+                        {
+                            "worktree": str(first_worktree),
+                            "action": "reap",
+                            "reason": "orphan",
+                        }
+                    ]
+                },
+                remove_worktree=lambda path: (_ for _ in ()).throw(
+                    AssertionError("partial response must not remove worktrees")
+                ),
+                delete_branch=lambda branch: (_ for _ in ()).throw(
+                    AssertionError("partial response must not delete branches")
+                ),
+            )
+
+        self.assertEqual(result.candidates, 2)
+        self.assertEqual(
+            result.agent_error,
+            "analysis agent must return exactly one reasoned disposition decision "
+            "per candidate",
+        )
+        self.assertEqual(result.reaped, 0)
+        candidate_outcomes = [
+            outcome
+            for outcome in result.outcomes
+            if outcome.worktree.resolve()
+            in {first_worktree.resolve(), second_worktree.resolve()}
+        ]
+        self.assertEqual(len(candidate_outcomes), 2)
+        self.assertTrue(
+            all(outcome.requested == "keep" for outcome in candidate_outcomes)
+        )
+        self.assertTrue(
+            all(
+                outcome.reason == "analysis disposition response was rejected"
+                for outcome in candidate_outcomes
+            )
+        )
+
     def test_cycle_records_disposition_and_appends_tag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -2031,6 +2220,8 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             records = RunStore(config.state_path / "runs.jsonl").read_records()
 
         cycle = summary.cycles[0]
+        self.assertIn("worktree_disposition_policy:report-only", cycle.actions)
+        self.assertIn("worktree_disposition_candidates:0", cycle.actions)
         self.assertIn("reaped_worktrees:0", cycle.actions)
         self.assertNotIn("worktree_disposition_agent_error", cycle.actions)
         reap_records = [
@@ -2040,6 +2231,7 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         ]
         self.assertEqual(len(reap_records), 1)
         self.assertEqual(reap_records[0]["reaped"], 0)
+        self.assertEqual(reap_records[0]["policy"], "report-only")
         self.assertFalse(reap_records[0]["agent_invoked"])
 
 

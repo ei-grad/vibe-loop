@@ -32,7 +32,8 @@ instruction or session end.
 1. **Health**: disk, process liveness, git sync, locks, worktrees, queue depth.
    Use `vibe-loop doctor`, `vibe-loop workers`, and `vibe-loop main-integration
    status`; cross-check process liveness for the `run-until-done` supervisor and
-   its workers.
+   its workers. Confirm the configured worktree-disposition policy; do not infer
+   permission to reap from the existence of an autopilot session.
 2. **Summarize**: run a read-only subagent to analyze commits merged to `main`
    since the previous cycle anchor and produce a concise "what landed" note. Use
    the last reported `main` SHA as the anchor; if no durable anchor exists, state
@@ -127,13 +128,20 @@ Answer from evidence, not process absence alone.
 
 ## Recovery Boundary
 
-Recovery is conservative and non-destructive. Do not delete worktrees, reset
-branches, steal locks, kill arbitrary processes, or revert peer/user changes.
-Stop only a specific process tree after identifying its pids and confirming it
-is on the autopilot critical path. Do not start a second supervisor while a live
-one still owns workers. If every safe path is blocked, report the precise
-missing access, approval, or decision and keep watching for newly available
-work.
+Recovery is conservative and non-destructive by default. Starting autopilot is
+not approval to delete a worktree or branch: the native
+`worktree_disposition = "report-only"` policy only inspects and journals eligible
+candidates. Automatic reaping is permitted only when an operator explicitly set
+`[autopilot] worktree_disposition = "reap"` or passed
+`--worktree-disposition reap`; an unattended steward must not choose that opt-in
+on the operator's behalf. Even then, keep the existing analysis-agent decision,
+ownership, merged-state, cleanliness, task-state, and liveness guards, with every
+decision and result journaled. Never reset branches, steal locks, kill arbitrary
+processes, or revert peer/user changes. Stop only a specific process tree after
+identifying its pids and confirming it is on the autopilot critical path. Do not
+start a second supervisor while a live one still owns workers. If every safe path
+is blocked, report the precise missing access, approval, or decision and keep
+watching for newly available work.
 
 ## Status Reports
 

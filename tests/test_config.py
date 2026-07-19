@@ -487,6 +487,7 @@ class ConfigTests(unittest.TestCase):
                 "min_ready = 2\n"
                 "planning_recheck_seconds = 45.0\n"
                 "require_clean_repo = false\n"
+                'worktree_disposition = "reap"\n'
                 'health_command = "scripts/health.sh"\n'
                 'planning_command = "scripts/plan.sh"\n',
                 encoding="utf-8",
@@ -500,6 +501,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.autopilot.planning_recheck_seconds, 45.0)
         self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 45.0)
         self.assertFalse(config.autopilot.require_clean_repo)
+        self.assertEqual(config.autopilot.worktree_disposition, "reap")
         self.assertEqual(
             config.autopilot.maintenance_command("health"), "scripts/health.sh"
         )
@@ -517,6 +519,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.autopilot.interval_seconds)
         self.assertIsNone(config.autopilot.min_ready)
         self.assertTrue(config.autopilot.require_clean_repo)
+        self.assertEqual(config.autopilot.worktree_disposition, "report-only")
         self.assertEqual(config.autopilot.planning_recheck_seconds, 60.0)
         self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 60.0)
         self.assertEqual(config.autopilot.explicit_keys, frozenset())
@@ -534,6 +537,14 @@ class ConfigTests(unittest.TestCase):
             (
                 'planning_recheck_seconds = "soon"\n',
                 "autopilot.planning_recheck_seconds",
+            ),
+            (
+                'worktree_disposition = "discard"\n',
+                "autopilot.worktree_disposition must be one of: report-only, reap",
+            ),
+            (
+                'worktree_disposition = ""\n',
+                "autopilot.worktree_disposition must be one of: report-only, reap",
             ),
             ("unsupported = true\n", "unsupported"),
         ]

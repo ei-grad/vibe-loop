@@ -6877,6 +6877,7 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIn(f"repo: {repo.name} ({repo})", output)
         self.assertIn("queue: 3 runnable / 3 total", output)
         self.assertIn("supervisor: idle", output)
+        self.assertIn("worktree disposition: report-only", output)
 
     def test_status_json_emits_stable_project_payload(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6888,8 +6889,9 @@ class AutopilotCliTests(unittest.TestCase):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 exit_code = main(["autopilot", "status", "--repo", str(repo), "--json"])
 
-        self.assertEqual(exit_code, 0)
         payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["worktree_disposition_policy"], "report-only")
         for key in (
             "repo",
             "display_name",
@@ -6947,6 +6949,56 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(cycle["status"], "blocked")
         self.assertIsNone(cycle["child_pid"])
         self.assertIn("repo_dirty", cycle["blockers"])
+
+    def test_run_accepts_explicit_worktree_disposition_override(self) -> None:
+        class Summary:
+            exit_code = 0
+
+            def to_json(self):
+                return {"cycles": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with (
+                patch.object(
+                    cli_module, "run_autopilot", return_value=Summary()
+                ) as run,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                exit_code = main(
+                    [
+                        "autopilot",
+                        "run",
+                        "--repo",
+                        str(repo),
+                        "--once",
+                        "--worktree-disposition",
+                        "reap",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        passed_config = run.call_args.args[0]
+        self.assertEqual(passed_config.autopilot.worktree_disposition, "reap")
+
+    def test_run_rejects_unknown_worktree_disposition(self) -> None:
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                main(
+                    [
+                        "autopilot",
+                        "run",
+                        "--worktree-disposition",
+                        "discard",
+                    ]
+                )
+
+        self.assertEqual(caught.exception.code, 2)
 
     def test_bare_autopilot_routes_to_run_and_terminates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7036,6 +7088,7 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         autopilot = payload["autopilot"]
         self.assertEqual(autopilot["jobs"], 2)
+        self.assertEqual(autopilot["worktree_disposition"], "report-only")
         self.assertTrue(autopilot["health_command_configured"])
         self.assertTrue(autopilot["health_command_redacted"])
         self.assertNotIn("health_command", autopilot)

@@ -39,6 +39,7 @@ from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
 from vibe_loop.workers import (
     ProcessExists,
     StaleLock,
+    WorktreeDispositionDecision,
     WorktreeDispositionEvidence,
     WorktreeDispositionOutcome,
     WorkerView,
@@ -48,7 +49,6 @@ from vibe_loop.workers import (
     execute_worktree_disposition,
     git_branch_delete,
     git_worktree_remove,
-    parse_worktree_disposition_decisions,
     pid_exists,
     record_expired_locks,
 )
@@ -171,6 +171,7 @@ class ProjectStatus:
     stale_locks: tuple[StaleLock, ...] = ()
     integration_lock: dict[str, object] = dataclasses.field(default_factory=dict)
     agent: dict[str, object] = dataclasses.field(default_factory=dict)
+    worktree_disposition_policy: str = "report-only"
     workspace_diagnostics: tuple[dict[str, object], ...] = ()
     supervisor: SupervisorStatus = dataclasses.field(default_factory=SupervisorStatus)
     blockers: tuple[str, ...] = ()
@@ -191,6 +192,7 @@ class ProjectStatus:
             "stale_locks": [lock.to_json() for lock in self.stale_locks],
             "integration_lock": self.integration_lock,
             "agent": self.agent,
+            "worktree_disposition_policy": self.worktree_disposition_policy,
             "workspace_diagnostics": [
                 dict(diagnostic) for diagnostic in self.workspace_diagnostics
             ],
@@ -231,6 +233,9 @@ class AutopilotCycleResult:
             "stale_locks": [lock.to_json() for lock in self.project_status.stale_locks],
             "integration_lock": self.project_status.integration_lock,
             "git": self.project_status.git.to_json(),
+            "worktree_disposition_policy": (
+                self.project_status.worktree_disposition_policy
+            ),
             "actions": list(self.actions),
             "blockers": list(self.blockers),
             "child_pid": self.child_pid,
@@ -313,6 +318,7 @@ def collect_project_status(
         stale_locks=stale_locks,
         integration_lock=integration_lock,
         agent=agent,
+        worktree_disposition_policy=config.autopilot.worktree_disposition,
         workspace_diagnostics=workspace_diagnostics,
         supervisor=supervisor,
         blockers=blockers,
@@ -1007,12 +1013,13 @@ class WorktreeDispositionCycleResult:
     """Outcome of one cycle's native worktree-disposition health step.
 
     Mirrors ``MaintenanceCommandResult`` so the step journals a single typed
-    ``autopilot_worktree_reap`` record (PRD-AUT-010/011). ``evidence`` and
-    ``outcomes`` carry the mechanical per-worktree evidence and the per-decision
-    keep/reap results for full-cycle action logging.
+    ``autopilot_worktree_reap`` record (PRD-AUT-010/011). ``policy``,
+    ``evidence``, and ``outcomes`` carry the operator-selected mode, mechanical
+    per-worktree evidence, and per-decision results for full-cycle logging.
     """
 
     cycle_id: str
+    policy: str
     evidence: tuple[WorktreeDispositionEvidence, ...]
     outcomes: tuple[WorktreeDispositionOutcome, ...]
     agent_invoked: bool
@@ -1021,6 +1028,10 @@ class WorktreeDispositionCycleResult:
     @property
     def reaped(self) -> int:
         return sum(1 for outcome in self.outcomes if outcome.applied == "reaped")
+
+    @property
+    def candidates(self) -> int:
+        return sum(1 for item in self.evidence if item.reapable)
 
     @property
     def kept(self) -> int:
@@ -1049,7 +1060,9 @@ class WorktreeDispositionCycleResult:
             "occurred_at": utc_now_iso(),
             "repo": str(repo),
             "cycle_id": self.cycle_id,
+            "policy": self.policy,
             "status": self.status,
+            "candidates": self.candidates,
             "reaped": self.reaped,
             "kept": self.kept,
             "refused": self.refused,
@@ -1082,6 +1095,35 @@ def build_worktree_disposition_prompt(
     )
 
 
+def validate_worktree_disposition_decisions(
+    payload: object,
+    candidates: Iterable[WorktreeDispositionEvidence],
+) -> tuple[list[WorktreeDispositionDecision], str]:
+    candidate_paths = {item.path.resolve() for item in candidates}
+    if not isinstance(payload, dict) or not isinstance(payload.get("decisions"), list):
+        return [], "analysis agent returned an invalid disposition schema"
+    raw_decisions = payload["decisions"]
+    if len(raw_decisions) != len(candidate_paths):
+        return [], (
+            "analysis agent must return exactly one reasoned disposition decision "
+            "per candidate"
+        )
+    decisions: list[WorktreeDispositionDecision] = []
+    seen: set[Path] = set()
+    for raw_decision in raw_decisions:
+        decision = WorktreeDispositionDecision.from_json(raw_decision)
+        if decision is None or not decision.reason.strip():
+            return [], "analysis agent returned an invalid or unreasoned decision"
+        worktree = decision.worktree.resolve()
+        if worktree not in candidate_paths or worktree in seen:
+            return [], "analysis agent returned a duplicate or out-of-scope decision"
+        seen.add(worktree)
+        decisions.append(decision)
+    if seen != candidate_paths:
+        return [], "analysis agent did not decide every disposition candidate"
+    return decisions, ""
+
+
 def run_worktree_disposition(
     config: VibeConfig,
     *,
@@ -1094,9 +1136,10 @@ def run_worktree_disposition(
 ) -> WorktreeDispositionCycleResult:
     """Run the native, evidence-gated worktree-disposition health step.
 
-    Gathers per-worktree evidence (AUTO-13), asks the read-only analysis agent
-    (AUTO-12) for keep/reap decisions only when at least one worktree clears the
-    mechanical guardrails, then executes within those guardrails. Git side
+    Gathers per-worktree evidence (AUTO-13). The default report-only policy
+    journals eligible candidates without invoking an agent or mutating git. An
+    explicit reap policy asks the read-only analysis agent (AUTO-12) for
+    decisions and executes them within the mechanical guardrails. Git side
     effects and the analysis call are dependency-injected so tests never run
     real git or spawn an agent. Stays inside the bounded PRD-AUT-006 exception.
     """
@@ -1117,7 +1160,7 @@ def run_worktree_disposition(
     agent_invoked = False
     agent_error = ""
     decisions = []
-    if reapable:
+    if reapable and config.autopilot.worktree_disposition == "reap":
         agent_invoked = True
         runner = analysis_runner or VibeRunner(config).run_analysis_agent
         output_path = (
@@ -1130,7 +1173,29 @@ def run_worktree_disposition(
             agent_error = str(exc)
         if payload is None and not agent_error:
             agent_error = "analysis agent returned no disposition decisions"
-        decisions = parse_worktree_disposition_decisions(payload)
+        if payload is not None:
+            decisions, agent_error = validate_worktree_disposition_decisions(
+                payload,
+                reapable,
+            )
+        if agent_error:
+            decisions = [
+                WorktreeDispositionDecision(
+                    worktree=item.path,
+                    action="keep",
+                    reason="analysis disposition response was rejected",
+                )
+                for item in reapable
+            ]
+    elif reapable:
+        decisions = [
+            WorktreeDispositionDecision(
+                worktree=item.path,
+                action="keep",
+                reason="worktree disposition policy is report-only",
+            )
+            for item in reapable
+        ]
     remover = remove_worktree or (
         lambda worktree: git_worktree_remove(config.repo, worktree)
     )
@@ -1143,6 +1208,7 @@ def run_worktree_disposition(
     )
     return WorktreeDispositionCycleResult(
         cycle_id=cycle_id,
+        policy=config.autopilot.worktree_disposition,
         evidence=tuple(evidence),
         outcomes=tuple(outcomes),
         agent_invoked=agent_invoked,
@@ -1203,6 +1269,8 @@ def execute_autopilot_cycle(
         process_exists=process_exists,
     )
     run_store.append_record(disposition.to_record(config.repo))
+    actions.append(f"worktree_disposition_policy:{disposition.policy}")
+    actions.append(f"worktree_disposition_candidates:{disposition.candidates}")
     actions.append(f"reaped_worktrees:{disposition.reaped}")
     if disposition.errors:
         actions.append(f"worktree_reap_errors:{disposition.errors}")
@@ -1467,6 +1535,7 @@ def run_autopilot(
                 "run_id": str(existing.metadata.get("run_id") or ""),
                 "pid": existing.metadata.get("pid"),
                 "observed_state": existing.state,
+                "worktree_disposition_policy": (config.autopilot.worktree_disposition),
             }
         )
         return AutopilotRunSummary(
@@ -1504,6 +1573,7 @@ def run_autopilot(
             "run_id": supervisor_run_id,
             "pid": os.getpid(),
             "log": str(supervisor_log),
+            "worktree_disposition_policy": config.autopilot.worktree_disposition,
         }
     )
 

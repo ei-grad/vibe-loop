@@ -131,6 +131,7 @@ AUTOPILOT_COMMAND_KEYS = frozenset(
         "planning_command",
     }
 )
+AUTOPILOT_WORKTREE_DISPOSITION_POLICIES = ("report-only", "reap")
 AUTOPILOT_CONFIG_KEYS = (
     frozenset(
         {
@@ -139,6 +140,7 @@ AUTOPILOT_CONFIG_KEYS = (
             "min_ready",
             "require_clean_repo",
             "planning_recheck_seconds",
+            "worktree_disposition",
         }
     )
     | AUTOPILOT_COMMAND_KEYS
@@ -575,6 +577,7 @@ class AutopilotConfig:
     min_ready: int | None = None
     require_clean_repo: bool = True
     planning_recheck_seconds: float = 60.0
+    worktree_disposition: str = "report-only"
     health_command: str | None = None
     summary_command: str | None = None
     troubleshoot_command: str | None = None
@@ -599,6 +602,7 @@ class AutopilotConfig:
             "min_ready": self.min_ready,
             "require_clean_repo": self.require_clean_repo,
             "planning_recheck_seconds": self.planning_recheck_seconds,
+            "worktree_disposition": self.worktree_disposition,
             "health_command": self.health_command,
             "summary_command": self.summary_command,
             "troubleshoot_command": self.troubleshoot_command,
@@ -1555,6 +1559,13 @@ def parse_autopilot(data: object) -> AutopilotConfig:
         raise ValueError(
             f"autopilot contains unsupported keys: {', '.join(unknown_keys)}"
         )
+    worktree_disposition = table.get("worktree_disposition", "report-only")
+    if (
+        not isinstance(worktree_disposition, str)
+        or worktree_disposition not in AUTOPILOT_WORKTREE_DISPOSITION_POLICIES
+    ):
+        allowed = ", ".join(AUTOPILOT_WORKTREE_DISPOSITION_POLICIES)
+        raise ValueError("autopilot.worktree_disposition must be one of: " + allowed)
     return AutopilotConfig(
         jobs=optional_positive_int(table.get("jobs"), "autopilot.jobs"),
         interval_seconds=optional_nonnegative_float(
@@ -1573,6 +1584,7 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             True,
             "autopilot.require_clean_repo",
         ),
+        worktree_disposition=worktree_disposition,
         health_command=optional_nonempty_string(table.get("health_command")),
         summary_command=optional_nonempty_string(table.get("summary_command")),
         troubleshoot_command=optional_nonempty_string(

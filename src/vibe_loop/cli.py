@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from vibe_loop.autopilot import (
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
+    AUTOPILOT_WORKTREE_DISPOSITION_POLICIES,
     AgentResolutionError,
     load_config,
 )
@@ -748,6 +750,15 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
             "(overrides [autopilot] min_ready; default 1)"
         ),
     )
+    parser.add_argument(
+        "--worktree-disposition",
+        choices=AUTOPILOT_WORKTREE_DISPOSITION_POLICIES,
+        default=None,
+        help=(
+            "Worktree disposition policy (overrides [autopilot] "
+            "worktree_disposition; default report-only)"
+        ),
+    )
 
 
 def add_repo_argument(parser: argparse.ArgumentParser) -> None:
@@ -1180,6 +1191,13 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return dispatch_autopilot_projects(args)
     if command in (None, "run"):
         ap = config.autopilot
+        worktree_disposition = getattr(args, "worktree_disposition", None)
+        if worktree_disposition is not None:
+            ap = dataclasses.replace(
+                ap,
+                worktree_disposition=worktree_disposition,
+            )
+            config = dataclasses.replace(config, autopilot=ap)
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
         interval = _first_set(getattr(args, "interval", None), ap.interval_seconds, 0.0)
         min_ready = _first_set(getattr(args, "min_ready", None), ap.min_ready, 1)
@@ -1222,6 +1240,7 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if supervisor.pid:
         supervisor_line += f" pid={supervisor.pid}"
     lines.append(supervisor_line)
+    lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
     if supervisor.log is not None:
         lines.append(f"log: {supervisor.log}")
     if status.blockers:

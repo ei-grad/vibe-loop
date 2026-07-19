@@ -349,13 +349,15 @@ exclude raw task-source, lock, completion, planning, and worklog command strings
 ## Autopilot
 
 Autopilot supervises one repository (or a registry of several) and drives
-`run-until-done` cycles. It never deletes worktrees, resets branches, steals
-locks, or mutates tracked project files on its own. See
+`run-until-done` cycles. Its default worktree policy is report-only: starting
+autopilot does not authorize deleting worktrees or branches. It never resets
+branches, steals locks, or mutates tracked project files on its own. See
 [`docs/prd/autopilot.md`](docs/prd/autopilot.md) for the full contract.
 
 ```bash
 vibe-loop autopilot status --repo . --json
 vibe-loop autopilot run --repo . --once
+vibe-loop autopilot run --repo . --once --worktree-disposition reap
 vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects status --json
@@ -375,13 +377,18 @@ decision it cleans only stale worker locks whose recorded worker process is
 missing — the same validated, audited path as `vibe-loop workers clean --force`
 (it emits `lock_expired` records and never deletes worktrees, resets branches,
 steals live locks, or removes a lock that has not yet observed a worker PID).
-Each cycle then runs a native worktree-disposition step: it gathers per-worktree
-evidence mechanically, asks the read-only analysis agent for a keep-or-reap
-decision per orphaned worktree, and reaps (`git worktree remove` plus
-`git branch -d`) only merged, clean, non-live-claimed leftovers within the
-evidence-gated guardrails — never the primary worktree and never dirty or
-unmerged work-in-progress. It appends a `reaped_worktrees:N` action tag and an
-`autopilot_worktree_reap` journal record every cycle.
+Each cycle then runs a native worktree-disposition step and gathers per-worktree
+evidence mechanically. The default `report-only` policy journals eligible
+candidates without invoking the analysis agent, removing a worktree, or deleting
+a branch. Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
+`--worktree-disposition reap` CLI override opts in to automatic disposition.
+Under that policy, the read-only analysis agent must return a reasoned reap
+decision and the executor still limits removal (`git worktree remove` plus
+`git branch -d`) to merged, clean, non-live-claimed leftovers — never the
+primary worktree and never dirty or unmerged work-in-progress. Every cycle
+journals the configured policy, candidate evidence, reasons, outcomes, and
+`worktree_disposition_policy:*`, `worktree_disposition_candidates:N`, and
+`reaped_worktrees:N` action tags.
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
@@ -481,6 +488,9 @@ type = "directory"
 # interval_seconds = 60.0
 # min_ready = 1
 require_clean_repo = true   # set false to let a dirty tree run a cycle
+# Safe default: inspect and journal eligible worktrees without removing them.
+# Set to "reap" only as an explicit operator opt-in; existing safety guards remain.
+worktree_disposition = "report-only"
 # Optional user-authored maintenance hooks, redacted in status/doctor JSON.
 # A failing health command blocks the launch; planning runs when the runnable
 # queue is below min_ready; if planning is not configured, the cycle records
