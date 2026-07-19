@@ -36,6 +36,7 @@ from vibe_loop.runner import (
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     AgentRuntimeContext,
     SchedulerLockBusy,
+    TaskActivationError,
     VibeRunner,
     active_lock_conflict_domains,
     build_batch_selection_prompt,
@@ -132,6 +133,23 @@ def file_fingerprint(path: Path, relative_path: str) -> dict[str, object]:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_activate_task_before_launch_rejects_empty_status(self) -> None:
+        class EmptyStatusSource:
+            def activate(self, *args: object, **kwargs: object) -> Task:
+                return Task(task_id="TASK-01", title="Task", status="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            runner._source = EmptyStatusSource()
+
+            with self.assertRaisesRegex(TaskActivationError, "empty status"):
+                runner.activate_task_before_launch(
+                    Task(task_id="TASK-01", title="Task", status="Next"),
+                    "run-1",
+                    {},
+                    continuation=False,
+                )
+
     def test_selection_prompt_includes_recent_logs(self) -> None:
         task = Task(task_id="LIVE-04", title="Realtime reconcile", status="Next")
 

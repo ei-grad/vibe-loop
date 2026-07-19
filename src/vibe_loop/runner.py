@@ -145,6 +145,15 @@ environment variables identify this run:
 - VIBE_LOOP_LOG - path to the run log file
 - VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
 
+### Task Activation
+
+For command-backed task sources, the supervisor acquired this run's exact task
+lock, invoked the configured task lifecycle adapter, and confirmed that the task
+is in a non-runnable in-progress state before starting this worker process. The
+activation is project task-source state; it is not a worker report and does not
+complete the task. If repository evidence contradicts that confirmed state,
+stop before workspace mutation and report the run as blocked.
+
 ### Workspace Claim
 
 After creating or choosing your task branch/worktree, and before implementation
@@ -381,6 +390,10 @@ class SchedulerLockBusy(RuntimeError):
     def __init__(self, path: Path):
         self.path = path
         super().__init__(f"resource scheduler lock is busy: {path}")
+
+
+class TaskActivationError(RuntimeError):
+    """A command task source could not confirm its pre-launch claim."""
 
 
 class AgentOutputObserver:
@@ -944,6 +957,33 @@ class VibeRunner:
                 },
             )
         )
+        continuation = recovery is not None or restart_count > 0
+        try:
+            activated_task = self.activate_task_before_launch(
+                task,
+                run_id,
+                command_env,
+                continuation=continuation,
+            )
+        except Exception:
+            # Any ordinary pre-launch failure after acquisition must release
+            # this run's exact task lock. Activation adapters are external and
+            # can fail outside the enumerated subprocess/config exceptions.
+            self.lock_manager.release(task_lock)
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.lock_event(
+                    LOCK_RELEASED_RECORD_TYPE,
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    lock_kind="task",
+                    lock_path=task_lock.path,
+                    payload={
+                        "started_at": active_state.started_at,
+                        "reason": "task_activation_failed",
+                    },
+                )
+            )
+            raise
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.run_started(
                 run_id=run_id,
@@ -958,7 +998,14 @@ class VibeRunner:
                     "conflict_domains_known": task.conflict_domains_known,
                     "restart_count": restart_count,
                     "max_restarts": max_restarts,
-                    "reason": "task_lock_acquired",
+                    "reason": (
+                        "task_activation_confirmed"
+                        if activated_task is not None
+                        else "task_lock_acquired"
+                    ),
+                    "task_activation_status": (
+                        activated_task.status if activated_task is not None else ""
+                    ),
                 },
             )
         )
@@ -1384,6 +1431,68 @@ class VibeRunner:
             )
         finally:
             self.release_scheduler_lock(scheduler_lock)
+
+    def activate_task_before_launch(
+        self,
+        task: Task,
+        run_id: str,
+        command_env: dict[str, str],
+        *,
+        continuation: bool,
+    ) -> Task | None:
+        activate = getattr(self.source, "activate", None)
+        if activate is None:
+            return None
+        runtime_context = {
+            key: command_env[key]
+            for key in (
+                "VIBE_LOOP_RUN_ID",
+                "VIBE_LOOP_TASK_ID",
+                "VIBE_LOOP_REPO",
+                "VIBE_LOOP_LOG",
+                "VIBE_LOOP_FENCING_TOKEN",
+            )
+            if key in command_env
+        }
+        try:
+            confirmed = activate(
+                task.task_id,
+                run_id,
+                continuation=continuation,
+                runtime_context=runtime_context,
+            )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            mode = "continuation confirmation" if continuation else "activation"
+            raise TaskActivationError(
+                f"task-source {mode} failed for {task.task_id}: {exc}; "
+                "worker was not launched"
+            ) from exc
+        if confirmed is None:
+            return None
+        if confirmed.task_id != task.task_id:
+            raise TaskActivationError(
+                "task_source.activate returned task "
+                f"{confirmed.task_id!r}, expected {task.task_id!r}; "
+                "worker was not launched"
+            )
+        if not confirmed.status.strip():
+            raise TaskActivationError(
+                "task_source.activate returned an empty status for "
+                f"{task.task_id}; worker was not launched"
+            )
+        if confirmed.done or confirmed.status.casefold() in BLOCKED_FAMILY_STATUSES:
+            raise TaskActivationError(
+                "task_source.activate returned terminal or blocked status "
+                f"{confirmed.status!r} for {task.task_id}; worker was not launched"
+            )
+        runnable_statuses = self.source_resolution.task_source.runnable_statuses
+        if confirmed.status in runnable_statuses:
+            raise TaskActivationError(
+                "task_source.activate left task "
+                f"{task.task_id} runnable with status {confirmed.status!r}; "
+                "worker was not launched"
+            )
+        return confirmed
 
     def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
         lock_path = (
@@ -2153,11 +2262,11 @@ class VibeRunner:
             "without consuming restart budget; supervisor backs off before "
             "the next cycle"
         )
-        # The worker claimed the task (ready -> active) itself and died on the
-        # wall before any terminal transition. The vibe-loop task lock is
-        # already released (run_task's finally), so the task now sits claimed
-        # in the backend with no live lock and would never be re-dispatched.
-        # An operator-configured reset hook returns it to its runnable state.
+        # Pre-launch activation moved the task out of the runnable set, and the
+        # worker died before any terminal transition. The vibe-loop task lock is
+        # already released (run_task's finally), so the task now sits active in
+        # the backend with no live lock and would never be re-dispatched. An
+        # operator-configured reset hook returns it to its runnable state.
         self._reset_task_source_status(result.task_id)
 
     def _report_worker_timeout(self, result: RunResult) -> None:
@@ -2167,11 +2276,12 @@ class VibeRunner:
             "task to its runnable state without consuming restart budget so the "
             "batch and other workers proceed"
         )
-        # The worker claimed the task (ready -> active) itself and was killed
-        # before any terminal transition. Its vibe-loop lock is already released
-        # (run_task's finally), so the task now sits claimed in the backend with
-        # no live lock and would never be re-dispatched. The reset hook returns
-        # it to its runnable state, mirroring the limit-wall recovery path.
+        # Pre-launch activation moved the task out of the runnable set, and the
+        # worker was killed before any terminal transition. Its vibe-loop lock
+        # is already released (run_task's finally), so the task now sits active
+        # in the backend with no live lock and would never be re-dispatched. The
+        # reset hook returns it to its runnable state, mirroring the limit-wall
+        # recovery path.
         self._reset_task_source_status(result.task_id)
 
     def _reset_task_source_status(self, task_id: str) -> None:

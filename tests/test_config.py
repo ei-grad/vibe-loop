@@ -1166,6 +1166,37 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("reset", config.task_source.explicit_source_keys)
         self.assertTrue(config.task_source.is_explicit("reset"))
 
+    def test_task_source_activate_hook_is_parsed_and_blocks_generated_cache(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\ntype = "command"\n'
+                'list = "tracker list --json"\n'
+                'activate = "tracker activate {task_id} --run {run_id}"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(
+            config.task_source.activate_command,
+            "tracker activate {task_id} --run {run_id}",
+        )
+        self.assertFalse(config.task_source.allows_generated_cache)
+        self.assertIn("activate", config.task_source.explicit_source_keys)
+        self.assertTrue(config.task_source.is_explicit("activate"))
+
+    def test_task_source_activate_hook_defaults_to_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text("[task_source]\n", encoding="utf-8")
+
+            config = load_config(repo)
+
+        self.assertIsNone(config.task_source.activate_command)
+
     def test_task_source_reset_hook_defaults_to_none(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

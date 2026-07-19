@@ -4,6 +4,7 @@ import dataclasses
 import json
 import os
 import re
+import shlex
 import subprocess
 from collections.abc import Iterable, Mapping
 from pathlib import Path, PurePosixPath
@@ -229,6 +230,23 @@ class TaskSource(Protocol):
 
     def probe(self, task_id: str) -> Task | None: ...
 
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        """Claim a command-backed task before worker launch.
+
+        Command sources return the normalized confirmed non-runnable task.
+        File-backed sources return None because their lifecycle remains owned by
+        the worker's repository edits. Continuations confirm the prior claimed
+        state without repeating the runnable-to-active transition.
+        """
+        ...
+
     def reset(self, task_id: str) -> bool:
         """Request the backend return a claimed task to its runnable state.
 
@@ -337,6 +355,16 @@ class MarkdownPlanSource:
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
 
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        return None
+
     def reset(self, task_id: str) -> bool:
         return False
 
@@ -433,6 +461,16 @@ class MarkdownProfileSource:
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
 
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        return None
+
     def reset(self, task_id: str) -> bool:
         return False
 
@@ -458,6 +496,16 @@ class RalphexMarkdownSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        return None
 
     def reset(self, task_id: str) -> bool:
         return False
@@ -493,6 +541,16 @@ class SpecToolMarkdownSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        return None
 
     def reset(self, task_id: str) -> bool:
         return False
@@ -2110,13 +2168,20 @@ class CommandTaskSource:
         return [task_from_mapping(item, index) for index, item in enumerate(raw_tasks)]
 
     def probe(self, task_id: str) -> Task | None:
+        return self._probe(task_id)
+
+    def _probe(
+        self,
+        task_id: str,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
         if self.config.probe_command:
             command = self.config.probe_command.format(task_id=task_id)
             payload = run_json_command(
                 self.repo,
                 command,
                 timeout=self.config.command_timeout_seconds,
-                runtime_context=self.runtime_context,
+                runtime_context=self._runtime_context(runtime_context),
             )
             if payload is None:
                 return None
@@ -2124,6 +2189,49 @@ class CommandTaskSource:
         return next(
             (task for task in self.list_tasks() if task.task_id == task_id), None
         )
+
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        if continuation:
+            confirmed = self._probe(task_id, runtime_context)
+            if confirmed is None:
+                raise ValueError(
+                    "command task source continuation probe returned no task for "
+                    f"{task_id}"
+                )
+            return confirmed
+        if not self.config.activate_command:
+            raise ValueError(
+                "command task source requires task_source.activate before "
+                "worker execution"
+            )
+        try:
+            command = self.config.activate_command.format(
+                task_id=shlex.quote(task_id),
+                run_id=shlex.quote(run_id),
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                "task_source.activate may only use {task_id} and {run_id} "
+                "template fields"
+            ) from exc
+        payload = run_json_command(
+            self.repo,
+            command,
+            timeout=self.config.command_timeout_seconds,
+            runtime_context=self._runtime_context(runtime_context),
+        )
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "task_source.activate must return one normalized task JSON object"
+            )
+        return task_from_mapping(payload, 0)
 
     def reset(self, task_id: str) -> bool:
         if not self.config.reset_command:
@@ -2136,6 +2244,14 @@ class CommandTaskSource:
             runtime_context=self.runtime_context,
         )
         return True
+
+    def _runtime_context(
+        self,
+        runtime_context: Mapping[str, str] | None,
+    ) -> dict[str, str]:
+        merged = dict(self.runtime_context)
+        merged.update(runtime_context or {})
+        return merged
 
 
 def run_json_command(

@@ -11,7 +11,11 @@ workflow.
 
 Acceptance must cover single-task `run-next`, serial `run-until-done`,
 environment variables passed to workers, worker prompt addendum, and the rule
-that workers own their slice lifecycle.
+that workers own their slice lifecycle. For command-backed sources it must also
+cover exact task-lock acquisition followed by project adapter activation and
+non-runnable-state confirmation before `run_started`, worker launch, workspace
+claim, or edit. Missing or unconfirmed activation must fail closed without
+resetting project state or touching another worker's lock or workspace.
 
 Related implementation IDs: `PAR-01`, `PAR-03`, `PAR-05`.
 

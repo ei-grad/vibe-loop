@@ -109,6 +109,13 @@ workspace and before implementation edits. Treat that ownership data as
 diagnostic coordination state only: it never authorizes automatic cleanup,
 branch deletion, resets, lock stealing, or central merge-queue behavior.
 
+For a CLI-launched command-backed task, the supervisor must acquire the exact
+task lock, invoke the repository-configured lifecycle adapter, and confirm a
+non-runnable in-progress task state before starting the worker process. The
+worker must not create, claim, or edit a workspace if repository evidence
+contradicts that confirmed state. Activation remains project task-source state;
+worker reports remain separate attempt outcomes.
+
 If a dedicated worktree cannot be created, or repo/user policy forbids creating
 one, state the precise blocker and proceed in the primary worktree only after
 inspecting its current state. Do not silently fall back to editing the primary

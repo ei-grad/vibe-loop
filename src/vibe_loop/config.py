@@ -240,6 +240,7 @@ TASK_SOURCE_SOURCE_KEYS = frozenset(
         "list",
         "next",
         "probe",
+        "activate",
         "reset",
         "profile",
     }
@@ -251,6 +252,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "list",
         "next",
         "probe",
+        "activate",
         "reset",
         "selection_command",
         "locks",
@@ -554,20 +556,25 @@ class TaskSourceConfig:
     list_command: str | None = None
     next_command: str | None = None
     probe_command: str | None = None
+    # Required for command-backed worker execution. The adapter transitions the
+    # selected task from a runnable state to a project-owned in-progress state
+    # and returns the normalized post-transition task JSON for confirmation.
+    activate_command: str | None = None
     # Optional operator wiring: a command that asks a command-backed task
     # backend to return a claimed task to its runnable state, templated with
     # {task_id}. The supervisor invokes it when a run hits a provider limit
-    # wall, because the worker transitions the task to a claimed/active status
-    # itself and dies before any terminal transition, and vibe-loop otherwise
-    # never mutates project-owned task status. Absent hook keeps that behavior.
+    # wall, because activation moved the task to an in-progress status before
+    # worker launch and the worker died before any terminal transition. Absent
+    # hook leaves project-owned task status unchanged.
     reset_command: str | None = None
     # Wall-clock ceiling applied to every task-source subprocess invocation
-    # (list at cycle start, probe during classification/recovery, and the
-    # reset hook). A hung backend command — a stalled loopyard CLI, a blocked
-    # Postgres query — would otherwise freeze the supervisor synchronously,
-    # because these calls are made inline on the dispatch/status path. Expiry
-    # raises subprocess.TimeoutExpired, a SubprocessError that behaves like any
-    # other command failure at each call site. See tasks.run_json_command.
+    # (list at cycle start, activate before launch, probe during
+    # classification/recovery, and the reset hook). A hung backend command — a
+    # stalled loopyard CLI, a blocked Postgres query — would otherwise freeze
+    # the supervisor synchronously, because these calls are made inline on the
+    # dispatch/status path. Expiry raises subprocess.TimeoutExpired, a
+    # SubprocessError that behaves like any other command failure at each call
+    # site. See tasks.run_json_command.
     command_timeout_seconds: float = 120.0
     runnable_statuses: tuple[str, ...] = DEFAULT_RUNNABLE_STATUSES
     # Opt-in: when true, the task source's emitted order is authoritative and
@@ -598,6 +605,7 @@ class TaskSourceConfig:
             "list_command": self.list_command,
             "next_command": self.next_command,
             "probe_command": self.probe_command,
+            "activate_command": self.activate_command,
             "reset_command": self.reset_command,
             "command_timeout_seconds": self.command_timeout_seconds,
             "runnable_statuses": list(self.runnable_statuses),
@@ -1585,6 +1593,7 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         list_command=optional_string(table.get("list")),
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
+        activate_command=optional_string(table.get("activate")),
         reset_command=optional_string(table.get("reset")),
         command_timeout_seconds=positive_float(
             table.get("command_timeout_seconds"),

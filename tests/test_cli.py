@@ -524,15 +524,21 @@ class CliTests(unittest.TestCase):
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
 
+        task_activation = CLI_WORKER_ADDENDUM.index("### Task Activation")
         workspace_claim = CLI_WORKER_ADDENDUM.index("### Workspace Claim")
         worker_reports = CLI_WORKER_ADDENDUM.index("### Worker Reports")
         integration_locking = CLI_WORKER_ADDENDUM.index("### Integration Locking")
+        self.assertLess(task_activation, workspace_claim)
         self.assertLess(workspace_claim, worker_reports)
         self.assertLess(worker_reports, integration_locking)
 
         self.assertIn(
             "After creating or choosing your task branch/worktree, and before "
             "implementation\nedits",
+            CLI_WORKER_ADDENDUM,
+        )
+        self.assertIn(
+            "confirmed that the task\nis in a non-runnable in-progress state",
             CLI_WORKER_ADDENDUM,
         )
         self.assertIn("vibe-loop worker claim-workspace", CLI_WORKER_ADDENDUM)
@@ -5042,9 +5048,9 @@ class CliTests(unittest.TestCase):
             (repo / "docs" / "design.md").write_text(design_text, encoding="utf-8")
             fingerprint = file_fingerprint(repo / "docs" / "spec.md", "docs/spec.md")
             (repo / "list_tasks.py").write_text(
-                "import json\n"
-                "print(json.dumps([{'id':'TRACE-01','title':'Trace task',"
-                "'status':'Next','dependencies':[],"
+                "import json\nimport sys\n"
+                "task = {'id':'TRACE-01','title':'Trace task',"
+                "'status':'active' if len(sys.argv) > 1 else 'Next','dependencies':[],"
                 "'acceptance':'Prompt includes bounded spec context.',"
                 "'evidence':'CLI prompt assertion.',"
                 "'requirement_ids':['PRD-SDE-003'],"
@@ -5055,7 +5061,8 @@ class CliTests(unittest.TestCase):
                 + str(fingerprint["size"])
                 + ",'sha256':'"
                 + str(fingerprint["sha256"])
-                + "','redacted':False}]}]))\n",
+                + "','redacted':False}]}\n"
+                "print(json.dumps(task if len(sys.argv) > 1 else [task]))\n",
                 encoding="utf-8",
             )
             (repo / "agent.py").write_text(
@@ -5078,6 +5085,7 @@ class CliTests(unittest.TestCase):
             (repo / ".vibe-loop.toml").write_text(
                 "[task_source]\n"
                 f"list = {toml_string(f'{sys.executable} list_tasks.py')}\n\n"
+                f"activate = {toml_string(f'{sys.executable} list_tasks.py activate')}\n\n"
                 "[agent]\n"
                 'kind = "claude"\n'
                 "command = " + json.dumps(command) + "\n",
@@ -5723,6 +5731,14 @@ class CliTests(unittest.TestCase):
                 "}\n"
                 "if sys.argv[2] == 'list':\n"
                 "    print(json.dumps([task]))\n"
+                "elif sys.argv[2] == 'activate':\n"
+                "    lock_path = Path.cwd() / '.vibe-loop' / 'locks' / 'TASK-01.lock'\n"
+                "    if not lock_path.exists() or state['status'] != 'ready':\n"
+                "        raise SystemExit(3)\n"
+                "    state = {'status': 'active', 'history': state['history'] + ['active']}\n"
+                "    Path(sys.argv[1]).write_text(json.dumps(state), encoding='utf-8')\n"
+                "    task['status'] = state['status']\n"
+                "    print(json.dumps(task))\n"
                 "elif len(sys.argv) > 3 and sys.argv[3] == task['id']:\n"
                 "    print(json.dumps(task))\n"
                 "else:\n"
@@ -5740,6 +5756,10 @@ class CliTests(unittest.TestCase):
                 "from vibe_loop.cli import main\n"
                 "repo = Path.cwd()\n"
                 "state_path = Path(sys.argv[2])\n"
+                "state = json.loads(state_path.read_text(encoding='utf-8'))\n"
+                "if state['status'] == 'ready':\n"
+                "    (repo / 'ready-edit-violation.txt').write_text('worker launched while ready\\n', encoding='utf-8')\n"
+                "    raise SystemExit(4)\n"
                 "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
                 "branch = f'worker/{task_id}'\n"
@@ -5761,7 +5781,7 @@ class CliTests(unittest.TestCase):
                 "    if main(step) != 0:\n"
                 "        raise SystemExit(1)\n"
                 "state_path.write_text(\n"
-                "    json.dumps({'status': 'review', 'history': ['ready', 'review']}),\n"
+                "    json.dumps({'status': 'review', 'history': state['history'] + ['review']}),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
                 "if main(['main-integration', 'acquire', '--repo', str(repo), '--run-id', run_id, '--task-id', task_id]) != 0:\n"
@@ -5769,7 +5789,7 @@ class CliTests(unittest.TestCase):
                 "if main(['main-integration', 'release', '--repo', str(repo), '--run-id', run_id, '--task-id', task_id]) != 0:\n"
                 "    raise SystemExit(1)\n"
                 "state_path.write_text(\n"
-                "    json.dumps({'status': 'done', 'history': ['ready', 'review', 'done'], 'no_commits': True}),\n"
+                "    json.dumps({'status': 'done', 'history': state['history'] + ['review', 'done'], 'no_commits': True}),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
                 "raise SystemExit(main([\n"
@@ -5791,6 +5811,13 @@ class CliTests(unittest.TestCase):
                 "probe",
                 "{task_id}",
             )
+            activate_command = shell_command(
+                sys.executable,
+                str(task_source_script),
+                str(state_path),
+                "activate",
+                "{task_id}",
+            )
             agent_command = shell_command(
                 sys.executable,
                 str(agent_script),
@@ -5804,6 +5831,8 @@ class CliTests(unittest.TestCase):
                 + json.dumps(list_command)
                 + "\nprobe = "
                 + json.dumps(probe_command)
+                + "\nactivate = "
+                + json.dumps(activate_command)
                 + '\nrunnable_statuses = ["ready"]\n',
                 encoding="utf-8",
             )
@@ -5845,6 +5874,7 @@ class CliTests(unittest.TestCase):
                 repo / ".vibe-loop" / "locks" / "main-integration.lock"
             ).exists()
             retained_worktree_exists = (repo.parent / "no-commit-worker").exists()
+            ready_edit_violation = (repo / "ready-edit-violation.txt").exists()
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -5858,7 +5888,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(task_payload["status"], "done")
         self.assertFalse(task_payload["ready"])
         self.assertEqual(task_state["status"], "done")
-        self.assertEqual(task_state["history"], ["ready", "review", "done"])
+        self.assertEqual(
+            task_state["history"],
+            ["ready", "active", "review", "done"],
+        )
+        self.assertFalse(ready_edit_violation)
         self.assertTrue(task_state["no_commits"])
         self.assertEqual(integration_events, ["lock_acquired", "lock_released"])
         self.assertIn("workspace_claim", {record["record_type"] for record in records})
@@ -5867,6 +5901,166 @@ class CliTests(unittest.TestCase):
         self.assertFalse(task_lock_exists)
         self.assertFalse(integration_lock_exists)
         self.assertTrue(retained_worktree_exists)
+
+    def test_run_next_fails_before_worker_when_command_activation_is_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            source_script = repo / "source.py"
+            write_python_executable(
+                source_script,
+                "import json\n"
+                "print(json.dumps([{\n"
+                "    'id': 'TASK-01', 'title': 'Activation required',\n"
+                "    'status': 'ready', 'dependencies': [],\n"
+                "}]))\n",
+            )
+            marker = repo / "agent-started.txt"
+            agent_script = repo / "agent.py"
+            write_python_executable(
+                agent_script,
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path(sys.argv[1]).write_text('started\\n', encoding='utf-8')\n",
+            )
+            list_command = shell_command(sys.executable, str(source_script))
+            agent_command = shell_command(
+                sys.executable,
+                str(agent_script),
+                str(marker),
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = "
+                + json.dumps(agent_command)
+                + '\n[task_source]\ntype = "command"\nlist = '
+                + json.dumps(list_command)
+                + '\nrunnable_statuses = ["ready"]\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run-next", "--repo", str(repo)])
+
+            records = [
+                json.loads(line)
+                for line in (repo / ".vibe-loop" / "runs.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            record_types = [record["record_type"] for record in records]
+            task_lock_exists = (repo / ".vibe-loop" / "locks" / "TASK-01.lock").exists()
+            agent_started = marker.exists()
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("requires task_source.activate", stderr.getvalue())
+        self.assertFalse(agent_started)
+        self.assertFalse(task_lock_exists)
+        self.assertEqual(record_types, ["lock_acquired", "lock_released"])
+        self.assertEqual(records[-1]["reason"], "task_activation_failed")
+
+    def test_command_prelaunch_failures_release_lock_without_starting_worker(
+        self,
+    ) -> None:
+        from vibe_loop.config import load_config
+        from vibe_loop.runner import TaskActivationError, VibeRunner
+
+        for case, restart_count in (
+            ("invalid-template", 0),
+            ("missing-continuation", 1),
+        ):
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory) / "repo"
+                    init_planning_repo(repo, PLAN)
+                    source_script = repo / "source.py"
+                    write_python_executable(
+                        source_script,
+                        "import json\n"
+                        "import sys\n"
+                        "task = {'id': 'TASK-01', 'title': 'Activation', "
+                        "'status': 'ready', 'dependencies': []}\n"
+                        "if len(sys.argv) == 1:\n"
+                        "    print(json.dumps([task]))\n"
+                        "elif sys.argv[1] == 'probe':\n"
+                        "    print('null')\n"
+                        "else:\n"
+                        "    task['status'] = 'active'\n"
+                        "    print(json.dumps(task))\n",
+                    )
+                    marker = repo / "agent-started.txt"
+                    agent_script = repo / "agent.py"
+                    write_python_executable(
+                        agent_script,
+                        "from pathlib import Path\n"
+                        "import sys\n"
+                        "Path(sys.argv[1]).write_text('started\\n', encoding='utf-8')\n",
+                    )
+                    list_command = shell_command(
+                        sys.executable,
+                        str(source_script),
+                    )
+                    probe_command = shell_command(
+                        sys.executable,
+                        str(source_script),
+                        "probe",
+                        "{task_id}",
+                    )
+                    if case == "invalid-template":
+                        activate_command = "activate {unsupported}"
+                    else:
+                        activate_command = shell_command(
+                            sys.executable,
+                            str(source_script),
+                            "activate",
+                            "{task_id}",
+                        )
+                    agent_command = shell_command(
+                        sys.executable,
+                        str(agent_script),
+                        str(marker),
+                    )
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[agent]\ncommand = "
+                        + json.dumps(agent_command)
+                        + '\n[task_source]\ntype = "command"\nlist = '
+                        + json.dumps(list_command)
+                        + "\nprobe = "
+                        + json.dumps(probe_command)
+                        + "\nactivate = "
+                        + json.dumps(activate_command)
+                        + '\nrunnable_statuses = ["ready"]\n',
+                        encoding="utf-8",
+                    )
+                    runner = VibeRunner(load_config(repo))
+                    task = runner.source.list_tasks()[0]
+
+                    with self.assertRaises(TaskActivationError):
+                        runner.run_task_with_supervision(
+                            task,
+                            restart_count=restart_count,
+                        )
+
+                    records = [
+                        json.loads(line)
+                        for line in (repo / ".vibe-loop" / "runs.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    ]
+                    record_types = [record["record_type"] for record in records]
+                    agent_started = marker.exists()
+                    task_lock_exists = (
+                        repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+                    ).exists()
+
+                self.assertFalse(agent_started)
+                self.assertFalse(task_lock_exists)
+                self.assertEqual(record_types, ["lock_acquired", "lock_released"])
+                self.assertEqual(records[-1]["reason"], "task_activation_failed")
 
     def test_main_integration_rejects_merged_branch_behind_main(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

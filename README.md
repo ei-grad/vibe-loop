@@ -731,7 +731,7 @@ lowercase statuses should configure lowercase entries. This keeps an explicit
 allowlist from silently accepting additional status spellings.
 
 Setting any explicit source key — `type`, `plan_path`, `plan_paths`, `profile`,
-`list`, `next`, `probe`, `reset` — disables generated cache as the active
+`list`, `next`, `probe`, `activate`, `reset` — disables generated cache as the active
 source. Non-source settings such as `runnable_statuses` still override matching
 generated fields without disabling the generated parser.
 
@@ -742,6 +742,7 @@ generated fields without disabling the generated parser.
 type = "command"
 list = "my-task-tool list --json"
 probe = "my-task-tool show {task_id} --json"
+activate = "my-task-tool activate {task_id} --run {run_id} --json"
 reset = "my-task-tool reset {task_id}"
 ```
 
@@ -755,15 +756,26 @@ optional traceability fields — `requirement_ids`, `spec_paths`, `design_refs`,
 `approval_state`, `source_fingerprints` — emitted in task JSON, analytics,
 promotion, and worker prompts when present.
 
+`activate` is required before a command-backed source can launch a worker. Once
+the exact task lock is held, vibe-loop invokes this command with shell-quoted
+`{task_id}` and `{run_id}` values. The adapter must atomically compare-and-set
+the project-owned task from one configured runnable status to a non-runnable
+in-progress status, then return that normalized task as one JSON object.
+Vibe-loop confirms the returned
+ID, rejects terminal, blocked, or still-runnable statuses, records `run_started`,
+and only then launches the worker. A missing, failed, timed-out, malformed, or
+unconfirmed activation releases only that run's task lock and launches no
+worker; it does not reset task state or touch a workspace. Continuation attempts
+probe and confirm the prior non-runnable state without repeating the fresh
+compare-and-set.
+
 `reset` is an optional hook, templated with `{task_id}`, that asks the backend
-to return a claimed task to its runnable state. A worker claims its task
-(runnable → active) in the backend itself; if it then dies on a provider limit
-wall before any terminal transition, the task is left claimed with no live
-vibe-loop lock and would never be re-dispatched. When the supervisor classifies
-a run as a limit wall it invokes this hook for the affected task so the next
-cycle can pick it up again. Absent hook, backend status is left untouched
-(vibe-loop never mutates project-owned status on its own); a hook that fails is
-logged and non-fatal.
+to return an activated task to its runnable state. If a worker dies on a
+provider limit wall before any terminal transition, the task is left active
+with no live vibe-loop lock and would never be re-dispatched. When the
+supervisor classifies a run as a limit wall it invokes this hook for the
+affected task so the next cycle can pick it up again. Absent hook, backend
+status is left untouched; a hook that fails is logged and non-fatal.
 
 **Spec gates** (read-only diagnostics by default). `doctor` and `specs check`
 report unapproved tasks, stale fingerprints, missing requirement IDs, and
