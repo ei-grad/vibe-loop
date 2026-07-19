@@ -393,6 +393,123 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["pid"], 999)
         self.assertEqual(payload["cycle_id"], "cycle-1")
 
+    def test_project_status_keeps_live_supervisor_across_pidless_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            manager.acquire_autopilot(
+                run_id="autopilot-1",
+                metadata={"pid": 999},
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            log_path = config.state_path / "autopilot" / "autopilot-1.log"
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                    "run_id": "autopilot-1",
+                    "pid": 999,
+                    "log": str(log_path),
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                }
+            )
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+                    "run_id": "autopilot-1",
+                    "pid": 999,
+                    "occurred_at": "2026-05-09T00:00:05+00:00",
+                }
+            )
+            for index in range(2):
+                run_store.append_record(
+                    {
+                        "schema_version": 1,
+                        "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                        "cycle_id": f"autopilot-1-c{index + 1}",
+                        "status": "idle",
+                        "occurred_at": f"2026-05-09T00:00:1{index}+00:00",
+                    }
+                )
+
+            payload = collect_project_status(
+                config,
+                process_exists=lambda pid: pid == 999,
+            ).to_json()
+
+        self.assertEqual(payload["supervisor"]["state"], "running")
+        self.assertEqual(payload["supervisor"]["pid"], 999)
+        self.assertEqual(payload["supervisor"]["run_id"], "autopilot-1")
+        self.assertEqual(payload["supervisor"]["log"], str(log_path))
+        self.assertEqual(payload["last_cycle"]["cycle_id"], "autopilot-1-c2")
+        self.assertEqual(payload["last_cycle"]["status"], "idle")
+
+    def test_project_status_does_not_treat_unlocked_supervisor_as_live(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                    "run_id": "autopilot-exited",
+                    "pid": 999,
+                    "log": str(config.state_path / "autopilot" / "exited.log"),
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                }
+            )
+
+            payload = collect_project_status(
+                config,
+                process_exists=lambda pid: pid == 999,
+            ).to_json()
+
+        self.assertNotEqual(payload["supervisor"]["state"], "running")
+
+    def test_project_status_does_not_treat_stale_supervisor_lock_as_live(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            manager.acquire_autopilot(
+                run_id="autopilot-stale",
+                metadata={"pid": 999},
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                    "run_id": "autopilot-stale",
+                    "pid": 999,
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                }
+            )
+
+            payload = collect_project_status(
+                config,
+                process_exists=lambda _pid: False,
+            ).to_json()
+
+        self.assertNotEqual(payload["supervisor"]["state"], "running")
+        self.assertEqual(payload["supervisor"]["run_id"], "autopilot-stale")
+
 
 class ExternalRunSupervisorTests(unittest.TestCase):
     def _store_with_records(

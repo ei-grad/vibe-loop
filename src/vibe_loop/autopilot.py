@@ -21,7 +21,7 @@ from vibe_loop.config import (
     unresolved_agent_command_message,
     unresolved_prompt_dialect_message,
 )
-from vibe_loop.locks import LockBusy, build_lock_manager
+from vibe_loop.locks import IntegrationLockStatus, LockBusy, build_lock_manager
 from vibe_loop.retry import parse_limit_wall_reset_delay
 from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
@@ -121,6 +121,7 @@ class SupervisorStatus:
     state: str = "idle"
     pid: int | None = None
     log: Path | None = None
+    run_id: str = ""
     cycle_id: str = ""
     observed_at: str = ""
     record: dict[str, Any] | None = None
@@ -130,6 +131,7 @@ class SupervisorStatus:
             "state": self.state,
             "pid": self.pid,
             "log": str(self.log) if self.log is not None else "",
+            "run_id": self.run_id,
             "cycle_id": self.cycle_id,
             "observed_at": self.observed_at,
             "record": self.record or {},
@@ -287,7 +289,12 @@ def collect_project_status(
     agent = config.agent.to_json()
     agent_blockers = agent_blocking_diagnostics(config)
     last_cycle = latest_cycle_summary(run_store)
-    supervisor = collect_supervisor_status(run_store, process_exists=process_exists)
+    supervisor_lock = lock_manager.autopilot_status(process_exists=process_exists)
+    supervisor = collect_supervisor_status(
+        run_store,
+        supervisor_lock=supervisor_lock,
+        process_exists=process_exists,
+    )
     workspace_diagnostics = tuple(
         diagnostic.to_json()
         for worker in workers
@@ -514,31 +521,113 @@ def ahead_behind(repo: Path, upstream: str) -> tuple[int, int]:
 def collect_supervisor_status(
     run_store: RunStore,
     *,
+    supervisor_lock: IntegrationLockStatus | None = None,
     process_exists: ProcessExists | None = None,
 ) -> SupervisorStatus:
     process_checker = process_exists if process_exists is not None else pid_exists
-    for record in reversed(run_store.read_records()):
-        if record.get("record_type") not in {
-            AUTOPILOT_CYCLE_RECORD_TYPE,
+    records = run_store.read_records()
+    supervisor_records = [
+        record
+        for record in records
+        if record.get("record_type")
+        in {
             AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
             AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
-        }:
-            continue
-        record_type = str(record.get("record_type"))
-        pid = int_value(record.get("child_pid")) or int_value(record.get("pid"))
-        alive = bool(pid and process_checker(pid))
-        state = "running" if alive else "observed"
-        if record_type == AUTOPILOT_CYCLE_RECORD_TYPE and not alive:
-            state = str(record.get("status") or "idle")
-        return SupervisorStatus(
-            state=state,
-            pid=pid,
-            log=path_value(record.get("child_log") or record.get("log")),
-            cycle_id=str(record.get("cycle_id") or ""),
-            observed_at=str(record.get("occurred_at") or ""),
-            record=record,
+        }
+    ]
+    cycle_record = next(
+        (
+            record
+            for record in reversed(records)
+            if record.get("record_type") == AUTOPILOT_CYCLE_RECORD_TYPE
+        ),
+        None,
+    )
+
+    if supervisor_lock is not None:
+        if supervisor_lock.locked and supervisor_lock.state in {"held", "unknown"}:
+            lock_run_id = str(supervisor_lock.metadata.get("run_id") or "")
+            lock_pid = int_value(supervisor_lock.metadata.get("pid"))
+            matching_records = [
+                record
+                for record in supervisor_records
+                if supervisor_record_matches_lock(
+                    record,
+                    run_id=lock_run_id,
+                    pid=lock_pid,
+                )
+            ]
+            newest_record = matching_records[-1] if matching_records else None
+            log = next(
+                (
+                    path
+                    for record in reversed(matching_records)
+                    if (path := path_value(record.get("log"))) is not None
+                ),
+                None,
+            )
+            return SupervisorStatus(
+                state=("running" if supervisor_lock.state == "held" else "observed"),
+                pid=lock_pid,
+                log=log,
+                run_id=lock_run_id,
+                cycle_id=(
+                    str(newest_record.get("cycle_id") or "")
+                    if newest_record is not None
+                    else ""
+                ),
+                observed_at=(
+                    str(newest_record.get("occurred_at") or "")
+                    if newest_record is not None
+                    else str(supervisor_lock.metadata.get("heartbeat_at") or "")
+                ),
+                record=(newest_record or supervisor_lock.metadata),
+            )
+    elif supervisor_records:
+        newest_record = supervisor_records[-1]
+        pid = int_value(newest_record.get("pid"))
+        if pid and process_checker(pid):
+            return supervisor_status_from_record(newest_record, state="running")
+
+    if cycle_record is not None:
+        return supervisor_status_from_record(
+            cycle_record,
+            state=str(cycle_record.get("status") or "idle"),
         )
+    if supervisor_records:
+        return supervisor_status_from_record(supervisor_records[-1], state="observed")
     return SupervisorStatus()
+
+
+def supervisor_record_matches_lock(
+    record: dict[str, Any],
+    *,
+    run_id: str,
+    pid: int | None,
+) -> bool:
+    record_run_id = str(record.get("run_id") or "")
+    record_pid = int_value(record.get("pid"))
+    if run_id and record_run_id != run_id:
+        return False
+    if pid is not None and record_pid != pid:
+        return False
+    return bool(run_id or pid is not None)
+
+
+def supervisor_status_from_record(
+    record: dict[str, Any],
+    *,
+    state: str,
+) -> SupervisorStatus:
+    return SupervisorStatus(
+        state=state,
+        pid=int_value(record.get("child_pid")) or int_value(record.get("pid")),
+        log=path_value(record.get("child_log") or record.get("log")),
+        run_id=str(record.get("run_id") or ""),
+        cycle_id=str(record.get("cycle_id") or ""),
+        observed_at=str(record.get("occurred_at") or ""),
+        record=record,
+    )
 
 
 def collect_external_run_supervisor(

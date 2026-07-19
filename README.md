@@ -378,7 +378,10 @@ workers, stale locks, workspace diagnostics, git refs/dirty state, the
 main-integration lock, supervisor state, blockers, and the last cycle. It never
 starts a worker or mutates state. The `--json` `ProjectStatus` payload is the
 machine-readable boundary consumed by external status surfaces such as the
-loopyard web UI (board, agents, and timeline screens).
+loopyard web UI (board, agents, and timeline screens). Supervisor state
+correlates the live supervisor lock with append-only started or observed
+records, preserving its run ID, PID, and log even when newer cycle records are
+idle and PID-less; `last_cycle` independently reports the newest cycle.
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch

@@ -16,6 +16,12 @@ objects, one-cycle result objects, bounded git/task/worker/lock/supervisor
 summaries, text rendering separated from state collection, and no dependency on
 live process memory for read-only status.
 
+Supervisor liveness is derived by correlating the current supervisor lock with
+the matching `autopilot_supervisor_started` or
+`autopilot_supervisor_observed` journal records. Later PID-less cycle records
+remain the latest cycle state and must not hide a still-live supervisor. A
+released or stale supervisor lock must not be reported as live.
+
 Autopilot must stay repository-agnostic. Its source, documentation, bundled eval
 fixtures, and command output must not embed downstream project names or absolute
 developer-machine paths, and a release check must assert this so the feature is
