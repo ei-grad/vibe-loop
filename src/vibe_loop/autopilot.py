@@ -1616,6 +1616,15 @@ def stop_detached_autopilot(
 ) -> AutopilotStopResult:
     """Stop a verified detached supervisor or explicitly recover its stale lock."""
 
+    binding = resolve_project_binding(config)
+    if binding.blocker is not None:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            blocker=binding.blocker,
+        )
+
     checker = process_exists if process_exists is not None else pid_exists
     get_process_group = (
         process_group_lookup if process_group_lookup is not None else os.getpgid
@@ -4209,7 +4218,6 @@ def iso_after(seconds: float) -> str:
 
 
 PROJECT_REGISTRY_SCHEMA_VERSION = 1
-PROJECT_BINDING_PRESERVED_KEYS = ("project_binding",)
 
 
 def default_registry_path() -> Path:
@@ -4234,41 +4242,18 @@ def redact_runtime_context_text(
 def redact_runtime_context_payload(
     value: object,
     runtime_context: tuple[tuple[str, str], ...],
-    *,
-    preserve_keys: tuple[str, ...] = PROJECT_BINDING_PRESERVED_KEYS,
 ) -> object:
-    """Redact runtime-context values from a payload.
-
-    ``preserve_keys`` names subtrees that are left untouched. The resolved
-    project binding is one: it reports validated namespace selectors, which
-    are precisely the routing fact an operator needs, and value redaction
-    would otherwise erase it wherever a binding came from registry context.
-    """
+    """Redact runtime-context values from every nested payload value."""
 
     if isinstance(value, str):
         return redact_runtime_context_text(value, runtime_context)
     if isinstance(value, dict):
         return {
-            key: (
-                item
-                if key in preserve_keys
-                else redact_runtime_context_payload(
-                    item,
-                    runtime_context,
-                    preserve_keys=preserve_keys,
-                )
-            )
+            key: redact_runtime_context_payload(item, runtime_context)
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [
-            redact_runtime_context_payload(
-                item,
-                runtime_context,
-                preserve_keys=preserve_keys,
-            )
-            for item in value
-        ]
+        return [redact_runtime_context_payload(item, runtime_context) for item in value]
     return value
 
 
@@ -4396,14 +4381,21 @@ class AggregateProjectStatus:
     runtime_context: tuple[tuple[str, str], ...] = ()
 
     def to_json(self) -> dict[str, object]:
+        status_payload = self.status.to_json() if self.status is not None else None
+        project_binding = None
+        if status_payload is not None:
+            project_binding = status_payload.pop("project_binding", None)
         payload = {
             "name": self.name,
             "repo": str(self.repo),
-            "status": self.status.to_json() if self.status is not None else None,
+            "status": status_payload,
             "error": self.error,
         }
         redacted = redact_runtime_context_payload(payload, self.runtime_context)
         assert isinstance(redacted, dict)
+        redacted_status = redacted.get("status")
+        if project_binding is not None and isinstance(redacted_status, dict):
+            redacted_status["project_binding"] = project_binding
         return redacted
 
 

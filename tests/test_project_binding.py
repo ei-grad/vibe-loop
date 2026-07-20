@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -13,6 +14,7 @@ from unittest import mock
 
 from vibe_loop.autopilot import (
     AUTOPILOT_RUNTIME_CONTEXT_FD_ENV,
+    AggregateProjectStatus,
     ProjectEntry,
     ProjectRegistry,
     collect_project_status,
@@ -23,6 +25,7 @@ from vibe_loop.autopilot import (
 )
 from vibe_loop.config import (
     ProjectBindingError,
+    RUNTIME_CONTEXT_REDACTION,
     load_config,
     parse_project_binding,
     resolve_project_binding,
@@ -30,6 +33,7 @@ from vibe_loop.config import (
 from vibe_loop import cli
 from vibe_loop.locks import build_lock_manager
 from vibe_loop.runner import VibeRunner
+from vibe_loop.workers import ActiveRunState, WorkerView
 
 
 SELECTOR = "DEMO_PROJECT"
@@ -461,15 +465,33 @@ class CrossProjectIsolationTests(unittest.TestCase):
             return []
         return self.invocation_log.read_text(encoding="utf-8").splitlines()
 
-    def guarded_cli_operations(self, repo: Path) -> list[tuple[str, list[str]]]:
+    def guarded_cli_operations(self, repo: Path) -> list[tuple[str, list[str], int]]:
         repo_arg = str(repo)
         return [
-            ("doctor", ["doctor", "--repo", repo_arg]),
-            ("workers", ["workers", "--repo", repo_arg]),
-            ("workers clean", ["workers", "clean", "--repo", repo_arg]),
-            ("task listing", ["tasks", "--repo", repo_arg]),
-            ("task selection", ["next", "--repo", repo_arg]),
-            ("task run selection", ["run-next", "--repo", repo_arg]),
+            ("doctor", ["doctor", "--repo", repo_arg], 1),
+            ("workers", ["workers", "--repo", repo_arg], 1),
+            ("workers clean", ["workers", "clean", "--repo", repo_arg], 1),
+            ("task listing", ["tasks", "--repo", repo_arg], 1),
+            ("task selection", ["next", "--repo", repo_arg], 1),
+            ("task run selection", ["run-next", "--repo", repo_arg], 1),
+            (
+                "autopilot stop",
+                ["autopilot", "stop", "--repo", repo_arg],
+                2,
+            ),
+            (
+                "autopilot stale recovery",
+                [
+                    "autopilot",
+                    "stop",
+                    "--repo",
+                    repo_arg,
+                    "--recover-stale",
+                    "--run-id",
+                    "test-run",
+                ],
+                2,
+            ),
             (
                 "main-integration acquire",
                 [
@@ -482,10 +504,12 @@ class CrossProjectIsolationTests(unittest.TestCase):
                     "--task-id",
                     "test-task",
                 ],
+                1,
             ),
             (
                 "main-integration status",
                 ["main-integration", "status", "--repo", repo_arg],
+                1,
             ),
             (
                 "main-integration release",
@@ -499,6 +523,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
                     "--task-id",
                     "test-task",
                 ],
+                1,
             ),
             (
                 "report fencing validation",
@@ -515,6 +540,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
                     "--fencing-token",
                     "test-token",
                 ],
+                1,
             ),
         ]
 
@@ -626,12 +652,12 @@ class CrossProjectIsolationTests(unittest.TestCase):
             ["BETA-1"],
         )
 
-    def build_unbound_repo(
+    def write_unbound_repo(
         self,
         *,
         name: str = "unbound-repo",
         pinned_context: str | None = None,
-    ):
+    ) -> Path:
         repo = self.root / name
         init_repo(repo)
         quoted_task = f"{sys.executable} {self.task_adapter}"
@@ -653,7 +679,17 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
         run_git(repo, "add", ".vibe-loop.toml")
         run_git(repo, "commit", "-m", "configure backend")
-        return load_config(repo)
+        return repo
+
+    def build_unbound_repo(
+        self,
+        *,
+        name: str = "unbound-repo",
+        pinned_context: str | None = None,
+    ):
+        return load_config(
+            self.write_unbound_repo(name=name, pinned_context=pinned_context)
+        )
 
     def build_generic_command_repo(self):
         repo = self.root / "generic-repo"
@@ -729,19 +765,23 @@ class CrossProjectIsolationTests(unittest.TestCase):
             mock.patch("vibe_loop.cli.inherited_runtime_context", return_value={}),
         ):
             os.environ.pop(SELECTOR, None)
-            for operation, arguments in self.guarded_cli_operations(config.repo):
+            for operation, arguments, expected_exit in self.guarded_cli_operations(
+                config.repo
+            ):
                 with self.subTest(operation=operation):
                     invocations = self.adapter_invocations()
+                    stdout = io.StringIO()
                     stderr = io.StringIO()
                     with (
-                        contextlib.redirect_stdout(io.StringIO()),
+                        contextlib.redirect_stdout(stdout),
                         contextlib.redirect_stderr(stderr),
                     ):
                         exit_code = cli.main(arguments)
 
-                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(exit_code, expected_exit)
                     self.assertIn(
-                        f"project_binding_unset:{SELECTOR}", stderr.getvalue()
+                        f"project_binding_unset:{SELECTOR}",
+                        stdout.getvalue() + stderr.getvalue(),
                     )
                     self.assertEqual(self.adapter_invocations(), invocations)
 
@@ -757,21 +797,60 @@ class CrossProjectIsolationTests(unittest.TestCase):
             "vibe_loop.cli.inherited_runtime_context",
             return_value={SELECTOR: "beta"},
         ):
-            for operation, arguments in self.guarded_cli_operations(config.repo):
+            for operation, arguments, expected_exit in self.guarded_cli_operations(
+                config.repo
+            ):
                 with self.subTest(operation=operation):
                     invocations = self.adapter_invocations()
+                    stdout = io.StringIO()
                     stderr = io.StringIO()
                     with (
-                        contextlib.redirect_stdout(io.StringIO()),
+                        contextlib.redirect_stdout(stdout),
                         contextlib.redirect_stderr(stderr),
                     ):
                         exit_code = cli.main(arguments)
 
-                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(exit_code, expected_exit)
                     self.assertIn(
-                        f"project_binding_conflict:{SELECTOR}", stderr.getvalue()
+                        f"project_binding_conflict:{SELECTOR}",
+                        stdout.getvalue() + stderr.getvalue(),
                     )
                     self.assertEqual(self.adapter_invocations(), invocations)
+
+    def test_empty_pinned_binding_is_rejected_without_adapter_invocation(self) -> None:
+        repo = self.write_unbound_repo(
+            name="empty-pinned-binding-repo",
+            pinned_context="",
+        )
+        invocations = self.adapter_invocations()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            exit_code = cli.main(["doctor", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("must not be empty", stderr.getvalue())
+        self.assertEqual(self.adapter_invocations(), invocations)
+
+    def test_blank_registry_binding_is_rejected_without_adapter_invocation(
+        self,
+    ) -> None:
+        repo = self.write_unbound_repo(name="blank-registry-binding-repo")
+        invocations = self.adapter_invocations()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch(
+                "vibe_loop.cli.inherited_runtime_context",
+                return_value={SELECTOR: "   "},
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            exit_code = cli.main(["doctor", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("must not be empty", stderr.getvalue())
+        self.assertEqual(self.adapter_invocations(), invocations)
 
     def test_generic_command_backends_need_no_project_binding(self) -> None:
         config = self.build_generic_command_repo()
@@ -841,9 +920,29 @@ class CrossProjectIsolationTests(unittest.TestCase):
             runtime_context=((SELECTOR, "beta"),),
         )
 
-        payload = collect_registry_status(
-            ProjectRegistry(path=self.root / "registry.json", entries=(entry,))
-        )[0].to_json()
+        status = collect_project_status(
+            load_config(repo, runtime_context=dict(entry.runtime_context))
+        )
+        worker = WorkerView(
+            active=ActiveRunState.new(
+                task_id="worker-1",
+                run_id="run-1",
+                log_path=self.root / "worker.log",
+                base_main="base",
+                command="worker",
+                trailer_context={
+                    "project_binding": {"adapter_value": "beta"},
+                },
+            ),
+            state="active",
+            process_state="live",
+        )
+        payload = AggregateProjectStatus(
+            name=entry.name,
+            repo=entry.repo,
+            status=dataclasses.replace(status, workers=(worker,)),
+            runtime_context=entry.runtime_context,
+        ).to_json()
 
         # The routing fact must survive the aggregate redaction pass that
         # otherwise scrubs every registry context value from the payload.
@@ -854,6 +953,12 @@ class CrossProjectIsolationTests(unittest.TestCase):
         self.assertEqual(
             [task["id"] for task in payload["status"]["queue"]["runnable_tasks"]],
             ["BETA-1"],
+        )
+        self.assertEqual(
+            payload["status"]["workers"][0]["trailer_context"]["project_binding"][
+                "adapter_value"
+            ],
+            RUNTIME_CONTEXT_REDACTION,
         )
 
 

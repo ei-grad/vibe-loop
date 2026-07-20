@@ -1014,6 +1014,10 @@ def normalize_registry_runtime_context_assignments(
             raise ValueError(
                 f"registry entry context value for {name!r} must be a string"
             )
+        if not context_value.strip():
+            raise ValueError(
+                f"registry entry context value for {name!r} must not be empty"
+            )
         if "\0" in context_value:
             raise ValueError(
                 f"registry entry context value for {name!r} contains a null byte"

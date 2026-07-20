@@ -265,15 +265,15 @@ in configuration. A `[project_binding]` table names the required selector
 variables in `require` and may pin their values in `context`. A required
 selector resolves from exactly two explicit sources: the per-project registry
 `context` for that entry, or the repository's own pinned `context`. A value
-present only in the ambient process environment does not resolve it.
+present only in the ambient process environment does not resolve it. Explicit
+selector values must contain at least one non-whitespace character.
 
-Resolution must fail closed before any observable effect. `autopilot run`,
-`autopilot start`, `run-until-done`, and `run-next` refuse a missing, ambient-
-only, or conflicting binding before acquiring the singleton supervisor lock,
-before acquiring any task lock, before listing tasks, and before launching a
-planning or worker child. Diagnostics name the variable and the failure reason
-(`unset`, `ambient_only`, `conflict`) and never echo the ambient or configured
-value.
+Resolution must fail closed before any observable effect. Supervisor run,
+start, stop, and stale-recovery operations; task selection; worker inspection
+and cleanup; integration locking; and fenced reporting refuse a missing,
+ambient-only, or conflicting binding before invoking a command adapter.
+Diagnostics name the variable and the failure reason (`unset`, `ambient_only`,
+`conflict`) and never echo the ambient or configured value.
 
 Structured status reports the resolved binding so operators can verify routing
 without reading configuration: each required selector appears with its resolved

@@ -402,13 +402,15 @@ receive. Each one resolves from exactly two explicit sources: the pinned
 `[project_binding.context]` above, or the `--context NAME=VALUE` recorded for
 this repo in the project registry. A value present only in the ambient
 environment does not resolve it — that is the ambiguity this table closes.
+Explicit values must contain at least one non-whitespace character.
 
-`autopilot run`, `autopilot start`, `run-until-done`, and `run-next` refuse an
-unresolved binding *before* acquiring the supervisor lock, acquiring any task
-lock, listing tasks, or launching a child. The diagnostic names the variable and
-the reason (`project_binding_unset:…`, `project_binding_ambient_only:…`,
-`project_binding_conflict:…`) and never echoes the value. `autopilot status`
-reports the same diagnostics as blockers rather than failing.
+Supervisor run, start, stop, and stale-recovery operations; task selection;
+worker inspection and cleanup; integration locking; and fenced reporting refuse
+an unresolved binding *before* invoking a command adapter. The diagnostic names
+the variable and the reason (`project_binding_unset:…`,
+`project_binding_ambient_only:…`, `project_binding_conflict:…`) and never echoes
+the value. `autopilot status` reports the same diagnostics as blockers rather
+than failing.
 
 `autopilot status --json` includes a `project_binding` block reporting each
 required selector's resolved value and whether it came from `config` or
