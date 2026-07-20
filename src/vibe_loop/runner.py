@@ -498,6 +498,10 @@ class VibeRunner:
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
+        # Terminal results recorded by an exhausting recovery run before it
+        # released its lock, keyed by run id and consumed by the recovery
+        # driver so the verdict is written exactly once.
+        self._exhausted_recovery_results: dict[str, RunResult] = {}
 
     @property
     def lock_manager(self) -> LockManager:
@@ -1530,17 +1534,16 @@ class VibeRunner:
             # so an append that raises leaves the run settling as unknown.
             settled_classification = classification.status
             settled_outcome = settled_run_outcome(classification.status)
-            if (
-                settled_outcome == UNKNOWN_RUN_OUTCOME
-                and recovery is not None
-                and recovery.attempt >= recovery.max_attempts
-            ):
+            if self.recovery_budget_exhausted_by(result, recovery):
                 # This is the last permitted recovery attempt and it still could
-                # not settle the task, so drive_unknown_recovery will record a
-                # failed terminal result for this same run. Publishing that
-                # verdict here is the only chance to keep external provenance
-                # from finalizing the final run as unknown: the lock is released
-                # below, before the supervisor reaches the exhaustion branch.
+                # not settle the task, so the supervisor will treat this run as
+                # terminally failed. The lock is released below, before it
+                # reaches the exhaustion branch, so the verdict is recorded and
+                # published here - durably first, so external provenance never
+                # claims a failure vibe-loop has not written down.
+                self._exhausted_recovery_results[result.run_id] = (
+                    self.record_recovery_budget_exhausted(result, recovery.attempt)
+                )
                 settled_outcome = "failed"
                 settled_classification = "failed"
             report_status(
@@ -2229,6 +2232,26 @@ class VibeRunner:
         self.record_result(exhausted)
         return exhausted
 
+    def recovery_budget_exhausted_by(
+        self,
+        result: RunResult,
+        recovery: RecoveryContext | None,
+    ) -> bool:
+        """Report whether this run is the one that exhausts the budget.
+
+        The condition mirrors ``drive_unknown_recovery`` exactly: only a run
+        that classifies ``unknown`` re-enters recovery, so any other
+        unknown-settling classification - ``timed_out``, ``limit_wall`` - is
+        terminal as itself and must not be published as failed.
+        """
+
+        if recovery is None or result.classification != "unknown":
+            return False
+        if not self.config.supervision.recover_unknown_runs:
+            return False
+        max_attempts = self.config.supervision.max_restarts
+        return max_attempts > 0 and recovery.attempt >= max_attempts
+
     def record_recovery_budget_exhausted(
         self,
         result: RunResult,
@@ -2280,10 +2303,15 @@ class VibeRunner:
         while current.classification == "unknown":
             attempt = attempts.get(current.task_id, 0) + 1
             if attempt > max_attempts:
-                terminal = self.record_recovery_budget_exhausted(
-                    current,
-                    attempts.get(current.task_id, 0),
-                )
+                # The exhausting run recorded this verdict before releasing its
+                # lock, so external provenance and the run store agree; reuse it
+                # instead of writing a second terminal result for the same run.
+                terminal = self._exhausted_recovery_results.pop(current.run_id, None)
+                if terminal is None:
+                    terminal = self.record_recovery_budget_exhausted(
+                        current,
+                        attempts.get(current.task_id, 0),
+                    )
                 results.append(terminal)
                 report_status(
                     "unknown-run recovery budget exhausted for "

@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -194,6 +195,53 @@ class LockManager:
         self.backend = (
             backend if backend is not None else DirectoryLockBackend(lock_root)
         )
+        # Settled outcome per owned task lock, keyed by task id. Command
+        # backends offer no compare-and-swap, so a read-back row cannot by
+        # itself order two writers; this is the owning supervisor's own record
+        # of what it settled, and every writer to a lock it owns lives in this
+        # process.
+        self._settled_outcomes: dict[str, tuple[str, str, str]] = {}
+        self._settled_outcomes_lock = threading.Lock()
+
+    def _remember_settled_outcome(
+        self,
+        task_id: str,
+        run_id: str,
+        outcome: str,
+        classification: str,
+    ) -> None:
+        with self._settled_outcomes_lock:
+            self._settled_outcomes[task_id] = (run_id, outcome, classification)
+
+    def _forget_settled_outcome(self, task_id: str) -> None:
+        with self._settled_outcomes_lock:
+            self._settled_outcomes.pop(task_id, None)
+
+    def _apply_settled_outcome(
+        self,
+        task_id: str,
+        metadata: dict[str, object],
+    ) -> None:
+        """Restore this manager's settled outcome onto an outgoing update.
+
+        Row-level precedence alone loses the race in which a concurrent update
+        read the row before settlement and writes it back after: its snapshot
+        of "current" is stale too. The settling supervisor's own record is not,
+        so it is reapplied to every update for the same run.
+        """
+
+        with self._settled_outcomes_lock:
+            settled = self._settled_outcomes.get(task_id)
+        if settled is None:
+            return
+        run_id, outcome, classification = settled
+        if string_value(metadata.get("run_id")) != run_id:
+            return
+        if str(metadata.get("outcome") or "") in TERMINAL_LOCK_OUTCOMES:
+            return
+        metadata["outcome"] = outcome
+        if classification:
+            metadata["classification"] = classification
 
     def acquire(
         self,
@@ -201,6 +249,7 @@ class LockManager:
         run_id: str,
         metadata: dict[str, object] | None = None,
     ) -> TaskLock:
+        self._forget_settled_outcome(task_id)
         task_lock = self.backend.acquire(task_id, run_id, metadata=metadata)
         try:
             record_acquired_fencing_token(
@@ -225,10 +274,9 @@ class LockManager:
             path=current.path,
         )
         validate_lock_run_id(task_lock, current.metadata)
-        return self.backend.update(
-            current,
-            preserve_runtime_lock_fields(metadata, current.metadata),
-        )
+        merged = preserve_runtime_lock_fields(metadata, current.metadata)
+        self._apply_settled_outcome(task_lock.task_id, merged)
+        return self.backend.update(current, merged)
 
     def release(self, task_lock: TaskLock) -> None:
         self.release_with_timeout(task_lock)
@@ -248,6 +296,15 @@ class LockManager:
         no release is issued and the lock stays held for recovery.
         """
 
+        run_id = string_value(metadata.get("run_id")) or string_value(
+            task_lock.metadata.get("run_id")
+        )
+        self._remember_settled_outcome(
+            task_lock.task_id,
+            run_id,
+            outcome,
+            str(metadata.get("classification") or ""),
+        )
         try:
             settled_lock = self.update(task_lock, metadata)
         except (
@@ -258,6 +315,10 @@ class LockManager:
             OSError,
             ValueError,
         ) as exc:
+            # Nothing was stored, so the run is not settled: drop the record
+            # rather than let a later update publish an outcome this gate
+            # deliberately refused to persist.
+            self._forget_settled_outcome(task_lock.task_id)
             raise SettledOutcomeNotPersisted(
                 task_lock.task_id,
                 str(task_lock.metadata.get("run_id") or ""),
@@ -298,6 +359,9 @@ class LockManager:
             )
         else:
             self.backend.release(current_lock)
+        # The lock is gone; a later holder of the same task id must not inherit
+        # this run's settled outcome.
+        self._forget_settled_outcome(task_lock.task_id)
 
     def status(self, task_id: str) -> dict[str, object] | None:
         return self.backend.status(task_id)

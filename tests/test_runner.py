@@ -4738,19 +4738,26 @@ class RecordingLockManager(LockManager):
 class SynchronizedHeartbeatLockManager(LockManager):
     """Runs a real ``LockManager.heartbeat`` across the settling update.
 
-    The heartbeat is the production one: it reads the lock row through
-    ``validate_owner`` and writes that snapshot back with a fresh
-    ``heartbeat_at``. Here its read is held before the settling update and its
-    write released after, so it carries the genuinely stale pre-settlement pair
-    - a stored ``outcome=unknown`` / ``classification=unknown`` written by an
-    earlier unsettled publication - into a row the backend has already
-    finalized as completed.
+    The heartbeat is the production one: it reads the lock row, then writes
+    that snapshot back with a fresh ``heartbeat_at``. Here its reads are held
+    before the settling update and its write released after, so it carries the
+    genuinely stale pre-settlement pair - a stored ``outcome=unknown`` /
+    ``classification=unknown`` written by an earlier unsettled publication -
+    into a row the backend has already finalized as completed.
+
+    ``hold_after_reads`` selects how much of the heartbeat is stale. One holds
+    only the caller's snapshot, so the write path still re-reads a settled row.
+    Two holds the re-read inside ``update`` as well, which is the window a
+    command backend cannot close with a compare-and-swap: both of the
+    heartbeat's views of the row predate settlement.
     """
 
     HEARTBEAT_WAIT_SECONDS = 10.0
 
-    def __init__(self, *args, **kwargs) -> None:
+    def __init__(self, *args, hold_after_reads: int = 1, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.hold_after_reads = hold_after_reads
+        self._reads = 0
         self.read_done = threading.Event()
         self.settled = threading.Event()
         self.heartbeat_snapshot: dict[str, object] | None = None
@@ -4776,14 +4783,17 @@ class SynchronizedHeartbeatLockManager(LockManager):
         except BaseException as exc:  # surfaced by the test, never swallowed
             self.heartbeat_error = exc
 
-    def validate_owner(self, **kwargs):
-        current = super().validate_owner(**kwargs)
+    def current_lock(self, task_id):
+        current = super().current_lock(task_id)
         if self._on_heartbeat_thread():
-            # The snapshot is read; hold it until the settling update stored a
-            # terminal outcome so the write back is unambiguously stale.
-            self.heartbeat_snapshot = dict(current.metadata)
-            self.read_done.set()
-            self.settled.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
+            self._reads += 1
+            if self._reads == 1:
+                self.heartbeat_snapshot = dict(current.metadata)
+            if self._reads == self.hold_after_reads:
+                # Hold this view of the row until the settling update stored a
+                # terminal outcome, so the write back is unambiguously stale.
+                self.read_done.set()
+                self.settled.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
         return current
 
     def update(self, task_lock, metadata):
@@ -4795,10 +4805,14 @@ class SynchronizedHeartbeatLockManager(LockManager):
         ):
             return super().update(task_lock, metadata)
         self.injected = True
-        unsettled = dict(task_lock.metadata)
+        # Model the row an earlier unsettled publication left behind. It is
+        # written straight through the backend: the manager already knows the
+        # outcome it is about to settle and would restore it.
+        stored = self.current_lock(task_lock.task_id)
+        unsettled = dict(stored.metadata)
         unsettled["outcome"] = "unknown"
         unsettled["classification"] = "unknown"
-        super().update(task_lock, unsettled)
+        self.backend.update(stored, unsettled)
         thread = threading.Thread(target=self._replay_heartbeat, args=(task_lock,))
         thread.start()
         try:
@@ -5400,7 +5414,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         records = json.loads(runs_path.read_text())
         return {run_id: str(record["outcome"]) for run_id, record in records.items()}
 
-    def test_command_backend_survives_a_stale_heartbeat_before_release(self) -> None:
+    def _assert_stale_heartbeat_keeps_completed(self, hold_after_reads: int) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
         done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
@@ -5411,6 +5425,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             manager = SynchronizedHeartbeatLockManager(
                 runner.config.state_path / "locks",
                 backend=command_backend,
+                hold_after_reads=hold_after_reads,
             )
             runner._lock_manager = manager
 
@@ -5431,6 +5446,15 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 (manager.heartbeat_metadata or {}).get("classification"), "completed"
             )
             self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    def test_command_backend_survives_a_stale_heartbeat_before_release(self) -> None:
+        self._assert_stale_heartbeat_keeps_completed(hold_after_reads=1)
+
+    def test_command_backend_survives_a_fully_stale_heartbeat_write(self) -> None:
+        # Both of the heartbeat's reads predate settlement, so the row it
+        # merges against is stale as well: only the settling manager's own
+        # record can keep the write from reopening the run.
+        self._assert_stale_heartbeat_keeps_completed(hold_after_reads=2)
 
     def test_command_backend_publishes_nothing_without_a_durable_result(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
@@ -5501,7 +5525,57 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 if record.get("record_type") == "run_result"
                 and record.get("run_id") == terminal.run_id
             ]
-            self.assertEqual(recorded[-1], "failed")
+            # The exhausting run recorded the verdict before releasing its lock
+            # and the recovery driver reused it: one durable terminal result.
+            self.assertEqual(recorded, ["unknown", "failed"])
+
+    def test_command_backend_keeps_a_timed_out_final_attempt_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(
+                directory,
+                [task],
+                {"T-1": task},
+                supervision=SupervisionConfig(max_restarts=1, cooldown_seconds=0),
+            )
+            self._attach_provenance_backend(runner, root)
+            recovery = runner_module.RecoveryContext(
+                task_id="T-1",
+                prior_run_id="prior",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log="",
+                attempt=1,
+                max_attempts=1,
+                workspace_claimed=False,
+            )
+
+            def timing_out_worker(command, cwd, log, **kwargs):
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=143, timed_out=True
+                )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch(
+                        "vibe_loop.runner.run_streaming_command", timing_out_worker
+                    ):
+                        result = runner.run_task(task, recovery=recovery)
+
+            # A timed_out run never re-enters recovery, so no exhaustion verdict
+            # is ever recorded for it. Publishing failed here would leave the
+            # external run terminal while the run store still says timed_out.
+            self.assertEqual(result.classification, "timed_out")
+            self.assertEqual(
+                self._external_run_outcomes(root).get(result.run_id), "unknown"
+            )
 
     def test_command_backend_keeps_unsettled_runs_unknown(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
