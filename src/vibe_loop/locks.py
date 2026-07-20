@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -181,11 +181,19 @@ class LockManager:
         metadata: dict[str, object] | None = None,
     ) -> TaskLock:
         task_lock = self.backend.acquire(task_id, run_id, metadata=metadata)
-        record_acquired_fencing_token(
-            self.lock_root,
-            task_id,
-            fencing_token_value(task_lock.metadata.get("fencing_token")),
-        )
+        try:
+            record_acquired_fencing_token(
+                self.lock_root,
+                task_id,
+                fencing_token_value(task_lock.metadata.get("fencing_token")),
+            )
+        except OSError:
+            # Hold the invariant "granted implies recorded": a lock whose
+            # generation was never recorded locally can never be recovered
+            # later, so give it back rather than leaving it unreleasable.
+            with suppress(LockBackendError, OSError):
+                self.backend.release(task_lock)
+            raise
         return task_lock
 
     def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
