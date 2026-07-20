@@ -1525,11 +1525,17 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
             )
         )
         if use_json:
+            status_payload = status.to_json()
+            project_binding = status_payload.pop("project_binding", None)
             payload = {"name": entry.name, "repo": str(entry.repo)}
-            payload.update(status.to_json())
+            payload.update(status_payload)
+            redacted = redact_runtime_context_payload(payload, entry.runtime_context)
+            assert isinstance(redacted, dict)
+            if project_binding is not None:
+                redacted["project_binding"] = project_binding
             print(
                 json.dumps(
-                    redact_runtime_context_payload(payload, entry.runtime_context),
+                    redacted,
                     indent=2,
                     default=list,
                 )

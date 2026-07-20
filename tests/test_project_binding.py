@@ -713,6 +713,23 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
         return load_config(repo)
 
+    def build_registry_bound_repo(self, name: str) -> Path:
+        repo = self.root / name
+        init_repo(repo)
+        quoted_task = f"{sys.executable} {self.task_adapter}"
+        (repo / ".vibe-loop.toml").write_text(
+            "[task_source]\n"
+            'type = "command"\n'
+            f'list = "{quoted_task} list"\n'
+            'runnable_statuses = ["ready"]\n'
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n',
+            encoding="utf-8",
+        )
+        run_git(repo, "add", ".vibe-loop.toml")
+        run_git(repo, "commit", "-m", "configure backend")
+        return repo
+
     def test_status_reports_binding_diagnostic_when_only_ambient_routing_exists(
         self,
     ) -> None:
@@ -900,20 +917,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
 
     def test_registry_supplied_binding_survives_aggregate_redaction(self) -> None:
         self.seed_tasks("beta", ["BETA-1"])
-        repo = self.root / "registry-only-repo"
-        init_repo(repo)
-        quoted_task = f"{sys.executable} {self.task_adapter}"
-        (repo / ".vibe-loop.toml").write_text(
-            "[task_source]\n"
-            'type = "command"\n'
-            f'list = "{quoted_task} list"\n'
-            'runnable_statuses = ["ready"]\n'
-            "[project_binding]\n"
-            f'require = ["{SELECTOR}"]\n',
-            encoding="utf-8",
-        )
-        run_git(repo, "add", ".vibe-loop.toml")
-        run_git(repo, "commit", "-m", "configure backend")
+        repo = self.build_registry_bound_repo("registry-only-repo")
         entry = ProjectEntry(
             name="registry-only-repo",
             repo=repo,
@@ -956,6 +960,70 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["status"]["workers"][0]["trailer_context"]["project_binding"][
+                "adapter_value"
+            ],
+            RUNTIME_CONTEXT_REDACTION,
+        )
+
+    def test_registry_inspect_preserves_only_authoritative_binding(self) -> None:
+        self.seed_tasks("beta", ["BETA-1"])
+        repo = self.build_registry_bound_repo("registry-inspect-repo")
+        entry = ProjectEntry(
+            name="registry-inspect-repo",
+            repo=repo,
+            runtime_context=((SELECTOR, "beta"),),
+        )
+        registry = ProjectRegistry(
+            path=self.root / "registry.json",
+            entries=(entry,),
+        )
+        registry.save()
+        status = collect_project_status(
+            load_config(repo, runtime_context=dict(entry.runtime_context))
+        )
+        worker = WorkerView(
+            active=ActiveRunState.new(
+                task_id="worker-1",
+                run_id="run-1",
+                log_path=self.root / "worker.log",
+                base_main="base",
+                command="worker",
+                trailer_context={
+                    "project_binding": {"adapter_value": "beta"},
+                },
+            ),
+            state="active",
+            process_state="live",
+        )
+        stdout = io.StringIO()
+
+        with (
+            mock.patch(
+                "vibe_loop.cli.collect_project_status",
+                return_value=dataclasses.replace(status, workers=(worker,)),
+            ),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = cli.main(
+                [
+                    "autopilot",
+                    "projects",
+                    "inspect",
+                    entry.name,
+                    "--registry",
+                    str(registry.path),
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            payload["project_binding"]["resolved"],
+            [{"name": SELECTOR, "source": "runtime_context", "value": "beta"}],
+        )
+        self.assertEqual(
+            payload["workers"][0]["trailer_context"]["project_binding"][
                 "adapter_value"
             ],
             RUNTIME_CONTEXT_REDACTION,
