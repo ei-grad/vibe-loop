@@ -60,6 +60,98 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(first["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(first["finished_at"], second["finished_at"])
 
+    def test_run_result_stats_round_trip_and_redact_sensitive_fields(self) -> None:
+        result = RunResult(
+            run_id="run-usage",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+            stats={
+                "schema_version": 1,
+                "phase": "implementation",
+                "usage_source": "native:codex:turn.completed",
+                "usage_version": "codex-jsonl-v1",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "provider_usage": {
+                    "input_tokens": 12,
+                    "reasoning_output_tokens": 2,
+                    "prompt": "PROMPT CANARY",
+                },
+                "prompt": "PROMPT CANARY",
+                "credential": "sk-secret-canary",
+                "token": "TOKEN CANARY",
+                "fencing_token": "FENCING CANARY",
+                "raw_transcript": "TRANSCRIPT CANARY",
+                "candidate_fingerprint": "sk-secret-canary",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            RunStore(path).append_result(result)
+            payload = RunStore(path).read_records()[0]
+
+        self.assertEqual(
+            payload["stats"],
+            {
+                "schema_version": 1,
+                "phase": "implementation",
+                "usage_source": "native:codex:turn.completed",
+                "usage_version": "codex-jsonl-v1",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "provider_usage": {
+                    "input_tokens": 12,
+                    "reasoning_output_tokens": 2,
+                },
+            },
+        )
+        encoded = json.dumps(payload)
+        self.assertNotIn("PROMPT CANARY", encoded)
+        self.assertNotIn("sk-secret", encoded)
+        self.assertNotIn("TOKEN CANARY", encoded)
+        self.assertNotIn("FENCING CANARY", encoded)
+        self.assertNotIn("TRANSCRIPT CANARY", encoded)
+
+    def test_run_result_stats_reject_malformed_provenance_values(self) -> None:
+        result = RunResult(
+            run_id="run-malformed-usage",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+            stats={
+                "phase": {"prompt": "PROMPT CANARY"},
+                "work_kind": ["review", "TRANSCRIPT CANARY"],
+                "provider": {"credential": "sk-secret-canary"},
+                "usage_source": ["native:provider"],
+                "candidate_fingerprint": ["FENCING CANARY"],
+                "provider_usage": {"input_tokens": 7, "secret": "TOKEN CANARY"},
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            RunStore(path).append_result(result)
+            payload = RunStore(path).read_records()[0]
+
+        self.assertEqual(payload["stats"], {"provider_usage": {"input_tokens": 7}})
+        encoded = json.dumps(payload)
+        for canary in (
+            "PROMPT CANARY",
+            "TRANSCRIPT CANARY",
+            "sk-secret-canary",
+            "FENCING CANARY",
+            "TOKEN CANARY",
+        ):
+            self.assertNotIn(canary, encoded)
+
     def test_run_result_json_can_store_native_session_id(self) -> None:
         result = RunResult(
             run_id="run-1",

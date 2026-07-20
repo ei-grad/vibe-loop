@@ -184,6 +184,7 @@ SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
 # batch/cycle. Only an explicit `worker_timeout_seconds = 0` restores the
 # historical unbounded behavior.
 SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS = 10800.0
+SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD = 100000
 SUPERVISION_CONFIG_KEYS = frozenset(
     {
         "max_restarts",
@@ -194,6 +195,7 @@ SUPERVISION_CONFIG_KEYS = frozenset(
         "limit_wall_backoff_seconds",
         "limit_wall_patterns",
         "worker_timeout_seconds",
+        "slice_token_threshold",
     }
 )
 LOCK_BACKEND_TYPES = ("directory", "command")
@@ -656,6 +658,7 @@ class SupervisionConfig:
     # 0.0 means unbounded (historical behavior); a positive value caps a single
     # worker's wall-clock runtime before its process group is force-killed.
     worker_timeout_seconds: float = SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS
+    slice_token_threshold: int = SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -671,6 +674,7 @@ class SupervisionConfig:
             "limit_wall_backoff_seconds": self.limit_wall_backoff_seconds,
             "limit_wall_patterns": list(self.limit_wall_patterns),
             "worker_timeout_seconds": self.worker_timeout_seconds,
+            "slice_token_threshold": self.slice_token_threshold,
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1870,6 +1874,11 @@ def parse_supervision(data: object) -> SupervisionConfig:
             table.get("worker_timeout_seconds"),
             SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
             "supervision.worker_timeout_seconds",
+        ),
+        slice_token_threshold=nonnegative_int(
+            table.get("slice_token_threshold"),
+            SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD,
+            "supervision.slice_token_threshold",
         ),
         explicit_keys=explicit_keys,
     )

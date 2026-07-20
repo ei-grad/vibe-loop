@@ -97,6 +97,7 @@ from vibe_loop.spec_diagnostics import (
     build_spec_diagnostics_report,
     render_spec_diagnostics,
 )
+from vibe_loop.telemetry import rolling_usage_summary
 from vibe_loop.task_views import (
     build_task_views,
     filter_views,
@@ -539,6 +540,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(runs_inspect)
     runs_inspect.add_argument("run_id")
     runs_inspect.add_argument("--json", action="store_true")
+    runs_summary = runs_subparsers.add_parser(
+        "summary", help="Summarize provider usage and budget diagnostics"
+    )
+    add_repo_argument(runs_summary)
+    runs_summary.add_argument("--json", action="store_true")
+    runs_summary.add_argument("--hours", type=float, default=24.0)
 
     integration = subparsers.add_parser(
         "main-integration",
@@ -1058,6 +1065,22 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
             print(json.dumps(payload, indent=2))
         else:
             print(render_run_inspection(inspection))
+        return 0
+
+    if args.runs_command == "summary":
+        if not math.isfinite(args.hours) or args.hours <= 0:
+            print("runs summary --hours must be a positive number", file=sys.stderr)
+            return 2
+        summary = rolling_usage_summary(
+            run_store.read_records(),
+            project=config.repo.name,
+            hours=args.hours,
+            slice_token_threshold=config.supervision.slice_token_threshold,
+        )
+        if args.json:
+            print(json.dumps(summary, indent=2))
+        else:
+            print(render_usage_summary(summary))
         return 0
 
     raise AssertionError(args.runs_command)
@@ -2471,6 +2494,31 @@ def render_run_inspection(inspection) -> str:
                 f"\trestart={record.get('restart_count')}/{record.get('max_restarts')}"
             )
         lines.append(f"- {record_type}\tstatus={status}\tupdated={updated}{restart}")
+    return "\n".join(lines)
+
+
+def render_usage_summary(summary: Mapping[str, object]) -> str:
+    lines = [
+        f"project: {summary['project']}",
+        f"window: {summary['window_hours']}h",
+    ]
+    groups = summary.get("groups")
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, Mapping):
+                continue
+            lines.append(
+                f"- {group['provider']}/{group['model']}/{group['phase']}: "
+                f"launches={group['launches']} completed={group['completed_runs']} "
+                f"tokens={group['total_tokens']} cost_usd="
+                f"{group['reported_cost_usd']}"
+            )
+    diagnostics = summary.get("diagnostics")
+    if isinstance(diagnostics, list):
+        lines.append(f"diagnostics: {len(diagnostics)}")
+        for diagnostic in diagnostics:
+            if isinstance(diagnostic, Mapping):
+                lines.append("- " + json.dumps(diagnostic, sort_keys=True))
     return "\n".join(lines)
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
 from vibe_loop.locks import redact_fencing_token_payload
+from vibe_loop.telemetry import sanitize_run_stats
 
 try:
     import fcntl
@@ -141,6 +142,15 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def redact_run_record(record: Mapping[str, object]) -> dict[str, object]:
+    payload = dict(record)
+    if "stats" in payload:
+        payload["stats"] = sanitize_run_stats(payload["stats"])
+    redacted = redact_fencing_token_payload(payload)
+    assert isinstance(redacted, dict)
+    return redacted
+
+
 def autopilot_child_started_record(
     *,
     repo: Path | str,
@@ -208,6 +218,7 @@ class RunResult:
     worker_report: dict[str, object] | None = None
     restart_count: int = 0
     max_restarts: int = 0
+    stats: dict[str, object] = dataclasses.field(default_factory=dict)
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
@@ -256,6 +267,8 @@ class RunResult:
             payload["trailer_context_sources"] = self.trailer_context_sources
         if self.transcript_path:
             payload["transcript_path"] = self.transcript_path
+        if self.stats:
+            payload["stats"] = sanitize_run_stats(self.stats)
         return payload
 
     def to_record(self) -> dict[str, object]:
@@ -657,6 +670,7 @@ class RunHistoryView:
     trailer_context_sources: dict[str, Any]
     classification_source: str
     worker_report: dict[str, Any] | None
+    stats: dict[str, Any]
     restart_count: int
     max_restarts: int
     restart_exhausted: bool
@@ -716,6 +730,7 @@ class RunHistoryView:
             ),
             classification_source=latest_text(valid_records, "classification_source"),
             worker_report=latest_worker_report_payload(valid_records),
+            stats=latest_mapping(valid_records, "stats"),
             restart_count=latest_int(records, "restart_count") or 0,
             max_restarts=latest_int(records, "max_restarts") or 0,
             restart_exhausted=latest_restart_exhausted(records),
@@ -754,6 +769,7 @@ class RunHistoryView:
             "trailer_context_sources": self.trailer_context_sources,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
+            "stats": self.stats,
             "restart_count": self.restart_count,
             "max_restarts": self.max_restarts,
             "restart_exhausted": self.restart_exhausted,
@@ -790,8 +806,7 @@ class RunStore:
         self.append_record(event.to_record())
 
     def append_record(self, record: dict[str, object]) -> None:
-        redacted = redact_fencing_token_payload(record)
-        assert isinstance(redacted, dict)
+        redacted = redact_run_record(record)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
             with append_record_lock(self.path):
@@ -811,8 +826,7 @@ class RunStore:
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict) and is_known_record_type(payload):
-                redacted = redact_fencing_token_payload(payload)
-                assert isinstance(redacted, dict)
+                redacted = redact_run_record(payload)
                 records.append(redacted)
         return records
 

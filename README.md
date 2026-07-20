@@ -222,13 +222,48 @@ agent actually did. The path is best-effort: if the agent persists no transcript
 (for example `--no-session-persistence`), the recorded path may not exist.
 Injection is skipped when the command already pins `--session-id`.
 
-Codex `exec` has no equivalent flag to force or print a session id without
-switching stdout to `--json` (which would replace the streamed human-readable
-output the wrapper log and the selection/analysis text parsing rely on), so
-Codex worker runs keep `session_id_source = fallback:run_id` and no
-`transcript_path`. If a worker instead emits a `session id: ...` line on its
-output, that native id is captured with `session_id_source` =
-`native:stdout`/`native:stderr`.
+For recognized Codex and Claude worker commands, the supervisor requests the
+native structured result stream (`codex exec --json` or Claude
+`--output-format stream-json --verbose`). Codex `thread.started` events provide
+the native session id; Codex still has no forced-session flag or resolved local
+transcript path. Custom commands keep their configured output mode. The wrapper
+log retains the provider stream, while run telemetry copies only recognized
+numeric usage fields and fixed provenance labels.
+
+#### Provider usage telemetry
+
+Final `run_result` records include a versioned `stats` object. When exposed by
+the provider, it records input, output, cached-input, cache-read,
+cache-creation, total tokens, turns, native duration, reported cost, and the
+provider's original recognized numeric fields. Missing or malformed usage gets
+an explicit `usage_unavailable_reason`; token counts are never estimated from
+wrapper-log or transcript byte size. Resumed Claude sessions count only records
+appended during the resumed invocation, so one continued session is not charged
+again from its cumulative transcript history.
+
+Telemetry persistence accepts only recognized numeric fields and bounded fixed
+labels. Prompts, credentials, fencing values, command payloads, and transcript
+content are discarded from `stats`. Existing Loopyard installations ingest the
+normalized fields without a schema adapter:
+
+```bash
+loopyard runs sync .vibe-loop/runs.jsonl -p <project>
+```
+
+`vibe-loop runs summary --repo . --hours 24` groups the rolling window by
+project, provider, model, and observed phase. JSON output includes launches,
+completed runs, immediate failures, restarts, worker-minutes, token/cache/cost
+totals, tasks created/landed, per-productive-task ratios, and typed budget
+diagnostics. Only phases with durable provenance are reported; no provider is
+switched automatically.
+
+Ordinary workers default to the `implementation` phase. A workflow that knows a
+more specific phase can report it with allowlisted metadata, for example
+`--metadata-json '{"phase":"review","work_kind":"review"}'`. Valid phases are
+`planning`, `implementation`, `focused_validation`, `full_validation`, `review`,
+`remediation`, and `integration`; repeated-candidate diagnostics accept only the
+`review` and `discovery` work kinds. Arbitrary metadata is not copied into usage
+stats.
 
 #### Unknown-run recovery
 
@@ -308,6 +343,7 @@ owner/path context.
 vibe-loop workers --repo . --json
 vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
+vibe-loop runs summary --repo . --hours 24 --json
 vibe-loop doctor --repo . --json
 vibe-loop specs check --repo . --json
 vibe-loop --version
@@ -739,6 +775,7 @@ max_restarts = 3
 cooldown_seconds = 30.0
 recover_unknown_runs = true   # set false to stop on `unknown` instead of launching a continuation worker
 worker_timeout_seconds = 10800.0  # wall-clock cap per worker; its process group is killed and the task returns to runnable. 0 = unbounded
+slice_token_threshold = 100000    # low-change/high-token diagnostic; 0 disables
 
 [locks]
 type = "directory"

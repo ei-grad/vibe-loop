@@ -63,6 +63,7 @@ from vibe_loop.runner import (
     build_resume_continuation_prompt,
     inject_claude_resume,
     inject_claude_session_id,
+    inject_structured_usage_output,
     parse_agent_runtime_context_from_command,
     parse_selected_task_id,
     parse_selected_task_ids,
@@ -71,6 +72,7 @@ from vibe_loop.runner import (
     resumable_prior_session_id,
     build_recovery_prompt_section,
     predicted_claude_transcript,
+    provider_selection_is_flexible,
     resolve_claude_home,
     resolve_claude_transcript,
     run_streaming_command,
@@ -78,6 +80,7 @@ from vibe_loop.runner import (
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
     wait_with_reap_watchdog,
+    worker_usage_provenance,
 )
 from vibe_loop.runs import (
     SETTLED_RUN_OUTCOMES,
@@ -4640,6 +4643,50 @@ class AgentCommandModelTests(unittest.TestCase):
 
 
 class SessionIdInjectionTests(unittest.TestCase):
+    def test_codex_structured_output_injection_allows_global_options(self) -> None:
+        self.assertEqual(
+            inject_structured_usage_output(
+                "codex --profile reviewer exec {prompt}", "codex"
+            ),
+            "codex --profile reviewer exec --json {prompt}",
+        )
+        self.assertEqual(
+            inject_structured_usage_output(
+                "MODE=review /usr/bin/codex --model gpt-5 exec {prompt}", "auto"
+            ),
+            "MODE=review /usr/bin/codex --model gpt-5 exec --json {prompt}",
+        )
+
+    def test_worker_usage_provenance_is_allowlisted(self) -> None:
+        report = WorkerReport(
+            run_id="run-1",
+            task_id="TASK-01",
+            status="completed",
+            metadata={"phase": "review", "work_kind": "review"},
+        )
+        malformed = dataclasses.replace(
+            report,
+            metadata={"phase": ["review"], "work_kind": "raw transcript"},
+        )
+
+        self.assertEqual(worker_usage_provenance(report), ("review", "review"))
+        self.assertEqual(worker_usage_provenance(malformed), ("implementation", ""))
+
+    def test_flexible_provider_selection_excludes_pinned_dispatches(self) -> None:
+        task = Task(task_id="TASK-01", title="Telemetry", status="Ready")
+
+        self.assertTrue(provider_selection_is_flexible(AgentConfig(), task))
+        self.assertFalse(
+            provider_selection_is_flexible(
+                dataclasses.replace(AgentConfig(), agent_kind="codex"), task
+            )
+        )
+        self.assertFalse(
+            provider_selection_is_flexible(
+                AgentConfig(), dataclasses.replace(task, model="gpt-pinned")
+            )
+        )
+
     def test_supports_capture_for_default_claude_command(self) -> None:
         self.assertTrue(
             command_supports_session_capture("claude -p {prompt}", "claude")

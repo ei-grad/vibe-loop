@@ -442,7 +442,8 @@ class CliTests(unittest.TestCase):
         )
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
-        self.assertIn("$vibe-loop TASK-01", agent_lines[1])
+        self.assertEqual(agent_lines[1], "--json")
+        self.assertIn("$vibe-loop TASK-01", agent_lines[2])
         self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
         self.assertIn("agent prompt dialect source: auto:codex", stderr.getvalue())
@@ -638,7 +639,7 @@ class CliTests(unittest.TestCase):
                 bin_dir / "claude",
                 "from pathlib import Path\n"
                 "import sys\n"
-                "if sys.argv[1] != '-p':\n"
+                "if '-p' not in sys.argv[1:]:\n"
                 "    raise SystemExit(64)\n"
                 "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
                 "plan = Path('docs/PLAN.md')\n"
@@ -663,12 +664,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
         agent_lines = agent_args.split("\n")
-        self.assertEqual(agent_lines[0], "-p")
+        self.assertEqual(
+            agent_lines[:3], ["--output-format", "stream-json", "--verbose"]
+        )
         # AUTO-20: a known --session-id is injected before the prompt so the run
         # records the agent's real session id instead of aliasing the run_id.
-        self.assertEqual(agent_lines[1], "--session-id")
-        self.assertRegex(agent_lines[2], r"^[0-9a-fA-F-]{36}$")
-        self.assertEqual(payload["session_id"], agent_lines[2])
+        self.assertEqual(agent_lines[4], "--session-id")
+        self.assertRegex(agent_lines[5], r"^[0-9a-fA-F-]{36}$")
+        self.assertEqual(payload["session_id"], agent_lines[5])
         self.assertEqual(payload["session_id_source"], "observed")
         self.assertIn("/vibe-loop TASK-01", agent_args)
         self.assertIn("vibe-loop CLI Coordination", agent_args)
@@ -1064,7 +1067,8 @@ class CliTests(unittest.TestCase):
         )
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
-        self.assertIn("$vibe-loop TASK-01", agent_lines[1])
+        self.assertEqual(agent_lines[1], "--json")
+        self.assertIn("$vibe-loop TASK-01", agent_lines[2])
         self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex:codex-first", stderr.getvalue())
         self.assertIn(

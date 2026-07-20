@@ -803,6 +803,23 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.supervision.explicit_keys, frozenset())
 
+    def test_supervision_config_slice_token_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            default = load_config(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nslice_token_threshold = 250000\n",
+                encoding="utf-8",
+            )
+            overridden = load_config(repo)
+
+        self.assertEqual(default.supervision.slice_token_threshold, 100000)
+        self.assertEqual(overridden.supervision.slice_token_threshold, 250000)
+        self.assertEqual(
+            overridden.supervision.to_json()["slice_token_threshold"], 250000
+        )
+        self.assertIn("slice_token_threshold", overridden.supervision.explicit_keys)
+
     def test_supervision_config_parses_worker_timeout_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -831,6 +848,7 @@ class ConfigTests(unittest.TestCase):
     def test_supervision_config_rejects_invalid_values(self) -> None:
         cases = [
             ("max_restarts = -1\n", "supervision.max_restarts"),
+            ("slice_token_threshold = -1\n", "supervision.slice_token_threshold"),
             (
                 "worker_timeout_seconds = -1\n",
                 "supervision.worker_timeout_seconds",

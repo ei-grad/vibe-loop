@@ -797,3 +797,31 @@ Autopilot acceptance must cover prompt change/message wakes, literal environment
 delivery, schema validation, deadline preservation, adaptive fallback polling,
 bounded error provenance, and unchanged clock/task-source behavior when no wake
 adapter is configured.
+
+## PRD-AUT-016 Provider Usage Run Telemetry
+
+Worker and native-planning results record provider-reported usage without
+estimating tokens from output or transcript size. Recognized Codex and Claude
+commands use their structured result streams; a persisted Claude transcript is
+a numeric-only fallback. Common input/output/cache/total token, duration, turn,
+and reported-cost values live in versioned `stats`, alongside recognized raw
+provider numeric fields and an explicit source/version. Missing and malformed
+usage have a typed reason.
+
+Telemetry records reject prompts, credentials, fencing values, command
+payloads, and transcript content at persistence. Normalized numeric fields stay
+compatible with Loopyard's existing `runs sync` ingestion. Rolling summaries
+group durable provenance by project, provider, model, and phase and report
+launch/productivity ratios plus typed budget diagnostics; diagnostics never
+switch providers.
+
+Worker usage defaults to implementation. An allowlisted `phase` and optional
+`review` or `discovery` `work_kind` from the terminal worker report can refine
+that provenance. Native planning records its configured model, observed
+provider, and full planning wall time. Retry ordinals are normalized to restart
+events before aggregation.
+
+Acceptance covers Claude and Codex present/missing/malformed/limit-wall
+fixtures, run-record and Loopyard-compatible stats round trips, phase-aware
+rolling summaries, low-change/high-token detection, same-session continuation,
+redaction, and existing run-result consumers.

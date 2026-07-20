@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
@@ -21,6 +21,7 @@ from typing import BinaryIO, TextIO
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
+    AgentConfig,
     AgentDetection,
     AgentResolutionError,
     VibeConfig,
@@ -78,6 +79,14 @@ from vibe_loop.runs import (
     utc_now_iso,
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
+from vibe_loop.telemetry import (
+    PHASES,
+    WORK_KINDS,
+    ProviderUsage,
+    ProviderUsageObserver,
+    parse_claude_transcript_usage,
+    unavailable_usage,
+)
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
@@ -105,7 +114,7 @@ except ImportError:  # pragma: no cover
 
 
 SESSION_ID_RE = re.compile(
-    r"\bsession(?:[_ -]?id)\s*[:=]\s*"
+    r"\b(?:session|thread)(?:[_ -]?id)[\"']?\s*[:=]\s*[\"']?"
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
@@ -363,6 +372,11 @@ class StreamingCommandResult:
     # True when the worker exceeded its configured wall-clock timeout and its
     # process group was force-killed rather than exiting on its own.
     timed_out: bool = False
+    usage: ProviderUsage = dataclasses.field(
+        default_factory=lambda: unavailable_usage(
+            "unknown", "provider_usage_not_reported"
+        )
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -426,11 +440,16 @@ class AgentLimitWallError(RuntimeError):
 
 
 class AgentOutputObserver:
-    def __init__(self) -> None:
+    def __init__(self, provider: str = "unknown") -> None:
         self._lock = threading.Lock()
         self._session_observation: SessionIdObservation | None = None
         self._runtime_context = AgentRuntimeContext()
         self._line_count = 0
+        self._usage_observer = ProviderUsageObserver(provider)
+
+    @property
+    def usage(self) -> ProviderUsage:
+        return self._usage_observer.usage
 
     @property
     def observation(self) -> AgentRuntimeObservation:
@@ -454,6 +473,7 @@ class AgentOutputObserver:
         line: str,
         stream_name: str,
     ) -> AgentRuntimeObservation | None:
+        self._usage_observer.observe_line(line)
         session_id = parse_worker_session_id(line)
         runtime_context = AgentRuntimeContext()
         with self._lock:
@@ -498,6 +518,9 @@ class VibeRunner:
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
+        self.last_analysis_usage = unavailable_usage(
+            "unknown", "provider_usage_not_reported"
+        )
         # Terminal results recorded by an exhausting recovery run before it
         # released its lock, keyed by run id and consumed by the recovery
         # driver so the verdict is written exactly once.
@@ -694,6 +717,9 @@ class VibeRunner:
             prompt=prompt,
             model=self.config.agent.model,
         )
+        command_str = inject_structured_usage_output(
+            command_str, self.config.agent.agent_kind
+        )
         cmd, use_shell = prepare_shell_command(command_str)
         walls: list[LimitWallSignal] = []
         try:
@@ -715,6 +741,15 @@ class VibeRunner:
         except (OSError, subprocess.TimeoutExpired) as exc:
             report_status(f"analysis agent failed to start: {exc}")
             return None
+        provider = parse_agent_runtime_context_from_command(
+            command_str
+        ).model_provider or {"codex": "openai", "claude": "anthropic"}.get(
+            self.config.agent.agent_kind, "unknown"
+        )
+        usage_observer = ProviderUsageObserver(provider)
+        for line in (result.stdout or "").splitlines():
+            usage_observer.observe_line(line)
+        self.last_analysis_usage = usage_observer.usage
         if walls:
             raise AgentLimitWallError(
                 walls[0],
@@ -916,6 +951,9 @@ class VibeRunner:
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
+        effective_template = inject_structured_usage_output(
+            effective_template, agent.agent_kind
+        )
         skill_prefix = agent.require_skill_ref_prefix()
         worker_prompt = build_run_worker_prompt(
             skill_prefix,
@@ -954,6 +992,12 @@ class VibeRunner:
             if injected_session_id and claude_home is not None
             else ""
         )
+        transcript_start_offset = 0
+        if resuming and transcript_path:
+            try:
+                transcript_start_offset = Path(transcript_path).stat().st_size
+            except OSError:
+                transcript_start_offset = 0
         command_context = parse_agent_runtime_context_from_command(command)
         agent_kind = agent.agent_kind
         agent_kind_source = agent.agent_kind_source
@@ -1363,6 +1407,12 @@ class VibeRunner:
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
                     timeout_seconds=self.config.supervision.worker_timeout_seconds,
+                    provider=(
+                        command_context.model_provider
+                        or {"codex": "openai", "claude": "anthropic"}.get(
+                            agent.agent_kind, "unknown"
+                        )
+                    ),
                 )
                 exit_code = stream_result.exit_code
                 worker_timed_out = stream_result.timed_out
@@ -1383,6 +1433,16 @@ class VibeRunner:
                 final_runtime_context = command_context.overlay(
                     stream_result.runtime_context
                 )
+                provider_usage = stream_result.usage
+                if (
+                    not provider_usage.available
+                    and agent.agent_kind in {"auto", "claude"}
+                    and transcript_path
+                ):
+                    provider_usage = parse_claude_transcript_usage(
+                        Path(transcript_path),
+                        start_offset=transcript_start_offset,
+                    )
                 final_context_payload = build_run_context_payload(
                     task_id=task.task_id,
                     run_id=run_id,
@@ -1479,6 +1539,7 @@ class VibeRunner:
                 output_tail,
                 timed_out=worker_timed_out,
             )
+            usage_phase, usage_work_kind = worker_usage_provenance(worker_report)
             if classification.status == "limit_wall" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
                 # its dispatch backoff from the recorded result alone.
@@ -1543,6 +1604,22 @@ class VibeRunner:
                 ),
                 restart_count=restart_count,
                 max_restarts=max_restarts,
+                stats=provider_usage.to_stats(
+                    phase=usage_phase,
+                    wall_time_seconds=(
+                        datetime.now(UTC)
+                        - datetime.fromisoformat(
+                            active_state.started_at.replace("Z", "+00:00")
+                        )
+                    ).total_seconds(),
+                    candidate_fingerprint=end_main or start_main,
+                    continuation=continuation,
+                    flexible_provider=provider_selection_is_flexible(agent, task),
+                    changed_lines=git_changed_lines(
+                        self.config.repo, start_main, end_main
+                    ),
+                    work_kind=usage_work_kind,
+                ),
             )
             self.record_result(result)
             # Only a durable local RunResult may be published externally. Until
@@ -3710,15 +3787,45 @@ def parse_selected_task_ids(output: str) -> list[str] | None:
 
 
 def selection_payload_from_output(output: str) -> object | None:
+    def _candidate(value: object) -> object | None:
+        if not isinstance(value, dict):
+            return None
+        if any(key in value for key in ("task_id", "task_ids", "should_plan")):
+            return value
+        result = value.get("result")
+        if isinstance(result, str):
+            nested = selection_payload_from_output(result)
+            if nested is not None:
+                return nested
+        item = value.get("item")
+        if isinstance(item, Mapping):
+            text = item.get("text")
+            if isinstance(text, str):
+                nested = selection_payload_from_output(text)
+                if nested is not None:
+                    return nested
+        if "type" not in value:
+            return value
+        return None
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        candidate = _candidate(parsed)
+        if candidate is not None:
+            return candidate
     start = output.find("{")
     end = output.rfind("}")
     if start == -1 or end == -1 or end < start:
         return None
     try:
-        payload = json.loads(output[start : end + 1])
+        parsed = json.loads(output[start : end + 1])
     except json.JSONDecodeError:
         return None
-    return payload
+    return _candidate(parsed)
 
 
 def validate_selected_task_batch(
@@ -4094,11 +4201,8 @@ def command_executable_name(argv: list[str]) -> str:
     return ""
 
 
-# Only Claude commands accept a forced --session-id. Codex `exec` has no
-# equivalent injection flag, and its session id is surfaced only via `--json`
-# (which would replace the streamed human-readable output the wrapper log and
-# selection/analysis text parsing rely on); Codex runs therefore keep the
-# run_id fallback. See README "Agent session transcripts".
+# Only Claude commands accept a forced --session-id. Codex `exec --json`
+# surfaces a native thread id, but it cannot be selected before launch.
 SESSION_CAPTURE_AGENT_KINDS = frozenset({"auto", "claude"})
 SESSION_OBSERVED_SOURCE = "observed"
 
@@ -4120,6 +4224,54 @@ def command_supports_session_capture(command: str, agent_kind: str) -> bool:
     if command_executable_name(argv) != "claude":
         return False
     return not command_specifies_session_id(argv)
+
+
+def inject_structured_usage_output(command: str, agent_kind: str) -> str:
+    """Request native result events only for recognized first-party CLIs."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    executable = command_executable_name(argv)
+    if executable == "codex" and agent_kind in {"auto", "codex"}:
+        if "exec" not in argv or "--json" in argv:
+            return command
+        return re.sub(r"(?<!\S)exec(?=\s|$)", "exec --json", command, count=1)
+    if executable == "claude" and agent_kind in {"auto", "claude"}:
+        if "--output-format" in argv or any(
+            token.startswith("--output-format=") for token in argv
+        ):
+            return command
+        return command.replace(
+            "claude ", "claude --output-format stream-json --verbose ", 1
+        )
+    return command
+
+
+def worker_usage_provenance(worker_report: WorkerReport | None) -> tuple[str, str]:
+    """Return allowlisted phase and work-kind metadata from a worker report."""
+    if worker_report is None:
+        return "implementation", ""
+    phase_value = worker_report.metadata.get("phase")
+    phase = (
+        phase_value if isinstance(phase_value, str) and phase_value in PHASES else ""
+    )
+    work_kind_value = worker_report.metadata.get("work_kind")
+    work_kind = (
+        work_kind_value
+        if isinstance(work_kind_value, str) and work_kind_value in WORK_KINDS
+        else ""
+    )
+    if not phase:
+        phase = "review" if work_kind == "review" else "implementation"
+    if phase == "review" and not work_kind:
+        work_kind = "review"
+    return phase, work_kind
+
+
+def provider_selection_is_flexible(agent: AgentConfig, task: Task) -> bool:
+    """Whether dispatch could choose a provider rather than a pinned model."""
+    return agent.agent_kind == "auto" and not task.model.strip()
 
 
 def inject_claude_session_id(command: str, session_id: str) -> str:
@@ -4689,6 +4841,7 @@ def run_streaming_command(
     reap_grace_seconds: float = 120.0,
     reap_poll_seconds: float = 10.0,
     timeout_seconds: float | None = None,
+    provider: str = "unknown",
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
     popen_kwargs: dict[str, object] = {}
@@ -4747,7 +4900,7 @@ def run_streaming_command(
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()
-    output_observer = AgentOutputObserver()
+    output_observer = AgentOutputObserver(provider)
     stdout_thread = threading.Thread(
         target=stream_pipe,
         args=(
@@ -4791,6 +4944,7 @@ def run_streaming_command(
         session_id_source=observation.session_id_source,
         runtime_context=observation.runtime_context,
         timed_out=wait_outcome.timed_out,
+        usage=output_observer.usage,
     )
 
 
@@ -4950,3 +5104,28 @@ def git_rev_parse(repo: Path, rev: str) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def git_changed_lines(repo: Path, start_rev: str, end_rev: str) -> int | None:
+    if not start_rev or not end_rev:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--numstat", start_rev, end_rev],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    changed = 0
+    for line in result.stdout.splitlines():
+        added, separator, remainder = line.partition("\t")
+        deleted, separator, _path = remainder.partition("\t")
+        if not separator or not added.isdigit() or not deleted.isdigit():
+            continue
+        changed += int(added) + int(deleted)
+    return changed

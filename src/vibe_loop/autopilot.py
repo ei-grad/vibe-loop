@@ -54,7 +54,13 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.retry import parse_limit_wall_reset_delay
-from vibe_loop.runner import AgentLimitWallError, VibeRunner, new_run_id
+from vibe_loop.runner import (
+    AgentLimitWallError,
+    ProviderUsageObserver,
+    VibeRunner,
+    inject_structured_usage_output,
+    new_run_id,
+)
 from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
@@ -77,6 +83,7 @@ from vibe_loop.runs import (
     utc_now_iso,
 )
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
+from vibe_loop.telemetry import merge_provider_usage, unavailable_usage
 from vibe_loop.workers import (
     ActiveRunState,
     ProcessExists,
@@ -3716,6 +3723,7 @@ class NativePlanningWorkerResult:
 class NativePlanningCycleResult:
     decision: NativePlanningDecision
     worker: NativePlanningWorkerResult
+    stats: dict[str, object] = dataclasses.field(default_factory=dict)
 
 
 PLANNING_OUTCOME_PRODUCTIVE = "productive"
@@ -4015,8 +4023,11 @@ def planning_outcome_record(
     created_count: int | None = None,
     created_task_ids: Sequence[str] = (),
     provider_launched: bool = True,
+    model_provider: str = "unknown",
+    model_id: str = "unknown",
+    stats: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
         "record_type": AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
         "occurred_at": utc_now_iso(),
@@ -4029,7 +4040,12 @@ def planning_outcome_record(
         "created_count": created_count,
         "created_task_ids": list(created_task_ids),
         "provider_launched": provider_launched,
+        "model_provider": model_provider,
+        "model_id": model_id,
     }
+    if stats:
+        record["stats"] = dict(stats)
+    return record
 
 
 NativePlanningRunner = Callable[..., NativePlanningCycleResult]
@@ -4234,7 +4250,15 @@ def run_native_planning(
     analysis_runner: AnalysisRunner | None = None,
     worker_launcher: PlanningWorkerLauncher = launch_native_planning_worker,
 ) -> NativePlanningCycleResult:
-    runner = analysis_runner or VibeRunner(config).run_analysis_agent
+    planning_started = time_module.monotonic()
+    analysis_vibe_runner = VibeRunner(config) if analysis_runner is None else None
+    runner = (
+        analysis_runner
+        if analysis_runner is not None
+        else analysis_vibe_runner.run_analysis_agent
+    )
+    analysis_usage = unavailable_usage("unknown", "provider_usage_not_reported")
+    worker_usage = unavailable_usage("unknown", "provider_usage_not_reported")
     output_path = config.state_path / "autopilot" / f"{cycle_id}-planning-decision.json"
     agent_error = ""
     agent_error_kind = ""
@@ -4276,6 +4300,8 @@ def run_native_planning(
     if payload is None and not agent_error:
         agent_error = "analysis agent returned no planning decision"
         agent_error_kind = PLANNING_ERROR_INVALID_PLAN
+    if analysis_vibe_runner is not None:
+        analysis_usage = analysis_vibe_runner.last_analysis_usage
     should_plan = False
     reason = ""
     objective = ""
@@ -4321,7 +4347,14 @@ def run_native_planning(
             error=agent_error,
         )
         run_store.append_record(worker.to_record(config.repo))
-        return NativePlanningCycleResult(decision=decision, worker=worker)
+        return NativePlanningCycleResult(
+            decision=decision,
+            worker=worker,
+            stats=analysis_usage.to_stats(
+                phase="planning",
+                wall_time_seconds=max(0.0, time_module.monotonic() - planning_started),
+            ),
+        )
 
     log_path = config.state_path / "autopilot" / f"{cycle_id}-planning-worker.log"
     worker_error = ""
@@ -4364,6 +4397,7 @@ def run_native_planning(
             prompt=build_native_planning_worker_prompt(config, decision),
             model=config.agent.model,
         )
+        command = inject_structured_usage_output(command, config.agent.agent_kind)
         launch_attempted = True
         process_result = worker_launcher(
             command,
@@ -4385,6 +4419,18 @@ def run_native_planning(
         ValueError,
     ) as exc:
         worker_error = _bounded_planning_text(exc)
+
+    usage_observer = ProviderUsageObserver(
+        {"codex": "openai", "claude": "anthropic"}.get(
+            config.agent.agent_kind, "unknown"
+        )
+    )
+    try:
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            usage_observer.observe_line(line)
+    except OSError:
+        pass
+    worker_usage = usage_observer.usage
 
     task_source_error = ""
     runnable_after: int | None = status.queue.runnable
@@ -4443,7 +4489,14 @@ def run_native_planning(
     run_store.append_record(worker.to_record(config.repo))
     if interruption is not None:
         raise interruption
-    return NativePlanningCycleResult(decision=decision, worker=worker)
+    return NativePlanningCycleResult(
+        decision=decision,
+        worker=worker,
+        stats=merge_provider_usage(analysis_usage, worker_usage).to_stats(
+            phase="planning",
+            wall_time_seconds=max(0.0, time_module.monotonic() - planning_started),
+        ),
+    )
 
 
 def execute_autopilot_cycle(
@@ -4606,6 +4659,11 @@ def execute_autopilot_cycle(
                     created_count=native_planning.worker.created_count,
                     created_task_ids=native_planning.worker.created_task_ids,
                     provider_launched=planning_provider_launched(native_planning),
+                    model_provider=str(
+                        native_planning.stats.get("provider") or "unknown"
+                    ),
+                    model_id=config.agent.model or "unknown",
+                    stats=native_planning.stats,
                 )
             )
             actions.append(f"{PLANNING_OUTCOME_ACTION_PREFIX}{planning_outcome}")
