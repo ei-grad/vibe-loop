@@ -931,6 +931,12 @@ def load_config(
     project_binding = parse_project_binding(data.get("project_binding", {}))
     autopilot = parse_autopilot(data.get("autopilot", {}))
     specs = parse_specs(data.get("specs", {}))
+    normalized_runtime_context = normalize_registry_runtime_context(runtime_context)
+    validate_required_project_binding_values(
+        project_binding.require,
+        normalized_runtime_context,
+        source="registry entry context",
+    )
     return VibeConfig(
         repo=repo,
         config_path=config_path,
@@ -951,7 +957,7 @@ def load_config(
         project_binding=project_binding,
         autopilot=autopilot,
         specs=specs,
-        runtime_context=normalize_registry_runtime_context(runtime_context),
+        runtime_context=normalized_runtime_context,
     )
 
 
@@ -1013,10 +1019,6 @@ def normalize_registry_runtime_context_assignments(
         if not isinstance(context_value, str):
             raise ValueError(
                 f"registry entry context value for {name!r} must be a string"
-            )
-        if not context_value.strip():
-            raise ValueError(
-                f"registry entry context value for {name!r} must not be empty"
             )
         if "\0" in context_value:
             raise ValueError(
@@ -1972,6 +1974,11 @@ def parse_project_binding(data: object) -> ProjectBindingConfig:
     require = parse_project_binding_require(table.get("require"))
     try:
         context = normalize_registry_runtime_context(table.get("context"))
+        validate_required_project_binding_values(
+            require,
+            context,
+            source="project_binding.context",
+        )
     except ValueError as exc:
         raise ValueError(f"project_binding.context is invalid: {exc}") from exc
     return ProjectBindingConfig(
@@ -1979,6 +1986,19 @@ def parse_project_binding(data: object) -> ProjectBindingConfig:
         context=context,
         explicit_keys=explicit_keys,
     )
+
+
+def validate_required_project_binding_values(
+    require: Sequence[str],
+    context: Sequence[tuple[str, str]],
+    *,
+    source: str,
+) -> None:
+    values = dict(context)
+    for name in require:
+        value = values.get(name)
+        if value is not None and not value.strip():
+            raise ValueError(f"{source} value for {name!r} must not be empty")
 
 
 def parse_project_binding_require(value: object) -> tuple[str, ...]:
