@@ -86,7 +86,8 @@ planning commands, but only when those commands are explicitly user-authored in
 Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status
 JSON, low-ready queue handling, and the rule that generated task-source
-profiles cannot introduce maintenance commands.
+profiles cannot introduce maintenance commands. An explicitly configured
+`planning_command` takes precedence over native planning.
 
 Related implementation IDs: `AUTO-04`.
 
@@ -213,7 +214,11 @@ in the generated-task-profile forbidden keys, and a runner entry point that
 launches the analysis agent and parses its strict structured (JSON) decision
 using the same prompt-delivery and shell-preparation validation as the existing
 selection path. The analysis agent must not be granted write/edit tools and must
-not be required for routine read-only status commands.
+not be required for routine read-only status commands. For native low-ready
+planning, it receives bounded queue and worker evidence and returns only a
+strict `should_plan`, reason, and objective decision. It never authors task
+content; a separate invocation of the configured read-write worker command
+performs any requested queue replenishment.
 
 Related implementation IDs: `AUTO-12`, `AUTO-18`.
 
@@ -286,10 +291,21 @@ behaviors while preserving the non-destructive recovery boundary
 opt-in (`PRD-AUT-010`), native disk-health
 checks, a native "what landed" git-log summary, native troubleshoot detection
 derived from `runs.jsonl`, and native planning that invokes the configured agent
-rather than requiring a separate `planning_command` script. Project-authored
-`[autopilot]` maintenance commands (`PRD-AUT-005`) continue to override or
-augment the native behaviors; native behavior is the default, not a replacement
-for explicit configuration.
+rather than requiring a separate `planning_command` script. Native planning is
+split into two stages: the read-only analysis runner decides whether and what to
+plan from bounded runtime evidence plus repository-local planning sources; only
+a separate read-write worker launched through `agent.command` may author task
+content. The supervisor validates and journals the decision, launches the
+worker when requested, records its started and terminal lifecycle (including
+PID, log, configured worker timeout, and before/after runnable depth), and
+re-reads rather than mutating the task source. Post-worker task-source failures
+remain explicit instead of becoming a zero count. Malformed decisions fail
+closed without launching a write-capable worker. The two stages use the
+registered `autopilot_planning_decision` and `autopilot_planning_worker` record
+types.
+Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
+override or augment the native behaviors; native behavior is the default, not a
+replacement for explicit configuration.
 
 Acceptance must cover each native behavior landing as an independently
 reviewable slice, every native action appearing in the append-only journal

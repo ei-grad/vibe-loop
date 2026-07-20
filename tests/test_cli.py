@@ -7998,7 +7998,18 @@ class AutopilotCliTests(unittest.TestCase):
             stdout = StringIO()
             stderr = StringIO()
 
-            with redirect_stdout(stdout), redirect_stderr(stderr):
+            with (
+                patch(
+                    "vibe_loop.autopilot.VibeRunner.run_analysis_agent",
+                    return_value={
+                        "should_plan": False,
+                        "reason": "fixture does not need more tasks",
+                        "objective": "",
+                    },
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
                 exit_code = main(["autopilot", "run", "--repo", str(repo), "--once"])
 
             summary = json.loads(stdout.getvalue())

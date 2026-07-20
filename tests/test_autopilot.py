@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import json
 import os
@@ -13,9 +14,13 @@ from unittest import mock
 from vibe_loop.autopilot import (
     AutopilotCycleResult,
     MaintenanceCommandResult,
+    NativePlanningProcessResult,
+    NativePlanningWorkerInterrupted,
     ProjectEntry,
     ProjectRegistry,
+    TaskQueueStatus,
     autopilot_child_command,
+    build_native_planning_decision_prompt,
     collect_external_run_supervisor,
     collect_project_status,
     collect_registry_status,
@@ -31,6 +36,8 @@ from vibe_loop.autopilot import (
     recheck_sleep_slices,
     run_autopilot,
     run_maintenance_command,
+    launch_native_planning_worker,
+    run_native_planning,
     run_worktree_disposition,
     wait_for_processes,
     WaitMessageAdapterError,
@@ -40,13 +47,15 @@ from vibe_loop.locks import AUTOPILOT_LOCK_NAME, build_lock_manager
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RunResult,
     RunStore,
 )
-from vibe_loop.workers import ActiveRunState
+from vibe_loop.workers import ActiveRunState, WorkerView
 
 
 class AutopilotStatusTests(unittest.TestCase):
@@ -835,12 +844,18 @@ class AutopilotRunTests(unittest.TestCase):
             config = load_config(repo)
             launcher, calls = self._recording_launcher()
 
-            summary = run_autopilot(config, once=True, min_ready=2, launcher=launcher)
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
 
         self.assertTrue(summary.started)
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertIn("planning_unconfigured", summary.cycles[0].actions)
+        self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
 
     def test_zero_min_ready_is_rejected_without_launch(self) -> None:
@@ -864,7 +879,12 @@ class AutopilotRunTests(unittest.TestCase):
             config = load_config(repo)
             launcher, calls = self._recording_launcher()
 
-            summary = run_autopilot(config, once=True, launcher=launcher)
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
             cycle_records = [
                 record
                 for record in RunStore(config.state_path / "runs.jsonl").read_records()
@@ -874,10 +894,10 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertTrue(summary.started)
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertIn("planning_unconfigured", summary.cycles[0].actions)
+        self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertIn("no_runnable_work", summary.cycles[0].actions)
         self.assertEqual(len(cycle_records), 1)
-        self.assertIn("planning_unconfigured", cycle_records[0]["actions"])
+        self.assertIn("native_planning_decision:no_plan", cycle_records[0]["actions"])
 
     def test_low_ready_queue_with_live_worker_reports_waiting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -905,13 +925,18 @@ class AutopilotRunTests(unittest.TestCase):
             )
             launcher, calls = self._recording_launcher()
 
-            summary = run_autopilot(config, once=True, launcher=launcher)
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
 
         self.assertTrue(summary.started)
         self.assertEqual(len(calls), 0)
         self.assertEqual(summary.cycles[0].status, "idle")
         self.assertIn("waiting_for_active_workers:1", summary.cycles[0].actions)
-        self.assertNotIn("planning_unconfigured", summary.cycles[0].actions)
+        self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertNotIn("no_runnable_work", summary.cycles[0].actions)
 
     def test_observes_live_supervisor_without_duplicating(self) -> None:
@@ -1481,6 +1506,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                 interval=100.0,
                 launcher=launcher,
                 sleep=sleeps.append,
+                native_planning_runner=native_no_plan,
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
@@ -1507,6 +1533,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                 interval=100.0,
                 launcher=launcher,
                 sleep=sleeps.append,
+                native_planning_runner=native_no_plan,
             )
 
         self.assertEqual(summary.cycles[0].status, "completed")
@@ -1591,6 +1618,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                 interval=100.0,
                 launcher=launcher,
                 sleep=sleeps.append,
+                native_planning_runner=native_no_plan,
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
@@ -1598,6 +1626,369 @@ class AutopilotRecheckTests(unittest.TestCase):
         # Even though the cycle is idle, the limit-wall backoff replaces the
         # recheck loop entirely; the recheck slice size never appears.
         self.assertEqual(sleeps, [42.0])
+
+
+class NativePlanningTests(unittest.TestCase):
+    def test_read_only_no_plan_decision_journals_skipped_worker_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            prompts: list[str] = []
+
+            def analysis_runner(prompt, output_path):
+                prompts.append(prompt)
+                return {
+                    "should_plan": False,
+                    "reason": "an active roadmap already covers the next slice",
+                    "objective": "",
+                }
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-1",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                analysis_runner=analysis_runner,
+                worker_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("no-plan decision must not launch a worker")
+                ),
+            )
+            records = run_store.read_records()
+
+        self.assertFalse(result.decision.should_plan)
+        self.assertFalse(result.worker.attempted)
+        self.assertEqual(result.worker.status, "skipped_not_needed")
+        self.assertIn("Do not edit files", prompts[0])
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            [
+                AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+                AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+            ],
+        )
+        self.assertEqual(records[0]["stage"], "read_only_detection")
+        self.assertEqual(records[1]["stage"], "read_write_authoring")
+        self.assertFalse(records[1]["attempted"])
+
+    def test_plan_decision_launches_read_write_worker_and_rechecks_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            worker_calls: list[dict[str, object]] = []
+
+            def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
+                worker_calls.append(
+                    {"command": command, "cwd": cwd, "log_path": log_path}
+                )
+                on_start(4242)
+                write_plan(
+                    repo,
+                    [
+                        ("TASK-01", "Next", "", "ready slice"),
+                        ("TASK-02", "Next", "", "new planned slice"),
+                    ],
+                )
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-2",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "the ready queue is below its target",
+                    "objective": "add one reviewed dependency-ready task",
+                },
+                worker_launcher=worker_launcher,
+            )
+            records = run_store.read_records()
+
+        self.assertTrue(result.decision.should_plan)
+        self.assertTrue(result.worker.attempted)
+        self.assertEqual(result.worker.status, "completed")
+        self.assertEqual(result.worker.runnable_before, 1)
+        self.assertEqual(result.worker.runnable_after, 2)
+        self.assertEqual(len(worker_calls), 1)
+        self.assertIn("$orchestrated-vibe-loop", worker_calls[0]["command"])
+        self.assertIn(
+            "add one reviewed dependency-ready task", worker_calls[0]["command"]
+        )
+        self.assertEqual(
+            records[0]["record_type"], AUTOPILOT_PLANNING_DECISION_RECORD_TYPE
+        )
+        self.assertEqual(
+            records[1]["record_type"], AUTOPILOT_PLANNING_WORKER_RECORD_TYPE
+        )
+        self.assertEqual(records[1]["phase"], "started")
+        self.assertEqual(records[2]["phase"], "terminal")
+        self.assertEqual(records[2]["runnable_after"], 2)
+
+    def test_invalid_analysis_response_never_launches_write_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            invalid_payloads = (
+                {"should_plan": "yes", "reason": "low", "objective": "add"},
+                {"should_plan": True, "reason": ["low"], "objective": {"add": 1}},
+                {
+                    "should_plan": True,
+                    "reason": "low",
+                    "objective": "add",
+                    "unexpected": "field",
+                },
+                {"should_plan": True, "reason": "low"},
+            )
+            for index, payload in enumerate(invalid_payloads):
+                with self.subTest(payload=payload):
+                    result = run_native_planning(
+                        config,
+                        cycle_id=f"cycle-3-{index}",
+                        status=status,
+                        min_ready=1,
+                        run_store=run_store,
+                        analysis_runner=lambda prompt, output_path, value=payload: (
+                            value
+                        ),
+                        worker_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
+                            AssertionError("invalid analysis must not launch a worker")
+                        ),
+                    )
+                    records = run_store.read_records()
+                    self.assertEqual(result.decision.status, "analysis_error")
+                    self.assertIn(
+                        "invalid planning schema", result.decision.agent_error
+                    )
+                    self.assertFalse(result.worker.attempted)
+                    self.assertEqual(result.worker.status, "skipped_analysis_error")
+                    self.assertEqual(records[-2]["status"], "analysis_error")
+                    self.assertEqual(records[-1]["status"], "skipped_analysis_error")
+
+    def test_decision_prompt_bounds_worker_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            workers = tuple(
+                WorkerView(
+                    active=ActiveRunState.new(
+                        task_id=f"TASK-{index:03d}",
+                        run_id=f"run-{index:03d}",
+                        log_path=config.state_path / "runs" / f"run-{index:03d}.log",
+                        base_main="abc",
+                        command="worker",
+                    ),
+                    state="active",
+                    process_state="live",
+                )
+                for index in range(55)
+            )
+            prompt = build_native_planning_decision_prompt(
+                dataclasses.replace(status, workers=workers),
+                min_ready=1,
+            )
+            evidence = json.loads(prompt.split("Runtime evidence:\n", 1)[1])
+
+        self.assertEqual(len(evidence["workers"]), 50)
+        self.assertEqual(evidence["workers_omitted"], 5)
+        self.assertEqual(evidence["planning_evidence_worker_limit"], 50)
+
+    def test_worker_timeout_records_started_and_terminal_phases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def timed_out_worker(command, *, on_start, **kwargs):
+                on_start(4242)
+                return NativePlanningProcessResult(
+                    exit_code=-9,
+                    pid=4242,
+                    timed_out=True,
+                )
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-timeout",
+                status=status,
+                min_ready=1,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "queue empty",
+                    "objective": "add one task",
+                },
+                worker_launcher=timed_out_worker,
+            )
+            records = run_store.read_records()
+
+        self.assertEqual(result.worker.status, "timed_out")
+        self.assertTrue(result.worker.timed_out)
+        self.assertEqual(
+            [record["phase"] for record in records[1:]], ["started", "terminal"]
+        )
+        self.assertEqual(records[1]["pid"], 4242)
+
+    def test_worker_interrupt_journals_terminal_phase_before_propagating(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def interrupted_worker(command, *, on_start, **kwargs):
+                on_start(4343)
+                raise NativePlanningWorkerInterrupted(
+                    NativePlanningProcessResult(exit_code=-9, pid=4343)
+                )
+
+            with self.assertRaises(KeyboardInterrupt):
+                run_native_planning(
+                    config,
+                    cycle_id="cycle-interrupt",
+                    status=status,
+                    min_ready=1,
+                    run_store=run_store,
+                    analysis_runner=lambda prompt, output_path: {
+                        "should_plan": True,
+                        "reason": "queue empty",
+                        "objective": "add one task",
+                    },
+                    worker_launcher=interrupted_worker,
+                )
+            records = run_store.read_records()
+
+        self.assertEqual(records[-2]["phase"], "started")
+        self.assertEqual(records[-1]["phase"], "terminal")
+        self.assertEqual(records[-1]["status"], "interrupted")
+
+    def test_prelaunch_error_records_no_attempt_or_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            config = dataclasses.replace(
+                config,
+                agent=dataclasses.replace(config.agent, command="codex exec"),
+            )
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-prelaunch-error",
+                status=status,
+                min_ready=1,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "queue empty",
+                    "objective": "add one task",
+                },
+                worker_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("invalid command must not reach the launcher")
+                ),
+            )
+
+        self.assertEqual(result.worker.status, "worker_error")
+        self.assertTrue(result.worker.requested)
+        self.assertFalse(result.worker.attempted)
+        self.assertFalse(result.worker.started)
+        self.assertIsNone(result.worker.log_path)
+
+    def test_post_worker_task_source_error_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def successful_worker(command, *, on_start, **kwargs):
+                on_start(4444)
+                return NativePlanningProcessResult(exit_code=0, pid=4444)
+
+            with mock.patch(
+                "vibe_loop.autopilot.collect_task_queue_status",
+                return_value=TaskQueueStatus(source_error="task backend unavailable"),
+            ):
+                result = run_native_planning(
+                    config,
+                    cycle_id="cycle-source-error",
+                    status=status,
+                    min_ready=1,
+                    run_store=run_store,
+                    analysis_runner=lambda prompt, output_path: {
+                        "should_plan": True,
+                        "reason": "queue empty",
+                        "objective": "add one task",
+                    },
+                    worker_launcher=successful_worker,
+                )
+
+        self.assertEqual(result.worker.status, "task_source_error")
+        self.assertEqual(result.worker.task_source_error, "task backend unavailable")
+        self.assertIsNone(result.worker.runnable_after)
+
+    def test_launcher_kills_process_group_on_timeout_and_interrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "planning.log"
+            timed_out_process = mock.Mock(pid=4545)
+            timed_out_process.wait.side_effect = [
+                subprocess.TimeoutExpired(cmd="worker", timeout=0.01),
+                -9,
+            ]
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.subprocess.Popen",
+                    return_value=timed_out_process,
+                ),
+                mock.patch("vibe_loop.autopilot.kill_command_process_group") as kill,
+            ):
+                result = launch_native_planning_worker(
+                    "worker",
+                    cwd=Path(directory),
+                    log_path=log_path,
+                    timeout_seconds=0.01,
+                    on_start=lambda pid: None,
+                )
+            self.assertTrue(result.timed_out)
+            kill.assert_called_once_with(timed_out_process)
+
+            interrupted_process = mock.Mock(pid=4646)
+            interrupted_process.wait.side_effect = [KeyboardInterrupt(), -9]
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.subprocess.Popen",
+                    return_value=interrupted_process,
+                ),
+                mock.patch("vibe_loop.autopilot.kill_command_process_group") as kill,
+                self.assertRaises(NativePlanningWorkerInterrupted),
+            ):
+                launch_native_planning_worker(
+                    "worker",
+                    cwd=Path(directory),
+                    log_path=log_path,
+                    timeout_seconds=0,
+                    on_start=lambda pid: None,
+                )
+            kill.assert_called_once_with(interrupted_process)
 
 
 class AutopilotMaintenanceTests(unittest.TestCase):
@@ -1652,6 +2043,9 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 min_ready=2,
                 launcher=launcher,
                 maintenance_runner=runner,
+                native_planning_runner=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("configured planning command must win")
+                ),
             )
             command_records = self._command_records(config)
 
@@ -1677,10 +2071,11 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 min_ready=2,
                 launcher=lambda *a, **k: 0,
                 maintenance_runner=runner,
+                native_planning_runner=native_no_plan,
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertIn("planning_unconfigured", summary.cycles[0].actions)
+        self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
         self.assertEqual(calls, [])
 
@@ -2639,6 +3034,21 @@ def configured_repo(
     write_plan(repo, rows)
     run(repo, "git", "add", "PLAN.md", ".vibe-loop.toml")
     run(repo, "git", "commit", "-m", "initial")
+
+
+def native_no_plan(config, **kwargs):
+    return run_native_planning(
+        config,
+        **kwargs,
+        analysis_runner=lambda prompt, output_path: {
+            "should_plan": False,
+            "reason": "fixture has no planning need",
+            "objective": "",
+        },
+        worker_launcher=lambda *args, **worker_kwargs: (_ for _ in ()).throw(
+            AssertionError("no-plan fixture must not launch a planning worker")
+        ),
+    )
 
 
 def init_repo(repo: Path) -> None:

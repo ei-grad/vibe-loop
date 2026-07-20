@@ -8,6 +8,8 @@ from pathlib import Path
 from vibe_loop.runs import (
     AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_RECORD_TYPES,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     KNOWN_RECORD_TYPES,
@@ -767,6 +769,14 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, "autopilot_worktree_reap")
         self.assertIn(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, AUTOPILOT_RECORD_TYPES)
         self.assertIn(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_native_planning_record_types_registered(self) -> None:
+        for record_type in (
+            AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+            AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+        ):
+            self.assertIn(record_type, AUTOPILOT_RECORD_TYPES)
+            self.assertIn(record_type, KNOWN_RECORD_TYPES)
 
     def test_read_records_keeps_worktree_reap_record_and_out_of_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

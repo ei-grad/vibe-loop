@@ -418,9 +418,16 @@ interrupt. `--jobs`, `--ask-agent`, `--continue-on-failure`, `--max-slices`, and
 runnable depth required before launching. The value must be a positive integer;
 zero is rejected so an empty queue can never satisfy the launch gate. If the
 queue is below that depth and no explicit `[autopilot] planning_command` is
-configured, the cycle records
-`planning_unconfigured` with the low/no-runnable observation instead of
-authoring new tasks itself. A single supervisor lock prevents duplicates; Ctrl-C
+configured, native planning first asks the read-only analysis runner for a
+strict decision and objective. A reasoned plan decision launches a separate
+read-write `agent.command` worker with an `orchestrated-vibe-loop` planning
+prompt; only that worker may author task content. The supervisor never edits the
+task source: it journals the decision plus started/terminal worker lifecycle,
+honors the configured worker timeout, terminates the worker process group on a
+timeout or interrupt, and re-reads runnable depth after the worker exits. Invalid
+analysis output fails closed without launching the write-capable worker, and a
+post-worker task-source error remains explicit. A configured planning command
+retains precedence. A single supervisor lock prevents duplicates; Ctrl-C
 terminates the in-flight child and releases the lock.
 
 **`projects`** manages an optional multi-project registry (`register`, `list`,
@@ -526,8 +533,9 @@ require_clean_repo = true   # set false to let a dirty tree run a cycle
 worktree_disposition = "report-only"
 # Optional user-authored maintenance hooks, redacted in status/doctor JSON.
 # A failing health command blocks the launch; planning runs when the runnable
-# queue is below min_ready; if planning is not configured, the cycle records
-# planning_unconfigured. Summary runs after a launch; troubleshoot runs after a
+# queue is below min_ready. When no planning command is configured, native
+# read-only planning detection may delegate task authoring to a separate
+# read-write worker. Summary runs after a launch; troubleshoot runs after a
 # failed child. Generated profiles can never introduce these hooks.
 # health_command = "scripts/health.sh"
 # summary_command = "scripts/summary.sh"
