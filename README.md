@@ -492,21 +492,27 @@ child's workers, and any process they detached into a separate session running
 under PID 1 — still holding task locks and still burning provider quota after
 the operator was told the run stopped. The drain set comes only from this
 installation's own records: the child identity the cycle recorded before waiting
-on it, the active-run locks whose recorded supervising process is exactly that
-child, and the process ancestry rooted at those verified processes. Names,
-process-group sweeps, and ambient process listings are never used, so a peer
-installation's work is never touched. Every process must present a matching
-kernel birth identity before any signal is sent; one unverifiable process blocks
-the whole stop with nothing signalled. Signals then go to exact pidfds, deepest
-descendants first and the supervisor last.
+on it, the active-run locks in this repository's own lock root, and the process
+ancestry rooted at those verified processes. Names, process-group sweeps, and
+ambient process listings are never used, so a peer installation's work is never
+touched.
+
+A worker is verified on its own recorded birth identity, not on its child still
+being alive — a worker orphans to PID 1 precisely because that child died, so
+that is the case a stop most needs to handle. Every process must present a
+matching kernel birth identity before any signal is sent; one live worker this
+run cannot attribute or verify blocks the whole stop with nothing signalled.
+Signals then go to exact pidfds, deepest descendants first and the supervisor
+last.
 
 A timeout, a refused signal, or an interruption reports the exact remaining
 role, run, task, and PID instead of a false success, and leaves both the
 supervisor record and the task locks untouched so you can verify and retry
 against named processes. On success, a worker killed mid-slice is recorded as a
-terminated run rather than a completed one: its task lock is released, but the
-task itself stays active and its committed worktree is preserved so the slice
-can be picked up again.
+terminated run rather than a completed one: its task lock is released only when
+its run, task, and fencing generation all still match what this installation
+recorded, while the task itself stays active and its committed worktree is
+preserved so the slice can be picked up again.
 
 If the recorded process is already absent but its lock remains, normal `stop`
 reports the stale lock without releasing it. Recovery is a separate explicit

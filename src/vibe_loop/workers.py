@@ -544,7 +544,10 @@ class WorkerView:
             "worker_pid": self.active.worker_pid,
             "worker_process_group_id": self.active.worker_process_group_id,
             "worker_session_id": self.active.worker_session_id,
-            "worker_process_birth_id": self.active.worker_process_birth_id,
+            # The birth ID embeds this host's boot ID, so status diagnostics
+            # report only whether one is known, never its value. The raw value
+            # stays in lock metadata, where identity verification needs it.
+            "worker_process_birth_id_known": bool(self.active.worker_process_birth_id),
             "pid_source": self.active.pid_source,
             "pid_scope": self.active.pid_scope,
             "supervisor_pid": self.active.supervisor_pid,

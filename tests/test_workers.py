@@ -32,6 +32,7 @@ from vibe_loop.workers import (
     KEEP_UNMERGED_WORKTREE,
     ActiveRunState,
     StaleLock,
+    WorkerView,
     WorkspaceClaim,
     WorktreeDispositionDecision,
     WorktreeDispositionEvidence,
@@ -793,6 +794,29 @@ class WorkerStateTests(unittest.TestCase):
             ),
             "running",
         )
+
+    def test_worker_view_reports_birth_identity_presence_not_its_value(self) -> None:
+        state = ActiveRunState(
+            task_id="PAR-02",
+            run_id="run-1",
+            worker_pid=100,
+            worker_process_group_id=100,
+            worker_session_id=100,
+            worker_process_birth_id="boot-id-canary:500",
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-02",
+        )
+
+        payload = json.dumps(
+            WorkerView(active=state, state="running", process_state="running").to_json()
+        )
+
+        # The birth ID embeds the host boot ID, so status must never render it.
+        self.assertNotIn("boot-id-canary", payload)
+        self.assertTrue(json.loads(payload)["worker_process_birth_id_known"])
 
     def test_worker_identity_round_trips_through_lock_metadata(self) -> None:
         state = ActiveRunState.new(

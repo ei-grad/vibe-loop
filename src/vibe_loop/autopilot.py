@@ -1108,6 +1108,7 @@ OWNED_PROCESS_ROLE_WORKER = "worker"
 OWNED_PROCESS_ROLE_DESCENDANT = "descendant"
 AUTOPILOT_STOP_TERMINATED_STATUS = "terminated"
 AUTOPILOT_STOP_TERMINATION_REASON = "autopilot_stop"
+AUTOPILOT_STOP_SUPERVISOR_GRACE_SECONDS = 2.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1145,7 +1146,6 @@ class OwnedProcessIdentity:
 class OwnedProcessDrainResult:
     drained: tuple[OwnedProcessIdentity, ...] = ()
     remaining: tuple[OwnedProcessIdentity, ...] = ()
-    signalled: tuple[OwnedProcessIdentity, ...] = ()
     blocker: str = ""
 
     @property
@@ -1634,41 +1634,31 @@ def autopilot_child_identity(
     return None
 
 
-def owned_worker_identities(
+def live_active_run_states(
     lock_manager: LockManager,
     *,
-    child_pid: int,
-) -> tuple[OwnedProcessIdentity, ...]:
-    """Active-run locks whose supervising process is exactly ``child_pid``.
+    process_exists: ProcessExists,
+) -> tuple[tuple[ActiveRunState, ...], str]:
+    """Active-run locks in this repository whose recorded worker PID is live.
 
-    Selection is by recorded supervisor PID, never by command name or an
-    ambient process listing, so a peer installation's workers can never enter
-    this drain set.
+    Locks are read from this installation's own lock root, never from a command
+    name match or an ambient process listing, so a peer installation's workers
+    can never appear here.
     """
 
-    identities: list[OwnedProcessIdentity] = []
     try:
         locks = lock_manager.list_locks()
     except (LockBackendError, OSError):
-        return ()
+        return (), "autopilot_stop_worker_lock_enumeration_failed"
+    live: list[ActiveRunState] = []
     for metadata in locks:
         active = ActiveRunState.from_lock_metadata(dict(metadata))
         if active is None or active.worker_pid is None:
             continue
-        if active.supervisor_pid != child_pid:
+        if not process_exists(active.worker_pid):
             continue
-        identities.append(
-            OwnedProcessIdentity(
-                role=OWNED_PROCESS_ROLE_WORKER,
-                pid=active.worker_pid,
-                process_group_id=active.worker_process_group_id or 0,
-                session_id=active.worker_session_id or 0,
-                process_birth_id=active.worker_process_birth_id,
-                run_id=active.run_id,
-                task_id=active.task_id,
-            )
-        )
-    return tuple(identities)
+        live.append(active)
+    return tuple(live), ""
 
 
 def collect_owned_stop_roots(
@@ -1682,37 +1672,66 @@ def collect_owned_stop_roots(
 ) -> tuple[tuple[OwnedProcessIdentity, ...], str]:
     """Verified non-supervisor roots to drain, or a fail-closed blocker.
 
-    A root that is already gone contributes nothing. A root that is still live
-    but whose birth identity was never recorded cannot be told apart from a
-    recycled PID, so it blocks the stop instead of being signalled.
+    A worker is an independently verifiable root: its own recorded birth
+    identity proves which process it is, and the active-run lock in this
+    repository's lock root proves the run owns it. Its liveness is therefore
+    never inferred from its supervising child. That distinction is the whole
+    point of this pass: a worker orphans to PID 1 precisely *because* its child
+    died, so gating worker roots on a live child would skip exactly the
+    processes that outlive a stop.
 
-    Workers are selected by their recorded supervising child PID, so they are
-    only trustworthy while that exact child process is still alive. Once the
-    child's birth identity stops matching, that PID names some other process
-    and every worker attributed to it is unverifiable, so the drain set is
-    empty rather than reaching into a subtree this run may not own.
+    The child only supplies attribution. A live worker this run cannot
+    attribute to a recorded child, or whose birth identity was never recorded,
+    is unverifiable rather than absent, so it blocks the stop instead of being
+    silently left running.
     """
 
     child = autopilot_child_identity(run_store, repo=repo, run_id=run_id)
-    if child is None:
-        return (), ""
-    if not process_exists(child.pid):
-        return (), ""
-    if not child.process_birth_id:
+    child_live = (
+        child is not None
+        and process_exists(child.pid)
+        and bool(child.process_birth_id)
+        and birth_identity_lookup(child.pid) == child.process_birth_id
+    )
+    if child is not None and process_exists(child.pid) and not child.process_birth_id:
         return (), "autopilot_stop_identity_unverified:child_birth_id_missing"
-    if birth_identity_lookup(child.pid) != child.process_birth_id:
-        return (), ""
+
+    live_states, enumeration_blocker = live_active_run_states(
+        lock_manager, process_exists=process_exists
+    )
+    if enumeration_blocker:
+        return (), enumeration_blocker
+
     roots: list[OwnedProcessIdentity] = []
-    for worker in owned_worker_identities(lock_manager, child_pid=child.pid):
-        if not process_exists(worker.pid):
-            continue
-        if not worker.process_birth_id:
+    for active in live_states:
+        label = active.task_id or active.run_id or str(active.worker_pid)
+        if child is None or active.supervisor_pid != child.pid:
+            # A live worker with no recorded child to attribute it to cannot be
+            # proven to belong to this run, and cannot be proven not to either.
             return (), (
-                "autopilot_stop_identity_unverified:worker_birth_id_missing:"
-                f"{worker.task_id or worker.run_id or worker.pid}"
+                f"autopilot_stop_identity_unverified:worker_unattributable:{label}"
             )
-        roots.append(worker)
-    roots.append(child)
+        if not active.worker_process_birth_id:
+            return (), (
+                f"autopilot_stop_identity_unverified:worker_birth_id_missing:{label}"
+            )
+        if birth_identity_lookup(active.worker_pid) != active.worker_process_birth_id:
+            # That PID now names some other process, so the recorded worker is
+            # gone and nothing here may be signalled on its behalf.
+            continue
+        roots.append(
+            OwnedProcessIdentity(
+                role=OWNED_PROCESS_ROLE_WORKER,
+                pid=active.worker_pid,
+                process_group_id=active.worker_process_group_id or 0,
+                session_id=active.worker_session_id or 0,
+                process_birth_id=active.worker_process_birth_id,
+                run_id=active.run_id,
+                task_id=active.task_id,
+            )
+        )
+    if child is not None and child_live:
+        roots.append(child)
     return tuple(roots), ""
 
 
@@ -1812,14 +1831,19 @@ def drain_owned_process_tree(
             except ProcessLookupError:
                 continue
             except OSError:
+                # Report only what is actually still alive: a process that
+                # already exited is not something the operator must chase.
                 return OwnedProcessDrainResult(
-                    remaining=tuple(entry for entry, _fd in opened),
+                    remaining=tuple(
+                        entry
+                        for entry, entry_fd in opened
+                        if not pidfd_exited(entry_fd)
+                    ),
                     blocker=(
                         f"autopilot_stop_signal_failed:{identity.role}:{identity.pid}"
                     ),
                 )
 
-        signalled = tuple(identity for identity, _fd in opened)
         pending = list(opened)
         drained: list[OwnedProcessIdentity] = list(exited_before_open)
         while True:
@@ -1833,13 +1857,11 @@ def drain_owned_process_tree(
             if not pending:
                 return OwnedProcessDrainResult(
                     drained=tuple(drained),
-                    signalled=signalled,
                 )
             if monotonic() >= deadline:
                 return OwnedProcessDrainResult(
                     drained=tuple(drained),
                     remaining=tuple(identity for identity, _fd in pending),
-                    signalled=signalled,
                     blocker="autopilot_stop_drain_timeout",
                 )
             try:
@@ -1848,7 +1870,6 @@ def drain_owned_process_tree(
                 return OwnedProcessDrainResult(
                     drained=tuple(drained),
                     remaining=tuple(identity for identity, _fd in pending),
-                    signalled=signalled,
                     blocker="autopilot_stop_interrupted",
                 )
     finally:
@@ -1900,6 +1921,19 @@ def reconcile_drained_workers(
         active = ActiveRunState.from_lock_metadata(dict(metadata))
         if active is None or active.run_id != identity.run_id:
             blockers.append(f"autopilot_stop_reconcile_lock_changed:{identity.task_id}")
+            continue
+        # Compare against the generation this installation recorded when it
+        # acquired the lock, not the one the backend now reports: a lock
+        # re-created out of band would otherwise pass by agreeing with itself.
+        local_fencing_token = lock_manager.local_fencing_token(identity.task_id)
+        if (
+            not active.fencing_token
+            or not local_fencing_token
+            or local_fencing_token != active.fencing_token
+        ):
+            blockers.append(
+                f"autopilot_stop_reconcile_fencing_mismatch:{identity.task_id}"
+            )
             continue
         run_store.append_lifecycle_event(
             RunLifecycleEvent.run_state_transition(
@@ -2438,6 +2472,16 @@ def stop_verified_detached_autopilot(
                 drained=drain.drained,
                 remaining=drain.remaining,
                 blocker=drain.blocker or "autopilot_stop_drain_incomplete",
+            )
+
+        # A drain that used most of the caller's budget would otherwise leave
+        # the supervisor wait no time at all, reporting a timeout for a
+        # supervisor that is exiting normally. The grace is only granted when
+        # processes were actually drained, and keeps the stop bounded.
+        if drain.drained:
+            stop_deadline = max(
+                stop_deadline,
+                monotonic() + AUTOPILOT_STOP_SUPERVISOR_GRACE_SECONDS,
             )
 
         try:

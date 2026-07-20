@@ -128,14 +128,22 @@ process tree before it may report success.
 
 The drain set is derived only from records this installation wrote: the
 `autopilot_child_started` record the cycle appends before waiting on its child,
-the active-run locks whose recorded supervising process is exactly that child,
-and the `/proc` ancestry rooted at those verified processes. Command names,
-process-group sweeps, and ambient process listings are never admissible, and
-`killpg` is never used, so a peer installation's processes can never enter the
-set. Because workers are attributed to their supervising child by PID, a child
-whose birth identity no longer matches invalidates every worker beneath it: the
-drain set is then empty rather than reaching into a subtree this run may not
-own.
+the active-run locks in this repository's own lock root, and the `/proc`
+ancestry rooted at those verified processes. Command names, process-group
+sweeps, and ambient process listings are never admissible, and `killpg` is never
+used, so a peer installation's processes can never enter the set.
+
+A worker is an independently verifiable root, never one inferred from a live
+child. A worker reparents to PID 1 precisely because its launching child died,
+so deriving worker liveness from the child would skip exactly the processes that
+outlive a stop. The worker's own recorded birth identity proves which process it
+is, and its active-run lock proves the run owns it; the child record supplies
+only attribution. A recorded root whose live birth identity no longer matches is
+gone rather than unverifiable, so that PID is dropped instead of signalled. A
+live worker this run cannot attribute to a recorded child, or whose birth
+identity was never recorded, is unverifiable rather than absent and blocks the
+stop instead of being silently left running — including for a supervisor that
+predates these records.
 
 Every candidate requires a kernel process-birth identity, an open pidfd, and a
 post-open recheck of birth, parent, group, and session. Any missing or changed
@@ -151,11 +159,18 @@ remaining role, run, task, and PID, writes no terminal record, and releases no
 task lock, so the operator can verify and retry against named processes rather
 than searching for orphans. On success, a drained worker that filed no terminal
 report is recorded as a terminated run attributed to the stop; success is never
-synthesized. Only task locks whose run and task identity still match are
-released, the authoritative task stays active, and the committed worktree is
-preserved so the slice can be picked up again. Incomplete ownership retains the
-lock and reports a blocker. Diagnostics report whether a birth identity is known,
-never its value, since it embeds the host boot identity.
+synthesized. A task lock is released only when its run and task identity still
+match and its fencing generation equals the one this installation recorded
+acquiring, read from a local record rather than from the backend status being
+released; a lock re-created out of band therefore fails closed instead of
+agreeing with itself. The authoritative task stays active and the committed
+worktree is preserved so the slice can be picked up again. Incomplete ownership
+retains the lock and reports a blocker.
+
+Diagnostics report whether a birth identity is known, never its value, since it
+embeds the host boot identity. This applies to worker and status output as well
+as to stop results; the raw value lives only in lock metadata, where identity
+verification needs it.
 
 Detached-start readiness must be proven by a local trusted contract, not by
 lock-wire metadata. The supervisor appends its own started record only after

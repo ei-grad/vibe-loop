@@ -2321,7 +2321,43 @@ class AutopilotStopDrainTests(unittest.TestCase):
         self.assertEqual(signals, [])
         self.assertTrue(lock_still_held)
 
-    def test_recycled_child_pid_never_drags_in_an_unrelated_subtree(self) -> None:
+    def test_orphaned_worker_is_drained_when_its_child_already_exited(self) -> None:
+        """The reported failure: the child dies, its worker outlives the stop.
+
+        A worker reparents to PID 1 precisely because its launching child died,
+        so this is the state a stop most needs to handle. The worker's own
+        recorded birth identity proves which process it is without any help
+        from the dead child.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            orphaned = drain_process_table()
+            del orphaned[CHILD_PID]
+            orphaned[WORKER_PID] = dataclasses.replace(
+                orphaned[WORKER_PID], parent_pid=1
+            )
+            result, signals, _closed, pid_for_fd = self._stop(
+                config, manager, holder, table=orphaned
+            )
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+            task_lock_after = manager.status("TASK-01")
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        self.assertTrue(result.stopped)
+        self.assertEqual(signalled_pids, [REVIEWER_PID, WORKER_PID, SUPERVISOR_PID])
+        self.assertEqual(
+            [identity.pid for identity in result.drained],
+            [REVIEWER_PID, WORKER_PID],
+        )
+        self.assertNotIn(SENTINEL_PID, signalled_pids)
+        self.assertEqual(result.reconciled_task_ids, ("TASK-01",))
+        self.assertIsNone(task_lock_after)
+        self.assertIsNone(lock_after)
+
+    def test_recycled_child_pid_still_drains_its_verifiable_workers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config, manager, holder, _run_store, _task_lock = (
                 self._drained_installation(
@@ -2332,12 +2368,39 @@ class AutopilotStopDrainTests(unittest.TestCase):
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
 
         signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
-        # The recorded child PID now belongs to a different process, so the
-        # drain set is empty and only the verified supervisor is signalled.
-        self.assertEqual(signalled_pids, [SUPERVISOR_PID])
+        # The recorded child PID now names a different process, so that PID is
+        # never signalled — but the worker below it is still independently
+        # verifiable by its own birth identity and must still be drained.
+        self.assertNotIn(CHILD_PID, signalled_pids)
+        self.assertNotIn(SENTINEL_PID, signalled_pids)
+        self.assertEqual(signalled_pids, [REVIEWER_PID, WORKER_PID, SUPERVISOR_PID])
         self.assertTrue(result.stopped)
-        self.assertEqual(result.drained, ())
         self.assertIsNone(lock_after)
+
+    def test_recycled_worker_pid_is_never_signalled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(
+                    Path(directory), worker_birth_id=f"{DRAIN_BOOT_ID}:reused"
+                )
+            )
+            result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        # That PID now belongs to some other process, so the recorded worker is
+        # gone; it is dropped rather than signalled, and its subtree is only
+        # reached through the still-verified child.
+        self.assertTrue(result.stopped)
+        self.assertEqual(
+            signalled_pids,
+            [REVIEWER_PID, WORKER_PID, CHILD_PID, SUPERVISOR_PID],
+        )
+        self.assertEqual(
+            [identity.role for identity in result.drained],
+            ["descendant", "descendant", "run_until_done_child"],
+        )
+        # Nothing was reconciled: no verified worker root was drained.
+        self.assertEqual(result.reconciled_task_ids, ())
 
     def test_signal_refusal_reports_exact_remaining_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2453,6 +2516,29 @@ class AutopilotStopDrainTests(unittest.TestCase):
         self.assertEqual(transitions, [])
         self.assertEqual(result.reconciled_task_ids, ())
 
+    def test_out_of_band_fencing_generation_retains_the_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, task_lock = self._drained_installation(
+                Path(directory)
+            )
+            # The lock was re-created out of band, so its generation is no
+            # longer the one this installation recorded acquiring.
+            metadata_path = task_lock.path / "lock.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata["fencing_token"] = "out-of-band-generation"
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+            result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
+            task_lock_still_held = manager.status("TASK-01") is not None
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reconciled_task_ids, ())
+        self.assertEqual(
+            result.reconciliation_blockers,
+            ("autopilot_stop_reconcile_fencing_mismatch:TASK-01",),
+        )
+        self.assertTrue(task_lock_still_held)
+
     def test_stop_result_json_is_redacted_and_serializable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config, manager, holder, _run_store, _task_lock = (
@@ -2514,11 +2600,41 @@ class AutopilotStopDrainTests(unittest.TestCase):
         self.assertTrue(record["run_id"])
         self.assertEqual(record["repo"], str(config.repo))
 
-    def test_no_recorded_child_stops_supervisor_only(self) -> None:
+    def test_unattributable_live_worker_blocks_with_zero_signals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config, manager, holder, _run_store, _task_lock = (
                 self._drained_installation(Path(directory), record_child=False)
             )
+            try:
+                result, signals, _closed, _pid_for_fd = self._stop(
+                    config, manager, holder
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+                task_lock_still_held = manager.status("TASK-01") is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        # A supervisor upgraded mid-run has no child record, so this live
+        # worker cannot be attributed. It is unverifiable, not absent, and must
+        # not be silently left running behind a successful stop.
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:worker_unattributable:TASK-01",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
+        self.assertTrue(task_lock_still_held)
+
+    def test_no_child_record_and_no_live_worker_stops_supervisor_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, task_lock = self._drained_installation(
+                Path(directory), record_child=False
+            )
+            manager.release(task_lock)
             result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
 
