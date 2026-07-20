@@ -3863,7 +3863,9 @@ def run_autopilot(
             if bounded_last:
                 break
             pause_seconds = result.limit_wall_pause_seconds
-            if pause_seconds is not None:
+            # A non-positive pause would skip the interval sleep entirely and
+            # spin the cycle; treat it as no pause at all.
+            if pause_seconds is not None and pause_seconds > 0:
                 # A child stopped on a provider limit wall. Pause dispatch until
                 # the advertised reset (or the configured backoff) instead of
                 # re-dispatching straight into the same wall, in both persistent

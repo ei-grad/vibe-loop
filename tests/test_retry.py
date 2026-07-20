@@ -147,9 +147,19 @@ class LimitWallDetectionTests(unittest.TestCase):
         self.assertIn("usage limit", signal.marker.lower())
         self.assertIn("Jul 25th", signal.reset_text)
         assert signal.reset_delay is not None
-        # Five days out, so the parse is clamped by the misparse guard rather
-        # than stalling the supervisor for the full advertised window.
-        self.assertEqual(signal.reset_delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+        # The full ~4.7-day wait must survive: a calendar reset carries a
+        # self-validating date, so truncating it to the clock-only misparse cap
+        # would report a wake four days before the limit actually clears.
+        self.assertAlmostEqual(
+            signal.reset_delay,
+            (
+                datetime.datetime(2026, 7, 25, 3, 24, tzinfo=datetime.timezone.utc)
+                - now
+            ).total_seconds()
+            + QUOTA_RESET_MARGIN_SECONDS,
+            delta=1.0,
+        )
+        self.assertGreater(signal.reset_delay, QUOTA_RESET_MAX_DELAY_SECONDS)
 
     def test_absolute_reset_within_the_cap_is_preserved(self) -> None:
         # A near-term calendar reset must survive intact: it is under the cap,
@@ -166,18 +176,22 @@ class LimitWallDetectionTests(unittest.TestCase):
             delta=1.0,
         )
 
-    def test_already_elapsed_absolute_reset_does_not_stall(self) -> None:
-        # A wall message read after its reset already passed must not stall the
-        # loop. The clock-only rule rolls a past time to tomorrow; the calendar
-        # parse sees the date is behind us and yields no wait beyond the margin.
+    def test_elapsed_absolute_reset_falls_back_to_configured_backoff(self) -> None:
+        # Recorded wall messages are re-parsed long after the fact. An elapsed
+        # reset must not read as "wait zero seconds", which would let the
+        # supervisor re-dispatch in a tight loop against a wall that may still
+        # be standing; it reports no usable reset so the caller backs off.
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
-        clock_only = parse_limit_wall_reset_delay("resets 3:24 AM", now=now)
-        dated = parse_limit_wall_reset_delay(
-            "try again at Jul 20th, 2026 3:24 AM", now=now
+        self.assertIsNone(
+            parse_limit_wall_reset_delay("try again at Jul 20th, 2026 3:24 AM", now=now)
         )
-        assert clock_only is not None and dated is not None
-        self.assertEqual(dated, 0.0)
-        self.assertGreater(clock_only, dated)
+        signal = detect_limit_wall(
+            "You've hit your usage limit, try again at Jul 20th, 2026 3:24 AM",
+            now=now,
+        )
+        assert signal is not None
+        self.assertIsNone(signal.reset_delay)
+        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 1800.0)
 
     def test_iso_reset_timestamp_is_parsed(self) -> None:
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
@@ -434,6 +448,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 max_retries=3,
                 sleep=fake_sleep,
                 on_retry=on_retry,
+                detect_limit_walls=True,
                 on_limit_wall=walls.append,
             )
         self.assertEqual(result.returncode, 1)
@@ -441,7 +456,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         fake_sleep.assert_not_called()
         on_retry.assert_not_called()
         self.assertEqual(len(walls), 1)
-        self.assertEqual(walls[0].reset_delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+        self.assertGreater(walls[0].reset_delay, QUOTA_RESET_MAX_DELAY_SECONDS)
 
     def test_limit_wall_on_stdout_is_detected(self) -> None:
         # Agent CLIs differ on which stream carries the refusal notice.
@@ -458,6 +473,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 text=True,
                 max_retries=3,
                 sleep=fake_sleep,
+                detect_limit_walls=True,
                 on_limit_wall=walls.append,
             )
         self.assertEqual(mock_run.call_count, 1)
@@ -473,6 +489,11 @@ class RetrySubprocessRunTests(unittest.TestCase):
             "Overloaded, please retry",
             "ECONNRESET",
             "at capacity",
+            # Collision cases: these carry a wall phrase but are independently
+            # transient and advertise no reset, so they must keep their
+            # retries rather than buying a half-hour pause for a 30s outage.
+            "Error 429: Too Many Requests. usage limit exceeded, retry after 30s",
+            "503: weekly limit reached, service temporarily unavailable",
         ):
             with self.subTest(stderr=stderr):
                 fake_sleep = MagicMock()
@@ -488,11 +509,82 @@ class RetrySubprocessRunTests(unittest.TestCase):
                         text=True,
                         max_retries=2,
                         sleep=fake_sleep,
+                        detect_limit_walls=True,
                         on_limit_wall=walls.append,
                     )
                 self.assertEqual(mock_run.call_count, 3)
                 self.assertEqual(fake_sleep.call_count, 2)
                 self.assertEqual(walls, [])
+
+    def test_reset_less_wall_that_is_not_transient_still_short_circuits(self) -> None:
+        # A wall phrase with no reset and no independent transient marker has
+        # nothing suggesting recoverability, so it stays terminal and backs off
+        # on the configured default rather than retrying into the wall. Note
+        # the phrasing: most reset-less wall texts also match a transient
+        # pattern and therefore keep their retries (see the collision cases in
+        # test_ordinary_transients_still_retry_with_wall_detection_on); this
+        # one does not, so it is the branch that still short-circuits.
+        fake_sleep = MagicMock()
+        walls: list[LimitWallSignal] = []
+        no_reset = subprocess.CompletedProcess(
+            args=["test"],
+            returncode=1,
+            stdout="",
+            stderr="You've reached your Fable 5 limit · switch models",
+        )
+        with patch("subprocess.run", return_value=no_reset) as mock_run:
+            retry_subprocess_run(
+                ["test"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                max_retries=2,
+                sleep=fake_sleep,
+                detect_limit_walls=True,
+                on_limit_wall=walls.append,
+            )
+        self.assertEqual(mock_run.call_count, 1)
+        fake_sleep.assert_not_called()
+        self.assertEqual(len(walls), 1)
+        self.assertIsNone(walls[0].reset_delay)
+        self.assertEqual(
+            limit_wall_backoff_seconds(walls[0], 1800.0),
+            1800.0,
+        )
+
+    def test_year_less_calendar_reset_rolls_across_the_year_boundary(self) -> None:
+        # "Jan 2nd" read on Dec 31 must not parse as ~363 days in the past,
+        # which previously collapsed to a zero pause and spun the supervisor.
+        now = datetime.datetime(2026, 12, 31, 23, 0, tzinfo=datetime.timezone.utc)
+        signal = detect_limit_wall(
+            "You've hit your usage limit. try again at Jan 2nd 3:00 AM.", now=now
+        )
+        assert signal is not None
+        assert signal.reset_delay is not None
+        self.assertAlmostEqual(
+            signal.reset_delay,
+            28 * 3600 + QUOTA_RESET_MARGIN_SECONDS,
+            delta=1.0,
+        )
+
+    def test_wall_detection_is_opt_in(self) -> None:
+        # Detection must not silently change unrelated call sites (task
+        # selection, generated profiles) that never asked for it.
+        fake_sleep = MagicMock()
+        wall_result = subprocess.CompletedProcess(
+            args=["test"], returncode=1, stdout="", stderr=OBSERVED_USAGE_WALL
+        )
+        with patch("subprocess.run", return_value=wall_result) as mock_run:
+            retry_subprocess_run(
+                ["test"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                max_retries=2,
+                sleep=fake_sleep,
+            )
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(fake_sleep.call_count, 2)
 
     def test_limit_wall_detection_can_be_disabled(self) -> None:
         fake_sleep = MagicMock()

@@ -291,11 +291,28 @@ disagree about which stream carries the refusal, and only applies to a nonzero
 exit so a successful run that merely quotes a limit phrase stays on the normal
 path.
 
+Detection is opt-in per call site. It is a behaviour change to the retry
+contract, so paths that never asked for it — task selection, generated-profile
+refresh — keep their existing retry semantics rather than inheriting wall
+classification from a default.
+
+The no-retry short circuit requires evidence that the wall is genuinely
+long-lived: either a parseable reset time, or the absence of any independent
+transient marker. Provider rate-limit bodies routinely carry a wall phrase while
+advertising recovery in seconds ("usage limit exceeded, retry after 30s"); those
+keep their bounded retries, because trading three short retries for a
+half-hour pause the provider never asked for is strictly worse.
+
 Advertised resets may be wall-clock ("resets 1am (UTC)") or an absolute calendar
 instant ("try again at Jul 25th, 2026 3:24 AM"). Calendar forms are parsed in
 preference to clock-only forms, since the two share their digits and a clock
-reading of a multi-day wall understates the wait. Parsed delays keep the
-existing safety margin and misparse cap.
+reading of a multi-day wall understates the wait. The two forms carry different
+misparse bounds: a bare clock cannot meaningfully mean more than a day, while a
+full date is self-validating and a multi-day account limit is a legitimate
+reading that must not be truncated into an untruthful wake. A year-less calendar
+date that reads as past has crossed the year boundary and rolls forward. An
+already-elapsed reset reports no usable reset at all rather than a zero wait,
+so the caller falls back to its configured backoff instead of spinning.
 
 When native planning hits a wall, the decision is journaled with its own
 `limit_wall` status and pause rather than the generic `analysis_error` status,

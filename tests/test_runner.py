@@ -34,6 +34,7 @@ from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+    AgentLimitWallError,
     AgentRuntimeContext,
     SchedulerLockBusy,
     TaskActivationError,
@@ -4364,6 +4365,50 @@ class AnalysisAgentTests(unittest.TestCase):
             payload = runner.run_analysis_agent("inspect", output_path)
 
             self.assertIsNone(payload)
+            self.assertFalse(output_path.exists())
+
+    def test_run_analysis_agent_raises_on_a_real_limit_wall_subprocess(self) -> None:
+        # End-to-end over a real subprocess: the observed Codex wall text must
+        # travel from the agent's exit through the retry layer and surface as a
+        # typed error carrying the reset, without spending any retry attempt.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            stub = repo / "analysis-stub.py"
+            attempts = repo / "attempts.log"
+            stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                f"open({str(attempts)!r}, 'a').write('x')\n"
+                'sys.stderr.write("You\'ve hit your usage limit. Your limit "\n'
+                '    "will reset and you can try again at Jul 25th, 2026 '
+                '3:24 AM.")\n'
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="worker",
+                        analysis_command=f"{stub} {{prompt}}",
+                    ),
+                )
+            )
+            output_path = repo / "decision.json"
+
+            with self.assertRaises(AgentLimitWallError) as caught:
+                runner.run_analysis_agent("inspect", output_path)
+
+            error = caught.exception
+            self.assertIn("Jul 25th", error.signal.reset_text)
+            assert error.signal.reset_delay is not None
+            # Days out, so the pause is the parsed reset rather than the
+            # configured default backoff.
+            self.assertGreater(error.pause_seconds, 24 * 3600)
+            self.assertEqual(error.pause_seconds, error.signal.reset_delay)
+            # Invoked exactly once: no jittered retries were burned.
+            self.assertEqual(attempts.read_text(), "x")
             self.assertFalse(output_path.exists())
 
     def test_run_analysis_agent_returns_none_on_non_json_output(self) -> None:

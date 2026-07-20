@@ -131,13 +131,32 @@ LIMIT_WALL_RESET_ISO_PATTERN = re.compile(
 )
 
 
+# The clock-only parser reads a bare wall-clock time, where anything beyond a
+# day is certainly a misparse; the calendar parser reads a full self-validating
+# date, so a multi-day account limit is a legitimate reading and must not be
+# truncated into an untruthful wake.
+LIMIT_WALL_RESET_MAX_DELAY_SECONDS = 7 * 24 * 3600.0
+
+
 def _delay_until(
     reset: datetime.datetime,
     now: datetime.datetime | None,
-) -> float:
+    *,
+    max_delay: float = QUOTA_RESET_MAX_DELAY_SECONDS,
+) -> float | None:
+    """Seconds until an absolute reset instant, or None once it has passed.
+
+    An elapsed reset must not read as "wait zero seconds": recorded wall
+    messages are re-parsed long after the fact, and a zero pause would let the
+    supervisor re-dispatch immediately in a tight loop. Returning None makes the
+    caller fall back to its configured backoff, which is the honest answer when
+    the advertised instant no longer says anything about the current wall.
+    """
     current = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
     delay = (reset - current).total_seconds() + QUOTA_RESET_MARGIN_SECONDS
-    return min(max(delay, 0.0), QUOTA_RESET_MAX_DELAY_SECONDS)
+    if delay <= 0.0:
+        return None
+    return min(delay, max_delay)
 
 
 def _reset_delay_from_date_match(
@@ -171,7 +190,15 @@ def _reset_delay_from_date_match(
         )
     except ValueError:
         return None
-    return _delay_until(reset, now)
+    if not groups.get("year") and reset < current:
+        # A year-less calendar reset always advertises a near-future instant, so
+        # a date that reads as past has crossed the year boundary ("Jan 2nd"
+        # seen on Dec 31). Roll it forward rather than reading it as elapsed.
+        try:
+            reset = reset.replace(year=year + 1)
+        except ValueError:
+            return None
+    return _delay_until(reset, now, max_delay=LIMIT_WALL_RESET_MAX_DELAY_SECONDS)
 
 
 def parse_quota_reset_delay(
@@ -197,8 +224,10 @@ def parse_quota_reset_delay(
 # straight into the same wall burns restart budget and stalls the loop, so
 # these are classified separately and paused until the advertised reset.
 DEFAULT_LIMIT_WALL_PATTERNS: tuple[str, ...] = (
-    r"you'?ve (?:reached|hit) your [^.\n]{0,60}?\blimit\b",
-    r"\b(?:usage|session|weekly|5-hour)\s+limit\s+(?:reached|exceeded)\b",
+    # The bound and the sentence-boundary exclusion keep the marker inside one
+    # clause, so a lazy match cannot run past a period into unrelated text.
+    r"you'?ve (?:reached|hit) your [^.\n]{0,120}?\blimits?\b",
+    r"\b(?:usage|session|weekly|5-hour)\s+limits?\s+(?:reached|exceeded)\b",
 )
 LIMIT_WALL_DEFAULT_BACKOFF_SECONDS = 1800.0
 # The advertised reset ("· resets 1am (UTC)") follows the limit phrase in the
@@ -361,13 +390,24 @@ def limit_wall_from_result(
     against a wall that cannot clear for hours. A zero exit is never a wall,
     which keeps a successful run that merely quotes a limit phrase off this
     path.
+
+    A match without a parseable reset is only treated as a wall when the result
+    is not independently transient. Provider rate-limit bodies say things like
+    "usage limit exceeded, retry after 30s": they carry a wall phrase but are
+    recoverable in seconds, and short-circuiting them would trade three bounded
+    retries for a half-hour pause the provider never asked for.
     """
     if result.returncode == 0:
         return None
     output = subprocess_result_output(result)
     if not output:
         return None
-    return detect_limit_wall(output, patterns, now=now)
+    signal = detect_limit_wall(output, patterns, now=now)
+    if signal is None:
+        return None
+    if signal.reset_delay is None and is_transient_subprocess_result(result):
+        return None
+    return signal
 
 
 def backoff_delay(
@@ -391,7 +431,7 @@ def retry_subprocess_run(
     jitter: float = DEFAULT_JITTER,
     on_retry: RetryCallback | None = None,
     sleep: Callable[[float], None] = time.sleep,
-    detect_limit_walls: bool = True,
+    detect_limit_walls: bool = False,
     limit_wall_patterns: Iterable[str] | None = None,
     on_limit_wall: Callable[[LimitWallSignal], None] | None = None,
     **subprocess_kwargs: Any,
