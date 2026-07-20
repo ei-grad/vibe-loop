@@ -405,7 +405,10 @@ inconsistent — absence cannot be verified against an identity that was never
 recorded — and reports `autopilot_supervisor_stop_record_missing_pid` or
 `autopilot_supervisor_record_missing_pid`. These blockers surface in the
 `ProjectStatus` payload so a stale cycle status cannot mask an unresolved
-supervisor.
+supervisor. A foreground supervisor writes its own terminal record while it is
+still unwinding, so a status sampled inside that short window legitimately
+reports `autopilot_supervisor_stop_record_live_process`; re-read status once the
+process has exited before treating it as an anomaly.
 
 **`start`** is the supported detached launcher on POSIX systems. It starts the
 same foreground `autopilot run` supervisor in a new session with standard input
@@ -445,8 +448,11 @@ vibe-loop autopilot stop --repo . --recover-stale \
 ```
 
 Recovery requires the exact recorded run and the fencing generation this
-installation last minted locally, read from the lock root's private token
-counter rather than from the backend status being recovered. A backend that
+installation last successfully acquired, read from a private record under the
+lock root rather than from the backend status being recovered. Only a granted
+acquire records that generation: a refused `autopilot start` fenced by the stale
+lock leaves it untouched, so the operator's natural retry cannot lock recovery
+out of the singleton it exists to release. A backend that
 reports a generation this installation never issued — another host's lock, or a
 lock re-created out of band — fails closed as a fencing mismatch. Recovery also
 refuses a live or identity-ambiguous owner, releases through the configured

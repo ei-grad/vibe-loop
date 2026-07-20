@@ -1439,6 +1439,21 @@ def detached_autopilot_identity(
     return None
 
 
+def supervisor_lock_released(status: IntegrationLockStatus, run_id: str) -> bool:
+    """True when the singleton lock is no longer held by `run_id`.
+
+    A successor supervisor that acquires the lock between polls must not read as
+    a failed release. An owner the backend reports without a run ID is not such a
+    successor: it is an unidentified holder, so it fails closed rather than
+    letting a still-held lock pass as released.
+    """
+
+    if not status.locked:
+        return True
+    current_run_id = str(status.metadata.get("run_id") or "")
+    return bool(current_run_id) and current_run_id != run_id
+
+
 def autopilot_supervisor_started_pid(
     run_store: RunStore,
     *,
@@ -1593,7 +1608,20 @@ def stop_detached_autopilot(
                     + ("foreign_host" if owner_host else "missing_host")
                 ),
             )
-        if pid is None and run_id and owner_run_id in {"", run_id}:
+        if run_id and owner_run_id and owner_run_id != run_id:
+            # Reject a run the lock does not name before deriving any identity
+            # from it, so the operator sees the real mismatch rather than a
+            # downstream consequence of it.
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                process_exited=not owner_live,
+                blocker="autopilot_stale_recovery_owner_mismatch",
+            )
+        if pid is None and run_id:
             # A command-backed singleton may record no PID at all. The exact
             # identity then comes from this installation's own started record
             # for that run, the only local witness of which process held the
@@ -1663,9 +1691,7 @@ def stop_detached_autopilot(
                         process_exists=checker,
                         command_timeout_seconds=backend_timeout(),
                     )
-                    lock_released = not current.locked or (
-                        str(current.metadata.get("run_id") or "") != run_id
-                    )
+                    lock_released = supervisor_lock_released(current, run_id)
                 except (LockBackendError, OSError):
                     lock_released = False
                 if not lock_released:
@@ -1896,12 +1922,7 @@ def stop_verified_detached_autopilot(
                     pid=identity.pid,
                     blocker="autopilot_stop_backend_status_failed",
                 )
-            # The target's lock is gone once the lock is unheld or a different
-            # run owns it; a successor supervisor acquiring the singleton between
-            # polls must not read as a failed release.
-            lock_released = not current.locked or (
-                str(current.metadata.get("run_id") or "") != identity.run_id
-            )
+            lock_released = supervisor_lock_released(current, identity.run_id)
             if process_exited and lock_released:
                 append_autopilot_stopped_record(
                     run_store,
@@ -3949,7 +3970,7 @@ def run_autopilot(
     finally:
         try:
             heartbeat.stop()
-            lock_manager.release_autopilot(
+            released = lock_manager.release_autopilot(
                 run_id=supervisor_run_id,
                 fencing_token=fencing_token,
                 command_timeout_seconds=30.0,
@@ -3964,6 +3985,7 @@ def run_autopilot(
                 ),
                 signal_number=termination_signal,
                 process_exited=False,
+                lock_released=released,
             )
         finally:
             signal_stack.close()

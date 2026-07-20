@@ -27,7 +27,12 @@ from vibe_loop.autopilot import (
 )
 from vibe_loop.cli import main
 from vibe_loop.config import load_config
-from vibe_loop.locks import AUTOPILOT_LOCK_NAME, LockManager, build_lock_manager
+from vibe_loop.locks import (
+    AUTOPILOT_LOCK_NAME,
+    LockBusy,
+    LockManager,
+    build_lock_manager,
+)
 from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     RunStore,
@@ -8371,7 +8376,7 @@ class AutopilotCliTests(unittest.TestCase):
                 config.state_path
                 / "locks"
                 / ".fencing-tokens"
-                / f"{AUTOPILOT_LOCK_NAME}.token"
+                / f"{AUTOPILOT_LOCK_NAME}.acquired"
             )
             self.assertTrue(token_file.is_file())
             token_file.unlink()
@@ -8388,6 +8393,74 @@ class AutopilotCliTests(unittest.TestCase):
                 result.blocker, "autopilot_stale_recovery_missing_fencing_token"
             )
             self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+    def test_recovery_does_not_report_release_for_an_unidentified_holder(self) -> None:
+        """A held lock reporting no run ID is not a successor; it fails closed.
+
+        Post-release verification treats a differing run ID as a successor that
+        legitimately took the singleton. A backend that quarantines `run_id` out
+        of its status payload must not thereby make a still-held lock read as
+        released and earn a terminal stop record.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            dead_pid = spawn_and_reap_pid()
+            manager.acquire_autopilot(
+                run_id="autopilot-dead", metadata={"pid": dead_pid}
+            )
+            # The release lands, then the lock reappears without an identity.
+            held = command_lock_state(state_path)
+            anonymous = dict(held[AUTOPILOT_LOCK_NAME])
+            anonymous.pop("run_id", None)
+
+            original_release = manager.backend.release_with_timeout
+
+            def release_then_reappear(
+                task_lock: object, *, timeout_seconds: float | None = None
+            ) -> None:
+                original_release(task_lock, timeout_seconds=timeout_seconds)
+                state_path.write_text(
+                    json.dumps({AUTOPILOT_LOCK_NAME: anonymous}), encoding="utf-8"
+                )
+
+            with patch.object(
+                manager.backend, "release_with_timeout", release_then_reappear
+            ):
+                with patch(
+                    "vibe_loop.autopilot.build_lock_manager", return_value=manager
+                ):
+                    result = stop_detached_autopilot(
+                        config,
+                        recovery=True,
+                        run_id="autopilot-dead",
+                        process_exists=lambda checked: False,
+                    )
+
+            self.assertFalse(result.stopped)
+            self.assertEqual(
+                result.blocker, "autopilot_stale_recovery_backend_release_failed"
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self.assertEqual(
+                collect_supervisor_status(
+                    run_store,
+                    process_exists=lambda checked: False,
+                ).state,
+                "idle",
+            )
 
     def test_command_backend_recovery_derives_pid_from_local_started_record(
         self,
@@ -8454,12 +8527,22 @@ class AutopilotCliTests(unittest.TestCase):
                 run_id="autopilot-other",
                 process_exists=checker,
             )
-            # A wrong run matches no local started record, so no PID can be
-            # derived for it and recovery fails closed before touching the
-            # backend at all.
+            # A run the lock does not name is rejected as a mismatch before any
+            # identity is derived from it, and the lock is left untouched.
             self.assertFalse(wrong_run.stopped)
-            self.assertEqual(wrong_run.blocker, "autopilot_stale_recovery_missing_pid")
+            self.assertEqual(
+                wrong_run.blocker, "autopilot_stale_recovery_owner_mismatch"
+            )
             self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+            # The reported operator sequence: a refused `autopilot start` against
+            # the stale lock must not burn the local generation and lock the
+            # recovery path out of the singleton it exists to release.
+            for _ in range(3):
+                with self.assertRaises(LockBusy):
+                    manager.acquire_autopilot(
+                        run_id="autopilot-retry", metadata={"pid": os.getpid()}
+                    )
 
             recovered = stop_detached_autopilot(
                 config,

@@ -109,9 +109,11 @@ vibe-loop autopilot stop --repo <repo> --recover-stale \
   --run-id <exact-supervisor-run-id> --json
 ```
 
-Recovery reads the fencing generation this installation last minted from the
-local token counter under the lock root, then requires the backend to report
-that same generation. It refuses live, foreign, missing-token, mismatched-token,
+Recovery reads the fencing generation this installation last successfully
+acquired, recorded under the lock root only when a backend actually granted the
+lock, then requires the backend to report that same generation. A refused
+acquire — a fenced `autopilot start` against the stale lock — must not advance
+it, or recovery would be locked out of the singleton it exists to release. It refuses live, foreign, missing-token, mismatched-token,
 or run-mismatched ownership. Never put a fencing token in argv, logs, prompts,
 or diagnostics. Directory and command lock backends use the same manager release
 and post-release verification path.

@@ -180,7 +180,13 @@ class LockManager:
         run_id: str,
         metadata: dict[str, object] | None = None,
     ) -> TaskLock:
-        return self.backend.acquire(task_id, run_id, metadata=metadata)
+        task_lock = self.backend.acquire(task_id, run_id, metadata=metadata)
+        record_acquired_fencing_token(
+            self.lock_root,
+            task_id,
+            fencing_token_value(task_lock.metadata.get("fencing_token")),
+        )
+        return task_lock
 
     def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
         current = self.current_lock(task_lock.task_id)
@@ -480,7 +486,7 @@ class LockManager:
         )
 
     def local_fencing_token(self, task_id: str) -> str:
-        return read_fencing_token(self.lock_root, task_id)
+        return read_acquired_fencing_token(self.lock_root, task_id)
 
     def release_autopilot(
         self,
@@ -1265,17 +1271,34 @@ def next_fencing_token(lock_root: Path, task_id: str) -> str:
     return str(next_token)
 
 
-def read_fencing_token(lock_root: Path, task_id: str) -> str:
-    """Locally recorded fencing generation for a task, or "" when unknown.
+def acquired_fencing_token_path(lock_root: Path, task_id: str) -> Path:
+    return lock_root / ".fencing-tokens" / f"{safe_name(task_id)}.acquired"
+
+
+def record_acquired_fencing_token(lock_root: Path, task_id: str, token: str) -> None:
+    """Remember the generation an acquire actually took, if it took one."""
+
+    if not token:
+        return
+    token_path = acquired_fencing_token_path(lock_root, task_id)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_update_lock(token_path):
+        token_path.write_text(f"{token}\n", encoding="utf-8")
+
+
+def read_acquired_fencing_token(lock_root: Path, task_id: str) -> str:
+    """Generation this installation last successfully acquired, or "".
 
     Both lock backends mint fencing tokens locally through `next_fencing_token`,
-    so this counter is an independent witness of the last generation this
-    installation acquired. Stale recovery compares it against the generation the
-    backend reports, which a token read back out of that same backend status
-    cannot do.
+    but that counter advances on every acquire *attempt*: the command backend
+    mints before it knows whether the backend granted the lock, so a refused
+    acquire burns a generation. Only a granted acquire records here, which makes
+    this an independent witness of the generation the backend should still be
+    reporting. Stale recovery compares it against the generation the backend
+    reports, which a token read back out of that same backend status cannot do.
     """
 
-    token_path = lock_root / ".fencing-tokens" / f"{safe_name(task_id)}.token"
+    token_path = acquired_fencing_token_path(lock_root, task_id)
     try:
         return fencing_token_value(token_path.read_text(encoding="utf-8").strip())
     except OSError:

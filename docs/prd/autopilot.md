@@ -128,9 +128,11 @@ signal.
 
 An already-absent process with a remaining lock requires the separate
 `autopilot stop --recover-stale --run-id <exact-run>` path. Recovery requires
-the exact recorded run and the fencing generation this installation last minted,
-read from the local token counter rather than from the backend status being
-recovered; comparing a backend token against itself would fence nothing. A
+the exact recorded run and the fencing generation this installation last
+successfully acquired, read from a local record rather than from the backend
+status being recovered; comparing a backend token against itself would fence
+nothing. Only a granted acquire may advance that record: a refused acquire
+against the very lock being recovered must not fence the operator out of it. A
 generation this installation never issued, a live owner, or a run mismatch all
 fail closed. Recovery releases through the configured directory or command
 backend and verifies absence afterward. Fencing tokens must not be accepted in
