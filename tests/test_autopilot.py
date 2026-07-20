@@ -16,6 +16,7 @@ from unittest import mock
 
 from vibe_loop.autopilot import (
     AutopilotCycleResult,
+    AutopilotTerminationRequested,
     MaintenanceCommandResult,
     NativePlanningProcessResult,
     NativePlanningWorkerInterrupted,
@@ -23,6 +24,7 @@ from vibe_loop.autopilot import (
     ProjectRegistry,
     TaskQueueStatus,
     autopilot_child_command,
+    autopilot_termination_signals,
     build_native_planning_decision_prompt,
     collect_external_run_supervisor,
     collect_project_status,
@@ -42,12 +44,15 @@ from vibe_loop.autopilot import (
     run_autopilot,
     run_maintenance_command,
     launch_native_planning_worker,
+    launch_run_until_done,
     run_native_planning,
     run_worktree_disposition,
     start_detached_autopilot,
+    stop_detached_autopilot,
     wait_for_processes,
     wait_for_idle_change,
     WaitMessageAdapterError,
+    _bounded_idle_wake_output,
 )
 from vibe_loop.config import load_config, normalize_registry_runtime_context
 from vibe_loop.locks import (
@@ -64,6 +69,7 @@ from vibe_loop.runs import (
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RunResult,
     RunStore,
@@ -596,6 +602,37 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertNotEqual(payload["supervisor"]["state"], "running")
         self.assertEqual(payload["supervisor"]["run_id"], "autopilot-stale")
 
+    def test_project_status_separates_stopped_supervisor_from_last_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                    "cycle_id": "autopilot-1-c1",
+                    "status": "completed",
+                    "occurred_at": "2026-05-09T00:00:01+00:00",
+                }
+            )
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+                    "run_id": "autopilot-1",
+                    "pid": 999,
+                    "process_exited": True,
+                    "lock_released": True,
+                    "occurred_at": "2026-05-09T00:00:02+00:00",
+                }
+            )
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["supervisor"]["state"], "stopped")
+        self.assertEqual(payload["supervisor"]["run_id"], "autopilot-1")
+        self.assertEqual(payload["last_cycle"]["status"], "completed")
+
 
 class ExternalRunSupervisorTests(unittest.TestCase):
     def _store_with_records(
@@ -739,6 +776,14 @@ class AutopilotRunTests(unittest.TestCase):
         types = [record["record_type"] for record in records]
         self.assertIn(AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE, types)
         self.assertIn(AUTOPILOT_CYCLE_RECORD_TYPE, types)
+        self.assertIn(AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE, types)
+        stopped = next(
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
+        )
+        self.assertEqual(stopped["stop_mode"], "foreground_exit")
+        self.assertTrue(stopped["lock_released"])
         policy_records = [
             record
             for record in records
@@ -792,6 +837,170 @@ class AutopilotRunTests(unittest.TestCase):
             observed_status.metadata["heartbeat_at"],
             observed_status.metadata["started_at"],
         )
+
+    def test_sigterm_unwinds_through_fenced_supervisor_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                os.kill(os.getpid(), signal.SIGTERM)
+                raise AssertionError("SIGTERM handler did not interrupt the launcher")
+
+            summary = run_autopilot(config, once=True, launcher=launcher)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
+
+        self.assertTrue(summary.started)
+        self.assertIsNone(lock_after)
+        stopped = [
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
+        ]
+        self.assertEqual(stopped[-1]["signal"], "SIGTERM")
+        self.assertTrue(stopped[-1]["lock_released"])
+
+    @unittest.skipUnless(
+        hasattr(signal, "pthread_sigmask"),
+        "atomic signal setup requires POSIX signal masking",
+    )
+    def test_sigterm_after_acquire_releases_lock_before_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            real_acquire = manager.acquire_autopilot
+
+            def acquire_then_signal(*, run_id, metadata=None):
+                task_lock = real_acquire(run_id=run_id, metadata=metadata)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return task_lock
+
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.build_lock_manager",
+                    return_value=manager,
+                ),
+                mock.patch.object(
+                    manager,
+                    "acquire_autopilot",
+                    side_effect=acquire_then_signal,
+                ),
+            ):
+                summary = run_autopilot(config, once=True)
+
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        self.assertTrue(summary.started)
+        self.assertIsNone(lock_after)
+
+    def test_sigterm_after_acquire_is_latched_without_pthread_sigmask(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            real_acquire = manager.acquire_autopilot
+
+            def acquire_then_signal(*, run_id, metadata=None):
+                task_lock = real_acquire(run_id=run_id, metadata=metadata)
+                os.kill(os.getpid(), signal.SIGTERM)
+                return task_lock
+
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.build_lock_manager",
+                    return_value=manager,
+                ),
+                mock.patch.object(
+                    manager,
+                    "acquire_autopilot",
+                    side_effect=acquire_then_signal,
+                ),
+                mock.patch.object(signal, "pthread_sigmask", None, create=True),
+            ):
+                summary = run_autopilot(config, once=True)
+
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        self.assertTrue(summary.started)
+        self.assertIsNone(lock_after)
+
+    def test_repeated_signals_are_coalesced_during_cleanup(self) -> None:
+        with mock.patch.object(signal, "pthread_sigmask", None, create=True):
+            with autopilot_termination_signals() as enable_signals:
+                enable_signals()
+                with self.assertRaises(AutopilotTerminationRequested) as caught:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                os.kill(os.getpid(), signal.SIGINT)
+
+        self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
+
+    @unittest.skipUnless(
+        hasattr(signal, "pthread_sigmask"),
+        "atomic signal setup requires POSIX signal masking",
+    )
+    def test_partial_signal_handler_install_restores_handler_and_mask(self) -> None:
+        previous_int = signal.getsignal(signal.SIGINT)
+        with (
+            mock.patch(
+                "vibe_loop.autopilot.signal.pthread_sigmask",
+                return_value=set(),
+            ) as change_mask,
+            mock.patch(
+                "vibe_loop.autopilot.signal.signal",
+                side_effect=[None, OSError("install failed"), None],
+            ) as install,
+            self.assertRaisesRegex(OSError, "install failed"),
+        ):
+            with autopilot_termination_signals():
+                self.fail("context unexpectedly entered")
+
+        self.assertEqual(
+            install.call_args_list[-1], mock.call(signal.SIGINT, previous_int)
+        )
+        self.assertEqual(change_mask.call_args_list[0].args[0], signal.SIG_BLOCK)
+        self.assertEqual(
+            change_mask.call_args_list[-1], mock.call(signal.SIG_SETMASK, set())
+        )
+
+    def test_signal_interrupt_terminates_active_child_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock(pid=4321)
+            process.wait.side_effect = AutopilotTerminationRequested(signal.SIGTERM)
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.subprocess.Popen",
+                    return_value=process,
+                ),
+                mock.patch(
+                    "vibe_loop.autopilot.terminate_command_process_group"
+                ) as terminate,
+            ):
+                with self.assertRaises(AutopilotTerminationRequested):
+                    launch_run_until_done(
+                        ["worker"],
+                        cwd=Path(directory),
+                        log_path=Path(directory) / "worker.log",
+                    )
+
+        terminate.assert_called_once_with(process)
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "setsid"),
@@ -854,10 +1063,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
             self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
 
-    @unittest.skipUnless(
-        os.name == "posix" and hasattr(os, "setsid"),
-        "detached autopilot start is POSIX-only",
-    )
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
     def test_start_preserves_command_lock_runtime_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -956,6 +1162,7 @@ class AutopilotRunTests(unittest.TestCase):
                 runtime_context={"PROJECT_SELECTOR": selector},
             )
             launch = start_detached_autopilot(config, interval=30)
+            stop_result = None
             try:
                 deadline = time.monotonic() + 10.0
                 maintenance_probe = repo / "maintenance-env.json"
@@ -981,14 +1188,17 @@ class AutopilotRunTests(unittest.TestCase):
                 self.assertEqual(status.supervisor.pid, launch.pid)
                 self.assertEqual(status.supervisor.run_id, launch.run_id)
                 self.assertNotIn(selector, payload)
+                stop_result = stop_detached_autopilot(config)
             finally:
-                stop_test_process_group(launch.pid, launch.process_group_id)
+                if stop_result is None or not stop_result.stopped:
+                    stop_test_process_group(launch.pid, launch.process_group_id)
             manager = build_lock_manager(
                 config.repo,
                 config.state_path / "locks",
                 config.locks,
                 runtime_context=config.runtime_environment,
             )
+            self.assertTrue(stop_result.stopped, stop_result.blocker)
             self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
 
     @unittest.skipUnless(
@@ -1334,6 +1544,303 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(command[command.index("--jobs") + 1], "3")
         self.assertEqual(command[command.index("--max-slices") + 1], "4")
         self.assertEqual(command[command.index("--max-tasks") + 1], "2")
+
+
+class AutopilotStopTests(unittest.TestCase):
+    def _locked_detached_supervisor(
+        self,
+        repo: Path,
+        *,
+        run_id: str = "autopilot-1",
+        pid: int = 4321,
+        birth_id: str = "boot-id:123",
+    ):
+        configured_repo(repo, [("TASK-01", "Done", "", "finished slice")])
+        config = load_config(repo)
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
+        holder = manager.acquire_autopilot(
+            run_id=run_id,
+            metadata={"pid": pid},
+        )
+        RunStore(config.state_path / "runs.jsonl").append_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+                "run_id": run_id,
+                "pid": pid,
+                "process_group_id": pid,
+                "session_id": pid,
+                "process_birth_id": birth_id,
+                "launch_mode": "detached_posix_session",
+                "occurred_at": "2026-05-09T00:00:00+00:00",
+            }
+        )
+        return config, manager, holder
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_stop_signals_exact_pidfd_and_verifies_lock_release(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            signals: list[tuple[int, int]] = []
+            closed: list[int] = []
+
+            def send_signal(pidfd: int, signal_number: int) -> None:
+                signals.append((pidfd, signal_number))
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+            result = stop_detached_autopilot(
+                config,
+                process_exists=lambda _pid: True,
+                process_group_lookup=lambda _pid: 4321,
+                session_lookup=lambda _pid: 4321,
+                birth_identity_lookup=lambda _pid: "boot-id:123",
+                pidfd_open=lambda _pid: 17,
+                pidfd_signal=send_signal,
+                pidfd_exited=lambda _pidfd: True,
+                close_fd=closed.append,
+            )
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        self.assertTrue(result.stopped)
+        self.assertTrue(result.process_exited)
+        self.assertTrue(result.lock_released)
+        self.assertEqual(signals, [(17, signal.SIGTERM)])
+        self.assertEqual(closed, [17])
+        self.assertIsNone(lock_after)
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_stop_refuses_pid_reuse_identity_mismatch_without_signaling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            signals: list[tuple[int, int]] = []
+            try:
+                result = stop_detached_autopilot(
+                    config,
+                    process_exists=lambda _pid: True,
+                    process_group_lookup=lambda _pid: 4321,
+                    session_lookup=lambda _pid: 4321,
+                    birth_identity_lookup=lambda _pid: "boot-id:reused",
+                    pidfd_open=lambda _pid: 18,
+                    pidfd_signal=lambda pidfd, signal_number: signals.append(
+                        (pidfd, signal_number)
+                    ),
+                    close_fd=lambda _pidfd: None,
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:pid_reuse_or_mismatch",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
+
+    def test_stale_recovery_requires_exact_run_and_local_fencing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            wrong_run = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-other",
+                process_exists=lambda _pid: False,
+            )
+            lock_after_wrong_run = manager.status(AUTOPILOT_LOCK_NAME)
+            recovered = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-1",
+                process_exists=lambda _pid: False,
+            )
+            lock_after_recovery = manager.status(AUTOPILOT_LOCK_NAME)
+
+        self.assertEqual(
+            wrong_run.blocker,
+            "autopilot_stale_recovery_owner_mismatch",
+        )
+        self.assertEqual(
+            lock_after_wrong_run["fencing_token"], holder.metadata["fencing_token"]
+        )
+        self.assertTrue(recovered.stopped)
+        self.assertTrue(recovered.recovered)
+        self.assertIsNone(lock_after_recovery)
+
+    def test_stale_recovery_refuses_live_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            try:
+                result = stop_detached_autopilot(
+                    config,
+                    recovery=True,
+                    run_id="autopilot-1",
+                    process_exists=lambda _pid: True,
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertEqual(result.blocker, "autopilot_stale_recovery_live_owner")
+        self.assertTrue(lock_still_held)
+
+    def test_stale_recovery_refuses_expired_foreign_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            metadata_path = holder.path / "lock.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            metadata.update(
+                {
+                    "host": "foreign.example.invalid",
+                    "lease_seconds": 1,
+                    "heartbeat_at": "2020-01-01T00:00:00+00:00",
+                }
+            )
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            try:
+                result = stop_detached_autopilot(
+                    config,
+                    recovery=True,
+                    run_id="autopilot-1",
+                    process_exists=lambda _pid: False,
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stale_recovery_identity_unverified:foreign_host",
+        )
+        self.assertTrue(lock_still_held)
+
+    def test_stale_recovery_redacts_backend_release_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            try:
+                with mock.patch.object(
+                    LockManager,
+                    "recover_stale_autopilot",
+                    side_effect=LockBackendError("secret-fence-1"),
+                ):
+                    result = stop_detached_autopilot(
+                        config,
+                        recovery=True,
+                        run_id="autopilot-1",
+                        process_exists=lambda _pid: False,
+                    )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stale_recovery_backend_release_failed",
+        )
+        self.assertNotIn("secret", json.dumps(result.to_json()))
+        self.assertTrue(lock_still_held)
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_interrupted_wait_never_reports_success_with_lock_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            try:
+                result = stop_detached_autopilot(
+                    config,
+                    process_exists=lambda _pid: True,
+                    process_group_lookup=lambda _pid: 4321,
+                    session_lookup=lambda _pid: 4321,
+                    birth_identity_lookup=lambda _pid: "boot-id:123",
+                    pidfd_open=lambda _pid: 19,
+                    pidfd_signal=lambda _pidfd, _signal_number: None,
+                    pidfd_exited=lambda _pidfd: False,
+                    close_fd=lambda _pidfd: None,
+                    sleep=lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.blocker, "autopilot_stop_interrupted")
+        self.assertTrue(lock_still_held)
+
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_initial_status_and_process_wait_share_one_stop_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder = self._locked_detached_supervisor(Path(directory))
+            now = [0.0]
+            sleeps: list[float] = []
+            real_status = manager.autopilot_status
+            status_calls = 0
+
+            def slow_initial_status(**kwargs):
+                nonlocal status_calls
+                status_calls += 1
+                if status_calls == 1:
+                    now[0] = 9.5
+                return real_status(**kwargs)
+
+            def advance(seconds: float) -> None:
+                sleeps.append(seconds)
+                now[0] += seconds
+
+            try:
+                with (
+                    mock.patch(
+                        "vibe_loop.autopilot.build_lock_manager",
+                        return_value=manager,
+                    ),
+                    mock.patch.object(
+                        manager,
+                        "autopilot_status",
+                        side_effect=slow_initial_status,
+                    ),
+                ):
+                    result = stop_detached_autopilot(
+                        config,
+                        timeout=10.0,
+                        process_exists=lambda _pid: True,
+                        process_group_lookup=lambda _pid: 4321,
+                        session_lookup=lambda _pid: 4321,
+                        birth_identity_lookup=lambda _pid: "boot-id:123",
+                        pidfd_open=lambda _pid: 20,
+                        pidfd_signal=lambda _pidfd, _signal_number: None,
+                        pidfd_exited=lambda _pidfd: False,
+                        close_fd=lambda _pidfd: None,
+                        sleep=advance,
+                        monotonic=lambda: now[0],
+                    )
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.blocker, "autopilot_stop_timeout")
+        self.assertLessEqual(sum(sleeps), 0.51)
 
 
 class LimitWallPauseTests(unittest.TestCase):
@@ -2305,6 +2812,32 @@ class AutopilotIdleWaitTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.category, "event_too_large")
 
+    def test_wake_command_interrupt_gracefully_terminates_process_group(self) -> None:
+        process = mock.Mock(pid=4747)
+        process.poll.return_value = None
+        with (
+            mock.patch(
+                "vibe_loop.autopilot.subprocess.Popen",
+                return_value=process,
+            ),
+            mock.patch(
+                "vibe_loop.autopilot.time_module.sleep",
+                side_effect=KeyboardInterrupt,
+            ),
+            mock.patch(
+                "vibe_loop.autopilot.terminate_command_process_group"
+            ) as terminate,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            _bounded_idle_wake_output(
+                "adapter",
+                environment={},
+                timeout=5.0,
+                cwd=None,
+            )
+
+        terminate.assert_called_once_with(process)
+
 
 class NativePlanningTests(unittest.TestCase):
     def test_read_only_no_plan_decision_journals_skipped_worker_stage(self) -> None:
@@ -2533,10 +3066,16 @@ class NativePlanningTests(unittest.TestCase):
             def interrupted_worker(command, *, on_start, **kwargs):
                 on_start(4343)
                 raise NativePlanningWorkerInterrupted(
-                    NativePlanningProcessResult(exit_code=-9, pid=4343)
+                    NativePlanningProcessResult(exit_code=-15, pid=4343),
+                    AutopilotTerminationRequested(signal.SIGTERM),
                 )
 
-            with self.assertRaises(KeyboardInterrupt):
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.collect_task_queue_status"
+                ) as collect_queue,
+                self.assertRaises(AutopilotTerminationRequested) as caught,
+            ):
                 run_native_planning(
                     config,
                     cycle_id="cycle-interrupt",
@@ -2552,6 +3091,8 @@ class NativePlanningTests(unittest.TestCase):
                 )
             records = run_store.read_records()
 
+        self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
+        collect_queue.assert_not_called()
         self.assertEqual(records[-2]["phase"], "started")
         self.assertEqual(records[-1]["phase"], "terminal")
         self.assertEqual(records[-1]["status"], "interrupted")
@@ -2650,13 +3191,16 @@ class NativePlanningTests(unittest.TestCase):
             kill.assert_called_once_with(timed_out_process)
 
             interrupted_process = mock.Mock(pid=4646)
-            interrupted_process.wait.side_effect = [KeyboardInterrupt(), -9]
+            interrupted_process.wait.side_effect = KeyboardInterrupt()
+            interrupted_process.returncode = -15
             with (
                 mock.patch(
                     "vibe_loop.autopilot.subprocess.Popen",
                     return_value=interrupted_process,
                 ),
-                mock.patch("vibe_loop.autopilot.kill_command_process_group") as kill,
+                mock.patch(
+                    "vibe_loop.autopilot.terminate_command_process_group"
+                ) as terminate,
                 self.assertRaises(NativePlanningWorkerInterrupted),
             ):
                 launch_native_planning_worker(
@@ -2666,7 +3210,7 @@ class NativePlanningTests(unittest.TestCase):
                     timeout_seconds=0,
                     on_start=lambda pid: None,
                 )
-            kill.assert_called_once_with(interrupted_process)
+            terminate.assert_called_once_with(interrupted_process)
 
 
 class AutopilotMaintenanceTests(unittest.TestCase):

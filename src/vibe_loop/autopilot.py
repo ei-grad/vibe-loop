@@ -3,13 +3,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import select
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time as time_module
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -37,6 +40,7 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     build_lock_manager,
+    fencing_token_value,
     redact_fencing_token_payload,
 )
 from vibe_loop.retry import parse_limit_wall_reset_delay
@@ -49,6 +53,7 @@ from vibe_loop.runs import (
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
@@ -593,6 +598,7 @@ def collect_supervisor_status(
         in {
             AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
             AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+            AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
         }
     ]
     cycle_record = next(
@@ -643,8 +649,54 @@ def collect_supervisor_status(
                 ),
                 record=(newest_record or supervisor_lock.metadata),
             )
-    elif supervisor_records:
-        newest_record = supervisor_records[-1]
+        if supervisor_lock.locked and supervisor_lock.state == "stale":
+            lock_run_id = str(supervisor_lock.metadata.get("run_id") or "")
+            lock_pid = int_value(supervisor_lock.metadata.get("pid"))
+            matching_records = [
+                record
+                for record in supervisor_records
+                if supervisor_record_matches_lock(
+                    record,
+                    run_id=lock_run_id,
+                    pid=lock_pid,
+                )
+            ]
+            newest_matching = matching_records[-1] if matching_records else None
+            record = dict(newest_matching or supervisor_lock.metadata)
+            record["stale_reason"] = supervisor_lock.stale_reason or "unknown"
+            return SupervisorStatus(
+                state="stale",
+                pid=lock_pid,
+                log=(
+                    path_value(newest_matching.get("log"))
+                    if newest_matching is not None
+                    else None
+                ),
+                run_id=lock_run_id,
+                observed_at=str(
+                    record.get("occurred_at")
+                    or supervisor_lock.metadata.get("heartbeat_at")
+                    or ""
+                ),
+                record=record,
+            )
+    newest_record = supervisor_records[-1] if supervisor_records else None
+    if (
+        newest_record is not None
+        and newest_record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
+    ):
+        return supervisor_status_from_record(newest_record, state="stopped")
+    if (
+        supervisor_lock is not None
+        and not supervisor_lock.locked
+        and newest_record is not None
+        and (
+            (record_pid := int_value(newest_record.get("pid"))) is None
+            or not process_checker(record_pid)
+        )
+    ):
+        return supervisor_status_from_record(newest_record, state="stopped")
+    if supervisor_lock is None and newest_record is not None:
         pid = int_value(newest_record.get("pid"))
         if pid and process_checker(pid):
             return supervisor_status_from_record(newest_record, state="running")
@@ -654,8 +706,8 @@ def collect_supervisor_status(
             cycle_record,
             state=str(cycle_record.get("status") or "idle"),
         )
-    if supervisor_records:
-        return supervisor_status_from_record(supervisor_records[-1], state="observed")
+    if newest_record is not None:
+        return supervisor_status_from_record(newest_record, state="observed")
     return SupervisorStatus()
 
 
@@ -895,6 +947,46 @@ class DetachedAutopilotLaunch:
         }
 
 
+@dataclasses.dataclass(frozen=True)
+class DetachedAutopilotIdentity:
+    run_id: str
+    pid: int
+    process_group_id: int
+    session_id: int
+    process_birth_id: str
+    record: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class AutopilotStopResult:
+    repo: Path
+    stopped: bool
+    state: str
+    run_id: str = ""
+    pid: int | None = None
+    process_exited: bool = False
+    lock_released: bool = False
+    recovered: bool = False
+    blocker: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.stopped else 2
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "repo": str(self.repo),
+            "stopped": self.stopped,
+            "state": self.state,
+            "run_id": self.run_id,
+            "pid": self.pid,
+            "process_exited": self.process_exited,
+            "lock_released": self.lock_released,
+            "recovered": self.recovered,
+            "blocker": self.blocker,
+        }
+
+
 def autopilot_child_command(
     config: VibeConfig,
     *,
@@ -1067,6 +1159,7 @@ def start_detached_autopilot(
     except OSError:
         process_group_id = None
         session_id = None
+    process_birth_id = process_birth_identity(process.pid)
 
     deadline = time_module.monotonic() + max(0.0, verification_timeout)
     blocker = "detached_autopilot_verification_timeout"
@@ -1081,6 +1174,7 @@ def start_detached_autopilot(
                 and status.state in {"held", "unknown"}
                 and lock_pid == process.pid
                 and lock_run_id
+                and status.metadata.get("stop_ready") is True
             ):
                 if (
                     process.poll() is not None
@@ -1099,6 +1193,7 @@ def start_detached_autopilot(
                         "pid": process.pid,
                         "process_group_id": process_group_id,
                         "session_id": session_id,
+                        "process_birth_id": process_birth_id,
                         "log": str(log_path),
                         "observed_state": status.state,
                         "launch_mode": "detached_posix_session",
@@ -1194,6 +1289,555 @@ def cleanup_detached_candidate(
     except Exception as exc:
         errors.append(f"{type(exc).__name__}:{exc}")
     return ";".join(errors)
+
+
+def process_birth_identity(pid: int, *, proc_root: Path = Path("/proc")) -> str:
+    if sys.platform != "linux" or pid <= 0:
+        return ""
+    try:
+        boot_id = (
+            (proc_root / "sys/kernel/random/boot_id")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+        stat_text = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    _prefix, separator, suffix = stat_text.rpartition(")")
+    fields = suffix.split() if separator else []
+    if not boot_id or len(fields) <= 19 or not fields[19].isdigit():
+        return ""
+    return f"{boot_id}:{fields[19]}"
+
+
+def open_process_pidfd(pid: int) -> int:
+    opener = getattr(os, "pidfd_open", None)
+    if opener is not None:
+        return opener(pid, 0)
+    if sys.platform != "linux":
+        raise OSError("pidfd signaling is unavailable")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc_pidfd_open = getattr(libc, "pidfd_open", None)
+    if libc_pidfd_open is None:
+        raise OSError("pidfd signaling is unavailable")
+    libc_pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+    libc_pidfd_open.restype = ctypes.c_int
+    pidfd = libc_pidfd_open(pid, 0)
+    if pidfd < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    return pidfd
+
+
+def send_process_pidfd_signal(pidfd: int, signal_number: int) -> None:
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if sender is not None:
+        sender(pidfd, signal_number)
+        return
+    if sys.platform != "linux":
+        raise OSError("pidfd signaling is unavailable")
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc_pidfd_send_signal = getattr(libc, "pidfd_send_signal", None)
+    if libc_pidfd_send_signal is None:
+        raise OSError("pidfd signaling is unavailable")
+    libc_pidfd_send_signal.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_void_p,
+        ctypes.c_uint,
+    ]
+    libc_pidfd_send_signal.restype = ctypes.c_int
+    result = libc_pidfd_send_signal(pidfd, signal_number, None, 0)
+    if result < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def process_pidfd_exited(pidfd: int) -> bool:
+    readable, _writable, _exceptional = select.select([pidfd], [], [], 0)
+    return bool(readable)
+
+
+def detached_autopilot_identity(
+    run_store: RunStore,
+    *,
+    run_id: str,
+    pid: int,
+) -> DetachedAutopilotIdentity | None:
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE:
+            continue
+        if record.get("launch_mode") != "detached_posix_session":
+            continue
+        if str(record.get("run_id") or "") != run_id:
+            continue
+        if int_value(record.get("pid")) != pid:
+            continue
+        process_group_id = int_value(record.get("process_group_id"))
+        session_id = int_value(record.get("session_id"))
+        process_birth_id = str(record.get("process_birth_id") or "")
+        if process_group_id is None or session_id is None or not process_birth_id:
+            return None
+        return DetachedAutopilotIdentity(
+            run_id=run_id,
+            pid=pid,
+            process_group_id=process_group_id,
+            session_id=session_id,
+            process_birth_id=process_birth_id,
+            record=record,
+        )
+    return None
+
+
+def append_autopilot_stopped_record(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    run_id: str,
+    pid: int | None,
+    stop_mode: str,
+    signal_number: int | None = None,
+    process_exited: bool = True,
+) -> None:
+    record: dict[str, object] = {
+        "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+        "record_type": AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+        "occurred_at": utc_now_iso(),
+        "repo": str(repo),
+        "run_id": run_id,
+        "pid": pid,
+        "stop_mode": stop_mode,
+        "process_exited": process_exited,
+        "lock_released": True,
+    }
+    if signal_number is not None:
+        record["signal"] = signal.Signals(signal_number).name
+    run_store.append_record(record)
+
+
+def stop_detached_autopilot(
+    config: VibeConfig,
+    *,
+    timeout: float = 10.0,
+    recovery: bool = False,
+    run_id: str = "",
+    process_exists: ProcessExists | None = None,
+    process_group_lookup: Callable[[int], int] | None = None,
+    session_lookup: Callable[[int], int] | None = None,
+    birth_identity_lookup: Callable[[int], str] | None = None,
+    pidfd_open: Callable[[int], int] | None = None,
+    pidfd_signal: Callable[[int, int], None] | None = None,
+    pidfd_exited: Callable[[int], bool] | None = None,
+    close_fd: Callable[[int], None] | None = None,
+    sleep: Sleep | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> AutopilotStopResult:
+    """Stop a verified detached supervisor or explicitly recover its stale lock."""
+
+    checker = process_exists if process_exists is not None else pid_exists
+    get_process_group = (
+        process_group_lookup if process_group_lookup is not None else os.getpgid
+    )
+    get_session = session_lookup if session_lookup is not None else os.getsid
+    get_birth_identity = (
+        birth_identity_lookup
+        if birth_identity_lookup is not None
+        else process_birth_identity
+    )
+    open_pidfd = pidfd_open if pidfd_open is not None else open_process_pidfd
+    send_pidfd_signal = (
+        pidfd_signal if pidfd_signal is not None else send_process_pidfd_signal
+    )
+    check_pidfd_exited = (
+        pidfd_exited if pidfd_exited is not None else process_pidfd_exited
+    )
+    close_process_fd = close_fd if close_fd is not None else os.close
+    sleeper = sleep if sleep is not None else time_module.sleep
+    clock = monotonic if monotonic is not None else time_module.monotonic
+    lock_manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+        runtime_context=config.runtime_environment,
+    )
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    backend_deadline = time_module.monotonic() + max(0.0, timeout)
+    stop_deadline = clock() + max(0.0, timeout)
+
+    def backend_timeout() -> float:
+        return max(0.001, backend_deadline - time_module.monotonic())
+
+    try:
+        status = lock_manager.autopilot_status(
+            process_exists=checker,
+            command_timeout_seconds=backend_timeout(),
+        )
+    except (LockBackendError, OSError):
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            blocker="autopilot_stop_backend_status_failed",
+        )
+    if not status.locked:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=True,
+            state="already_stopped",
+            process_exited=True,
+            lock_released=True,
+        )
+
+    owner_run_id = str(status.metadata.get("run_id") or "")
+    pid = int_value(status.metadata.get("pid"))
+    owner_live = pid is not None and checker(pid)
+    if recovery:
+        owner_host = str(status.metadata.get("host") or "")
+        if not owner_host or owner_host != socket.gethostname():
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                blocker=(
+                    "autopilot_stale_recovery_identity_unverified:"
+                    + ("foreign_host" if owner_host else "missing_host")
+                ),
+            )
+        if owner_live:
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                blocker="autopilot_stale_recovery_live_owner",
+            )
+        local_fencing_token = fencing_token_value(status.metadata.get("fencing_token"))
+        if not run_id:
+            blocker = "autopilot_stale_recovery_missing_run_id"
+        elif not local_fencing_token:
+            blocker = "autopilot_stale_recovery_missing_fencing_token"
+        else:
+            blocker = ""
+        if blocker:
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                process_exited=True,
+                blocker=blocker,
+            )
+        try:
+            released = lock_manager.recover_stale_autopilot(
+                run_id=run_id,
+                fencing_token=local_fencing_token,
+                process_exists=checker,
+                command_timeout_seconds=backend_timeout(),
+            )
+        except LockOwnerMismatch:
+            blocker = "autopilot_stale_recovery_owner_mismatch"
+        except LockFencingMismatch:
+            blocker = "autopilot_stale_recovery_fencing_mismatch"
+        except LockBackendError:
+            blocker = "autopilot_stale_recovery_backend_release_failed"
+        except OSError:
+            blocker = "autopilot_stale_recovery_backend_release_failed"
+        else:
+            if not released:
+                blocker = "autopilot_stale_recovery_lock_changed"
+            else:
+                try:
+                    lock_released = not lock_manager.autopilot_status(
+                        process_exists=checker,
+                        command_timeout_seconds=backend_timeout(),
+                    ).locked
+                except (LockBackendError, OSError):
+                    lock_released = False
+                if not lock_released:
+                    blocker = "autopilot_stale_recovery_backend_release_failed"
+                else:
+                    append_autopilot_stopped_record(
+                        run_store,
+                        repo=config.repo,
+                        run_id=run_id,
+                        pid=pid,
+                        stop_mode="fenced_stale_recovery",
+                    )
+                    return AutopilotStopResult(
+                        repo=config.repo,
+                        stopped=True,
+                        state="recovered",
+                        run_id=run_id,
+                        pid=pid,
+                        process_exited=True,
+                        lock_released=True,
+                        recovered=True,
+                    )
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            process_exited=not owner_live,
+            blocker=blocker,
+        )
+
+    if run_id:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_stop_recovery_identity_requires_recover_stale",
+        )
+    if not owner_live:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            process_exited=True,
+            blocker=(
+                "autopilot_supervisor_lock_stale:"
+                f"{status.stale_reason or 'missing_process'}"
+            ),
+        )
+    if sys.platform != "linux":
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker=f"autopilot_stop_unsupported_platform:{sys.platform}",
+        )
+    if status.process_state == "foreign_host":
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_stop_identity_unverified:foreign_host",
+        )
+    if not owner_run_id or pid is None:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_stop_identity_unverified:missing_lock_identity",
+        )
+    identity = detached_autopilot_identity(
+        run_store,
+        run_id=owner_run_id,
+        pid=pid,
+    )
+    if identity is None:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_stop_identity_unverified:missing_detached_record",
+        )
+    return stop_verified_detached_autopilot(
+        config=config,
+        lock_manager=lock_manager,
+        run_store=run_store,
+        identity=identity,
+        process_exists=checker,
+        process_group_lookup=get_process_group,
+        session_lookup=get_session,
+        birth_identity_lookup=get_birth_identity,
+        pidfd_open=open_pidfd,
+        pidfd_signal=send_pidfd_signal,
+        pidfd_exited=check_pidfd_exited,
+        close_fd=close_process_fd,
+        sleep=sleeper,
+        monotonic=clock,
+        backend_deadline=backend_deadline,
+        stop_deadline=stop_deadline,
+    )
+
+
+def stop_verified_detached_autopilot(
+    *,
+    config: VibeConfig,
+    lock_manager: LockManager,
+    run_store: RunStore,
+    identity: DetachedAutopilotIdentity,
+    process_exists: ProcessExists,
+    process_group_lookup: Callable[[int], int],
+    session_lookup: Callable[[int], int],
+    birth_identity_lookup: Callable[[int], str],
+    pidfd_open: Callable[[int], int],
+    pidfd_signal: Callable[[int, int], None],
+    pidfd_exited: Callable[[int], bool],
+    close_fd: Callable[[int], None],
+    sleep: Sleep,
+    monotonic: Callable[[], float],
+    backend_deadline: float,
+    stop_deadline: float,
+) -> AutopilotStopResult:
+    try:
+        process_fd = pidfd_open(identity.pid)
+    except ProcessLookupError:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=identity.run_id,
+            pid=identity.pid,
+            process_exited=True,
+            blocker="autopilot_supervisor_lock_stale:missing_process",
+        )
+    except OSError:
+        return AutopilotStopResult(
+            repo=config.repo,
+            stopped=False,
+            state="blocked",
+            run_id=identity.run_id,
+            pid=identity.pid,
+            blocker="autopilot_stop_identity_unverified:pidfd_unavailable",
+        )
+
+    try:
+        try:
+            actual_process_group = process_group_lookup(identity.pid)
+            actual_session = session_lookup(identity.pid)
+            actual_birth_id = birth_identity_lookup(identity.pid)
+        except OSError:
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=identity.run_id,
+                pid=identity.pid,
+                process_exited=True,
+                blocker="autopilot_supervisor_lock_stale:missing_process",
+            )
+        if (
+            identity.process_group_id != identity.pid
+            or identity.session_id != identity.pid
+            or actual_process_group != identity.process_group_id
+            or actual_session != identity.session_id
+            or not actual_birth_id
+            or actual_birth_id != identity.process_birth_id
+        ):
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=identity.run_id,
+                pid=identity.pid,
+                blocker="autopilot_stop_identity_unverified:pid_reuse_or_mismatch",
+            )
+
+        try:
+            pidfd_signal(process_fd, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=identity.run_id,
+                pid=identity.pid,
+                blocker="autopilot_stop_signal_failed",
+            )
+
+        while True:
+            try:
+                process_exited = pidfd_exited(process_fd)
+                current = lock_manager.autopilot_status(
+                    process_exists=process_exists,
+                    command_timeout_seconds=max(
+                        0.001,
+                        backend_deadline - time_module.monotonic(),
+                    ),
+                )
+            except KeyboardInterrupt:
+                return AutopilotStopResult(
+                    repo=config.repo,
+                    stopped=False,
+                    state="blocked",
+                    run_id=identity.run_id,
+                    pid=identity.pid,
+                    blocker="autopilot_stop_interrupted",
+                )
+            except (LockBackendError, OSError):
+                return AutopilotStopResult(
+                    repo=config.repo,
+                    stopped=False,
+                    state="blocked",
+                    run_id=identity.run_id,
+                    pid=identity.pid,
+                    blocker="autopilot_stop_backend_status_failed",
+                )
+            lock_released = not current.locked
+            if process_exited and lock_released:
+                append_autopilot_stopped_record(
+                    run_store,
+                    repo=config.repo,
+                    run_id=identity.run_id,
+                    pid=identity.pid,
+                    stop_mode="operator_verified",
+                    signal_number=signal.SIGTERM,
+                )
+                return AutopilotStopResult(
+                    repo=config.repo,
+                    stopped=True,
+                    state="stopped",
+                    run_id=identity.run_id,
+                    pid=identity.pid,
+                    process_exited=True,
+                    lock_released=True,
+                )
+            if monotonic() >= stop_deadline:
+                if process_exited and not lock_released:
+                    blocker = "autopilot_stop_backend_release_failed"
+                elif not process_exited and lock_released:
+                    blocker = "autopilot_stop_process_exit_timeout"
+                else:
+                    blocker = "autopilot_stop_timeout"
+                return AutopilotStopResult(
+                    repo=config.repo,
+                    stopped=False,
+                    state="blocked",
+                    run_id=identity.run_id,
+                    pid=identity.pid,
+                    process_exited=process_exited,
+                    lock_released=lock_released,
+                    blocker=blocker,
+                )
+            try:
+                sleep(min(0.05, max(0.0, stop_deadline - monotonic())))
+            except KeyboardInterrupt:
+                return AutopilotStopResult(
+                    repo=config.repo,
+                    stopped=False,
+                    state="blocked",
+                    run_id=identity.run_id,
+                    pid=identity.pid,
+                    blocker="autopilot_stop_interrupted",
+                )
+    finally:
+        close_fd(process_fd)
 
 
 def runtime_context_subprocess_transport(
@@ -1315,10 +1959,7 @@ def launch_run_until_done(
     try:
         return process.wait()
     except KeyboardInterrupt:
-        # On interrupt, terminate the worker we spawned rather than orphan
-        # it, then let the supervisor unwind and release its lock.
-        process.terminate()
-        process.wait()
+        terminate_command_process_group(process)
         raise
 
 
@@ -1420,7 +2061,32 @@ def maintenance_command_env(
     }
 
 
-def kill_command_process_group(process: subprocess.Popen[bytes]) -> None:
+def terminate_command_process_group(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            process.terminate()
+            process.wait(timeout=5.0)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            kill_command_process_group(process)
+            process.wait()
+            return
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        else:
+            process.terminate()
+        process.wait(timeout=5.0)
+    except ProcessLookupError:
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        kill_command_process_group(process)
+        process.wait()
+
+
+def kill_command_process_group(process: subprocess.Popen[Any]) -> None:
     if os.name == "nt":
         # process.kill() would reap only the shell, orphaning its children
         # (which then keep the cwd and pipes alive); taskkill /T kills the
@@ -1498,28 +2164,32 @@ def run_maintenance_command(
         timed_out = False
         size_exceeded = False
         deadline = start + timeout
-        while True:
-            code = process.poll()
-            if code is not None:
-                break
-            buffer.seek(0, os.SEEK_END)
-            if buffer.tell() > max_output_bytes:
-                # Brief grace so a command that already wrote its final output
-                # and is exiting reports its real exit code instead of being
-                # misclassified as a flood; a true flooder is still killed.
-                try:
-                    process.wait(timeout=0.05)
-                except subprocess.TimeoutExpired:
-                    size_exceeded = True
+        try:
+            while True:
+                code = process.poll()
+                if code is not None:
+                    break
+                buffer.seek(0, os.SEEK_END)
+                if buffer.tell() > max_output_bytes:
+                    # Brief grace so a command that already wrote its final output
+                    # and is exiting reports its real exit code instead of being
+                    # misclassified as a flood; a true flooder is still killed.
+                    try:
+                        process.wait(timeout=0.05)
+                    except subprocess.TimeoutExpired:
+                        size_exceeded = True
+                        kill_command_process_group(process)
+                        process.wait()
+                    break
+                if time_module.monotonic() >= deadline:
+                    timed_out = True
                     kill_command_process_group(process)
                     process.wait()
-                break
-            if time_module.monotonic() >= deadline:
-                timed_out = True
-                kill_command_process_group(process)
-                process.wait()
-                break
-            time_module.sleep(0.01)
+                    break
+                time_module.sleep(0.01)
+        except KeyboardInterrupt:
+            terminate_command_process_group(process)
+            raise
         duration = time_module.monotonic() - start
         buffer.seek(0)
         raw = buffer.read()
@@ -1850,9 +2520,14 @@ PlanningWorkerLauncher = Callable[..., NativePlanningProcessResult]
 
 
 class NativePlanningWorkerInterrupted(KeyboardInterrupt):
-    def __init__(self, result: NativePlanningProcessResult):
-        super().__init__()
+    def __init__(
+        self,
+        result: NativePlanningProcessResult,
+        interruption: KeyboardInterrupt,
+    ):
+        super().__init__(*interruption.args)
         self.result = result
+        self.interruption = interruption
 
 
 def _bounded_planning_text(value: object) -> str:
@@ -2006,14 +2681,14 @@ def launch_native_planning_worker(
                 pid=process.pid,
                 timed_out=True,
             )
-        except KeyboardInterrupt:
-            kill_command_process_group(process)
-            exit_code = process.wait()
+        except KeyboardInterrupt as exc:
+            terminate_command_process_group(process)
             raise NativePlanningWorkerInterrupted(
                 NativePlanningProcessResult(
-                    exit_code=exit_code,
+                    exit_code=process.returncode,
                     pid=process.pid,
-                )
+                ),
+                exc,
             ) from None
 
 
@@ -2089,7 +2764,7 @@ def run_native_planning(
     launch_attempted = False
     started_pid: int | None = None
     process_result: NativePlanningProcessResult | None = None
-    interrupted = False
+    interruption: KeyboardInterrupt | None = None
 
     def record_worker_started(pid: int) -> None:
         nonlocal started_pid
@@ -2137,7 +2812,7 @@ def run_native_planning(
     except NativePlanningWorkerInterrupted as exc:
         process_result = exc.result
         record_worker_started(process_result.pid)
-        interrupted = True
+        interruption = exc.interruption
     except (
         AgentResolutionError,
         KeyError,
@@ -2149,11 +2824,11 @@ def run_native_planning(
 
     task_source_error = ""
     runnable_after: int | None = status.queue.runnable
-    if started_pid is not None:
+    if started_pid is not None and interruption is None:
         queue_after = collect_task_queue_status(config)
         task_source_error = _bounded_planning_text(queue_after.source_error)
         runnable_after = None if task_source_error else queue_after.runnable
-    if interrupted:
+    if interruption is not None:
         worker_status = "interrupted"
     elif worker_error:
         worker_status = "worker_error"
@@ -2183,8 +2858,8 @@ def run_native_planning(
         error=worker_error,
     )
     run_store.append_record(worker.to_record(config.repo))
-    if interrupted:
-        raise KeyboardInterrupt
+    if interruption is not None:
+        raise interruption
     return NativePlanningCycleResult(decision=decision, worker=worker)
 
 
@@ -2587,23 +3262,27 @@ def _bounded_idle_wake_output(
             )
         except OSError as exc:
             raise IdleWakeAdapterError("execution_error") from exc
-        while True:
-            return_code = process.poll()
-            buffer.seek(0, os.SEEK_END)
-            output_size = buffer.tell()
-            if output_size > IDLE_WAKE_MAX_OUTPUT_BYTES:
-                if return_code is None:
+        try:
+            while True:
+                return_code = process.poll()
+                buffer.seek(0, os.SEEK_END)
+                output_size = buffer.tell()
+                if output_size > IDLE_WAKE_MAX_OUTPUT_BYTES:
+                    if return_code is None:
+                        kill_command_process_group(process)
+                        process.wait()
+                    raise IdleWakeAdapterError("output_too_large")
+                if return_code is not None:
+                    break
+                remaining = deadline - time_module.monotonic()
+                if remaining <= 0:
                     kill_command_process_group(process)
                     process.wait()
-                raise IdleWakeAdapterError("output_too_large")
-            if return_code is not None:
-                break
-            remaining = deadline - time_module.monotonic()
-            if remaining <= 0:
-                kill_command_process_group(process)
-                process.wait()
-                raise IdleWakeAdapterError("timeout")
-            time_module.sleep(min(0.01, remaining))
+                    raise IdleWakeAdapterError("timeout")
+                time_module.sleep(min(0.01, remaining))
+        except KeyboardInterrupt:
+            terminate_command_process_group(process)
+            raise
         if return_code != 0:
             raise IdleWakeAdapterError("nonzero_exit")
         buffer.seek(0)
@@ -2793,6 +3472,72 @@ def recheck_interval_for_runnable(
     return False
 
 
+class AutopilotTerminationRequested(KeyboardInterrupt):
+    def __init__(self, signal_number: int):
+        self.signal_number = signal_number
+        super().__init__(signal.Signals(signal_number).name)
+
+
+@contextmanager
+def autopilot_termination_signals() -> Iterator[Callable[[], None]]:
+    def enable_immediately() -> None:
+        return
+
+    if threading.current_thread() is not threading.main_thread():
+        yield enable_immediately
+        return
+    handled_signals = tuple(
+        stop_signal
+        for stop_signal in (getattr(signal, "SIGINT", None), signal.SIGTERM)
+        if stop_signal is not None
+    )
+    previous_handlers = {
+        stop_signal: signal.getsignal(stop_signal) for stop_signal in handled_signals
+    }
+    previous_mask: set[signal.Signals] | None = None
+    signals_enabled = False
+    pthread_sigmask = getattr(signal, "pthread_sigmask", None)
+    if callable(pthread_sigmask):
+        previous_mask = pthread_sigmask(signal.SIG_BLOCK, handled_signals)
+    stop_requested = False
+    pending_signal: int | None = None
+
+    def request_stop(signal_number: int, _frame: object) -> None:
+        nonlocal pending_signal, stop_requested
+        if stop_requested:
+            return
+        stop_requested = True
+        if not signals_enabled:
+            pending_signal = signal_number
+            return
+        raise AutopilotTerminationRequested(signal_number)
+
+    installed_signals: list[signal.Signals] = []
+    try:
+        for stop_signal in handled_signals:
+            signal.signal(stop_signal, request_stop)
+            installed_signals.append(stop_signal)
+
+        def enable_signals() -> None:
+            nonlocal signals_enabled
+            if signals_enabled:
+                return
+            signals_enabled = True
+            if previous_mask is not None:
+                assert pthread_sigmask is not None
+                pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            if pending_signal is not None:
+                raise AutopilotTerminationRequested(pending_signal)
+
+        yield enable_signals
+    finally:
+        for stop_signal in installed_signals:
+            signal.signal(stop_signal, previous_handlers[stop_signal])
+        if previous_mask is not None and not signals_enabled:
+            assert pthread_sigmask is not None
+            pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
 def run_autopilot(
     config: VibeConfig,
     *,
@@ -2816,6 +3561,7 @@ def run_autopilot(
         poll_idle_wake_command
     ),
     should_stop: Callable[[], bool] | None = None,
+    install_signal_handlers: bool = True,
 ) -> AutopilotRunSummary:
     """Supervise ``run-until-done`` as a foreground persistent loop.
 
@@ -2856,7 +3602,20 @@ def run_autopilot(
     )
     supervisor_run_id = new_run_id("autopilot")
 
-    existing = lock_manager.autopilot_status(process_exists=process_checker)
+    signal_stack = ExitStack()
+
+    def enable_termination_signals() -> None:
+        return
+
+    if install_signal_handlers:
+        enable_termination_signals = signal_stack.enter_context(
+            autopilot_termination_signals()
+        )
+    try:
+        existing = lock_manager.autopilot_status(process_exists=process_checker)
+    except BaseException:
+        signal_stack.close()
+        raise
     if existing.locked and existing.state in {"held", "unknown"}:
         run_store.append_record(
             {
@@ -2870,29 +3629,38 @@ def run_autopilot(
                 "worktree_disposition_policy": (config.autopilot.worktree_disposition),
             }
         )
-        return AutopilotRunSummary(
+        summary = AutopilotRunSummary(
             repo=config.repo,
             run_id=supervisor_run_id,
             started=False,
             blocker="autopilot_supervisor_active",
         )
+        signal_stack.close()
+        return summary
     if existing.locked and existing.state == "stale":
-        return AutopilotRunSummary(
+        summary = AutopilotRunSummary(
             repo=config.repo,
             run_id=supervisor_run_id,
             started=False,
             blocker=f"autopilot_supervisor_lock_stale:{existing.stale_reason or 'unknown'}",
         )
+        signal_stack.close()
+        return summary
 
     try:
         lock = lock_manager.acquire_autopilot(run_id=supervisor_run_id)
     except LockBusy:
-        return AutopilotRunSummary(
+        summary = AutopilotRunSummary(
             repo=config.repo,
             run_id=supervisor_run_id,
             started=False,
             blocker="autopilot_supervisor_active",
         )
+        signal_stack.close()
+        return summary
+    except BaseException:
+        signal_stack.close()
+        raise
 
     fencing_token = str(lock.metadata.get("fencing_token") or "")
     supervisor_log = config.state_path / "autopilot" / f"{supervisor_run_id}.log"
@@ -2903,8 +3671,13 @@ def run_autopilot(
         lease_seconds=int_value(lock.metadata.get("lease_seconds")),
     )
     cycles: list[AutopilotCycleResult] = []
-    heartbeat.start()
+    termination_signal: int | None = None
     try:
+        enable_termination_signals()
+        lock_metadata = dict(lock.metadata)
+        lock_metadata["stop_ready"] = True
+        lock = lock_manager.update(lock, lock_metadata)
+        heartbeat.start()
         run_store.append_record(
             {
                 "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
@@ -3062,12 +3835,29 @@ def run_autopilot(
             # operator intervention, so the supervisor stops instead of spinning.
             if result.status not in {"completed", "restartable"}:
                 break
+    except AutopilotTerminationRequested as exc:
+        termination_signal = exc.signal_number
     finally:
-        heartbeat.stop()
-        lock_manager.release_autopilot(
-            run_id=supervisor_run_id,
-            fencing_token=fencing_token,
-        )
+        try:
+            heartbeat.stop()
+            lock_manager.release_autopilot(
+                run_id=supervisor_run_id,
+                fencing_token=fencing_token,
+                command_timeout_seconds=30.0,
+            )
+            append_autopilot_stopped_record(
+                run_store,
+                repo=config.repo,
+                run_id=supervisor_run_id,
+                pid=os.getpid(),
+                stop_mode=(
+                    "signal" if termination_signal is not None else "foreground_exit"
+                ),
+                signal_number=termination_signal,
+                process_exited=False,
+            )
+        finally:
+            signal_stack.close()
 
     return AutopilotRunSummary(
         repo=config.repo,

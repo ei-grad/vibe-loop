@@ -82,6 +82,38 @@ operation is required. Do not substitute a plain `nohup ... &` launch in job
 harnesses that reap child jobs; it has no verified lock handoff or durable
 session identity.
 
+## Stop The Supervisor
+
+On Linux, stop a detached supervisor through the verified lifecycle command:
+
+```bash
+vibe-loop autopilot stop --repo <repo> --json
+```
+
+Do not send signals manually. `stop` correlates the live lock with the recorded
+run, PID, process group, session, and kernel birth identity, signals the exact
+pidfd, and succeeds only after both the process and singleton lock are absent.
+Identity ambiguity, a foreign host, interruption, timeout, or backend failure
+is a blocker; the command does not escalate to `SIGKILL`. Live verified stop is
+Linux-only even though detached `start` is available on POSIX systems more
+broadly. For a foreground supervisor, the first `SIGINT` or `SIGTERM` starts
+bounded cleanup; repeated supported signals are coalesced until child cleanup
+and fenced lock release finish.
+
+If status shows that the recorded process is already absent while its lock
+remains, use the explicit fenced recovery path only after verifying the exact
+recorded run ID:
+
+```bash
+vibe-loop autopilot stop --repo <repo> --recover-stale \
+  --run-id <exact-supervisor-run-id> --json
+```
+
+Recovery reads the private local fencing token from the configured lock backend
+and refuses live, foreign, missing-token, or run-mismatched ownership. Never put
+a fencing token in argv, logs, prompts, or diagnostics. Directory and command
+lock backends use the same manager release and post-release verification path.
+
 ## Wake / Wait
 
 Use `vibe-loop wait-helper` instead of ad hoc polling loops. By default it wakes

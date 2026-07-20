@@ -32,6 +32,7 @@ from vibe_loop.autopilot import (
     redact_runtime_context_text,
     run_autopilot,
     start_detached_autopilot,
+    stop_detached_autopilot,
     wait_for_processes,
     WaitMessageAdapterError,
     WaitResult,
@@ -344,6 +345,30 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(autopilot_start)
     add_autopilot_run_arguments(autopilot_start)
     autopilot_start.add_argument("--json", action="store_true")
+    autopilot_stop = autopilot_subparsers.add_parser(
+        "stop",
+        help="Gracefully stop a verified detached autopilot supervisor",
+        description=(
+            "Gracefully stop a verified detached autopilot supervisor on Linux. "
+            "Success requires both the recorded process to exit and its singleton "
+            "lock to be absent. --recover-stale only releases an absent local "
+            "owner's lock with the exact recorded run identity and private fencing "
+            "token."
+        ),
+    )
+    add_repo_argument(autopilot_stop)
+    autopilot_stop.add_argument("--timeout", type=nonnegative_float, default=10.0)
+    autopilot_stop.add_argument(
+        "--recover-stale",
+        action="store_true",
+        help="Release an absent supervisor's lock using exact local fencing state",
+    )
+    autopilot_stop.add_argument(
+        "--run-id",
+        default="",
+        help="Exact recorded supervisor run ID required by --recover-stale",
+    )
+    autopilot_stop.add_argument("--json", action="store_true")
     autopilot_projects = autopilot_subparsers.add_parser(
         "projects",
         help="Manage the optional multi-project autopilot registry",
@@ -1247,6 +1272,18 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return 0
     if command == "projects":
         return dispatch_autopilot_projects(args)
+    if command == "stop":
+        result = stop_detached_autopilot(
+            config,
+            timeout=args.timeout,
+            recovery=args.recover_stale,
+            run_id=args.run_id,
+        )
+        if args.json:
+            print(json.dumps(result.to_json(), indent=2))
+        else:
+            print(render_autopilot_stop(result))
+        return result.exit_code
     if command in (None, "run", "start"):
         ap = config.autopilot
         worktree_disposition = getattr(args, "worktree_disposition", None)
@@ -1314,6 +1351,20 @@ def render_detached_autopilot_launch(launch) -> str:
         f"process_group={launch.process_group_id} session={launch.session_id} "
         f"run_id={launch.run_id} log={launch.log}"
     )
+
+
+def render_autopilot_stop(result) -> str:
+    if not result.stopped:
+        message = f"autopilot not stopped: {result.blocker or 'unknown'}"
+        if result.pid is not None:
+            message += f" pid={result.pid}"
+        if result.run_id:
+            message += f" run_id={result.run_id}"
+        return message
+    if result.state == "already_stopped":
+        return "autopilot already stopped"
+    action = "recovered" if result.recovered else "stopped"
+    return f"autopilot {action} pid={result.pid} run_id={result.run_id}"
 
 
 def render_autopilot_status(status: ProjectStatus) -> str:

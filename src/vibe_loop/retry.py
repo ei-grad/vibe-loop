@@ -3,8 +3,10 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import errno
+import os
 import random
 import re
+import signal
 import subprocess
 import time
 from collections.abc import Callable, Iterable
@@ -249,10 +251,16 @@ def retry_subprocess_run(
     sleep: Callable[[float], None] = time.sleep,
     **subprocess_kwargs: Any,
 ) -> subprocess.CompletedProcess[str]:
+    interrupt_process_group = bool(
+        subprocess_kwargs.pop("interrupt_process_group", False)
+    )
     max_retries = max(max_retries, 0)
     for attempt in range(max_retries + 1):
         try:
-            result = subprocess.run(cmd, **subprocess_kwargs)
+            if interrupt_process_group:
+                result = run_interruptible_subprocess(cmd, **subprocess_kwargs)
+            else:
+                result = subprocess.run(cmd, **subprocess_kwargs)
         except subprocess.TimeoutExpired:
             if attempt >= max_retries:
                 raise
@@ -286,3 +294,61 @@ def retry_subprocess_run(
         sleep(delay)
 
     raise RuntimeError("retry_subprocess_run: unreachable")
+
+
+def run_interruptible_subprocess(
+    cmd: str | list[str],
+    **subprocess_kwargs: Any,
+) -> subprocess.CompletedProcess[str]:
+    timeout = subprocess_kwargs.pop("timeout", None)
+    if os.name != "nt":
+        subprocess_kwargs["start_new_session"] = True
+    with subprocess.Popen(cmd, **subprocess_kwargs) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_interruptible_process_group(process)
+            process.communicate()
+            raise
+        except KeyboardInterrupt:
+            terminate_interruptible_process_group(process)
+            raise
+        return subprocess.CompletedProcess(
+            process.args,
+            process.returncode,
+            stdout,
+            stderr,
+        )
+
+
+def terminate_interruptible_process_group(
+    process: subprocess.Popen[Any],
+    *,
+    grace_seconds: float = 5.0,
+) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.terminate()
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        kill_interruptible_process_group(process)
+        process.wait()
+
+
+def kill_interruptible_process_group(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is not None:
+        return
+    if os.name == "nt":
+        process.kill()
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return

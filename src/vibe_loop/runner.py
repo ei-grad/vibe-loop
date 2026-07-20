@@ -653,6 +653,7 @@ class VibeRunner:
                 encoding="utf-8",
                 errors="replace",
                 timeout=900,
+                interrupt_process_group=True,
                 on_retry=_analysis_retry_callback,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:

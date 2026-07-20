@@ -296,6 +296,27 @@ class BackoffDelayTests(unittest.TestCase):
 
 
 class RetrySubprocessRunTests(unittest.TestCase):
+    def test_interruptible_run_terminates_process_group_before_propagating(
+        self,
+    ) -> None:
+        process = MagicMock(pid=5151)
+        process.__enter__.return_value = process
+        process.communicate.side_effect = KeyboardInterrupt
+        with (
+            patch("vibe_loop.retry.subprocess.Popen", return_value=process),
+            patch("vibe_loop.retry.terminate_interruptible_process_group") as terminate,
+            self.assertRaises(KeyboardInterrupt),
+        ):
+            retry_subprocess_run(
+                ["analysis-agent"],
+                interrupt_process_group=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        terminate.assert_called_once_with(process)
+
     def test_success_on_first_attempt(self) -> None:
         fake_sleep = MagicMock()
         with patch("subprocess.run") as mock_run:

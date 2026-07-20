@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import tempfile
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from vibe_loop import locks
 
@@ -110,6 +113,51 @@ class WriteMetadataTests(unittest.TestCase):
 
 
 class CommandLockContextTests(unittest.TestCase):
+    def test_interrupt_gracefully_terminates_adapter_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = locks.CommandLockBackend(
+                repo=root,
+                lock_root=root / "locks",
+                acquire_command="adapter",
+                release_command="adapter",
+                status_command="adapter",
+                list_command="adapter",
+            )
+            process = Mock(pid=5252)
+            with (
+                patch("vibe_loop.locks.subprocess.Popen", return_value=process),
+                patch(
+                    "vibe_loop.locks.wait_for_lock_command",
+                    side_effect=KeyboardInterrupt,
+                ),
+                patch("vibe_loop.locks.terminate_lock_command_gracefully") as terminate,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                backend.status("TASK-1")
+
+        terminate.assert_called_once_with(process)
+
+    def test_status_timeout_is_bounded_by_caller_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = f'{sys.executable} -c "import time; time.sleep(2)"'
+            backend = locks.CommandLockBackend(
+                repo=root,
+                lock_root=root / "locks",
+                acquire_command=command,
+                release_command=command,
+                status_command=command,
+                list_command=command,
+            )
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(locks.LockBackendError, "timed out"):
+                backend.status_with_timeout("TASK-1", timeout_seconds=0.05)
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+
     def test_context_covers_every_operation_and_protocol_values_win(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -183,6 +231,148 @@ class CommandLockContextTests(unittest.TestCase):
         self.assertTrue(
             all(record["PROJECT_SELECTOR"] == "entry-selector" for record in records)
         )
+
+
+class AutopilotRecoveryTests(unittest.TestCase):
+    class Backend:
+        def __init__(self, root: Path, metadata: dict[str, object]):
+            self.root = root
+            self.metadata = dict(metadata)
+            self.released: locks.TaskLock | None = None
+
+        def path_for(self, task_id: str) -> Path:
+            return self.root / f"{task_id}.lock"
+
+        def acquire(self, task_id, run_id, metadata=None):
+            raise AssertionError("not used")
+
+        def update(self, task_lock, metadata):
+            raise AssertionError("not used")
+
+        def release(self, task_lock: locks.TaskLock) -> None:
+            self.released = task_lock
+            self.metadata = {}
+
+        def status(self, task_id: str) -> dict[str, object] | None:
+            return dict(self.metadata) if self.metadata else None
+
+        def list_locks(self):
+            return [dict(self.metadata)] if self.metadata else []
+
+    def _manager(self, root: Path, *, token: str = "fence-1"):
+        metadata: dict[str, object] = {
+            "task_id": locks.AUTOPILOT_LOCK_NAME,
+            "run_id": "autopilot-1",
+            "pid": 4321,
+            "host": socket.gethostname(),
+        }
+        if token:
+            metadata["fencing_token"] = token
+        backend = self.Backend(root, metadata)
+        return locks.LockManager(root, backend=backend), backend
+
+    def test_recovery_releases_through_backend_with_exact_fencing_metadata(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, backend = self._manager(Path(directory))
+
+            released = manager.recover_stale_autopilot(
+                run_id="autopilot-1",
+                fencing_token="fence-1",
+                process_exists=lambda _pid: False,
+            )
+
+        self.assertTrue(released)
+        self.assertIsNotNone(backend.released)
+        self.assertEqual(backend.released.metadata["fencing_token"], "fence-1")
+
+    def test_recovery_refuses_missing_or_wrong_fencing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, backend = self._manager(Path(directory), token="")
+            with self.assertRaisesRegex(
+                locks.LockBackendError,
+                "recorded fencing token",
+            ):
+                manager.recover_stale_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token="fence-1",
+                    process_exists=lambda _pid: False,
+                )
+            self.assertIsNone(backend.released)
+
+            manager, backend = self._manager(Path(directory))
+            with self.assertRaises(locks.LockFencingMismatch):
+                manager.recover_stale_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token="wrong-fence",
+                    process_exists=lambda _pid: False,
+                )
+            self.assertIsNone(backend.released)
+
+    def test_recovery_refuses_live_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, backend = self._manager(Path(directory))
+
+            with self.assertRaisesRegex(locks.LockBackendError, "live process"):
+                manager.recover_stale_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token="fence-1",
+                    process_exists=lambda _pid: True,
+                )
+
+        self.assertIsNone(backend.released)
+
+    def test_recovery_refuses_expired_foreign_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, backend = self._manager(Path(directory))
+            backend.metadata.update(
+                {
+                    "host": "foreign.example.invalid",
+                    "lease_seconds": 1,
+                    "heartbeat_at": "2020-01-01T00:00:00+00:00",
+                }
+            )
+
+            with self.assertRaisesRegex(locks.LockBackendError, "local host owner"):
+                manager.recover_stale_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token="fence-1",
+                    process_exists=lambda _pid: False,
+                )
+
+        self.assertIsNone(backend.released)
+
+    def test_release_revalidates_run_when_fencing_tokens_collide(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, backend = self._manager(Path(directory))
+            stale_owner = locks.TaskLock(
+                task_id=locks.AUTOPILOT_LOCK_NAME,
+                path=backend.path_for(locks.AUTOPILOT_LOCK_NAME),
+                metadata={
+                    "run_id": "autopilot-old",
+                    "fencing_token": "fence-1",
+                },
+            )
+
+            with self.assertRaises(locks.LockOwnerMismatch):
+                manager.release(stale_owner)
+
+        self.assertIsNone(backend.released)
+
+    def test_fencing_generation_is_atomic_across_local_contenders(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                tokens = list(
+                    executor.map(
+                        lambda _index: locks.next_fencing_token(root, "TASK-1"),
+                        range(32),
+                    )
+                )
+
+        self.assertEqual(len(set(tokens)), 32)
+        self.assertEqual(sorted(map(int, tokens)), list(range(1, 33)))
 
 
 if __name__ == "__main__":

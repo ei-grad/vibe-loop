@@ -189,13 +189,23 @@ class LockManager:
             current.metadata,
             path=current.path,
         )
+        validate_lock_run_id(task_lock, current.metadata)
         return self.backend.update(
             current,
             preserve_runtime_lock_fields(metadata, current.metadata),
         )
 
     def release(self, task_lock: TaskLock) -> None:
-        current = self.backend.status(task_lock.task_id)
+        self.release_with_timeout(task_lock)
+
+    def release_with_timeout(
+        self,
+        task_lock: TaskLock,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        deadline = command_deadline(timeout_seconds)
+        current = self._backend_status(task_lock.task_id, timeout_seconds)
         if current is None:
             return
         current_path = path_from_metadata(
@@ -203,15 +213,37 @@ class LockManager:
             self.backend.path_for(task_lock.task_id),
         )
         validate_lock_fencing_token(task_lock.metadata, current, path=current_path)
-        self.backend.release(
-            TaskLock(
-                task_id=task_lock.task_id,
-                path=current_path,
-                metadata=current,
-            )
+        validate_lock_run_id(
+            task_lock,
+            current,
+            path=current_path,
         )
+        current_lock = TaskLock(
+            task_id=task_lock.task_id,
+            path=current_path,
+            metadata=current,
+        )
+        if isinstance(self.backend, CommandLockBackend):
+            self.backend.release_with_timeout(
+                current_lock,
+                timeout_seconds=remaining_command_timeout(deadline),
+            )
+        else:
+            self.backend.release(current_lock)
 
     def status(self, task_id: str) -> dict[str, object] | None:
+        return self.backend.status(task_id)
+
+    def _backend_status(
+        self,
+        task_id: str,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object] | None:
+        if isinstance(self.backend, CommandLockBackend):
+            return self.backend.status_with_timeout(
+                task_id,
+                timeout_seconds=timeout_seconds,
+            )
         return self.backend.status(task_id)
 
     def current_lock(self, task_id: str) -> TaskLock:
@@ -423,9 +455,13 @@ class LockManager:
         *,
         current_host: str | None = None,
         process_exists: ProcessExists | None = None,
+        command_timeout_seconds: float | None = None,
     ) -> IntegrationLockStatus:
         path = self.backend.path_for(AUTOPILOT_LOCK_NAME)
-        metadata = self.backend.status(AUTOPILOT_LOCK_NAME)
+        metadata = self._backend_status(
+            AUTOPILOT_LOCK_NAME,
+            command_timeout_seconds,
+        )
         if metadata is None:
             return IntegrationLockStatus(
                 locked=False,
@@ -448,8 +484,12 @@ class LockManager:
         *,
         run_id: str,
         fencing_token: str | None = None,
+        command_timeout_seconds: float | None = None,
     ) -> bool:
-        status = self.autopilot_status()
+        deadline = command_deadline(command_timeout_seconds)
+        status = self.autopilot_status(
+            command_timeout_seconds=command_timeout_seconds,
+        )
         if not status.locked:
             return False
         owner_run_id = string_value(status.metadata.get("run_id"))
@@ -460,18 +500,93 @@ class LockManager:
                 run_id=run_id,
                 task_id=AUTOPILOT_LOCK_NAME,
             )
-        if fencing_token:
-            validate_lock_fencing_token(
-                {"fencing_token": fencing_token},
-                status.metadata,
-                path=status.path,
+        if not fencing_token:
+            raise LockBackendError("autopilot release requires a fencing token")
+        if not fencing_token_value(status.metadata.get("fencing_token")):
+            raise LockBackendError(
+                "autopilot release requires a recorded fencing token"
             )
-        self.release(
+        validate_lock_fencing_token(
+            {"fencing_token": fencing_token},
+            status.metadata,
+            path=status.path,
+        )
+        self.release_with_timeout(
             TaskLock(
                 task_id=AUTOPILOT_LOCK_NAME,
                 path=status.path,
                 metadata=status.metadata,
+            ),
+            timeout_seconds=remaining_command_timeout(deadline),
+        )
+        return True
+
+    def recover_stale_autopilot(
+        self,
+        *,
+        run_id: str,
+        fencing_token: str,
+        current_host: str | None = None,
+        process_exists: ProcessExists | None = None,
+        command_timeout_seconds: float | None = None,
+    ) -> bool:
+        deadline = command_deadline(command_timeout_seconds)
+        status = self.autopilot_status(
+            current_host=current_host,
+            process_exists=process_exists,
+            command_timeout_seconds=command_timeout_seconds,
+        )
+        if not status.locked:
+            return False
+        if not run_id or not fencing_token:
+            raise LockBackendError(
+                "stale autopilot recovery requires run ID and fencing token"
             )
+        owner_run_id = string_value(status.metadata.get("run_id"))
+        if owner_run_id != run_id:
+            raise LockOwnerMismatch(
+                status.path,
+                status.metadata,
+                run_id=run_id,
+                task_id=AUTOPILOT_LOCK_NAME,
+            )
+        actual_token = fencing_token_value(status.metadata.get("fencing_token"))
+        if not actual_token:
+            raise LockBackendError(
+                "stale autopilot recovery requires a recorded fencing token"
+            )
+        validate_lock_fencing_token(
+            {"fencing_token": fencing_token},
+            status.metadata,
+            path=status.path,
+        )
+        owner_host = string_value(status.metadata.get("host"))
+        local_host = current_host if current_host is not None else socket.gethostname()
+        if not owner_host or owner_host != local_host:
+            raise LockBackendError(
+                "stale autopilot recovery requires an exact local host owner"
+            )
+        pid = int_value(status.metadata.get("pid"))
+        if pid is None:
+            raise LockBackendError(
+                "stale autopilot recovery requires a recorded process ID"
+            )
+        checker = process_exists if process_exists is not None else pid_exists
+        if checker(pid):
+            raise LockBackendError(
+                "stale autopilot recovery refused for a live process"
+            )
+        if status.state != "stale":
+            raise LockBackendError(
+                f"stale autopilot recovery requires stale state, got {status.state}"
+            )
+        self.release_with_timeout(
+            TaskLock(
+                task_id=AUTOPILOT_LOCK_NAME,
+                path=status.path,
+                metadata=status.metadata,
+            ),
+            timeout_seconds=remaining_command_timeout(deadline),
         )
         return True
 
@@ -689,6 +804,14 @@ class CommandLockBackend:
         )
 
     def release(self, task_lock: TaskLock) -> None:
+        self.release_with_timeout(task_lock)
+
+    def release_with_timeout(
+        self,
+        task_lock: TaskLock,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         payload = self._run_json_command(
             "locks.release_command",
             self.release_command,
@@ -696,6 +819,7 @@ class CommandLockBackend:
             task_id=task_lock.task_id,
             run_id=string_value(task_lock.metadata.get("run_id")),
             metadata=task_lock.metadata,
+            timeout_seconds=timeout_seconds,
         )
         if not isinstance(payload, dict) or not isinstance(
             payload.get("released"), bool
@@ -707,6 +831,14 @@ class CommandLockBackend:
             raise LockBackendError("locks.release_command reported released=false")
 
     def status(self, task_id: str) -> dict[str, object] | None:
+        return self.status_with_timeout(task_id)
+
+    def status_with_timeout(
+        self,
+        task_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object] | None:
         payload = self._run_json_command(
             "locks.status_command",
             self.status_command,
@@ -714,6 +846,7 @@ class CommandLockBackend:
             task_id=task_id,
             run_id="",
             metadata={"task_id": task_id},
+            timeout_seconds=timeout_seconds,
         )
         if not isinstance(payload, dict):
             raise LockBackendError("locks.status_command must return a JSON object")
@@ -810,6 +943,7 @@ class CommandLockBackend:
         task_id: str,
         run_id: str,
         metadata: dict[str, object],
+        timeout_seconds: float | None = None,
     ) -> object:
         env = os.environ.copy()
         env.update(self.runtime_context)
@@ -842,12 +976,17 @@ class CommandLockBackend:
                     raise LockBackendError(
                         f"{setting_name} could not start: {exc}"
                     ) from exc
-                returncode = wait_for_lock_command(
-                    process,
-                    stdout_file,
-                    stderr_file,
-                    setting_name,
-                )
+                try:
+                    returncode = wait_for_lock_command(
+                        process,
+                        stdout_file,
+                        stderr_file,
+                        setting_name,
+                        timeout_seconds=timeout_seconds,
+                    )
+                except KeyboardInterrupt:
+                    terminate_lock_command_gracefully(process)
+                    raise
                 stdout = read_command_output(stdout_file, setting_name, "stdout")
                 stderr = read_command_output(stderr_file, setting_name, "stderr")
         if returncode != 0:
@@ -892,8 +1031,15 @@ def wait_for_lock_command(
     stdout_file: object,
     stderr_file: object,
     setting_name: str,
+    *,
+    timeout_seconds: float | None = None,
 ) -> int:
-    deadline = time.monotonic() + COMMAND_LOCK_TIMEOUT_SECONDS
+    command_timeout = (
+        COMMAND_LOCK_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(0.001, timeout_seconds)
+    )
+    deadline = time.monotonic() + command_timeout
     while True:
         returncode = process.poll()
         if returncode is not None:
@@ -911,7 +1057,7 @@ def wait_for_lock_command(
         if time.monotonic() >= deadline:
             terminate_lock_command(process)
             raise LockBackendError(
-                f"{setting_name} timed out after {COMMAND_LOCK_TIMEOUT_SECONDS:g}s"
+                f"{setting_name} timed out after {command_timeout:g}s"
             )
         time.sleep(0.01)
 
@@ -953,6 +1099,26 @@ def terminate_lock_command(process: subprocess.Popen[bytes]) -> None:
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
+
+
+def terminate_lock_command_gracefully(
+    process: subprocess.Popen[bytes],
+    *,
+    grace_seconds: float = 5.0,
+) -> None:
+    if process.poll() is not None:
+        return
+    if os.name != "nt":
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+    else:
+        process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        terminate_lock_command(process)
 
 
 def build_lock_manager(
@@ -1059,18 +1225,48 @@ def runtime_lock_field_empty(value: object) -> bool:
     return False
 
 
+def command_deadline(timeout_seconds: float | None) -> float | None:
+    if timeout_seconds is None:
+        return None
+    return time.monotonic() + max(0.0, timeout_seconds)
+
+
+def remaining_command_timeout(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.001, deadline - time.monotonic())
+
+
 def next_fencing_token(lock_root: Path, task_id: str) -> str:
     token_root = lock_root / ".fencing-tokens"
     token_root.mkdir(parents=True, exist_ok=True)
     token_path = token_root / f"{safe_name(task_id)}.token"
-    current = 0
-    try:
-        current = int(token_path.read_text(encoding="utf-8").strip() or "0")
-    except (OSError, ValueError):
+    with metadata_update_lock(token_path):
         current = 0
-    next_token = current + 1
-    token_path.write_text(f"{next_token}\n", encoding="utf-8")
+        try:
+            current = int(token_path.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            current = 0
+        next_token = current + 1
+        token_path.write_text(f"{next_token}\n", encoding="utf-8")
     return str(next_token)
+
+
+def validate_lock_run_id(
+    expected: TaskLock,
+    current: Mapping[str, object],
+    *,
+    path: Path | None = None,
+) -> None:
+    expected_run_id = string_value(expected.metadata.get("run_id"))
+    actual_run_id = string_value(current.get("run_id"))
+    if expected_run_id != actual_run_id:
+        raise LockOwnerMismatch(
+            path or expected.path,
+            dict(current),
+            run_id=expected_run_id,
+            task_id=expected.task_id,
+        )
 
 
 def validate_lock_fencing_token(

@@ -32,8 +32,8 @@ Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-05`.
 ## PRD-AUT-002 Command Surface
 
 The CLI must expose autopilot through a subcommand group:
-`vibe-loop autopilot run`, `vibe-loop autopilot start`, and
-`vibe-loop autopilot status`. The bare
+`vibe-loop autopilot run`, `vibe-loop autopilot start`,
+`vibe-loop autopilot stop`, and `vibe-loop autopilot status`. The bare
 `vibe-loop autopilot` command may remain as a shorthand for `run`, but command
 semantics must be explicit in help and tests.
 
@@ -104,6 +104,29 @@ lease. Acceptance also includes documentation that this mechanism is not reboot
 persistence and that platform service managers are required for restart
 policies and non-POSIX hosts. Plain `nohup` is not a sufficient supported
 lifecycle in harnesses that reap child jobs.
+
+`autopilot stop` must request graceful termination only after correlating the
+live lock with an append-only detached observation and a stable process
+identity. The verified live path is Linux-only and must use the recorded run,
+PID, process-group/session identity, kernel process-birth identity, and pidfd
+signaling so PID reuse cannot redirect the signal. It must return success only
+after both the exact process and supervisor lock are absent; timeout,
+interruption, missing or foreign identity, and backend errors fail closed
+without automatic `SIGKILL`. The foreground supervisor must translate
+supported termination signals into normal unwinding, terminate any active
+child process group, stop its heartbeat, and release its lock with the acquired
+fencing token. Once signal cleanup begins, repeated supported signals must be
+coalesced until bounded child and backend cleanup completes so a second signal
+cannot interrupt fenced release.
+
+An already-absent process with a remaining lock requires the separate
+`autopilot stop --recover-stale --run-id <exact-run>` path. Recovery privately
+re-reads and requires the backend's nonblank local fencing token, rejects a
+live owner or run mismatch, releases through the configured directory or
+command backend, and verifies absence afterward. Fencing tokens must not be
+accepted in argv or rendered in diagnostics. Successful ordinary, signal, and
+recovery exits append a terminal supervisor record only after lock release;
+status reports that lifecycle as `stopped` independently from `last_cycle`.
 
 Related implementation IDs: `AUTO-03`.
 

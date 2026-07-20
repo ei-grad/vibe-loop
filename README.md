@@ -374,6 +374,7 @@ vibe-loop autopilot run --repo . --once
 vibe-loop autopilot run --repo . --once --worktree-disposition reap
 vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 vibe-loop autopilot start --repo . --interval 60 --jobs 2 --json
+vibe-loop autopilot stop --repo . --json
 vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects register --repo . --name tasks \
   --context LOOPYARD_PROJECT=vibe-loop
@@ -390,6 +391,9 @@ loopyard web UI (board, agents, and timeline screens). Supervisor state
 correlates the live supervisor lock with append-only started or observed
 records, preserving its run ID, PID, and log even when newer cycle records are
 idle and PID-less; `last_cycle` independently reports the newest cycle.
+After a bounded or operator-requested exit, supervisor state is `stopped` while
+`last_cycle` retains the independent child-cycle result such as `completed` or
+`idle`.
 
 **`start`** is the supported detached launcher on POSIX systems. It starts the
 same foreground `autopilot run` supervisor in a new session with standard input
@@ -405,6 +409,33 @@ status. Use a platform service manager such as systemd, launchd, or a container
 orchestrator for those guarantees and for non-POSIX hosts. Plain `nohup ... &`
 is not the supported lifecycle because job harnesses may reap child jobs and it
 provides no verified process/lock handoff.
+
+**`stop`** gracefully terminates a verified detached supervisor and returns
+success only after both its exact process and singleton lock are absent. The
+live stop path is Linux-only: it correlates the lock and detached observation's
+run ID, PID, process group, session, and kernel process-birth identity, then
+uses a pidfd to avoid signaling a reused PID. Unsupported platforms, foreign
+hosts, missing observations, identity mismatches, timeouts, interrupted waits,
+and backend release failures fail closed without escalating to `SIGKILL` or
+stealing a lock. The foreground supervisor handles `SIGINT` and `SIGTERM`
+through its normal cleanup, terminates an active child process group, and
+releases the lock with its fencing token. A first supported signal starts this
+bounded cleanup; repeated `SIGINT`/`SIGTERM` requests are coalesced so they
+cannot interrupt fenced lock release and leave a false stale owner.
+
+If the recorded process is already absent but its lock remains, normal `stop`
+reports the stale lock without releasing it. Recovery is a separate explicit
+operation:
+
+```bash
+vibe-loop autopilot stop --repo . --recover-stale \
+  --run-id <exact-supervisor-run-id> --json
+```
+
+Recovery re-reads the local backend's private fencing token, requires the exact
+recorded run, refuses a live or identity-ambiguous owner, releases through the
+configured directory or command backend, and verifies that the lock is gone.
+The token is never accepted on the command line or included in output.
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch

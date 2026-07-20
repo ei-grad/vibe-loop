@@ -7764,6 +7764,38 @@ class CliTests(unittest.TestCase):
 
 
 class AutopilotCliTests(unittest.TestCase):
+    def test_stop_is_idempotent_when_supervisor_is_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["autopilot", "stop", "--repo", str(repo), "--json"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(payload["stopped"])
+        self.assertEqual(payload["state"], "already_stopped")
+
+    def test_stop_help_documents_explicit_stale_recovery(self) -> None:
+        stdout = StringIO()
+        stderr = StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                main(["autopilot", "stop", "--help"])
+
+        self.assertEqual(caught.exception.code, 0)
+        self.assertIn("--recover-stale", stdout.getvalue())
+        self.assertIn("--run-id", stdout.getvalue())
+        self.assertIn("on Linux", stdout.getvalue())
+        self.assertIn("process to exit", stdout.getvalue())
+        self.assertIn("singleton lock to be", stdout.getvalue())
+        self.assertIn("absent", stdout.getvalue())
+        self.assertNotIn("fencing-token", stdout.getvalue())
+
     def test_status_text_reports_repo_queue_and_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             # Resolved so the assertion matches the CLI's resolved repo path
@@ -7974,17 +8006,15 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(child_log.parent, repo / ".vibe-loop" / "autopilot")
         self.assertTrue(log_exists)
 
-    @unittest.skipUnless(
-        os.name == "posix" and hasattr(os, "setsid"),
-        "detached autopilot start is POSIX-only",
-    )
-    def test_start_survives_caller_exit_and_remains_duplicate_fenced(self) -> None:
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_start_stop_releases_lock_and_allows_immediate_restart(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
             init_planning_repo(
                 repo,
                 PLAN.replace("| TASK-01 | P0 | Next |", "| TASK-01 | P0 | Done |"),
             )
+            launched: list[tuple[int, int]] = []
             start = subprocess.run(
                 [
                     sys.executable,
@@ -8008,6 +8038,7 @@ class AutopilotCliTests(unittest.TestCase):
             pid = launch["pid"]
             process_group_id = launch["process_group_id"]
             session_id = launch["session_id"]
+            launched.append((pid, process_group_id))
 
             try:
                 os.kill(pid, 0)
@@ -8066,16 +8097,103 @@ class AutopilotCliTests(unittest.TestCase):
                     duplicate_payload["blocker"], "autopilot_supervisor_active"
                 )
                 self.assertEqual(duplicate_payload["pid"], pid)
+
+                stop = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "stop",
+                        "--repo",
+                        str(repo),
+                        "--json",
+                    ],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    stop.returncode,
+                    0,
+                    f"stderr={stop.stderr}\nstdout={stop.stdout}",
+                )
+                stop_payload = json.loads(stop.stdout)
+                self.assertTrue(stop_payload["stopped"])
+                self.assertTrue(stop_payload["process_exited"])
+                self.assertTrue(stop_payload["lock_released"])
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+
+                manager = LockManager(repo / ".vibe-loop" / "locks")
+                self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
+                stopped_status = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "status",
+                        "--repo",
+                        str(repo),
+                        "--json",
+                    ],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                stopped_payload = json.loads(stopped_status.stdout)
+                self.assertEqual(stopped_payload["supervisor"]["state"], "stopped")
+
+                restart = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "start",
+                        "--repo",
+                        str(repo),
+                        "--interval",
+                        "30",
+                        "--json",
+                    ],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    restart.returncode,
+                    0,
+                    f"stderr={restart.stderr}\nstdout={restart.stdout}",
+                )
+                restarted_launch = json.loads(restart.stdout)
+                restarted_pid = restarted_launch["pid"]
+                restarted_group = restarted_launch["process_group_id"]
+                launched.append((restarted_pid, restarted_group))
+                restart_stop = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "vibe_loop",
+                        "autopilot",
+                        "stop",
+                        "--repo",
+                        str(repo),
+                        "--json",
+                    ],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(restart_stop.returncode, 0, restart_stop.stderr)
             finally:
-                stop_test_process_group(pid, process_group_id)
-            manager = LockManager(repo / ".vibe-loop" / "locks")
-            deadline = time.monotonic() + 2.0
-            while (
-                manager.status(AUTOPILOT_LOCK_NAME) is not None
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.05)
-            self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
+                for launched_pid, launched_group in launched:
+                    stop_test_process_group(launched_pid, launched_group)
 
     def test_doctor_reports_redacted_autopilot_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
