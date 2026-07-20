@@ -275,6 +275,38 @@ performs any requested queue replenishment.
 
 Related implementation IDs: `AUTO-12`, `AUTO-18`.
 
+### Account Limit Walls At The Agent Subprocess Boundary
+
+An agent refusal caused by an account usage/session/weekly limit is a *known
+duration* wall, not a short transport transient. Its text also matches the
+transient patterns (it mentions "limit"/"quota"), so without separate
+classification the retry layer spends its whole jittered budget against a wall
+that cannot clear for hours or days.
+
+The subprocess boundary must therefore classify a limit wall before transient
+classification and return immediately without consuming retry attempts, while
+ordinary 429, 5xx, capacity, network, and overload failures keep their bounded
+transient retries. Detection reads both stdout and stderr, because agent CLIs
+disagree about which stream carries the refusal, and only applies to a nonzero
+exit so a successful run that merely quotes a limit phrase stays on the normal
+path.
+
+Advertised resets may be wall-clock ("resets 1am (UTC)") or an absolute calendar
+instant ("try again at Jul 25th, 2026 3:24 AM"). Calendar forms are parsed in
+preference to clock-only forms, since the two share their digits and a clock
+reading of a multi-day wall understates the wait. Parsed delays keep the
+existing safety margin and misparse cap.
+
+When native planning hits a wall, the decision is journaled with its own
+`limit_wall` status and pause rather than the generic `analysis_error` status,
+the cycle records a `native_planning_limit_wall:<seconds>s` action, and the
+supervisor pauses dispatch until the reset. The journaled `next_wake` must be
+the reset the supervisor actually sleeps to, not the interval stamped before the
+cycle ran, and status output must name the wall so a paused cycle stays
+distinguishable from a planning failure that shares the same `idle` status. A
+stop request must interrupt the pause: signal-driven stops unwind through the
+sleeper, and a cooperative stop is polled between bounded slices.
+
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
 Autopilot cycles must include a native worktree-disposition health step so that

@@ -1398,6 +1398,10 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         lines.append(
             f"last cycle: {cycle.cycle_id} {cycle.status} @ {cycle.occurred_at}"
         )
+        # A paused cycle keeps the plain "idle" status, so name the wall
+        # explicitly: otherwise it is indistinguishable from a planning error.
+        if cycle.limit_wall_action:
+            lines.append(f"limit wall: {cycle.limit_wall_action}")
     if status.next_wake:
         lines.append(f"next wake: {status.next_wake}")
     return "\n".join(lines)

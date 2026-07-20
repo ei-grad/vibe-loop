@@ -44,7 +44,7 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
 )
 from vibe_loop.retry import parse_limit_wall_reset_delay
-from vibe_loop.runner import VibeRunner, new_run_id
+from vibe_loop.runner import AgentLimitWallError, VibeRunner, new_run_id
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
@@ -173,6 +173,14 @@ class SupervisorStatus:
         return redacted
 
 
+NATIVE_PLANNING_LIMIT_WALL_ACTION = "native_planning_limit_wall"
+CHILD_LIMIT_WALL_ACTION = "limit_wall_pause"
+LIMIT_WALL_ACTION_PREFIXES = (
+    f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:",
+    f"{CHILD_LIMIT_WALL_ACTION}:",
+)
+
+
 @dataclasses.dataclass(frozen=True)
 class CycleSummary:
     cycle_id: str
@@ -182,6 +190,19 @@ class CycleSummary:
     blockers: tuple[str, ...] = ()
     next_wake: str = ""
     record: dict[str, Any] = dataclasses.field(default_factory=dict)
+
+    @property
+    def limit_wall_action(self) -> str:
+        """The limit-wall action recorded for this cycle, if any.
+
+        Derived from the recorded actions so a paused cycle stays
+        distinguishable from a generic planning-analysis error, which shares
+        the same ``idle`` cycle status.
+        """
+        for action in self.actions:
+            if action.startswith(LIMIT_WALL_ACTION_PREFIXES):
+                return action
+        return ""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -2424,6 +2445,7 @@ NATIVE_PLANNING_TEXT_LIMIT = 4096
 NATIVE_PLANNING_EVIDENCE_TASK_LIMIT = 50
 NATIVE_PLANNING_EVIDENCE_WORKER_LIMIT = 50
 NATIVE_PLANNING_DECISION_KEYS = frozenset({"should_plan", "reason", "objective"})
+NATIVE_PLANNING_LIMIT_WALL_STATUS = "limit_wall"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2437,6 +2459,12 @@ class NativePlanningDecision:
     objective: str
     agent_invoked: bool
     agent_error: str = ""
+    limit_wall_reset_text: str = ""
+    limit_wall_pause_seconds: float | None = None
+
+    @property
+    def limit_wall(self) -> bool:
+        return self.status == NATIVE_PLANNING_LIMIT_WALL_STATUS
 
     def to_record(self, repo: Path) -> dict[str, object]:
         return {
@@ -2454,6 +2482,8 @@ class NativePlanningDecision:
             "objective": self.objective,
             "agent_invoked": self.agent_invoked,
             "agent_error": self.agent_error,
+            "limit_wall_reset_text": self.limit_wall_reset_text,
+            "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
         }
 
 
@@ -2692,6 +2722,12 @@ def launch_native_planning_worker(
             ) from None
 
 
+def _native_planning_status(agent_error: str, limit_wall_pause: float | None) -> str:
+    if limit_wall_pause is not None:
+        return NATIVE_PLANNING_LIMIT_WALL_STATUS
+    return "analysis_error" if agent_error else "decided"
+
+
 def run_native_planning(
     config: VibeConfig,
     *,
@@ -2705,11 +2741,22 @@ def run_native_planning(
     runner = analysis_runner or VibeRunner(config).run_analysis_agent
     output_path = config.state_path / "autopilot" / f"{cycle_id}-planning-decision.json"
     agent_error = ""
+    limit_wall_reset_text = ""
+    limit_wall_pause: float | None = None
     try:
         payload = runner(
             build_native_planning_decision_prompt(status, min_ready=min_ready),
             output_path,
         )
+    except AgentLimitWallError as exc:
+        # An account limit wall is not a planning failure: the analysis agent
+        # never got to decide. Surface it as its own status so the supervisor
+        # pauses until the advertised reset instead of re-running planning into
+        # the same wall every cycle.
+        payload = None
+        agent_error = _bounded_planning_text(exc)
+        limit_wall_reset_text = exc.signal.reset_text
+        limit_wall_pause = exc.pause_seconds
     except (
         AgentResolutionError,
         KeyError,
@@ -2732,12 +2779,14 @@ def run_native_planning(
         cycle_id=cycle_id,
         runnable=status.queue.runnable,
         min_ready=min_ready,
-        status="analysis_error" if agent_error else "decided",
+        status=_native_planning_status(agent_error, limit_wall_pause),
         should_plan=should_plan,
         reason=reason,
         objective=objective,
         agent_invoked=True,
         agent_error=agent_error,
+        limit_wall_reset_text=limit_wall_reset_text,
+        limit_wall_pause_seconds=limit_wall_pause,
     )
     run_store.append_record(decision.to_record(config.repo))
 
@@ -2745,7 +2794,11 @@ def run_native_planning(
         worker = NativePlanningWorkerResult(
             cycle_id=cycle_id,
             phase="terminal",
-            status="skipped_analysis_error" if agent_error else "skipped_not_needed",
+            status=(
+                "skipped_limit_wall"
+                if limit_wall_pause is not None
+                else ("skipped_analysis_error" if agent_error else "skipped_not_needed")
+            ),
             requested=False,
             attempted=False,
             started=False,
@@ -2891,6 +2944,7 @@ def execute_autopilot_cycle(
     child_pid: int | None = None
     child_log: Path | None = None
     cleanup_errors = 0
+    planning_limit_wall_pause: float | None = None
 
     cleanup_candidates = tuple(
         lock for lock in status.stale_locks if lock.stale_reason == "missing_process"
@@ -2974,7 +3028,15 @@ def execute_autopilot_cycle(
                 min_ready=min_ready,
                 run_store=run_store,
             )
-            if native_planning.decision.agent_error:
+            if native_planning.decision.limit_wall:
+                planning_limit_wall_pause = (
+                    native_planning.decision.limit_wall_pause_seconds
+                )
+                actions.append(
+                    f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:"
+                    f"{planning_limit_wall_pause:.0f}s"
+                )
+            elif native_planning.decision.agent_error:
                 actions.append("native_planning_analysis_error")
             elif native_planning.decision.should_plan:
                 actions.append("native_planning_decision:plan")
@@ -3046,8 +3108,17 @@ def execute_autopilot_cycle(
         since=cycle_started_at,
         default_backoff=config.supervision.limit_wall_backoff_seconds,
     )
+    # A planning wall and a dispatched-child wall can both land in one cycle;
+    # the longer advertised reset governs, since resuming earlier only walks
+    # into the wall that is still standing.
+    if planning_limit_wall_pause is not None:
+        pause_seconds = (
+            planning_limit_wall_pause
+            if pause_seconds is None
+            else max(pause_seconds, planning_limit_wall_pause)
+        )
     if pause_seconds is not None:
-        actions.append(f"limit_wall_pause:{pause_seconds:.0f}s")
+        actions.append(f"{CHILD_LIMIT_WALL_ACTION}:{pause_seconds:.0f}s")
 
     return AutopilotCycleResult(
         cycle_id=cycle_id,
@@ -3112,6 +3183,37 @@ def recheck_sleep_slices(interval: float, recheck_seconds: float) -> Iterator[fl
         current = step if step < remaining else remaining
         yield current
         remaining -= current
+
+
+def sleep_until_stop(
+    total_seconds: float,
+    *,
+    sleeper: Callable[[float], None],
+    should_stop: Callable[[], bool] | None = None,
+    slice_seconds: float,
+) -> bool:
+    """Sleep ``total_seconds`` in stop-checkable slices.
+
+    A limit-wall pause can run for hours, so it must not become one
+    uninterruptible sleep: a cooperative stop would otherwise only be observed
+    after the wall cleared. Signal-driven stops already unwind through
+    ``sleeper``; this adds the cooperative ``should_stop`` path. Returns False
+    when a stop was observed, True when the full pause elapsed.
+
+    Slicing exists only to poll ``should_stop``, so with no cooperative stop
+    installed the pause stays a single sleep of the full duration.
+    """
+    if should_stop is None:
+        if total_seconds > 0:
+            sleeper(total_seconds)
+        return True
+    if should_stop():
+        return False
+    for slice_duration in recheck_sleep_slices(total_seconds, slice_seconds):
+        sleeper(slice_duration)
+        if should_stop():
+            return False
+    return True
 
 
 def poll_runnable_count(config: VibeConfig) -> int:
@@ -3748,6 +3850,14 @@ def run_autopilot(
                         result,
                         actions=(*result.actions, post_cycle_action),
                     )
+            if not bounded_last and result.limit_wall_pause_seconds is not None:
+                # The interval-based wake stamped before the cycle is a lie once
+                # a limit wall pauses dispatch: report the reset the supervisor
+                # actually sleeps to.
+                result = dataclasses.replace(
+                    result,
+                    next_wake=iso_after(result.limit_wall_pause_seconds),
+                )
             result.append_to(run_store)
             cycles.append(result)
             if bounded_last:
@@ -3763,7 +3873,13 @@ def run_autopilot(
                     f"{pause_seconds:.0f}s before the next cycle",
                     flush=True,
                 )
-                sleeper(pause_seconds)
+                if not sleep_until_stop(
+                    pause_seconds,
+                    sleeper=sleeper,
+                    should_stop=should_stop,
+                    slice_seconds=config.autopilot.planning_recheck_seconds,
+                ):
+                    break
                 continue
             if interval > 0:
                 # Persistent watch: keep cycling and sleeping until a bound or

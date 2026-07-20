@@ -17,6 +17,7 @@ from unittest import mock
 from vibe_loop.autopilot import (
     AutopilotCycleResult,
     AutopilotTerminationRequested,
+    CycleSummary,
     MaintenanceCommandResult,
     NativePlanningProcessResult,
     NativePlanningWorkerInterrupted,
@@ -47,6 +48,7 @@ from vibe_loop.autopilot import (
     launch_run_until_done,
     run_native_planning,
     run_worktree_disposition,
+    sleep_until_stop,
     start_detached_autopilot,
     stop_detached_autopilot,
     wait_for_processes,
@@ -55,6 +57,8 @@ from vibe_loop.autopilot import (
     _bounded_idle_wake_output,
 )
 from vibe_loop.config import load_config, normalize_registry_runtime_context
+from vibe_loop.retry import LimitWallSignal
+from vibe_loop.runner import AgentLimitWallError
 from vibe_loop.locks import (
     AUTOPILOT_LOCK_NAME,
     LockBackendError,
@@ -2468,6 +2472,149 @@ class AutopilotRecheckTests(unittest.TestCase):
         # recheck loop entirely; the recheck slice size never appears.
         self.assertEqual(sleeps, [42.0])
 
+    def test_planning_limit_wall_pauses_and_reports_a_truthful_wake(self) -> None:
+        # The planner hitting a wall must pause dispatch like a child wall does,
+        # and the journaled next wake must be the reset the supervisor actually
+        # sleeps to, not the interval stamped before the cycle ran.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "[supervision]\n"
+                    "limit_wall_backoff_seconds = 42\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher, _launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            def wall_planning(config, **kwargs):
+                return run_native_planning(
+                    config,
+                    cycle_id=kwargs["cycle_id"],
+                    status=kwargs["status"],
+                    min_ready=kwargs["min_ready"],
+                    run_store=kwargs["run_store"],
+                    analysis_runner=lambda prompt, output_path: (_ for _ in ()).throw(
+                        AgentLimitWallError(
+                            LimitWallSignal(
+                                marker="You've hit your usage limit",
+                                reset_text="try again at Jul 25th, 2026 3:24 AM",
+                                reset_delay=3600.0,
+                            ),
+                            default_backoff=42.0,
+                        )
+                    ),
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+                native_planning_runner=wall_planning,
+            )
+
+        first = summary.cycles[0]
+        self.assertEqual(first.status, "idle")
+        # The advertised reset governs, not the 42s configured fallback.
+        self.assertEqual(first.limit_wall_pause_seconds, 3600.0)
+        self.assertIn("native_planning_limit_wall:3600s", first.actions)
+        self.assertNotIn("native_planning_analysis_error", first.actions)
+        self.assertEqual(sleeps, [3600.0])
+        # A truthful wake: ~1h out, not the 100s interval.
+        wake = datetime.datetime.fromisoformat(first.next_wake)
+        occurred = datetime.datetime.fromisoformat(first.occurred_at)
+        self.assertGreater((wake - occurred).total_seconds(), 3000.0)
+
+
+class CycleSummaryLimitWallTests(unittest.TestCase):
+    def _summary(self, actions: tuple[str, ...]) -> CycleSummary:
+        return CycleSummary(
+            cycle_id="c1",
+            status="idle",
+            occurred_at="2026-07-20T10:19:36Z",
+            actions=actions,
+        )
+
+    def test_planning_wall_is_distinguished_from_analysis_error(self) -> None:
+        wall = self._summary(("native_planning_limit_wall:3600s",))
+        error = self._summary(("native_planning_analysis_error",))
+        self.assertEqual(wall.limit_wall_action, "native_planning_limit_wall:3600s")
+        self.assertEqual(error.limit_wall_action, "")
+        # Both cycles carry the same status, which is exactly why the action
+        # rather than the status has to carry the distinction.
+        self.assertEqual(wall.status, error.status)
+
+    def test_child_wall_is_also_surfaced(self) -> None:
+        summary = self._summary(("launched_run_until_done", "limit_wall_pause:42s"))
+        self.assertEqual(summary.limit_wall_action, "limit_wall_pause:42s")
+
+    def test_unrelated_actions_report_no_wall(self) -> None:
+        summary = self._summary(("launched_run_until_done", "child_exit:0"))
+        self.assertEqual(summary.limit_wall_action, "")
+
+
+class SleepUntilStopTests(unittest.TestCase):
+    def test_cooperative_stop_interrupts_a_long_pause(self) -> None:
+        # An 8-hour reset wait must not become one uninterruptible sleep when a
+        # cooperative stop is installed.
+        sleeps: list[float] = []
+        stop_after = 2
+
+        def should_stop() -> bool:
+            return len(sleeps) >= stop_after
+
+        completed = sleep_until_stop(
+            8 * 3600.0,
+            sleeper=sleeps.append,
+            should_stop=should_stop,
+            slice_seconds=60.0,
+        )
+        self.assertFalse(completed)
+        self.assertEqual(sleeps, [60.0, 60.0])
+
+    def test_stop_already_requested_sleeps_not_at_all(self) -> None:
+        sleeps: list[float] = []
+        completed = sleep_until_stop(
+            8 * 3600.0,
+            sleeper=sleeps.append,
+            should_stop=lambda: True,
+            slice_seconds=60.0,
+        )
+        self.assertFalse(completed)
+        self.assertEqual(sleeps, [])
+
+    def test_full_pause_elapses_in_slices_summing_to_the_total(self) -> None:
+        sleeps: list[float] = []
+        completed = sleep_until_stop(
+            250.0,
+            sleeper=sleeps.append,
+            should_stop=lambda: False,
+            slice_seconds=60.0,
+        )
+        self.assertTrue(completed)
+        self.assertAlmostEqual(sum(sleeps), 250.0, places=6)
+        self.assertLessEqual(max(sleeps), 60.0)
+
+    def test_without_a_cooperative_stop_the_pause_is_one_sleep(self) -> None:
+        # Signal-driven stops already unwind through the sleeper, so there is
+        # nothing to poll for and the pause stays a single call.
+        sleeps: list[float] = []
+        completed = sleep_until_stop(
+            8 * 3600.0,
+            sleeper=sleeps.append,
+            should_stop=None,
+            slice_seconds=60.0,
+        )
+        self.assertTrue(completed)
+        self.assertEqual(sleeps, [8 * 3600.0])
+
 
 class AutopilotIdleWaitTests(unittest.TestCase):
     def test_default_thirty_minute_wait_uses_five_fallback_listings(self) -> None:
@@ -2986,6 +3133,58 @@ class NativePlanningTests(unittest.TestCase):
                     self.assertEqual(result.worker.status, "skipped_analysis_error")
                     self.assertEqual(records[-2]["status"], "analysis_error")
                     self.assertEqual(records[-1]["status"], "skipped_analysis_error")
+
+    def test_analysis_limit_wall_is_not_an_analysis_error(self) -> None:
+        # A limit wall means the analysis agent never got to decide. It must be
+        # journaled as its own status carrying the pause, not collapsed into the
+        # generic analysis-error path that keeps re-planning every cycle.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def wall_runner(prompt: str, output_path: Path) -> dict[str, object]:
+                raise AgentLimitWallError(
+                    LimitWallSignal(
+                        marker="You've hit your usage limit",
+                        reset_text="try again at Jul 25th, 2026 3:24 AM",
+                        reset_delay=7200.0,
+                    ),
+                    default_backoff=1800.0,
+                )
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-wall",
+                status=status,
+                min_ready=1,
+                run_store=run_store,
+                analysis_runner=wall_runner,
+                worker_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("a limit wall must not launch a worker")
+                ),
+            )
+
+            self.assertEqual(result.decision.status, "limit_wall")
+            self.assertTrue(result.decision.limit_wall)
+            self.assertEqual(result.decision.limit_wall_pause_seconds, 7200.0)
+            self.assertEqual(
+                result.decision.limit_wall_reset_text,
+                "try again at Jul 25th, 2026 3:24 AM",
+            )
+            self.assertFalse(result.worker.attempted)
+            self.assertEqual(result.worker.status, "skipped_limit_wall")
+            records = run_store.read_records()
+            self.assertEqual(records[-2]["status"], "limit_wall")
+            self.assertEqual(records[-2]["limit_wall_pause_seconds"], 7200.0)
+            self.assertEqual(records[-1]["status"], "skipped_limit_wall")
+
+    def test_limit_wall_without_reset_falls_back_to_configured_backoff(self) -> None:
+        signal = LimitWallSignal(marker="You've hit your usage limit")
+        error = AgentLimitWallError(signal, default_backoff=1800.0)
+        self.assertEqual(error.pause_seconds, 1800.0)
 
     def test_decision_prompt_bounds_worker_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

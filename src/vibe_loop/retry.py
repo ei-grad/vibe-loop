@@ -47,6 +47,7 @@ TRANSIENT_OSERROR_ERRNOS: frozenset[int] = frozenset(
 )
 
 _RESET_CLOCK = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
+_RESET_CLOCK_NAMED = r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)?"
 # Transient-path parser: requires an explicit UTC marker to avoid reading a
 # bare number as a time.
 QUOTA_RESET_PATTERN = re.compile(
@@ -87,6 +88,92 @@ def _reset_delay_from_match(
     return min(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
 
 
+_MONTH_NUMBERS: dict[str, int] = {
+    name: index
+    for index, name in enumerate(
+        (
+            "jan",
+            "feb",
+            "mar",
+            "apr",
+            "may",
+            "jun",
+            "jul",
+            "aug",
+            "sep",
+            "oct",
+            "nov",
+            "dec",
+        ),
+        start=1,
+    )
+}
+
+# Absolute reset walls advertise a calendar instant rather than a wall clock
+# time, e.g. "try again at Jul 25th, 2026 3:24 AM" or "resets 2026-07-25T03:24Z".
+# These are only meaningful for multi-day account limits, where a clock-only
+# parse would land on the wrong day.
+LIMIT_WALL_RESET_DATE_PATTERN = re.compile(
+    r"(?:try\s+again|resets?|available\s+again)\s+(?:at\s+|on\s+)?"
+    r"(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s*"
+    r"(?P<year>\d{4})?,?\s*"
+    rf"(?:at\s+)?{_RESET_CLOCK_NAMED}"
+    r"\s*(?:\(?\s*UTC\s*\)?)?",
+    re.IGNORECASE,
+)
+LIMIT_WALL_RESET_ISO_PATTERN = re.compile(
+    r"(?:try\s+again|resets?|available\s+again)\s+(?:at\s+|on\s+)?"
+    r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
+    r"[T\s](?P<hour>\d{1,2}):(?P<minute>\d{2})(?::\d{2})?"
+    r"\s*(?:Z|UTC|\+00:?00)?",
+    re.IGNORECASE,
+)
+
+
+def _delay_until(
+    reset: datetime.datetime,
+    now: datetime.datetime | None,
+) -> float:
+    current = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    delay = (reset - current).total_seconds() + QUOTA_RESET_MARGIN_SECONDS
+    return min(max(delay, 0.0), QUOTA_RESET_MAX_DELAY_SECONDS)
+
+
+def _reset_delay_from_date_match(
+    match: re.Match[str],
+    now: datetime.datetime | None,
+) -> float | None:
+    groups = match.groupdict()
+    month_text = groups["month"].lower()
+    month = (
+        int(month_text) if month_text.isdigit() else _MONTH_NUMBERS.get(month_text[:3])
+    )
+    if month is None or not 1 <= month <= 12:
+        return None
+    day = int(groups["day"])
+    current = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
+    year = int(groups["year"]) if groups.get("year") else current.year
+    hour = int(groups["hour"])
+    minute = int(groups.get("minute") or 0)
+    meridiem = (groups.get("meridiem") or "").lower()
+    if minute > 59:
+        return None
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    elif hour > 23:
+        return None
+    try:
+        reset = datetime.datetime(
+            year, month, day, hour, minute, tzinfo=datetime.timezone.utc
+        )
+    except ValueError:
+        return None
+    return _delay_until(reset, now)
+
+
 def parse_quota_reset_delay(
     text: str,
     *,
@@ -110,8 +197,8 @@ def parse_quota_reset_delay(
 # straight into the same wall burns restart budget and stalls the loop, so
 # these are classified separately and paused until the advertised reset.
 DEFAULT_LIMIT_WALL_PATTERNS: tuple[str, ...] = (
-    r"you'?ve reached your .*? limit",
-    r"you'?ve hit your session limit",
+    r"you'?ve (?:reached|hit) your [^.\n]{0,60}?\blimit\b",
+    r"\b(?:usage|session|weekly|5-hour)\s+limit\s+(?:reached|exceeded)\b",
 )
 LIMIT_WALL_DEFAULT_BACKOFF_SECONDS = 1800.0
 # The advertised reset ("· resets 1am (UTC)") follows the limit phrase in the
@@ -154,10 +241,36 @@ def parse_limit_wall_reset_delay(
     caller has already confirmed a limit-wall phrase. Returns None when no reset
     time is present, so the caller falls back to the configured backoff.
     """
-    match = LIMIT_WALL_RESET_PATTERN.search(text)
-    if match is None:
-        return None
-    return _reset_delay_from_match(match, now)
+    found = search_limit_wall_reset(text, now=now)
+    return None if found is None else found[1]
+
+
+def search_limit_wall_reset(
+    text: str,
+    *,
+    now: datetime.datetime | None = None,
+) -> tuple[str, float] | None:
+    """Find an advertised reset instant in ``text``.
+
+    Absolute calendar resets are tried before wall-clock resets: a multi-day
+    account limit ("try again at Jul 25th, 2026 3:24 AM") shares its clock
+    digits with the clock-only form, and reading it as a same-or-next-day time
+    would understate the wait by days. Returns the matched phrase and the
+    seconds until it, or None when no reset time is present.
+    """
+    for pattern, extract in (
+        (LIMIT_WALL_RESET_ISO_PATTERN, _reset_delay_from_date_match),
+        (LIMIT_WALL_RESET_DATE_PATTERN, _reset_delay_from_date_match),
+        (LIMIT_WALL_RESET_PATTERN, _reset_delay_from_match),
+    ):
+        match = pattern.search(text)
+        if match is None:
+            continue
+        delay = extract(match, now)
+        if delay is None:
+            continue
+        return match.group(0).strip(), delay
+    return None
 
 
 def detect_limit_wall(
@@ -177,15 +290,11 @@ def detect_limit_wall(
         if match is None:
             continue
         window = text[match.start() : match.end() + LIMIT_WALL_RESET_WINDOW_CHARS]
-        reset_match = LIMIT_WALL_RESET_PATTERN.search(window)
+        found = search_limit_wall_reset(window, now=now)
         return LimitWallSignal(
             marker=match.group(0).strip(),
-            reset_text=reset_match.group(0).strip() if reset_match else "",
-            reset_delay=(
-                parse_limit_wall_reset_delay(reset_match.group(0), now=now)
-                if reset_match
-                else None
-            ),
+            reset_text=found[0] if found is not None else "",
+            reset_delay=found[1] if found is not None else None,
         )
     return None
 
@@ -228,6 +337,39 @@ def is_transient_subprocess_result(result: subprocess.CompletedProcess[str]) -> 
     return is_transient_stderr(stderr)
 
 
+def subprocess_result_output(result: subprocess.CompletedProcess[str]) -> str:
+    """Combined stdout+stderr of a finished subprocess.
+
+    Agent CLIs disagree about which stream carries a refusal notice, so
+    limit-wall detection must read both.
+    """
+    parts = [text for text in (result.stdout, result.stderr) if text]
+    return "\n".join(parts)
+
+
+def limit_wall_from_result(
+    result: subprocess.CompletedProcess[str],
+    patterns: Iterable[str] | None = None,
+    *,
+    now: datetime.datetime | None = None,
+) -> LimitWallSignal | None:
+    """Detect a provider limit wall in a nonzero subprocess result.
+
+    A limit wall is terminal for the advertised window: its text also matches
+    the transient patterns (it mentions "limit"/"quota"), so it must be checked
+    before transient classification or the caller burns its whole retry budget
+    against a wall that cannot clear for hours. A zero exit is never a wall,
+    which keeps a successful run that merely quotes a limit phrase off this
+    path.
+    """
+    if result.returncode == 0:
+        return None
+    output = subprocess_result_output(result)
+    if not output:
+        return None
+    return detect_limit_wall(output, patterns, now=now)
+
+
 def backoff_delay(
     attempt: int,
     base_delay: float = DEFAULT_BASE_DELAY,
@@ -249,6 +391,9 @@ def retry_subprocess_run(
     jitter: float = DEFAULT_JITTER,
     on_retry: RetryCallback | None = None,
     sleep: Callable[[float], None] = time.sleep,
+    detect_limit_walls: bool = True,
+    limit_wall_patterns: Iterable[str] | None = None,
+    on_limit_wall: Callable[[LimitWallSignal], None] | None = None,
     **subprocess_kwargs: Any,
 ) -> subprocess.CompletedProcess[str]:
     interrupt_process_group = bool(
@@ -277,6 +422,13 @@ def retry_subprocess_run(
                 on_retry(attempt + 1, delay, f"OSError: {exc}")
             sleep(delay)
             continue
+
+        if detect_limit_walls:
+            wall = limit_wall_from_result(result, limit_wall_patterns)
+            if wall is not None:
+                if on_limit_wall is not None:
+                    on_limit_wall(wall)
+                return result
 
         if result.returncode == 0 or not is_transient_subprocess_result(result):
             return result

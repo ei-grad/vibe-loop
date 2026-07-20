@@ -49,8 +49,10 @@ from vibe_loop.locks import (
     fencing_token_value,
 )
 from vibe_loop.retry import (
+    LimitWallSignal,
     detect_limit_wall,
     is_transient_stderr,
+    limit_wall_backoff_seconds,
     parse_quota_reset_delay,
     retry_subprocess_run,
 )
@@ -396,6 +398,24 @@ class TaskActivationError(RuntimeError):
     """A command task source could not confirm its pre-launch claim."""
 
 
+class AgentLimitWallError(RuntimeError):
+    """An agent subprocess refused work because an account limit was reached.
+
+    Raised instead of returning a generic failure so callers can pause until
+    ``pause_seconds`` rather than treating the refusal as a short transient.
+    ``pause_seconds`` is the advertised reset delay when the wall carried one,
+    otherwise the configured backoff. Deliberately not a ValueError/OSError
+    subclass: callers catch those as ordinary agent errors, and a wall must
+    stay distinguishable from them.
+    """
+
+    def __init__(self, signal: LimitWallSignal, *, default_backoff: float) -> None:
+        self.signal = signal
+        self.pause_seconds = limit_wall_backoff_seconds(signal, default_backoff)
+        detail = f" ({signal.reset_text})" if signal.reset_text else ""
+        super().__init__(f"agent limit wall: {signal.marker}{detail}")
+
+
 class AgentOutputObserver:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -625,6 +645,13 @@ class VibeRunner:
             return None
         return next((task for task in candidates if task.task_id == task_id), None)
 
+    def _limit_wall_retry_options(self) -> dict[str, object]:
+        supervision = self.config.supervision
+        return {
+            "detect_limit_walls": supervision.limit_wall_detection,
+            "limit_wall_patterns": supervision.limit_wall_patterns or None,
+        }
+
     def run_analysis_agent(
         self,
         prompt: str,
@@ -642,6 +669,7 @@ class VibeRunner:
             model=self.config.agent.model,
         )
         cmd, use_shell = prepare_shell_command(command_str)
+        walls: list[LimitWallSignal] = []
         try:
             result = retry_subprocess_run(
                 cmd,
@@ -655,10 +683,17 @@ class VibeRunner:
                 timeout=900,
                 interrupt_process_group=True,
                 on_retry=_analysis_retry_callback,
+                on_limit_wall=walls.append,
+                **self._limit_wall_retry_options(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             report_status(f"analysis agent failed to start: {exc}")
             return None
+        if walls:
+            raise AgentLimitWallError(
+                walls[0],
+                default_backoff=self.config.supervision.limit_wall_backoff_seconds,
+            )
         if result.returncode != 0:
             stderr_tail = (result.stderr or "")[-500:]
             report_status(f"analysis agent exited {result.returncode}: {stderr_tail}")
