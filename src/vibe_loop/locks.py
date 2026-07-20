@@ -155,7 +155,7 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
     )
     for token in sorted(fencing_token_values(context), key=len, reverse=True):
         detail = re.sub(
-            rf"(?<![\w.-]){re.escape(token)}(?![\w-])(?!\.\w)",
+            rf"(?<![\w.-]){re.escape(token)}(?!\w)(?![.-]\w)",
             FENCING_TOKEN_REDACTION,
             detail,
         )

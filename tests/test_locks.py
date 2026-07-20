@@ -526,6 +526,7 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                 raise locks.LockBackendError(
                     f"adapter refused: generation {token} rejected, run 141 kept"
                     f"; retry after generation {token}. schema {token}.4 held"
+                    f"; generation {token}- unavailable, node n-{token}-b idle"
                 )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -547,12 +548,19 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                 error.release_detail,
             )
             self.assertNotIn(f"generation {granted_token} ", error.release_detail)
-            # Sentence punctuation still ends a token.
+            # Sentence punctuation still ends a token; a dot or hyphen only
+            # suppresses redaction when identifier text follows it.
             self.assertIn(
                 f"generation {locks.FENCING_TOKEN_REDACTION}. schema",
                 error.release_detail,
             )
+            self.assertIn(
+                f"generation {locks.FENCING_TOKEN_REDACTION}- unavailable",
+                error.release_detail,
+            )
             self.assertNotIn(f"generation {granted_token}.", error.release_detail)
+            self.assertNotIn(f"generation {granted_token}-", error.release_detail)
+            self.assertIn(f"node n-{granted_token}-b idle", error.release_detail)
             # A generation this short over-redacts standalone matches rather
             # than leak, but must not rewrite the inside of larger numbers.
             self.assertIn("run 141 kept", error.release_detail)
