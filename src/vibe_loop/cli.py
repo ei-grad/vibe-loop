@@ -1061,6 +1061,7 @@ def redacted_autopilot_config(autopilot) -> dict[str, object]:
         "summary_command",
         "troubleshoot_command",
         "planning_command",
+        "idle_wake_command",
     ):
         configured = bool(payload.pop(key, None))
         payload[f"{key}_configured"] = configured

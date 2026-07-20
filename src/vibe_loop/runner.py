@@ -72,7 +72,7 @@ from vibe_loop.tasks import (
     Task,
     TaskSource,
     build_task_source,
-    runnable_tasks,
+    runnable_tasks_from_snapshot,
 )
 from vibe_loop.workers import (
     ActiveRunState,
@@ -492,19 +492,42 @@ class VibeRunner:
         return self._source
 
     def list_candidates(self, exclude: set[str] | None = None) -> list[Task]:
+        return self.list_candidates_from_snapshot(
+            self.source.list_tasks(), exclude=exclude
+        )
+
+    def list_candidates_from_snapshot(
+        self,
+        tasks: list[Task],
+        exclude: set[str] | None = None,
+        *,
+        active_runs: tuple[ActiveRunState, ...] | None = None,
+    ) -> list[Task]:
         excluded = exclude or set()
-        tasks = runnable_tasks(
-            self.source,
+        candidates = runnable_tasks_from_snapshot(
+            tasks,
             self.source_resolution.task_source.runnable_statuses,
             self.source_resolution.task_source.respect_source_order,
         )
-        active_domains = active_lock_conflict_domains(self.lock_manager)
-        enforce_conflicts = resource_conflicts_enabled(tasks, active_domains)
+        if active_runs is None:
+            active_domains = active_lock_conflict_domains(self.lock_manager)
+            locked_task_ids: set[str] | None = None
+        else:
+            active_domains = tuple(
+                conflict_domains_from_task_like(active) for active in active_runs
+            )
+            locked_task_ids = {active.task_id for active in active_runs}
+        enforce_conflicts = resource_conflicts_enabled(candidates, active_domains)
         return [
             task
-            for task in tasks
+            for task in candidates
             if task.task_id not in excluded
-            and not self.lock_manager.is_locked(task.task_id)
+            and (
+                locked_task_ids is not None
+                and task.task_id not in locked_task_ids
+                or locked_task_ids is None
+                and not self.lock_manager.is_locked(task.task_id)
+            )
             and (
                 not enforce_conflicts
                 or not task_conflicts_with_domains(task, active_domains)

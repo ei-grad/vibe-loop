@@ -412,8 +412,20 @@ A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
 work and exits when a cycle is idle or blocked; with `--interval N` it stays
-resident, sleeping `N` seconds between cycles until `--max-cycles` or an
-interrupt. `--jobs`, `--ask-agent`, `--continue-on-failure`, `--max-slices`, and
+resident until `--max-cycles` or an interrupt. Idle cycles use bounded adaptive
+task-source rechecks: the first listing follows `planning_recheck_seconds`
+(60s by default), delays double up to `idle_poll_max_seconds` (600s by default),
+and the last delay is shortened to preserve the outer interval deadline. A
+default 30-minute empty interval therefore performs five fallback listings, not
+roughly 30; each poll derives its runnable set from that single task snapshot.
+Task-source command timeouts are shortened to the remaining interval budget so
+a failing source cannot overrun the deadline. Fallback candidate filtering uses
+the cycle's active-run/conflict snapshot instead of issuing separately timed
+lock-backend queries; lock-only changes wake through the configured adapter or
+the outer deadline. Each wait appends an `autopilot_idle_wait` record with the
+wake reason, deadline, runnable count, poll/adapter counts, and bounded source
+or adapter errors. `--jobs`, `--ask-agent`, `--continue-on-failure`,
+`--max-slices`, and
 `--max-tasks` are forwarded to each child; `--min-ready` sets the minimum
 runnable depth required before launching. The value must be a positive integer;
 zero is rejected so an empty queue can never satisfy the launch gate. If the
@@ -430,12 +442,30 @@ post-worker task-source error remains explicit. A configured planning command
 retains precedence. A single supervisor lock prevents duplicates; Ctrl-C
 terminates the in-flight child and releases the lock.
 
+An explicit `[autopilot] idle_wake_command` can replace clock-only sleeping
+between fallback listings with a trusted long-poll adapter. Each invocation is
+bounded by the current adaptive delay and receives that delay, the cycle ID,
+and outer deadline literally through `VIBE_LOOP_IDLE_WAIT_SECONDS`,
+`VIBE_LOOP_IDLE_CYCLE_ID`, and `VIBE_LOOP_IDLE_DEADLINE`. It returns
+`{"woke":false}` or `{"woke":true,"reason":"task_change"}`; an
+`operator_message` reason may include an `event` object whose `id`, `at`,
+`sender`, and `session_ref` metadata are journaled. Message content and adapter
+stdout/stderr are not journaled. Invalid, failed, or timed-out adapters are
+recorded by error category and use the same adaptive fallback budget, so they
+cannot create a spin loop. Adapter stdout is capped at 64 KiB before JSON
+parsing, allowed event strings at 1 KiB each, and the journaled event at 4 KiB.
+The command is trusted, user-authored configuration;
+generated task profiles cannot introduce it. Validated per-project registry
+context is copied into this adapter environment using the same literal selector
+boundary as task-source and lock adapters.
+
 **`projects`** manages an optional multi-project registry (`register`, `list`,
 `remove`, `status`). It records repo paths and display names in a small JSON file
 (default `~/.vibe-loop/projects.json`, `--registry` to override); each project
 keeps its own state directory. A repeated `register --context NAME=VALUE` option
 adds bounded, non-secret selectors for repositories whose command-backed task
-source or lock adapter needs distinct context such as `LOOPYARD_PROJECT`.
+source, lock adapter, or idle-wake adapter needs distinct context such as
+`LOOPYARD_PROJECT`.
 Selectors are copied literally into only those subprocess environments, never
 shell-interpolated or added to global `os.environ`. Names must be selector-
 shaped, with suffixes such as `_PROJECT`, `_BOARD`, `_TENANT`, `_WORKSPACE`,
@@ -527,6 +557,8 @@ type = "directory"
 # jobs = 2
 # interval_seconds = 60.0
 # min_ready = 1              # positive integer; zero is invalid
+# planning_recheck_seconds = 60.0  # initial idle fallback delay; minimum 5s
+# idle_poll_max_seconds = 600.0    # exponential idle fallback cap; minimum 5s
 require_clean_repo = true   # set false to let a dirty tree run a cycle
 # Safe default: inspect and journal eligible worktrees without removing them.
 # Set to "reap" only as an explicit operator opt-in; existing safety guards remain.
@@ -541,6 +573,7 @@ worktree_disposition = "report-only"
 # summary_command = "scripts/summary.sh"
 # troubleshoot_command = "scripts/troubleshoot.sh"
 # planning_command = "scripts/plan.sh"
+# idle_wake_command = "scripts/wait-for-change.sh"
 ```
 
 When `--repo` points at a Git linked worktree without its own `.vibe-loop.toml`,

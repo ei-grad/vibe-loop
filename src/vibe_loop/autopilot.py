@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time as time_module
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from vibe_loop.runner import VibeRunner, new_run_id
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -48,6 +49,7 @@ from vibe_loop.runs import (
 )
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
 from vibe_loop.workers import (
+    ActiveRunState,
     ProcessExists,
     StaleLock,
     WorktreeDispositionDecision,
@@ -380,11 +382,32 @@ def collect_worker_views(
     )
 
 
-def collect_task_queue_status(config: VibeConfig) -> TaskQueueStatus:
-    runner = VibeRunner(config)
+def collect_task_queue_status(
+    config: VibeConfig,
+    timeout_seconds: float | None = None,
+    *,
+    active_runs: tuple[ActiveRunState, ...] | None = None,
+) -> TaskQueueStatus:
+    effective_config = config
+    if timeout_seconds is not None:
+        bounded_timeout = max(
+            min(config.task_source.command_timeout_seconds, timeout_seconds),
+            0.001,
+        )
+        effective_config = dataclasses.replace(
+            config,
+            task_source=dataclasses.replace(
+                config.task_source,
+                command_timeout_seconds=bounded_timeout,
+            ),
+        )
+    runner = VibeRunner(effective_config)
     try:
         tasks = runner.source.list_tasks()
-        runnable = runner.list_candidates()
+        runnable = runner.list_candidates_from_snapshot(
+            tasks,
+            active_runs=active_runs,
+        )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         return TaskQueueStatus(source_error=str(exc))
     except (subprocess.SubprocessError, OSError) as exc:
@@ -1969,6 +1992,12 @@ def execute_autopilot_cycle(
 
 
 _RECHECK_EPSILON = 1e-9
+IDLE_WAIT_ERROR_LIMIT = 8
+IDLE_WAIT_ERROR_TEXT_LIMIT = 256
+IDLE_WAKE_REASONS = frozenset({"task_change", "operator_message"})
+IDLE_WAKE_MAX_OUTPUT_BYTES = 64 * 1024
+IDLE_WAKE_EVENT_FIELD_MAX_BYTES = 1024
+IDLE_WAKE_EVENT_MAX_BYTES = 4096
 
 
 def require_positive_min_ready(min_ready: int) -> int:
@@ -2035,6 +2064,298 @@ def poll_runnable_count(config: VibeConfig) -> int:
     return status.runnable
 
 
+class IdleWakeAdapterError(RuntimeError):
+    def __init__(self, category: str) -> None:
+        self.category = category
+        super().__init__(category)
+
+
+@dataclasses.dataclass(frozen=True)
+class IdleWaitResult:
+    cycle_id: str
+    wake_reason: str
+    deadline: str
+    poll_count: int = 0
+    runnable: int = 0
+    adapter_calls: int = 0
+    source_error_count: int = 0
+    adapter_error_count: int = 0
+    source_errors: tuple[str, ...] = ()
+    adapter_errors: tuple[str, ...] = ()
+    event: dict[str, object] | None = None
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "wake_reason": self.wake_reason,
+            "deadline": self.deadline,
+            "poll_count": self.poll_count,
+            "runnable": self.runnable,
+            "adapter_calls": self.adapter_calls,
+            "source_error_count": self.source_error_count,
+            "adapter_error_count": self.adapter_error_count,
+            "source_errors": list(self.source_errors),
+            "adapter_errors": list(self.adapter_errors),
+        }
+        if self.event is not None:
+            payload["event"] = dict(self.event)
+        return payload
+
+
+IdleWakeAdapter = Callable[[float], dict[str, object] | None]
+IdleRunnableProbe = Callable[[VibeConfig, float], TaskQueueStatus | int]
+
+
+def poll_idle_wake_command(
+    command: str,
+    *,
+    cycle_id: str,
+    deadline: str,
+    timeout: float,
+    runtime_context: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> dict[str, object] | None:
+    """Run one trusted idle-wake adapter wait and validate its JSON envelope."""
+    environment = os.environ.copy()
+    environment["VIBE_LOOP_IDLE_CYCLE_ID"] = cycle_id
+    environment["VIBE_LOOP_IDLE_DEADLINE"] = deadline
+    environment["VIBE_LOOP_IDLE_WAIT_SECONDS"] = f"{timeout:.6f}"
+    if runtime_context is not None:
+        environment.update(runtime_context)
+    stdout = _bounded_idle_wake_output(
+        command,
+        environment=environment,
+        timeout=timeout,
+        cwd=cwd,
+    )
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise IdleWakeAdapterError("invalid_json") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("woke"), bool):
+        raise IdleWakeAdapterError("invalid_schema")
+    reason = payload.get("reason")
+    event = payload.get("event")
+    if not payload["woke"]:
+        if reason is not None or event is not None:
+            raise IdleWakeAdapterError("invalid_schema")
+        return None
+    if reason not in IDLE_WAKE_REASONS:
+        raise IdleWakeAdapterError("invalid_schema")
+    if event is not None and not isinstance(event, dict):
+        raise IdleWakeAdapterError("invalid_schema")
+    wake_event: dict[str, object] = {"kind": reason}
+    if isinstance(event, dict):
+        for key in ("id", "at", "sender", "session_ref"):
+            value = event.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                if (
+                    isinstance(value, str)
+                    and len(value.encode("utf-8")) > IDLE_WAKE_EVENT_FIELD_MAX_BYTES
+                ):
+                    raise IdleWakeAdapterError("event_too_large")
+                wake_event[key] = value
+    if len(json.dumps(wake_event).encode("utf-8")) > IDLE_WAKE_EVENT_MAX_BYTES:
+        raise IdleWakeAdapterError("event_too_large")
+    return wake_event
+
+
+def _bounded_idle_wake_output(
+    command: str,
+    *,
+    environment: dict[str, str],
+    timeout: float,
+    cwd: Path | None,
+) -> str:
+    prepared, use_shell = prepare_shell_command(command)
+    popen_kwargs: dict[str, Any] = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    deadline = time_module.monotonic() + max(timeout, 0.001)
+    with tempfile.TemporaryFile() as buffer:
+        try:
+            process = subprocess.Popen(
+                prepared,
+                cwd=cwd,
+                shell=use_shell,
+                stdout=buffer,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+                **popen_kwargs,
+            )
+        except OSError as exc:
+            raise IdleWakeAdapterError("execution_error") from exc
+        while True:
+            return_code = process.poll()
+            buffer.seek(0, os.SEEK_END)
+            output_size = buffer.tell()
+            if output_size > IDLE_WAKE_MAX_OUTPUT_BYTES:
+                if return_code is None:
+                    kill_command_process_group(process)
+                    process.wait()
+                raise IdleWakeAdapterError("output_too_large")
+            if return_code is not None:
+                break
+            remaining = deadline - time_module.monotonic()
+            if remaining <= 0:
+                kill_command_process_group(process)
+                process.wait()
+                raise IdleWakeAdapterError("timeout")
+            time_module.sleep(min(0.01, remaining))
+        if return_code != 0:
+            raise IdleWakeAdapterError("nonzero_exit")
+        buffer.seek(0)
+        raw = buffer.read(IDLE_WAKE_MAX_OUTPUT_BYTES + 1)
+    if len(raw) > IDLE_WAKE_MAX_OUTPUT_BYTES:
+        raise IdleWakeAdapterError("output_too_large")
+    return raw.decode("utf-8", errors="replace")
+
+
+def _bounded_idle_error(value: object) -> str:
+    text = " ".join(str(value).split())
+    return text[:IDLE_WAIT_ERROR_TEXT_LIMIT]
+
+
+def _record_bounded_error(errors: list[str], value: object) -> None:
+    if len(errors) < IDLE_WAIT_ERROR_LIMIT:
+        errors.append(_bounded_idle_error(value))
+
+
+def wait_for_idle_change(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    deadline: str,
+    interval: float,
+    initial_poll_seconds: float,
+    max_poll_seconds: float,
+    sleeper: Sleep,
+    should_stop: Callable[[], bool] | None = None,
+    runnable_probe: IdleRunnableProbe | None = None,
+    min_ready: int = 1,
+    wake_adapter: IdleWakeAdapter | None = None,
+    monotonic: Callable[[], float] | None = None,
+    active_runs: tuple[ActiveRunState, ...] = (),
+) -> IdleWaitResult:
+    """Wait for idle work with a trusted wake adapter and adaptive fallback."""
+    threshold = require_positive_min_ready(min_ready)
+    if runnable_probe is None:
+
+        def probe(probe_config: VibeConfig, timeout: float) -> TaskQueueStatus:
+            return collect_task_queue_status(
+                probe_config,
+                timeout,
+                active_runs=active_runs,
+            )
+
+    else:
+        probe = runnable_probe
+    clock = monotonic if monotonic is not None else time_module.monotonic
+    remaining_budget = max(interval, 0.0)
+    deadline_at = clock() + remaining_budget
+    maximum = max(max_poll_seconds, 0.1)
+    delay = min(max(initial_poll_seconds, 0.1), maximum)
+    polls = 0
+    adapter_calls = 0
+    source_error_count = 0
+    adapter_error_count = 0
+    source_errors: list[str] = []
+    adapter_errors: list[str] = []
+
+    while remaining_budget > _RECHECK_EPSILON:
+        remaining = min(remaining_budget, max(deadline_at - clock(), 0.0))
+        if remaining <= _RECHECK_EPSILON:
+            break
+        wait_budget = min(delay, remaining)
+        adapter_elapsed = 0.0
+        if wake_adapter is not None:
+            adapter_calls += 1
+            adapter_started = clock()
+            try:
+                event = wake_adapter(wait_budget)
+            except IdleWakeAdapterError as exc:
+                adapter_error_count += 1
+                _record_bounded_error(adapter_errors, exc.category)
+                event = None
+            adapter_elapsed = min(max(clock() - adapter_started, 0.0), wait_budget)
+            if event is not None and clock() < deadline_at:
+                return IdleWaitResult(
+                    cycle_id=cycle_id,
+                    wake_reason=str(event["kind"]),
+                    deadline=deadline,
+                    poll_count=polls,
+                    adapter_calls=adapter_calls,
+                    source_error_count=source_error_count,
+                    adapter_error_count=adapter_error_count,
+                    source_errors=tuple(source_errors),
+                    adapter_errors=tuple(adapter_errors),
+                    event=event,
+                )
+        sleep_for = wait_budget - adapter_elapsed
+        if sleep_for > _RECHECK_EPSILON:
+            sleeper(sleep_for)
+        remaining_budget -= wait_budget
+        if should_stop is not None and should_stop():
+            return IdleWaitResult(
+                cycle_id=cycle_id,
+                wake_reason="stopped",
+                deadline=deadline,
+                poll_count=polls,
+                adapter_calls=adapter_calls,
+                source_error_count=source_error_count,
+                adapter_error_count=adapter_error_count,
+                source_errors=tuple(source_errors),
+                adapter_errors=tuple(adapter_errors),
+            )
+        remaining = min(remaining_budget, max(deadline_at - clock(), 0.0))
+        if remaining <= _RECHECK_EPSILON:
+            break
+
+        polls += 1
+        status = probe(config, remaining)
+        if isinstance(status, int):
+            runnable = status
+            source_error = ""
+        else:
+            runnable = status.runnable
+            source_error = status.source_error
+        if source_error:
+            source_error_count += 1
+            _record_bounded_error(source_errors, source_error)
+        if clock() >= deadline_at:
+            break
+        if not source_error and runnable >= threshold:
+            return IdleWaitResult(
+                cycle_id=cycle_id,
+                wake_reason="task_change",
+                deadline=deadline,
+                poll_count=polls,
+                runnable=runnable,
+                adapter_calls=adapter_calls,
+                source_error_count=source_error_count,
+                adapter_error_count=adapter_error_count,
+                source_errors=tuple(source_errors),
+                adapter_errors=tuple(adapter_errors),
+            )
+        delay = min(delay * 2.0, maximum)
+
+    return IdleWaitResult(
+        cycle_id=cycle_id,
+        wake_reason="deadline",
+        deadline=deadline,
+        poll_count=polls,
+        adapter_calls=adapter_calls,
+        source_error_count=source_error_count,
+        adapter_error_count=adapter_error_count,
+        source_errors=tuple(source_errors),
+        adapter_errors=tuple(adapter_errors),
+    )
+
+
 def recheck_interval_for_runnable(
     config: VibeConfig,
     *,
@@ -2092,6 +2413,10 @@ def run_autopilot(
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     native_planning_runner: NativePlanningRunner = run_native_planning,
+    idle_waiter: Callable[..., IdleWaitResult] = wait_for_idle_change,
+    idle_wake_command_runner: Callable[..., dict[str, object] | None] = (
+        poll_idle_wake_command
+    ),
     should_stop: Callable[[], bool] | None = None,
 ) -> AutopilotRunSummary:
     """Supervise ``run-until-done`` as a foreground persistent loop.
@@ -2194,6 +2519,13 @@ def run_autopilot(
                 worktree_disposition_runner=worktree_disposition_runner,
                 native_planning_runner=native_planning_runner,
             )
+            if (
+                not bounded_last
+                and interval > 0
+                and cycle_should_recheck(result)
+                and result.limit_wall_pause_seconds is None
+            ):
+                result = dataclasses.replace(result, next_wake=iso_after(interval))
             post_cycle_planning_delay: float | None = None
             if (
                 not bounded_last
@@ -2242,22 +2574,54 @@ def run_autopilot(
                 # Persistent watch: keep cycling and sleeping until a bound or
                 # signal stops the loop, even across idle or blocked cycles.
                 if cycle_should_recheck(result):
-                    # An idle/planning cycle may gain runnable tasks out of band
-                    # (a planning worker or external tool filling the queue). Poll the
-                    # task source in recheck slices instead of sleeping the whole
-                    # interval, and start the next cycle as soon as work appears.
-                    woke_early = recheck_interval_for_runnable(
+                    wake_adapter_callback: IdleWakeAdapter | None = None
+                    idle_wake_command = config.autopilot.idle_wake_command
+                    if idle_wake_command is not None:
+
+                        def _wake_adapter(
+                            timeout: float,
+                        ) -> dict[str, object] | None:
+                            return idle_wake_command_runner(
+                                idle_wake_command,
+                                cycle_id=result.cycle_id,
+                                deadline=result.next_wake,
+                                timeout=timeout,
+                                runtime_context=config.runtime_environment,
+                                cwd=config.repo,
+                            )
+
+                        wake_adapter_callback = _wake_adapter
+
+                    wait_result = idle_waiter(
                         config,
+                        cycle_id=result.cycle_id,
+                        deadline=result.next_wake,
                         interval=interval,
-                        recheck_seconds=config.autopilot.planning_recheck_seconds,
+                        initial_poll_seconds=(
+                            config.autopilot.planning_recheck_seconds
+                        ),
+                        max_poll_seconds=config.autopilot.idle_poll_max_seconds,
                         sleeper=sleeper,
                         should_stop=should_stop,
                         min_ready=min_ready,
+                        wake_adapter=wake_adapter_callback,
+                        active_runs=tuple(
+                            worker.active
+                            for worker in result.project_status.workers
+                            if worker_holds_active_conflict(worker)
+                        ),
                     )
-                    if woke_early:
+                    run_store.append_record(wait_result.to_record(config.repo))
+                    if wait_result.wake_reason == "task_change":
                         print(
-                            "[vibe-loop] autopilot recheck: runnable tasks "
-                            "appeared, starting next cycle early",
+                            "[vibe-loop] autopilot idle wake: task source changed, "
+                            "starting next cycle early",
+                            flush=True,
+                        )
+                    elif wait_result.wake_reason == "operator_message":
+                        print(
+                            "[vibe-loop] autopilot idle wake: operator message, "
+                            "starting next cycle early",
                             flush=True,
                         )
                 elif post_cycle_planning_delay is not None:

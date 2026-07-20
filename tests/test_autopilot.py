@@ -4,6 +4,7 @@ import dataclasses
 import datetime
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -28,9 +29,11 @@ from vibe_loop.autopilot import (
     collect_supervisor_status,
     cycle_schedule_deadline,
     cycle_should_recheck,
+    IdleWakeAdapterError,
     limit_wall_pause_seconds,
     parse_wait_deadline,
     poll_wait_message_command,
+    poll_idle_wake_command,
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
@@ -40,6 +43,7 @@ from vibe_loop.autopilot import (
     run_native_planning,
     run_worktree_disposition,
     wait_for_processes,
+    wait_for_idle_change,
     WaitMessageAdapterError,
 )
 from vibe_loop.config import load_config
@@ -47,6 +51,7 @@ from vibe_loop.locks import AUTOPILOT_LOCK_NAME, build_lock_manager
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -1338,8 +1343,8 @@ class AutopilotRecheckTests(unittest.TestCase):
         # Planning fires on every idle cycle (it is never starved) ...
         self.assertEqual(kinds, ["planning", "planning"])
         # ... and the recheck does not wake early on the below-threshold count;
-        # it sleeps the full interval in slices instead of spinning.
-        self.assertEqual(sleeps, [10.0] * 10)
+        # it sleeps the full interval with adaptive fallback instead of spinning.
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
 
     def test_poll_runnable_count_reports_zero_on_source_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1415,6 +1420,31 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertTrue(status.source_error)
         self.assertEqual(status.runnable, 0)
 
+    def test_idle_probe_bounds_command_source_timeout_to_remaining_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml='[task_source]\ntype = "command"\nlist = "list-tasks"\n',
+            )
+            config = load_config(repo)
+            observed_timeouts: list[float] = []
+
+            def raise_timeout(
+                *args: object, **kwargs: object
+            ) -> subprocess.CompletedProcess:
+                observed_timeouts.append(float(kwargs["timeout"]))
+                raise subprocess.TimeoutExpired(
+                    cmd=args[0], timeout=kwargs.get("timeout")
+                )
+
+            with mock.patch("vibe_loop.tasks.subprocess.run", raise_timeout):
+                status = collect_task_queue_status(config, 7.5)
+
+        self.assertTrue(status.source_error)
+        self.assertEqual(observed_timeouts, [7.5])
+
     def test_cycle_should_recheck_only_for_idle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1483,7 +1513,7 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertIn("ran_planning_command:exit=0", summary.cycles[0].actions)
         self.assertEqual(kinds, ["planning"])
         # Recheck slices, not one full interval; woke on the second poll.
-        self.assertEqual(sleeps, [10.0, 10.0])
+        self.assertEqual(sleeps, [10.0, 20.0])
         # The next cycle picked up the freshly planned task and dispatched.
         self.assertEqual(len(launcher_calls), 1)
         self.assertEqual(summary.cycles[1].status, "completed")
@@ -1508,12 +1538,21 @@ class AutopilotRecheckTests(unittest.TestCase):
                 sleep=sleeps.append,
                 native_planning_runner=native_no_plan,
             )
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
 
         self.assertEqual(summary.cycles[0].status, "idle")
-        # No runnable task ever appears, so the recheck loop sleeps the full
-        # interval in recheck-sized slices, then the next cycle begins.
-        self.assertEqual(sleeps, [10.0] * 10)
+        # No runnable task ever appears, so adaptive fallback consumes the full
+        # interval before the next cycle begins.
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
         self.assertEqual(len(launcher_calls), 0)
+        idle_wait = next(
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_IDLE_WAIT_RECORD_TYPE
+        )
+        self.assertEqual(idle_wait["wake_reason"], "deadline")
+        self.assertEqual(idle_wait["poll_count"], 3)
+        self.assertEqual(idle_wait["source_error_count"], 0)
 
     def test_dispatched_cycle_sleeps_plain_interval(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1626,6 +1665,350 @@ class AutopilotRecheckTests(unittest.TestCase):
         # Even though the cycle is idle, the limit-wall backoff replaces the
         # recheck loop entirely; the recheck slice size never appears.
         self.assertEqual(sleeps, [42.0])
+
+
+class AutopilotIdleWaitTests(unittest.TestCase):
+    def test_default_thirty_minute_wait_uses_five_fallback_listings(self) -> None:
+        sleeps: list[float] = []
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=1800.0,
+            initial_poll_seconds=60.0,
+            max_poll_seconds=600.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: 0,
+        )
+
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.poll_count, 5)
+        self.assertEqual(sleeps, [60.0, 120.0, 240.0, 480.0, 600.0, 300.0])
+        self.assertEqual(sum(sleeps), 1800.0)
+
+    def test_fallback_wakes_when_dispatch_threshold_appears(self) -> None:
+        sleeps: list[float] = []
+        probes = iter([1, 2])
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=1800.0,
+            initial_poll_seconds=60.0,
+            max_poll_seconds=600.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: next(probes),
+            min_ready=2,
+        )
+
+        self.assertEqual(result.wake_reason, "task_change")
+        self.assertEqual(result.poll_count, 2)
+        self.assertEqual(result.runnable, 2)
+        self.assertEqual(sleeps, [60.0, 120.0])
+
+    def test_repeated_source_errors_back_off_and_are_bounded(self) -> None:
+        sleeps: list[float] = []
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=100.0,
+            initial_poll_seconds=5.0,
+            max_poll_seconds=5.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: TaskQueueStatus(
+                source_error="backend unavailable " + "x" * 400
+            ),
+        )
+
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.poll_count, 19)
+        self.assertEqual(result.source_error_count, 19)
+        self.assertEqual(len(result.source_errors), 8)
+        self.assertTrue(all(len(error) <= 256 for error in result.source_errors))
+        self.assertEqual(sum(sleeps), 100.0)
+
+    def test_fallback_cap_can_be_lower_than_the_initial_delay(self) -> None:
+        sleeps: list[float] = []
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=25.0,
+            initial_poll_seconds=60.0,
+            max_poll_seconds=10.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: 0,
+        )
+
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.poll_count, 2)
+        self.assertEqual(sleeps, [10.0, 10.0, 5.0])
+
+    def test_slow_source_probes_consume_the_absolute_deadline_budget(self) -> None:
+        now = [0.0]
+        probe_timeouts: list[float] = []
+
+        def sleeper(seconds: float) -> None:
+            now[0] += seconds
+
+        def slow_probe(_config: object, timeout: float) -> TaskQueueStatus:
+            probe_timeouts.append(timeout)
+            now[0] += min(30.0, timeout)
+            return TaskQueueStatus(source_error="source timeout")
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=100.0,
+            initial_poll_seconds=20.0,
+            max_poll_seconds=20.0,
+            sleeper=sleeper,
+            runnable_probe=slow_probe,
+            monotonic=lambda: now[0],
+        )
+
+        self.assertEqual(now[0], 100.0)
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.poll_count, 2)
+        self.assertEqual(result.source_error_count, 2)
+        self.assertEqual(probe_timeouts, [80.0, 30.0])
+
+    def test_task_change_finishing_at_deadline_does_not_override_deadline(self) -> None:
+        now = [0.0]
+
+        def sleeper(seconds: float) -> None:
+            now[0] += seconds
+
+        def deadline_probe(_config: object, timeout: float) -> int:
+            now[0] += timeout
+            return 1
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=100.0,
+            initial_poll_seconds=20.0,
+            max_poll_seconds=20.0,
+            sleeper=sleeper,
+            runnable_probe=deadline_probe,
+            monotonic=lambda: now[0],
+        )
+
+        self.assertEqual(now[0], 100.0)
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.poll_count, 1)
+
+    def test_five_fallback_polls_issue_five_task_source_listings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Done", "", "done")])
+            config = load_config(repo)
+            list_calls = 0
+
+            class Source:
+                def list_tasks(self) -> list[object]:
+                    nonlocal list_calls
+                    list_calls += 1
+                    return []
+
+            class Runner:
+                source = Source()
+
+                def list_candidates_from_snapshot(
+                    self,
+                    _tasks: list[object],
+                    *,
+                    active_runs: tuple[object, ...] | None = None,
+                ) -> list[object]:
+                    self.assert_no_active_runs(active_runs)
+                    return []
+
+                @staticmethod
+                def assert_no_active_runs(
+                    active_runs: tuple[object, ...] | None,
+                ) -> None:
+                    if active_runs != ():
+                        raise AssertionError(active_runs)
+
+            with mock.patch("vibe_loop.autopilot.VibeRunner", return_value=Runner()):
+                result = wait_for_idle_change(
+                    config,
+                    cycle_id="cycle-1",
+                    deadline="deadline",
+                    interval=1800.0,
+                    initial_poll_seconds=60.0,
+                    max_poll_seconds=600.0,
+                    sleeper=lambda _seconds: None,
+                )
+
+        self.assertEqual(result.poll_count, 5)
+        self.assertEqual(list_calls, 5)
+
+    def test_idle_probe_does_not_query_command_lock_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Done", "", "done")],
+                extra_toml=(
+                    '[locks]\ntype = "command"\n'
+                    'acquire_command = "unused"\n'
+                    'release_command = "unused"\n'
+                    'status_command = "unused"\n'
+                    'list_command = "unused"\n'
+                ),
+            )
+            config = load_config(repo)
+
+            with mock.patch(
+                "vibe_loop.locks.CommandLockBackend.list_locks",
+                side_effect=AssertionError("idle probe queried lock backend"),
+            ):
+                result = wait_for_idle_change(
+                    config,
+                    cycle_id="cycle-1",
+                    deadline="deadline",
+                    interval=10.0,
+                    initial_poll_seconds=5.0,
+                    max_poll_seconds=5.0,
+                    sleeper=lambda _seconds: None,
+                )
+
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.poll_count, 1)
+
+    def test_operator_message_adapter_wakes_without_fallback_listing(self) -> None:
+        sleeps: list[float] = []
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=1800.0,
+            initial_poll_seconds=60.0,
+            max_poll_seconds=600.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: self.fail("fallback probe ran"),
+            wake_adapter=lambda _timeout: {
+                "kind": "operator_message",
+                "id": "message-1",
+            },
+        )
+
+        self.assertEqual(result.wake_reason, "operator_message")
+        self.assertEqual(result.adapter_calls, 1)
+        self.assertEqual(result.poll_count, 0)
+        self.assertEqual(sleeps, [])
+
+    def test_adapter_errors_use_the_same_bounded_fallback_budget(self) -> None:
+        sleeps: list[float] = []
+
+        def broken_adapter(_timeout: float) -> dict[str, object] | None:
+            raise IdleWakeAdapterError("nonzero_exit")
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=1800.0,
+            initial_poll_seconds=60.0,
+            max_poll_seconds=600.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: 0,
+            wake_adapter=broken_adapter,
+            monotonic=lambda: 0.0,
+        )
+
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(result.adapter_calls, 6)
+        self.assertEqual(result.adapter_error_count, 6)
+        self.assertEqual(result.adapter_errors, ("nonzero_exit",) * 6)
+        self.assertEqual(sum(sleeps), 1800.0)
+
+    def test_wake_command_uses_literal_environment_and_redacts_message_text(
+        self,
+    ) -> None:
+        output = json.dumps(
+            {
+                "woke": True,
+                "reason": "operator_message",
+                "event": {
+                    "id": "message-1",
+                    "content": "sensitive operator text",
+                },
+            }
+        )
+        with mock.patch(
+            "vibe_loop.autopilot._bounded_idle_wake_output", return_value=output
+        ) as run:
+            event = poll_idle_wake_command(
+                "adapter --wait",
+                cycle_id="cycle;literal",
+                deadline="2030-01-01T00:00:00Z",
+                timeout=30.0,
+                runtime_context={"TRACKER_PROJECT": "project;literal"},
+            )
+
+        self.assertEqual(event, {"kind": "operator_message", "id": "message-1"})
+        environment = run.call_args.kwargs["environment"]
+        self.assertEqual(environment["VIBE_LOOP_IDLE_CYCLE_ID"], "cycle;literal")
+        self.assertEqual(environment["VIBE_LOOP_IDLE_WAIT_SECONDS"], "30.000000")
+        self.assertEqual(environment["TRACKER_PROJECT"], "project;literal")
+        self.assertEqual(run.call_args.kwargs["timeout"], 30.0)
+
+    def test_wake_command_rejects_unknown_reason(self) -> None:
+        output = json.dumps({"woke": True, "reason": "surprise"})
+        with (
+            mock.patch(
+                "vibe_loop.autopilot._bounded_idle_wake_output",
+                return_value=output,
+            ),
+            self.assertRaises(IdleWakeAdapterError) as caught,
+        ):
+            poll_idle_wake_command(
+                "adapter", cycle_id="cycle-1", deadline="deadline", timeout=5.0
+            )
+
+        self.assertEqual(caught.exception.category, "invalid_schema")
+
+    def test_wake_command_rejects_oversized_stdout(self) -> None:
+        script = 'import sys; sys.stdout.write("x" * 70000)'
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+        with self.assertRaises(IdleWakeAdapterError) as caught:
+            poll_idle_wake_command(
+                command, cycle_id="cycle-1", deadline="deadline", timeout=5.0
+            )
+
+        self.assertEqual(caught.exception.category, "output_too_large")
+
+    def test_wake_command_rejects_oversized_event_metadata(self) -> None:
+        output = json.dumps(
+            {
+                "woke": True,
+                "reason": "operator_message",
+                "event": {"id": "x" * 1025},
+            }
+        )
+        with (
+            mock.patch(
+                "vibe_loop.autopilot._bounded_idle_wake_output",
+                return_value=output,
+            ),
+            self.assertRaises(IdleWakeAdapterError) as caught,
+        ):
+            poll_idle_wake_command(
+                "adapter", cycle_id="cycle-1", deadline="deadline", timeout=5.0
+            )
+
+        self.assertEqual(caught.exception.category, "event_too_large")
 
 
 class NativePlanningTests(unittest.TestCase):

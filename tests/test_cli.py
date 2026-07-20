@@ -7950,7 +7950,8 @@ class AutopilotCliTests(unittest.TestCase):
             repo = Path(directory) / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)
             (repo / ".vibe-loop.toml").write_text(
-                '[autopilot]\njobs = 2\nhealth_command = "secret-health --token abc"\n',
+                '[autopilot]\njobs = 2\nhealth_command = "secret-health --token abc"\n'
+                'idle_wake_command = "secret-wake --token def"\n',
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
@@ -7977,7 +7978,11 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertTrue(autopilot["health_command_configured"])
         self.assertTrue(autopilot["health_command_redacted"])
         self.assertNotIn("health_command", autopilot)
+        self.assertTrue(autopilot["idle_wake_command_configured"])
+        self.assertTrue(autopilot["idle_wake_command_redacted"])
+        self.assertNotIn("idle_wake_command", autopilot)
         self.assertNotIn("secret-health", raw)
+        self.assertNotIn("secret-wake", raw)
 
     def test_run_once_honors_config_min_ready_without_launching(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -51,14 +51,19 @@ repository's configured runtime journal, such as `.vibe-loop/runs.jsonl`, rather
 than a separate hidden state file.
 
 Records include `autopilot_cycle`, `autopilot_supervisor_started`,
-`autopilot_supervisor_observed`, and `autopilot_command_result`. Each record
+`autopilot_supervisor_observed`, `autopilot_command_result`, and
+`autopilot_idle_wait`. Each cycle record
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
 Cycle and supervisor records also carry the configured worktree-disposition
 policy. Worktree-disposition records carry that policy plus candidate counts,
 evidence, reasons, and outcomes. Existing run readers must keep tolerating
-unknown record types.
+unknown record types. Idle-wait records carry the originating cycle id, outer
+deadline, wake reason, runnable count, task-source poll count, wake-adapter call
+count, and bounded source/adapter error categories. This provenance must
+distinguish a task change, deadline, operator message, and a failing source
+without persisting operator-message content.
 
 Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`.
 
@@ -73,7 +78,16 @@ Acceptance must cover child command construction, log redirection under the
 configured state directory, pid/log observation, no duplicate supervisor
 launch, one-cycle mode, bounded cycle counts, foreground interval sleeping,
 signal behavior, and classification of clean drain versus restartable exit
-versus blocked state.
+versus blocked state. Idle foreground waits use an adaptive full-list fallback
+whose delays grow to a configured cap while preserving the outer interval
+deadline; repeated task-source or wake-adapter failures must not spin. With the
+default settings, a 30-minute empty interval performs substantially fewer than
+30 task-source listings. Each logical fallback poll performs one task-source
+listing, derives runnable work from that snapshot, and bounds a command-backed
+listing by the remaining absolute monotonic deadline. Candidate filtering uses
+the cycle's active-run/conflict snapshot so the fallback does not introduce an
+independently timed lock-backend query; a lock-only change is observed through
+the trusted wake adapter or at the outer deadline.
 
 Related implementation IDs: `AUTO-03`.
 
@@ -421,3 +435,20 @@ resolution, literal environment delivery, schema validation, bounded command
 execution, safe errors, and unchanged behavior when no adapter is configured.
 
 Related implementation IDs: `AUTO-22`.
+
+Autopilot may also use an explicit trusted `[autopilot] idle_wake_command`
+between adaptive task-source fallback listings. The command receives the
+current wait budget, cycle id, and outer deadline through literal environment
+values rather than shell interpolation. Validated registry runtime selectors
+use the same literal adapter-environment boundary. The command returns
+`{"woke":false}` or a validated `task_change`/`operator_message` wake reason
+with optional bounded event metadata. Each invocation is time-bounded; invalid,
+failed, or timed-out commands are journaled by safe category and fall back to
+the same adaptive wait budget. Adapter output, permitted event fields, and total
+journaled event size are byte-bounded. Message content and adapter stdout/stderr
+are not journaled. Generated task-source profiles cannot introduce this command.
+
+Autopilot acceptance must cover prompt change/message wakes, literal environment
+delivery, schema validation, deadline preservation, adaptive fallback polling,
+bounded error provenance, and unchanged clock/task-source behavior when no wake
+adapter is configured.

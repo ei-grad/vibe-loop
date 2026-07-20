@@ -575,10 +575,12 @@ class ConfigTests(unittest.TestCase):
                 "interval_seconds = 30.0\n"
                 "min_ready = 2\n"
                 "planning_recheck_seconds = 45.0\n"
+                "idle_poll_max_seconds = 300.0\n"
                 "require_clean_repo = false\n"
                 'worktree_disposition = "reap"\n'
                 'health_command = "scripts/health.sh"\n'
-                'planning_command = "scripts/plan.sh"\n',
+                'planning_command = "scripts/plan.sh"\n'
+                'idle_wake_command = "scripts/wait-for-change.sh"\n',
                 encoding="utf-8",
             )
 
@@ -589,6 +591,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.autopilot.min_ready, 2)
         self.assertEqual(config.autopilot.planning_recheck_seconds, 45.0)
         self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 45.0)
+        self.assertEqual(config.autopilot.idle_poll_max_seconds, 300.0)
+        self.assertEqual(config.autopilot.to_json()["idle_poll_max_seconds"], 300.0)
         self.assertFalse(config.autopilot.require_clean_repo)
         self.assertEqual(config.autopilot.worktree_disposition, "reap")
         self.assertEqual(
@@ -596,6 +600,9 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(
             config.autopilot.maintenance_command("planning"), "scripts/plan.sh"
+        )
+        self.assertEqual(
+            config.autopilot.idle_wake_command, "scripts/wait-for-change.sh"
         )
         self.assertIsNone(config.autopilot.maintenance_command("summary"))
         self.assertIsNone(config.autopilot.maintenance_command("troubleshoot"))
@@ -611,6 +618,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.autopilot.worktree_disposition, "report-only")
         self.assertEqual(config.autopilot.planning_recheck_seconds, 60.0)
         self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 60.0)
+        self.assertEqual(config.autopilot.idle_poll_max_seconds, 600.0)
+        self.assertEqual(config.autopilot.to_json()["idle_poll_max_seconds"], 600.0)
+        self.assertIsNone(config.autopilot.idle_wake_command)
         self.assertEqual(config.autopilot.explicit_keys, frozenset())
 
     def test_autopilot_config_rejects_invalid_values(self) -> None:
@@ -620,6 +630,8 @@ class ConfigTests(unittest.TestCase):
             ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
             ("planning_recheck_seconds = 0\n", "autopilot.planning_recheck_seconds"),
             ("planning_recheck_seconds = -5\n", "autopilot.planning_recheck_seconds"),
+            ("idle_poll_max_seconds = 0\n", "autopilot.idle_poll_max_seconds"),
+            ("idle_poll_max_seconds = 2\n", "at least 5.0 seconds"),
             # Below the 5s floor: a misconfigured tiny value could otherwise
             # generate ~1.8M probes across an interval.
             ("planning_recheck_seconds = 2.0\n", "at least 5.0 seconds"),
@@ -662,6 +674,7 @@ class ConfigTests(unittest.TestCase):
             "summary_command",
             "troubleshoot_command",
             "planning_command",
+            "idle_wake_command",
             "analysis_command",
             "autopilot",
         ):

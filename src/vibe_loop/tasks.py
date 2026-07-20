@@ -294,7 +294,16 @@ def runnable_tasks(
     statuses: tuple[str, ...],
     respect_source_order: bool = False,
 ) -> list[Task]:
-    tasks = source.list_tasks()
+    return runnable_tasks_from_snapshot(
+        source.list_tasks(), statuses, respect_source_order
+    )
+
+
+def runnable_tasks_from_snapshot(
+    tasks: list[Task],
+    statuses: tuple[str, ...],
+    respect_source_order: bool = False,
+) -> list[Task]:
     done = {task.task_id for task in tasks if task.done}
     allowed = set(statuses)
     candidates = [

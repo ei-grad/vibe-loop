@@ -205,6 +205,7 @@ AUTOPILOT_COMMAND_KEYS = frozenset(
         "summary_command",
         "troubleshoot_command",
         "planning_command",
+        "idle_wake_command",
     }
 )
 AUTOPILOT_WORKTREE_DISPOSITION_POLICIES = ("report-only", "reap")
@@ -216,6 +217,7 @@ AUTOPILOT_CONFIG_KEYS = (
             "min_ready",
             "require_clean_repo",
             "planning_recheck_seconds",
+            "idle_poll_max_seconds",
             "worktree_disposition",
         }
     )
@@ -266,6 +268,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "summary_command",
         "troubleshoot_command",
         "planning_command",
+        "idle_wake_command",
         "analysis_command",
     }
 )
@@ -661,11 +664,13 @@ class AutopilotConfig:
     min_ready: int | None = None
     require_clean_repo: bool = True
     planning_recheck_seconds: float = 60.0
+    idle_poll_max_seconds: float = 600.0
     worktree_disposition: str = "report-only"
     health_command: str | None = None
     summary_command: str | None = None
     troubleshoot_command: str | None = None
     planning_command: str | None = None
+    idle_wake_command: str | None = None
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -686,11 +691,13 @@ class AutopilotConfig:
             "min_ready": self.min_ready,
             "require_clean_repo": self.require_clean_repo,
             "planning_recheck_seconds": self.planning_recheck_seconds,
+            "idle_poll_max_seconds": self.idle_poll_max_seconds,
             "worktree_disposition": self.worktree_disposition,
             "health_command": self.health_command,
             "summary_command": self.summary_command,
             "troubleshoot_command": self.troubleshoot_command,
             "planning_command": self.planning_command,
+            "idle_wake_command": self.idle_wake_command,
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1782,6 +1789,12 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             "autopilot.planning_recheck_seconds",
             minimum=5.0,
         ),
+        idle_poll_max_seconds=positive_float(
+            table.get("idle_poll_max_seconds"),
+            600.0,
+            "autopilot.idle_poll_max_seconds",
+            minimum=5.0,
+        ),
         require_clean_repo=optional_bool(
             table.get("require_clean_repo"),
             True,
@@ -1794,6 +1807,7 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             table.get("troubleshoot_command")
         ),
         planning_command=optional_nonempty_string(table.get("planning_command")),
+        idle_wake_command=optional_nonempty_string(table.get("idle_wake_command")),
         explicit_keys=explicit_keys,
     )
 
