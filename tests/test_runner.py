@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import json
 import os
@@ -4371,6 +4372,19 @@ class AnalysisAgentTests(unittest.TestCase):
         # End-to-end over a real subprocess: the observed Codex wall text must
         # travel from the agent's exit through the retry layer and surface as a
         # typed error carrying the reset, without spending any retry attempt.
+        # The reset is expressed relative to the real clock the production
+        # parser reads. Pinning the observed Jul 25 2026 instant instead would
+        # make this test pass only until that date, then report the wall as
+        # elapsed and fall back to the default backoff.
+        reset = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            days=5
+        )
+        reset_month = reset.strftime("%b")
+        reset_phrase = (
+            f"{reset_month} {reset.day}, {reset.year} "
+            f"{reset.hour % 12 or 12}:{reset.minute:02d} "
+            f"{'AM' if reset.hour < 12 else 'PM'}"
+        )
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             stub = repo / "analysis-stub.py"
@@ -4380,8 +4394,7 @@ class AnalysisAgentTests(unittest.TestCase):
                 "import sys\n"
                 f"open({str(attempts)!r}, 'a').write('x')\n"
                 'sys.stderr.write("You\'ve hit your usage limit. Your limit "\n'
-                '    "will reset and you can try again at Jul 25th, 2026 '
-                '3:24 AM.")\n'
+                f'    "will reset and you can try again at {reset_phrase}.")\n'
                 "sys.exit(1)\n",
                 encoding="utf-8",
             )
@@ -4401,11 +4414,11 @@ class AnalysisAgentTests(unittest.TestCase):
                 runner.run_analysis_agent("inspect", output_path)
 
             error = caught.exception
-            self.assertIn("Jul 25th", error.signal.reset_text)
+            self.assertIn(f"{reset_month} {reset.day}", error.signal.reset_text)
             assert error.signal.reset_delay is not None
             # Days out, so the pause is the parsed reset rather than the
             # configured default backoff.
-            self.assertGreater(error.pause_seconds, 24 * 3600)
+            self.assertGreater(error.pause_seconds, 4 * 24 * 3600)
             self.assertEqual(error.pause_seconds, error.signal.reset_delay)
             # Invoked exactly once: no jittered retries were burned.
             self.assertEqual(attempts.read_text(), "x")

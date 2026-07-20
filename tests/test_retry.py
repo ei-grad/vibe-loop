@@ -483,17 +483,20 @@ class RetrySubprocessRunTests(unittest.TestCase):
     def test_ordinary_transients_still_retry_with_wall_detection_on(self) -> None:
         # Acceptance guard: limit-wall classification must not swallow the
         # short-transient retries that 429/5xx/capacity failures depend on.
-        for stderr in (
-            "429 Too Many Requests",
-            "503 Service Unavailable",
-            "Overloaded, please retry",
-            "ECONNRESET",
-            "at capacity",
+        for stderr, carries_wall_phrase in (
+            ("429 Too Many Requests", False),
+            ("503 Service Unavailable", False),
+            ("Overloaded, please retry", False),
+            ("ECONNRESET", False),
+            ("at capacity", False),
             # Collision cases: these carry a wall phrase but are independently
             # transient and advertise no reset, so they must keep their
             # retries rather than buying a half-hour pause for a 30s outage.
-            "Error 429: Too Many Requests. usage limit exceeded, retry after 30s",
-            "503: weekly limit reached, service temporarily unavailable",
+            (
+                "Error 429: Too Many Requests. usage limit exceeded, retry after 30s",
+                True,
+            ),
+            ("503: weekly limit reached, service temporarily unavailable", True),
         ):
             with self.subTest(stderr=stderr):
                 fake_sleep = MagicMock()
@@ -514,7 +517,39 @@ class RetrySubprocessRunTests(unittest.TestCase):
                     )
                 self.assertEqual(mock_run.call_count, 3)
                 self.assertEqual(fake_sleep.call_count, 2)
-                self.assertEqual(walls, [])
+                # The retries come first either way. A body that never named a
+                # limit stays a plain transient failure; one that did is
+                # surfaced once, after its retries are spent, so the caller
+                # backs off instead of redispatching into the same refusal.
+                self.assertEqual(len(walls), 1 if carries_wall_phrase else 0)
+
+    def test_stdout_only_throttling_body_keeps_its_retries(self) -> None:
+        # Wall detection reads stdout and stderr, so the recoverability check
+        # must read the same combined output. A throttling body that arrives
+        # only on stdout is no less recoverable than one on stderr, and
+        # classifying it as a terminal wall would cost it every retry.
+        fake_sleep = MagicMock()
+        walls: list[LimitWallSignal] = []
+        stdout_only = subprocess.CompletedProcess(
+            args=["test"],
+            returncode=1,
+            stdout="Error 429: Too Many Requests. usage limit exceeded, retry after 30s",
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=stdout_only) as mock_run:
+            retry_subprocess_run(
+                ["test"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                max_retries=2,
+                sleep=fake_sleep,
+                detect_limit_walls=True,
+                on_limit_wall=walls.append,
+            )
+        self.assertEqual(mock_run.call_count, 3)
+        self.assertEqual(fake_sleep.call_count, 2)
+        self.assertEqual(len(walls), 1)
 
     def test_reset_less_wall_that_is_not_transient_still_short_circuits(self) -> None:
         # A wall phrase with no reset and no independent transient marker has
@@ -566,6 +601,29 @@ class RetrySubprocessRunTests(unittest.TestCase):
             28 * 3600 + QUOTA_RESET_MARGIN_SECONDS,
             delta=1.0,
         )
+
+    def test_year_less_reset_hours_in_the_past_is_elapsed_not_next_year(self) -> None:
+        # A same-day reset already behind the clock is simply elapsed. Rolling
+        # every past year-less date into the next year turned it into a
+        # ~365-day wait, capped to a false seven-day pause, instead of falling
+        # back to the configured backoff.
+        now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
+        signal = detect_limit_wall(
+            "You've hit your usage limit. try again at Jul 20th 3:24 AM.", now=now
+        )
+        assert signal is not None
+        self.assertIsNone(signal.reset_delay)
+        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 1800.0)
+
+    def test_year_less_reset_months_in_the_past_is_elapsed(self) -> None:
+        # Well short of the year boundary: rolling "Mar 1" seen in July into
+        # next March advertises a wait no limit wall ever means.
+        now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
+        signal = detect_limit_wall(
+            "You've hit your usage limit. try again at Mar 1 3:00 AM.", now=now
+        )
+        assert signal is not None
+        self.assertIsNone(signal.reset_delay)
 
     def test_wall_detection_is_opt_in(self) -> None:
         # Detection must not silently change unrelated call sites (task

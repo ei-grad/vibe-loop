@@ -3850,13 +3850,23 @@ def run_autopilot(
                         result,
                         actions=(*result.actions, post_cycle_action),
                     )
-            if not bounded_last and result.limit_wall_pause_seconds is not None:
+            limit_wall_pause = result.limit_wall_pause_seconds
+            # Restamping and waiting must share one predicate. A configured
+            # zero backoff makes an elapsed or reset-less wall pause for zero
+            # seconds, which is not a pause at all: stamping next_wake to now
+            # and then sleeping the ordinary interval would report a wake the
+            # supervisor never honours.
+            if (
+                not bounded_last
+                and limit_wall_pause is not None
+                and limit_wall_pause > 0
+            ):
                 # The interval-based wake stamped before the cycle is a lie once
                 # a limit wall pauses dispatch: report the reset the supervisor
                 # actually sleeps to.
                 result = dataclasses.replace(
                     result,
-                    next_wake=iso_after(result.limit_wall_pause_seconds),
+                    next_wake=iso_after(limit_wall_pause),
                 )
             result.append_to(run_store)
             cycles.append(result)

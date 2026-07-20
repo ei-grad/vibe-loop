@@ -191,13 +191,18 @@ def _reset_delay_from_date_match(
     except ValueError:
         return None
     if not groups.get("year") and reset < current:
-        # A year-less calendar reset always advertises a near-future instant, so
-        # a date that reads as past has crossed the year boundary ("Jan 2nd"
-        # seen on Dec 31). Roll it forward rather than reading it as elapsed.
+        # A year-less calendar reset that reads as past may have crossed the
+        # year boundary ("Jan 2nd" seen on Dec 31). Roll it forward only when
+        # the rolled instant lands inside the same near-future window that
+        # bounds any wall: an hours-old same-day reset ("Jul 20th 3:24 AM" seen
+        # at 10:00) would otherwise become a year away and be capped into a
+        # false multi-day pause, when it is simply elapsed.
         try:
-            reset = reset.replace(year=year + 1)
+            rolled = reset.replace(year=year + 1)
         except ValueError:
             return None
+        if (rolled - current).total_seconds() <= LIMIT_WALL_RESET_MAX_DELAY_SECONDS:
+            reset = rolled
     return _delay_until(reset, now, max_delay=LIMIT_WALL_RESET_MAX_DELAY_SECONDS)
 
 
@@ -376,38 +381,55 @@ def subprocess_result_output(result: subprocess.CompletedProcess[str]) -> str:
     return "\n".join(parts)
 
 
+def classify_limit_wall_result(
+    result: subprocess.CompletedProcess[str],
+    patterns: Iterable[str] | None = None,
+    *,
+    now: datetime.datetime | None = None,
+) -> tuple[LimitWallSignal | None, bool]:
+    """Classify a finished subprocess as a limit wall or recoverable throttling.
+
+    Returns ``(wall, retry_as_transient)``. A limit wall is terminal for the
+    advertised window: its text also matches the transient patterns (it
+    mentions "limit"/"quota"), so it must be checked before transient
+    classification or the caller burns its whole retry budget against a wall
+    that cannot clear for hours. A zero exit is never a wall, which keeps a
+    successful run that merely quotes a limit phrase off this path.
+
+    A match without a parseable reset is only treated as a wall when the output
+    carries no independent transient marker. Provider rate-limit bodies say
+    things like "usage limit exceeded, retry after 30s": they carry a wall
+    phrase but are recoverable in seconds, and short-circuiting them would
+    trade three bounded retries for a half-hour pause the provider never asked
+    for. That collision check reads the same combined stdout+stderr the wall
+    scan reads, since a body arriving only on stdout is no less recoverable;
+    ``retry_as_transient`` then tells the caller to keep the short retries even
+    though stderr alone looks unremarkable.
+    """
+    if result.returncode == 0:
+        return None, False
+    output = subprocess_result_output(result)
+    if not output:
+        return None, False
+    signal = detect_limit_wall(output, patterns, now=now)
+    if signal is None:
+        return None, False
+    if signal.reset_delay is None and is_transient_stderr(output):
+        return None, True
+    return signal, False
+
+
 def limit_wall_from_result(
     result: subprocess.CompletedProcess[str],
     patterns: Iterable[str] | None = None,
     *,
     now: datetime.datetime | None = None,
 ) -> LimitWallSignal | None:
-    """Detect a provider limit wall in a nonzero subprocess result.
+    """The limit wall in a nonzero subprocess result, if any.
 
-    A limit wall is terminal for the advertised window: its text also matches
-    the transient patterns (it mentions "limit"/"quota"), so it must be checked
-    before transient classification or the caller burns its whole retry budget
-    against a wall that cannot clear for hours. A zero exit is never a wall,
-    which keeps a successful run that merely quotes a limit phrase off this
-    path.
-
-    A match without a parseable reset is only treated as a wall when the result
-    is not independently transient. Provider rate-limit bodies say things like
-    "usage limit exceeded, retry after 30s": they carry a wall phrase but are
-    recoverable in seconds, and short-circuiting them would trade three bounded
-    retries for a half-hour pause the provider never asked for.
+    See classify_limit_wall_result for the classification rules.
     """
-    if result.returncode == 0:
-        return None
-    output = subprocess_result_output(result)
-    if not output:
-        return None
-    signal = detect_limit_wall(output, patterns, now=now)
-    if signal is None:
-        return None
-    if signal.reset_delay is None and is_transient_subprocess_result(result):
-        return None
-    return signal
+    return classify_limit_wall_result(result, patterns, now=now)[0]
 
 
 def backoff_delay(
@@ -463,17 +485,33 @@ def retry_subprocess_run(
             sleep(delay)
             continue
 
+        retry_as_transient = False
         if detect_limit_walls:
-            wall = limit_wall_from_result(result, limit_wall_patterns)
+            wall, retry_as_transient = classify_limit_wall_result(
+                result, limit_wall_patterns
+            )
             if wall is not None:
                 if on_limit_wall is not None:
                     on_limit_wall(wall)
                 return result
 
-        if result.returncode == 0 or not is_transient_subprocess_result(result):
+        if result.returncode == 0 or not (
+            retry_as_transient or is_transient_subprocess_result(result)
+        ):
             return result
 
         if attempt >= max_retries:
+            # A reset-less wall phrase kept its short retries because the body
+            # also looked recoverable. Once those are spent the wall is the
+            # best remaining explanation, so surface it exactly once and let
+            # the caller apply its configured backoff instead of redispatching
+            # into the same refusal.
+            if detect_limit_walls and on_limit_wall is not None:
+                exhausted = detect_limit_wall(
+                    subprocess_result_output(result), limit_wall_patterns
+                )
+                if exhausted is not None:
+                    on_limit_wall(exhausted)
             return result
 
         delay = backoff_delay(attempt, base_delay, max_delay, jitter)

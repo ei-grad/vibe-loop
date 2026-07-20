@@ -2532,6 +2532,66 @@ class AutopilotRecheckTests(unittest.TestCase):
         occurred = datetime.datetime.fromisoformat(first.occurred_at)
         self.assertGreater((wake - occurred).total_seconds(), 3000.0)
 
+    def test_zero_backoff_wall_reports_the_interval_wake_it_actually_sleeps(
+        self,
+    ) -> None:
+        # A reset-less wall under a configured zero backoff produces a
+        # zero-second pause, which is no pause at all: the loop falls through to
+        # the ordinary interval sleep. Restamping next_wake to "now" there would
+        # advertise a wake the supervisor never honours.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "[supervision]\n"
+                    "limit_wall_backoff_seconds = 0\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher, _launcher_calls = self._recording_launcher()
+            sleeps: list[float] = []
+
+            def wall_planning(config, **kwargs):
+                return run_native_planning(
+                    config,
+                    cycle_id=kwargs["cycle_id"],
+                    status=kwargs["status"],
+                    min_ready=kwargs["min_ready"],
+                    run_store=kwargs["run_store"],
+                    analysis_runner=lambda prompt, output_path: (_ for _ in ()).throw(
+                        AgentLimitWallError(
+                            LimitWallSignal(
+                                marker="You've hit your usage limit",
+                                reset_text="",
+                                reset_delay=None,
+                            ),
+                            default_backoff=0.0,
+                        )
+                    ),
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+                native_planning_runner=wall_planning,
+            )
+
+        first = summary.cycles[0]
+        self.assertEqual(first.limit_wall_pause_seconds, 0.0)
+        # The ordinary interval sleep ran (sliced for planning rechecks), not a
+        # zero-second wall pause, so the wake must describe that interval.
+        self.assertEqual(sum(sleeps), 100.0)
+        wake = datetime.datetime.fromisoformat(first.next_wake)
+        occurred = datetime.datetime.fromisoformat(first.occurred_at)
+        self.assertGreater((wake - occurred).total_seconds(), 1.0)
+
 
 class CycleSummaryLimitWallTests(unittest.TestCase):
     def _summary(self, actions: tuple[str, ...]) -> CycleSummary:

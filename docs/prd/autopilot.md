@@ -301,7 +301,12 @@ long-lived: either a parseable reset time, or the absence of any independent
 transient marker. Provider rate-limit bodies routinely carry a wall phrase while
 advertising recovery in seconds ("usage limit exceeded, retry after 30s"); those
 keep their bounded retries, because trading three short retries for a
-half-hour pause the provider never asked for is strictly worse.
+half-hour pause the provider never asked for is strictly worse. That
+recoverability check reads the same combined stdout+stderr the wall scan reads;
+a throttling body arriving only on stdout is no less recoverable. Once those
+retries are spent and the failure persists, the named wall is the best remaining
+explanation, so it is surfaced exactly once and the caller applies its
+configured backoff rather than redispatching into the same refusal.
 
 Advertised resets may be wall-clock ("resets 1am (UTC)") or an absolute calendar
 instant ("try again at Jul 25th, 2026 3:24 AM"). Calendar forms are parsed in
@@ -310,7 +315,9 @@ reading of a multi-day wall understates the wait. The two forms carry different
 misparse bounds: a bare clock cannot meaningfully mean more than a day, while a
 full date is self-validating and a multi-day account limit is a legitimate
 reading that must not be truncated into an untruthful wake. A year-less calendar
-date that reads as past has crossed the year boundary and rolls forward. An
+date that reads as past rolls forward a year only when the rolled instant lands
+inside that same near-future bound, which distinguishes a genuine year-boundary
+crossing ("Jan 2nd" seen on Dec 31) from a reset that is merely hours old. An
 already-elapsed reset reports no usable reset at all rather than a zero wait,
 so the caller falls back to its configured backoff instead of spinning.
 
@@ -321,6 +328,9 @@ supervisor pauses dispatch until the reset. The journaled `next_wake` must be
 the reset the supervisor actually sleeps to, not the interval stamped before the
 cycle ran, and status output must name the wall so a paused cycle stays
 distinguishable from a planning failure that shares the same `idle` status. A
+non-positive pause is not a pause: a configured zero backoff leaves the cycle on
+its ordinary interval, and the reported wake must describe that interval rather
+than the wall. A
 stop request must interrupt the pause: signal-driven stops unwind through the
 sleeper, and a cooperative stop is polled between bounded slices.
 
