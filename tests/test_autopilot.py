@@ -4678,6 +4678,65 @@ class AutopilotIdleWaitTests(unittest.TestCase):
 
 
 class NativePlanningTests(unittest.TestCase):
+    def test_mixed_command_providers_override_unavailable_usage_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            claude_stub = repo / "claude"
+            claude_stub.write_text(
+                "#!/usr/bin/env python3\n"
+                'print(\'\'\'{"should_plan":true,"reason":"queue low",'
+                '"objective":"add one task"}\'\'\')\n',
+                encoding="utf-8",
+            )
+            claude_stub.chmod(0o755)
+            base_config = load_config(repo)
+            config = dataclasses.replace(
+                base_config,
+                agent=dataclasses.replace(
+                    base_config.agent,
+                    command="codex exec -m openai-model {prompt}",
+                    analysis_command=(
+                        f"{claude_stub} -p --model claude-model {{prompt}}"
+                    ),
+                    agent_kind="auto",
+                ),
+            )
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
+                on_start(4242)
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-mixed-provider",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                worker_launcher=worker_launcher,
+            )
+            run_store.append_record(
+                planning_outcome_record(
+                    repo,
+                    cycle_id="cycle-mixed-provider",
+                    outcome="zero_created",
+                    fingerprint="fingerprint",
+                    runnable_before=result.worker.runnable_before,
+                    runnable_after=result.worker.runnable_after,
+                    model_provider=result.model_provider,
+                    model_id=result.model_id,
+                    stats=result.stats,
+                )
+            )
+            persisted = run_store.read_records()[-1]
+
+        self.assertEqual(result.model_provider, "mixed")
+        self.assertEqual(result.model_id, "mixed")
+        self.assertEqual(persisted["model_provider"], "mixed")
+        self.assertEqual(persisted["model_id"], "mixed")
+
     def test_explicit_worker_model_persists_in_planning_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

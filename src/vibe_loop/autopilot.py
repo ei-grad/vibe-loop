@@ -4383,9 +4383,9 @@ def run_native_planning(
                 wall_time_seconds=max(0.0, time_module.monotonic() - planning_started),
             ),
             model_provider=(
-                analysis_usage.provider
-                if analysis_usage.provider != "unknown"
-                else model_provider
+                model_provider
+                if model_provider != "unknown"
+                else analysis_usage.provider
             ),
             model_id=model_id,
         )
@@ -4536,9 +4536,7 @@ def run_native_planning(
             wall_time_seconds=max(0.0, time_module.monotonic() - planning_started),
         ),
         model_provider=(
-            merged_usage.provider
-            if merged_usage.provider != "unknown"
-            else model_provider
+            model_provider if model_provider != "unknown" else merged_usage.provider
         ),
         model_id=model_id,
     )
