@@ -76,10 +76,11 @@ Three ordering rules keep the two stores in agreement:
 - A settled outcome is only publishable once the local `run_result` append has
   succeeded. External provenance may never claim a completion vibe-loop itself
   failed to record, so a failed append leaves the run settling as `unknown`.
-- A settled outcome is monotonic in the lock row. Only the supervisor that
-  classified the run writes one, so a same-owner update carrying none — a
-  heartbeat refreshing from a snapshot read before settlement — preserves the
-  stored outcome instead of reopening the run.
+- A settled outcome is monotonic in the lock row: a stored terminal outcome
+  (`completed`, `failed`, `blocked`) may only be replaced by another terminal
+  one. A same-owner update carrying no outcome, or still carrying `unknown` —
+  a heartbeat refreshing from a snapshot read before settlement — keeps the
+  stored outcome and its classification instead of reopening the run.
 - A recovery attempt that exhausts the unknown-run recovery budget settles as
   `failed`, not `unknown`. The supervisor records the terminal `failed` result
   for that run after its lock is released, so the verdict is published from the

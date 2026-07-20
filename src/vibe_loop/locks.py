@@ -1280,6 +1280,40 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# The settled outcomes that are terminal for a run. Mirrors the non-unknown
+# members of runs.SETTLED_RUN_OUTCOMES, duplicated here because runs imports
+# locks.
+TERMINAL_LOCK_OUTCOMES = frozenset({"completed", "failed", "blocked"})
+
+
+def preserve_settled_lock_outcome(
+    updated: dict[str, object],
+    current: dict[str, object],
+) -> None:
+    """Keep a stored terminal outcome from being downgraded in place.
+
+    Backends that mirror run provenance finalize from the stored lock row, so
+    the settled outcome is monotonic: once the supervisor that classified the
+    run writes a terminal outcome, no later same-owner update may replace it
+    with an absent or still-unknown one. A heartbeat refreshing from a snapshot
+    read before settlement carries exactly that stale pair, and it arrives after
+    the settlement update by construction. Outcome and classification move
+    together so provenance never reads a completed outcome beside an unknown
+    classification.
+    """
+
+    stored = current.get("outcome")
+    if not isinstance(stored, str) or stored not in TERMINAL_LOCK_OUTCOMES:
+        return
+    incoming = updated.get("outcome")
+    if isinstance(incoming, str) and incoming in TERMINAL_LOCK_OUTCOMES:
+        return
+    updated["outcome"] = stored
+    stored_classification = current.get("classification")
+    if not runtime_lock_field_empty(stored_classification):
+        updated["classification"] = stored_classification
+
+
 def preserve_runtime_lock_fields(
     metadata: dict[str, object],
     current: dict[str, object],
@@ -1288,13 +1322,8 @@ def preserve_runtime_lock_fields(
     for key in ("fencing_token", "lease_seconds", "heartbeat_at"):
         if key not in updated and key in current:
             updated[key] = current[key]
+    preserve_settled_lock_outcome(updated, current)
     for key in (
-        # A settled outcome is monotonic: only the supervisor that classified
-        # the run ever writes one, so an update carrying none - a heartbeat
-        # refreshing from a snapshot taken before settlement, for instance -
-        # must not clear the row the backend finalizes the run from.
-        "outcome",
-        "classification",
         "workspace",
         "worker_pid",
         "pid",

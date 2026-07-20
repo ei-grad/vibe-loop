@@ -4735,33 +4735,79 @@ class RecordingLockManager(LockManager):
         return ""
 
 
-class HeartbeatInjectingLockManager(LockManager):
-    """Replays a same-owner heartbeat that raced the settling update.
+class SynchronizedHeartbeatLockManager(LockManager):
+    """Runs a real ``LockManager.heartbeat`` across the settling update.
 
-    A heartbeat reads the lock row, stamps ``heartbeat_at`` and writes the row
-    back. One that reads before the settling update but writes after it carries
-    a snapshot with no outcome, which is the narrow window in which a settled
-    run could be reopened. The stale snapshot is captured from the last update
-    that carried no outcome and replayed just before release.
+    The heartbeat is the production one: it reads the lock row through
+    ``validate_owner`` and writes that snapshot back with a fresh
+    ``heartbeat_at``. Here its read is held before the settling update and its
+    write released after, so it carries the genuinely stale pre-settlement pair
+    - a stored ``outcome=unknown`` / ``classification=unknown`` written by an
+    earlier unsettled publication - into a row the backend has already
+    finalized as completed.
     """
+
+    HEARTBEAT_WAIT_SECONDS = 10.0
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.stale: dict[str, object] | None = None
+        self.read_done = threading.Event()
+        self.settled = threading.Event()
+        self.heartbeat_snapshot: dict[str, object] | None = None
+        self.heartbeat_metadata: dict[str, object] | None = None
+        self.heartbeat_error: BaseException | None = None
         self.injected = False
+        self._heartbeat = threading.local()
+
+    def _on_heartbeat_thread(self) -> bool:
+        return getattr(self._heartbeat, "active", False)
+
+    def _replay_heartbeat(self, task_lock) -> None:
+        self._heartbeat.active = True
+        try:
+            refreshed = self.heartbeat(
+                task_id=task_lock.task_id,
+                run_id=str(task_lock.metadata.get("run_id") or ""),
+                fencing_token=str(task_lock.metadata.get("fencing_token") or "")
+                or None,
+                heartbeat_at="2026-07-20T00:00:00Z",
+            )
+            self.heartbeat_metadata = dict(refreshed.metadata)
+        except BaseException as exc:  # surfaced by the test, never swallowed
+            self.heartbeat_error = exc
+
+    def validate_owner(self, **kwargs):
+        current = super().validate_owner(**kwargs)
+        if self._on_heartbeat_thread():
+            # The snapshot is read; hold it until the settling update stored a
+            # terminal outcome so the write back is unambiguously stale.
+            self.heartbeat_snapshot = dict(current.metadata)
+            self.read_done.set()
+            self.settled.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
+        return current
 
     def update(self, task_lock, metadata):
-        if not metadata.get("outcome"):
-            self.stale = dict(metadata)
-        return super().update(task_lock, metadata)
-
-    def release(self, task_lock) -> None:
-        if not self.injected and self.stale is not None:
-            self.injected = True
-            heartbeat = dict(self.stale)
-            heartbeat["heartbeat_at"] = "2026-07-20T00:00:00Z"
-            super().update(task_lock, heartbeat)
-        super().release(task_lock)
+        if self._on_heartbeat_thread() or self.injected:
+            return super().update(task_lock, metadata)
+        if (
+            str(metadata.get("outcome") or "")
+            not in locks_module.TERMINAL_LOCK_OUTCOMES
+        ):
+            return super().update(task_lock, metadata)
+        self.injected = True
+        unsettled = dict(task_lock.metadata)
+        unsettled["outcome"] = "unknown"
+        unsettled["classification"] = "unknown"
+        super().update(task_lock, unsettled)
+        thread = threading.Thread(target=self._replay_heartbeat, args=(task_lock,))
+        thread.start()
+        try:
+            self.read_done.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
+            settled = super().update(task_lock, metadata)
+        finally:
+            self.settled.set()
+            thread.join(timeout=self.HEARTBEAT_WAIT_SECONDS)
+        return settled
 
 
 class StubTaskSource:
@@ -5362,7 +5408,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
             self._attach_provenance_backend(runner, root)
             command_backend = runner.lock_manager.backend
-            manager = HeartbeatInjectingLockManager(
+            manager = SynchronizedHeartbeatLockManager(
                 runner.config.state_path / "locks",
                 backend=command_backend,
             )
@@ -5370,10 +5416,20 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             self._run_task(runner, task, self._reporting_worker(runner, "completed"))
 
-            # The heartbeat landed between the settling update and the release
-            # the backend finalizes on, carrying a snapshot read before the
-            # outcome was written. It must not reopen the settled run.
             self.assertTrue(manager.injected)
+            self.assertIsNone(manager.heartbeat_error)
+            snapshot = manager.heartbeat_snapshot or {}
+            self.assertEqual(snapshot.get("outcome"), "unknown")
+            self.assertEqual(snapshot.get("classification"), "unknown")
+            # The heartbeat really did carry the stale unsettled pair into the
+            # row after settlement; precedence, not absence, is what keeps the
+            # stored outcome terminal for the backend that finalizes on release.
+            self.assertEqual(
+                (manager.heartbeat_metadata or {}).get("outcome"), "completed"
+            )
+            self.assertEqual(
+                (manager.heartbeat_metadata or {}).get("classification"), "completed"
+            )
             self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
 
     def test_command_backend_publishes_nothing_without_a_durable_result(self) -> None:
