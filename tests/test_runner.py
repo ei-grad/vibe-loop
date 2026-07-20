@@ -18,6 +18,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
 from vibe_loop.config import (
     AgentConfig,
@@ -4991,6 +4992,135 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 "completed",
             )
 
+    def test_lock_released_event_carries_the_settled_outcome(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            released = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "lock_released"
+            ]
+            self.assertEqual(len(released), 1)
+            # vibe-loop's own provenance must settle on the same outcome it
+            # published to the backend, so both views agree after the fact.
+            self.assertEqual(released[0].get("outcome"), "completed")
+            self.assertEqual(released[0].get("classification"), "completed")
+
+    def test_parallel_jobs_settle_each_run_independently(self) -> None:
+        tasks = [
+            Task(task_id=f"T-{index}", title=f"Task {index}", status="Next")
+            for index in range(1, 5)
+        ]
+        statuses = {"T-1": "completed", "T-2": "blocked", "T-3": "failed"}
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory,
+                tasks,
+                {
+                    task.task_id: Task(
+                        task_id=task.task_id, title=task.title, status="Done"
+                    )
+                    for task in tasks
+                },
+            )
+
+            def fake_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                source.mark_dispatched(task_id)
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=task_id,
+                        status=statuses.get(task_id, "unknown"),
+                        message="parallel worker report",
+                    )
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        runner.run_until_done(jobs=2, continue_on_failure=True)
+
+            # Concurrent slots share the supervisor but not their settled
+            # outcomes: no run may inherit or overwrite a sibling's.
+            for task_id, expected in {
+                "T-1": "completed",
+                "T-2": "blocked",
+                "T-3": "failed",
+                "T-4": "unknown",
+            }.items():
+                with self.subTest(task_id=task_id):
+                    self.assertEqual(lock_manager.outcome_at_release(task_id), expected)
+
+    def test_command_lock_backend_receives_outcome_on_the_wire(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            wire_log = repo / "wire.jsonl"
+            adapter = repo / "adapter.py"
+            adapter.write_text(
+                "import json, os, pathlib, sys\n"
+                "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
+                "metadata = json.loads(os.environ['VIBE_LOOP_LOCK_METADATA_JSON'])\n"
+                "log = pathlib.Path(sys.argv[1])\n"
+                "store = log.with_suffix('.state')\n"
+                "log.open('a').write(\n"
+                "    json.dumps({'operation': operation, 'metadata': metadata}) + '\\n'\n"
+                ")\n"
+                "held = json.loads(store.read_text()) if store.exists() else None\n"
+                "if operation == 'list':\n"
+                "    print(json.dumps({'locks': [held] if held else []}))\n"
+                "elif operation == 'status':\n"
+                "    print(json.dumps({'locked': bool(held), 'metadata': held or {}}))\n"
+                "elif operation == 'release':\n"
+                "    store.unlink(missing_ok=True)\n"
+                "    print(json.dumps({'released': True}))\n"
+                "else:\n"
+                "    store.write_text(json.dumps(metadata))\n"
+                "    print(json.dumps({'acquired': True, 'metadata': metadata}))\n"
+            )
+            command = f"{sys.executable} {adapter} {wire_log}"
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            runner._lock_manager = LockManager(
+                runner.config.state_path / "locks",
+                backend=locks_module.CommandLockBackend(
+                    repo=repo,
+                    lock_root=runner.config.state_path / "locks",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            calls = [
+                json.loads(line)
+                for line in wire_log.read_text().splitlines()
+                if line.strip()
+            ]
+            # The defect lived on this wire: the backend that finalizes run
+            # provenance must be handed the outcome by an update it persists,
+            # before the release it finalizes on.
+            operations = [call["operation"] for call in calls]
+            last_update = max(
+                index
+                for index, operation in enumerate(operations)
+                if operation == "update"
+            )
+            release_index = operations.index("release")
+            self.assertLess(last_update, release_index)
+            self.assertEqual(calls[last_update]["metadata"].get("outcome"), "completed")
+
 
 class SettledRunOutcomeTests(unittest.TestCase):
     def test_settling_classifications_map_through(self) -> None:
@@ -5003,11 +5133,19 @@ class SettledRunOutcomeTests(unittest.TestCase):
             with self.subTest(classification=classification):
                 self.assertEqual(settled_run_outcome(classification), "unknown")
 
-    def test_every_settled_outcome_is_a_valid_backend_value(self) -> None:
-        self.assertEqual(
-            set(SETTLED_RUN_OUTCOMES),
-            {"completed", "failed", "blocked", "unknown"},
-        )
+    def test_every_run_classification_settles_within_the_outcome_family(self) -> None:
+        # A backend that stores one terminal outcome per run rejects anything
+        # outside this family, so no classification may escape the mapping.
+        for classification in (
+            "completed",
+            "failed",
+            "blocked",
+            "unknown",
+            "timed_out",
+            "limit_wall",
+        ):
+            with self.subTest(classification=classification):
+                self.assertIn(settled_run_outcome(classification), SETTLED_RUN_OUTCOMES)
 
 
 if __name__ == "__main__":

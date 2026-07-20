@@ -111,21 +111,21 @@ LIFECYCLE_PROTECTED_KEYS = frozenset(
 # terminal outcome per run, while classifications such as "timed_out" and
 # "limit_wall" describe a run that ended without settling the task at all.
 SETTLED_RUN_OUTCOMES = ("completed", "failed", "blocked", "unknown")
-SETTLED_RUN_OUTCOME_CLASSIFICATIONS = frozenset({"completed", "failed", "blocked"})
+UNKNOWN_RUN_OUTCOME = "unknown"
 
 
 def settled_run_outcome(classification: str) -> str:
     """Map a run classification onto its settled outcome.
 
-    Only classifications that themselves settle the run map through verbatim.
-    Everything else - an indeterminate probe, a wall-clock kill, a provider
-    limit wall, an interrupted supervisor - is genuinely unknown and must not
-    be promoted to a completion.
+    Only a classification that is itself a settled outcome maps through
+    verbatim. Everything else - an indeterminate probe, a wall-clock kill, a
+    provider limit wall, an interrupted supervisor - is genuinely unknown and
+    must not be promoted to a completion.
     """
 
-    if classification in SETTLED_RUN_OUTCOME_CLASSIFICATIONS:
+    if classification in SETTLED_RUN_OUTCOMES:
         return classification
-    return "unknown"
+    return UNKNOWN_RUN_OUTCOME
 
 
 _APPEND_LOCK = threading.Lock()

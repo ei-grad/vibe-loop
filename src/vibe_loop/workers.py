@@ -168,7 +168,9 @@ class ActiveRunState:
     # Published into the lock metadata just before release so a command lock
     # backend that mirrors run provenance finalizes this run with the outcome
     # the supervisor actually settled on, instead of inferring one from the
-    # release event alone. Empty while the run is still in flight.
+    # release event alone. Never treat a parsed value as proof that the run
+    # settled: a backend may materialize a placeholder "unknown" for every live
+    # lock, so only the supervisor that classified the run knows the difference.
     settled_outcome: str = ""
     settled_classification: str = ""
 

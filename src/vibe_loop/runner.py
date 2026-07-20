@@ -1122,24 +1122,29 @@ class VibeRunner:
             # the next dispatch. Best effort: the authoritative RunResult is
             # already durable, so a backend hiccup must not mask it.
             nonlocal active_state
-            active_state = active_state.with_settled_outcome(
-                settled_outcome,
-                settled_classification,
-            )
-            try:
-                update_active_task_lock()
-            except (
-                LockBusy,
-                LockBackendError,
-                LockOwnerMismatch,
-                LockFencingMismatch,
-                OSError,
-                ValueError,
-            ) as exc:
-                report_status(
-                    f"could not publish settled outcome {settled_outcome} for "
-                    f"{task.task_id} before lock release: {exc}"
+            # Same guard the observation callbacks use: a reader thread that
+            # outlives the streaming call would otherwise replace active_state
+            # from a pre-publish snapshot and re-publish the lock without the
+            # settled outcome.
+            with observation_lock:
+                active_state = active_state.with_settled_outcome(
+                    settled_outcome,
+                    settled_classification,
                 )
+                try:
+                    update_active_task_lock()
+                except (
+                    LockBusy,
+                    LockBackendError,
+                    LockOwnerMismatch,
+                    LockFencingMismatch,
+                    OSError,
+                    ValueError,
+                ) as exc:
+                    report_status(
+                        f"could not publish settled outcome {settled_outcome} "
+                        f"for {task.task_id} before lock release: {exc}"
+                    )
 
         def record_agent_observation(observation: AgentRuntimeObservation) -> None:
             nonlocal active_state
