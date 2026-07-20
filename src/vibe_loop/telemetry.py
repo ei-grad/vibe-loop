@@ -28,6 +28,7 @@ WORK_KINDS = frozenset({"discovery", "review"})
 NORMALIZED_NUMERIC_FIELDS = (
     "input_tokens",
     "output_tokens",
+    "reasoning_output_tokens",
     "cached_input_tokens",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
@@ -35,6 +36,15 @@ NORMALIZED_NUMERIC_FIELDS = (
     "turns",
     "duration_seconds",
     "cost_usd",
+)
+TOKEN_GROUP_METRICS = (
+    "input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "cached_input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "total_tokens",
 )
 PROVIDER_NUMERIC_FIELDS = frozenset(
     {
@@ -278,6 +288,7 @@ def _normalized_usage(
         "cache_creation_input_tokens": "cache_creation_input_tokens",
         "cache_read_tokens": "cache_read_input_tokens",
         "cache_creation_tokens": "cache_creation_input_tokens",
+        "reasoning_output_tokens": "reasoning_output_tokens",
         "total_tokens": "total_tokens",
     }
     for raw_key, normalized_key in aliases.items():
@@ -507,6 +518,40 @@ def _group_identity(record: Mapping[str, object]) -> tuple[str, str, str]:
     return provider, model, phase
 
 
+def _new_usage_group(
+    *, project: str, provider: str, model: str, phase: str
+) -> dict[str, object]:
+    group: dict[str, object] = {
+        "project": project,
+        "provider": provider,
+        "model": model,
+        "phase": phase,
+        "launches": 0,
+        "completed_runs": 0,
+        "immediate_failures": 0,
+        "restarts": 0,
+        "worker_minutes": 0.0,
+        "reported_cost_usd": 0.0,
+        "tasks_created": 0,
+        "tasks_landed": 0,
+    }
+    for metric in TOKEN_GROUP_METRICS:
+        group[metric] = 0
+    group["non_cached_input_tokens"] = 0
+    return group
+
+
+def non_cached_input_tokens(stats: object) -> int:
+    """Fresh (non-cache-served) input tokens. Providers report cached input as a
+    subset of input, so this is clamped at zero rather than allowed to go
+    negative when a provider reports the two inconsistently."""
+    return max(
+        0,
+        int(_metric(stats, "input_tokens"))
+        - int(_metric(stats, "cached_input_tokens")),
+    )
+
+
 def rolling_usage_summary(
     records: Iterable[Mapping[str, object]],
     *,
@@ -555,26 +600,9 @@ def rolling_usage_summary(
         key = (provider, model, "planning")
         group = groups.setdefault(
             key,
-            {
-                "project": project,
-                "provider": provider,
-                "model": model,
-                "phase": "planning",
-                "launches": 0,
-                "completed_runs": 0,
-                "immediate_failures": 0,
-                "restarts": 0,
-                "worker_minutes": 0.0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cached_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "total_tokens": 0,
-                "reported_cost_usd": 0.0,
-                "tasks_created": 0,
-                "tasks_landed": 0,
-            },
+            _new_usage_group(
+                project=project, provider=provider, model=model, phase="planning"
+            ),
         )
         if record.get("provider_launched") is not False:
             group["launches"] = int(group["launches"]) + 1
@@ -586,15 +614,11 @@ def rolling_usage_summary(
         group["tasks_created"] = int(group["tasks_created"]) + int(
             _integer(record.get("created_count")) or 0
         )
-        for metric in (
-            "input_tokens",
-            "output_tokens",
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-            "total_tokens",
-        ):
+        for metric in TOKEN_GROUP_METRICS:
             group[metric] = int(group[metric]) + int(_metric(stats, metric))
+        group["non_cached_input_tokens"] = int(
+            group["non_cached_input_tokens"]
+        ) + non_cached_input_tokens(stats)
         group["reported_cost_usd"] = float(group["reported_cost_usd"]) + _metric(
             stats, "cost_usd"
         )
@@ -606,26 +630,9 @@ def rolling_usage_summary(
         key = (provider, model, phase)
         group = groups.setdefault(
             key,
-            {
-                "project": project,
-                "provider": provider,
-                "model": model,
-                "phase": phase,
-                "launches": 0,
-                "completed_runs": 0,
-                "immediate_failures": 0,
-                "restarts": 0,
-                "worker_minutes": 0.0,
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cached_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "total_tokens": 0,
-                "reported_cost_usd": 0.0,
-                "tasks_created": 0,
-                "tasks_landed": 0,
-            },
+            _new_usage_group(
+                project=project, provider=provider, model=model, phase=phase
+            ),
         )
         stats = record.get("stats")
         duration = record_duration_seconds(record)
@@ -640,15 +647,11 @@ def rolling_usage_summary(
             group["immediate_failures"] = int(group["immediate_failures"]) + 1
         if (_integer(record.get("restart_count")) or 0) > 0:
             group["restarts"] = int(group["restarts"]) + 1
-        for metric in (
-            "input_tokens",
-            "output_tokens",
-            "cached_input_tokens",
-            "cache_read_input_tokens",
-            "cache_creation_input_tokens",
-            "total_tokens",
-        ):
+        for metric in TOKEN_GROUP_METRICS:
             group[metric] = int(group[metric]) + int(_metric(stats, metric))
+        group["non_cached_input_tokens"] = int(
+            group["non_cached_input_tokens"]
+        ) + non_cached_input_tokens(stats)
         group["reported_cost_usd"] = float(group["reported_cost_usd"]) + _metric(
             stats, "cost_usd"
         )
@@ -684,8 +687,13 @@ def rolling_usage_summary(
                     "run_id": record.get("run_id"),
                     "task_id": task_id,
                     "total_tokens": int(total_tokens),
+                    "input_tokens": int(_metric(stats, "input_tokens")),
+                    "cached_input_tokens": int(_metric(stats, "cached_input_tokens")),
+                    "non_cached_input_tokens": non_cached_input_tokens(stats),
+                    "output_tokens": int(_metric(stats, "output_tokens")),
                     "changed_lines": changed_lines,
                     "threshold": slice_token_threshold,
+                    "threshold_metric": "total_tokens",
                 }
             )
         if record.get("classification") == "limit_wall":

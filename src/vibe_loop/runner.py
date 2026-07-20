@@ -125,6 +125,35 @@ AGENT_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+# A bare top-level string `model` value is only a model identity inside these
+# structured lifecycle events. Any other JSON object carrying a `model` key
+# (tool payloads, task records, nested agent envelopes) is generic data.
+MODEL_IDENTITY_EVENT_TYPES = frozenset(
+    {
+        "assistant",
+        "init",
+        "result",
+        "session.created",
+        "session.start",
+        "session_configured",
+        "system",
+        "thread.started",
+        "turn.completed",
+        "turn.started",
+    }
+)
+# Higher rank wins when two observations disagree about the same field. Command
+# arguments are explicit operator intent; structured native events outrank both
+# free-text log scraping and executable-name inference.
+AGENT_CONTEXT_SOURCE_RANKS = (
+    ("command_arg:", 40),
+    ("command_config:", 35),
+    ("native:", 30),
+    ("command_executable:", 10),
+)
+# Free-text log scraping (`native:stdout:model`) is weaker than a structured
+# native event (`native:stdout:json.model`) even though both are native.
+AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK = 20
 AGENT_CONTEXT_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$")
 SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 REASONING_EFFORT_VALUES = frozenset({"minimal", "low", "medium", "high", "xhigh"})
@@ -306,26 +335,64 @@ class AgentRuntimeContext:
             ),
         )
 
-    def missing_delta(self, candidate: AgentRuntimeContext) -> AgentRuntimeContext:
+    def prefer(self, other: AgentRuntimeContext) -> AgentRuntimeContext:
+        """Merge `other` over self, but only where `other` is at least as
+        authoritative. Prevents a weak stream observation from overwriting an
+        explicit command-line or structured model identity."""
+        provider, provider_source = pick_agent_context_field(
+            self.model_provider,
+            self.model_provider_source,
+            other.model_provider,
+            other.model_provider_source,
+        )
+        model_id, model_id_source = pick_agent_context_field(
+            self.model_id,
+            self.model_id_source,
+            other.model_id,
+            other.model_id_source,
+        )
+        effort, effort_source = pick_agent_context_field(
+            self.reasoning_effort,
+            self.reasoning_effort_source,
+            other.reasoning_effort,
+            other.reasoning_effort_source,
+        )
         return AgentRuntimeContext(
-            model_provider=candidate.model_provider if not self.model_provider else "",
-            model_provider_source=(
-                candidate.model_provider_source
-                if candidate.model_provider and not self.model_provider
+            model_provider=provider,
+            model_provider_source=provider_source,
+            model_id=model_id,
+            model_id_source=model_id_source,
+            reasoning_effort=effort,
+            reasoning_effort_source=effort_source,
+        )
+
+    def missing_delta(self, candidate: AgentRuntimeContext) -> AgentRuntimeContext:
+        """Fields `candidate` contributes that self does not already hold at an
+        equal-or-stronger source rank."""
+        merged = self.prefer(candidate)
+        return AgentRuntimeContext(
+            model_provider=(
+                merged.model_provider
+                if merged.model_provider != self.model_provider
                 else ""
             ),
-            model_id=candidate.model_id if not self.model_id else "",
-            model_id_source=(
-                candidate.model_id_source
-                if candidate.model_id and not self.model_id
+            model_provider_source=(
+                merged.model_provider_source
+                if merged.model_provider != self.model_provider
                 else ""
+            ),
+            model_id=(merged.model_id if merged.model_id != self.model_id else ""),
+            model_id_source=(
+                merged.model_id_source if merged.model_id != self.model_id else ""
             ),
             reasoning_effort=(
-                candidate.reasoning_effort if not self.reasoning_effort else ""
+                merged.reasoning_effort
+                if merged.reasoning_effort != self.reasoning_effort
+                else ""
             ),
             reasoning_effort_source=(
-                candidate.reasoning_effort_source
-                if candidate.reasoning_effort and not self.reasoning_effort
+                merged.reasoning_effort_source
+                if merged.reasoning_effort != self.reasoning_effort
                 else ""
             ),
         )
@@ -1229,7 +1296,7 @@ class VibeRunner:
                 ):
                     observed_session_id = observation.session_id
                     observed_session_id_source = observation.session_id_source
-                effective_context = command_context.overlay(observed_output_context)
+                effective_context = command_context.prefer(observed_output_context)
                 context_payload = build_run_context_payload(
                     task_id=task.task_id,
                     run_id=run_id,
@@ -1433,7 +1500,7 @@ class VibeRunner:
                     session_id_source = (
                         stream_result.session_id_source or "fallback:run_id"
                     )
-                final_runtime_context = command_context.overlay(
+                final_runtime_context = command_context.prefer(
                     stream_result.runtime_context
                 )
                 provider_usage = stream_result.usage
@@ -4407,32 +4474,76 @@ def resolve_claude_transcript(session_id: str, claude_home: Path) -> Path | None
     return matches[0] if matches else None
 
 
+def agent_context_source_rank(source: str) -> int:
+    if not source:
+        return 0
+    for prefix, rank in AGENT_CONTEXT_SOURCE_RANKS:
+        if source.startswith(prefix):
+            if prefix == "native:" and ":json." not in source:
+                return AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK
+            return rank
+    return AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK
+
+
+def pick_agent_context_field(
+    current: str,
+    current_source: str,
+    candidate: str,
+    candidate_source: str,
+) -> tuple[str, str]:
+    if not candidate:
+        return current, current_source
+    if not current:
+        return candidate, candidate_source
+    if agent_context_source_rank(candidate_source) >= agent_context_source_rank(
+        current_source
+    ):
+        return candidate, candidate_source
+    return current, current_source
+
+
 def parse_agent_runtime_context_from_line(
     line: str,
     stream_name: str,
 ) -> AgentRuntimeContext:
     source_prefix = f"native:{stream_name}"
-    context = parse_agent_runtime_context_from_json_line(line, source_prefix)
-    return context.overlay(
-        parse_agent_runtime_context_from_text_line(line, source_prefix)
-    )
+    json_payload = agent_context_json_payload(line)
+    if json_payload is not None:
+        # A structured line is parsed structurally only; rescanning its raw text
+        # would harvest nested keys the structured reader deliberately rejected.
+        return parse_agent_runtime_context_from_json_payload(
+            json_payload, source_prefix
+        )
+    return parse_agent_runtime_context_from_text_line(line, source_prefix)
+
+
+def agent_context_json_payload(line: str) -> dict[str, object] | None:
+    text = line.strip()
+    if text.startswith("data:"):
+        text = text.removeprefix("data:").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def parse_agent_runtime_context_from_json_line(
     line: str,
     source_prefix: str,
 ) -> AgentRuntimeContext:
-    text = line.strip()
-    if text.startswith("data:"):
-        text = text.removeprefix("data:").strip()
-    if not text.startswith("{"):
+    payload = agent_context_json_payload(line)
+    if payload is None:
         return AgentRuntimeContext()
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return AgentRuntimeContext()
-    if not isinstance(payload, dict):
-        return AgentRuntimeContext()
+    return parse_agent_runtime_context_from_json_payload(payload, source_prefix)
+
+
+def parse_agent_runtime_context_from_json_payload(
+    payload: dict[str, object],
+    source_prefix: str,
+) -> AgentRuntimeContext:
     model_value = payload.get("model")
     model_mapping = model_value if isinstance(model_value, dict) else {}
     model_provider = first_clean_agent_context_value(
@@ -4440,10 +4551,15 @@ def parse_agent_runtime_context_from_json_line(
         model_mapping.get("provider"),
         payload.get("provider"),
     )
+    bare_model = (
+        model_value
+        if isinstance(model_value, str) and payload_declares_model_identity(payload)
+        else None
+    )
     model_id = first_clean_agent_context_value(
         payload.get("model_id"),
         model_mapping.get("id"),
-        model_value if isinstance(model_value, str) else None,
+        bare_model,
     )
     reasoning_effort = first_clean_agent_context_value(
         payload.get("reasoning_effort"),
@@ -4499,6 +4615,13 @@ def parse_agent_runtime_context_from_text_line(
                 )
             )
     return context
+
+
+def payload_declares_model_identity(payload: dict[str, object]) -> bool:
+    event_type = payload.get("type")
+    if not isinstance(event_type, str):
+        return False
+    return event_type.strip().lower() in MODEL_IDENTITY_EVENT_TYPES
 
 
 def normalize_agent_context_key(value: str) -> str:

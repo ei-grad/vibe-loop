@@ -2510,8 +2510,13 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
             lines.append(
                 f"- {group['provider']}/{group['model']}/{group['phase']}: "
                 f"launches={group['launches']} completed={group['completed_runs']} "
-                f"tokens={group['total_tokens']} cost_usd="
-                f"{group['reported_cost_usd']}"
+                f"tokens={group['total_tokens']} "
+                f"input={group.get('input_tokens', 0)} "
+                f"cached_input={group.get('cached_input_tokens', 0)} "
+                f"non_cached_input={group.get('non_cached_input_tokens', 0)} "
+                f"output={group.get('output_tokens', 0)} "
+                f"reasoning_output={group.get('reasoning_output_tokens', 0)} "
+                f"cost_usd={group['reported_cost_usd']}"
             )
     diagnostics = summary.get("diagnostics")
     if isinstance(diagnostics, list):

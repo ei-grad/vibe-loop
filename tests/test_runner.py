@@ -65,6 +65,7 @@ from vibe_loop.runner import (
     inject_claude_session_id,
     inject_structured_usage_output,
     parse_agent_runtime_context_from_command,
+    parse_agent_runtime_context_from_line,
     parse_selected_task_id,
     parse_selected_task_ids,
     parse_worker_session_id,
@@ -6037,3 +6038,126 @@ class SettledRunOutcomeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
+    """Regression cover for run
+    20260720T214201Z-hyphen-adjacent-generation-redaction-3d23bf62, where a
+    generic JSON `model` value was recorded as the run's model identity."""
+
+    def test_generic_json_model_value_is_not_a_model_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model": "task", "status": "queued"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "")
+        self.assertEqual(context.model_id_source, "")
+
+    def test_nested_generic_model_key_is_not_scraped_from_json_text(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "item.completed", "item": {"model": "task"}}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "")
+
+    def test_codex_session_event_still_supplies_model_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "session.created", "model": "gpt-5.6-sol"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "gpt-5.6-sol")
+        self.assertEqual(context.model_id_source, "native:stdout:json.model")
+
+    def test_claude_init_event_still_supplies_model_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {"type": "system", "subtype": "init", "model": "claude-opus-4-8"}
+            ),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "claude-opus-4-8")
+
+    def test_structured_model_mapping_retains_existing_precedence(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model": {"provider": "openai", "id": "gpt-5.5"}}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_provider, "openai")
+        self.assertEqual(context.model_id, "gpt-5.5")
+
+    def test_explicit_model_id_field_retains_existing_precedence(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model_id": "gpt-5.5"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "gpt-5.5")
+
+    def test_malformed_model_value_fails_closed_to_unknown(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "session.created", "model": "gpt 5.6\tsol"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "")
+        self.assertEqual(context.model_id_source, "")
+
+    def test_plain_text_lines_still_yield_free_text_model_context(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            "starting agent model=gpt-5.6-sol",
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "gpt-5.6-sol")
+        self.assertEqual(context.model_id_source, "native:stdout:model")
+
+    def test_free_text_observation_cannot_overwrite_command_model(self) -> None:
+        command_context = parse_agent_runtime_context_from_command(
+            "codex exec --model gpt-5.6-sol"
+        )
+        observed = parse_agent_runtime_context_from_line(
+            "worker note model: task",
+            "stdout",
+        )
+
+        effective = command_context.prefer(observed)
+
+        self.assertEqual(effective.model_id, "gpt-5.6-sol")
+        self.assertEqual(effective.model_id_source, "command_arg:--model")
+        self.assertEqual(effective.model_provider, "openai")
+
+    def test_structured_native_provider_refines_executable_inference(self) -> None:
+        command_context = parse_agent_runtime_context_from_command("codex exec")
+        observed = parse_agent_runtime_context_from_line(
+            json.dumps({"model": {"provider": "openai", "id": "gpt-5.6-sol"}}),
+            "stdout",
+        )
+
+        effective = command_context.prefer(observed)
+
+        self.assertEqual(effective.model_id, "gpt-5.6-sol")
+        self.assertEqual(effective.model_id_source, "native:stdout:json.model")
+        self.assertEqual(effective.model_provider, "openai")
+        self.assertEqual(
+            effective.model_provider_source, "native:stdout:json.model_provider"
+        )
+
+    def test_structured_event_upgrades_earlier_free_text_observation(self) -> None:
+        weak = parse_agent_runtime_context_from_line(
+            "banner model: task",
+            "stdout",
+        )
+        strong = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "session.created", "model": "gpt-5.6-sol"}),
+            "stdout",
+        )
+
+        delta = weak.missing_delta(strong)
+
+        self.assertEqual(delta.model_id, "gpt-5.6-sol")
+        self.assertEqual(weak.overlay(delta).model_id, "gpt-5.6-sol")

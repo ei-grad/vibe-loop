@@ -530,3 +530,80 @@ class TelemetryUnittestCoverage(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(payload["project"], "demo")
         self.assertEqual(payload["groups"][0]["total_tokens"], 120)
+
+
+def codex_amplification_record() -> dict[str, object]:
+    """Shaped from run 20260720T214201Z-hyphen-adjacent-generation-redaction-3d23bf62:
+    a Codex run that burned 1M input tokens, almost entirely cache reads, while
+    changing no mainline lines."""
+    finished = datetime(2026, 7, 20, 21, 46, tzinfo=UTC)
+    return {
+        "record_type": "run_result",
+        "run_id": "20260720T214201Z-hyphen-adjacent-generation-redaction-3d23bf62",
+        "task_id": "hyphen-adjacent-generation-redaction",
+        "classification": "blocked",
+        "started_at": (finished - timedelta(seconds=234.6)).isoformat(),
+        "finished_at": finished.isoformat(),
+        "model_provider": "openai",
+        "model_id": "gpt-5.6-sol",
+        "stats": {
+            "phase": "implementation",
+            "input_tokens": 1_033_913,
+            "cached_input_tokens": 977_152,
+            "output_tokens": 6_608,
+            "reasoning_output_tokens": 4_096,
+            "total_tokens": 1_040_521,
+            "changed_lines": 0,
+        },
+    }
+
+
+def test_rolling_summary_separates_cached_from_fresh_input_tokens() -> None:
+    now = datetime(2026, 7, 20, 22, 0, tzinfo=UTC)
+
+    summary = rolling_usage_summary(
+        [codex_amplification_record()], project="vibe-loop", hours=2, now=now
+    )
+
+    group = summary["groups"][0]
+    assert group["provider"] == "openai"
+    assert group["model"] == "gpt-5.6-sol"
+    assert group["input_tokens"] == 1_033_913
+    assert group["cached_input_tokens"] == 977_152
+    assert group["non_cached_input_tokens"] == 56_761
+    assert group["output_tokens"] == 6_608
+    assert group["reasoning_output_tokens"] == 4_096
+
+
+def test_low_change_high_token_reports_raw_and_non_cached_evidence() -> None:
+    now = datetime(2026, 7, 20, 22, 0, tzinfo=UTC)
+
+    summary = rolling_usage_summary(
+        [codex_amplification_record()], project="vibe-loop", hours=2, now=now
+    )
+
+    diagnostic = next(
+        item
+        for item in summary["diagnostics"]
+        if item["type"] == "low_change_high_token"
+    )
+    assert diagnostic["total_tokens"] == 1_040_521
+    assert diagnostic["input_tokens"] == 1_033_913
+    assert diagnostic["cached_input_tokens"] == 977_152
+    assert diagnostic["non_cached_input_tokens"] == 56_761
+    assert diagnostic["output_tokens"] == 6_608
+    # The trigger still fires on raw totals; non-cached evidence is additive.
+    assert diagnostic["threshold"] == 100_000
+    assert diagnostic["threshold_metric"] == "total_tokens"
+
+
+def test_non_cached_input_clamps_inconsistent_provider_reports() -> None:
+    now = datetime(2026, 7, 20, 22, 0, tzinfo=UTC)
+    record = codex_amplification_record()
+    stats = record["stats"]
+    assert isinstance(stats, dict)
+    stats["cached_input_tokens"] = stats["input_tokens"] + 5_000
+
+    summary = rolling_usage_summary([record], project="vibe-loop", hours=2, now=now)
+
+    assert summary["groups"][0]["non_cached_input_tokens"] == 0
