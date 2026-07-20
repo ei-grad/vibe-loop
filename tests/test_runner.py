@@ -6036,10 +6036,6 @@ class SettledRunOutcomeTests(unittest.TestCase):
                 self.assertIn(settled_run_outcome(classification), SETTLED_RUN_OUTCOMES)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
     """Regression cover for run
     20260720T214201Z-hyphen-adjacent-generation-redaction-3d23bf62, where a
@@ -6107,29 +6103,49 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         self.assertEqual(context.model_id, "")
         self.assertEqual(context.model_id_source, "")
 
-    def test_plain_text_lines_still_yield_free_text_model_context(self) -> None:
-        context = parse_agent_runtime_context_from_line(
-            "starting agent model=gpt-5.6-sol",
-            "stdout",
-        )
-
-        self.assertEqual(context.model_id, "gpt-5.6-sol")
-        self.assertEqual(context.model_id_source, "native:stdout:model")
-
-    def test_free_text_observation_cannot_overwrite_command_model(self) -> None:
-        command_context = parse_agent_runtime_context_from_command(
-            "codex exec --model gpt-5.6-sol"
-        )
+    def test_generic_text_cannot_establish_codex_or_claude_identity(self) -> None:
         observed = parse_agent_runtime_context_from_line(
-            "worker note model: task",
+            "worker note: provider=value model=task",
             "stdout",
         )
 
-        effective = command_context.prefer(observed)
+        self.assertTrue(observed.empty)
+        for command, expected_provider in (
+            ("codex exec --json", "openai"),
+            ("claude --output-format stream-json", "anthropic"),
+        ):
+            with self.subTest(command=command):
+                effective = parse_agent_runtime_context_from_command(command).prefer(
+                    observed
+                )
+                self.assertEqual(effective.model_provider, expected_provider)
+                self.assertEqual(effective.model_id, "")
 
-        self.assertEqual(effective.model_id, "gpt-5.6-sol")
-        self.assertEqual(effective.model_id_source, "command_arg:--model")
-        self.assertEqual(effective.model_provider, "openai")
+    def test_claude_init_resolves_command_model_alias(self) -> None:
+        command_context = parse_agent_runtime_context_from_command(
+            "claude --model opus"
+        )
+        init_context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {"type": "system", "subtype": "init", "model": "claude-opus-4-8"}
+            ),
+            "stdout",
+        )
+        assistant_context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": "provider=value model=task"},
+                }
+            ),
+            "stdout",
+        )
+
+        effective = command_context.prefer(init_context).prefer(assistant_context)
+
+        self.assertEqual(effective.model_provider, "anthropic")
+        self.assertEqual(effective.model_id, "claude-opus-4-8")
+        self.assertEqual(effective.model_id_source, "native:stdout:json.model")
 
     def test_structured_native_provider_refines_executable_inference(self) -> None:
         command_context = parse_agent_runtime_context_from_command("codex exec")
@@ -6147,10 +6163,10 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
             effective.model_provider_source, "native:stdout:json.model_provider"
         )
 
-    def test_structured_event_upgrades_earlier_free_text_observation(self) -> None:
-        weak = parse_agent_runtime_context_from_line(
-            "banner model: task",
-            "stdout",
+    def test_same_value_structured_event_upgrades_weak_source(self) -> None:
+        weak = AgentRuntimeContext(
+            model_id="gpt-5.6-sol",
+            model_id_source="native:stdout:model",
         )
         strong = parse_agent_runtime_context_from_line(
             json.dumps({"type": "session.created", "model": "gpt-5.6-sol"}),
@@ -6159,5 +6175,12 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
 
         delta = weak.missing_delta(strong)
 
+        merged = weak.overlay(delta)
         self.assertEqual(delta.model_id, "gpt-5.6-sol")
-        self.assertEqual(weak.overlay(delta).model_id, "gpt-5.6-sol")
+        self.assertEqual(delta.model_id_source, "native:stdout:json.model")
+        self.assertEqual(merged.model_id, "gpt-5.6-sol")
+        self.assertEqual(merged.model_id_source, "native:stdout:json.model")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -154,6 +154,7 @@ AGENT_CONTEXT_SOURCE_RANKS = (
 # Free-text log scraping (`native:stdout:model`) is weaker than a structured
 # native event (`native:stdout:json.model`) even though both are native.
 AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK = 20
+CLAUDE_MODEL_ALIASES = frozenset({"haiku", "opus", "sonnet"})
 AGENT_CONTEXT_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$")
 SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 REASONING_EFFORT_VALUES = frozenset({"minimal", "low", "medium", "high", "xhigh"})
@@ -345,11 +346,12 @@ class AgentRuntimeContext:
             other.model_provider,
             other.model_provider_source,
         )
-        model_id, model_id_source = pick_agent_context_field(
+        model_id, model_id_source = pick_agent_model_field(
             self.model_id,
             self.model_id_source,
             other.model_id,
             other.model_id_source,
+            current_provider=self.model_provider,
         )
         effort, effort_source = pick_agent_context_field(
             self.reasoning_effort,
@@ -370,30 +372,28 @@ class AgentRuntimeContext:
         """Fields `candidate` contributes that self does not already hold at an
         equal-or-stronger source rank."""
         merged = self.prefer(candidate)
+        provider_changed = (
+            merged.model_provider,
+            merged.model_provider_source,
+        ) != (self.model_provider, self.model_provider_source)
+        model_changed = (merged.model_id, merged.model_id_source) != (
+            self.model_id,
+            self.model_id_source,
+        )
+        effort_changed = (
+            merged.reasoning_effort,
+            merged.reasoning_effort_source,
+        ) != (self.reasoning_effort, self.reasoning_effort_source)
         return AgentRuntimeContext(
-            model_provider=(
-                merged.model_provider
-                if merged.model_provider != self.model_provider
-                else ""
-            ),
+            model_provider=(merged.model_provider if provider_changed else ""),
             model_provider_source=(
-                merged.model_provider_source
-                if merged.model_provider != self.model_provider
-                else ""
+                merged.model_provider_source if provider_changed else ""
             ),
-            model_id=(merged.model_id if merged.model_id != self.model_id else ""),
-            model_id_source=(
-                merged.model_id_source if merged.model_id != self.model_id else ""
-            ),
-            reasoning_effort=(
-                merged.reasoning_effort
-                if merged.reasoning_effort != self.reasoning_effort
-                else ""
-            ),
+            model_id=(merged.model_id if model_changed else ""),
+            model_id_source=(merged.model_id_source if model_changed else ""),
+            reasoning_effort=(merged.reasoning_effort if effort_changed else ""),
             reasoning_effort_source=(
-                merged.reasoning_effort_source
-                if merged.reasoning_effort != self.reasoning_effort
-                else ""
+                merged.reasoning_effort_source if effort_changed else ""
             ),
         )
 
@@ -4495,11 +4495,39 @@ def pick_agent_context_field(
         return current, current_source
     if not current:
         return candidate, candidate_source
-    if agent_context_source_rank(candidate_source) >= agent_context_source_rank(
-        current_source
-    ):
+    candidate_rank = agent_context_source_rank(candidate_source)
+    current_rank = agent_context_source_rank(current_source)
+    if candidate == current:
+        if candidate_rank > current_rank:
+            return candidate, candidate_source
+        return current, current_source
+    if candidate_rank >= current_rank:
         return candidate, candidate_source
     return current, current_source
+
+
+def pick_agent_model_field(
+    current: str,
+    current_source: str,
+    candidate: str,
+    candidate_source: str,
+    *,
+    current_provider: str,
+) -> tuple[str, str]:
+    if (
+        current_provider == "anthropic"
+        and current.lower() in CLAUDE_MODEL_ALIASES
+        and current_source.startswith(("command_arg:", "command_config:"))
+        and candidate_source.startswith("native:")
+        and ":json." in candidate_source
+    ):
+        return candidate, candidate_source
+    return pick_agent_context_field(
+        current,
+        current_source,
+        candidate,
+        candidate_source,
+    )
 
 
 def parse_agent_runtime_context_from_line(
@@ -4590,21 +4618,7 @@ def parse_agent_runtime_context_from_text_line(
         value = clean_agent_context_value(match.group("value"))
         if not value:
             continue
-        if key in {"model_provider", "provider"}:
-            context = context.overlay(
-                AgentRuntimeContext(
-                    model_provider=value,
-                    model_provider_source=f"{source_prefix}:{key}",
-                )
-            )
-        elif key in {"model", "model_id"}:
-            context = context.overlay(
-                AgentRuntimeContext(
-                    model_id=value,
-                    model_id_source=f"{source_prefix}:{key}",
-                )
-            )
-        elif key == "reasoning_effort":
+        if key == "reasoning_effort":
             value = clean_reasoning_effort_value(match.group("value"))
             if not value:
                 continue

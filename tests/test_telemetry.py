@@ -531,6 +531,15 @@ class TelemetryUnittestCoverage(unittest.TestCase):
         self.assertEqual(payload["project"], "demo")
         self.assertEqual(payload["groups"][0]["total_tokens"], 120)
 
+    def test_cached_and_fresh_input_summary(self) -> None:
+        test_rolling_summary_separates_cached_from_fresh_input_tokens()
+
+    def test_high_token_diagnostic_evidence(self) -> None:
+        test_low_change_high_token_reports_raw_and_non_cached_evidence()
+
+    def test_non_cached_input_clamp(self) -> None:
+        test_non_cached_input_clamps_inconsistent_provider_reports()
+
 
 def codex_amplification_record() -> dict[str, object]:
     """Shaped from run 20260720T214201Z-hyphen-adjacent-generation-redaction-3d23bf62:
