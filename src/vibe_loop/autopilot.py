@@ -2887,7 +2887,6 @@ def planning_source_fingerprint(queue: TaskQueueStatus) -> str:
     return f"{len(source_tasks)}:{digest}"
 
 
-PLANNING_OUTCOME_SCAN_MAX_RECORDS = 500
 PLANNING_LAUNCH_WINDOW_SECONDS = 86400.0
 
 
@@ -2915,13 +2914,12 @@ PLANNING_RECORD_TYPES = (
 
 
 def _planning_records(run_store: RunStore, repo: Path) -> list[dict[str, object]]:
-    records = [
+    return [
         record
         for record in run_store.read_records()
         if record.get("record_type") in PLANNING_RECORD_TYPES
         and str(record.get("repo") or "") == str(repo)
     ]
-    return records[-PLANNING_OUTCOME_SCAN_MAX_RECORDS:]
 
 
 def _parse_record_time(value: object) -> datetime | None:
@@ -2976,6 +2974,8 @@ def planning_outcome_backoff(
     ]
     streak: list[dict[str, object]] = []
     for record in reversed(outcomes):
+        if str(record.get("fingerprint") or "") != fingerprint:
+            break
         outcome = str(record.get("outcome") or "")
         if outcome == PLANNING_OUTCOME_PRODUCTIVE:
             break
@@ -3011,20 +3011,19 @@ def planning_outcome_backoff(
 
     if streak and len(streak) >= unproductive_threshold and backoff_seconds > 0:
         latest = streak[0]
-        if str(latest.get("fingerprint") or "") == fingerprint:
-            occurred = _parse_record_time(latest.get("occurred_at"))
-            if occurred is not None:
-                remaining = backoff_seconds - (moment - occurred).total_seconds()
-                if remaining > 0:
-                    deadlines.append(
-                        (
-                            remaining,
-                            "unproductive_outcomes",
-                            str(latest.get("outcome") or ""),
-                            len(streak),
-                            launches_in_window,
-                        )
+        occurred = _parse_record_time(latest.get("occurred_at"))
+        if occurred is not None:
+            remaining = backoff_seconds - (moment - occurred).total_seconds()
+            if remaining > 0:
+                deadlines.append(
+                    (
+                        remaining,
+                        "unproductive_outcomes",
+                        str(latest.get("outcome") or ""),
+                        len(streak),
+                        launches_in_window,
                     )
+                )
 
     if max_launches_per_day > 0 and launches_in_window >= max_launches_per_day:
         launch_times.sort()
@@ -4070,6 +4069,7 @@ def wait_for_idle_change(
     wake_adapter: IdleWakeAdapter | None = None,
     monotonic: Callable[[], float] | None = None,
     active_runs: tuple[ActiveRunState, ...] = (),
+    baseline_fingerprint: str = "",
 ) -> IdleWaitResult:
     """Wait for idle work with a trusted wake adapter and adaptive fallback."""
     threshold = require_positive_min_ready(min_ready)
@@ -4150,15 +4150,21 @@ def wait_for_idle_change(
         if isinstance(status, int):
             runnable = status
             source_error = ""
+            source_changed = False
         else:
             runnable = status.runnable
             source_error = status.source_error
+            source_changed = bool(
+                baseline_fingerprint
+                and not source_error
+                and planning_source_fingerprint(status) != baseline_fingerprint
+            )
         if source_error:
             source_error_count += 1
             _record_bounded_error(source_errors, source_error)
         if clock() >= deadline_at:
             break
-        if not source_error and runnable >= threshold:
+        if not source_error and (runnable >= threshold or source_changed):
             return IdleWaitResult(
                 cycle_id=cycle_id,
                 wake_reason="task_change",
@@ -4612,6 +4618,9 @@ def run_autopilot(
                             worker.active
                             for worker in result.project_status.workers
                             if worker_holds_active_conflict(worker)
+                        ),
+                        baseline_fingerprint=planning_source_fingerprint(
+                            result.project_status.queue
                         ),
                     )
                     run_store.append_record(wait_result.to_record(config.repo))

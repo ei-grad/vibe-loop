@@ -2875,6 +2875,80 @@ class AutopilotIdleWaitTests(unittest.TestCase):
         self.assertEqual(result.runnable, 2)
         self.assertEqual(sleeps, [60.0, 120.0])
 
+    def test_material_source_change_wakes_below_dispatch_threshold(self) -> None:
+        baseline_task = {
+            "id": "task-a",
+            "title": "draft",
+            "status": "ready",
+            "source": "board-a",
+        }
+        baseline = planning_source_fingerprint(
+            TaskQueueStatus(source_tasks=(baseline_task,))
+        )
+        changed_tasks = (
+            {**baseline_task, "id": "task-b"},
+            {**baseline_task, "title": "rewritten"},
+            {**baseline_task, "source": "board-b"},
+        )
+
+        for changed_task in changed_tasks:
+            with self.subTest(changed_task=changed_task):
+                sleeps: list[float] = []
+                result = wait_for_idle_change(
+                    object(),
+                    cycle_id="cycle-1",
+                    deadline="deadline",
+                    interval=20.0,
+                    initial_poll_seconds=5.0,
+                    max_poll_seconds=5.0,
+                    sleeper=sleeps.append,
+                    runnable_probe=lambda _config, _timeout, task=changed_task: (
+                        TaskQueueStatus(source_tasks=(task,))
+                    ),
+                    min_ready=2,
+                    baseline_fingerprint=baseline,
+                )
+
+                self.assertEqual(result.wake_reason, "task_change")
+                self.assertEqual(result.runnable, 0)
+                self.assertEqual(sleeps, [5.0])
+
+    def test_lifecycle_and_counter_churn_do_not_wake_below_threshold(self) -> None:
+        baseline_task = {
+            "id": "task-a",
+            "title": "draft",
+            "status": "ready",
+            "source": "board-a",
+        }
+        baseline = planning_source_fingerprint(
+            TaskQueueStatus(source_tasks=(baseline_task,))
+        )
+        changed_status = TaskQueueStatus(
+            total=10,
+            runnable=0,
+            active=4,
+            done=5,
+            blocked=1,
+            source_tasks=({**baseline_task, "status": "active"},),
+        )
+        sleeps: list[float] = []
+
+        result = wait_for_idle_change(
+            object(),
+            cycle_id="cycle-1",
+            deadline="deadline",
+            interval=10.0,
+            initial_poll_seconds=5.0,
+            max_poll_seconds=5.0,
+            sleeper=sleeps.append,
+            runnable_probe=lambda _config, _timeout: changed_status,
+            min_ready=2,
+            baseline_fingerprint=baseline,
+        )
+
+        self.assertEqual(result.wake_reason, "deadline")
+        self.assertEqual(sleeps, [5.0, 5.0])
+
     def test_repeated_source_errors_back_off_and_are_bounded(self) -> None:
         sleeps: list[float] = []
 
@@ -5077,6 +5151,44 @@ class PlanningOutcomeBackoffTests(unittest.TestCase):
         )
         self.assertIsNone(self._backoff(records, repo=repo, fingerprint="11:1:0:10:0"))
 
+    def test_a_changed_fingerprint_starts_a_new_unproductive_epoch(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (7200.0, "no_tasks", "fingerprint-a"),
+                (3600.0, "zero_created", "fingerprint-a"),
+                (60.0, "no_tasks", "fingerprint-b"),
+            ],
+            now=self.now,
+        )
+        self.assertIsNone(
+            self._backoff(
+                records,
+                repo=repo,
+                fingerprint="fingerprint-b",
+                max_launches_per_day=0,
+            )
+        )
+
+        records.extend(
+            planning_outcome_records(
+                repo,
+                [(30.0, "zero_created", "fingerprint-b")],
+                now=self.now,
+            )
+        )
+        records[-1]["cycle_id"] = "fingerprint-b-second"
+        backoff = self._backoff(
+            records,
+            repo=repo,
+            fingerprint="fingerprint-b",
+            max_launches_per_day=0,
+        )
+        assert backoff is not None
+        self.assertEqual(backoff.reason, "unproductive_outcomes")
+        self.assertEqual(backoff.attempts, 2)
+
     def test_an_unchanged_task_source_does_not_release_the_backoff(self) -> None:
         repo = Path("/repo")
         records = planning_outcome_records(
@@ -5173,6 +5285,45 @@ class PlanningOutcomeBackoffTests(unittest.TestCase):
         assert backoff is not None
         self.assertEqual(backoff.reason, "daily_launch_cap")
         self.assertEqual(backoff.launches_in_window, 4)
+
+    def test_exempt_record_volume_cannot_evict_charged_launches(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (80000.0, "productive", "charged-1"),
+                (60000.0, "productive", "charged-2"),
+                (40000.0, "productive", "charged-3"),
+                (20000.0, "productive", "charged-4"),
+            ],
+            now=self.now,
+        )
+        for index in range(260):
+            cycle_id = f"provider-free-{index}"
+            seconds_ago = 1000.0 - index
+            launch = planning_launch_records(
+                repo,
+                [(seconds_ago, cycle_id)],
+                now=self.now,
+            )[0]
+            outcome = planning_outcome_records(
+                repo,
+                [(seconds_ago - 0.5, "analysis_error", "current")],
+                now=self.now,
+            )[0]
+            outcome["cycle_id"] = cycle_id
+            outcome["provider_launched"] = False
+            records.extend((launch, outcome))
+
+        backoff = self._backoff(records, repo=repo, fingerprint="current")
+        assert backoff is not None
+        self.assertEqual(backoff.reason, "daily_launch_cap")
+        self.assertEqual(backoff.launches_in_window, 4)
+        self.assertAlmostEqual(
+            backoff.remaining_seconds,
+            86400.0 - 80000.0,
+            places=3,
+        )
 
     def test_a_launch_and_its_outcome_consume_one_slot_not_two(self) -> None:
         repo = Path("/repo")
@@ -5338,6 +5489,75 @@ class PlanningBackoffCycleTests(unittest.TestCase):
         wake = datetime.datetime.fromisoformat(third.next_wake)
         occurred = datetime.datetime.fromisoformat(third.occurred_at)
         self.assertGreater((wake - occurred).total_seconds(), 21000.0)
+
+    def test_real_waiter_wakes_backoff_on_below_threshold_source_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "planning_backoff_seconds = 21600.0\n"
+                    "planning_unproductive_threshold = 2\n"
+                    "require_clean_repo = false\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher, launcher_calls = self._recording_launcher()
+            planning_calls: list[str] = []
+            wait_intervals: list[float] = []
+            source_changed = False
+
+            def planning_runner(config, **kwargs):
+                planning_calls.append(kwargs["cycle_id"])
+                return native_no_plan(config, **kwargs)
+
+            def idle_waiter(config, **kwargs):
+                nonlocal source_changed
+                wait_intervals.append(kwargs["interval"])
+
+                def sleeper(_seconds: float) -> None:
+                    nonlocal source_changed
+                    if kwargs["interval"] > 1000.0 and not source_changed:
+                        write_plan(
+                            repo,
+                            [
+                                (
+                                    "TASK-REPLACEMENT",
+                                    "Next",
+                                    "MISSING",
+                                    "same-depth replacement scope",
+                                )
+                            ],
+                        )
+                        source_changed = True
+
+                return wait_for_idle_change(
+                    config,
+                    **{**kwargs, "sleeper": sleeper},
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=4,
+                interval=100.0,
+                launcher=launcher,
+                sleep=lambda seconds: None,
+                native_planning_runner=planning_runner,
+                idle_waiter=idle_waiter,
+            )
+
+        self.assertEqual(launcher_calls, [])
+        self.assertTrue(source_changed)
+        self.assertGreater(wait_intervals[2], 21000.0)
+        self.assertEqual(len(planning_calls), 3)
+        third, fourth = summary.cycles[2:]
+        self.assertIsNotNone(third.planning_backoff_seconds)
+        self.assertNotIn("native_planning_outcome:no_tasks", third.actions)
+        self.assertIsNone(fourth.planning_backoff_seconds)
+        self.assertIn("native_planning_outcome:no_tasks", fourth.actions)
 
     def test_a_new_ready_task_wakes_the_backoff_and_launches_one_implementer(
         self,

@@ -459,7 +459,9 @@ Two independent gates then withhold planning, and the later deadline governs:
 
 - `unproductive_outcomes` - once `planning_unproductive_threshold` consecutive
   unproductive launches are recorded (default 2), planning is withheld for
-  `planning_backoff_seconds` (default six hours) measured from the last one.
+  `planning_backoff_seconds` (default six hours) measured from the last one. A
+  fingerprint change starts a new evidence epoch, so earlier outcomes from the
+  previous source state do not count toward the new state's threshold.
 - `daily_launch_cap` - at most `planning_max_launches_per_day` launches (default
   4) in a rolling 24 hours, expiring only as the oldest counted launch ages out.
 
@@ -472,7 +474,9 @@ crashes after the analysis or worker started but before it can classify itself
 has already spent budget, and must still consume one of the day's launches;
 counting terminal records alone would let a crash loop plan without limit. The
 only launch exempted is one whose outcome proves no provider was reached, such
-as an unresolvable agent executable.
+as an unresolvable agent executable. Cap accounting scans the complete planning
+journal for the rolling window; intervening exempt outcomes cannot evict charged
+launches from consideration.
 
 The outcome gate is evidence-based and releases when the evidence changes: a
 launch is compared against a fingerprint of the task source it acted on, and a
@@ -483,6 +487,12 @@ content/source edit is therefore detected even though every count is unchanged,
 while `active`/`done` transitions and counter churn from unrelated workers are
 not mistaken for fresh planning evidence. The daily cap is a spend ceiling, not
 an evidence gate, so a changed fingerprint does not lift it.
+
+During an outcome backoff, the idle waiter compares each complete task-source
+snapshot with the pre-wait fingerprint in addition to checking `min_ready`. A
+same-cardinality replacement or content/source edit therefore wakes the next
+cycle even when runnable depth remains below the dispatch threshold. Status-only
+and counter-only churn retains the same fingerprint and does not wake early.
 
 The backoff extends the idle wait budget rather than adding a blocking sleep, so
 it can never shorten an operator's configured interval, only lengthen it, and so
