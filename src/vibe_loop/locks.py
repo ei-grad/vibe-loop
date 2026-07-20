@@ -248,6 +248,14 @@ class LockManager:
     def status(self, task_id: str) -> dict[str, object] | None:
         return self.backend.status(task_id)
 
+    def status_with_timeout(
+        self,
+        task_id: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, object] | None:
+        return self._backend_status(task_id, timeout_seconds)
+
     def _backend_status(
         self,
         task_id: str,
@@ -617,7 +625,11 @@ class LockManager:
         )
         return True
 
-    def list_locks(self) -> list[dict[str, object]]:
+    def list_locks(
+        self, *, timeout_seconds: float | None = None
+    ) -> list[dict[str, object]]:
+        if isinstance(self.backend, CommandLockBackend):
+            return self.backend.list_locks_with_timeout(timeout_seconds=timeout_seconds)
         return self.backend.list_locks()
 
     @property
@@ -631,20 +643,25 @@ class LockManager:
         run_id: str,
         path: Path,
         kind: str,
+        timeout_seconds: float | None = None,
     ) -> bool:
+        deadline = command_deadline(timeout_seconds)
         lock_task_id = MAIN_INTEGRATION_LOCK_NAME if kind == "integration" else task_id
-        metadata = self.backend.status(lock_task_id)
+        metadata = self._backend_status(
+            lock_task_id, remaining_command_timeout(deadline)
+        )
         if metadata is None:
             return False
         current_path = path_from_metadata(metadata, self.backend.path_for(lock_task_id))
         if current_path != path or string_value(metadata.get("run_id")) != run_id:
             raise LockBackendError("lock metadata changed since collection")
-        self.release(
+        self.release_with_timeout(
             TaskLock(
                 task_id=lock_task_id,
                 path=current_path,
                 metadata=metadata,
-            )
+            ),
+            timeout_seconds=remaining_command_timeout(deadline),
         )
         return True
 
@@ -891,6 +908,11 @@ class CommandLockBackend:
         )
 
     def list_locks(self) -> list[dict[str, object]]:
+        return self.list_locks_with_timeout()
+
+    def list_locks_with_timeout(
+        self, *, timeout_seconds: float | None = None
+    ) -> list[dict[str, object]]:
         payload = self._run_json_command(
             "locks.list_command",
             self.list_command,
@@ -898,6 +920,7 @@ class CommandLockBackend:
             task_id="",
             run_id="",
             metadata={},
+            timeout_seconds=timeout_seconds,
         )
         raw_locks = (
             payload.get("locks", payload) if isinstance(payload, dict) else payload

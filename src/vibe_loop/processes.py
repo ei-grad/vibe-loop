@@ -23,6 +23,7 @@ class ProcessNode:
     process_group_id: int
     session_id: int
     process_birth_id: str
+    state: str = ""
 
 
 def boot_identity(proc_root: Path = PROC_ROOT) -> str:
@@ -85,6 +86,7 @@ def read_process_node(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessNode |
         process_group_id=int(process_group_id),
         session_id=int(session_id),
         process_birth_id=f"{boot_id}:{start_time}",
+        state=fields[0],
     )
 
 

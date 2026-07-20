@@ -1766,10 +1766,11 @@ class AutopilotStopTests(unittest.TestCase):
 
             def send_signal(pidfd: int, signal_number: int) -> None:
                 signals.append((pidfd, signal_number))
-                manager.release_autopilot(
-                    run_id="autopilot-1",
-                    fencing_token=str(holder.metadata["fencing_token"]),
-                )
+                if signal_number == signal.SIGTERM:
+                    manager.release_autopilot(
+                        run_id="autopilot-1",
+                        fencing_token=str(holder.metadata["fencing_token"]),
+                    )
 
             result = stop_detached_autopilot(
                 config,
@@ -1787,7 +1788,14 @@ class AutopilotStopTests(unittest.TestCase):
         self.assertTrue(result.stopped)
         self.assertTrue(result.process_exited)
         self.assertTrue(result.lock_released)
-        self.assertEqual(signals, [(17, signal.SIGTERM)])
+        self.assertEqual(
+            signals,
+            [
+                (17, signal.SIGSTOP),
+                (17, signal.SIGTERM),
+                (17, signal.SIGCONT),
+            ],
+        )
         self.assertEqual(closed, [17])
         self.assertIsNone(lock_after)
 
@@ -1951,6 +1959,14 @@ class AutopilotStopTests(unittest.TestCase):
                     pidfd_exited=lambda _pidfd: False,
                     close_fd=lambda _pidfd: None,
                     sleep=lambda _seconds: (_ for _ in ()).throw(KeyboardInterrupt()),
+                    process_node=lambda pid: ProcessNode(
+                        pid=pid,
+                        parent_pid=1,
+                        process_group_id=4321,
+                        session_id=4321,
+                        process_birth_id="boot-id:123",
+                        state="R",
+                    ),
                 )
                 lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
             finally:
@@ -2008,6 +2024,14 @@ class AutopilotStopTests(unittest.TestCase):
                         close_fd=lambda _pidfd: None,
                         sleep=advance,
                         monotonic=lambda: now[0],
+                        process_node=lambda pid: ProcessNode(
+                            pid=pid,
+                            parent_pid=1,
+                            process_group_id=4321,
+                            session_id=4321,
+                            process_birth_id="boot-id:123",
+                            state="R",
+                        ),
                     )
             finally:
                 manager.release_autopilot(
@@ -2151,6 +2175,9 @@ class AutopilotStopDrainTests(unittest.TestCase):
         signals: list[tuple[int, int]] = []
         closed: list[int] = []
         exited: set[int] = set(overrides.pop("initially_exited", ()))
+        stopped: set[int] = set()
+        pending_termination: set[int] = set()
+        signal_observer = overrides.pop("signal_observer", None)
         table = overrides.pop("table", None) or drain_process_table()
         fd_for_pid = {pid: 100 + index for index, pid in enumerate(sorted(table))}
         pid_for_fd = {fd: pid for pid, fd in fd_for_pid.items()}
@@ -2158,12 +2185,31 @@ class AutopilotStopDrainTests(unittest.TestCase):
         def send_signal(pidfd: int, signal_number: int) -> None:
             signals.append((pidfd, signal_number))
             pid = pid_for_fd[pidfd]
+            if signal_observer is not None:
+                signal_observer(pid, signal_number)
+            if signal_number == signal.SIGSTOP:
+                stopped.add(pid)
+                return
+            if signal_number == signal.SIGCONT:
+                stopped.discard(pid)
+                if pid not in pending_termination:
+                    return
+                pending_termination.discard(pid)
+            elif signal_number == signal.SIGTERM and pid in stopped:
+                pending_termination.add(pid)
+                return
             exited.add(pid)
             if pid == SUPERVISOR_PID:
                 manager.release_autopilot(
                     run_id=str(holder.metadata["run_id"]),
                     fencing_token=str(holder.metadata["fencing_token"]),
                 )
+
+        def current_process_node(pid: int):
+            node = table.get(pid)
+            if node is not None and pid in stopped:
+                return dataclasses.replace(node, state="T")
+            return node
 
         defaults = dict(
             process_exists=lambda pid: pid in table,
@@ -2175,7 +2221,7 @@ class AutopilotStopDrainTests(unittest.TestCase):
             pidfd_exited=lambda pidfd: pid_for_fd[pidfd] in exited,
             close_fd=closed.append,
             process_table=lambda: table,
-            process_node=lambda pid: table.get(pid),
+            process_node=current_process_node,
         )
         defaults.update(overrides)
         result = stop_detached_autopilot(config, **defaults)
@@ -2189,13 +2235,18 @@ class AutopilotStopDrainTests(unittest.TestCase):
             result, signals, closed, pid_for_fd = self._stop(config, manager, holder)
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
 
-        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        signalled_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
         self.assertTrue(result.stopped)
         self.assertEqual(
             signalled_pids,
             [REVIEWER_PID, WORKER_PID, CHILD_PID, SUPERVISOR_PID],
         )
-        self.assertEqual({number for _fd, number in signals}, {signal.SIGTERM})
+        self.assertEqual(
+            [number for _fd, number in signals if number != signal.SIGTERM],
+            [signal.SIGSTOP, signal.SIGCONT],
+        )
         self.assertNotIn(SENTINEL_PID, signalled_pids)
         self.assertEqual(
             [identity.pid for identity in result.drained],
@@ -2231,10 +2282,19 @@ class AutopilotStopDrainTests(unittest.TestCase):
                         fencing_token=str(holder.metadata["fencing_token"]),
                     )
 
-        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        signalled_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
         self.assertFalse(result.stopped)
         self.assertEqual(result.blocker, "autopilot_stop_drain_timeout")
         self.assertNotIn(SUPERVISOR_PID, signalled_pids)
+        self.assertIn(
+            (
+                next(fd for fd, pid in pid_for_fd.items() if pid == SUPERVISOR_PID),
+                signal.SIGCONT,
+            ),
+            signals,
+        )
         self.assertEqual(
             [identity.pid for identity in result.remaining], [REVIEWER_PID]
         )
@@ -2345,7 +2405,9 @@ class AutopilotStopDrainTests(unittest.TestCase):
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
             task_lock_after = manager.status("TASK-01")
 
-        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        signalled_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
         self.assertTrue(result.stopped)
         self.assertEqual(signalled_pids, [REVIEWER_PID, WORKER_PID, SUPERVISOR_PID])
         self.assertEqual(
@@ -2357,7 +2419,7 @@ class AutopilotStopDrainTests(unittest.TestCase):
         self.assertIsNone(task_lock_after)
         self.assertIsNone(lock_after)
 
-    def test_recycled_child_pid_still_drains_its_verifiable_workers(self) -> None:
+    def test_recycled_child_pid_blocks_with_zero_signals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config, manager, holder, _run_store, _task_lock = (
                 self._drained_installation(
@@ -2367,17 +2429,15 @@ class AutopilotStopDrainTests(unittest.TestCase):
             result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
 
-        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
-        # The recorded child PID now names a different process, so that PID is
-        # never signalled — but the worker below it is still independently
-        # verifiable by its own birth identity and must still be drained.
-        self.assertNotIn(CHILD_PID, signalled_pids)
-        self.assertNotIn(SENTINEL_PID, signalled_pids)
-        self.assertEqual(signalled_pids, [REVIEWER_PID, WORKER_PID, SUPERVISOR_PID])
-        self.assertTrue(result.stopped)
-        self.assertIsNone(lock_after)
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:child_birth_id_mismatch",
+        )
+        self.assertEqual(signals, [])
+        self.assertIsNotNone(lock_after)
 
-    def test_recycled_worker_pid_is_not_treated_as_the_recorded_worker(self) -> None:
+    def test_recycled_worker_pid_blocks_with_zero_signals(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config, manager, holder, _run_store, _task_lock = (
                 self._drained_installation(
@@ -2387,28 +2447,14 @@ class AutopilotStopDrainTests(unittest.TestCase):
             result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
             task_lock_after = manager.status("TASK-01")
 
-        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
-        # That PID now names some other process, so it contributes no verified
-        # worker root. It is still reached and signalled here, but only as an
-        # ordinary descendant of the child whose identity did verify.
-        self.assertTrue(result.stopped)
+        self.assertFalse(result.stopped)
         self.assertEqual(
-            signalled_pids,
-            [REVIEWER_PID, WORKER_PID, CHILD_PID, SUPERVISOR_PID],
+            result.blocker,
+            "autopilot_stop_identity_unverified:worker_birth_id_mismatch:TASK-01",
         )
-        self.assertEqual(
-            [identity.role for identity in result.drained],
-            ["descendant", "descendant", "run_until_done_child"],
-        )
-        # No verified worker root was drained, so the lock is retained rather
-        # than released on the strength of a bare PID match — and the retained
-        # lock is surfaced instead of passing silently under a clean stop.
+        self.assertEqual(signals, [])
         self.assertEqual(result.reconciled_task_ids, ())
         self.assertIsNotNone(task_lock_after)
-        self.assertIn(
-            "autopilot_stop_worker_lock_retained:TASK-01",
-            result.reconciliation_blockers,
-        )
 
     def test_worker_orphaned_by_an_earlier_cycle_is_still_attributable(self) -> None:
         """A supervisor runs many cycles; orphans outlive the cycle that made them.
@@ -2448,7 +2494,9 @@ class AutopilotStopDrainTests(unittest.TestCase):
             )
             task_lock_after = manager.status("TASK-01")
 
-        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        signalled_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
         self.assertTrue(result.stopped)
         self.assertEqual(result.blocker, "")
         self.assertIn(WORKER_PID, signalled_pids)
@@ -2464,8 +2512,17 @@ class AutopilotStopDrainTests(unittest.TestCase):
                 self._drained_installation(Path(directory))
             )
 
-            def refuse(_pidfd: int, _signal_number: int) -> None:
-                raise PermissionError(1, "Operation not permitted")
+            def refuse(_pidfd: int, signal_number: int) -> None:
+                if signal_number == signal.SIGTERM:
+                    raise PermissionError(1, "Operation not permitted")
+
+            table = drain_process_table()
+
+            def stopped_supervisor_node(pid: int):
+                node = table.get(pid)
+                if node is not None and pid == SUPERVISOR_PID:
+                    return dataclasses.replace(node, state="T")
+                return node
 
             try:
                 result, _signals, _closed, _pid_for_fd = self._stop(
@@ -2473,6 +2530,8 @@ class AutopilotStopDrainTests(unittest.TestCase):
                     manager,
                     holder,
                     pidfd_signal=refuse,
+                    table=table,
+                    process_node=stopped_supervisor_node,
                 )
                 lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
             finally:
@@ -2503,12 +2562,19 @@ class AutopilotStopDrainTests(unittest.TestCase):
             # snapshot still names the same process, and the drain continues.
             reparented = dict(table)
             reparented.pop(WORKER_PID)
+
+            def reparented_node(pid: int):
+                node = reparented.get(pid)
+                if node is not None and pid == SUPERVISOR_PID:
+                    return dataclasses.replace(node, state="T")
+                return node
+
             result, signals, _closed, pid_for_fd = self._stop(
                 config,
                 manager,
                 holder,
                 table=table,
-                process_node=lambda pid: reparented.get(pid),
+                process_node=reparented_node,
             )
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
 
@@ -2540,6 +2606,17 @@ class AutopilotStopDrainTests(unittest.TestCase):
         self.assertEqual(len(transitions), 1)
         self.assertEqual(transitions[0]["to_state"], "terminated")
         self.assertEqual(transitions[0]["reason"], "autopilot_stop")
+        results = [
+            record
+            for record in records
+            if record.get("record_type") == "run_result"
+            and record.get("run_id") == "run-task-01"
+        ]
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["classification"], "terminated")
+        self.assertEqual(results[0]["status"], "terminated")
+        self.assertEqual(results[0]["classification_source"], "autopilot_stop")
+        self.assertNotEqual(results[0]["exit_code"], 0)
         # No completion is ever synthesized for a worker killed by a stop.
         self.assertNotIn("completed", json.dumps(transitions))
         self.assertIsNone(task_lock_after)
@@ -2562,6 +2639,7 @@ class AutopilotStopDrainTests(unittest.TestCase):
             )
             result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
             records = run_store.read_records()
+            task_lock_after = manager.status("TASK-01")
 
         transitions = [
             record
@@ -2570,11 +2648,330 @@ class AutopilotStopDrainTests(unittest.TestCase):
         ]
         self.assertTrue(result.stopped)
         self.assertEqual(transitions, [])
-        self.assertEqual(result.reconciled_task_ids, ())
+        self.assertEqual(result.reconciled_task_ids, ("TASK-01",))
+        self.assertIsNone(task_lock_after)
+        reports = [
+            record for record in records if record.get("record_type") == "worker_report"
+        ]
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["status"], "completed")
+
+    def test_quiesce_rescans_and_drains_child_started_after_first_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            late_child_pid = CHILD_PID + 50
+            table = drain_process_table()
+            table[late_child_pid] = drain_node(
+                late_child_pid,
+                SUPERVISOR_PID,
+                late_child_pid,
+                late_child_pid,
+                150,
+            )
+            initial_table = {
+                pid: node for pid, node in table.items() if pid != late_child_pid
+            }
+            recorded = False
+
+            def process_node(pid: int):
+                nonlocal recorded
+                if pid == SUPERVISOR_PID:
+                    return dataclasses.replace(table[pid], state="T")
+                if pid == CHILD_PID and not recorded:
+                    recorded = True
+                    run_store.append_record(
+                        autopilot_child_started_record(
+                            repo=config.repo,
+                            run_id="autopilot-1",
+                            cycle_id="autopilot-1-c2",
+                            pid=late_child_pid,
+                            process_group_id=late_child_pid,
+                            session_id=late_child_pid,
+                            process_birth_id=f"{DRAIN_BOOT_ID}:150",
+                        )
+                    )
+                return table.get(pid)
+
+            snapshots = 0
+
+            def process_table():
+                nonlocal snapshots
+                snapshots += 1
+                return initial_table if snapshots == 1 else table
+
+            result, signals, _closed, pid_for_fd = self._stop(
+                config,
+                manager,
+                holder,
+                table=table,
+                process_table=process_table,
+                process_node=process_node,
+            )
+
+        terminated_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
+        self.assertTrue(result.stopped)
+        self.assertIn(late_child_pid, terminated_pids)
+        self.assertIn(late_child_pid, [entry.pid for entry in result.drained])
+
+    def test_waits_for_kernel_stop_ack_before_rescanning_for_late_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            late_child_pid = CHILD_PID + 55
+            table = drain_process_table()
+            table[late_child_pid] = drain_node(
+                late_child_pid,
+                SUPERVISOR_PID,
+                late_child_pid,
+                late_child_pid,
+                155,
+            )
+            quiesce_polls = 0
+
+            def delayed_process_node(pid: int):
+                nonlocal quiesce_polls
+                node = table.get(pid)
+                if pid != SUPERVISOR_PID or node is None:
+                    return node
+                quiesce_polls += 1
+                if quiesce_polls == 1:
+                    run_store.append_record(
+                        autopilot_child_started_record(
+                            repo=config.repo,
+                            run_id="autopilot-1",
+                            cycle_id="autopilot-1-c2",
+                            pid=late_child_pid,
+                            process_group_id=late_child_pid,
+                            session_id=late_child_pid,
+                            process_birth_id=f"{DRAIN_BOOT_ID}:155",
+                        )
+                    )
+                return dataclasses.replace(
+                    node,
+                    state="T" if quiesce_polls >= 3 else "R",
+                )
+
+            result, signals, _closed, pid_for_fd = self._stop(
+                config,
+                manager,
+                holder,
+                table=table,
+                process_table=lambda: table,
+                process_node=delayed_process_node,
+                timeout=1.0,
+            )
+
+        terminated_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
+        self.assertTrue(result.stopped)
+        self.assertGreaterEqual(quiesce_polls, 3)
+        self.assertIn(late_child_pid, terminated_pids)
+
+    def test_empty_snapshot_rescans_after_supervisor_quiesce(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, task_lock = self._drained_installation(
+                Path(directory), record_child=False
+            )
+            manager.release(task_lock)
+            late_child_pid = CHILD_PID + 60
+            table = drain_process_table()
+            table[late_child_pid] = drain_node(
+                late_child_pid,
+                SUPERVISOR_PID,
+                late_child_pid,
+                late_child_pid,
+                160,
+            )
+
+            def observe(pid: int, signal_number: int) -> None:
+                if pid != SUPERVISOR_PID or signal_number != signal.SIGSTOP:
+                    return
+                run_store.append_record(
+                    autopilot_child_started_record(
+                        repo=config.repo,
+                        run_id="autopilot-1",
+                        cycle_id="autopilot-1-c1",
+                        pid=late_child_pid,
+                        process_group_id=late_child_pid,
+                        session_id=late_child_pid,
+                        process_birth_id=f"{DRAIN_BOOT_ID}:160",
+                    )
+                )
+
+            result, signals, _closed, pid_for_fd = self._stop(
+                config,
+                manager,
+                holder,
+                table=table,
+                process_table=lambda: table,
+                signal_observer=observe,
+            )
+
+        terminated_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
+        self.assertTrue(result.stopped)
+        self.assertIn(late_child_pid, terminated_pids)
+
+    def test_lock_enumeration_expiry_sends_no_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            now = [0.0]
+            timeouts: list[float | None] = []
+
+            def slow_list(*, timeout_seconds=None):
+                timeouts.append(timeout_seconds)
+                now[0] = 100.0
+                return []
+
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.build_lock_manager", return_value=manager
+                ),
+                mock.patch.object(manager, "list_locks", side_effect=slow_list),
+            ):
+                result, signals, _closed, _pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    timeout=0.1,
+                    monotonic=lambda: now[0],
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.blocker, "autopilot_stop_deadline_exceeded")
+        self.assertEqual(signals, [])
+        self.assertTrue(timeouts)
+        self.assertLessEqual(timeouts[0] or 0.0, 0.1)
+
+    def test_reconciliation_status_expiry_retains_exact_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            now = [0.0]
+            task_metadata = manager.status("TASK-01")
+
+            def slow_status(_task_id: str, *, timeout_seconds=None):
+                now[0] = 100.0
+                return task_metadata
+
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.build_lock_manager", return_value=manager
+                ),
+                mock.patch.object(
+                    manager, "status_with_timeout", side_effect=slow_status
+                ),
+            ):
+                result, _signals, _closed, _pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    timeout=0.1,
+                    monotonic=lambda: now[0],
+                )
+            lock_after = manager.status("TASK-01")
+            records = run_store.read_records()
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_reconcile_timeout:TASK-01",
+        )
+        self.assertIsNotNone(lock_after)
+        self.assertFalse(
+            any(
+                record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
+                for record in records
+            )
+        )
+
+    def test_reconciliation_release_uses_remaining_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            now = [0.0]
+            timeouts: list[float | None] = []
+
+            def slow_release(**kwargs):
+                timeouts.append(kwargs.get("timeout_seconds"))
+                now[0] = 100.0
+                return False
+
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.build_lock_manager", return_value=manager
+                ),
+                mock.patch.object(
+                    manager, "release_stale_lock", side_effect=slow_release
+                ),
+            ):
+                result, _signals, _closed, _pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    timeout=0.1,
+                    monotonic=lambda: now[0],
+                )
+            lock_after = manager.status("TASK-01")
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_reconcile_timeout:TASK-01",
+        )
+        self.assertIsNotNone(lock_after)
+        self.assertTrue(timeouts)
+        self.assertLessEqual(timeouts[0] or 0.0, 0.1)
+
+    def test_unknown_run_result_is_followed_by_stop_termination_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            run_store.append_result(
+                RunResult(
+                    run_id="run-task-01",
+                    task_id="TASK-01",
+                    classification="unknown",
+                    exit_code=1,
+                    log_path=config.state_path / "logs" / "run-task-01.log",
+                    start_main="main",
+                    end_main="main",
+                    classification_source="agent_exit",
+                )
+            )
+            result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
+            results = [
+                record
+                for record in run_store.read_records()
+                if record.get("record_type") == "run_result"
+                and record.get("run_id") == "run-task-01"
+            ]
+
+        self.assertTrue(result.stopped)
+        self.assertEqual(
+            [record["classification"] for record in results],
+            ["unknown", "terminated"],
+        )
+        self.assertEqual(results[-1]["classification_source"], "autopilot_stop")
+        self.assertNotEqual(results[-1]["exit_code"], 0)
 
     def test_out_of_band_fencing_generation_retains_the_task_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            config, manager, holder, _run_store, task_lock = self._drained_installation(
+            config, manager, holder, run_store, task_lock = self._drained_installation(
                 Path(directory)
             )
             # The lock was re-created out of band, so its generation is no
@@ -2586,14 +2983,82 @@ class AutopilotStopDrainTests(unittest.TestCase):
 
             result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
             task_lock_still_held = manager.status("TASK-01") is not None
+            records = run_store.read_records()
 
-        self.assertTrue(result.stopped)
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.state, "blocked")
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_reconcile_fencing_mismatch:TASK-01",
+        )
         self.assertEqual(result.reconciled_task_ids, ())
         self.assertEqual(
             result.reconciliation_blockers,
             ("autopilot_stop_reconcile_fencing_mismatch:TASK-01",),
         )
         self.assertTrue(task_lock_still_held)
+        self.assertFalse(
+            any(
+                record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
+                for record in records
+            )
+        )
+
+    def test_stop_quiesces_supervisor_before_child_can_trigger_respawn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
+
+        supervisor_fd = next(
+            pidfd for pidfd, pid in pid_for_fd.items() if pid == SUPERVISOR_PID
+        )
+        child_fd = next(pidfd for pidfd, pid in pid_for_fd.items() if pid == CHILD_PID)
+        self.assertTrue(result.stopped)
+        self.assertLess(
+            signals.index((supervisor_fd, signal.SIGSTOP)),
+            signals.index((child_fd, signal.SIGTERM)),
+        )
+        self.assertLess(
+            signals.index((child_fd, signal.SIGTERM)),
+            signals.index((supervisor_fd, signal.SIGTERM)),
+        )
+        self.assertLess(
+            signals.index((supervisor_fd, signal.SIGTERM)),
+            signals.index((supervisor_fd, signal.SIGCONT)),
+        )
+
+    def test_descendant_drain_and_supervisor_exit_share_caller_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            now = [0.0]
+
+            def advance(seconds: float) -> None:
+                now[0] += seconds
+
+            try:
+                result, _signals, _closed, _pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    timeout=0.1,
+                    monotonic=lambda: now[0],
+                    sleep=advance,
+                    pidfd_exited=lambda pidfd: pidfd != 100 and now[0] >= 0.08,
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    manager.release_autopilot(
+                        run_id="autopilot-1",
+                        fencing_token=str(holder.metadata["fencing_token"]),
+                    )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.blocker, "autopilot_stop_deadline_exceeded")
+        self.assertLessEqual(now[0], 0.1)
 
     def test_stop_result_json_is_redacted_and_serializable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2695,7 +3160,14 @@ class AutopilotStopDrainTests(unittest.TestCase):
             lock_after = manager.status(AUTOPILOT_LOCK_NAME)
 
         self.assertTrue(result.stopped)
-        self.assertEqual([pid_for_fd[pidfd] for pidfd, _n in signals], [SUPERVISOR_PID])
+        self.assertEqual(
+            [
+                pid_for_fd[pidfd]
+                for pidfd, number in signals
+                if number == signal.SIGTERM
+            ],
+            [SUPERVISOR_PID],
+        )
         self.assertEqual(result.drained, ())
         self.assertIsNone(lock_after)
 

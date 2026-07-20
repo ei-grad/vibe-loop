@@ -501,9 +501,19 @@ A worker is verified on its own recorded birth identity, not on its child still
 being alive — a worker orphans to PID 1 precisely because that child died, so
 that is the case a stop most needs to handle. Every process must present a
 matching kernel birth identity before any signal is sent; one live worker this
-run cannot attribute or verify blocks the whole stop with nothing signalled.
-Signals then go to exact pidfds, deepest descendants first and the supervisor
-last.
+run cannot attribute or verify blocks the whole stop with nothing signalled,
+including when its PID was recycled inside an otherwise verified child tree.
+After verification, the supervisor is temporarily stopped through its exact
+pidfd so the drained child cannot trigger another cycle. Termination then goes
+to exact pidfds, deepest descendants first and the supervisor last. Stop waits
+for the exact supervisor's kernel state to acknowledge quiescence; merely
+submitting the stop signal is not treated as an acknowledgement. A second
+record/lock scan then catches a child created after the first
+snapshot, including an initially empty one; resuming the supervisor then lets
+its pending termination handler perform normal fenced cleanup. Enumeration,
+task-lock reconciliation, descendant drain, supervisor exit, and singleton-lock
+release share the caller's original deadline without an added grace period or a
+fresh backend timeout.
 
 A timeout, a refused signal, or an interruption reports the exact remaining
 role, run, task, and PID instead of a false success, and leaves both the
@@ -512,7 +522,11 @@ against named processes. On success, a worker killed mid-slice is recorded as a
 terminated run rather than a completed one: its task lock is released only when
 its run, task, and fencing generation all still match what this installation
 recorded, while the task itself stays active and its committed worktree is
-preserved so the slice can be picked up again.
+preserved so the slice can be picked up again. A worker without its own report
+receives a terminal non-success run result as well as the terminated lifecycle
+transition. A prior same-run `unknown` result does not suppress this explicit
+termination result. Any reconciliation blocker makes the overall stop fail,
+retains the affected task lock, and suppresses the operator stop record.
 
 If the recorded process is already absent but its lock remains, normal `stop`
 reports the stale lock without releasing it. Recovery is a separate explicit

@@ -143,34 +143,48 @@ just its current one: a supervisor runs many cycles, and a worker orphaned by an
 earlier cycle is still this run's, so comparing it against only the latest child
 would block the stop on exactly the orphan it exists to drain.
 
-A recorded root whose live birth identity no longer matches is gone rather than
-unverifiable, so that PID is dropped instead of signalled, and its retained task
-lock is reported rather than released on a bare PID match. A live worker this run
-cannot attribute to any recorded child, or whose birth identity was never
-recorded, is unverifiable rather than absent and blocks the stop instead of being
-silently left running — including for a supervisor that predates these records.
+A recorded worker whose live birth identity no longer matches is unverifiable,
+even when the recycled PID still appears below a verified child in the ancestry
+snapshot. The mismatch blocks the stop with zero signals rather than admitting
+the PID again as an ordinary descendant. A live worker this run cannot attribute
+to any recorded child, or whose birth identity was never recorded, fails the
+same way — including for a supervisor that predates these records.
 
 Every candidate requires a kernel process-birth identity, an open pidfd, and a
 post-open recheck of birth, parent, group, and session. Any missing or changed
 identity blocks the stop with zero signals sent, rather than leaving a
-half-signalled tree. Signals go to exact pidfds, deepest descendants first, then
-worker roots, then the child, and only then the supervisor. The pidfds are
-retained across the whole wait, so a process that reparents mid-drain is still
-observed to exit; a PID-based recheck cannot do this. All of them plus the
-singleton lock state must settle within one bounded deadline.
+half-signalled tree. After every identity passes, the verified supervisor pidfd
+is stopped so a completed child cannot trigger another cycle while shutdown is
+in progress. Submission of `SIGSTOP` is not sufficient: the stop path polls the
+exact supervisor's birth identity and kernel process state until it is observed
+stopped or the original deadline expires. It then rereads synchronous
+child-start records and
+active task locks, draining anything created between the first snapshot and
+supervisor quiescence. This rescan also runs after an initially empty snapshot.
+Termination goes to exact pidfds, deepest descendants first, then worker roots,
+then the child, and only then the supervisor; the supervisor is resumed to handle
+its pending termination normally. The pidfds are retained across the whole wait,
+so a process that reparents mid-drain is still observed to exit; a PID-based
+recheck cannot do this. Enumeration, task-lock status and release, process exit,
+and singleton-lock state must all settle within the caller's one bounded
+deadline, with no post-drain grace or fresh backend timeout.
 
 Timeout, signal refusal, or interruption returns `stopped=false` with the exact
 remaining role, run, task, and PID, writes no terminal record, and releases no
 task lock, so the operator can verify and retry against named processes rather
 than searching for orphans. On success, a drained worker that filed no terminal
-report is recorded as a terminated run attributed to the stop; success is never
-synthesized. A task lock is released only when its run and task identity still
+report receives a terminal non-success `run_result` and lifecycle transition,
+both attributed to the stop; success is never synthesized. An earlier
+same-run `unknown` result is non-terminal and is followed by the explicit
+terminated result rather than suppressing it. A task lock is
+released only when its run and task identity still
 match and its fencing generation equals the one this installation recorded
 acquiring, read from a local record rather than from the backend status being
 released; a lock re-created out of band therefore fails closed instead of
 agreeing with itself. The authoritative task stays active and the committed
 worktree is preserved so the slice can be picked up again. Incomplete ownership
-retains the lock and reports a blocker.
+or any reconciliation failure retains the affected lock, returns
+`stopped=false`, and does not append the operator stop record.
 
 Diagnostics report whether a birth identity is known, never its value, since it
 embeds the host boot identity. This applies to worker and status output as well

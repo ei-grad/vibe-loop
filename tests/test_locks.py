@@ -158,6 +158,27 @@ class CommandLockContextTests(unittest.TestCase):
 
         self.assertLess(elapsed, 1.0)
 
+    def test_list_timeout_is_bounded_by_caller_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            command = f'{sys.executable} -c "import time; time.sleep(2)"'
+            backend = locks.CommandLockBackend(
+                repo=root,
+                lock_root=root / "locks",
+                acquire_command=command,
+                release_command=command,
+                status_command=command,
+                list_command=command,
+            )
+            manager = locks.LockManager(root / "locks", backend=backend)
+
+            started = time.monotonic()
+            with self.assertRaisesRegex(locks.LockBackendError, "timed out"):
+                manager.list_locks(timeout_seconds=0.05)
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+
     def test_context_covers_every_operation_and_protocol_values_win(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

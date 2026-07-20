@@ -43,6 +43,7 @@ def node(pid: int, ppid: int, pgid: int, sid: int, starttime: int) -> ProcessNod
         process_group_id=pgid,
         session_id=sid,
         process_birth_id=f"{BOOT_ID}:{starttime}",
+        state="S",
     )
 
 
