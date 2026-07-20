@@ -414,6 +414,58 @@ than the wall. A
 stop request must interrupt the pause: signal-driven stops unwind through the
 sleeper, and a cooperative stop is polled between bounded slices.
 
+## PRD-AUT-009a Planning Outcome Budget Backoff
+
+Every native planning launch spends provider budget on a read-only analysis pass
+and, when it decides to plan, an authoring worker. Repeating that launch on the
+ordinary supervisor interval while it produces nothing is the dominant failure
+mode: an observed 48-hour window spent $28.94 across twelve launches, ending in
+an `invalid_plan` decision that created no tasks.
+
+Each launch must therefore be classified into exactly one outcome:
+
+| Outcome | Meaning | Charged to the streak |
+| --- | --- | --- |
+| `productive` | runnable work rose | resets it |
+| `invalid_plan` | the analysis agent returned an unusable decision | yes |
+| `no_tasks` | the analysis agent decided no plan was needed | yes |
+| `zero_created` | the authoring worker finished without adding runnable work | yes |
+| `limit_wall` | a provider wall stopped the launch | no |
+| `worker_error` | the authoring worker never started or failed | no |
+| `task_source_error` | the task source could not be read after planning | no |
+
+The three inconclusive outcomes say nothing about whether planning *can* produce
+work, so they neither extend nor reset the streak; classifying them as
+unproductive would let provider walls consume the planning budget, and
+classifying them as productive would reopen the gate on no evidence.
+
+Two independent gates then withhold planning, and the later deadline governs:
+
+- `unproductive_outcomes` - once `planning_unproductive_threshold` consecutive
+  unproductive launches are recorded (default 2), planning is withheld for
+  `planning_backoff_seconds` (default six hours) measured from the last one.
+- `daily_launch_cap` - at most `planning_max_launches_per_day` launches (default
+  4) in a rolling 24 hours, expiring only as the oldest counted launch ages out.
+
+A withheld cycle must not invoke the analysis agent at all; attempting the launch
+and discarding it would spend exactly the budget the gate exists to protect.
+
+The outcome gate is evidence-based and releases when the evidence changes: a
+launch is compared against a fingerprint of the task-source counts it acted on,
+and a materially changed board (or a productive launch) clears the streak. The
+daily cap is a spend ceiling, not an evidence gate, so a changed fingerprint does
+not lift it.
+
+The backoff extends the idle wait budget rather than adding a blocking sleep, so
+it can never shorten an operator's configured interval, only lengthen it, and so
+the idle waiter keeps its existing guarantees throughout: a task source that
+reaches `min_ready` still wakes the next cycle early and dispatches at most one
+implementer, stop requests are still honoured per slice, exponential poll backoff
+still prevents a busy loop, and the journaled `next_wake` is the deadline the
+supervisor actually honours. Status output must name the recorded outcome, the
+attempt count, and the backoff reason, using outcome names and counts only - no
+prompt text, objectives, or credentials.
+
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
 Autopilot cycles must include a native worktree-disposition health step so that

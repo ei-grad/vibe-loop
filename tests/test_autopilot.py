@@ -18,8 +18,22 @@ from vibe_loop.autopilot import (
     AutopilotCycleResult,
     AutopilotTerminationRequested,
     CycleSummary,
+    IdleWaitResult,
     MaintenanceCommandResult,
+    NativePlanningCycleResult,
+    NativePlanningDecision,
     NativePlanningProcessResult,
+    NativePlanningWorkerResult,
+    PLANNING_OUTCOME_INVALID_PLAN,
+    PLANNING_OUTCOME_LIMIT_WALL,
+    PLANNING_OUTCOME_NO_TASKS,
+    PLANNING_OUTCOME_PRODUCTIVE,
+    PLANNING_OUTCOME_TASK_SOURCE_ERROR,
+    PLANNING_OUTCOME_WORKER_ERROR,
+    PLANNING_OUTCOME_ZERO_CREATED,
+    PLANNING_UNPRODUCTIVE_OUTCOMES,
+    classify_planning_outcome,
+    planning_outcome_backoff,
     NativePlanningWorkerInterrupted,
     ProjectEntry,
     ProjectRegistry,
@@ -70,6 +84,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
@@ -4633,6 +4648,552 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         self.assertEqual(reap_records[0]["reaped"], 0)
         self.assertEqual(reap_records[0]["policy"], "report-only")
         self.assertFalse(reap_records[0]["agent_invoked"])
+
+
+def planning_outcome_records(
+    repo: Path,
+    entries: list[tuple[float, str, str]],
+    *,
+    now: datetime.datetime,
+) -> list[dict[str, object]]:
+    """Outcome records placed at fixed offsets (seconds ago) from ``now``."""
+    return [
+        {
+            "schema_version": 1,
+            "record_type": AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
+            "occurred_at": (now - datetime.timedelta(seconds=seconds_ago)).isoformat(),
+            "repo": str(repo),
+            "cycle_id": f"c{index}",
+            "outcome": outcome,
+            "fingerprint": fingerprint,
+            "runnable_before": 0,
+            "runnable_after": 0,
+        }
+        for index, (seconds_ago, outcome, fingerprint) in enumerate(entries)
+    ]
+
+
+class PlanningOutcomeClassificationTests(unittest.TestCase):
+    def _result(
+        self,
+        *,
+        status: str = "completed",
+        should_plan: bool = True,
+        agent_error: str = "",
+        worker_status: str = "completed",
+        attempted: bool = True,
+        runnable_before: int = 0,
+        runnable_after: int | None = 0,
+        task_source_error: str = "",
+    ) -> NativePlanningCycleResult:
+        return NativePlanningCycleResult(
+            decision=NativePlanningDecision(
+                cycle_id="c1",
+                runnable=runnable_before,
+                min_ready=1,
+                status=status,
+                should_plan=should_plan,
+                reason="reason",
+                objective="objective" if should_plan else "",
+                agent_invoked=True,
+                agent_error=agent_error,
+            ),
+            worker=NativePlanningWorkerResult(
+                cycle_id="c1",
+                phase="authoring",
+                status=worker_status,
+                requested=should_plan,
+                attempted=attempted,
+                started=attempted,
+                pid=1 if attempted else None,
+                exit_code=0 if attempted else None,
+                log_path=None,
+                runnable_before=runnable_before,
+                runnable_after=runnable_after,
+                task_source_error=task_source_error,
+            ),
+        )
+
+    def test_invalid_schema_is_an_invalid_plan_outcome(self) -> None:
+        result = self._result(
+            agent_error="analysis agent returned an invalid planning schema",
+        )
+        self.assertEqual(
+            classify_planning_outcome(result), PLANNING_OUTCOME_INVALID_PLAN
+        )
+
+    def test_a_no_plan_decision_is_a_no_tasks_outcome(self) -> None:
+        result = self._result(should_plan=False, attempted=False)
+        self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_NO_TASKS)
+
+    def test_planning_that_adds_no_runnable_work_is_zero_created(self) -> None:
+        result = self._result(runnable_before=3, runnable_after=3)
+        self.assertEqual(
+            classify_planning_outcome(result), PLANNING_OUTCOME_ZERO_CREATED
+        )
+
+    def test_planning_that_adds_runnable_work_is_productive(self) -> None:
+        result = self._result(runnable_before=0, runnable_after=2)
+        self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_PRODUCTIVE)
+
+    def test_a_limit_wall_outranks_the_analysis_error_it_produces(self) -> None:
+        # A wall stops the analysis agent, which also surfaces as an agent
+        # error. Charging that to the unproductive streak would let provider
+        # walls silently consume the planning budget.
+        result = self._result(status="limit_wall", agent_error="usage limit")
+        self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_LIMIT_WALL)
+
+    def test_an_unreadable_task_source_is_not_charged_as_unproductive(self) -> None:
+        result = self._result(task_source_error="adapter exited 1", runnable_after=None)
+        self.assertEqual(
+            classify_planning_outcome(result), PLANNING_OUTCOME_TASK_SOURCE_ERROR
+        )
+        self.assertNotIn(
+            classify_planning_outcome(result), PLANNING_UNPRODUCTIVE_OUTCOMES
+        )
+
+    def test_a_crashed_worker_is_not_charged_as_unproductive(self) -> None:
+        result = self._result(worker_status="worker_error")
+        self.assertEqual(
+            classify_planning_outcome(result), PLANNING_OUTCOME_WORKER_ERROR
+        )
+
+
+class PlanningOutcomeBackoffTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.now = datetime.datetime(2026, 7, 20, 12, 0, tzinfo=datetime.UTC)
+
+    def _store(self, directory: str, records: list[dict[str, object]]) -> RunStore:
+        store = RunStore(Path(directory) / "runs.jsonl")
+        for record in records:
+            store.append_record(record)
+        return store
+
+    def _backoff(
+        self,
+        records: list[dict[str, object]],
+        *,
+        repo: Path,
+        fingerprint: str = "10:0:0:10:0",
+        backoff_seconds: float = 21600.0,
+        max_launches_per_day: int = 4,
+        unproductive_threshold: int = 2,
+        now: datetime.datetime | None = None,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory, records)
+            return planning_outcome_backoff(
+                store,
+                repo=repo,
+                fingerprint=fingerprint,
+                backoff_seconds=backoff_seconds,
+                max_launches_per_day=max_launches_per_day,
+                unproductive_threshold=unproductive_threshold,
+                now=now if now is not None else self.now,
+            )
+
+    def test_no_history_permits_planning(self) -> None:
+        repo = Path("/repo")
+        self.assertIsNone(self._backoff([], repo=repo))
+
+    def test_one_unproductive_launch_stays_on_the_ordinary_cadence(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo, [(60.0, "no_tasks", "10:0:0:10:0")], now=self.now
+        )
+        self.assertIsNone(self._backoff(records, repo=repo))
+
+    def test_repeated_unproductive_launches_hold_planning_for_six_hours(self) -> None:
+        repo = Path("/repo")
+        for outcome in ("invalid_plan", "no_tasks", "zero_created"):
+            with self.subTest(outcome=outcome):
+                records = planning_outcome_records(
+                    repo,
+                    [(7200.0, outcome, "10:0:0:10:0"), (60.0, outcome, "10:0:0:10:0")],
+                    now=self.now,
+                )
+                backoff = self._backoff(records, repo=repo)
+                assert backoff is not None
+                self.assertEqual(backoff.reason, "unproductive_outcomes")
+                self.assertEqual(backoff.outcome, outcome)
+                self.assertEqual(backoff.attempts, 2)
+                # Six hours measured from the last unproductive launch.
+                self.assertAlmostEqual(
+                    backoff.remaining_seconds, 21600.0 - 60.0, places=3
+                )
+
+    def test_mixed_unproductive_outcomes_accumulate_one_streak(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (7200.0, "invalid_plan", "10:0:0:10:0"),
+                (3600.0, "no_tasks", "10:0:0:10:0"),
+                (60.0, "zero_created", "10:0:0:10:0"),
+            ],
+            now=self.now,
+        )
+        backoff = self._backoff(records, repo=repo)
+        assert backoff is not None
+        self.assertEqual(backoff.attempts, 3)
+        self.assertEqual(backoff.outcome, "zero_created")
+
+    def test_the_backoff_expires_instead_of_looping(self) -> None:
+        # Past the deadline the gate must open, or the supervisor would be
+        # parked forever on stale evidence.
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (30000.0, "no_tasks", "10:0:0:10:0"),
+                (21601.0, "no_tasks", "10:0:0:10:0"),
+            ],
+            now=self.now,
+        )
+        self.assertIsNone(self._backoff(records, repo=repo))
+
+    def test_a_changed_task_source_releases_the_outcome_backoff(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [(7200.0, "no_tasks", "10:0:0:10:0"), (60.0, "no_tasks", "10:0:0:10:0")],
+            now=self.now,
+        )
+        self.assertIsNone(self._backoff(records, repo=repo, fingerprint="11:1:0:10:0"))
+
+    def test_an_unchanged_task_source_does_not_release_the_backoff(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [(7200.0, "no_tasks", "10:0:0:10:0"), (60.0, "no_tasks", "10:0:0:10:0")],
+            now=self.now,
+        )
+        self.assertIsNotNone(self._backoff(records, repo=repo))
+
+    def test_productive_planning_resets_the_streak(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (7200.0, "no_tasks", "10:0:0:10:0"),
+                (3600.0, "no_tasks", "10:0:0:10:0"),
+                (60.0, "productive", "10:0:0:10:0"),
+            ],
+            now=self.now,
+        )
+        self.assertIsNone(self._backoff(records, repo=repo))
+
+    def test_inconclusive_outcomes_neither_extend_nor_reset_the_streak(self) -> None:
+        # A limit wall or an unreadable source says nothing about whether
+        # planning can produce work, so it must not stand in for a productive
+        # launch and reopen the gate.
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (7200.0, "no_tasks", "10:0:0:10:0"),
+                (3600.0, "no_tasks", "10:0:0:10:0"),
+                (60.0, "limit_wall", "10:0:0:10:0"),
+            ],
+            now=self.now,
+        )
+        backoff = self._backoff(records, repo=repo)
+        assert backoff is not None
+        self.assertEqual(backoff.attempts, 2)
+
+    def test_four_launches_a_day_cap_holds_even_when_the_source_changed(self) -> None:
+        # The daily cap is a spend ceiling, not an evidence gate: fresh
+        # evidence must not buy a fifth launch inside the same rolling day.
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (80000.0, "productive", "1:0:0:0:0"),
+                (60000.0, "productive", "2:0:0:0:0"),
+                (40000.0, "productive", "3:0:0:0:0"),
+                (60.0, "productive", "4:0:0:0:0"),
+            ],
+            now=self.now,
+        )
+        backoff = self._backoff(records, repo=repo, fingerprint="9:9:9:9:9")
+        assert backoff is not None
+        self.assertEqual(backoff.reason, "daily_launch_cap")
+        self.assertEqual(backoff.launches_in_window, 4)
+        # Open again once the oldest counted launch ages out of the window.
+        self.assertAlmostEqual(backoff.remaining_seconds, 86400.0 - 80000.0, places=3)
+
+    def test_launches_older_than_a_day_do_not_count_against_the_cap(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (90000.0, "productive", "1:0:0:0:0"),
+                (89000.0, "productive", "2:0:0:0:0"),
+                (88000.0, "productive", "3:0:0:0:0"),
+                (60.0, "productive", "4:0:0:0:0"),
+            ],
+            now=self.now,
+        )
+        self.assertIsNone(self._backoff(records, repo=repo, fingerprint="9:9:9:9:9"))
+
+    def test_the_longer_of_the_two_gates_governs(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (80000.0, "no_tasks", "10:0:0:10:0"),
+                (70000.0, "no_tasks", "10:0:0:10:0"),
+                (60000.0, "no_tasks", "10:0:0:10:0"),
+                (60.0, "no_tasks", "10:0:0:10:0"),
+            ],
+            now=self.now,
+        )
+        backoff = self._backoff(records, repo=repo)
+        assert backoff is not None
+        # The cap expires in ~6400s; the outcome backoff in ~21540s.
+        self.assertEqual(backoff.reason, "unproductive_outcomes")
+        self.assertAlmostEqual(backoff.remaining_seconds, 21600.0 - 60.0, places=3)
+
+    def test_another_repository_history_is_ignored(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            Path("/other"),
+            [(7200.0, "no_tasks", "10:0:0:10:0"), (60.0, "no_tasks", "10:0:0:10:0")],
+            now=self.now,
+        )
+        self.assertIsNone(self._backoff(records, repo=repo))
+
+    def test_a_zero_backoff_disables_the_outcome_gate(self) -> None:
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [(7200.0, "no_tasks", "10:0:0:10:0"), (60.0, "no_tasks", "10:0:0:10:0")],
+            now=self.now,
+        )
+        self.assertIsNone(self._backoff(records, repo=repo, backoff_seconds=0.0))
+
+
+class PlanningBackoffCycleTests(unittest.TestCase):
+    def _recording_launcher(self):
+        calls: list[list[str]] = []
+
+        def launcher(command, *, cwd, log_path, on_start=None):
+            calls.append(list(command))
+            if on_start is not None:
+                on_start(4242)
+            return 0
+
+        return launcher, calls
+
+    def _idle_recorder(self, on_wait=None):
+        waits: list[float] = []
+
+        def idle_waiter(config, **kwargs):
+            waits.append(kwargs["interval"])
+            reason = "deadline"
+            if on_wait is not None:
+                reason = on_wait(kwargs["interval"]) or "deadline"
+            return IdleWaitResult(
+                cycle_id=kwargs["cycle_id"],
+                wake_reason=reason,
+                deadline=kwargs["deadline"],
+            )
+
+        return idle_waiter, waits
+
+    def test_repeated_no_task_planning_enters_a_bounded_backoff(self) -> None:
+        # Two unproductive launches are evidence; the third cycle must withhold
+        # the launch entirely and stamp the wake it actually honours.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "planning_backoff_seconds = 21600.0\n"
+                    "planning_unproductive_threshold = 2\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher, launcher_calls = self._recording_launcher()
+            idle_waiter, waits = self._idle_recorder()
+            planning_calls: list[str] = []
+
+            def planning_runner(config, **kwargs):
+                planning_calls.append(kwargs["cycle_id"])
+                return native_no_plan(config, **kwargs)
+
+            summary = run_autopilot(
+                config,
+                max_cycles=4,
+                interval=100.0,
+                launcher=launcher,
+                sleep=lambda seconds: None,
+                native_planning_runner=planning_runner,
+                idle_waiter=idle_waiter,
+            )
+
+        self.assertEqual(launcher_calls, [])
+        # Cycles one and two spend the budget; the rest do not.
+        self.assertEqual(len(planning_calls), 2)
+        first, second, third, _fourth = summary.cycles
+        self.assertEqual(first.actions.count("native_planning_outcome:no_tasks"), 1)
+        self.assertIsNone(first.planning_backoff_seconds)
+        self.assertIsNone(second.planning_backoff_seconds)
+        assert third.planning_backoff_seconds is not None
+        self.assertGreater(third.planning_backoff_seconds, 21000.0)
+        self.assertNotIn("native_planning_outcome:no_tasks", third.actions)
+        backoff_action = next(
+            action for action in third.actions if action.startswith("planning_backoff:")
+        )
+        self.assertIn("unproductive_outcomes", backoff_action)
+        self.assertIn("no_tasks", backoff_action)
+        self.assertIn("attempts=2", backoff_action)
+        # The withheld cycle still reports why it is idle.
+        self.assertIn("no_runnable_work", third.actions)
+        # Truthful wake: the idle wait budget and next_wake are the backoff,
+        # not the 100s interval.
+        self.assertEqual(waits[:2], [100.0, 100.0])
+        self.assertGreater(waits[2], 21000.0)
+        wake = datetime.datetime.fromisoformat(third.next_wake)
+        occurred = datetime.datetime.fromisoformat(third.occurred_at)
+        self.assertGreater((wake - occurred).total_seconds(), 21000.0)
+
+    def test_a_new_ready_task_wakes_the_backoff_and_launches_one_implementer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "planning_backoff_seconds = 21600.0\n"
+                    "planning_unproductive_threshold = 2\n"
+                    # The wake is driven by rewriting PLAN.md mid-run, which
+                    # leaves the worktree dirty.
+                    "require_clean_repo = false\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher, launcher_calls = self._recording_launcher()
+
+            def on_wait(interval: float) -> str:
+                if interval > 1000.0:
+                    # The task source gained runnable work while the supervisor
+                    # sat in the backoff wait.
+                    write_plan(
+                        repo,
+                        [
+                            ("TASK-00", "Next", "MISSING", "blocked scope"),
+                            ("TASK-01", "Next", "", "fresh scope"),
+                        ],
+                    )
+                    return "task_change"
+                return "deadline"
+
+            idle_waiter, waits = self._idle_recorder(on_wait=on_wait)
+
+            summary = run_autopilot(
+                config,
+                max_cycles=4,
+                interval=100.0,
+                launcher=launcher,
+                sleep=lambda seconds: None,
+                native_planning_runner=native_no_plan,
+                idle_waiter=idle_waiter,
+            )
+
+        self.assertGreater(waits[2], 21000.0)
+        fourth = summary.cycles[3]
+        self.assertEqual(fourth.status, "completed")
+        self.assertIn("launched_run_until_done", fourth.actions)
+        # At most one implementer: a single dispatch, not one per wake.
+        self.assertEqual(len(launcher_calls), 1)
+
+    def test_productive_planning_keeps_the_ordinary_cadence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-00", "Next", "MISSING", "blocked scope")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "planning_unproductive_threshold = 2\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher, _launcher_calls = self._recording_launcher()
+            idle_waiter, waits = self._idle_recorder()
+
+            def productive_planning(config, **kwargs):
+                result = native_no_plan(config, **kwargs)
+                return dataclasses.replace(
+                    result,
+                    decision=dataclasses.replace(
+                        result.decision, should_plan=True, objective="plan it"
+                    ),
+                    worker=dataclasses.replace(
+                        result.worker,
+                        status="completed",
+                        attempted=True,
+                        started=True,
+                        exit_code=0,
+                        runnable_before=0,
+                        runnable_after=3,
+                    ),
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=3,
+                interval=100.0,
+                launcher=launcher,
+                sleep=lambda seconds: None,
+                native_planning_runner=productive_planning,
+                idle_waiter=idle_waiter,
+            )
+
+        for cycle in summary.cycles:
+            self.assertIn("native_planning_outcome:productive", cycle.actions)
+            self.assertIsNone(cycle.planning_backoff_seconds)
+        self.assertEqual(waits, [100.0, 100.0])
+
+    def test_the_status_summary_names_the_outcome_and_backoff_reason(self) -> None:
+        summary = CycleSummary(
+            cycle_id="c3",
+            status="idle",
+            occurred_at="2026-07-20T12:00:00+00:00",
+            actions=(
+                "planning_backoff:unproductive_outcomes:no_tasks:"
+                "attempts=2:launches=2:21540s",
+                "no_runnable_work",
+            ),
+            next_wake="2026-07-20T18:00:00+00:00",
+        )
+        self.assertEqual(
+            summary.planning_backoff_action,
+            "planning_backoff:unproductive_outcomes:no_tasks:"
+            "attempts=2:launches=2:21540s",
+        )
+        self.assertEqual(summary.planning_outcome, "")
+        # Nothing but outcome names and counts: no prompt text, no credentials.
+        self.assertNotIn("objective", summary.planning_backoff_action)
+
+    def test_the_status_summary_reports_a_recorded_outcome(self) -> None:
+        summary = CycleSummary(
+            cycle_id="c1",
+            status="idle",
+            occurred_at="2026-07-20T12:00:00+00:00",
+            actions=("native_planning_outcome:zero_created", "no_runnable_work"),
+        )
+        self.assertEqual(summary.planning_outcome, "zero_created")
+        self.assertEqual(summary.planning_backoff_action, "")
 
 
 def configured_repo(

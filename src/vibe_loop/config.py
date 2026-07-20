@@ -226,11 +226,21 @@ AUTOPILOT_CONFIG_KEYS = (
             "require_clean_repo",
             "planning_recheck_seconds",
             "idle_poll_max_seconds",
+            "planning_backoff_seconds",
+            "planning_max_launches_per_day",
+            "planning_unproductive_threshold",
             "worktree_disposition",
         }
     )
     | AUTOPILOT_COMMAND_KEYS
 )
+# Six hours between planning attempts once planning stops producing actionable
+# work, capped at four launches a rolling day: an analysis plus authoring pass
+# costs real provider spend, and repeating it on the ordinary supervisor
+# interval burns that budget without moving the board.
+AUTOPILOT_DEFAULT_PLANNING_BACKOFF_SECONDS = 21600.0
+AUTOPILOT_DEFAULT_PLANNING_MAX_LAUNCHES_PER_DAY = 4
+AUTOPILOT_DEFAULT_PLANNING_UNPRODUCTIVE_THRESHOLD = 2
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -673,6 +683,11 @@ class AutopilotConfig:
     require_clean_repo: bool = True
     planning_recheck_seconds: float = 60.0
     idle_poll_max_seconds: float = 600.0
+    planning_backoff_seconds: float = AUTOPILOT_DEFAULT_PLANNING_BACKOFF_SECONDS
+    planning_max_launches_per_day: int = AUTOPILOT_DEFAULT_PLANNING_MAX_LAUNCHES_PER_DAY
+    planning_unproductive_threshold: int = (
+        AUTOPILOT_DEFAULT_PLANNING_UNPRODUCTIVE_THRESHOLD
+    )
     worktree_disposition: str = "report-only"
     health_command: str | None = None
     summary_command: str | None = None
@@ -700,6 +715,9 @@ class AutopilotConfig:
             "require_clean_repo": self.require_clean_repo,
             "planning_recheck_seconds": self.planning_recheck_seconds,
             "idle_poll_max_seconds": self.idle_poll_max_seconds,
+            "planning_backoff_seconds": self.planning_backoff_seconds,
+            "planning_max_launches_per_day": self.planning_max_launches_per_day,
+            "planning_unproductive_threshold": self.planning_unproductive_threshold,
             "worktree_disposition": self.worktree_disposition,
             "health_command": self.health_command,
             "summary_command": self.summary_command,
@@ -1905,6 +1923,21 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             600.0,
             "autopilot.idle_poll_max_seconds",
             minimum=5.0,
+        ),
+        planning_backoff_seconds=nonnegative_float(
+            table.get("planning_backoff_seconds"),
+            AUTOPILOT_DEFAULT_PLANNING_BACKOFF_SECONDS,
+            "autopilot.planning_backoff_seconds",
+        ),
+        planning_max_launches_per_day=nonnegative_int(
+            table.get("planning_max_launches_per_day"),
+            AUTOPILOT_DEFAULT_PLANNING_MAX_LAUNCHES_PER_DAY,
+            "autopilot.planning_max_launches_per_day",
+        ),
+        planning_unproductive_threshold=positive_int(
+            table.get("planning_unproductive_threshold"),
+            AUTOPILOT_DEFAULT_PLANNING_UNPRODUCTIVE_THRESHOLD,
+            "autopilot.planning_unproductive_threshold",
         ),
         require_clean_repo=optional_bool(
             table.get("require_clean_repo"),

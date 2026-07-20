@@ -1405,6 +1405,10 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         # explicitly: otherwise it is indistinguishable from a planning error.
         if cycle.limit_wall_action:
             lines.append(f"limit wall: {cycle.limit_wall_action}")
+        if cycle.planning_outcome:
+            lines.append(f"planning outcome: {cycle.planning_outcome}")
+        if cycle.planning_backoff_action:
+            lines.append(f"planning backoff: {cycle.planning_backoff_action}")
     if status.next_wake:
         lines.append(f"next wake: {status.next_wake}")
     return "\n".join(lines)

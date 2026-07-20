@@ -52,6 +52,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
@@ -179,6 +180,8 @@ class SupervisorStatus:
 
 NATIVE_PLANNING_LIMIT_WALL_ACTION = "native_planning_limit_wall"
 CHILD_LIMIT_WALL_ACTION = "limit_wall_pause"
+PLANNING_BACKOFF_ACTION = "planning_backoff"
+PLANNING_OUTCOME_ACTION_PREFIX = "native_planning_outcome:"
 LIMIT_WALL_ACTION_PREFIXES = (
     f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:",
     f"{CHILD_LIMIT_WALL_ACTION}:",
@@ -206,6 +209,26 @@ class CycleSummary:
         for action in self.actions:
             if action.startswith(LIMIT_WALL_ACTION_PREFIXES):
                 return action
+        return ""
+
+    @property
+    def planning_backoff_action(self) -> str:
+        """The planning spend-backoff action recorded for this cycle, if any.
+
+        Like the limit wall, a backed-off cycle keeps the plain ``idle`` status,
+        so the reason has to be named explicitly or the cycle is
+        indistinguishable from one that simply found nothing to do.
+        """
+        for action in self.actions:
+            if action.startswith(f"{PLANNING_BACKOFF_ACTION}:"):
+                return action
+        return ""
+
+    @property
+    def planning_outcome(self) -> str:
+        for action in self.actions:
+            if action.startswith(PLANNING_OUTCOME_ACTION_PREFIX):
+                return action[len(PLANNING_OUTCOME_ACTION_PREFIX) :]
         return ""
 
     def to_json(self) -> dict[str, object]:
@@ -295,6 +318,7 @@ class AutopilotCycleResult:
     child_log: Path | None = None
     next_wake: str = ""
     limit_wall_pause_seconds: float | None = None
+    planning_backoff_seconds: float | None = None
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -318,6 +342,7 @@ class AutopilotCycleResult:
             "child_log": str(self.child_log) if self.child_log is not None else "",
             "next_wake": self.next_wake,
             "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
+            "planning_backoff_seconds": self.planning_backoff_seconds,
         }
 
     def append_to(self, run_store: RunStore) -> None:
@@ -2745,6 +2770,223 @@ class NativePlanningCycleResult:
     worker: NativePlanningWorkerResult
 
 
+PLANNING_OUTCOME_PRODUCTIVE = "productive"
+PLANNING_OUTCOME_INVALID_PLAN = "invalid_plan"
+PLANNING_OUTCOME_NO_TASKS = "no_tasks"
+PLANNING_OUTCOME_ZERO_CREATED = "zero_created"
+PLANNING_OUTCOME_LIMIT_WALL = "limit_wall"
+PLANNING_OUTCOME_WORKER_ERROR = "worker_error"
+PLANNING_OUTCOME_TASK_SOURCE_ERROR = "task_source_error"
+# The three outcomes that spent provider budget and left the board no more
+# runnable than before. Everything else is either productive or inconclusive.
+PLANNING_UNPRODUCTIVE_OUTCOMES = frozenset(
+    {
+        PLANNING_OUTCOME_INVALID_PLAN,
+        PLANNING_OUTCOME_NO_TASKS,
+        PLANNING_OUTCOME_ZERO_CREATED,
+    }
+)
+
+
+def classify_planning_outcome(result: NativePlanningCycleResult) -> str:
+    """Name what one native planning launch actually achieved.
+
+    Ordered so the inconclusive outcomes win over the unproductive ones: a
+    limit wall, a crashed worker, or an unreadable task source says nothing
+    about whether planning *can* produce work, and must not be charged to the
+    unproductive streak that gates the spend backoff.
+    """
+    decision = result.decision
+    worker = result.worker
+    if decision.limit_wall or worker.status == "skipped_limit_wall":
+        return PLANNING_OUTCOME_LIMIT_WALL
+    if decision.agent_error:
+        return PLANNING_OUTCOME_INVALID_PLAN
+    if not decision.should_plan:
+        return PLANNING_OUTCOME_NO_TASKS
+    if not worker.attempted:
+        return PLANNING_OUTCOME_WORKER_ERROR
+    if worker.task_source_error or worker.runnable_after is None:
+        return PLANNING_OUTCOME_TASK_SOURCE_ERROR
+    if worker.status != "completed":
+        return PLANNING_OUTCOME_WORKER_ERROR
+    if worker.runnable_after > worker.runnable_before:
+        return PLANNING_OUTCOME_PRODUCTIVE
+    return PLANNING_OUTCOME_ZERO_CREATED
+
+
+def planning_source_fingerprint(queue: TaskQueueStatus) -> str:
+    """A compact stamp of the task-source state planning was asked to act on.
+
+    Two planning attempts that saw the same fingerprint saw the same board, so
+    repeating the second one cannot plausibly produce a different result. A
+    changed fingerprint is the "task source materially changed" signal that
+    releases the unproductive-outcome backoff.
+    """
+    return f"{queue.total}:{queue.runnable}:{queue.active}:{queue.done}:{queue.blocked}"
+
+
+PLANNING_OUTCOME_SCAN_MAX_RECORDS = 500
+PLANNING_LAUNCH_WINDOW_SECONDS = 86400.0
+
+
+@dataclasses.dataclass(frozen=True)
+class PlanningBackoff:
+    reason: str
+    outcome: str
+    attempts: int
+    launches_in_window: int
+    remaining_seconds: float
+
+    @property
+    def action(self) -> str:
+        return (
+            f"{PLANNING_BACKOFF_ACTION}:{self.reason}:{self.outcome}:"
+            f"attempts={self.attempts}:launches={self.launches_in_window}:"
+            f"{self.remaining_seconds:.0f}s"
+        )
+
+
+def _planning_outcome_records(
+    run_store: RunStore, repo: Path
+) -> list[dict[str, object]]:
+    records = [
+        record
+        for record in run_store.read_records()
+        if record.get("record_type") == AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE
+        and str(record.get("repo") or "") == str(repo)
+    ]
+    return records[-PLANNING_OUTCOME_SCAN_MAX_RECORDS:]
+
+
+def _parse_record_time(value: object) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def planning_outcome_backoff(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    fingerprint: str,
+    backoff_seconds: float,
+    max_launches_per_day: int,
+    unproductive_threshold: int,
+    now: datetime | None = None,
+) -> PlanningBackoff | None:
+    """How long to withhold native planning after unproductive launches.
+
+    Two independent gates, both read from recorded outcomes; the later deadline
+    wins:
+
+    * ``unproductive_outcomes`` - ``unproductive_threshold`` consecutive
+      invalid/no-task/zero-created launches hold planning for
+      ``backoff_seconds``. A productive launch clears the streak, and so does a
+      task source whose fingerprint moved since the last unproductive launch:
+      a changed board is new evidence, so planning gets to look again.
+    * ``daily_launch_cap`` - a hard ceiling of ``max_launches_per_day`` launches
+      in a rolling day. This is a spend ceiling, not an evidence gate, so a
+      changed fingerprint does *not* lift it; it expires only when the oldest
+      launch in the window ages out.
+
+    Pure decision function: reads recorded state, returns seconds, never sleeps.
+    Returns None when planning may run now.
+    """
+    moment = now if now is not None else datetime.now(UTC)
+    records = _planning_outcome_records(run_store, repo)
+    if not records:
+        return None
+
+    deadlines: list[tuple[float, str, str, int, int]] = []
+
+    streak: list[dict[str, object]] = []
+    for record in reversed(records):
+        outcome = str(record.get("outcome") or "")
+        if outcome == PLANNING_OUTCOME_PRODUCTIVE:
+            break
+        if outcome not in PLANNING_UNPRODUCTIVE_OUTCOMES:
+            # Inconclusive: neither evidence of futility nor of progress.
+            continue
+        streak.append(record)
+    launch_times = [
+        occurred
+        for record in records
+        if (occurred := _parse_record_time(record.get("occurred_at"))) is not None
+        and (moment - occurred).total_seconds() < PLANNING_LAUNCH_WINDOW_SECONDS
+    ]
+    launches_in_window = len(launch_times)
+
+    if streak and len(streak) >= unproductive_threshold and backoff_seconds > 0:
+        latest = streak[0]
+        if str(latest.get("fingerprint") or "") == fingerprint:
+            occurred = _parse_record_time(latest.get("occurred_at"))
+            if occurred is not None:
+                remaining = backoff_seconds - (moment - occurred).total_seconds()
+                if remaining > 0:
+                    deadlines.append(
+                        (
+                            remaining,
+                            "unproductive_outcomes",
+                            str(latest.get("outcome") or ""),
+                            len(streak),
+                            launches_in_window,
+                        )
+                    )
+
+    if max_launches_per_day > 0 and launches_in_window >= max_launches_per_day:
+        launch_times.sort()
+        oldest_counted = launch_times[-max_launches_per_day]
+        remaining = (
+            PLANNING_LAUNCH_WINDOW_SECONDS - (moment - oldest_counted).total_seconds()
+        )
+        if remaining > 0:
+            deadlines.append(
+                (
+                    remaining,
+                    "daily_launch_cap",
+                    str(records[-1].get("outcome") or ""),
+                    len(streak),
+                    launches_in_window,
+                )
+            )
+
+    if not deadlines:
+        return None
+    remaining, reason, outcome, attempts, launches = max(deadlines)
+    return PlanningBackoff(
+        reason=reason,
+        outcome=outcome,
+        attempts=attempts,
+        launches_in_window=launches,
+        remaining_seconds=remaining,
+    )
+
+
+def planning_outcome_record(
+    repo: Path,
+    *,
+    cycle_id: str,
+    outcome: str,
+    fingerprint: str,
+    runnable_before: int,
+    runnable_after: int | None,
+) -> dict[str, object]:
+    return {
+        "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+        "record_type": AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
+        "occurred_at": utc_now_iso(),
+        "repo": str(repo),
+        "cycle_id": cycle_id,
+        "outcome": outcome,
+        "fingerprint": fingerprint,
+        "runnable_before": runnable_before,
+        "runnable_after": runnable_after,
+    }
+
+
 NativePlanningRunner = Callable[..., NativePlanningCycleResult]
 
 
@@ -3154,6 +3396,7 @@ def execute_autopilot_cycle(
     child_log: Path | None = None
     cleanup_errors = 0
     planning_limit_wall_pause: float | None = None
+    planning_backoff_pause: float | None = None
 
     cleanup_candidates = tuple(
         lock for lock in status.stale_locks if lock.stale_reason == "missing_process"
@@ -3230,6 +3473,32 @@ def execute_autopilot_cycle(
         active_conflict_workers = active_conflict_worker_count(status.workers)
         planning = run_maintenance("planning")
         if planning is None:
+            fingerprint = planning_source_fingerprint(status.queue)
+            planning_backoff = planning_outcome_backoff(
+                run_store,
+                repo=config.repo,
+                fingerprint=fingerprint,
+                backoff_seconds=config.autopilot.planning_backoff_seconds,
+                max_launches_per_day=(config.autopilot.planning_max_launches_per_day),
+                unproductive_threshold=(
+                    config.autopilot.planning_unproductive_threshold
+                ),
+            )
+        else:
+            planning_backoff = None
+        if planning is None and planning_backoff is not None:
+            # Withhold the launch entirely: the analysis and authoring agents
+            # are the spend this backoff exists to bound, so an "attempt but
+            # skip" would defeat it.
+            planning_backoff_pause = planning_backoff.remaining_seconds
+            actions.append(planning_backoff.action)
+            if runnable == 0 and active_conflict_workers:
+                actions.append(f"waiting_for_active_workers:{active_conflict_workers}")
+            elif runnable == 0:
+                actions.append("no_runnable_work")
+            else:
+                actions.append(f"low_runnable_work:{runnable}/{min_ready}")
+        elif planning is None:
             native_planning = native_planning_runner(
                 config,
                 cycle_id=cycle_id,
@@ -3237,6 +3506,18 @@ def execute_autopilot_cycle(
                 min_ready=min_ready,
                 run_store=run_store,
             )
+            planning_outcome = classify_planning_outcome(native_planning)
+            run_store.append_record(
+                planning_outcome_record(
+                    config.repo,
+                    cycle_id=cycle_id,
+                    outcome=planning_outcome,
+                    fingerprint=fingerprint,
+                    runnable_before=native_planning.worker.runnable_before,
+                    runnable_after=native_planning.worker.runnable_after,
+                )
+            )
+            actions.append(f"{PLANNING_OUTCOME_ACTION_PREFIX}{planning_outcome}")
             if native_planning.decision.limit_wall:
                 planning_limit_wall_pause = (
                     native_planning.decision.limit_wall_pause_seconds
@@ -3341,6 +3622,7 @@ def execute_autopilot_cycle(
         child_log=child_log,
         next_wake=next_wake,
         limit_wall_pause_seconds=pause_seconds,
+        planning_backoff_seconds=planning_backoff_pause,
     )
 
 
@@ -4032,13 +4314,27 @@ def run_autopilot(
                 worktree_disposition_runner=worktree_disposition_runner,
                 native_planning_runner=native_planning_runner,
             )
+            idle_wait_seconds = interval
             if (
                 not bounded_last
                 and interval > 0
                 and cycle_should_recheck(result)
                 and result.limit_wall_pause_seconds is None
             ):
-                result = dataclasses.replace(result, next_wake=iso_after(interval))
+                planning_backoff_seconds = result.planning_backoff_seconds
+                # The backoff extends the idle wait budget rather than adding a
+                # blocking sleep, so the idle waiter keeps polling the task
+                # source throughout: a new ready task still wakes the next
+                # cycle early, and a stop request is still honoured per slice.
+                # It never shortens the operator's interval, only lengthens it.
+                if (
+                    planning_backoff_seconds is not None
+                    and planning_backoff_seconds > interval
+                ):
+                    idle_wait_seconds = planning_backoff_seconds
+                result = dataclasses.replace(
+                    result, next_wake=iso_after(idle_wait_seconds)
+                )
             post_cycle_planning_delay: float | None = None
             if (
                 not bounded_last
@@ -4131,11 +4427,19 @@ def run_autopilot(
 
                         wake_adapter_callback = _wake_adapter
 
+                    if idle_wait_seconds > interval:
+                        print(
+                            "[vibe-loop] autopilot planning backoff: withholding "
+                            f"planning for {idle_wait_seconds:.0f}s after "
+                            "unproductive launches; a task source change still "
+                            "wakes the next cycle early",
+                            flush=True,
+                        )
                     wait_result = idle_waiter(
                         config,
                         cycle_id=result.cycle_id,
                         deadline=result.next_wake,
-                        interval=interval,
+                        interval=idle_wait_seconds,
                         initial_poll_seconds=(
                             config.autopilot.planning_recheck_seconds
                         ),

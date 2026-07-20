@@ -544,7 +544,19 @@ and the last delay is shortened to preserve the outer interval deadline. A
 default 30-minute empty interval therefore performs five fallback listings, not
 roughly 30; each poll derives its runnable set from that single task snapshot.
 Task-source command timeouts are shortened to the remaining interval budget so
-a failing source cannot overrun the deadline. Fallback candidate filtering uses
+a failing source cannot overrun the deadline.
+
+Native planning costs provider budget on every launch, so its outcome is
+classified and repeated futility is throttled. Two consecutive `invalid_plan`,
+`no_tasks`, or `zero_created` outcomes withhold planning for
+`planning_backoff_seconds` (six hours by default), and no more than
+`planning_max_launches_per_day` launches (four by default) run in a rolling day.
+The backoff extends the idle wait rather than blocking it: a task source that
+reaches `min_ready` still wakes the next cycle early, stop requests are still
+honoured, and `next_wake` reports the deadline the supervisor actually sleeps to.
+A productive launch, or a materially changed task source, clears the outcome
+gate; only time clears the daily cap. `vibe-loop autopilot status` names the
+recorded outcome and the backoff reason. Fallback candidate filtering uses
 the cycle's active-run/conflict snapshot instead of issuing separately timed
 lock-backend queries; lock-only changes wake through the configured adapter or
 the outer deadline. Each wait appends an `autopilot_idle_wait` record with the
@@ -686,6 +698,11 @@ type = "directory"
 # min_ready = 1              # positive integer; zero is invalid
 # planning_recheck_seconds = 60.0  # initial idle fallback delay; minimum 5s
 # idle_poll_max_seconds = 600.0    # exponential idle fallback cap; minimum 5s
+# planning_backoff_seconds = 21600.0        # hold planning after repeated
+#                                           # unproductive launches; 0 disables
+# planning_max_launches_per_day = 4         # rolling-day launch ceiling; 0 disables
+# planning_unproductive_threshold = 2       # consecutive unproductive launches
+#                                           # before the backoff engages
 require_clean_repo = true   # set false to let a dirty tree run a cycle
 # Safe default: inspect and journal eligible worktrees without removing them.
 # Set to "reap" only as an explicit operator opt-in; existing safety guards remain.
