@@ -119,6 +119,44 @@ fencing token. Once signal cleanup begins, repeated supported signals must be
 coalesced until bounded child and backend cleanup completes so a second signal
 cannot interrupt fenced release.
 
+Signalling the supervisor alone is not a stop. Its `run-until-done` child, that
+child's workers, and any process those workers detached into their own group or
+session all survive the supervisor and reparent to PID 1, where they keep
+holding task locks and burning provider quota while the operator has been told
+the run stopped. `autopilot stop` must therefore drain the exact recorded
+process tree before it may report success.
+
+The drain set is derived only from records this installation wrote: the
+`autopilot_child_started` record the cycle appends before waiting on its child,
+the active-run locks whose recorded supervising process is exactly that child,
+and the `/proc` ancestry rooted at those verified processes. Command names,
+process-group sweeps, and ambient process listings are never admissible, and
+`killpg` is never used, so a peer installation's processes can never enter the
+set. Because workers are attributed to their supervising child by PID, a child
+whose birth identity no longer matches invalidates every worker beneath it: the
+drain set is then empty rather than reaching into a subtree this run may not
+own.
+
+Every candidate requires a kernel process-birth identity, an open pidfd, and a
+post-open recheck of birth, parent, group, and session. Any missing or changed
+identity blocks the stop with zero signals sent, rather than leaving a
+half-signalled tree. Signals go to exact pidfds, deepest descendants first, then
+worker roots, then the child, and only then the supervisor. The pidfds are
+retained across the whole wait, so a process that reparents mid-drain is still
+observed to exit; a PID-based recheck cannot do this. All of them plus the
+singleton lock state must settle within one bounded deadline.
+
+Timeout, signal refusal, or interruption returns `stopped=false` with the exact
+remaining role, run, task, and PID, writes no terminal record, and releases no
+task lock, so the operator can verify and retry against named processes rather
+than searching for orphans. On success, a drained worker that filed no terminal
+report is recorded as a terminated run attributed to the stop; success is never
+synthesized. Only task locks whose run and task identity still match are
+released, the authoritative task stays active, and the committed worktree is
+preserved so the slice can be picked up again. Incomplete ownership retains the
+lock and reports a blocker. Diagnostics report whether a birth identity is known,
+never its value, since it embeds the host boot identity.
+
 Detached-start readiness must be proven by a local trusted contract, not by
 lock-wire metadata. The supervisor appends its own started record only after
 installing termination handlers, and the launcher verifies that record before

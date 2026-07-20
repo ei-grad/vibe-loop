@@ -1678,12 +1678,19 @@ def collect_owned_stop_roots(
     repo: Path,
     run_id: str,
     process_exists: ProcessExists,
+    birth_identity_lookup: Callable[[int], str],
 ) -> tuple[tuple[OwnedProcessIdentity, ...], str]:
     """Verified non-supervisor roots to drain, or a fail-closed blocker.
 
     A root that is already gone contributes nothing. A root that is still live
     but whose birth identity was never recorded cannot be told apart from a
     recycled PID, so it blocks the stop instead of being signalled.
+
+    Workers are selected by their recorded supervising child PID, so they are
+    only trustworthy while that exact child process is still alive. Once the
+    child's birth identity stops matching, that PID names some other process
+    and every worker attributed to it is unverifiable, so the drain set is
+    empty rather than reaching into a subtree this run may not own.
     """
 
     child = autopilot_child_identity(run_store, repo=repo, run_id=run_id)
@@ -1693,6 +1700,8 @@ def collect_owned_stop_roots(
         return (), ""
     if not child.process_birth_id:
         return (), "autopilot_stop_identity_unverified:child_birth_id_missing"
+    if birth_identity_lookup(child.pid) != child.process_birth_id:
+        return (), ""
     roots: list[OwnedProcessIdentity] = []
     for worker in owned_worker_identities(lock_manager, child_pid=child.pid):
         if not process_exists(worker.pid):
@@ -2396,6 +2405,7 @@ def stop_verified_detached_autopilot(
             repo=config.repo,
             run_id=identity.run_id,
             process_exists=process_exists,
+            birth_identity_lookup=birth_identity_lookup,
         )
         if roots_blocker:
             return AutopilotStopResult(

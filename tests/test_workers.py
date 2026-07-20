@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -746,6 +747,73 @@ class WorkerStateTests(unittest.TestCase):
             classify_process(state, "test-host", process_exists=lambda pid: False),
             "missing",
         )
+
+    def test_recycled_worker_pid_does_not_read_as_the_recorded_worker(self) -> None:
+        state = ActiveRunState(
+            task_id="PAR-02",
+            run_id="run-1",
+            worker_pid=100,
+            worker_process_group_id=100,
+            worker_session_id=100,
+            worker_process_birth_id="boot-id:500",
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-02",
+        )
+
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: True,
+                birth_identity_lookup=lambda pid: "boot-id:500",
+            ),
+            "running",
+        )
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: True,
+                birth_identity_lookup=lambda pid: "boot-id:900",
+            ),
+            "missing",
+        )
+        # A run recorded before birth identities existed keeps the plain
+        # existence check rather than degrading to "missing".
+        legacy = dataclasses.replace(state, worker_process_birth_id="")
+        self.assertEqual(
+            classify_process(
+                legacy,
+                "test-host",
+                process_exists=lambda pid: True,
+                birth_identity_lookup=lambda pid: "boot-id:900",
+            ),
+            "running",
+        )
+
+    def test_worker_identity_round_trips_through_lock_metadata(self) -> None:
+        state = ActiveRunState.new(
+            task_id="PAR-03",
+            run_id="run-2",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-03",
+        ).with_worker_pid(
+            321,
+            process_group_id=321,
+            session_id=320,
+            process_birth_id="boot-id:777",
+        )
+
+        restored = ActiveRunState.from_lock_metadata(state.to_lock_metadata())
+
+        self.assertEqual(restored.worker_pid, 321)
+        self.assertEqual(restored.worker_process_group_id, 321)
+        self.assertEqual(restored.worker_session_id, 320)
+        self.assertEqual(restored.worker_process_birth_id, "boot-id:777")
 
     def test_worker_views_mark_missing_process_and_recorded_result_as_stale(
         self,

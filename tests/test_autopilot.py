@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime
 import json
@@ -72,6 +73,11 @@ from vibe_loop.autopilot import (
     run_worktree_disposition,
     sleep_until_stop,
     start_detached_autopilot,
+    OwnedProcessIdentity,
+    drain_owned_process_tree,
+    open_process_pidfd,
+    process_pidfd_exited,
+    send_process_pidfd_signal,
     stop_detached_autopilot,
     wait_for_processes,
     wait_for_idle_change,
@@ -101,6 +107,15 @@ from vibe_loop.runs import (
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RunResult,
     RunStore,
+    WorkerReport,
+    autopilot_child_started_record,
+)
+from vibe_loop.cli import render_autopilot_stop
+from vibe_loop.processes import (
+    ProcessNode,
+    collect_owned_descendants,
+    read_process_node,
+    read_process_table,
 )
 from vibe_loop.workers import ActiveRunState, WorkerView
 
@@ -2003,6 +2018,649 @@ class AutopilotStopTests(unittest.TestCase):
         self.assertFalse(result.stopped)
         self.assertEqual(result.blocker, "autopilot_stop_timeout")
         self.assertLessEqual(sum(sleeps), 0.51)
+
+
+DRAIN_BOOT_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+SUPERVISOR_PID = 4321
+CHILD_PID = 5000
+WORKER_PID = 6000
+REVIEWER_PID = 7000
+SENTINEL_PID = 8000
+
+
+def drain_node(
+    pid: int,
+    parent_pid: int,
+    process_group_id: int,
+    session_id: int,
+    start_time: int,
+) -> ProcessNode:
+    return ProcessNode(
+        pid=pid,
+        parent_pid=parent_pid,
+        process_group_id=process_group_id,
+        session_id=session_id,
+        process_birth_id=f"{DRAIN_BOOT_ID}:{start_time}",
+    )
+
+
+def drain_process_table() -> dict[int, ProcessNode]:
+    """supervisor -> child -> worker -> setsid reviewer, plus an unowned peer.
+
+    The reviewer leads its own group and session, so a drain that walked
+    process groups instead of exact parent links would miss it; the sentinel is
+    an equally plausible peer process that must never be touched.
+    """
+
+    nodes = [
+        drain_node(SUPERVISOR_PID, 1, SUPERVISOR_PID, SUPERVISOR_PID, 100),
+        drain_node(CHILD_PID, SUPERVISOR_PID, CHILD_PID, CHILD_PID, 101),
+        drain_node(WORKER_PID, CHILD_PID, WORKER_PID, WORKER_PID, 102),
+        drain_node(REVIEWER_PID, WORKER_PID, REVIEWER_PID, REVIEWER_PID, 103),
+        drain_node(SENTINEL_PID, 1, SENTINEL_PID, SENTINEL_PID, 104),
+    ]
+    return {node.pid: node for node in nodes}
+
+
+class AutopilotStopDrainTests(unittest.TestCase):
+    """Stop must drain the exact recorded tree before it may report success."""
+
+    def _drained_installation(
+        self,
+        repo: Path,
+        *,
+        run_id: str = "autopilot-1",
+        child_birth_id: str | None = None,
+        worker_birth_id: str | None = None,
+        record_child: bool = True,
+    ):
+        configured_repo(repo, [("TASK-01", "Planned", "", "in flight slice")])
+        config = load_config(repo)
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+        )
+        holder = manager.acquire_autopilot(
+            run_id=run_id,
+            metadata={"pid": SUPERVISOR_PID},
+        )
+        run_store = RunStore(config.state_path / "runs.jsonl")
+        run_store.append_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
+                "run_id": run_id,
+                "pid": SUPERVISOR_PID,
+                "process_group_id": SUPERVISOR_PID,
+                "session_id": SUPERVISOR_PID,
+                "process_birth_id": f"{DRAIN_BOOT_ID}:100",
+                "launch_mode": "detached_posix_session",
+                "occurred_at": "2026-07-20T00:00:00+00:00",
+            }
+        )
+        if record_child:
+            run_store.append_record(
+                autopilot_child_started_record(
+                    repo=config.repo,
+                    run_id=run_id,
+                    cycle_id=f"{run_id}-c1",
+                    pid=CHILD_PID,
+                    process_group_id=CHILD_PID,
+                    session_id=CHILD_PID,
+                    process_birth_id=(
+                        f"{DRAIN_BOOT_ID}:101"
+                        if child_birth_id is None
+                        else child_birth_id
+                    ),
+                )
+            )
+        worker_state = ActiveRunState.new(
+            task_id="TASK-01",
+            run_id="run-task-01",
+            log_path=config.state_path / "logs" / "run-task-01.log",
+            base_main="main",
+            command="codex exec",
+        )
+        worker_state = dataclasses.replace(
+            worker_state.with_worker_pid(
+                WORKER_PID,
+                process_group_id=WORKER_PID,
+                session_id=WORKER_PID,
+                process_birth_id=(
+                    f"{DRAIN_BOOT_ID}:102"
+                    if worker_birth_id is None
+                    else worker_birth_id
+                ),
+            ),
+            supervisor_pid=CHILD_PID,
+        )
+        task_lock = manager.acquire(
+            "TASK-01",
+            "run-task-01",
+            metadata=worker_state.to_lock_metadata(),
+        )
+        return config, manager, holder, run_store, task_lock
+
+    def _stop(self, config, manager, holder, **overrides):
+        """Run stop against the fixture tree, releasing the singleton on SIGTERM.
+
+        The supervisor's own SIGTERM stands in for its normal cleanup path: a
+        real supervisor releases the singleton lock as it exits.
+        """
+
+        signals: list[tuple[int, int]] = []
+        closed: list[int] = []
+        exited: set[int] = set(overrides.pop("initially_exited", ()))
+        table = overrides.pop("table", None) or drain_process_table()
+        fd_for_pid = {pid: 100 + index for index, pid in enumerate(sorted(table))}
+        pid_for_fd = {fd: pid for pid, fd in fd_for_pid.items()}
+
+        def send_signal(pidfd: int, signal_number: int) -> None:
+            signals.append((pidfd, signal_number))
+            pid = pid_for_fd[pidfd]
+            exited.add(pid)
+            if pid == SUPERVISOR_PID:
+                manager.release_autopilot(
+                    run_id=str(holder.metadata["run_id"]),
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        defaults = dict(
+            process_exists=lambda pid: pid in table,
+            process_group_lookup=lambda pid: table[pid].process_group_id,
+            session_lookup=lambda pid: table[pid].session_id,
+            birth_identity_lookup=lambda pid: table[pid].process_birth_id,
+            pidfd_open=lambda pid: fd_for_pid[pid],
+            pidfd_signal=send_signal,
+            pidfd_exited=lambda pidfd: pid_for_fd[pidfd] in exited,
+            close_fd=closed.append,
+            process_table=lambda: table,
+            process_node=lambda pid: table.get(pid),
+        )
+        defaults.update(overrides)
+        result = stop_detached_autopilot(config, **defaults)
+        return result, signals, closed, pid_for_fd
+
+    def test_drains_descendants_leaf_first_before_stopping_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            result, signals, closed, pid_for_fd = self._stop(config, manager, holder)
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        self.assertTrue(result.stopped)
+        self.assertEqual(
+            signalled_pids,
+            [REVIEWER_PID, WORKER_PID, CHILD_PID, SUPERVISOR_PID],
+        )
+        self.assertEqual({number for _fd, number in signals}, {signal.SIGTERM})
+        self.assertNotIn(SENTINEL_PID, signalled_pids)
+        self.assertEqual(
+            [identity.pid for identity in result.drained],
+            [REVIEWER_PID, WORKER_PID, CHILD_PID],
+        )
+        self.assertEqual(
+            [identity.role for identity in result.drained],
+            ["descendant", "worker", "run_until_done_child"],
+        )
+        self.assertEqual(sorted(closed), sorted(pid_for_fd)[:-1])
+        self.assertIsNone(lock_after)
+
+    def test_success_requires_every_descendant_to_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            try:
+                # The reviewer ignores SIGTERM: the drain must not advance to
+                # the supervisor, and the run must not read as stopped.
+                result, signals, _closed, pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    timeout=0.05,
+                    pidfd_exited=lambda pidfd: pidfd != 100 + 3,
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                with contextlib.suppress(Exception):
+                    manager.release_autopilot(
+                        run_id="autopilot-1",
+                        fencing_token=str(holder.metadata["fencing_token"]),
+                    )
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        self.assertFalse(result.stopped)
+        self.assertEqual(result.blocker, "autopilot_stop_drain_timeout")
+        self.assertNotIn(SUPERVISOR_PID, signalled_pids)
+        self.assertEqual(
+            [identity.pid for identity in result.remaining], [REVIEWER_PID]
+        )
+        self.assertTrue(lock_still_held)
+
+    def test_descendant_identity_change_blocks_with_zero_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            table = drain_process_table()
+            recycled = dict(table)
+            recycled[REVIEWER_PID] = drain_node(
+                REVIEWER_PID, WORKER_PID, REVIEWER_PID, REVIEWER_PID, 999
+            )
+            try:
+                result, signals, _closed, _pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    table=table,
+                    process_node=lambda pid: recycled.get(pid),
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            f"autopilot_stop_identity_unverified:descendant_identity_changed:{REVIEWER_PID}",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
+
+    def test_missing_child_birth_identity_blocks_with_zero_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory), child_birth_id="")
+            )
+            try:
+                result, signals, _closed, _pid_for_fd = self._stop(
+                    config, manager, holder
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:child_birth_id_missing",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
+
+    def test_missing_worker_birth_identity_blocks_with_zero_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory), worker_birth_id="")
+            )
+            try:
+                result, signals, _closed, _pid_for_fd = self._stop(
+                    config, manager, holder
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            "autopilot_stop_identity_unverified:worker_birth_id_missing:TASK-01",
+        )
+        self.assertEqual(signals, [])
+        self.assertTrue(lock_still_held)
+
+    def test_recycled_child_pid_never_drags_in_an_unrelated_subtree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(
+                    Path(directory), child_birth_id=f"{DRAIN_BOOT_ID}:reused"
+                )
+            )
+            result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        # The recorded child PID now belongs to a different process, so the
+        # drain set is empty and only the verified supervisor is signalled.
+        self.assertEqual(signalled_pids, [SUPERVISOR_PID])
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.drained, ())
+        self.assertIsNone(lock_after)
+
+    def test_signal_refusal_reports_exact_remaining_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+
+            def refuse(_pidfd: int, _signal_number: int) -> None:
+                raise PermissionError(1, "Operation not permitted")
+
+            try:
+                result, _signals, _closed, _pid_for_fd = self._stop(
+                    config,
+                    manager,
+                    holder,
+                    pidfd_signal=refuse,
+                )
+                lock_still_held = manager.status(AUTOPILOT_LOCK_NAME) is not None
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-1",
+                    fencing_token=str(holder.metadata["fencing_token"]),
+                )
+
+        self.assertFalse(result.stopped)
+        self.assertEqual(
+            result.blocker,
+            f"autopilot_stop_signal_failed:descendant:{REVIEWER_PID}",
+        )
+        self.assertEqual(
+            sorted(identity.pid for identity in result.remaining),
+            [CHILD_PID, WORKER_PID, REVIEWER_PID],
+        )
+        self.assertTrue(lock_still_held)
+
+    def test_reparented_descendant_still_drains_after_supervisor_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            table = drain_process_table()
+            # Between snapshot and recheck the reviewer's launcher exited, so
+            # the reviewer reparented to PID 1. The pidfd captured from the
+            # snapshot still names the same process, and the drain continues.
+            reparented = dict(table)
+            reparented.pop(WORKER_PID)
+            result, signals, _closed, pid_for_fd = self._stop(
+                config,
+                manager,
+                holder,
+                table=table,
+                process_node=lambda pid: reparented.get(pid),
+            )
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        self.assertTrue(result.stopped)
+        self.assertIn(REVIEWER_PID, signalled_pids)
+        self.assertIn(WORKER_PID, signalled_pids)
+        self.assertIsNone(lock_after)
+
+    def test_drained_worker_is_terminated_not_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
+            task_lock_after = manager.status("TASK-01")
+            records = run_store.read_records()
+            plan_text = (config.repo / "PLAN.md").read_text(encoding="utf-8")
+
+        transitions = [
+            record
+            for record in records
+            if record.get("record_type") == "run_state_transition"
+            and record.get("run_id") == "run-task-01"
+        ]
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.reconciled_task_ids, ("TASK-01",))
+        self.assertEqual(result.reconciliation_blockers, ())
+        self.assertEqual(len(transitions), 1)
+        self.assertEqual(transitions[0]["to_state"], "terminated")
+        self.assertEqual(transitions[0]["reason"], "autopilot_stop")
+        # No completion is ever synthesized for a worker killed by a stop.
+        self.assertNotIn("completed", json.dumps(transitions))
+        self.assertIsNone(task_lock_after)
+        # The authoritative task source keeps the task runnable so the slice
+        # can be picked up again rather than silently reading as finished.
+        self.assertIn("| TASK-01 | P0 | Planned |", plan_text)
+
+    def test_existing_worker_report_is_never_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            run_store.append_record(
+                WorkerReport(
+                    run_id="run-task-01",
+                    task_id="TASK-01",
+                    status="completed",
+                    message="worker finished before stop",
+                ).to_record()
+            )
+            result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
+            records = run_store.read_records()
+
+        transitions = [
+            record
+            for record in records
+            if record.get("record_type") == "run_state_transition"
+        ]
+        self.assertTrue(result.stopped)
+        self.assertEqual(transitions, [])
+        self.assertEqual(result.reconciled_task_ids, ())
+
+    def test_stop_result_json_is_redacted_and_serializable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory))
+            )
+            result, _signals, _closed, _pid_for_fd = self._stop(config, manager, holder)
+            payload = json.dumps(result.to_json())
+            rendered = render_autopilot_stop(result)
+
+        self.assertNotIn(DRAIN_BOOT_ID, payload)
+        self.assertNotIn(DRAIN_BOOT_ID, rendered)
+        self.assertTrue(
+            all(
+                entry["process_birth_id_known"]
+                for entry in json.loads(payload)["drained"]
+            )
+        )
+        self.assertEqual(json.loads(payload)["reconciled_task_ids"], ["TASK-01"])
+        self.assertIn(f"worker:{WORKER_PID}/TASK-01", rendered)
+        self.assertIn("terminated runs released: TASK-01", rendered)
+
+    @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
+    def test_cycle_records_child_identity_before_the_launcher_returns(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "fresh scope")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            recorded_during_launch: list[dict] = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                if on_start is not None:
+                    # This test's own PID stands in for the child, so the
+                    # identity read is against a process that really exists.
+                    on_start(os.getpid())
+                recorded_during_launch.extend(
+                    record
+                    for record in run_store.read_records()
+                    if record.get("record_type") == "autopilot_child_started"
+                )
+                return 0
+
+            run_autopilot(
+                config,
+                max_cycles=1,
+                interval=0.0,
+                launcher=launcher,
+                sleep=lambda seconds: None,
+                native_planning_runner=native_no_plan,
+            )
+
+        self.assertEqual(len(recorded_during_launch), 1)
+        record = recorded_during_launch[0]
+        expected = read_process_node(os.getpid())
+        self.assertEqual(record["pid"], os.getpid())
+        self.assertEqual(record["process_group_id"], expected.process_group_id)
+        self.assertEqual(record["session_id"], expected.session_id)
+        self.assertEqual(record["process_birth_id"], expected.process_birth_id)
+        self.assertTrue(record["run_id"])
+        self.assertEqual(record["repo"], str(config.repo))
+
+    def test_no_recorded_child_stops_supervisor_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(Path(directory), record_child=False)
+            )
+            result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+
+        self.assertTrue(result.stopped)
+        self.assertEqual([pid_for_fd[pidfd] for pidfd, _n in signals], [SUPERVISOR_PID])
+        self.assertEqual(result.drained, ())
+        self.assertIsNone(lock_after)
+
+
+FIXTURE_TREE_SCRIPT = """
+import subprocess
+import sys
+import time
+
+depth = int(sys.argv[1])
+if depth > 0:
+    options = {}
+    if depth == 1:
+        # The deepest level detaches into its own session and process group,
+        # the way a reviewer subagent launched with setsid does.
+        options["start_new_session"] = True
+    subprocess.Popen([sys.executable, __file__, str(depth - 1)], **options)
+time.sleep(600)
+"""
+
+
+@unittest.skipUnless(sys.platform == "linux", "owned process drain requires Linux")
+class OwnedProcessTreeIntegrationTests(unittest.TestCase):
+    """Drains a real process tree this test itself created and owns.
+
+    Every PID here comes from this test's own ``Popen`` calls or from walking
+    the subtree beneath them. No PID discovered by any other means is inspected
+    or signalled, and cleanup re-verifies birth identity before killing so a
+    recycled PID can never be hit.
+    """
+
+    def _spawn(self, script: Path, depth: int) -> subprocess.Popen:
+        return subprocess.Popen(
+            [sys.executable, str(script), str(depth)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _await_subtree(self, root_pid: int, expected: int) -> list[ProcessNode]:
+        root = read_process_node(root_pid)
+        self.assertIsNotNone(root, "fixture root process did not start")
+        deadline = time.monotonic() + 30.0
+        while True:
+            found = collect_owned_descendants(
+                read_process_table(), {root_pid: root.process_birth_id}
+            )
+            if len(found) >= expected:
+                return found
+            if time.monotonic() >= deadline:
+                self.fail(f"fixture tree never reached {expected} processes")
+            time.sleep(0.05)
+
+    def _kill_owned(self, nodes: list[ProcessNode]) -> None:
+        for node in nodes:
+            current = read_process_node(node.pid)
+            if current is None or current.process_birth_id != node.process_birth_id:
+                continue
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(node.pid, signal.SIGKILL)
+
+    def test_drains_only_the_recorded_tree_and_spares_an_owned_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "fixture_tree.py"
+            script.write_text(FIXTURE_TREE_SCRIPT, encoding="utf-8")
+            tree_nodes: list[ProcessNode] = []
+            sentinel_node = None
+            root_process = None
+            sentinel_process = None
+            try:
+                root_process = self._spawn(script, 3)
+                sentinel_process = self._spawn(script, 0)
+                root_pid = root_process.pid
+                sentinel_pid = sentinel_process.pid
+                tree_nodes = self._await_subtree(root_pid, 4)
+                sentinel_node = read_process_node(sentinel_pid)
+                self.assertIsNotNone(sentinel_node)
+                self.assertNotIn(sentinel_pid, {node.pid for node in tree_nodes})
+                # The deepest fixture process really did leave the root's
+                # session, so a session- or group-wide kill would be needed to
+                # reach it without exact parent-link ancestry.
+                self.assertNotEqual(tree_nodes[0].session_id, tree_nodes[-1].session_id)
+
+                root = read_process_node(root_pid)
+                drain = drain_owned_process_tree(
+                    [
+                        OwnedProcessIdentity(
+                            role="run_until_done_child",
+                            pid=root_pid,
+                            process_group_id=root.process_group_id,
+                            session_id=root.session_id,
+                            process_birth_id=root.process_birth_id,
+                        )
+                    ],
+                    pidfd_open=open_process_pidfd,
+                    pidfd_signal=send_process_pidfd_signal,
+                    pidfd_exited=process_pidfd_exited,
+                    close_fd=os.close,
+                    sleep=time.sleep,
+                    monotonic=time.monotonic,
+                    deadline=time.monotonic() + 30.0,
+                    process_table=read_process_table,
+                    process_node=read_process_node,
+                )
+
+                self.assertEqual(drain.blocker, "")
+                self.assertTrue(drain.complete)
+                self.assertEqual(
+                    {identity.pid for identity in drain.drained},
+                    {node.pid for node in tree_nodes},
+                )
+                # The root is this test's own child, so it stays a zombie in
+                # /proc until reaped here; the deeper levels were reparented to
+                # init, which reaps them.
+                self.assertEqual(root_process.wait(timeout=30), -signal.SIGTERM)
+                for node in tree_nodes:
+                    if node.pid == root_pid:
+                        continue
+                    current = read_process_node(node.pid)
+                    self.assertTrue(
+                        current is None
+                        or current.process_birth_id != node.process_birth_id,
+                        f"fixture process {node.pid} survived the drain",
+                    )
+                surviving = read_process_node(sentinel_pid)
+                self.assertIsNotNone(surviving, "owned peer must survive the drain")
+                self.assertEqual(
+                    surviving.process_birth_id, sentinel_node.process_birth_id
+                )
+                self.assertIsNone(sentinel_process.poll())
+            finally:
+                self._kill_owned(tree_nodes)
+                if sentinel_node is not None:
+                    self._kill_owned([sentinel_node])
+                for process in (root_process, sentinel_process):
+                    if process is not None:
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            process.wait(timeout=10)
 
 
 class LimitWallPauseTests(unittest.TestCase):
