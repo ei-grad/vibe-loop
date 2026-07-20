@@ -37,6 +37,7 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     SettledOutcomeNotPersisted,
+    TaskLock,
 )
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
@@ -4854,6 +4855,38 @@ class ParkedWriteBackend:
         return self.inner.path_for(task_id)
 
 
+class ObservedWriteBackend:
+    """Lock backend that records when a caller reaches the backend write.
+
+    The settling manager writes through this, so the test can tell "settlement
+    is blocked before its write" from "settlement is merely slow": both look
+    alike from the outside, and only the first is what the boundary promises.
+    """
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.update_entered = threading.Event()
+
+    def acquire(self, task_id, run_id, metadata=None):
+        return self.inner.acquire(task_id, run_id, metadata=metadata)
+
+    def update(self, task_lock, metadata):
+        self.update_entered.set()
+        return self.inner.update(task_lock, metadata)
+
+    def release(self, task_lock) -> None:
+        self.inner.release(task_lock)
+
+    def status(self, task_id):
+        return self.inner.status(task_id)
+
+    def list_locks(self):
+        return self.inner.list_locks()
+
+    def path_for(self, task_id):
+        return self.inner.path_for(task_id)
+
+
 class ForeignHeartbeatLockManager(LockManager):
     """Settles while a heartbeat from another process is parked mid-update.
 
@@ -4866,15 +4899,28 @@ class ForeignHeartbeatLockManager(LockManager):
     """
 
     WAIT_SECONDS = 10.0
-    # Bounded release for the correct ordering, where settlement is blocked
-    # behind the parked writer and would otherwise never reach its own write.
-    UNBLOCK_SECONDS = 0.75
+    # How long settlement is watched for while the writer is parked. The
+    # observation that matters - settlement never reached its backend write -
+    # is true for any duration once the boundary holds, so this only has to be
+    # long enough that an unserialized settlement, which is one status read away
+    # from its write, is certain to be caught.
+    OBSERVE_SECONDS = 2.0
 
-    def __init__(self, *args, writer_backend: ParkedWriteBackend, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        *args,
+        writer_backend: ParkedWriteBackend,
+        observed_backend: ObservedWriteBackend,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, backend=observed_backend, **kwargs)
         self.writer_backend = writer_backend
+        self.observed_backend = observed_backend
         self.writer_metadata: dict[str, object] | None = None
         self.writer_error: BaseException | None = None
+        self.settlement_error: BaseException | None = None
+        self.settlement_lock: TaskLock | None = None
+        self.settled_while_writer_parked = False
         self.injected = False
 
     def _run_writer(self, task_lock) -> None:
@@ -4906,20 +4952,37 @@ class ForeignHeartbeatLockManager(LockManager):
         unsettled["outcome"] = "unknown"
         unsettled["classification"] = "unknown"
         self.backend.update(stored, unsettled)
-        thread = threading.Thread(target=self._run_writer, args=(task_lock,))
-        thread.start()
-        self.writer_backend.at_write.wait(timeout=self.WAIT_SECONDS)
-        unblock = threading.Timer(
-            self.UNBLOCK_SECONDS,
-            self.writer_backend.proceed.set,
-        )
-        unblock.start()
+        self.observed_backend.update_entered.clear()
+        writer = threading.Thread(target=self._run_writer, args=(task_lock,))
+        writer.start()
+        if not self.writer_backend.at_write.wait(timeout=self.WAIT_SECONDS):
+            raise AssertionError("the foreign writer never reached its backend write")
+        settling = threading.Thread(target=self._settle, args=(task_lock, metadata))
+        settling.start()
         try:
-            return super().update(task_lock, metadata)
+            # Settlement must not reach its own backend write while the writer
+            # holds the boundary: a merge it performed now would land on a row
+            # the parked write is about to overwrite. Elapsed time proves
+            # nothing by itself, so the write entry is what is observed.
+            self.settled_while_writer_parked = (
+                self.observed_backend.update_entered.wait(
+                    timeout=self.OBSERVE_SECONDS,
+                )
+            )
         finally:
-            unblock.cancel()
             self.writer_backend.proceed.set()
-            thread.join(timeout=self.WAIT_SECONDS)
+            writer.join(timeout=self.WAIT_SECONDS)
+            settling.join(timeout=self.WAIT_SECONDS)
+        if self.settlement_error is not None:
+            raise self.settlement_error
+        assert self.settlement_lock is not None
+        return self.settlement_lock
+
+    def _settle(self, task_lock, metadata) -> None:
+        try:
+            self.settlement_lock = super().update(task_lock, metadata)
+        except BaseException as exc:  # surfaced by the test, never swallowed
+            self.settlement_error = exc
 
 
 class StubTaskSource:
@@ -5566,8 +5629,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             manager = ForeignHeartbeatLockManager(
                 runner.config.state_path / "locks",
-                backend=command_backend,
                 writer_backend=writer_backend,
+                observed_backend=ObservedWriteBackend(command_backend),
             )
             runner._lock_manager = manager
 
@@ -5575,6 +5638,9 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             self.assertTrue(manager.injected)
             self.assertIsNone(manager.writer_error)
+            # Settlement was blocked before its backend write for as long as the
+            # writer held the boundary, so the two writes cannot interleave.
+            self.assertFalse(manager.settled_while_writer_parked)
             # The foreign heartbeat did store its stale pair - it was parked
             # holding it, so nothing could rewrite it - which is why ordering,
             # not row precedence, has to be what keeps the run settled.
