@@ -33,6 +33,7 @@ LOCK_ACQUIRED_RECORD_TYPE = "lock_acquired"
 LOCK_RELEASED_RECORD_TYPE = "lock_released"
 LOCK_EXPIRED_RECORD_TYPE = "lock_expired"
 RUN_STARTED_RECORD_TYPE = "run_started"
+WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
@@ -76,6 +77,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         LOCK_RELEASED_RECORD_TYPE,
         LOCK_EXPIRED_RECORD_TYPE,
         RUN_STARTED_RECORD_TYPE,
+        WORKER_PROCESS_STARTED_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
         WORKSPACE_CLAIM_RECORD_TYPE,
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
@@ -425,6 +427,35 @@ class RunLifecycleEvent:
             run_id=run_id,
             task_id=task_id,
             payload=event_payload,
+        )
+
+    @classmethod
+    def worker_process_started(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        worker_pid: int,
+        supervisor_pid: int,
+        process_group_id: int | None,
+        session_id: int | None,
+        process_birth_id: str,
+        host: str,
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=WORKER_PROCESS_STARTED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "worker_pid": worker_pid,
+                "supervisor_pid": supervisor_pid,
+                "worker_process_group_id": process_group_id,
+                "worker_session_id": session_id,
+                "worker_process_birth_id": process_birth_id,
+                "pid_source": "popen",
+                "pid_scope": "configured_command_process",
+                "host": host,
+            },
         )
 
     @classmethod
@@ -1000,6 +1031,8 @@ def record_status(record: dict[str, Any]) -> str:
     if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
         return string_value(record.get("to_state"))
     if record_type == RUN_STARTED_RECORD_TYPE:
+        return "started"
+    if record_type == WORKER_PROCESS_STARTED_RECORD_TYPE:
         return "started"
     if record_type == AGENT_CONTEXT_OBSERVED_RECORD_TYPE:
         return string_value(record.get("status")) or "observed"

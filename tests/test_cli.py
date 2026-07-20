@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import hashlib
 import os
@@ -33,8 +34,11 @@ from vibe_loop.locks import (
     LockManager,
     build_lock_manager,
 )
+from vibe_loop.processes import read_process_node
 from vibe_loop.runs import (
+    AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    WORKER_PROCESS_STARTED_RECORD_TYPE,
     RunStore,
     utc_now_iso,
 )
@@ -8274,6 +8278,200 @@ class AutopilotCliTests(unittest.TestCase):
                 for launched_pid, launched_group in launched:
                     stop_test_process_group(launched_pid, launched_group)
 
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_command_backend_stop_drains_recorded_live_worker_tree(self) -> None:
+        """Configured-command identity survives a quarantining lock projection."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / "agent.py").write_text(
+                "import json\n"
+                "import os\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "Path('agent-process.json').write_text(\n"
+                "    json.dumps({'pid': os.getpid(), 'parent_pid': os.getppid()}),\n"
+                "    encoding='utf-8',\n"
+                ")\n"
+                "while True:\n"
+                "    time.sleep(1)\n",
+                encoding="utf-8",
+            )
+            agent_command = f"{shell_command(sys.executable, 'agent.py')} & wait"
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent]\ncommand = "
+                + json.dumps(agent_command)
+                + "\n"
+                + command_lock_toml(command),
+                encoding="utf-8",
+            )
+            (repo / ".gitignore").write_text(
+                "agent-process.json\nlock_adapter.py\nlock_state.json\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "agent.py", ".vibe-loop.toml", ".gitignore"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "configure process fixture"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            sentinel = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(600)"],
+                start_new_session=True,
+            )
+            cleanup_groups: list[tuple[int, int]] = [
+                (sentinel.pid, sentinel.pid),
+            ]
+
+            def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-m", "vibe_loop", "autopilot", *args],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            start = run_cli("start", "--repo", str(repo), "--interval", "30", "--json")
+            self.assertEqual(start.returncode, 0, start.stderr)
+            launch = json.loads(start.stdout)
+            supervisor_pid = launch["pid"]
+            cleanup_groups.append((supervisor_pid, launch["process_group_id"]))
+            status_payload: dict[str, object] | None = None
+            agent_payload: dict[str, int] | None = None
+            child_pid: int | None = None
+            worker_pid: int | None = None
+            last_status_payload: dict[str, object] = {}
+
+            try:
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    status = run_cli("status", "--repo", str(repo), "--json")
+                    if status.returncode == 0:
+                        candidate = json.loads(status.stdout)
+                        last_status_payload = candidate
+                        workers = candidate.get("workers") or []
+                        agent_path = repo / "agent-process.json"
+                        if workers and agent_path.is_file():
+                            worker = workers[0]
+                            if worker.get("worker_process_birth_id_known") is True:
+                                status_payload = candidate
+                                agent_payload = json.loads(
+                                    agent_path.read_text(encoding="utf-8")
+                                )
+                                worker_pid = int(worker["worker_pid"])
+                                records = RunStore(
+                                    repo / ".vibe-loop" / "runs.jsonl"
+                                ).read_records()
+                                children = [
+                                    record
+                                    for record in records
+                                    if record.get("record_type")
+                                    == AUTOPILOT_CHILD_STARTED_RECORD_TYPE
+                                    and record.get("run_id") == launch["run_id"]
+                                ]
+                                if children:
+                                    child_pid = int(children[-1]["pid"])
+                                    break
+                    time.sleep(0.05)
+
+                self.assertIsNotNone(
+                    status_payload,
+                    json.dumps(last_status_payload, sort_keys=True),
+                )
+                self.assertIsNotNone(agent_payload)
+                self.assertIsNotNone(child_pid)
+                self.assertIsNotNone(worker_pid)
+                assert status_payload is not None
+                assert agent_payload is not None
+                assert child_pid is not None
+                assert worker_pid is not None
+                cleanup_groups.extend(
+                    [(child_pid, child_pid), (worker_pid, worker_pid)]
+                )
+                worker = status_payload["workers"][0]
+                agent_pid = int(agent_payload["pid"])
+                cleanup_groups.append((agent_pid, worker_pid))
+
+                self.assertEqual(agent_payload["parent_pid"], worker_pid)
+                self.assertEqual(worker["worker_process_group_id"], worker_pid)
+                self.assertEqual(worker["worker_session_id"], worker_pid)
+                self.assertEqual(worker["pid_source"], "popen")
+                self.assertNotIn("worker_process_birth_id", worker)
+                self.assertEqual(
+                    read_process_node(child_pid).parent_pid,
+                    supervisor_pid,
+                )
+                self.assertEqual(
+                    read_process_node(worker_pid).parent_pid,
+                    child_pid,
+                )
+                self.assertEqual(
+                    read_process_node(agent_pid).parent_pid,
+                    worker_pid,
+                )
+                worker_records = [
+                    record
+                    for record in RunStore(
+                        repo / ".vibe-loop" / "runs.jsonl"
+                    ).read_records()
+                    if record.get("record_type") == WORKER_PROCESS_STARTED_RECORD_TYPE
+                    and record.get("worker_pid") == worker_pid
+                ]
+                self.assertEqual(len(worker_records), 1)
+                self.assertEqual(
+                    worker_records[0]["worker_process_birth_id"],
+                    read_process_node(worker_pid).process_birth_id,
+                )
+                self.assertNotEqual(
+                    read_process_node(sentinel.pid).process_birth_id,
+                    read_process_node(worker_pid).process_birth_id,
+                )
+
+                stop = run_cli("stop", "--repo", str(repo), "--json")
+                self.assertEqual(
+                    stop.returncode,
+                    0,
+                    f"stderr={stop.stderr}\nstdout={stop.stdout}",
+                )
+                stop_payload = json.loads(stop.stdout)
+                self.assertTrue(stop_payload["stopped"], stop_payload["blocker"])
+                drained = {entry["pid"]: entry for entry in stop_payload["drained"]}
+                self.assertTrue({agent_pid, worker_pid, child_pid}.issubset(drained))
+                self.assertTrue(
+                    all(entry["process_birth_id_known"] for entry in drained.values())
+                )
+                self.assertNotIn(sentinel.pid, drained)
+                os.kill(sentinel.pid, 0)
+                self.assertNotIn("TASK-01", command_lock_state(state_path))
+
+                process_deadline = time.monotonic() + 5
+                while time.monotonic() < process_deadline:
+                    if all(
+                        read_process_node(pid) is None
+                        for pid in (agent_pid, worker_pid, child_pid, supervisor_pid)
+                    ):
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(
+                    all(
+                        read_process_node(pid) is None
+                        for pid in (agent_pid, worker_pid, child_pid, supervisor_pid)
+                    )
+                )
+            finally:
+                for launched_pid, process_group_id in reversed(cleanup_groups):
+                    with contextlib.suppress(AssertionError):
+                        stop_test_process_group(launched_pid, process_group_id)
+
     def test_command_backend_fenced_recovery_rejects_wrong_run_and_token(self) -> None:
         """Stale recovery on a command backend is fenced by run ID and token."""
 
@@ -9137,6 +9335,16 @@ KNOWN_FIELDS = {
     "record_type",
     "resource",
     "path",
+    "worker_pid",
+    "supervisor_pid",
+    "pid_source",
+    "pid_scope",
+    "resources",
+    "paths",
+    "conflict_domains_known",
+    "restart_count",
+    "max_restarts",
+    "workspace",
 }
 
 state_path = Path(__ADAPTER_STATE__)

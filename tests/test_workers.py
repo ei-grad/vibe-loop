@@ -45,6 +45,7 @@ from vibe_loop.workers import (
     load_active_run_states,
     parse_git_worktree_list,
     parse_worktree_disposition_decisions,
+    restore_projected_worker_process_identity,
 )
 
 
@@ -838,6 +839,88 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(restored.worker_process_group_id, 321)
         self.assertEqual(restored.worker_session_id, 320)
         self.assertEqual(restored.worker_process_birth_id, "boot-id:777")
+
+    def test_worker_view_restores_identity_quarantined_from_command_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            projected = ActiveRunState.new(
+                task_id="PAR-03",
+                run_id="run-2",
+                log_path=Path("run.log"),
+                base_main="abc123",
+                command="agent PAR-03",
+            ).with_worker_pid(321)
+            manager.acquire(
+                "PAR-03",
+                "run-2",
+                metadata=projected.to_lock_metadata(),
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.worker_process_started(
+                    run_id="run-2",
+                    task_id="PAR-03",
+                    worker_pid=321,
+                    supervisor_pid=projected.supervisor_pid or 1,
+                    process_group_id=321,
+                    session_id=320,
+                    process_birth_id="boot-id:777",
+                    host=projected.host,
+                )
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host=projected.host,
+                process_exists=lambda pid: True,
+            )
+
+        restored = views[0].active
+        self.assertEqual(restored.worker_process_group_id, 321)
+        self.assertEqual(restored.worker_session_id, 320)
+        self.assertEqual(restored.worker_process_birth_id, "boot-id:777")
+        self.assertTrue(views[0].to_json()["worker_process_birth_id_known"])
+
+    def test_worker_identity_record_requires_exact_projected_owner(self) -> None:
+        active = dataclasses.replace(
+            ActiveRunState.new(
+                task_id="PAR-03",
+                run_id="run-2",
+                log_path=Path("run.log"),
+                base_main="abc123",
+                command="agent PAR-03",
+            ).with_worker_pid(321),
+            supervisor_pid=100,
+            host="test-host",
+        )
+        mismatched = RunLifecycleEvent.worker_process_started(
+            run_id="run-2",
+            task_id="PAR-03",
+            worker_pid=321,
+            supervisor_pid=999,
+            process_group_id=321,
+            session_id=321,
+            process_birth_id="boot-id:777",
+            host="test-host",
+        ).to_record()
+
+        cases = {
+            "missing_host": dataclasses.replace(active, host=""),
+            "missing_supervisor": dataclasses.replace(active, supervisor_pid=None),
+            "mismatched_host": dataclasses.replace(active, host="other-host"),
+            "mismatched_supervisor": active,
+        }
+        for name, projected in cases.items():
+            with self.subTest(name=name):
+                restored = restore_projected_worker_process_identity(
+                    projected,
+                    [mismatched],
+                )
+
+                self.assertEqual(restored, projected)
+                self.assertEqual(restored.worker_process_birth_id, "")
 
     def test_worker_views_mark_missing_process_and_recorded_result_as_stale(
         self,

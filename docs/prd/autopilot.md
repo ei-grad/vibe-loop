@@ -128,10 +128,15 @@ process tree before it may report success.
 
 The drain set is derived only from records this installation wrote: the
 `autopilot_child_started` record the cycle appends before waiting on its child,
-the active-run locks in this repository's own lock root, and the `/proc`
-ancestry rooted at those verified processes. Command names, process-group
-sweeps, and ambient process listings are never admissible, and `killpg` is never
-used, so a peer installation's processes can never enter the set.
+the `worker_process_started` record appended immediately after `Popen`, the
+active-run locks in this repository's own lock root, and the `/proc` ancestry
+rooted at those verified processes. A command backend may quarantine worker
+group, session, and birth fields from the lock status projection. The local
+record may restore only omitted fields after the task, run, PID, host, and
+supervisor all match; projected conflicts are never overwritten. Command names,
+process-group sweeps, and ambient process listings are never admissible, and
+`killpg` is never used, so a peer installation's processes can never enter the
+set.
 
 A worker is an independently verifiable root, never one inferred from a live
 child. A worker reparents to PID 1 precisely because its launching child died,
@@ -188,8 +193,8 @@ or any reconciliation failure retains the affected lock, returns
 
 Diagnostics report whether a birth identity is known, never its value, since it
 embeds the host boot identity. This applies to worker and status output as well
-as to stop results; the raw value lives only in lock metadata, where identity
-verification needs it.
+as to stop results; the raw value lives only in local identity records and lock
+metadata retained by backends, where identity verification needs it.
 
 Detached-start readiness must be proven by a local trusted contract, not by
 lock-wire metadata. The supervisor appends its own started record only after

@@ -32,6 +32,7 @@ from vibe_loop.config import (
     shell_quote,
 )
 from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.processes import read_process_node
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
@@ -2493,6 +2494,73 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(len(started_pids), 1)
         self.assertGreater(started_pids[0], 0)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "detached process groups are POSIX-only"
+    )
+    def test_streaming_command_reaps_group_when_start_recording_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "hang.py"
+            child_path = Path(directory) / "child.pid"
+            child_ready_path = Path(directory) / "child.ready"
+            child_code = (
+                "import signal\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"Path({str(child_ready_path)!r}).write_text("
+                "'ready', encoding='utf-8')\n"
+                "time.sleep(30)\n"
+            )
+            script.write_text(
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                f"child_code = {child_code!r}\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code])\n"
+                f"Path({str(child_path)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            started_pids: list[int] = []
+
+            def fail_to_record(worker_pid: int) -> None:
+                started_pids.append(worker_pid)
+                deadline = time.monotonic() + 2.0
+                while not child_ready_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(child_path.is_file())
+                self.assertTrue(child_ready_path.is_file())
+                raise OSError("worker identity record store unavailable")
+
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    with self.assertRaisesRegex(OSError, "record store unavailable"):
+                        run_streaming_command(
+                            f"{sys.executable} hang.py",
+                            Path(directory),
+                            log,
+                            on_start=fail_to_record,
+                        )
+                child_pid = int(child_path.read_text(encoding="utf-8"))
+                process_pids = (*started_pids, child_pid)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if all(read_process_node(pid) is None for pid in process_pids):
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(
+                    all(read_process_node(pid) is None for pid in process_pids),
+                    process_pids,
+                )
+            finally:
+                if started_pids:
+                    try:
+                        os.killpg(started_pids[0], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"

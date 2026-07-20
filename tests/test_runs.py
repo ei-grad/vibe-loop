@@ -30,6 +30,7 @@ from vibe_loop.runs import (
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     WORKER_REPORT_SCHEMA_VERSION,
+    WORKER_PROCESS_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
@@ -324,6 +325,29 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(
             payload["trailer_context"]["plan_item_candidates"], ["TASK-01"]
         )
+
+    def test_worker_process_started_event_persists_exact_observed_identity(
+        self,
+    ) -> None:
+        event = RunLifecycleEvent.worker_process_started(
+            run_id="run-1",
+            task_id="TASK-01",
+            worker_pid=123,
+            supervisor_pid=100,
+            process_group_id=123,
+            session_id=123,
+            process_birth_id="boot-id:500",
+            host="test-host",
+        ).to_record()
+
+        self.assertEqual(event["record_type"], WORKER_PROCESS_STARTED_RECORD_TYPE)
+        self.assertEqual(event["worker_pid"], 123)
+        self.assertEqual(event["supervisor_pid"], 100)
+        self.assertEqual(event["worker_process_group_id"], 123)
+        self.assertEqual(event["worker_session_id"], 123)
+        self.assertEqual(event["worker_process_birth_id"], "boot-id:500")
+        self.assertEqual(event["pid_source"], "popen")
+        self.assertIn(WORKER_PROCESS_STARTED_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
     def test_lifecycle_event_rejects_unknown_type(self) -> None:
         with self.assertRaises(ValueError):
