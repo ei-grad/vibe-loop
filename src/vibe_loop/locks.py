@@ -708,6 +708,8 @@ class LockManager:
         path: Path,
         kind: str,
         timeout_seconds: float | None = None,
+        settled_outcome: str = "",
+        settled_classification: str = "",
     ) -> bool:
         deadline = command_deadline(timeout_seconds)
         lock_task_id = MAIN_INTEGRATION_LOCK_NAME if kind == "integration" else task_id
@@ -719,15 +721,59 @@ class LockManager:
         current_path = path_from_metadata(metadata, self.backend.path_for(lock_task_id))
         if current_path != path or string_value(metadata.get("run_id")) != run_id:
             raise LockBackendError("lock metadata changed since collection")
+        current_lock = TaskLock(
+            task_id=lock_task_id,
+            path=current_path,
+            metadata=metadata,
+        )
+        if settled_outcome in TERMINAL_LOCK_OUTCOMES:
+            current_lock = self._republish_settled_outcome(
+                current_lock,
+                settled_outcome,
+                settled_classification,
+            )
         self.release_with_timeout(
-            TaskLock(
-                task_id=lock_task_id,
-                path=current_path,
-                metadata=metadata,
-            ),
+            current_lock,
             timeout_seconds=remaining_command_timeout(deadline),
         )
         return True
+
+    def _republish_settled_outcome(
+        self,
+        current_lock: TaskLock,
+        outcome: str,
+        classification: str,
+    ) -> TaskLock:
+        """Write a run's durable terminal outcome onto its retained lock row.
+
+        A run whose settlement update failed keeps its lock, and the row still
+        says ``unknown`` while the local RunResult is terminal. Stale recovery
+        would otherwise release that row and let a provenance-mirroring backend
+        finalize the run from it, contradicting the durable result. Recovery is
+        therefore the same gate settlement is: republish first, and if that
+        write fails, refuse the release so the lock stays recoverable.
+        """
+
+        if string_value(current_lock.metadata.get("outcome")) == outcome:
+            return current_lock
+        republished = dict(current_lock.metadata)
+        republished["outcome"] = outcome
+        if classification:
+            republished["classification"] = classification
+        try:
+            return self.update(current_lock, republished)
+        except (
+            LockBusy,
+            LockBackendError,
+            LockOwnerMismatch,
+            LockFencingMismatch,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise LockBackendError(
+                f"could not republish settled outcome {outcome} on the lock for "
+                f"{current_lock.task_id}: {exc}; lock left held for recovery"
+            ) from exc
 
 
 class DirectoryLockBackend:

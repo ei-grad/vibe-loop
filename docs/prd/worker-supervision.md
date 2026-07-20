@@ -97,6 +97,13 @@ Four ordering rules keep the two stores in agreement:
   run classified `unknown` re-enters recovery, so a `timed_out` or
   `limit_wall` run is terminal as itself and stays `unknown` externally.
 
+The gate would be worthless if stale recovery could undo it. A lock retained by
+a failed settlement still stores `unknown` while the run's `run_result` is
+terminal, so `vibe-loop workers clean --force` republishes that durable outcome
+onto the row before releasing it, and refuses the release when republication
+fails. Recovery therefore either finalizes the run as it actually settled or
+leaves the lock held and recoverable; it can never finalize it as `unknown`.
+
 Related implementation IDs: `PAR-03`, `PAR-05`.
 
 ## PRD-WRK-004 Parallel Supervision

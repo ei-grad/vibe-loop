@@ -88,7 +88,12 @@ from vibe_loop.runs import (
 )
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import Task
-from vibe_loop.workers import ActiveRunState
+from vibe_loop.workers import (
+    ActiveRunState,
+    StaleLock,
+    clean_stale_locks,
+    collect_stale_locks,
+)
 
 
 class MutableTaskSource:
@@ -5616,6 +5621,49 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 if record.get("record_type") == "run_result"
             ]
             self.assertEqual(classifications, ["completed"])
+
+    def test_stale_cleanup_cannot_finalize_a_retained_lock_as_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "fail_update").write_text("")
+
+            with self.assertRaises(SettledOutcomeNotPersisted):
+                self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
+
+            def collect() -> list[StaleLock]:
+                return collect_stale_locks(
+                    runner.lock_manager,
+                    runner.run_store,
+                    process_exists=lambda pid: False,
+                )
+
+            stale = collect()
+            self.assertEqual([lock.task_id for lock in stale], ["T-1"])
+            # The run is durably completed locally, so the operator recovery path
+            # must carry that verdict rather than releasing the row it collected.
+            self.assertEqual(stale[0].settled_outcome, "completed")
+
+            blocked = clean_stale_locks(stale, runner.lock_manager)
+            self.assertEqual(blocked.cleaned, [])
+            self.assertEqual([lock.task_id for lock, _ in blocked.errors], ["T-1"])
+            # Republication still fails, so refusing the release is the only way
+            # to keep provenance from finalizing this run against its own result.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            self.assertIsNotNone(runner.lock_manager.status("T-1"))
+
+            (root / "state" / "fail_update").unlink()
+            recovered = clean_stale_locks(collect(), runner.lock_manager)
+            self.assertEqual(recovered.errors, [])
+            self.assertEqual([lock.task_id for lock in recovered.cleaned], ["T-1"])
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+            self.assertIsNone(runner.lock_manager.status("T-1"))
 
     @staticmethod
     def _external_run_outcomes(root: Path) -> dict[str, str]:

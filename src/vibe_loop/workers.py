@@ -13,6 +13,7 @@ from typing import Any
 
 from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
+    TERMINAL_LOCK_OUTCOMES,
     LockBackendError,
     LockFencingMismatch,
     LockManager,
@@ -27,6 +28,8 @@ from vibe_loop.locks import (
 from vibe_loop.processes import process_birth_identity
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
+    LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
     RUN_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
@@ -1610,6 +1613,8 @@ class StaleLock:
     kind: str
     recovery_command: str
     started_at: str = ""
+    settled_outcome: str = ""
+    settled_classification: str = ""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1634,6 +1639,7 @@ def collect_stale_locks(
     ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[StaleLock]:
     stale: list[StaleLock] = []
+    pending_settlements = pending_settlements_by_run_id(run_store.read_records())
     for view in build_worker_views(
         lock_manager,
         run_store,
@@ -1648,6 +1654,7 @@ def collect_stale_locks(
         lock_path = view.active.lock_path
         if lock_path is None:
             continue
+        settlement = pending_settlements.get(view.active.run_id, ("", ""))
         stale.append(
             StaleLock(
                 task_id=view.active.task_id,
@@ -1660,6 +1667,8 @@ def collect_stale_locks(
                     lock_path,
                 ),
                 started_at=view.active.started_at,
+                settled_outcome=settlement[0],
+                settled_classification=settlement[1],
             )
         )
 
@@ -1693,6 +1702,40 @@ def collect_stale_locks(
     return stale
 
 
+def pending_settlements_by_run_id(
+    records: Sequence[dict[str, Any]],
+) -> dict[str, tuple[str, str]]:
+    """Terminal outcomes that are durable locally but never reached their lock.
+
+    A settlement update that fails leaves the lock held and records a
+    ``lock_finalization_failed`` event carrying the outcome the run actually
+    settled on. Recovery paths need it: the retained row still says ``unknown``,
+    so releasing it as collected would finalize the run against its own durable
+    result. A later ``lock_released`` for the same run means settlement
+    succeeded after all, and clears the pending entry.
+    """
+
+    pending: dict[str, tuple[str, str]] = {}
+    for record in records:
+        run_id = optional_string(record.get("run_id"))
+        if not run_id:
+            continue
+        record_type = record.get("record_type")
+        if record_type == LOCK_RELEASED_RECORD_TYPE:
+            pending.pop(run_id, None)
+            continue
+        if record_type != LOCK_FINALIZATION_FAILED_RECORD_TYPE:
+            continue
+        outcome = optional_string(record.get("outcome")) or ""
+        if outcome not in TERMINAL_LOCK_OUTCOMES:
+            continue
+        pending[run_id] = (
+            outcome,
+            optional_string(record.get("classification")) or "",
+        )
+    return pending
+
+
 @dataclasses.dataclass(frozen=True)
 class CleanResult:
     cleaned: list[StaleLock]
@@ -1713,6 +1756,8 @@ def clean_stale_locks(
                     run_id=lock.run_id,
                     path=lock.lock_path,
                     kind=lock.kind,
+                    settled_outcome=lock.settled_outcome,
+                    settled_classification=lock.settled_classification,
                 )
             except LockBackendError as exc:
                 errors.append((lock, str(exc)))
