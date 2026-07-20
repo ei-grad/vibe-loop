@@ -71,6 +71,20 @@ run it was told nothing about, so a failed store loses no information, and
 blocking release there would strand the lock of an interrupted or report-less
 run.
 
+Three ordering rules keep the two stores in agreement:
+
+- A settled outcome is only publishable once the local `run_result` append has
+  succeeded. External provenance may never claim a completion vibe-loop itself
+  failed to record, so a failed append leaves the run settling as `unknown`.
+- A settled outcome is monotonic in the lock row. Only the supervisor that
+  classified the run writes one, so a same-owner update carrying none — a
+  heartbeat refreshing from a snapshot read before settlement — preserves the
+  stored outcome instead of reopening the run.
+- A recovery attempt that exhausts the unknown-run recovery budget settles as
+  `failed`, not `unknown`. The supervisor records the terminal `failed` result
+  for that run after its lock is released, so the verdict is published from the
+  run itself while it still owns the lock.
+
 Related implementation IDs: `PAR-03`, `PAR-05`.
 
 ## PRD-WRK-004 Parallel Supervision

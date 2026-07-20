@@ -959,9 +959,10 @@ class VibeRunner:
         agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
         worker_timed_out = False
-        # Defaults hold for any exit that never reaches classification - an
-        # interrupted supervisor, a crash, a pre-classification error - which
-        # is an honestly unknown outcome, not a failure and not a completion.
+        # Defaults hold for any exit that never reaches a durable RunResult - an
+        # interrupted supervisor, a crash, a pre-classification error, a failed
+        # result append - which is an honestly unknown outcome, not a failure
+        # and not a completion.
         settled_outcome = "unknown"
         settled_classification = ""
         active_state = ActiveRunState.new(
@@ -1458,8 +1459,6 @@ class VibeRunner:
                 output_tail,
                 timed_out=worker_timed_out,
             )
-            settled_classification = classification.status
-            settled_outcome = settled_run_outcome(classification.status)
             if classification.status == "limit_wall" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
                 # its dispatch backoff from the recorded result alone.
@@ -1526,6 +1525,24 @@ class VibeRunner:
                 max_restarts=max_restarts,
             )
             self.record_result(result)
+            # Only a durable local RunResult may be published externally. Until
+            # the append succeeds there is nothing for provenance to agree with,
+            # so an append that raises leaves the run settling as unknown.
+            settled_classification = classification.status
+            settled_outcome = settled_run_outcome(classification.status)
+            if (
+                settled_outcome == UNKNOWN_RUN_OUTCOME
+                and recovery is not None
+                and recovery.attempt >= recovery.max_attempts
+            ):
+                # This is the last permitted recovery attempt and it still could
+                # not settle the task, so drive_unknown_recovery will record a
+                # failed terminal result for this same run. Publishing that
+                # verdict here is the only chance to keep external provenance
+                # from finalizing the final run as unknown: the lock is released
+                # below, before the supervisor reaches the exhaustion branch.
+                settled_outcome = "failed"
+                settled_classification = "failed"
             report_status(
                 f"recorded {classification.status} result for {task.task_id}: "
                 f"{log_path}"

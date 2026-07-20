@@ -1289,6 +1289,12 @@ def preserve_runtime_lock_fields(
         if key not in updated and key in current:
             updated[key] = current[key]
     for key in (
+        # A settled outcome is monotonic: only the supervisor that classified
+        # the run ever writes one, so an update carrying none - a heartbeat
+        # refreshing from a snapshot taken before settlement, for instance -
+        # must not clear the row the backend finalizes the run from.
+        "outcome",
+        "classification",
         "workspace",
         "worker_pid",
         "pid",

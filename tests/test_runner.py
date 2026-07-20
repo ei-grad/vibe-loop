@@ -4735,6 +4735,35 @@ class RecordingLockManager(LockManager):
         return ""
 
 
+class HeartbeatInjectingLockManager(LockManager):
+    """Replays a same-owner heartbeat that raced the settling update.
+
+    A heartbeat reads the lock row, stamps ``heartbeat_at`` and writes the row
+    back. One that reads before the settling update but writes after it carries
+    a snapshot with no outcome, which is the narrow window in which a settled
+    run could be reopened. The stale snapshot is captured from the last update
+    that carried no outcome and replayed just before release.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.stale: dict[str, object] | None = None
+        self.injected = False
+
+    def update(self, task_lock, metadata):
+        if not metadata.get("outcome"):
+            self.stale = dict(metadata)
+        return super().update(task_lock, metadata)
+
+    def release(self, task_lock) -> None:
+        if not self.injected and self.stale is not None:
+            self.injected = True
+            heartbeat = dict(self.stale)
+            heartbeat["heartbeat_at"] = "2026-07-20T00:00:00Z"
+            super().update(task_lock, heartbeat)
+        super().release(task_lock)
+
+
 class StubTaskSource:
     def __init__(self, tasks: list[Task], probe_results: dict[str, Task | None]):
         self._tasks = tasks
@@ -4769,6 +4798,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         directory: str,
         tasks: list[Task],
         probe_results: dict[str, Task | None],
+        supervision: SupervisionConfig | None = None,
     ) -> tuple[VibeRunner, RecordingLockManager, StubTaskSource]:
         repo = Path(directory)
         runner = VibeRunner(
@@ -4786,6 +4816,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                         skill_ref_prefix="$",
                     )
                 },
+                supervision=supervision or SupervisionConfig(),
             )
         )
         lock_manager = RecordingLockManager(runner.config.state_path / "locks")
@@ -5314,6 +5345,107 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 if record.get("record_type") == "run_result"
             ]
             self.assertEqual(classifications, ["completed"])
+
+    @staticmethod
+    def _external_run_outcomes(root: Path) -> dict[str, str]:
+        runs_path = root / "state" / "runs.json"
+        if not runs_path.exists():
+            return {}
+        records = json.loads(runs_path.read_text())
+        return {run_id: str(record["outcome"]) for run_id, record in records.items()}
+
+    def test_command_backend_survives_a_stale_heartbeat_before_release(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            command_backend = runner.lock_manager.backend
+            manager = HeartbeatInjectingLockManager(
+                runner.config.state_path / "locks",
+                backend=command_backend,
+            )
+            runner._lock_manager = manager
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            # The heartbeat landed between the settling update and the release
+            # the backend finalizes on, carrying a snapshot read before the
+            # outcome was written. It must not reopen the settled run.
+            self.assertTrue(manager.injected)
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    def test_command_backend_publishes_nothing_without_a_durable_result(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+
+            with patch.object(
+                runner, "record_result", side_effect=OSError("run store full")
+            ):
+                with self.assertRaises(OSError):
+                    self._run_task(
+                        runner, task, self._reporting_worker(runner, "completed")
+                    )
+
+            # External provenance may never claim a completion vibe-loop itself
+            # failed to record: with no durable RunResult there is nothing for
+            # the two stores to agree on, so the run stays honestly unknown.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            classifications = [
+                record["classification"]
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_result"
+            ]
+            self.assertEqual(classifications, [])
+
+    def test_command_backend_settles_exhausted_recovery_as_failed(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The task stays runnable through every attempt, so each run
+            # classifies unknown and recovery burns its single attempt.
+            runner, _, _ = self._build_runner(
+                directory,
+                [task],
+                {"T-1": task},
+                supervision=SupervisionConfig(max_restarts=1, cooldown_seconds=0),
+            )
+            self._attach_provenance_backend(runner, root)
+            worker = self._reporting_worker(runner, "completed", report=False)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", worker):
+                        first = runner.run_task(task)
+                        results: list[RunResult] = []
+                        terminal = runner.drive_unknown_recovery(
+                            first, attempts={}, results=results
+                        )
+
+            self.assertEqual(first.classification, "unknown")
+            self.assertEqual(terminal.classification, "failed")
+            self.assertEqual(
+                terminal.classification_source, "recovery_budget_exhausted"
+            )
+            self.assertNotEqual(terminal.run_id, first.run_id)
+            external = self._external_run_outcomes(root)
+            # Task runs and worklog must settle together: the supervisor calls
+            # the final run failed, so external provenance may not keep it
+            # unknown just because the exhaustion verdict lands after release.
+            self.assertEqual(external.get(terminal.run_id), "failed")
+            self.assertEqual(external.get(first.run_id), "unknown")
+            recorded = [
+                record["classification"]
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_result"
+                and record.get("run_id") == terminal.run_id
+            ]
+            self.assertEqual(recorded[-1], "failed")
 
     def test_command_backend_keeps_unsettled_runs_unknown(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
