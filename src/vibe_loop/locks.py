@@ -139,8 +139,9 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
     locally minted generations, which start at "1" and fall below the shared
     helper's opaque-token length floor. A generation that short is
     indistinguishable from an unrelated small number, so the pass over-redacts
-    rather than leak; the word boundaries only keep "1" from rewriting the
-    inside of larger numbers and identifiers.
+    rather than leak. Identifier guards only preserve evidence-backed embedded
+    forms, including larger numbers, dotted numbers, and hyphenated identifiers
+    where the generation is not the leading segment.
     """
 
     context = dict(metadata)
@@ -155,7 +156,7 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
     )
     for token in sorted(fencing_token_values(context), key=len, reverse=True):
         detail = re.sub(
-            rf"(?<![\w.-]){re.escape(token)}(?!\w)(?![.-]\w)",
+            rf"(?<![\w.-]){re.escape(token)}(?!\w)(?!\.\w)",
             FENCING_TOKEN_REDACTION,
             detail,
         )

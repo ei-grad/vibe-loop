@@ -526,7 +526,8 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                 raise locks.LockBackendError(
                     f"adapter refused: generation {token} rejected, run 141 kept"
                     f"; retry after generation {token}. schema {token}.4 held"
-                    f"; generation {token}- unavailable, node n-{token}-b idle"
+                    f"; generation {token}- unavailable"
+                    f"; generation {token}-rejected, node n-{token}-b idle"
                 )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -548,14 +549,18 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                 error.release_detail,
             )
             self.assertNotIn(f"generation {granted_token} ", error.release_detail)
-            # Sentence punctuation still ends a token; a dot or hyphen only
-            # suppresses redaction when identifier text follows it.
+            # Sentence punctuation ends the generation. A leading generation
+            # before a hyphen is ambiguous and therefore over-redacted.
             self.assertIn(
                 f"generation {locks.FENCING_TOKEN_REDACTION}. schema",
                 error.release_detail,
             )
             self.assertIn(
                 f"generation {locks.FENCING_TOKEN_REDACTION}- unavailable",
+                error.release_detail,
+            )
+            self.assertIn(
+                f"generation {locks.FENCING_TOKEN_REDACTION}-rejected",
                 error.release_detail,
             )
             self.assertNotIn(f"generation {granted_token}.", error.release_detail)
@@ -565,6 +570,24 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
             # than leak, but must not rewrite the inside of larger numbers.
             self.assertIn("run 141 kept", error.release_detail)
             self.assertIn(f"schema {granted_token}.4 held", error.release_detail)
+
+    def test_short_generation_is_redacted_at_punctuation_boundaries(self) -> None:
+        metadata = {"fencing_token": "1"}
+        cases = (
+            ("generation 1.", "generation <redacted>."),
+            ("generation 1-rejected", "generation <redacted>-rejected"),
+            ("1-rejected", "<redacted>-rejected"),
+            ("generation 1-", "generation <redacted>-"),
+        )
+
+        for diagnostic, expected in cases:
+            with self.subTest(diagnostic=diagnostic):
+                self.assertEqual(
+                    locks.describe_lock_failure(
+                        locks.LockBackendError(diagnostic), metadata
+                    ),
+                    f"LockBackendError: {expected}",
+                )
 
     def test_command_backend_spawn_rejection_is_a_compensation_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
