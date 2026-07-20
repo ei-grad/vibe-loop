@@ -395,29 +395,127 @@ class AutopilotRecoveryTests(unittest.TestCase):
         self.assertEqual(len(set(tokens)), 32)
         self.assertEqual(sorted(map(int, tokens)), list(range(1, 33)))
 
-    def test_acquire_releases_a_lock_whose_generation_cannot_be_recorded(self) -> None:
-        class GrantingBackend(AutopilotRecoveryTests.Backend):
-            def acquire(self, task_id, run_id, metadata=None):
-                return locks.TaskLock(
-                    task_id=task_id,
-                    path=self.path_for(task_id),
-                    metadata={"run_id": run_id, "fencing_token": "7"},
+
+class AcquireWitnessCompensationTests(unittest.TestCase):
+    """Give-back behaviour when the local fencing witness cannot be written."""
+
+    @staticmethod
+    def _witness_failure():
+        return patch.object(
+            locks,
+            "record_acquired_fencing_token",
+            side_effect=OSError("witness volume offline"),
+        )
+
+    def test_witness_failure_removes_the_lock_and_allows_reacquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = locks.DirectoryLockBackend(root)
+            manager = locks.LockManager(root, backend=backend)
+
+            with self._witness_failure():
+                with self.assertRaises(OSError):
+                    manager.acquire("TASK-1", "run-1")
+
+            self.assertIsNone(backend.status("TASK-1"))
+            self.assertFalse(backend.path_for("TASK-1").exists())
+            self.assertEqual(locks.read_acquired_fencing_token(root, "TASK-1"), "")
+
+            reacquired = manager.acquire("TASK-1", "run-2")
+            self.assertEqual(reacquired.metadata["run_id"], "run-2")
+            self.assertEqual(
+                locks.read_acquired_fencing_token(root, "TASK-1"),
+                locks.fencing_token_value(reacquired.metadata.get("fencing_token")),
+            )
+
+    def test_double_failure_surfaces_both_roles_without_leaking_the_token(
+        self,
+    ) -> None:
+        class TokenLeakingReleaseBackend(locks.DirectoryLockBackend):
+            def release(self, task_lock: locks.TaskLock) -> None:
+                token = locks.fencing_token_value(
+                    task_lock.metadata.get("fencing_token")
+                )
+                raise locks.LockBackendError(
+                    f"give-back refused with fencing_token={token}"
                 )
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            backend = GrantingBackend(root, {})
+            backend = TokenLeakingReleaseBackend(root)
             manager = locks.LockManager(root, backend=backend)
-            with patch.object(
-                locks,
-                "record_acquired_fencing_token",
-                side_effect=OSError("read-only lock root"),
-            ):
-                with self.assertRaises(OSError):
+
+            with self._witness_failure():
+                with self.assertRaises(locks.LockWitnessCompensationError) as caught:
                     manager.acquire("TASK-1", "run-1")
 
-            self.assertIsNotNone(backend.released)
+            error = caught.exception
+            granted_token = locks.fencing_token_value(
+                (backend.status("TASK-1") or {}).get("fencing_token")
+            )
+            self.assertTrue(granted_token)
+            self.assertTrue(backend.path_for("TASK-1").exists())
             self.assertEqual(locks.read_acquired_fencing_token(root, "TASK-1"), "")
+
+            self.assertIs(error.witness_error, error.__cause__)
+            self.assertIsInstance(error.witness_error, OSError)
+            self.assertIsInstance(error.release_error, locks.LockBackendError)
+            self.assertIn("witness volume offline", error.witness_detail)
+            self.assertIn("give-back refused", error.release_detail)
+            self.assertIn("may remain held", str(error))
+            self.assertNotIn(f"fencing_token={granted_token}", str(error))
+            self.assertIn(
+                f"fencing_token={locks.FENCING_TOKEN_REDACTION}",
+                error.release_detail,
+            )
+
+    def test_compensation_mismatch_cannot_replace_the_witness_failure(self) -> None:
+        def owner_mismatch(path: Path) -> BaseException:
+            return locks.LockOwnerMismatch(
+                path,
+                {"run_id": "other-run"},
+                run_id="run-1",
+                task_id="TASK-1",
+            )
+
+        def fencing_mismatch(path: Path) -> BaseException:
+            return locks.LockFencingMismatch(
+                path,
+                {"fencing_token": "9"},
+                expected_token="1",
+                actual_token="9",
+            )
+
+        for name, build_error in (
+            ("owner", owner_mismatch),
+            ("fencing", fencing_mismatch),
+        ):
+            with self.subTest(mismatch=name):
+
+                class MismatchingReleaseBackend(locks.DirectoryLockBackend):
+                    def release(self, task_lock: locks.TaskLock) -> None:
+                        raise build_error(self.path_for(task_lock.task_id))
+
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    backend = MismatchingReleaseBackend(root)
+                    manager = locks.LockManager(root, backend=backend)
+
+                    with self._witness_failure():
+                        with self.assertRaises(
+                            locks.LockWitnessCompensationError
+                        ) as caught:
+                            manager.acquire("TASK-1", "run-1")
+
+                    error = caught.exception
+                    self.assertIs(error.witness_error, error.__cause__)
+                    self.assertIn("witness volume offline", error.witness_detail)
+                    self.assertIn(
+                        type(build_error(root)).__name__,
+                        error.release_detail,
+                    )
+                    self.assertIn("may remain held", str(error))
+                    self.assertIsNotNone(backend.status("TASK-1"))
 
 
 if __name__ == "__main__":

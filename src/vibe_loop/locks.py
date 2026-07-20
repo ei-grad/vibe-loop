@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -94,6 +94,59 @@ class LockFencingMismatch(RuntimeError):
 
 class LockBackendError(RuntimeError):
     pass
+
+
+class LockWitnessCompensationError(LockBackendError):
+    """A granted lock could neither be recorded locally nor given back.
+
+    The backend still considers the lock held, but no local fencing witness
+    exists, so ordinary release and stale recovery both fail closed against it.
+    Operators must resolve the orphaned holder out of band. Both underlying
+    failures are retained: the witness write is the primary cause, the
+    compensating give-back the secondary one.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        *,
+        witness_error: BaseException,
+        release_error: BaseException,
+        metadata: Mapping[str, object] | None = None,
+    ):
+        self.task_id = task_id
+        self.witness_error = witness_error
+        self.release_error = release_error
+        redaction_context = dict(metadata or {})
+        self.witness_detail = describe_lock_failure(witness_error, redaction_context)
+        self.release_detail = describe_lock_failure(release_error, redaction_context)
+        super().__init__(
+            f"lock {task_id} may remain held: recording the granted fencing "
+            f"generation failed ({self.witness_detail}) and the compensating "
+            f"release also failed ({self.release_detail})"
+        )
+
+
+def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) -> str:
+    """Render a lock failure for operators without leaking fencing tokens.
+
+    The redaction context spans the granted lock metadata and any token the
+    raising exception carries itself, since mismatch errors know generations the
+    caller's metadata does not.
+    """
+
+    context = dict(metadata)
+    context["_error_metadata"] = getattr(error, "metadata", {})
+    for field in ("expected_token", "actual_token"):
+        value = getattr(error, field, None)
+        if value is not None:
+            context[field] = value
+    return truncate_diagnostic(
+        redact_fencing_token_diagnostic(
+            f"{type(error).__name__}: {error}",
+            context,
+        )
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -187,12 +240,25 @@ class LockManager:
                 task_id,
                 fencing_token_value(task_lock.metadata.get("fencing_token")),
             )
-        except OSError:
-            # Hold the invariant "granted implies recorded": a lock whose
-            # generation was never recorded locally can never be recovered
-            # later, so give it back rather than leaving it unreleasable.
-            with suppress(LockBackendError, OSError):
+        except OSError as witness_error:
+            # A lock whose generation was never recorded locally can never be
+            # released or recovered later, so give it back. The give-back is
+            # best effort: when it also fails the lock stays held with no local
+            # witness, and that outcome is surfaced rather than swallowed.
+            try:
                 self.backend.release(task_lock)
+            except (
+                LockBackendError,
+                LockOwnerMismatch,
+                LockFencingMismatch,
+                OSError,
+            ) as release_error:
+                raise LockWitnessCompensationError(
+                    task_id,
+                    witness_error=witness_error,
+                    release_error=release_error,
+                    metadata=task_lock.metadata,
+                ) from witness_error
             raise
         return task_lock
 

@@ -215,6 +215,18 @@ fail closed. Recovery releases through the configured directory or command
 backend and verifies absence afterward. Fencing tokens must not be accepted in
 argv or rendered in diagnostics.
 
+Because both release and recovery need that local witness, an acquire whose
+witness write fails gives the granted lock straight back, and the ordinary case
+leaves the singleton immediately reacquirable. That give-back is best effort,
+not an invariant: when it also fails the lock stays held by a generation no
+local record witnesses, and neither release nor recovery can resolve it. That
+outcome must be reported as a single failure naming both the witness write and
+the compensating give-back, with each role distinguishable and no token value
+rendered, rather than silently reduced to either one, so the operator knows an
+orphaned singleton needs out-of-band resolution. Directory owner and fencing
+mismatches raised during the give-back are compensation failures of that same
+kind, not replacements for the original witness failure.
+
 Successful ordinary, signal, and recovery exits append a terminal supervisor
 record only after lock release. Status reports `stopped` only when such a
 terminal record exists AND the recorded process is verifiably absent. A stop
