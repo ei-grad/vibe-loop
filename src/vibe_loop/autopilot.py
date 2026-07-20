@@ -46,9 +46,17 @@ from vibe_loop.locks import (
     build_lock_manager,
     redact_fencing_token_payload,
 )
+from vibe_loop.processes import (
+    ProcessNode,
+    collect_owned_descendants,
+    process_birth_identity,
+    read_process_node,
+    read_process_table,
+)
 from vibe_loop.retry import parse_limit_wall_reset_delay
 from vibe_loop.runner import AgentLimitWallError, VibeRunner, new_run_id
 from vibe_loop.runs import (
+    AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
@@ -62,7 +70,9 @@ from vibe_loop.runs import (
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+    RunLifecycleEvent,
     RunStore,
+    autopilot_child_started_record,
     utc_now_iso,
 )
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
@@ -1092,6 +1102,57 @@ class DetachedAutopilotIdentity:
     record: dict[str, Any]
 
 
+OWNED_PROCESS_ROLE_SUPERVISOR = "supervisor"
+OWNED_PROCESS_ROLE_CHILD = "run_until_done_child"
+OWNED_PROCESS_ROLE_WORKER = "worker"
+OWNED_PROCESS_ROLE_DESCENDANT = "descendant"
+AUTOPILOT_STOP_TERMINATED_STATUS = "terminated"
+AUTOPILOT_STOP_TERMINATION_REASON = "autopilot_stop"
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnedProcessIdentity:
+    """One process this installation recorded starting, with its birth proof."""
+
+    role: str
+    pid: int
+    process_group_id: int
+    session_id: int
+    process_birth_id: str
+    parent_pid: int | None = None
+    run_id: str = ""
+    task_id: str = ""
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "role": self.role,
+            "pid": self.pid,
+            "process_group_id": self.process_group_id,
+            "session_id": self.session_id,
+            "parent_pid": self.parent_pid,
+        }
+        # The birth ID embeds the host boot ID; the identity is diagnostic, so
+        # only its presence is reported, never the value itself.
+        payload["process_birth_id_known"] = bool(self.process_birth_id)
+        if self.run_id:
+            payload["run_id"] = self.run_id
+        if self.task_id:
+            payload["task_id"] = self.task_id
+        return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnedProcessDrainResult:
+    drained: tuple[OwnedProcessIdentity, ...] = ()
+    remaining: tuple[OwnedProcessIdentity, ...] = ()
+    signalled: tuple[OwnedProcessIdentity, ...] = ()
+    blocker: str = ""
+
+    @property
+    def complete(self) -> bool:
+        return not self.blocker and not self.remaining
+
+
 @dataclasses.dataclass(frozen=True)
 class AutopilotStopResult:
     repo: Path
@@ -1103,6 +1164,10 @@ class AutopilotStopResult:
     lock_released: bool = False
     recovered: bool = False
     blocker: str = ""
+    drained: tuple[OwnedProcessIdentity, ...] = ()
+    remaining: tuple[OwnedProcessIdentity, ...] = ()
+    reconciled_task_ids: tuple[str, ...] = ()
+    reconciliation_blockers: tuple[str, ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -1119,6 +1184,10 @@ class AutopilotStopResult:
             "lock_released": self.lock_released,
             "recovered": self.recovered,
             "blocker": self.blocker,
+            "drained": [identity.to_json() for identity in self.drained],
+            "remaining": [identity.to_json() for identity in self.remaining],
+            "reconciled_task_ids": list(self.reconciled_task_ids),
+            "reconciliation_blockers": list(self.reconciliation_blockers),
         }
 
 
@@ -1445,25 +1514,6 @@ def cleanup_detached_candidate(
     return ";".join(errors)
 
 
-def process_birth_identity(pid: int, *, proc_root: Path = Path("/proc")) -> str:
-    if sys.platform != "linux" or pid <= 0:
-        return ""
-    try:
-        boot_id = (
-            (proc_root / "sys/kernel/random/boot_id")
-            .read_text(encoding="utf-8")
-            .strip()
-        )
-        stat_text = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    _prefix, separator, suffix = stat_text.rpartition(")")
-    fields = suffix.split() if separator else []
-    if not boot_id or len(fields) <= 19 or not fields[19].isdigit():
-        return ""
-    return f"{boot_id}:{fields[19]}"
-
-
 def open_process_pidfd(pid: int) -> int:
     opener = getattr(os, "pidfd_open", None)
     if opener is not None:
@@ -1547,6 +1597,328 @@ def detached_autopilot_identity(
     return None
 
 
+def autopilot_child_identity(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    run_id: str,
+) -> OwnedProcessIdentity | None:
+    """The run-until-done child this supervisor run last recorded starting.
+
+    Returns None when no child was recorded, which is the normal state for a
+    supervisor between cycles. A recorded child with incomplete identity is
+    surfaced with an empty birth ID so the caller can fail closed rather than
+    signalling an unverifiable PID.
+    """
+
+    if not run_id:
+        return None
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_CHILD_STARTED_RECORD_TYPE:
+            continue
+        if str(record.get("repo") or "") != str(repo):
+            continue
+        if str(record.get("run_id") or "") != run_id:
+            continue
+        pid = int_value(record.get("pid"))
+        if pid is None:
+            return None
+        return OwnedProcessIdentity(
+            role=OWNED_PROCESS_ROLE_CHILD,
+            pid=pid,
+            process_group_id=int_value(record.get("process_group_id")) or 0,
+            session_id=int_value(record.get("session_id")) or 0,
+            process_birth_id=str(record.get("process_birth_id") or ""),
+            run_id=run_id,
+        )
+    return None
+
+
+def owned_worker_identities(
+    lock_manager: LockManager,
+    *,
+    child_pid: int,
+) -> tuple[OwnedProcessIdentity, ...]:
+    """Active-run locks whose supervising process is exactly ``child_pid``.
+
+    Selection is by recorded supervisor PID, never by command name or an
+    ambient process listing, so a peer installation's workers can never enter
+    this drain set.
+    """
+
+    identities: list[OwnedProcessIdentity] = []
+    try:
+        locks = lock_manager.list_locks()
+    except (LockBackendError, OSError):
+        return ()
+    for metadata in locks:
+        active = ActiveRunState.from_lock_metadata(dict(metadata))
+        if active is None or active.worker_pid is None:
+            continue
+        if active.supervisor_pid != child_pid:
+            continue
+        identities.append(
+            OwnedProcessIdentity(
+                role=OWNED_PROCESS_ROLE_WORKER,
+                pid=active.worker_pid,
+                process_group_id=active.worker_process_group_id or 0,
+                session_id=active.worker_session_id or 0,
+                process_birth_id=active.worker_process_birth_id,
+                run_id=active.run_id,
+                task_id=active.task_id,
+            )
+        )
+    return tuple(identities)
+
+
+def collect_owned_stop_roots(
+    run_store: RunStore,
+    lock_manager: LockManager,
+    *,
+    repo: Path,
+    run_id: str,
+    process_exists: ProcessExists,
+) -> tuple[tuple[OwnedProcessIdentity, ...], str]:
+    """Verified non-supervisor roots to drain, or a fail-closed blocker.
+
+    A root that is already gone contributes nothing. A root that is still live
+    but whose birth identity was never recorded cannot be told apart from a
+    recycled PID, so it blocks the stop instead of being signalled.
+    """
+
+    child = autopilot_child_identity(run_store, repo=repo, run_id=run_id)
+    if child is None:
+        return (), ""
+    if not process_exists(child.pid):
+        return (), ""
+    if not child.process_birth_id:
+        return (), "autopilot_stop_identity_unverified:child_birth_id_missing"
+    roots: list[OwnedProcessIdentity] = []
+    for worker in owned_worker_identities(lock_manager, child_pid=child.pid):
+        if not process_exists(worker.pid):
+            continue
+        if not worker.process_birth_id:
+            return (), (
+                "autopilot_stop_identity_unverified:worker_birth_id_missing:"
+                f"{worker.task_id or worker.run_id or worker.pid}"
+            )
+        roots.append(worker)
+    roots.append(child)
+    return tuple(roots), ""
+
+
+def drain_owned_process_tree(
+    roots: Sequence[OwnedProcessIdentity],
+    *,
+    pidfd_open: Callable[[int], int],
+    pidfd_signal: Callable[[int, int], None],
+    pidfd_exited: Callable[[int], bool],
+    close_fd: Callable[[int], None],
+    sleep: Sleep,
+    monotonic: Callable[[], float],
+    deadline: float,
+    process_table: Callable[[], dict[int, ProcessNode]],
+    process_node: Callable[[int], ProcessNode | None],
+) -> OwnedProcessDrainResult:
+    """Terminate the exact recorded process tree, deepest descendants first.
+
+    Every pidfd is opened and re-verified against the snapshot before any
+    signal is sent, so a single unverifiable candidate aborts the drain with
+    zero signals rather than leaving a half-signalled tree. The pidfds are then
+    retained for the whole wait: they stay bound to the original process even
+    after it reparents to PID 1, which a PID-based recheck cannot do.
+    """
+
+    if not roots:
+        return OwnedProcessDrainResult()
+    root_births = {root.pid: root.process_birth_id for root in roots}
+    role_by_pid = {root.pid: root for root in roots}
+    table = process_table()
+    candidates = collect_owned_descendants(table, root_births)
+    if not candidates:
+        return OwnedProcessDrainResult()
+
+    def identity_for(node: ProcessNode) -> OwnedProcessIdentity:
+        recorded = role_by_pid.get(node.pid)
+        return OwnedProcessIdentity(
+            role=recorded.role if recorded else OWNED_PROCESS_ROLE_DESCENDANT,
+            pid=node.pid,
+            process_group_id=node.process_group_id,
+            session_id=node.session_id,
+            process_birth_id=node.process_birth_id,
+            parent_pid=node.parent_pid,
+            run_id=recorded.run_id if recorded else "",
+            task_id=recorded.task_id if recorded else "",
+        )
+
+    opened: list[tuple[OwnedProcessIdentity, int]] = []
+    blocker = ""
+    exited_before_open: list[OwnedProcessIdentity] = []
+    try:
+        for node in candidates:
+            identity = identity_for(node)
+            if not node.process_birth_id:
+                blocker = (
+                    "autopilot_stop_identity_unverified:"
+                    f"descendant_birth_id_missing:{node.pid}"
+                )
+                break
+            try:
+                process_fd = pidfd_open(node.pid)
+            except ProcessLookupError:
+                # Exiting between snapshot and open is the drain succeeding
+                # early for that process, not an unverifiable identity.
+                exited_before_open.append(identity)
+                continue
+            except OSError:
+                blocker = (
+                    "autopilot_stop_identity_unverified:"
+                    f"descendant_pidfd_unavailable:{node.pid}"
+                )
+                break
+            opened.append((identity, process_fd))
+            current = process_node(node.pid)
+            if current is None:
+                # The pidfd already pins this process; a vanished /proc entry
+                # means it exited after the open, so the retained fd still
+                # observes its exit.
+                continue
+            if (
+                current.process_birth_id != node.process_birth_id
+                or current.parent_pid != node.parent_pid
+                or current.process_group_id != node.process_group_id
+                or current.session_id != node.session_id
+            ):
+                blocker = (
+                    "autopilot_stop_identity_unverified:"
+                    f"descendant_identity_changed:{node.pid}"
+                )
+                break
+        if blocker:
+            return OwnedProcessDrainResult(blocker=blocker)
+
+        for identity, process_fd in opened:
+            try:
+                pidfd_signal(process_fd, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except OSError:
+                return OwnedProcessDrainResult(
+                    remaining=tuple(entry for entry, _fd in opened),
+                    blocker=(
+                        f"autopilot_stop_signal_failed:{identity.role}:{identity.pid}"
+                    ),
+                )
+
+        signalled = tuple(identity for identity, _fd in opened)
+        pending = list(opened)
+        drained: list[OwnedProcessIdentity] = list(exited_before_open)
+        while True:
+            still_pending: list[tuple[OwnedProcessIdentity, int]] = []
+            for identity, process_fd in pending:
+                if pidfd_exited(process_fd):
+                    drained.append(identity)
+                else:
+                    still_pending.append((identity, process_fd))
+            pending = still_pending
+            if not pending:
+                return OwnedProcessDrainResult(
+                    drained=tuple(drained),
+                    signalled=signalled,
+                )
+            if monotonic() >= deadline:
+                return OwnedProcessDrainResult(
+                    drained=tuple(drained),
+                    remaining=tuple(identity for identity, _fd in pending),
+                    signalled=signalled,
+                    blocker="autopilot_stop_drain_timeout",
+                )
+            try:
+                sleep(min(0.05, max(0.0, deadline - monotonic())))
+            except KeyboardInterrupt:
+                return OwnedProcessDrainResult(
+                    drained=tuple(drained),
+                    remaining=tuple(identity for identity, _fd in pending),
+                    signalled=signalled,
+                    blocker="autopilot_stop_interrupted",
+                )
+    finally:
+        for _identity, process_fd in opened:
+            close_fd(process_fd)
+
+
+def reconcile_drained_workers(
+    run_store: RunStore,
+    lock_manager: LockManager,
+    *,
+    repo: Path,
+    drained: Sequence[OwnedProcessIdentity],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Record terminated runs and release only their exact task locks.
+
+    A worker killed by a stop never filed a report, so its run is classified
+    terminated. Success is never synthesized: the authoritative task stays
+    active and its committed worktree is preserved, so the work can be picked
+    up again rather than being silently marked finished.
+    """
+
+    reconciled: list[str] = []
+    blockers: list[str] = []
+    for identity in drained:
+        if identity.role != OWNED_PROCESS_ROLE_WORKER:
+            continue
+        if not identity.run_id or not identity.task_id:
+            blockers.append(
+                f"autopilot_stop_reconcile_identity_incomplete:{identity.pid}"
+            )
+            continue
+        if (
+            run_store.latest_worker_report(identity.run_id, identity.task_id)
+            is not None
+        ):
+            # The worker filed its own terminal report before exiting; that
+            # report is authoritative and must not be overwritten here.
+            continue
+        try:
+            metadata = lock_manager.status(identity.task_id)
+        except (LockBackendError, OSError):
+            blockers.append(
+                f"autopilot_stop_reconcile_status_failed:{identity.task_id}"
+            )
+            continue
+        if metadata is None:
+            continue
+        active = ActiveRunState.from_lock_metadata(dict(metadata))
+        if active is None or active.run_id != identity.run_id:
+            blockers.append(f"autopilot_stop_reconcile_lock_changed:{identity.task_id}")
+            continue
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=identity.run_id,
+                task_id=identity.task_id,
+                to_state=AUTOPILOT_STOP_TERMINATED_STATUS,
+                reason=AUTOPILOT_STOP_TERMINATION_REASON,
+            )
+        )
+        try:
+            released = lock_manager.release_stale_lock(
+                task_id=identity.task_id,
+                run_id=identity.run_id,
+                path=active.lock_path or Path(str(metadata.get("path") or "")),
+                kind="task",
+            )
+        except (LockBackendError, OSError):
+            blockers.append(
+                f"autopilot_stop_reconcile_release_failed:{identity.task_id}"
+            )
+            continue
+        if not released:
+            blockers.append(f"autopilot_stop_reconcile_lock_changed:{identity.task_id}")
+            continue
+        reconciled.append(identity.task_id)
+    return tuple(reconciled), tuple(blockers)
+
+
 def supervisor_lock_released(status: IntegrationLockStatus, run_id: str) -> bool:
     """True when the singleton lock is no longer held by `run_id`.
 
@@ -1609,6 +1981,9 @@ def append_autopilot_stopped_record(
     signal_number: int | None = None,
     process_exited: bool = True,
     lock_released: bool = True,
+    drained: Sequence[OwnedProcessIdentity] = (),
+    reconciled_task_ids: Sequence[str] = (),
+    reconciliation_blockers: Sequence[str] = (),
 ) -> None:
     record: dict[str, object] = {
         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
@@ -1620,6 +1995,9 @@ def append_autopilot_stopped_record(
         "stop_mode": stop_mode,
         "process_exited": process_exited,
         "lock_released": lock_released,
+        "drained": [identity.to_json() for identity in drained],
+        "reconciled_task_ids": list(reconciled_task_ids),
+        "reconciliation_blockers": list(reconciliation_blockers),
     }
     if signal_number is not None:
         record["signal"] = signal.Signals(signal_number).name
@@ -1642,6 +2020,8 @@ def stop_detached_autopilot(
     close_fd: Callable[[int], None] | None = None,
     sleep: Sleep | None = None,
     monotonic: Callable[[], float] | None = None,
+    process_table: Callable[[], dict[int, ProcessNode]] | None = None,
+    process_node: Callable[[int], ProcessNode | None] | None = None,
 ) -> AutopilotStopResult:
     """Stop a verified detached supervisor or explicitly recover its stale lock."""
 
@@ -1672,6 +2052,12 @@ def stop_detached_autopilot(
         pidfd_exited if pidfd_exited is not None else process_pidfd_exited
     )
     close_process_fd = close_fd if close_fd is not None else os.close
+    snapshot_process_table = (
+        process_table if process_table is not None else read_process_table
+    )
+    lookup_process_node = (
+        process_node if process_node is not None else read_process_node
+    )
     sleeper = sleep if sleep is not None else time_module.sleep
     clock = monotonic if monotonic is not None else time_module.monotonic
     lock_manager = build_lock_manager(
@@ -1921,6 +2307,8 @@ def stop_detached_autopilot(
         monotonic=clock,
         backend_deadline=backend_deadline,
         stop_deadline=stop_deadline,
+        process_table=snapshot_process_table,
+        process_node=lookup_process_node,
     )
 
 
@@ -1942,6 +2330,8 @@ def stop_verified_detached_autopilot(
     monotonic: Callable[[], float],
     backend_deadline: float,
     stop_deadline: float,
+    process_table: Callable[[], dict[int, ProcessNode]],
+    process_node: Callable[[int], ProcessNode | None],
 ) -> AutopilotStopResult:
     try:
         process_fd = pidfd_open(identity.pid)
@@ -1997,6 +2387,49 @@ def stop_verified_detached_autopilot(
                 blocker="autopilot_stop_identity_unverified:pid_reuse_or_mismatch",
             )
 
+        # The supervisor's own descendants are drained first: signalling only
+        # the supervisor lets its run-until-done child and that child's workers
+        # reparent to PID 1 and keep burning quota after stop reports success.
+        roots, roots_blocker = collect_owned_stop_roots(
+            run_store,
+            lock_manager,
+            repo=config.repo,
+            run_id=identity.run_id,
+            process_exists=process_exists,
+        )
+        if roots_blocker:
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=identity.run_id,
+                pid=identity.pid,
+                blocker=roots_blocker,
+            )
+        drain = drain_owned_process_tree(
+            roots,
+            pidfd_open=pidfd_open,
+            pidfd_signal=pidfd_signal,
+            pidfd_exited=pidfd_exited,
+            close_fd=close_fd,
+            sleep=sleep,
+            monotonic=monotonic,
+            deadline=stop_deadline,
+            process_table=process_table,
+            process_node=process_node,
+        )
+        if not drain.complete:
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=identity.run_id,
+                pid=identity.pid,
+                drained=drain.drained,
+                remaining=drain.remaining,
+                blocker=drain.blocker or "autopilot_stop_drain_incomplete",
+            )
+
         try:
             pidfd_signal(process_fd, signal.SIGTERM)
         except ProcessLookupError:
@@ -2008,6 +2441,7 @@ def stop_verified_detached_autopilot(
                 state="blocked",
                 run_id=identity.run_id,
                 pid=identity.pid,
+                drained=drain.drained,
                 blocker="autopilot_stop_signal_failed",
             )
 
@@ -2041,6 +2475,12 @@ def stop_verified_detached_autopilot(
                 )
             lock_released = supervisor_lock_released(current, identity.run_id)
             if process_exited and lock_released:
+                reconciled, reconcile_blockers = reconcile_drained_workers(
+                    run_store,
+                    lock_manager,
+                    repo=config.repo,
+                    drained=drain.drained,
+                )
                 append_autopilot_stopped_record(
                     run_store,
                     repo=config.repo,
@@ -2048,6 +2488,9 @@ def stop_verified_detached_autopilot(
                     pid=identity.pid,
                     stop_mode="operator_verified",
                     signal_number=signal.SIGTERM,
+                    drained=drain.drained,
+                    reconciled_task_ids=reconciled,
+                    reconciliation_blockers=reconcile_blockers,
                 )
                 return AutopilotStopResult(
                     repo=config.repo,
@@ -2057,6 +2500,9 @@ def stop_verified_detached_autopilot(
                     pid=identity.pid,
                     process_exited=True,
                     lock_released=True,
+                    drained=drain.drained,
+                    reconciled_task_ids=reconciled,
+                    reconciliation_blockers=reconcile_blockers,
                 )
             if monotonic() >= stop_deadline:
                 if process_exited and not lock_released:
@@ -2073,6 +2519,21 @@ def stop_verified_detached_autopilot(
                     pid=identity.pid,
                     process_exited=process_exited,
                     lock_released=lock_released,
+                    drained=drain.drained,
+                    remaining=(
+                        ()
+                        if process_exited
+                        else (
+                            OwnedProcessIdentity(
+                                role=OWNED_PROCESS_ROLE_SUPERVISOR,
+                                pid=identity.pid,
+                                process_group_id=identity.process_group_id,
+                                session_id=identity.session_id,
+                                process_birth_id=identity.process_birth_id,
+                                run_id=identity.run_id,
+                            ),
+                        )
+                    ),
                     blocker=blocker,
                 )
             try:
@@ -3519,6 +3980,7 @@ def execute_autopilot_cycle(
     config: VibeConfig,
     *,
     cycle_id: str,
+    autopilot_run_id: str = "",
     jobs: int,
     ask_agent: bool,
     continue_on_failure: bool,
@@ -3737,6 +4199,21 @@ def execute_autopilot_cycle(
 
         def _on_start(pid: int) -> None:
             observed_pid["pid"] = pid
+            # Appended before the launcher blocks on the child: a stop arriving
+            # mid-cycle otherwise has no durable identity for the in-flight
+            # child, and can only reach the supervisor.
+            identity = read_process_node(pid)
+            run_store.append_record(
+                autopilot_child_started_record(
+                    repo=config.repo,
+                    run_id=autopilot_run_id,
+                    cycle_id=cycle_id,
+                    pid=pid,
+                    process_group_id=(identity.process_group_id if identity else None),
+                    session_id=identity.session_id if identity else None,
+                    process_birth_id=(identity.process_birth_id if identity else ""),
+                )
+            )
 
         actions.append("launched_run_until_done")
         exit_code = launcher(
@@ -4466,6 +4943,7 @@ def run_autopilot(
             result = execute_autopilot_cycle(
                 config,
                 cycle_id=f"{supervisor_run_id}-c{cycle_number}",
+                autopilot_run_id=supervisor_run_id,
                 jobs=jobs,
                 ask_agent=ask_agent,
                 continue_on_failure=continue_on_failure,

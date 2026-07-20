@@ -53,9 +53,11 @@ AUTOPILOT_PLANNING_WORKER_RECORD_TYPE = "autopilot_planning_worker"
 AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE = "autopilot_planning_launch"
 AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE = "autopilot_planning_outcome"
 AUTOPILOT_IDLE_WAIT_RECORD_TYPE = "autopilot_idle_wait"
+AUTOPILOT_CHILD_STARTED_RECORD_TYPE = "autopilot_child_started"
 AUTOPILOT_RECORD_TYPES = frozenset(
     {
         AUTOPILOT_CYCLE_RECORD_TYPE,
+        AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
         AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
         AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
         AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
@@ -111,6 +113,38 @@ LOCK_TIMEOUT_SECONDS = 30.0
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def autopilot_child_started_record(
+    *,
+    repo: Path | str,
+    run_id: str,
+    cycle_id: str,
+    pid: int,
+    process_group_id: int | None,
+    session_id: int | None,
+    process_birth_id: str,
+) -> dict[str, object]:
+    """Durable identity of the run-until-done child while it is still running.
+
+    The launcher only returns the child's exit code, so without this record a
+    stop request arriving mid-cycle has no verified way to name the in-flight
+    child, and can only signal the supervisor while the child's own descendants
+    survive reparenting to PID 1.
+    """
+
+    return {
+        "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+        "record_type": AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
+        "occurred_at": utc_now_iso(),
+        "repo": str(repo),
+        "run_id": run_id,
+        "cycle_id": cycle_id,
+        "pid": pid,
+        "process_group_id": process_group_id,
+        "session_id": session_id,
+        "process_birth_id": process_birth_id,
+    }
 
 
 @dataclasses.dataclass(frozen=True)

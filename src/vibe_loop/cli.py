@@ -1356,18 +1356,45 @@ def render_detached_autopilot_launch(launch) -> str:
     )
 
 
+def render_owned_process_identities(identities) -> str:
+    return " ".join(
+        f"{identity.role}:{identity.pid}"
+        + (f"/{identity.task_id}" if identity.task_id else "")
+        for identity in identities
+    )
+
+
 def render_autopilot_stop(result) -> str:
+    lines: list[str] = []
     if not result.stopped:
         message = f"autopilot not stopped: {result.blocker or 'unknown'}"
         if result.pid is not None:
             message += f" pid={result.pid}"
         if result.run_id:
             message += f" run_id={result.run_id}"
-        return message
-    if result.state == "already_stopped":
+        lines.append(message)
+        if result.remaining:
+            lines.append(
+                "remaining: " + render_owned_process_identities(result.remaining)
+            )
+            lines.append(
+                "recovery: verify each remaining process is still owned by this "
+                "run, then rerun stop once it can be drained"
+            )
+    elif result.state == "already_stopped":
         return "autopilot already stopped"
-    action = "recovered" if result.recovered else "stopped"
-    return f"autopilot {action} pid={result.pid} run_id={result.run_id}"
+    else:
+        action = "recovered" if result.recovered else "stopped"
+        lines.append(f"autopilot {action} pid={result.pid} run_id={result.run_id}")
+    if result.drained:
+        lines.append("drained: " + render_owned_process_identities(result.drained))
+    if result.reconciled_task_ids:
+        lines.append(
+            "terminated runs released: " + " ".join(result.reconciled_task_ids)
+        )
+    for blocker in result.reconciliation_blockers:
+        lines.append(f"reconciliation blocker: {blocker}")
+    return "\n".join(lines)
 
 
 def render_autopilot_status(status: ProjectStatus) -> str:

@@ -49,6 +49,7 @@ from vibe_loop.locks import (
     build_lock_manager,
     fencing_token_value,
 )
+from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
     LimitWallSignal,
     detect_limit_wall,
@@ -1243,7 +1244,21 @@ class VibeRunner:
 
                 def record_worker_pid(worker_pid: int) -> None:
                     nonlocal active_state
-                    active_state = active_state.with_worker_pid(worker_pid)
+                    # Captured immediately after Popen, while the worker is
+                    # still the process this supervisor started: after it
+                    # execs its own session leader and reparents, the PID
+                    # alone can no longer prove which process is ours.
+                    identity = read_process_node(worker_pid)
+                    active_state = active_state.with_worker_pid(
+                        worker_pid,
+                        process_group_id=(
+                            identity.process_group_id if identity else None
+                        ),
+                        session_id=identity.session_id if identity else None,
+                        process_birth_id=(
+                            identity.process_birth_id if identity else ""
+                        ),
+                    )
                     update_active_task_lock()
                     report_status(
                         "worker process started "
@@ -1648,13 +1663,26 @@ class VibeRunner:
         if jobs < 1:
             raise ValueError("run-until-done --jobs must be at least 1")
         require_project_binding(self.config)
+        supervisor_pid = os.getpid()
+        supervisor_identity = read_process_node(supervisor_pid)
         self.run_store.append_record(
             {
                 "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
                 "record_type": RUN_SUPERVISOR_STARTED_RECORD_TYPE,
                 "occurred_at": utc_now_iso(),
                 "repo": str(self.config.repo),
-                "pid": os.getpid(),
+                "pid": supervisor_pid,
+                "process_group_id": (
+                    supervisor_identity.process_group_id
+                    if supervisor_identity
+                    else None
+                ),
+                "session_id": (
+                    supervisor_identity.session_id if supervisor_identity else None
+                ),
+                "process_birth_id": (
+                    supervisor_identity.process_birth_id if supervisor_identity else ""
+                ),
                 "jobs": jobs,
             }
         )

@@ -24,6 +24,7 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
     validate_lock_fencing_token,
 )
+from vibe_loop.processes import process_birth_identity
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
     RUN_RECORD_TYPE,
@@ -155,6 +156,9 @@ class ActiveRunState:
     heartbeat_at: str = ""
     fencing_token: str = ""
     worker_pid: int | None = None
+    worker_process_group_id: int | None = None
+    worker_session_id: int | None = None
+    worker_process_birth_id: str = ""
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
     supervisor_pid: int | None = None
@@ -296,6 +300,13 @@ class ActiveRunState:
             heartbeat_at=optional_string(metadata.get("heartbeat_at")) or "",
             fencing_token=fencing_token_value(metadata.get("fencing_token")),
             worker_pid=worker_pid,
+            worker_process_group_id=optional_int(
+                metadata.get("worker_process_group_id")
+            ),
+            worker_session_id=optional_int(metadata.get("worker_session_id")),
+            worker_process_birth_id=(
+                optional_string(metadata.get("worker_process_birth_id")) or ""
+            ),
             pid_source=pid_source,
             pid_scope=(
                 optional_string(metadata.get("pid_scope"))
@@ -307,8 +318,21 @@ class ActiveRunState:
             workspace=WorkspaceClaim.from_json(metadata.get("workspace")),
         )
 
-    def with_worker_pid(self, worker_pid: int) -> ActiveRunState:
-        return dataclasses.replace(self, worker_pid=worker_pid)
+    def with_worker_pid(
+        self,
+        worker_pid: int,
+        *,
+        process_group_id: int | None = None,
+        session_id: int | None = None,
+        process_birth_id: str = "",
+    ) -> ActiveRunState:
+        return dataclasses.replace(
+            self,
+            worker_pid=worker_pid,
+            worker_process_group_id=process_group_id,
+            worker_session_id=session_id,
+            worker_process_birth_id=process_birth_id,
+        )
 
     def with_trailer_context(
         self,
@@ -374,6 +398,9 @@ class ActiveRunState:
             "run_id": self.run_id,
             "pid": self.worker_pid,
             "worker_pid": self.worker_pid,
+            "worker_process_group_id": self.worker_process_group_id,
+            "worker_session_id": self.worker_session_id,
+            "worker_process_birth_id": self.worker_process_birth_id,
             "pid_source": self.pid_source,
             "pid_scope": self.pid_scope,
             "supervisor_pid": self.supervisor_pid,
@@ -515,6 +542,9 @@ class WorkerView:
             "stale_reason": self.stale_reason,
             "pid": self.active.worker_pid,
             "worker_pid": self.active.worker_pid,
+            "worker_process_group_id": self.active.worker_process_group_id,
+            "worker_session_id": self.active.worker_session_id,
+            "worker_process_birth_id": self.active.worker_process_birth_id,
             "pid_source": self.active.pid_source,
             "pid_scope": self.active.pid_scope,
             "supervisor_pid": self.active.supervisor_pid,
@@ -1337,13 +1367,37 @@ def classify_process(
     active: ActiveRunState,
     current_host: str,
     process_exists: ProcessExists | None = None,
+    birth_identity_lookup: Callable[[int], str] | None = None,
 ) -> str:
+    """Live-process disposition for one active-run lock.
+
+    When the run recorded a worker birth ID, a live PID alone is not enough:
+    the kernel may have recycled that PID for an unrelated process. Comparing
+    the recorded birth ID keeps a recycled PID from reading as this worker
+    still running. Runs recorded before birth IDs existed keep the plain
+    existence check rather than degrading to "missing".
+    """
+
     process_checker = process_exists if process_exists is not None else pid_exists
+    get_birth_identity = (
+        birth_identity_lookup
+        if birth_identity_lookup is not None
+        else process_birth_identity
+    )
     if active.host and active.host != current_host:
         return "foreign_host"
     if active.worker_pid is None:
         return "unknown_pid"
-    return "running" if process_checker(active.worker_pid) else "missing"
+    if not process_checker(active.worker_pid):
+        return "missing"
+    if not active.worker_process_birth_id:
+        return "running"
+    current_birth_id = get_birth_identity(active.worker_pid)
+    if not current_birth_id:
+        return "running"
+    return (
+        "running" if current_birth_id == active.worker_process_birth_id else "missing"
+    )
 
 
 def active_run_is_live(
