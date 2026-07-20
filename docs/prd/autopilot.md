@@ -817,9 +817,10 @@ switch providers.
 
 Worker usage defaults to implementation. An allowlisted `phase` and optional
 `review` or `discovery` `work_kind` from the terminal worker report can refine
-that provenance. Native planning records its configured model, observed
-provider, and full planning wall time. Retry ordinals are normalized to restart
-events before aggregation.
+that provenance. Native planning records model/provider provenance from the
+formatted analysis and authoring commands, falls back to the configured model,
+and measures the full planning wall time. Retry ordinals are normalized to
+restart events before aggregation.
 
 Acceptance covers Claude and Codex present/missing/malformed/limit-wall
 fixtures, run-record and Loopyard-compatible stats round trips, phase-aware

@@ -41,6 +41,7 @@ from vibe_loop.autopilot import (
     PLANNING_UNPRODUCTIVE_OUTCOMES,
     classify_planning_outcome,
     planning_outcome_backoff,
+    planning_outcome_record,
     planning_provider_launched,
     planning_source_fingerprint,
     NativePlanningWorkerInterrupted,
@@ -4677,6 +4678,56 @@ class AutopilotIdleWaitTests(unittest.TestCase):
 
 
 class NativePlanningTests(unittest.TestCase):
+    def test_explicit_worker_model_persists_in_planning_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "codex exec -m gpt-explicit {prompt}"\n',
+                encoding="utf-8",
+            )
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
+                self.assertIn("-m gpt-explicit", command)
+                on_start(4242)
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-model",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "queue is below target",
+                    "objective": "add one task",
+                },
+                worker_launcher=worker_launcher,
+            )
+            run_store.append_record(
+                planning_outcome_record(
+                    repo,
+                    cycle_id="cycle-model",
+                    outcome="zero_created",
+                    fingerprint="fingerprint",
+                    runnable_before=result.worker.runnable_before,
+                    runnable_after=result.worker.runnable_after,
+                    model_provider=result.model_provider,
+                    model_id=result.model_id,
+                    stats=result.stats,
+                )
+            )
+            persisted = run_store.read_records()[-1]
+
+        self.assertEqual(result.model_provider, "openai")
+        self.assertEqual(result.model_id, "gpt-explicit")
+        self.assertEqual(persisted["model_provider"], "openai")
+        self.assertEqual(persisted["model_id"], "gpt-explicit")
+
     def test_read_only_no_plan_decision_journals_skipped_worker_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

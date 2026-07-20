@@ -521,6 +521,7 @@ class VibeRunner:
         self.last_analysis_usage = unavailable_usage(
             "unknown", "provider_usage_not_reported"
         )
+        self.last_analysis_runtime_context = AgentRuntimeContext()
         # Terminal results recorded by an exhausting recovery run before it
         # released its lock, keyed by run id and consumed by the recovery
         # driver so the verdict is written exactly once.
@@ -720,6 +721,9 @@ class VibeRunner:
         command_str = inject_structured_usage_output(
             command_str, self.config.agent.agent_kind
         )
+        self.last_analysis_runtime_context = parse_agent_runtime_context_from_command(
+            command_str
+        )
         cmd, use_shell = prepare_shell_command(command_str)
         walls: list[LimitWallSignal] = []
         try:
@@ -741,11 +745,10 @@ class VibeRunner:
         except (OSError, subprocess.TimeoutExpired) as exc:
             report_status(f"analysis agent failed to start: {exc}")
             return None
-        provider = parse_agent_runtime_context_from_command(
-            command_str
-        ).model_provider or {"codex": "openai", "claude": "anthropic"}.get(
-            self.config.agent.agent_kind, "unknown"
-        )
+        provider = self.last_analysis_runtime_context.model_provider or {
+            "codex": "openai",
+            "claude": "anthropic",
+        }.get(self.config.agent.agent_kind, "unknown")
         usage_observer = ProviderUsageObserver(provider)
         for line in (result.stdout or "").splitlines():
             usage_observer.observe_line(line)

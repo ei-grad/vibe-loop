@@ -4420,7 +4420,7 @@ class AnalysisAgentTests(unittest.TestCase):
                     repo=repo,
                     agent=AgentConfig(
                         command="worker",
-                        analysis_command=f"{stub} {{prompt}}",
+                        analysis_command=f"{stub} --model analysis-model {{prompt}}",
                     ),
                 )
             )
@@ -4433,6 +4433,13 @@ class AnalysisAgentTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(output_path.read_text(encoding="utf-8")),
                 {"decision": "keep", "reason": "active WIP"},
+            )
+            self.assertEqual(
+                runner.last_analysis_runtime_context.model_id, "analysis-model"
+            )
+            self.assertEqual(
+                runner.last_analysis_runtime_context.model_id_source,
+                "command_arg:--model",
             )
 
     def test_run_analysis_agent_returns_none_on_nonzero_exit(self) -> None:
