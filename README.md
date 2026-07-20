@@ -554,8 +554,11 @@ classified and repeated futility is throttled. Two consecutive `invalid_plan`,
 The backoff extends the idle wait rather than blocking it: a task source that
 reaches `min_ready` still wakes the next cycle early, stop requests are still
 honoured, and `next_wake` reports the deadline the supervisor actually sleeps to.
-A productive launch, or a materially changed task source, clears the outcome
-gate; only time clears the daily cap. `vibe-loop autopilot status` names the
+A launch that creates tasks, or a materially changed task source, clears the
+outcome gate; only time clears the daily cap, which counts every launch that
+reached a provider including one interrupted before it could record an outcome.
+Provider and infrastructure failures stay distinct from `invalid_plan` and never
+extend the unproductive streak. `vibe-loop autopilot status` names the
 recorded outcome and the backoff reason. Fallback candidate filtering uses
 the cycle's active-run/conflict snapshot instead of issuing separately timed
 lock-backend queries; lock-only changes wake through the configured adapter or

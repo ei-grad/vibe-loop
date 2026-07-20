@@ -426,18 +426,33 @@ Each launch must therefore be classified into exactly one outcome:
 
 | Outcome | Meaning | Charged to the streak |
 | --- | --- | --- |
-| `productive` | runnable work rose | resets it |
+| `productive` | the launch created at least one task | resets it |
 | `invalid_plan` | the analysis agent returned an unusable decision | yes |
 | `no_tasks` | the analysis agent decided no plan was needed | yes |
-| `zero_created` | the authoring worker finished without adding runnable work | yes |
+| `zero_created` | the authoring worker finished without creating a task | yes |
 | `limit_wall` | a provider wall stopped the launch | no |
+| `analysis_error` | the analysis stage failed on infrastructure | no |
 | `worker_error` | the authoring worker never started or failed | no |
 | `task_source_error` | the task source could not be read after planning | no |
 
-The three inconclusive outcomes say nothing about whether planning *can* produce
+The four inconclusive outcomes say nothing about whether planning *can* produce
 work, so they neither extend nor reset the streak; classifying them as
 unproductive would let provider walls consume the planning budget, and
 classifying them as productive would reopen the gate on no evidence.
+
+`invalid_plan` is reserved for a genuine plan/schema fault. Failing to resolve
+the agent executable, an `OSError`, a subprocess failure, and an unreadable task
+source are infrastructure faults with distinct causes and no bearing on planning
+quality; folding them into `invalid_plan` would back off planning for six hours
+because of a misconfigured path. They are recorded as `analysis_error`,
+`worker_error`, or `task_source_error` accordingly.
+
+Productivity is decided from authoritative created-task evidence - the task
+identities that appeared across the launch - not from the runnable-count delta.
+Concurrent claims and completions move that count independently of planning, so
+the delta can call a productive launch unproductive (workers claimed tasks while
+planning ran) or credit planning for work it never authored (a completion
+unblocked dependents).
 
 Two independent gates then withhold planning, and the later deadline governs:
 
@@ -450,11 +465,22 @@ Two independent gates then withhold planning, and the later deadline governs:
 A withheld cycle must not invoke the analysis agent at all; attempting the launch
 and discarding it would spend exactly the budget the gate exists to protect.
 
+The daily cap counts a durable pre-launch record appended before the analysis
+agent runs, not only terminal outcome records. A launch that is interrupted or
+crashes after the analysis or worker started but before it can classify itself
+has already spent budget, and must still consume one of the day's launches;
+counting terminal records alone would let a crash loop plan without limit. The
+only launch exempted is one whose outcome proves no provider was reached, such
+as an unresolvable agent executable.
+
 The outcome gate is evidence-based and releases when the evidence changes: a
-launch is compared against a fingerprint of the task-source counts it acted on,
-and a materially changed board (or a productive launch) clears the streak. The
-daily cap is a spend ceiling, not an evidence gate, so a changed fingerprint does
-not lift it.
+launch is compared against a fingerprint of the task source it acted on, and a
+materially changed board (or a productive launch) clears the streak. That
+fingerprint is built from runnable task identity and content, so swapping one
+runnable task for another is detected even though every count is unchanged,
+while `active`/`done` counter churn from unrelated workers is not mistaken for
+fresh planning evidence. The daily cap is a spend ceiling, not an evidence gate,
+so a changed fingerprint does not lift it.
 
 The backoff extends the idle wait budget rather than adding a blocking sleep, so
 it can never shorten an operator's configured interval, only lengthen it, and so

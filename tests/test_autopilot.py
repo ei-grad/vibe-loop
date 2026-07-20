@@ -24,6 +24,12 @@ from vibe_loop.autopilot import (
     NativePlanningDecision,
     NativePlanningProcessResult,
     NativePlanningWorkerResult,
+    PLANNING_ERROR_EXECUTABLE_RESOLUTION,
+    PLANNING_ERROR_INVALID_PLAN,
+    PLANNING_ERROR_LIMIT_WALL,
+    PLANNING_ERROR_OS_ERROR,
+    PLANNING_ERROR_SUBPROCESS,
+    PLANNING_OUTCOME_ANALYSIS_ERROR,
     PLANNING_OUTCOME_INVALID_PLAN,
     PLANNING_OUTCOME_LIMIT_WALL,
     PLANNING_OUTCOME_NO_TASKS,
@@ -34,6 +40,8 @@ from vibe_loop.autopilot import (
     PLANNING_UNPRODUCTIVE_OUTCOMES,
     classify_planning_outcome,
     planning_outcome_backoff,
+    planning_provider_launched,
+    planning_source_fingerprint,
     NativePlanningWorkerInterrupted,
     ProjectEntry,
     ProjectRegistry,
@@ -84,6 +92,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
     AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -4668,9 +4677,87 @@ def planning_outcome_records(
             "fingerprint": fingerprint,
             "runnable_before": 0,
             "runnable_after": 0,
+            "created_count": 0,
+            "created_task_ids": [],
+            "provider_launched": True,
         }
         for index, (seconds_ago, outcome, fingerprint) in enumerate(entries)
     ]
+
+
+def planning_launch_records(
+    repo: Path,
+    entries: list[tuple[float, str]],
+    *,
+    now: datetime.datetime,
+) -> list[dict[str, object]]:
+    """Pre-launch records placed at fixed offsets (seconds ago) from ``now``."""
+    return [
+        {
+            "schema_version": 1,
+            "record_type": AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+            "occurred_at": (now - datetime.timedelta(seconds=seconds_ago)).isoformat(),
+            "repo": str(repo),
+            "cycle_id": cycle_id,
+            "fingerprint": "10:0:0000000000000000",
+        }
+        for seconds_ago, cycle_id in entries
+    ]
+
+
+class PlanningSourceFingerprintTests(unittest.TestCase):
+    def _queue(self, tasks, **counts) -> TaskQueueStatus:
+        return TaskQueueStatus(
+            total=counts.get("total", len(tasks)),
+            runnable=counts.get("runnable", len(tasks)),
+            active=counts.get("active", 0),
+            done=counts.get("done", 0),
+            blocked=counts.get("blocked", 0),
+            runnable_tasks=tuple(tasks),
+        )
+
+    def _task(self, task_id: str, title: str = "t", priority: str = "normal") -> dict:
+        return {
+            "id": task_id,
+            "title": title,
+            "status": "ready",
+            "priority": priority,
+            "source": "board",
+        }
+
+    def test_the_same_board_fingerprints_the_same(self) -> None:
+        tasks = [self._task("a"), self._task("b")]
+        self.assertEqual(
+            planning_source_fingerprint(self._queue(tasks)),
+            planning_source_fingerprint(self._queue(list(reversed(tasks)))),
+        )
+
+    def test_swapping_one_task_for_another_changes_the_fingerprint(self) -> None:
+        # Same cardinality, different board: the counters alone cannot see
+        # this, and planning deserves a fresh look.
+        before = self._queue([self._task("a"), self._task("b")])
+        after = self._queue([self._task("a"), self._task("c")])
+        self.assertNotEqual(
+            planning_source_fingerprint(before), planning_source_fingerprint(after)
+        )
+
+    def test_editing_a_task_changes_the_fingerprint(self) -> None:
+        before = self._queue([self._task("a", title="draft")])
+        after = self._queue([self._task("a", title="rewritten")])
+        self.assertNotEqual(
+            planning_source_fingerprint(before), planning_source_fingerprint(after)
+        )
+
+    def test_unrelated_counter_churn_does_not_change_the_fingerprint(self) -> None:
+        # Other workers claiming and finishing tasks moves active/done without
+        # changing what planning was asked to act on. Treating that as fresh
+        # evidence would let the backoff be reset by ordinary traffic.
+        tasks = [self._task("a")]
+        before = self._queue(tasks, total=10, active=1, done=2, blocked=3)
+        after = self._queue(tasks, total=10, active=4, done=5, blocked=0)
+        self.assertEqual(
+            planning_source_fingerprint(before), planning_source_fingerprint(after)
+        )
 
 
 class PlanningOutcomeClassificationTests(unittest.TestCase):
@@ -4680,11 +4767,14 @@ class PlanningOutcomeClassificationTests(unittest.TestCase):
         status: str = "completed",
         should_plan: bool = True,
         agent_error: str = "",
+        agent_error_kind: str = "",
         worker_status: str = "completed",
         attempted: bool = True,
         runnable_before: int = 0,
         runnable_after: int | None = 0,
         task_source_error: str = "",
+        created_task_ids: tuple[str, ...] = (),
+        created_count: int | None = 0,
     ) -> NativePlanningCycleResult:
         return NativePlanningCycleResult(
             decision=NativePlanningDecision(
@@ -4697,6 +4787,7 @@ class PlanningOutcomeClassificationTests(unittest.TestCase):
                 objective="objective" if should_plan else "",
                 agent_invoked=True,
                 agent_error=agent_error,
+                agent_error_kind=agent_error_kind,
             ),
             worker=NativePlanningWorkerResult(
                 cycle_id="c1",
@@ -4711,12 +4802,15 @@ class PlanningOutcomeClassificationTests(unittest.TestCase):
                 runnable_before=runnable_before,
                 runnable_after=runnable_after,
                 task_source_error=task_source_error,
+                created_task_ids=created_task_ids,
+                created_count=created_count,
             ),
         )
 
     def test_invalid_schema_is_an_invalid_plan_outcome(self) -> None:
         result = self._result(
             agent_error="analysis agent returned an invalid planning schema",
+            agent_error_kind=PLANNING_ERROR_INVALID_PLAN,
         )
         self.assertEqual(
             classify_planning_outcome(result), PLANNING_OUTCOME_INVALID_PLAN
@@ -4732,9 +4826,72 @@ class PlanningOutcomeClassificationTests(unittest.TestCase):
             classify_planning_outcome(result), PLANNING_OUTCOME_ZERO_CREATED
         )
 
-    def test_planning_that_adds_runnable_work_is_productive(self) -> None:
-        result = self._result(runnable_before=0, runnable_after=2)
+    def test_planning_that_creates_tasks_is_productive(self) -> None:
+        result = self._result(
+            runnable_before=0,
+            runnable_after=2,
+            created_task_ids=("t-1", "t-2"),
+            created_count=2,
+        )
         self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_PRODUCTIVE)
+
+    def test_created_tasks_beat_a_runnable_count_that_concurrency_moved_down(
+        self,
+    ) -> None:
+        # Two workers claimed tasks while planning ran, so the runnable count
+        # fell even though planning authored one. Counting the delta would
+        # call this unproductive and start backing off real productive work.
+        result = self._result(
+            runnable_before=5,
+            runnable_after=4,
+            created_task_ids=("t-9",),
+            created_count=1,
+        )
+        self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_PRODUCTIVE)
+
+    def test_a_runnable_count_that_rose_without_created_tasks_is_zero_created(
+        self,
+    ) -> None:
+        # A concurrent completion unblocked dependents, lifting the runnable
+        # count. Planning created nothing and must not be credited for it.
+        result = self._result(
+            runnable_before=1,
+            runnable_after=4,
+            created_task_ids=(),
+            created_count=0,
+        )
+        self.assertEqual(
+            classify_planning_outcome(result), PLANNING_OUTCOME_ZERO_CREATED
+        )
+
+    def test_infrastructure_analysis_errors_are_not_invalid_plans(self) -> None:
+        for kind in (
+            PLANNING_ERROR_EXECUTABLE_RESOLUTION,
+            PLANNING_ERROR_OS_ERROR,
+            PLANNING_ERROR_SUBPROCESS,
+        ):
+            with self.subTest(kind=kind):
+                result = self._result(agent_error="boom", agent_error_kind=kind)
+                outcome = classify_planning_outcome(result)
+                self.assertEqual(outcome, PLANNING_OUTCOME_ANALYSIS_ERROR)
+                self.assertNotIn(outcome, PLANNING_UNPRODUCTIVE_OUTCOMES)
+
+    def test_an_unresolvable_agent_executable_never_reached_a_provider(self) -> None:
+        result = self._result(
+            agent_error="agent.command could not be resolved",
+            agent_error_kind=PLANNING_ERROR_EXECUTABLE_RESOLUTION,
+            attempted=False,
+        )
+        self.assertFalse(planning_provider_launched(result))
+
+    def test_a_limit_wall_still_counts_as_provider_spend(self) -> None:
+        result = self._result(
+            status="limit_wall",
+            agent_error="usage limit",
+            agent_error_kind=PLANNING_ERROR_LIMIT_WALL,
+            attempted=False,
+        )
+        self.assertTrue(planning_provider_launched(result))
 
     def test_a_limit_wall_outranks_the_analysis_error_it_produces(self) -> None:
         # A wall stops the analysis agent, which also surfaces as an agent
@@ -4934,6 +5091,68 @@ class PlanningOutcomeBackoffTests(unittest.TestCase):
             ],
             now=self.now,
         )
+        self.assertIsNone(self._backoff(records, repo=repo, fingerprint="9:9:9:9:9"))
+
+    def test_a_launch_interrupted_before_its_outcome_still_consumes_the_cap(
+        self,
+    ) -> None:
+        # Three launches finished and a fourth was interrupted after the
+        # analysis agent started but before it could classify itself. That
+        # fourth launch spent provider budget, so the ceiling must count it -
+        # otherwise a crash loop buys unlimited planning.
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (80000.0, "productive", "1:0:0:0:0"),
+                (60000.0, "productive", "2:0:0:0:0"),
+                (40000.0, "productive", "3:0:0:0:0"),
+            ],
+            now=self.now,
+        ) + planning_launch_records(repo, [(60.0, "crashed")], now=self.now)
+        backoff = self._backoff(records, repo=repo, fingerprint="9:9:9:9:9")
+        assert backoff is not None
+        self.assertEqual(backoff.reason, "daily_launch_cap")
+        self.assertEqual(backoff.launches_in_window, 4)
+
+    def test_a_launch_and_its_outcome_consume_one_slot_not_two(self) -> None:
+        repo = Path("/repo")
+        outcomes = planning_outcome_records(
+            repo,
+            [
+                (80000.0, "productive", "1:0:0:0:0"),
+                (60000.0, "productive", "2:0:0:0:0"),
+                (40000.0, "productive", "3:0:0:0:0"),
+            ],
+            now=self.now,
+        )
+        launches = planning_launch_records(
+            repo,
+            [(80001.0, "c0"), (60001.0, "c1"), (40001.0, "c2")],
+            now=self.now,
+        )
+        self.assertIsNone(
+            self._backoff(launches + outcomes, repo=repo, fingerprint="9:9:9:9:9")
+        )
+
+    def test_a_launch_that_never_reached_a_provider_does_not_consume_the_cap(
+        self,
+    ) -> None:
+        # An unresolvable agent executable fails before any provider call, so
+        # it is not spend and must not burn a day's planning budget.
+        repo = Path("/repo")
+        records = planning_outcome_records(
+            repo,
+            [
+                (80000.0, "productive", "1:0:0:0:0"),
+                (60000.0, "productive", "2:0:0:0:0"),
+                (40000.0, "productive", "3:0:0:0:0"),
+                (60.0, "analysis_error", "4:0:0:0:0"),
+            ],
+            now=self.now,
+        )
+        records[-1]["provider_launched"] = False
+        records.extend(planning_launch_records(repo, [(61.0, "c3")], now=self.now))
         self.assertIsNone(self._backoff(records, repo=repo, fingerprint="9:9:9:9:9"))
 
     def test_the_longer_of_the_two_gates_governs(self) -> None:
@@ -5146,6 +5365,8 @@ class PlanningBackoffCycleTests(unittest.TestCase):
                         exit_code=0,
                         runnable_before=0,
                         runnable_after=3,
+                        created_task_ids=("TASK-01", "TASK-02", "TASK-03"),
+                        created_count=3,
                     ),
                 )
 

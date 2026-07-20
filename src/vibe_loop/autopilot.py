@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import select
@@ -52,6 +53,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
     AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -2693,6 +2695,7 @@ class NativePlanningDecision:
     objective: str
     agent_invoked: bool
     agent_error: str = ""
+    agent_error_kind: str = ""
     limit_wall_reset_text: str = ""
     limit_wall_pause_seconds: float | None = None
 
@@ -2716,6 +2719,7 @@ class NativePlanningDecision:
             "objective": self.objective,
             "agent_invoked": self.agent_invoked,
             "agent_error": self.agent_error,
+            "agent_error_kind": self.agent_error_kind,
             "limit_wall_reset_text": self.limit_wall_reset_text,
             "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
         }
@@ -2738,6 +2742,14 @@ class NativePlanningWorkerResult:
     timed_out: bool = False
     task_source_error: str = ""
     error: str = ""
+    # Task identities that appeared in the runnable set across the launch.
+    # ``None`` means the post-launch snapshot was unreadable, so nothing can be
+    # claimed about what planning created; an empty tuple means it created
+    # nothing. Identities are used instead of the runnable count delta because
+    # concurrent claims and completions move that count independently of what
+    # this planning launch authored.
+    created_task_ids: tuple[str, ...] = ()
+    created_count: int | None = 0
 
     def to_record(self, repo: Path) -> dict[str, object]:
         return {
@@ -2761,6 +2773,8 @@ class NativePlanningWorkerResult:
             "timed_out": self.timed_out,
             "task_source_error": self.task_source_error,
             "error": self.error,
+            "created_task_ids": list(self.created_task_ids),
+            "created_count": self.created_count,
         }
 
 
@@ -2777,6 +2791,16 @@ PLANNING_OUTCOME_ZERO_CREATED = "zero_created"
 PLANNING_OUTCOME_LIMIT_WALL = "limit_wall"
 PLANNING_OUTCOME_WORKER_ERROR = "worker_error"
 PLANNING_OUTCOME_TASK_SOURCE_ERROR = "task_source_error"
+PLANNING_OUTCOME_ANALYSIS_ERROR = "analysis_error"
+
+# Why the analysis stage produced no usable decision. Only ``invalid_plan``
+# says anything about planning's ability to produce work; the rest are
+# infrastructure faults that must stay out of the unproductive streak.
+PLANNING_ERROR_INVALID_PLAN = "invalid_plan"
+PLANNING_ERROR_EXECUTABLE_RESOLUTION = "executable_resolution"
+PLANNING_ERROR_OS_ERROR = "os_error"
+PLANNING_ERROR_SUBPROCESS = "subprocess_error"
+PLANNING_ERROR_LIMIT_WALL = "limit_wall"
 # The three outcomes that spent provider budget and left the board no more
 # runnable than before. Everything else is either productive or inconclusive.
 PLANNING_UNPRODUCTIVE_OUTCOMES = frozenset(
@@ -2801,18 +2825,34 @@ def classify_planning_outcome(result: NativePlanningCycleResult) -> str:
     if decision.limit_wall or worker.status == "skipped_limit_wall":
         return PLANNING_OUTCOME_LIMIT_WALL
     if decision.agent_error:
-        return PLANNING_OUTCOME_INVALID_PLAN
+        if decision.agent_error_kind == PLANNING_ERROR_INVALID_PLAN:
+            return PLANNING_OUTCOME_INVALID_PLAN
+        return PLANNING_OUTCOME_ANALYSIS_ERROR
     if not decision.should_plan:
         return PLANNING_OUTCOME_NO_TASKS
     if not worker.attempted:
         return PLANNING_OUTCOME_WORKER_ERROR
-    if worker.task_source_error or worker.runnable_after is None:
+    if worker.task_source_error or worker.created_count is None:
         return PLANNING_OUTCOME_TASK_SOURCE_ERROR
     if worker.status != "completed":
         return PLANNING_OUTCOME_WORKER_ERROR
-    if worker.runnable_after > worker.runnable_before:
+    if worker.created_count > 0:
         return PLANNING_OUTCOME_PRODUCTIVE
     return PLANNING_OUTCOME_ZERO_CREATED
+
+
+def planning_provider_launched(result: NativePlanningCycleResult) -> bool:
+    """Whether this cycle actually spent provider budget.
+
+    The rolling-day ceiling is a spend ceiling, so it counts launches that
+    reached a provider. Failing to resolve the agent executable never reaches
+    one and must not consume a day's planning budget; everything else -
+    including a limit wall, a crash, or an unreadable task source - either
+    reached the provider or cannot be proven not to have.
+    """
+    if result.worker.started:
+        return True
+    return result.decision.agent_error_kind != PLANNING_ERROR_EXECUTABLE_RESOLUTION
 
 
 def planning_source_fingerprint(queue: TaskQueueStatus) -> str:
@@ -2822,8 +2862,23 @@ def planning_source_fingerprint(queue: TaskQueueStatus) -> str:
     repeating the second one cannot plausibly produce a different result. A
     changed fingerprint is the "task source materially changed" signal that
     releases the unproductive-outcome backoff.
+
+    Built from runnable task identity and content rather than status counters:
+    swapping one runnable task for another keeps every count identical but is a
+    genuinely different board, while ``active``/``done`` counters churn as
+    unrelated workers claim and finish work that planning was never asked about.
     """
-    return f"{queue.total}:{queue.runnable}:{queue.active}:{queue.done}:{queue.blocked}"
+    identity = "\n".join(
+        sorted(
+            "\x1f".join(
+                str(task.get(field) or "")
+                for field in ("id", "title", "status", "priority")
+            )
+            for task in queue.runnable_tasks
+        )
+    )
+    digest = hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"{queue.total}:{queue.runnable}:{digest}"
 
 
 PLANNING_OUTCOME_SCAN_MAX_RECORDS = 500
@@ -2847,13 +2902,17 @@ class PlanningBackoff:
         )
 
 
-def _planning_outcome_records(
-    run_store: RunStore, repo: Path
-) -> list[dict[str, object]]:
+PLANNING_RECORD_TYPES = (
+    AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+    AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
+)
+
+
+def _planning_records(run_store: RunStore, repo: Path) -> list[dict[str, object]]:
     records = [
         record
         for record in run_store.read_records()
-        if record.get("record_type") == AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE
+        if record.get("record_type") in PLANNING_RECORD_TYPES
         and str(record.get("repo") or "") == str(repo)
     ]
     return records[-PLANNING_OUTCOME_SCAN_MAX_RECORDS:]
@@ -2890,20 +2949,27 @@ def planning_outcome_backoff(
     * ``daily_launch_cap`` - a hard ceiling of ``max_launches_per_day`` launches
       in a rolling day. This is a spend ceiling, not an evidence gate, so a
       changed fingerprint does *not* lift it; it expires only when the oldest
-      launch in the window ages out.
+      launch in the window ages out. It counts durable pre-launch records, so a
+      launch that was interrupted or crashed before its outcome was appended
+      still consumes a day's budget.
 
     Pure decision function: reads recorded state, returns seconds, never sleeps.
     Returns None when planning may run now.
     """
     moment = now if now is not None else datetime.now(UTC)
-    records = _planning_outcome_records(run_store, repo)
+    records = _planning_records(run_store, repo)
     if not records:
         return None
 
     deadlines: list[tuple[float, str, str, int, int]] = []
 
+    outcomes = [
+        record
+        for record in records
+        if record.get("record_type") == AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE
+    ]
     streak: list[dict[str, object]] = []
-    for record in reversed(records):
+    for record in reversed(outcomes):
         outcome = str(record.get("outcome") or "")
         if outcome == PLANNING_OUTCOME_PRODUCTIVE:
             break
@@ -2911,12 +2977,30 @@ def planning_outcome_backoff(
             # Inconclusive: neither evidence of futility nor of progress.
             continue
         streak.append(record)
-    launch_times = [
-        occurred
-        for record in records
-        if (occurred := _parse_record_time(record.get("occurred_at"))) is not None
-        and (moment - occurred).total_seconds() < PLANNING_LAUNCH_WINDOW_SECONDS
-    ]
+
+    # One entry per planning cycle, timed by its earliest durable record. A
+    # cycle whose outcome record proves the provider was never reached is not
+    # spend and does not consume the ceiling; a cycle with no outcome record at
+    # all crashed mid-launch and is counted, because it cannot be shown free.
+    launch_times: list[datetime] = []
+    cycle_times: dict[str, datetime] = {}
+    cycle_free: dict[str, bool] = {}
+    for record in records:
+        occurred = _parse_record_time(record.get("occurred_at"))
+        if occurred is None:
+            continue
+        cycle_id = str(record.get("cycle_id") or "")
+        key = cycle_id or f"\x00{len(cycle_times)}"
+        previous = cycle_times.get(key)
+        if previous is None or occurred < previous:
+            cycle_times[key] = occurred
+        if record.get("record_type") == AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE:
+            cycle_free[key] = record.get("provider_launched") is False
+    for key, occurred in cycle_times.items():
+        if cycle_free.get(key):
+            continue
+        if (moment - occurred).total_seconds() < PLANNING_LAUNCH_WINDOW_SECONDS:
+            launch_times.append(occurred)
     launches_in_window = len(launch_times)
 
     if streak and len(streak) >= unproductive_threshold and backoff_seconds > 0:
@@ -2947,7 +3031,7 @@ def planning_outcome_backoff(
                 (
                     remaining,
                     "daily_launch_cap",
-                    str(records[-1].get("outcome") or ""),
+                    str(outcomes[-1].get("outcome") or "") if outcomes else "",
                     len(streak),
                     launches_in_window,
                 )
@@ -2965,6 +3049,25 @@ def planning_outcome_backoff(
     )
 
 
+def planning_launch_record(
+    repo: Path, *, cycle_id: str, fingerprint: str
+) -> dict[str, object]:
+    """Durable evidence that a planning launch was about to spend budget.
+
+    Appended before the analysis agent runs so the rolling-day ceiling still
+    counts a launch that is interrupted or crashed before it can classify its
+    own outcome.
+    """
+    return {
+        "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+        "record_type": AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
+        "occurred_at": utc_now_iso(),
+        "repo": str(repo),
+        "cycle_id": cycle_id,
+        "fingerprint": fingerprint,
+    }
+
+
 def planning_outcome_record(
     repo: Path,
     *,
@@ -2973,6 +3076,9 @@ def planning_outcome_record(
     fingerprint: str,
     runnable_before: int,
     runnable_after: int | None,
+    created_count: int | None = None,
+    created_task_ids: Sequence[str] = (),
+    provider_launched: bool = True,
 ) -> dict[str, object]:
     return {
         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
@@ -2984,6 +3090,9 @@ def planning_outcome_record(
         "fingerprint": fingerprint,
         "runnable_before": runnable_before,
         "runnable_after": runnable_after,
+        "created_count": created_count,
+        "created_task_ids": list(created_task_ids),
+        "provider_launched": provider_launched,
     }
 
 
@@ -3192,6 +3301,7 @@ def run_native_planning(
     runner = analysis_runner or VibeRunner(config).run_analysis_agent
     output_path = config.state_path / "autopilot" / f"{cycle_id}-planning-decision.json"
     agent_error = ""
+    agent_error_kind = ""
     limit_wall_reset_text = ""
     limit_wall_pause: float | None = None
     try:
@@ -3206,19 +3316,30 @@ def run_native_planning(
         # the same wall every cycle.
         payload = None
         agent_error = _bounded_planning_text(exc)
+        agent_error_kind = PLANNING_ERROR_LIMIT_WALL
         limit_wall_reset_text = exc.signal.reset_text
         limit_wall_pause = exc.pause_seconds
-    except (
-        AgentResolutionError,
-        KeyError,
-        OSError,
-        subprocess.SubprocessError,
-        ValueError,
-    ) as exc:
+    except AgentResolutionError as exc:
         payload = None
         agent_error = _bounded_planning_text(exc)
+        agent_error_kind = PLANNING_ERROR_EXECUTABLE_RESOLUTION
+    except subprocess.SubprocessError as exc:
+        payload = None
+        agent_error = _bounded_planning_text(exc)
+        agent_error_kind = PLANNING_ERROR_SUBPROCESS
+    except OSError as exc:
+        payload = None
+        agent_error = _bounded_planning_text(exc)
+        agent_error_kind = PLANNING_ERROR_OS_ERROR
+    except (KeyError, ValueError) as exc:
+        # The analysis agent answered, but its output could not be read as a
+        # planning decision: that is a plan/schema fault, not infrastructure.
+        payload = None
+        agent_error = _bounded_planning_text(exc)
+        agent_error_kind = PLANNING_ERROR_INVALID_PLAN
     if payload is None and not agent_error:
         agent_error = "analysis agent returned no planning decision"
+        agent_error_kind = PLANNING_ERROR_INVALID_PLAN
     should_plan = False
     reason = ""
     objective = ""
@@ -3226,6 +3347,8 @@ def run_native_planning(
         should_plan, reason, objective, agent_error = validate_native_planning_decision(
             payload
         )
+        if agent_error:
+            agent_error_kind = PLANNING_ERROR_INVALID_PLAN
     decision = NativePlanningDecision(
         cycle_id=cycle_id,
         runnable=status.queue.runnable,
@@ -3236,6 +3359,7 @@ def run_native_planning(
         objective=objective,
         agent_invoked=True,
         agent_error=agent_error,
+        agent_error_kind=agent_error_kind,
         limit_wall_reset_text=limit_wall_reset_text,
         limit_wall_pause_seconds=limit_wall_pause,
     )
@@ -3328,10 +3452,27 @@ def run_native_planning(
 
     task_source_error = ""
     runnable_after: int | None = status.queue.runnable
+    created_task_ids: tuple[str, ...] = ()
+    created_count: int | None = 0
     if started_pid is not None and interruption is None:
         queue_after = collect_task_queue_status(config)
         task_source_error = _bounded_planning_text(queue_after.source_error)
         runnable_after = None if task_source_error else queue_after.runnable
+        if task_source_error:
+            created_count = None
+        else:
+            before_ids = {
+                str(task.get("id") or "") for task in status.queue.runnable_tasks
+            }
+            created_task_ids = tuple(
+                sorted(
+                    task_id
+                    for task in queue_after.runnable_tasks
+                    if (task_id := str(task.get("id") or ""))
+                    and task_id not in before_ids
+                )
+            )
+            created_count = len(created_task_ids)
     if interruption is not None:
         worker_status = "interrupted"
     elif worker_error:
@@ -3360,6 +3501,8 @@ def run_native_planning(
         timed_out=process_result.timed_out if process_result is not None else False,
         task_source_error=task_source_error,
         error=worker_error,
+        created_task_ids=created_task_ids,
+        created_count=created_count,
     )
     run_store.append_record(worker.to_record(config.repo))
     if interruption is not None:
@@ -3499,6 +3642,14 @@ def execute_autopilot_cycle(
             else:
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
         elif planning is None:
+            # Appended before the analysis agent runs: an interrupted or
+            # crashed launch never reaches the outcome append below, and must
+            # still consume one of the day's planning launches.
+            run_store.append_record(
+                planning_launch_record(
+                    config.repo, cycle_id=cycle_id, fingerprint=fingerprint
+                )
+            )
             native_planning = native_planning_runner(
                 config,
                 cycle_id=cycle_id,
@@ -3515,6 +3666,9 @@ def execute_autopilot_cycle(
                     fingerprint=fingerprint,
                     runnable_before=native_planning.worker.runnable_before,
                     runnable_after=native_planning.worker.runnable_after,
+                    created_count=native_planning.worker.created_count,
+                    created_task_ids=native_planning.worker.created_task_ids,
+                    provider_launched=planning_provider_launched(native_planning),
                 )
             )
             actions.append(f"{PLANNING_OUTCOME_ACTION_PREFIX}{planning_outcome}")
