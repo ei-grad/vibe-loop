@@ -529,10 +529,18 @@ class LockManager:
         *,
         run_id: str,
         fencing_token: str,
+        verified_pid: int | None = None,
         current_host: str | None = None,
         process_exists: ProcessExists | None = None,
         command_timeout_seconds: float | None = None,
     ) -> bool:
+        """Release a stale autopilot lock owned by an exact run and generation.
+
+        `verified_pid` supplies the owner's process ID for backends that record
+        none of their own; it is only consulted when the lock metadata omits
+        `pid`, and the process it names must still be absent.
+        """
+
         deadline = command_deadline(command_timeout_seconds)
         status = self.autopilot_status(
             current_host=current_host,
@@ -570,6 +578,8 @@ class LockManager:
                 "stale autopilot recovery requires an exact local host owner"
             )
         pid = int_value(status.metadata.get("pid"))
+        if pid is None:
+            pid = verified_pid
         if pid is None:
             raise LockBackendError(
                 "stale autopilot recovery requires a recorded process ID"

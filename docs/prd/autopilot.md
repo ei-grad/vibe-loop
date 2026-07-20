@@ -145,8 +145,13 @@ PID at all must each report an `inconsistent` supervisor state with a specific
 blocker, so an unresolved supervisor is never presented as a clean stop or
 masked by an older cycle status. A record without a PID is inconsistent by
 construction: absence cannot be verified against an identity that was never
-recorded. Recovery therefore refuses a lock with no recorded PID rather than
-releasing it and writing an unverifiable terminal record.
+recorded. Recovery therefore never writes a terminal record without a PID. A
+command-backed lock is entitled to record no PID; recovery must then derive the
+exact PID from the matching local `autopilot_supervisor_started` record for the
+requested run, verify that exact process absent, release with the exact run and
+locally minted generation, and prove lock absence so the singleton is
+immediately reacquirable. Only when no PID exists in the lock or the local
+records does recovery refuse outright.
 
 Related implementation IDs: `AUTO-03`.
 

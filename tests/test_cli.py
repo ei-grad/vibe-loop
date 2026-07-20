@@ -20,11 +20,19 @@ from pathlib import Path
 from unittest.mock import patch
 
 import vibe_loop.cli as cli_module
-from vibe_loop.autopilot import collect_supervisor_status, stop_detached_autopilot
+from vibe_loop.autopilot import (
+    AUTOPILOT_RECORD_SCHEMA_VERSION,
+    collect_supervisor_status,
+    stop_detached_autopilot,
+)
 from vibe_loop.cli import main
 from vibe_loop.config import load_config
 from vibe_loop.locks import AUTOPILOT_LOCK_NAME, LockManager, build_lock_manager
-from vibe_loop.runs import RunStore
+from vibe_loop.runs import (
+    AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    RunStore,
+    utc_now_iso,
+)
 
 
 @contextmanager
@@ -8381,8 +8389,103 @@ class AutopilotCliTests(unittest.TestCase):
             )
             self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
 
-    def test_recovery_without_a_recorded_pid_fails_closed(self) -> None:
-        """A PID-less lock is unverifiable, so recovery refuses to release it.
+    def test_command_backend_recovery_derives_pid_from_local_started_record(
+        self,
+    ) -> None:
+        """The reported failure: a PID-less singleton with a local started record.
+
+        Loopyard stores neither lease nor PID for the supervisor lock, so the
+        exact identity must come from this installation's own started record.
+        Recovery derives that PID, verifies it absent, releases with the exact
+        run and locally minted generation, proves the lock is gone, and leaves
+        the singleton immediately reacquirable.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            dead_pid = spawn_and_reap_pid()
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                    "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                    "occurred_at": utc_now_iso(),
+                    "repo": str(config.repo),
+                    "run_id": "autopilot-dead",
+                    "pid": dead_pid,
+                    "log": str(config.state_path / "autopilot" / "dead.log"),
+                }
+            )
+            manager.acquire_autopilot(run_id="autopilot-dead", metadata={})
+            held = command_lock_state(state_path)
+            held[AUTOPILOT_LOCK_NAME].pop("pid", None)
+            state_path.write_text(json.dumps(held), encoding="utf-8")
+            live_pids = {dead_pid: True}
+
+            def checker(checked: int) -> bool:
+                return live_pids.get(checked, False)
+
+            live_owner = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=checker,
+            )
+            self.assertFalse(live_owner.stopped)
+            self.assertEqual(live_owner.pid, dead_pid)
+            self.assertEqual(live_owner.blocker, "autopilot_stale_recovery_live_owner")
+            live_pids[dead_pid] = False
+
+            wrong_run = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-other",
+                process_exists=checker,
+            )
+            # A wrong run matches no local started record, so no PID can be
+            # derived for it and recovery fails closed before touching the
+            # backend at all.
+            self.assertFalse(wrong_run.stopped)
+            self.assertEqual(wrong_run.blocker, "autopilot_stale_recovery_missing_pid")
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+            recovered = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=checker,
+            )
+
+            self.assertTrue(recovered.stopped, recovered.blocker)
+            self.assertTrue(recovered.recovered)
+            self.assertEqual(recovered.pid, dead_pid)
+            self.assertNotIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+            # The terminal record carries the derived PID, so status can verify
+            # absence and report a clean stop rather than an inconsistent one.
+            self.assertEqual(
+                collect_supervisor_status(run_store, process_exists=checker).state,
+                "stopped",
+            )
+            manager.acquire_autopilot(run_id="autopilot-next", metadata={})
+            self.assertEqual(
+                command_lock_state(state_path)[AUTOPILOT_LOCK_NAME]["run_id"],
+                "autopilot-next",
+            )
+
+    def test_recovery_with_no_recorded_pid_anywhere_fails_closed(self) -> None:
+        """A PID-less lock with no local started record refuses to release.
 
         Recovery must never produce a terminal stop record without a PID: status
         could not then verify the exact process is absent.

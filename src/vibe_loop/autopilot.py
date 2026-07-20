@@ -1439,18 +1439,18 @@ def detached_autopilot_identity(
     return None
 
 
-def autopilot_supervisor_started_recorded(
+def autopilot_supervisor_started_pid(
     run_store: RunStore,
     *,
     repo: Path,
     run_id: str,
-    pid: int,
-) -> bool:
-    """True once the supervisor recorded that its termination handlers are live.
+) -> int | None:
+    """PID this installation recorded for a supervisor run, or None.
 
     `run_autopilot` appends this record only after `enable_termination_signals`,
     so its presence is the local trusted contract that a detached supervisor can
-    honor a stop signal through its normal cleanup path.
+    honor a stop signal through its normal cleanup path. It is also the only
+    local witness of which process held the lock when the backend keeps no PID.
     """
 
     for record in reversed(run_store.read_records()):
@@ -1460,10 +1460,20 @@ def autopilot_supervisor_started_recorded(
             continue
         if str(record.get("run_id") or "") != run_id:
             continue
-        if int_value(record.get("pid")) != pid:
-            continue
-        return True
-    return False
+        return int_value(record.get("pid"))
+    return None
+
+
+def autopilot_supervisor_started_recorded(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    run_id: str,
+    pid: int,
+) -> bool:
+    """True once the supervisor recorded that its termination handlers are live."""
+
+    return autopilot_supervisor_started_pid(run_store, repo=repo, run_id=run_id) == pid
 
 
 def append_autopilot_stopped_record(
@@ -1583,6 +1593,17 @@ def stop_detached_autopilot(
                     + ("foreign_host" if owner_host else "missing_host")
                 ),
             )
+        if pid is None and run_id and owner_run_id in {"", run_id}:
+            # A command-backed singleton may record no PID at all. The exact
+            # identity then comes from this installation's own started record
+            # for that run, the only local witness of which process held the
+            # lock. Absence is still verified against that exact PID below.
+            pid = autopilot_supervisor_started_pid(
+                run_store,
+                repo=config.repo,
+                run_id=run_id,
+            )
+            owner_live = pid is not None and checker(pid)
         if owner_live:
             return AutopilotStopResult(
                 repo=config.repo,
@@ -1599,8 +1620,9 @@ def stop_detached_autopilot(
         if not run_id:
             blocker = "autopilot_stale_recovery_missing_run_id"
         elif pid is None:
-            # Without a PID from either the lock or the local records, absence
-            # cannot be verified and no terminal record could justify "stopped".
+            # Neither the lock nor the local started record named a process, so
+            # absence cannot be verified and no terminal record written here
+            # could ever justify "stopped".
             blocker = "autopilot_stale_recovery_missing_pid"
         elif not local_fencing_token:
             blocker = "autopilot_stale_recovery_missing_fencing_token"
@@ -1620,6 +1642,7 @@ def stop_detached_autopilot(
             released = lock_manager.recover_stale_autopilot(
                 run_id=run_id,
                 fencing_token=local_fencing_token,
+                verified_pid=pid,
                 process_exists=checker,
                 command_timeout_seconds=backend_timeout(),
             )

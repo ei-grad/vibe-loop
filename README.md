@@ -453,6 +453,14 @@ refuses a live or identity-ambiguous owner, releases through the configured
 directory or command backend, and verifies that the lock is gone. The token is
 never accepted on the command line or included in output.
 
+A command-backed singleton may record no PID at all — the reported failure was a
+lock held with neither lease nor PID. Recovery then derives the exact PID from
+this installation's local `autopilot_supervisor_started` record for the
+requested run and verifies that exact process is absent before releasing, so the
+terminal stop record it writes always carries a verifiable identity. When no PID
+exists in either the lock or the local records, recovery fails closed with
+`autopilot_stale_recovery_missing_pid`.
+
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch
 decision it cleans only stale worker locks whose recorded worker process is
