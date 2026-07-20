@@ -83,6 +83,7 @@ from vibe_loop.runner import (
     worker_usage_provenance,
 )
 from vibe_loop.runs import (
+    LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     SETTLED_RUN_OUTCOMES,
     WORKER_REPORT_STATUSES,
     RunResult,
@@ -5709,6 +5710,71 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             self.assertEqual([lock.task_id for lock, _ in blocked.errors], ["T-1"])
             # Republication still fails, so refusing the release is the only way
             # to keep provenance from finalizing this run against its own result.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            self.assertIsNotNone(runner.lock_manager.status("T-1"))
+
+            (root / "state" / "fail_update").unlink()
+            recovered = clean_stale_locks(collect(), runner.lock_manager)
+            self.assertEqual(recovered.errors, [])
+            self.assertEqual([lock.task_id for lock in recovered.cleaned], ["T-1"])
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+            self.assertIsNone(runner.lock_manager.status("T-1"))
+
+    def test_stale_cleanup_falls_back_when_failure_event_append_fails(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "fail_update").write_text("")
+            append_event = runner.run_store.append_lifecycle_event
+
+            def append_except_finalization_failure(event) -> None:
+                if event.record_type == LOCK_FINALIZATION_FAILED_RECORD_TYPE:
+                    raise OSError("injected lifecycle append failure")
+                append_event(event)
+
+            with patch.object(
+                runner.run_store,
+                "append_lifecycle_event",
+                side_effect=append_except_finalization_failure,
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "injected lifecycle append failure"
+                ):
+                    self._run_task(
+                        runner, task, self._reporting_worker(runner, "completed")
+                    )
+
+            records = runner.run_store.read_records()
+            self.assertEqual(
+                [
+                    record["classification"]
+                    for record in records
+                    if record.get("record_type") == "run_result"
+                ],
+                ["completed"],
+            )
+            self.assertNotIn(
+                LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+                [record.get("record_type") for record in records],
+            )
+
+            def collect() -> list[StaleLock]:
+                return collect_stale_locks(
+                    runner.lock_manager,
+                    runner.run_store,
+                    process_exists=lambda pid: False,
+                )
+
+            stale = collect()
+            self.assertEqual([lock.settled_outcome for lock in stale], ["completed"])
+
+            blocked = clean_stale_locks(stale, runner.lock_manager)
+            self.assertEqual(blocked.cleaned, [])
+            self.assertEqual([lock.task_id for lock, _ in blocked.errors], ["T-1"])
             self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
             self.assertIsNotNone(runner.lock_manager.status("T-1"))
 

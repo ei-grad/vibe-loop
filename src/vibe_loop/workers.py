@@ -1707,15 +1707,13 @@ def pending_settlements_by_run_id(
 ) -> dict[str, tuple[str, str]]:
     """Terminal outcomes that are durable locally but never reached their lock.
 
-    A settlement update that fails leaves the lock held and records a
-    ``lock_finalization_failed`` event carrying the outcome the run actually
-    settled on. Recovery paths need it: the retained row still says ``unknown``,
-    so releasing it as collected would finalize the run against its own durable
-    result. A later ``lock_released`` for the same run means settlement
-    succeeded after all, and clears the pending entry.
+    Prefer the explicit ``lock_finalization_failed`` event when it exists. If
+    that append also failed, the same run's terminal ``run_result`` is the
+    fallback source. A later ``lock_released`` for the run clears either source.
     """
 
     pending: dict[str, tuple[str, str]] = {}
+    event_derived: set[str] = set()
     for record in records:
         run_id = optional_string(record.get("run_id"))
         if not run_id:
@@ -1723,6 +1721,12 @@ def pending_settlements_by_run_id(
         record_type = record.get("record_type")
         if record_type == LOCK_RELEASED_RECORD_TYPE:
             pending.pop(run_id, None)
+            event_derived.discard(run_id)
+            continue
+        if record_type == RUN_RECORD_TYPE:
+            classification = optional_string(record.get("classification")) or ""
+            if classification in TERMINAL_LOCK_OUTCOMES and run_id not in event_derived:
+                pending[run_id] = (classification, classification)
             continue
         if record_type != LOCK_FINALIZATION_FAILED_RECORD_TYPE:
             continue
@@ -1733,6 +1737,7 @@ def pending_settlements_by_run_id(
             outcome,
             optional_string(record.get("classification")) or "",
         )
+        event_derived.add(run_id)
     return pending
 
 
