@@ -43,8 +43,11 @@ from vibe_loop.generated_discovery import (
     redact_manifest_text,
 )
 from vibe_loop.locks import (
+    LockBackendError,
     LockBusy,
+    LockFencingMismatch,
     LockManager,
+    LockOwnerMismatch,
     TaskLock,
     build_lock_manager,
     fencing_token_value,
@@ -68,6 +71,7 @@ from vibe_loop.runs import (
     RunResult,
     RunStore,
     WorkerReport,
+    settled_run_outcome,
     utc_now_iso,
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
@@ -952,6 +956,11 @@ class VibeRunner:
         agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
         worker_timed_out = False
+        # Defaults hold for any exit that never reaches classification - an
+        # interrupted supervisor, a crash, a pre-classification error - which
+        # is an honestly unknown outcome, not a failure and not a completion.
+        settled_outcome = "unknown"
+        settled_classification = ""
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -1103,6 +1112,34 @@ class VibeRunner:
                 task_lock,
                 active_state.to_lock_metadata(),
             )
+
+        def publish_settled_outcome() -> None:
+            # Runs while this supervisor still owns the task lock, so a lock
+            # backend that mirrors run provenance sees the settled outcome
+            # before the release that finalizes the run there. Releasing first
+            # would leave the backend to infer an outcome it cannot know, and
+            # deferring to the enclosing run-until-done child's exit would race
+            # the next dispatch. Best effort: the authoritative RunResult is
+            # already durable, so a backend hiccup must not mask it.
+            nonlocal active_state
+            active_state = active_state.with_settled_outcome(
+                settled_outcome,
+                settled_classification,
+            )
+            try:
+                update_active_task_lock()
+            except (
+                LockBusy,
+                LockBackendError,
+                LockOwnerMismatch,
+                LockFencingMismatch,
+                OSError,
+                ValueError,
+            ) as exc:
+                report_status(
+                    f"could not publish settled outcome {settled_outcome} for "
+                    f"{task.task_id} before lock release: {exc}"
+                )
 
         def record_agent_observation(observation: AgentRuntimeObservation) -> None:
             nonlocal active_state
@@ -1403,6 +1440,8 @@ class VibeRunner:
                 output_tail,
                 timed_out=worker_timed_out,
             )
+            settled_classification = classification.status
+            settled_outcome = settled_run_outcome(classification.status)
             if classification.status == "limit_wall" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
                 # its dispatch backoff from the recorded result alone.
@@ -1475,6 +1514,7 @@ class VibeRunner:
             )
             return result
         finally:
+            publish_settled_outcome()
             self.lock_manager.release(task_lock)
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
@@ -1483,7 +1523,11 @@ class VibeRunner:
                     task_id=task.task_id,
                     lock_kind="task",
                     lock_path=task_lock.path,
-                    payload={"started_at": active_state.started_at},
+                    payload={
+                        "started_at": active_state.started_at,
+                        "outcome": settled_outcome,
+                        "classification": settled_classification,
+                    },
                 )
             )
 

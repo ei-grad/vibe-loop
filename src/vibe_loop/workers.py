@@ -165,6 +165,12 @@ class ActiveRunState:
     host: str = dataclasses.field(default_factory=socket.gethostname)
     lock_path: Path | None = None
     workspace: WorkspaceClaim | None = None
+    # Published into the lock metadata just before release so a command lock
+    # backend that mirrors run provenance finalizes this run with the outcome
+    # the supervisor actually settled on, instead of inferring one from the
+    # release event alone. Empty while the run is still in flight.
+    settled_outcome: str = ""
+    settled_classification: str = ""
 
     @classmethod
     def new(
@@ -316,6 +322,10 @@ class ActiveRunState:
             host=optional_string(metadata.get("host")) or "",
             lock_path=optional_path(metadata.get("path")),
             workspace=WorkspaceClaim.from_json(metadata.get("workspace")),
+            settled_outcome=optional_string(metadata.get("outcome")) or "",
+            settled_classification=(
+                optional_string(metadata.get("classification")) or ""
+            ),
         )
 
     def with_worker_pid(
@@ -440,7 +450,22 @@ class ActiveRunState:
             metadata["fencing_token"] = self.fencing_token
         if self.workspace is not None:
             metadata["workspace"] = self.workspace.to_json()
+        if self.settled_outcome:
+            metadata["outcome"] = self.settled_outcome
+        if self.settled_classification:
+            metadata["classification"] = self.settled_classification
         return metadata
+
+    def with_settled_outcome(
+        self,
+        outcome: str,
+        classification: str,
+    ) -> ActiveRunState:
+        return dataclasses.replace(
+            self,
+            settled_outcome=outcome,
+            settled_classification=classification,
+        )
 
 
 @dataclasses.dataclass(frozen=True)

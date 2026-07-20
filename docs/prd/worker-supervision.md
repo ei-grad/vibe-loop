@@ -43,6 +43,18 @@ consider worker exit status, configured completion commands, task probing, and
 main-branch change heuristics while marking the result as less authoritative
 than a matching worker report.
 
+A settled run must also finalize where external provenance lives. Once the run
+is classified, the supervisor publishes a settled outcome — one of `completed`,
+`failed`, `blocked`, `unknown` — into the task lock metadata while it still owns
+the lock, so a command lock backend that mirrors run provenance finalizes the
+run from the supervisor's own conclusion rather than inferring one at release.
+Classifications that do not settle the run, such as `timed_out` and
+`limit_wall`, publish `unknown`; so does any exit that never reached
+classification. Publishing must precede the lock release and must not depend on
+the enclosing `run-until-done` process, whose next dispatch or idle transition
+would otherwise race it. A backend failure while publishing is reported but
+never masks the recorded `run_result`.
+
 Related implementation IDs: `PAR-03`, `PAR-05`.
 
 ## PRD-WRK-004 Parallel Supervision

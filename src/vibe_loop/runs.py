@@ -106,6 +106,28 @@ LIFECYCLE_STATES = (
 LIFECYCLE_PROTECTED_KEYS = frozenset(
     {"schema_version", "record_type", "occurred_at", "run_id"}
 )
+# The settled outcome family a run finalizes into. It is deliberately coarser
+# than the classification vocabulary: external provenance backends record one
+# terminal outcome per run, while classifications such as "timed_out" and
+# "limit_wall" describe a run that ended without settling the task at all.
+SETTLED_RUN_OUTCOMES = ("completed", "failed", "blocked", "unknown")
+SETTLED_RUN_OUTCOME_CLASSIFICATIONS = frozenset({"completed", "failed", "blocked"})
+
+
+def settled_run_outcome(classification: str) -> str:
+    """Map a run classification onto its settled outcome.
+
+    Only classifications that themselves settle the run map through verbatim.
+    Everything else - an indeterminate probe, a wall-clock kill, a provider
+    limit wall, an interrupted supervisor - is genuinely unknown and must not
+    be promoted to a completion.
+    """
+
+    if classification in SETTLED_RUN_OUTCOME_CLASSIFICATIONS:
+        return classification
+    return "unknown"
+
+
 _APPEND_LOCK = threading.Lock()
 LOCK_POLL_SECONDS = 0.05
 LOCK_TIMEOUT_SECONDS = 30.0

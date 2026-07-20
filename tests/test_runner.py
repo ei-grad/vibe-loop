@@ -72,7 +72,13 @@ from vibe_loop.runner import (
     validate_selected_task_batch,
     wait_with_reap_watchdog,
 )
-from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
+from vibe_loop.runs import (
+    SETTLED_RUN_OUTCOMES,
+    WORKER_REPORT_STATUSES,
+    RunResult,
+    WorkerReport,
+    settled_run_outcome,
+)
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import Task
 from vibe_loop.workers import ActiveRunState
@@ -4691,6 +4697,317 @@ class SessionIdInjectionTests(unittest.TestCase):
             runtime_context=AgentRuntimeContext(),
         )
         self.assertNotIn("transcript_path", payload)
+
+
+class RecordingLockManager(LockManager):
+    """Captures the lock metadata visible to the backend at each transition.
+
+    A command lock backend finalizes external run provenance from the lock row
+    it holds at release time, so these snapshots are what such a backend would
+    actually observe.
+    """
+
+    def __init__(self, lock_root: Path) -> None:
+        super().__init__(lock_root)
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def update(self, task_lock, metadata):
+        self.events.append(("update", dict(metadata)))
+        return super().update(task_lock, metadata)
+
+    def release(self, task_lock) -> None:
+        task_id = str(task_lock.metadata.get("task_id") or "")
+        self.events.append(("release", dict(self.status(task_id) or {})))
+        super().release(task_lock)
+
+    def outcome_at_release(self, task_id: str) -> str:
+        for kind, metadata in self.events:
+            if kind == "release" and metadata.get("task_id") == task_id:
+                return str(metadata.get("outcome") or "")
+        return ""
+
+
+class StubTaskSource:
+    def __init__(self, tasks: list[Task], probe_results: dict[str, Task | None]):
+        self._tasks = tasks
+        self._probe_results = probe_results
+        self._dispatched: set[str] = set()
+        self.probe_calls: list[str] = []
+
+    def list_tasks(self) -> list[Task]:
+        # A dispatched task leaves the runnable set the way a real source does
+        # once the worker moves it out of a runnable status.
+        return [task for task in self._tasks if task.task_id not in self._dispatched]
+
+    def probe(self, task_id: str) -> Task | None:
+        self.probe_calls.append(task_id)
+        return self._probe_results.get(task_id)
+
+    def mark_dispatched(self, task_id: str) -> None:
+        self._dispatched.add(task_id)
+
+
+class SettledOutcomeFinalizationTests(unittest.TestCase):
+    """Regression cover for completed runs finalizing as ``unknown``.
+
+    A worker that files a completed report, has its task marked done and its
+    lock released must settle as ``completed`` in the run record *and* in the
+    lock state the backend sees at release, regardless of whether the enclosing
+    run-until-done process immediately dispatches another task or goes idle.
+    """
+
+    def _build_runner(
+        self,
+        directory: str,
+        tasks: list[Task],
+        probe_results: dict[str, Task | None],
+    ) -> tuple[VibeRunner, RecordingLockManager, StubTaskSource]:
+        repo = Path(directory)
+        runner = VibeRunner(
+            VibeConfig(
+                repo=repo,
+                agent=AgentConfig(
+                    command="worker {prompt}",
+                    prompt_dialect="codex",
+                    skill_ref_prefix="$",
+                ),
+                agent_profiles={
+                    "worker": AgentConfig(
+                        command="worker {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                },
+            )
+        )
+        lock_manager = RecordingLockManager(runner.config.state_path / "locks")
+        runner._lock_manager = lock_manager
+        source = StubTaskSource(tasks, probe_results)
+        runner._source = source
+        return runner, lock_manager, source
+
+    def _reporting_worker(
+        self,
+        runner: VibeRunner,
+        status: str,
+        *,
+        exit_code: int = 0,
+        report: bool = True,
+    ):
+        def fake_run(command, cwd, log, **kwargs):
+            env = kwargs.get("env") or {}
+            if report:
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status=status,
+                        message=f"{status} via worker report",
+                    )
+                )
+            on_start = kwargs.get("on_start")
+            if on_start is not None:
+                on_start(os.getpid())
+            return runner_module.StreamingCommandResult(exit_code=exit_code)
+
+        return fake_run
+
+    def _run_task(self, runner: VibeRunner, task: Task, fake_run) -> RunResult:
+        with patch.object(runner, "ensure_spec_execution_gate"):
+            with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                    return runner.run_task(task)
+
+    def test_completed_report_settles_before_lock_release(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+
+            result = self._run_task(
+                runner, task, self._reporting_worker(runner, "completed")
+            )
+
+            self.assertEqual(result.classification, "completed")
+            # The backend that finalizes external run provenance at release
+            # must already see the settled outcome, not infer one afterwards.
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_settled_outcome_published_before_next_dispatch(self) -> None:
+        first = Task(task_id="T-1", title="First", status="Next", agent="worker")
+        second = Task(task_id="T-2", title="Second", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="First", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory,
+                [first, second],
+                {
+                    "T-1": done,
+                    "T-2": Task(
+                        task_id="T-2", title="Second", status="Done", agent="worker"
+                    ),
+                },
+            )
+            dispatched: list[str] = []
+            fake_run = self._reporting_worker(runner, "completed")
+
+            def tracking_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                dispatched.append(task_id)
+                source.mark_dispatched(task_id)
+                if task_id == "T-2":
+                    # The second dispatch must not be able to rewrite or defer
+                    # the first run's already-settled outcome.
+                    self.assertEqual(
+                        lock_manager.outcome_at_release("T-1"), "completed"
+                    )
+                return fake_run(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", tracking_run):
+                        results = runner.run_until_done(continue_on_failure=True)
+
+            self.assertEqual(dispatched[:2], ["T-1", "T-2"])
+            self.assertEqual(results[0].classification, "completed")
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_settled_outcome_survives_idle_after_completion(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+            reporting = self._reporting_worker(runner, "completed")
+
+            def fake_run(command, cwd, log, **kwargs):
+                source.mark_dispatched((kwargs.get("env") or {})["VIBE_LOOP_TASK_ID"])
+                return reporting(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        results = runner.run_until_done()
+
+            # The queue drains to idle right after the completed task; the
+            # settled outcome must not be reopened by the cycle ending.
+            self.assertEqual([item.classification for item in results], ["completed"])
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_terminal_report_statuses_map_to_settled_outcomes(self) -> None:
+        for status, expected in (
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("blocked", "blocked"),
+            ("unknown", "unknown"),
+        ):
+            with self.subTest(status=status):
+                task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+                with tempfile.TemporaryDirectory() as directory:
+                    runner, lock_manager, _ = self._build_runner(
+                        directory, [task], {"T-1": None}
+                    )
+
+                    result = self._run_task(
+                        runner, task, self._reporting_worker(runner, status)
+                    )
+
+                    self.assertEqual(result.classification, status)
+                    self.assertEqual(lock_manager.outcome_at_release("T-1"), expected)
+
+    def test_missing_report_with_indeterminate_probe_stays_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(
+                directory, [task], {"T-1": None}
+            )
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "completed", report=False),
+            )
+
+            self.assertEqual(result.classification, "unknown")
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "unknown")
+
+    def test_interrupted_run_settles_unknown_not_completed(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+
+            def interrupting_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                        message="reported then interrupted",
+                    )
+                )
+                raise KeyboardInterrupt
+
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_task(runner, task, interrupting_run)
+
+            # A report on disk is not a settled run: the supervisor never
+            # classified this one, so its outcome is genuinely unknown even
+            # though the task source would now probe as done.
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "unknown")
+
+    def test_publish_failure_does_not_mask_recorded_result(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+            original_update = lock_manager.update
+            calls: list[int] = []
+
+            def failing_update(task_lock, metadata):
+                calls.append(1)
+                if "outcome" in metadata:
+                    raise LockBusy(task_lock.path, {"reason": "backend unavailable"})
+                return original_update(task_lock, metadata)
+
+            lock_manager.update = failing_update
+
+            result = self._run_task(
+                runner, task, self._reporting_worker(runner, "completed")
+            )
+
+            self.assertEqual(result.classification, "completed")
+            self.assertEqual(
+                runner.run_store.read_records()[-1].get("classification"),
+                "completed",
+            )
+
+
+class SettledRunOutcomeTests(unittest.TestCase):
+    def test_settling_classifications_map_through(self) -> None:
+        for classification in ("completed", "failed", "blocked"):
+            with self.subTest(classification=classification):
+                self.assertEqual(settled_run_outcome(classification), classification)
+
+    def test_non_settling_classifications_are_unknown(self) -> None:
+        for classification in ("unknown", "timed_out", "limit_wall", "", "weird"):
+            with self.subTest(classification=classification):
+                self.assertEqual(settled_run_outcome(classification), "unknown")
+
+    def test_every_settled_outcome_is_a_valid_backend_value(self) -> None:
+        self.assertEqual(
+            set(SETTLED_RUN_OUTCOMES),
+            {"completed", "failed", "blocked", "unknown"},
+        )
 
 
 if __name__ == "__main__":
