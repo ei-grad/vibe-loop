@@ -525,6 +525,7 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                 )
                 raise locks.LockBackendError(
                     f"adapter refused: generation {token} rejected, run 141 kept"
+                    f"; retry after generation {token}. schema {token}.4 held"
                 )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -546,9 +547,16 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                 error.release_detail,
             )
             self.assertNotIn(f"generation {granted_token} ", error.release_detail)
+            # Sentence punctuation still ends a token.
+            self.assertIn(
+                f"generation {locks.FENCING_TOKEN_REDACTION}. schema",
+                error.release_detail,
+            )
+            self.assertNotIn(f"generation {granted_token}.", error.release_detail)
             # A generation this short over-redacts standalone matches rather
             # than leak, but must not rewrite the inside of larger numbers.
             self.assertIn("run 141 kept", error.release_detail)
+            self.assertIn(f"schema {granted_token}.4 held", error.release_detail)
 
     def test_command_backend_spawn_rejection_is_a_compensation_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

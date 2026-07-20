@@ -97,7 +97,7 @@ class LockBackendError(RuntimeError):
 
 
 class LockWitnessCompensationError(LockBackendError):
-    """A granted lock could neither be recorded locally nor given back.
+    """A granted lock was not recorded locally and its give-back failed.
 
     No local fencing witness exists, and the give-back raised, so whether the
     backend still holds the lock is unknown: an adapter may have removed it and
@@ -155,7 +155,7 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
     )
     for token in sorted(fencing_token_values(context), key=len, reverse=True):
         detail = re.sub(
-            rf"(?<![\w.-]){re.escape(token)}(?![\w.-])",
+            rf"(?<![\w.-]){re.escape(token)}(?![\w-])(?!\.\w)",
             FENCING_TOKEN_REDACTION,
             detail,
         )
