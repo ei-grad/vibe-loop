@@ -45,6 +45,7 @@ from vibe_loop.workers import (
     load_active_run_states,
     parse_git_worktree_list,
     parse_worktree_disposition_decisions,
+    pending_settlements_by_run_id,
     restore_projected_worker_process_identity,
 )
 
@@ -1774,6 +1775,81 @@ class StaleLockTests(unittest.TestCase):
 
         self.assertEqual(len(stale), 1)
         self.assertEqual(stale[0].stale_reason, "result_recorded")
+        self.assertEqual(stale[0].settled_outcome, "completed")
+
+    def test_collect_does_not_apply_an_unrelated_terminal_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="retained-run",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "retained-run.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire(
+                "TASK-01", "retained-run", metadata=state.to_lock_metadata()
+            )
+            run_store.append_result(
+                RunResult(
+                    run_id="other-run",
+                    task_id="TASK-01",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / ".vibe-loop" / "runs" / "other-run.log",
+                    start_main="abc123",
+                    end_main="def456",
+                )
+            )
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].run_id, "retained-run")
+        self.assertEqual(stale[0].settled_outcome, "")
+
+    def test_terminal_result_fallback_is_same_run_and_terminal_only(self) -> None:
+        def result(run_id: str, classification: str) -> dict[str, object]:
+            return RunResult(
+                run_id=run_id,
+                task_id=f"task-{run_id}",
+                classification=classification,
+                exit_code=0,
+                log_path=Path(f"{run_id}.log"),
+                start_main="abc123",
+                end_main="def456",
+            ).to_record()
+
+        pending = pending_settlements_by_run_id(
+            [
+                result("completed-run", "completed"),
+                result("failed-run", "failed"),
+                result("blocked-run", "blocked"),
+                result("unknown-run", "unknown"),
+                result("timed-out-run", "timed_out"),
+            ]
+        )
+
+        self.assertEqual(
+            pending,
+            {
+                "completed-run": ("completed", "completed"),
+                "failed-run": ("failed", "failed"),
+                "blocked-run": ("blocked", "blocked"),
+            },
+        )
+        self.assertNotIn("unknown-run", pending)
+        self.assertNotIn("timed-out-run", pending)
 
     def test_clean_removes_stale_lock_directories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
