@@ -479,6 +479,9 @@ class LockManager:
             process_exists=process_exists,
         )
 
+    def local_fencing_token(self, task_id: str) -> str:
+        return read_fencing_token(self.lock_root, task_id)
+
     def release_autopilot(
         self,
         *,
@@ -1250,6 +1253,23 @@ def next_fencing_token(lock_root: Path, task_id: str) -> str:
         next_token = current + 1
         token_path.write_text(f"{next_token}\n", encoding="utf-8")
     return str(next_token)
+
+
+def read_fencing_token(lock_root: Path, task_id: str) -> str:
+    """Locally recorded fencing generation for a task, or "" when unknown.
+
+    Both lock backends mint fencing tokens locally through `next_fencing_token`,
+    so this counter is an independent witness of the last generation this
+    installation acquired. Stale recovery compares it against the generation the
+    backend reports, which a token read back out of that same backend status
+    cannot do.
+    """
+
+    token_path = lock_root / ".fencing-tokens" / f"{safe_name(task_id)}.token"
+    try:
+        return fencing_token_value(token_path.read_text(encoding="utf-8").strip())
+    except OSError:
+        return ""
 
 
 def validate_lock_run_id(

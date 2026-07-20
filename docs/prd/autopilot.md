@@ -119,14 +119,30 @@ fencing token. Once signal cleanup begins, repeated supported signals must be
 coalesced until bounded child and backend cleanup completes so a second signal
 cannot interrupt fenced release.
 
+Detached-start readiness must be proven by a local trusted contract, not by
+lock-wire metadata. The supervisor appends its own started record only after
+installing termination handlers, and the launcher verifies that record before
+declaring the detached supervisor live. Backends are entitled to quarantine
+unknown wire fields, so a lock-metadata readiness flag is not an admissible
+signal.
+
 An already-absent process with a remaining lock requires the separate
-`autopilot stop --recover-stale --run-id <exact-run>` path. Recovery privately
-re-reads and requires the backend's nonblank local fencing token, rejects a
-live owner or run mismatch, releases through the configured directory or
-command backend, and verifies absence afterward. Fencing tokens must not be
-accepted in argv or rendered in diagnostics. Successful ordinary, signal, and
-recovery exits append a terminal supervisor record only after lock release;
-status reports that lifecycle as `stopped` independently from `last_cycle`.
+`autopilot stop --recover-stale --run-id <exact-run>` path. Recovery requires
+the exact recorded run and the fencing generation this installation last minted,
+read from the local token counter rather than from the backend status being
+recovered; comparing a backend token against itself would fence nothing. A
+generation this installation never issued, a live owner, or a run mismatch all
+fail closed. Recovery releases through the configured directory or command
+backend and verifies absence afterward. Fencing tokens must not be accepted in
+argv or rendered in diagnostics.
+
+Successful ordinary, signal, and recovery exits append a terminal supervisor
+record only after lock release. Status reports `stopped` only when such a
+terminal record exists AND the recorded process is verifiably absent. A stop
+record with a live process, a live process without the singleton lock, or a
+vanished process with no terminal record must each report an `inconsistent`
+supervisor state with a specific blocker, so an unresolved supervisor is never
+presented as a clean stop or masked by an older cycle status.
 
 Related implementation IDs: `AUTO-03`.
 

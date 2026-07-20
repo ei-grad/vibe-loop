@@ -393,7 +393,15 @@ records, preserving its run ID, PID, and log even when newer cycle records are
 idle and PID-less; `last_cycle` independently reports the newest cycle.
 After a bounded or operator-requested exit, supervisor state is `stopped` while
 `last_cycle` retains the independent child-cycle result such as `completed` or
-`idle`.
+`idle`. `stopped` requires both an explicit terminal stop record and a verified
+absence of the recorded process. When those disagree, state is `inconsistent`
+and a matching blocker is reported rather than a clean stop:
+`autopilot_supervisor_stop_record_live_process` (a stop record whose process is
+still running), `autopilot_supervisor_live_without_lock` (a live supervisor that
+no longer holds the singleton lock), and
+`autopilot_supervisor_exited_without_stop_record` (the process is gone but never
+recorded its own termination). These blockers surface in the `ProjectStatus`
+payload so a stale cycle status cannot mask an unresolved supervisor.
 
 **`start`** is the supported detached launcher on POSIX systems. It starts the
 same foreground `autopilot run` supervisor in a new session with standard input
@@ -432,10 +440,14 @@ vibe-loop autopilot stop --repo . --recover-stale \
   --run-id <exact-supervisor-run-id> --json
 ```
 
-Recovery re-reads the local backend's private fencing token, requires the exact
-recorded run, refuses a live or identity-ambiguous owner, releases through the
-configured directory or command backend, and verifies that the lock is gone.
-The token is never accepted on the command line or included in output.
+Recovery requires the exact recorded run and the fencing generation this
+installation last minted locally, read from the lock root's private token
+counter rather than from the backend status being recovered. A backend that
+reports a generation this installation never issued — another host's lock, or a
+lock re-created out of band — fails closed as a fencing mismatch. Recovery also
+refuses a live or identity-ambiguous owner, releases through the configured
+directory or command backend, and verifies that the lock is gone. The token is
+never accepted on the command line or included in output.
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch
