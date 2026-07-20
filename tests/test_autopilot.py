@@ -2377,7 +2377,7 @@ class AutopilotStopDrainTests(unittest.TestCase):
         self.assertTrue(result.stopped)
         self.assertIsNone(lock_after)
 
-    def test_recycled_worker_pid_is_never_signalled(self) -> None:
+    def test_recycled_worker_pid_is_not_treated_as_the_recorded_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config, manager, holder, _run_store, _task_lock = (
                 self._drained_installation(
@@ -2385,11 +2385,12 @@ class AutopilotStopDrainTests(unittest.TestCase):
                 )
             )
             result, signals, _closed, pid_for_fd = self._stop(config, manager, holder)
+            task_lock_after = manager.status("TASK-01")
 
         signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
-        # That PID now belongs to some other process, so the recorded worker is
-        # gone; it is dropped rather than signalled, and its subtree is only
-        # reached through the still-verified child.
+        # That PID now names some other process, so it contributes no verified
+        # worker root. It is still reached and signalled here, but only as an
+        # ordinary descendant of the child whose identity did verify.
         self.assertTrue(result.stopped)
         self.assertEqual(
             signalled_pids,
@@ -2399,8 +2400,63 @@ class AutopilotStopDrainTests(unittest.TestCase):
             [identity.role for identity in result.drained],
             ["descendant", "descendant", "run_until_done_child"],
         )
-        # Nothing was reconciled: no verified worker root was drained.
+        # No verified worker root was drained, so the lock is retained rather
+        # than released on the strength of a bare PID match — and the retained
+        # lock is surfaced instead of passing silently under a clean stop.
         self.assertEqual(result.reconciled_task_ids, ())
+        self.assertIsNotNone(task_lock_after)
+        self.assertIn(
+            "autopilot_stop_worker_lock_retained:TASK-01",
+            result.reconciliation_blockers,
+        )
+
+    def test_worker_orphaned_by_an_earlier_cycle_is_still_attributable(self) -> None:
+        """A supervisor runs many cycles; orphans outlive the cycle that made them.
+
+        Attribution must span every recorded child, otherwise the exact
+        orphaned-worker state this pass exists to drain would block forever and
+        push the operator back to a manual forced cleanup.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, run_store, _task_lock = self._drained_installation(
+                Path(directory)
+            )
+            later_child_pid = CHILD_PID + 1
+            run_store.append_record(
+                autopilot_child_started_record(
+                    repo=config.repo,
+                    run_id="autopilot-1",
+                    cycle_id="autopilot-1-c2",
+                    pid=later_child_pid,
+                    process_group_id=later_child_pid,
+                    session_id=later_child_pid,
+                    process_birth_id=f"{DRAIN_BOOT_ID}:201",
+                )
+            )
+            # Cycle 1's child is gone and its worker reparented to PID 1, while
+            # cycle 2's child is the one the latest record names.
+            table = drain_process_table()
+            del table[CHILD_PID]
+            table[WORKER_PID] = dataclasses.replace(table[WORKER_PID], parent_pid=1)
+            table[later_child_pid] = drain_node(
+                later_child_pid, SUPERVISOR_PID, later_child_pid, later_child_pid, 201
+            )
+
+            result, signals, _closed, pid_for_fd = self._stop(
+                config, manager, holder, table=table
+            )
+            task_lock_after = manager.status("TASK-01")
+
+        signalled_pids = [pid_for_fd[pidfd] for pidfd, _number in signals]
+        self.assertTrue(result.stopped)
+        self.assertEqual(result.blocker, "")
+        self.assertIn(WORKER_PID, signalled_pids)
+        self.assertIn(REVIEWER_PID, signalled_pids)
+        self.assertIn(later_child_pid, signalled_pids)
+        self.assertNotIn(SENTINEL_PID, signalled_pids)
+        self.assertEqual(result.reconciled_task_ids, ("TASK-01",))
+        self.assertIsNone(task_lock_after)
 
     def test_signal_refusal_reports_exact_remaining_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

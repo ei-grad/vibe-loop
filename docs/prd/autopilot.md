@@ -137,13 +137,18 @@ A worker is an independently verifiable root, never one inferred from a live
 child. A worker reparents to PID 1 precisely because its launching child died,
 so deriving worker liveness from the child would skip exactly the processes that
 outlive a stop. The worker's own recorded birth identity proves which process it
-is, and its active-run lock proves the run owns it; the child record supplies
-only attribution. A recorded root whose live birth identity no longer matches is
-gone rather than unverifiable, so that PID is dropped instead of signalled. A
-live worker this run cannot attribute to a recorded child, or whose birth
-identity was never recorded, is unverifiable rather than absent and blocks the
-stop instead of being silently left running — including for a supervisor that
-predates these records.
+is, and its active-run lock proves the run owns it; the child records supply
+only attribution. Attribution spans every child a supervisor run recorded, not
+just its current one: a supervisor runs many cycles, and a worker orphaned by an
+earlier cycle is still this run's, so comparing it against only the latest child
+would block the stop on exactly the orphan it exists to drain.
+
+A recorded root whose live birth identity no longer matches is gone rather than
+unverifiable, so that PID is dropped instead of signalled, and its retained task
+lock is reported rather than released on a bare PID match. A live worker this run
+cannot attribute to any recorded child, or whose birth identity was never
+recorded, is unverifiable rather than absent and blocks the stop instead of being
+silently left running — including for a supervisor that predates these records.
 
 Every candidate requires a kernel process-birth identity, an open pidfd, and a
 post-open recheck of birth, parent, group, and session. Any missing or changed

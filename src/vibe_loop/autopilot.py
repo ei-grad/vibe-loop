@@ -1634,6 +1634,38 @@ def autopilot_child_identity(
     return None
 
 
+def autopilot_child_pids(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    run_id: str,
+) -> frozenset[int]:
+    """Every run-until-done child PID this supervisor run recorded starting.
+
+    A supervisor runs many cycles, and a worker orphaned by an earlier cycle can
+    still be alive during a later one. Attribution therefore spans all recorded
+    children, not just the current one: comparing such a worker against only the
+    latest child would reject a worker this run demonstrably launched. Admission
+    still requires the worker's own birth identity to verify, so a PID reused
+    across cycles cannot smuggle in an unrelated process.
+    """
+
+    if not run_id:
+        return frozenset()
+    pids: set[int] = set()
+    for record in run_store.read_records():
+        if record.get("record_type") != AUTOPILOT_CHILD_STARTED_RECORD_TYPE:
+            continue
+        if str(record.get("repo") or "") != str(repo):
+            continue
+        if str(record.get("run_id") or "") != run_id:
+            continue
+        pid = int_value(record.get("pid"))
+        if pid is not None:
+            pids.add(pid)
+    return frozenset(pids)
+
+
 def live_active_run_states(
     lock_manager: LockManager,
     *,
@@ -1669,8 +1701,8 @@ def collect_owned_stop_roots(
     run_id: str,
     process_exists: ProcessExists,
     birth_identity_lookup: Callable[[int], str],
-) -> tuple[tuple[OwnedProcessIdentity, ...], str]:
-    """Verified non-supervisor roots to drain, or a fail-closed blocker.
+) -> tuple[tuple[OwnedProcessIdentity, ...], str, tuple[str, ...]]:
+    """Verified non-supervisor roots, a fail-closed blocker, and diagnostics.
 
     A worker is an independently verifiable root: its own recorded birth
     identity proves which process it is, and the active-run lock in this
@@ -1680,13 +1712,16 @@ def collect_owned_stop_roots(
     died, so gating worker roots on a live child would skip exactly the
     processes that outlive a stop.
 
-    The child only supplies attribution. A live worker this run cannot
-    attribute to a recorded child, or whose birth identity was never recorded,
-    is unverifiable rather than absent, so it blocks the stop instead of being
-    silently left running.
+    The recorded children only supply attribution, and attribution spans every
+    child this run recorded rather than the current one, so a worker orphaned by
+    an earlier cycle is still recognized as this run's. A live worker this run
+    cannot attribute to any recorded child, or whose birth identity was never
+    recorded, is unverifiable rather than absent, so it blocks the stop instead
+    of being silently left running.
     """
 
     child = autopilot_child_identity(run_store, repo=repo, run_id=run_id)
+    attributable_pids = autopilot_child_pids(run_store, repo=repo, run_id=run_id)
     child_live = (
         child is not None
         and process_exists(child.pid)
@@ -1694,30 +1729,38 @@ def collect_owned_stop_roots(
         and birth_identity_lookup(child.pid) == child.process_birth_id
     )
     if child is not None and process_exists(child.pid) and not child.process_birth_id:
-        return (), "autopilot_stop_identity_unverified:child_birth_id_missing"
+        return (), "autopilot_stop_identity_unverified:child_birth_id_missing", ()
 
     live_states, enumeration_blocker = live_active_run_states(
         lock_manager, process_exists=process_exists
     )
     if enumeration_blocker:
-        return (), enumeration_blocker
+        return (), enumeration_blocker, ()
 
     roots: list[OwnedProcessIdentity] = []
+    diagnostics: list[str] = []
     for active in live_states:
         label = active.task_id or active.run_id or str(active.worker_pid)
-        if child is None or active.supervisor_pid != child.pid:
-            # A live worker with no recorded child to attribute it to cannot be
-            # proven to belong to this run, and cannot be proven not to either.
-            return (), (
-                f"autopilot_stop_identity_unverified:worker_unattributable:{label}"
+        if active.supervisor_pid not in attributable_pids:
+            # A live worker matching no recorded child cannot be proven to
+            # belong to this run, and cannot be proven not to either.
+            return (
+                (),
+                f"autopilot_stop_identity_unverified:worker_unattributable:{label}",
+                (),
             )
         if not active.worker_process_birth_id:
-            return (), (
-                f"autopilot_stop_identity_unverified:worker_birth_id_missing:{label}"
+            return (
+                (),
+                f"autopilot_stop_identity_unverified:worker_birth_id_missing:{label}",
+                (),
             )
         if birth_identity_lookup(active.worker_pid) != active.worker_process_birth_id:
             # That PID now names some other process, so the recorded worker is
-            # gone and nothing here may be signalled on its behalf.
+            # gone and nothing here may be signalled on its behalf. Its lock is
+            # left held rather than released on the strength of a PID match, so
+            # surface it instead of letting a stale lock pass unreported.
+            diagnostics.append(f"autopilot_stop_worker_lock_retained:{label}")
             continue
         roots.append(
             OwnedProcessIdentity(
@@ -1732,7 +1775,7 @@ def collect_owned_stop_roots(
         )
     if child is not None and child_live:
         roots.append(child)
-    return tuple(roots), ""
+    return tuple(roots), "", tuple(diagnostics)
 
 
 def drain_owned_process_tree(
@@ -2433,7 +2476,7 @@ def stop_verified_detached_autopilot(
         # The supervisor's own descendants are drained first: signalling only
         # the supervisor lets its run-until-done child and that child's workers
         # reparent to PID 1 and keep burning quota after stop reports success.
-        roots, roots_blocker = collect_owned_stop_roots(
+        roots, roots_blocker, retained_lock_diagnostics = collect_owned_stop_roots(
             run_store,
             lock_manager,
             repo=config.repo,
@@ -2535,6 +2578,7 @@ def stop_verified_detached_autopilot(
                     repo=config.repo,
                     drained=drain.drained,
                 )
+                reconcile_blockers = retained_lock_diagnostics + reconcile_blockers
                 append_autopilot_stopped_record(
                     run_store,
                     repo=config.repo,
