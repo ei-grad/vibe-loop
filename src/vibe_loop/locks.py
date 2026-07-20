@@ -1798,9 +1798,13 @@ def replace_metadata_file(source: Path, target: Path) -> None:
             delay = min(delay * 2, 0.1)
 
 
+def metadata_lock_file_path(path: Path) -> Path:
+    return path.parent / f".{path.name}.metadata-update"
+
+
 @contextmanager
 def metadata_update_lock(path: Path):
-    lock_path = path.parent / f".{path.name}.metadata-update"
+    lock_path = metadata_lock_file_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:
         ensure_metadata_lock_byte(handle)

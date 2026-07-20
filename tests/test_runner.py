@@ -37,7 +37,6 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     SettledOutcomeNotPersisted,
-    TaskLock,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.runner import (
@@ -2511,6 +2510,73 @@ class RunnerTests(unittest.TestCase):
     @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"
     )
+    def test_streaming_command_reaps_group_when_start_recording_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "hang.py"
+            child_path = Path(directory) / "child.pid"
+            child_ready_path = Path(directory) / "child.ready"
+            child_code = (
+                "import signal\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                f"Path({str(child_ready_path)!r}).write_text("
+                "'ready', encoding='utf-8')\n"
+                "time.sleep(30)\n"
+            )
+            script.write_text(
+                "import subprocess\n"
+                "import sys\n"
+                "import time\n"
+                "from pathlib import Path\n"
+                f"child_code = {child_code!r}\n"
+                "child = subprocess.Popen([sys.executable, '-c', child_code])\n"
+                f"Path({str(child_path)!r}).write_text(str(child.pid), encoding='utf-8')\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            started_pids: list[int] = []
+
+            def fail_to_record(worker_pid: int) -> None:
+                started_pids.append(worker_pid)
+                deadline = time.monotonic() + 2.0
+                while not child_ready_path.is_file() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(child_path.is_file())
+                self.assertTrue(child_ready_path.is_file())
+                raise OSError("worker identity record store unavailable")
+
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    with self.assertRaisesRegex(OSError, "record store unavailable"):
+                        run_streaming_command(
+                            f"{sys.executable} hang.py",
+                            Path(directory),
+                            log,
+                            on_start=fail_to_record,
+                        )
+                child_pid = int(child_path.read_text(encoding="utf-8"))
+                process_pids = (*started_pids, child_pid)
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline:
+                    if all(read_process_node(pid) is None for pid in process_pids):
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(
+                    all(read_process_node(pid) is None for pid in process_pids),
+                    process_pids,
+                )
+            finally:
+                if started_pids:
+                    try:
+                        os.killpg(started_pids[0], signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "detached process groups are POSIX-only"
+    )
     def test_streaming_command_wall_clock_timeout_reaps_detached_worker(
         self,
     ) -> None:
@@ -4856,36 +4922,42 @@ class ParkedWriteBackend:
         return self.inner.path_for(task_id)
 
 
-class ObservedWriteBackend:
-    """Lock backend that records when a caller reaches the backend write.
+MUTEX_PROBE_SOURCE = """
+import fcntl
+import sys
 
-    The settling manager writes through this, so the test can tell "settlement
-    is blocked before its write" from "settlement is merely slow": both look
-    alike from the outside, and only the first is what the boundary promises.
+with open(sys.argv[1], "a+b") as handle:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(3)
+sys.exit(0)
+"""
+
+
+def settlement_mutex_is_free(mutex_path: Path) -> bool:
+    """Report whether another process could take the settlement mutex now.
+
+    The probe is a real separate process taking the real advisory lock, so it
+    answers the only question that matters about the boundary - is it held
+    while the racing writer is mid-update - without depending on elapsed time.
     """
 
-    def __init__(self, inner) -> None:
-        self.inner = inner
-        self.update_entered = threading.Event()
-
-    def acquire(self, task_id, run_id, metadata=None):
-        return self.inner.acquire(task_id, run_id, metadata=metadata)
-
-    def update(self, task_lock, metadata):
-        self.update_entered.set()
-        return self.inner.update(task_lock, metadata)
-
-    def release(self, task_lock) -> None:
-        self.inner.release(task_lock)
-
-    def status(self, task_id):
-        return self.inner.status(task_id)
-
-    def list_locks(self):
-        return self.inner.list_locks()
-
-    def path_for(self, task_id):
-        return self.inner.path_for(task_id)
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            MUTEX_PROBE_SOURCE,
+            str(locks_module.metadata_lock_file_path(mutex_path)),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode not in (0, 3):
+        raise AssertionError(
+            f"settlement mutex probe failed: rc={probe.returncode} {probe.stderr}"
+        )
+    return probe.returncode == 0
 
 
 class ForeignHeartbeatLockManager(LockManager):
@@ -4900,28 +4972,14 @@ class ForeignHeartbeatLockManager(LockManager):
     """
 
     WAIT_SECONDS = 10.0
-    # How long settlement is watched for while the writer is parked. The
-    # observation that matters - settlement never reached its backend write -
-    # is true for any duration once the boundary holds, so this only has to be
-    # long enough that an unserialized settlement, which is one status read away
-    # from its write, is certain to be caught.
-    OBSERVE_SECONDS = 2.0
 
-    def __init__(
-        self,
-        *args,
-        writer_backend: ParkedWriteBackend,
-        observed_backend: ObservedWriteBackend,
-        **kwargs,
-    ) -> None:
-        super().__init__(*args, backend=observed_backend, **kwargs)
+    def __init__(self, *args, writer_backend: ParkedWriteBackend, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self.writer_backend = writer_backend
-        self.observed_backend = observed_backend
         self.writer_metadata: dict[str, object] | None = None
         self.writer_error: BaseException | None = None
-        self.settlement_error: BaseException | None = None
-        self.settlement_lock: TaskLock | None = None
-        self.settled_while_writer_parked = False
+        self.mutex_free_while_parked: bool | None = None
+        self.mutex_free_after_write: bool | None = None
         self.injected = False
 
     def _run_writer(self, task_lock) -> None:
@@ -4953,37 +5011,28 @@ class ForeignHeartbeatLockManager(LockManager):
         unsettled["outcome"] = "unknown"
         unsettled["classification"] = "unknown"
         self.backend.update(stored, unsettled)
-        self.observed_backend.update_entered.clear()
+        mutex_path = self.settlement_mutex_path(task_lock.task_id)
         writer = threading.Thread(target=self._run_writer, args=(task_lock,))
         writer.start()
-        if not self.writer_backend.at_write.wait(timeout=self.WAIT_SECONDS):
-            raise AssertionError("the foreign writer never reached its backend write")
-        settling = threading.Thread(target=self._settle, args=(task_lock, metadata))
-        settling.start()
         try:
-            # Settlement must not reach its own backend write while the writer
-            # holds the boundary: a merge it performed now would land on a row
-            # the parked write is about to overwrite. Elapsed time proves
-            # nothing by itself, so the write entry is what is observed.
-            self.settled_while_writer_parked = (
-                self.observed_backend.update_entered.wait(
-                    timeout=self.OBSERVE_SECONDS,
+            if not self.writer_backend.at_write.wait(timeout=self.WAIT_SECONDS):
+                raise AssertionError(
+                    "the foreign writer never reached its backend write"
                 )
-            )
+            # The writer has merged its stale pair and is one instruction from
+            # storing it. Whether settlement can interleave is decided entirely
+            # by whether the boundary is held right now, which another process
+            # can answer outright.
+            self.mutex_free_while_parked = settlement_mutex_is_free(mutex_path)
         finally:
             self.writer_backend.proceed.set()
             writer.join(timeout=self.WAIT_SECONDS)
-            settling.join(timeout=self.WAIT_SECONDS)
-        if self.settlement_error is not None:
-            raise self.settlement_error
-        assert self.settlement_lock is not None
-        return self.settlement_lock
-
-    def _settle(self, task_lock, metadata) -> None:
-        try:
-            self.settlement_lock = super().update(task_lock, metadata)
-        except BaseException as exc:  # surfaced by the test, never swallowed
-            self.settlement_error = exc
+        if writer.is_alive():
+            raise AssertionError("the foreign writer never finished its update")
+        self.mutex_free_after_write = settlement_mutex_is_free(mutex_path)
+        # Settlement runs only after the stale write landed, which is the order
+        # the boundary forces on the real supervisor.
+        return super().update(task_lock, metadata)
 
 
 class StubTaskSource:
@@ -5608,6 +5657,10 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
 
+    @unittest.skipIf(
+        locks_module.fcntl is None,
+        "the out-of-process mutex probe is written against flock",
+    )
     def test_command_backend_orders_settlement_after_a_parked_foreign_write(
         self,
     ) -> None:
@@ -5630,8 +5683,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             manager = ForeignHeartbeatLockManager(
                 runner.config.state_path / "locks",
+                backend=command_backend,
                 writer_backend=writer_backend,
-                observed_backend=ObservedWriteBackend(command_backend),
             )
             runner._lock_manager = manager
 
@@ -5639,9 +5692,11 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             self.assertTrue(manager.injected)
             self.assertIsNone(manager.writer_error)
-            # Settlement was blocked before its backend write for as long as the
-            # writer held the boundary, so the two writes cannot interleave.
-            self.assertFalse(manager.settled_while_writer_parked)
+            # A separate process could not take the boundary while the foreign
+            # writer was parked with its stale row merged, and could once that
+            # write had landed. No settlement can interleave with that window.
+            self.assertIs(manager.mutex_free_while_parked, False)
+            self.assertIs(manager.mutex_free_after_write, True)
             # The foreign heartbeat did store its stale pair - it was parked
             # holding it, so nothing could rewrite it - which is why ordering,
             # not row precedence, has to be what keeps the run settled.
