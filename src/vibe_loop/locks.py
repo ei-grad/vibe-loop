@@ -99,11 +99,11 @@ class LockBackendError(RuntimeError):
 class LockWitnessCompensationError(LockBackendError):
     """A granted lock could neither be recorded locally nor given back.
 
-    The backend still considers the lock held, but no local fencing witness
-    exists, so ordinary release and stale recovery both fail closed against it.
-    Operators must resolve the orphaned holder out of band. Both underlying
-    failures are retained: the witness write is the primary cause, the
-    compensating give-back the secondary one.
+    No local fencing witness exists, and the give-back raised, so whether the
+    backend still holds the lock is unknown: an adapter may have removed it and
+    then failed to report that cleanly. Operators must determine the actual
+    holder state out of band. Both underlying failures are retained: the witness
+    write is the primary cause, the compensating give-back the secondary one.
     """
 
     def __init__(
@@ -133,6 +133,14 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
     The redaction context spans the granted lock metadata and any token the
     raising exception carries itself, since mismatch errors know generations the
     caller's metadata does not.
+
+    Backend text is arbitrary, so the shared diagnostic redaction is followed by
+    a standalone-occurrence pass over the known tokens. That pass covers the
+    locally minted generations, which start at "1" and fall below the shared
+    helper's opaque-token length floor. A generation that short is
+    indistinguishable from an unrelated small number, so the pass over-redacts
+    rather than leak; the word boundaries only keep "1" from rewriting the
+    inside of larger numbers and identifiers.
     """
 
     context = dict(metadata)
@@ -141,12 +149,17 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
         value = getattr(error, field, None)
         if value is not None:
             context[field] = value
-    return truncate_diagnostic(
-        redact_fencing_token_diagnostic(
-            f"{type(error).__name__}: {error}",
-            context,
-        )
+    detail = redact_fencing_token_diagnostic(
+        f"{type(error).__name__}: {error}",
+        context,
     )
+    for token in sorted(fencing_token_values(context), key=len, reverse=True):
+        detail = re.sub(
+            rf"(?<![\w.-]){re.escape(token)}(?![\w.-])",
+            FENCING_TOKEN_REDACTION,
+            detail,
+        )
+    return truncate_diagnostic(detail)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1088,7 +1101,10 @@ class CommandLockBackend:
                         env=env,
                         start_new_session=os.name != "nt",
                     )
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
+                    # ValueError covers spawn arguments Popen rejects outright,
+                    # such as an embedded NUL in the configured command or in a
+                    # runtime-context value.
                     raise LockBackendError(
                         f"{setting_name} could not start: {exc}"
                     ) from exc

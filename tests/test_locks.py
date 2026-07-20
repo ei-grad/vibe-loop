@@ -517,6 +517,80 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                     self.assertIn("may remain held", str(error))
                     self.assertIsNotNone(backend.status("TASK-1"))
 
+    def test_unlabelled_low_entropy_generation_is_redacted(self) -> None:
+        class BareGenerationReleaseBackend(locks.DirectoryLockBackend):
+            def release(self, task_lock: locks.TaskLock) -> None:
+                token = locks.fencing_token_value(
+                    task_lock.metadata.get("fencing_token")
+                )
+                raise locks.LockBackendError(
+                    f"adapter refused: generation {token} rejected, run 141 kept"
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = BareGenerationReleaseBackend(root)
+            manager = locks.LockManager(root, backend=backend)
+
+            with self._witness_failure():
+                with self.assertRaises(locks.LockWitnessCompensationError) as caught:
+                    manager.acquire("TASK-1", "run-1")
+
+            error = caught.exception
+            granted_token = locks.fencing_token_value(
+                (backend.status("TASK-1") or {}).get("fencing_token")
+            )
+            self.assertEqual(granted_token, "1")
+            self.assertIn(
+                f"generation {locks.FENCING_TOKEN_REDACTION} rejected",
+                error.release_detail,
+            )
+            self.assertNotIn(f"generation {granted_token} ", error.release_detail)
+            # A generation this short over-redacts standalone matches rather
+            # than leak, but must not rewrite the inside of larger numbers.
+            self.assertIn("run 141 kept", error.release_detail)
+
+    def test_command_backend_spawn_rejection_is_a_compensation_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            with patch.object(
+                locks.subprocess,
+                "Popen",
+                side_effect=ValueError("embedded null byte"),
+            ):
+                with self.assertRaises(locks.LockBackendError) as spawn_caught:
+                    locks.CommandLockBackend(
+                        repo=root,
+                        lock_root=root,
+                        status_command="true",
+                        acquire_command="true",
+                        release_command="true\0",
+                        list_command="true",
+                    ).release(
+                        locks.TaskLock(
+                            task_id="TASK-1",
+                            path=root / "TASK-1.json",
+                            metadata={"run_id": "run-1", "fencing_token": "1"},
+                        )
+                    )
+
+            self.assertIn("could not start", str(spawn_caught.exception))
+            self.assertIsInstance(spawn_caught.exception.__cause__, ValueError)
+
+            class SpawnRejectingReleaseBackend(locks.DirectoryLockBackend):
+                def release(self, task_lock: locks.TaskLock) -> None:
+                    raise locks.LockBackendError(
+                        "lock release_command could not start: embedded null byte"
+                    )
+
+            backend = SpawnRejectingReleaseBackend(root)
+            manager = locks.LockManager(root, backend=backend)
+            with self._witness_failure():
+                with self.assertRaises(locks.LockWitnessCompensationError) as caught:
+                    manager.acquire("TASK-2", "run-1")
+            self.assertIn("could not start", caught.exception.release_detail)
+
 
 if __name__ == "__main__":
     unittest.main()

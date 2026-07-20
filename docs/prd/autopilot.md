@@ -218,14 +218,16 @@ argv or rendered in diagnostics.
 Because both release and recovery need that local witness, an acquire whose
 witness write fails gives the granted lock straight back, and the ordinary case
 leaves the singleton immediately reacquirable. That give-back is best effort,
-not an invariant: when it also fails the lock stays held by a generation no
-local record witnesses, and neither release nor recovery can resolve it. That
-outcome must be reported as a single failure naming both the witness write and
-the compensating give-back, with each role distinguishable and no token value
-rendered, rather than silently reduced to either one, so the operator knows an
-orphaned singleton needs out-of-band resolution. Directory owner and fencing
-mismatches raised during the give-back are compensation failures of that same
-kind, not replacements for the original witness failure.
+not an invariant: when it also fails, no local record witnesses the granted
+generation and the resulting holder state is unknown, because a backend can
+remove the lock and still fail to report that cleanly. If the lock does survive,
+neither release nor recovery can resolve it. That outcome must be reported as a
+single failure naming both the witness write and the compensating give-back,
+with each role distinguishable and no token value rendered, rather than silently
+reduced to either one, so the operator knows to determine the holder state out
+of band. Directory owner and fencing mismatches raised during the give-back are
+compensation failures of that same kind, not replacements for the original
+witness failure.
 
 Successful ordinary, signal, and recovery exits append a terminal supervisor
 record only after lock release. Status reports `stopped` only when such a
