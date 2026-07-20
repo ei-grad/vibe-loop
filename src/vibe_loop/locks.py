@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -180,7 +180,21 @@ class LockManager:
         run_id: str,
         metadata: dict[str, object] | None = None,
     ) -> TaskLock:
-        return self.backend.acquire(task_id, run_id, metadata=metadata)
+        task_lock = self.backend.acquire(task_id, run_id, metadata=metadata)
+        try:
+            record_acquired_fencing_token(
+                self.lock_root,
+                task_id,
+                fencing_token_value(task_lock.metadata.get("fencing_token")),
+            )
+        except OSError:
+            # Hold the invariant "granted implies recorded": a lock whose
+            # generation was never recorded locally can never be recovered
+            # later, so give it back rather than leaving it unreleasable.
+            with suppress(LockBackendError, OSError):
+                self.backend.release(task_lock)
+            raise
+        return task_lock
 
     def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
         current = self.current_lock(task_lock.task_id)
@@ -479,6 +493,9 @@ class LockManager:
             process_exists=process_exists,
         )
 
+    def local_fencing_token(self, task_id: str) -> str:
+        return read_acquired_fencing_token(self.lock_root, task_id)
+
     def release_autopilot(
         self,
         *,
@@ -526,10 +543,18 @@ class LockManager:
         *,
         run_id: str,
         fencing_token: str,
+        verified_pid: int | None = None,
         current_host: str | None = None,
         process_exists: ProcessExists | None = None,
         command_timeout_seconds: float | None = None,
     ) -> bool:
+        """Release a stale autopilot lock owned by an exact run and generation.
+
+        `verified_pid` supplies the owner's process ID for backends that record
+        none of their own; it is only consulted when the lock metadata omits
+        `pid`, and the process it names must still be absent.
+        """
+
         deadline = command_deadline(command_timeout_seconds)
         status = self.autopilot_status(
             current_host=current_host,
@@ -567,6 +592,8 @@ class LockManager:
                 "stale autopilot recovery requires an exact local host owner"
             )
         pid = int_value(status.metadata.get("pid"))
+        if pid is None:
+            pid = verified_pid
         if pid is None:
             raise LockBackendError(
                 "stale autopilot recovery requires a recorded process ID"
@@ -1250,6 +1277,40 @@ def next_fencing_token(lock_root: Path, task_id: str) -> str:
         next_token = current + 1
         token_path.write_text(f"{next_token}\n", encoding="utf-8")
     return str(next_token)
+
+
+def acquired_fencing_token_path(lock_root: Path, task_id: str) -> Path:
+    return lock_root / ".fencing-tokens" / f"{safe_name(task_id)}.acquired"
+
+
+def record_acquired_fencing_token(lock_root: Path, task_id: str, token: str) -> None:
+    """Remember the generation an acquire actually took, if it took one."""
+
+    if not token:
+        return
+    token_path = acquired_fencing_token_path(lock_root, task_id)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_update_lock(token_path):
+        token_path.write_text(f"{token}\n", encoding="utf-8")
+
+
+def read_acquired_fencing_token(lock_root: Path, task_id: str) -> str:
+    """Generation this installation last successfully acquired, or "".
+
+    Both lock backends mint fencing tokens locally through `next_fencing_token`,
+    but that counter advances on every acquire *attempt*: the command backend
+    mints before it knows whether the backend granted the lock, so a refused
+    acquire burns a generation. Only a granted acquire records here, which makes
+    this an independent witness of the generation the backend should still be
+    reporting. Stale recovery compares it against the generation the backend
+    reports, which a token read back out of that same backend status cannot do.
+    """
+
+    token_path = acquired_fencing_token_path(lock_root, task_id)
+    try:
+        return fencing_token_value(token_path.read_text(encoding="utf-8").strip())
+    except OSError:
+        return ""
 
 
 def validate_lock_run_id(

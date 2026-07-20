@@ -631,11 +631,145 @@ class AutopilotStatusTests(unittest.TestCase):
                 }
             )
 
-            payload = collect_project_status(config).to_json()
+            payload = collect_project_status(
+                config,
+                process_exists=lambda pid: False,
+            ).to_json()
 
         self.assertEqual(payload["supervisor"]["state"], "stopped")
         self.assertEqual(payload["supervisor"]["run_id"], "autopilot-1")
+        self.assertEqual(payload["supervisor"]["blocker"], "")
         self.assertEqual(payload["last_cycle"]["status"], "completed")
+
+    def _status_with_supervisor_record(
+        self,
+        record: dict[str, object],
+        *,
+        process_exists,
+    ) -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                    "cycle_id": "autopilot-1-c1",
+                    "status": "completed",
+                    "occurred_at": "2026-05-09T00:00:01+00:00",
+                }
+            )
+            run_store.append_record(record)
+            return collect_project_status(
+                config,
+                process_exists=process_exists,
+            ).to_json()
+
+    def test_stop_record_with_live_process_is_not_a_clean_stop(self) -> None:
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "pid": 4321,
+                "process_exited": False,
+                "lock_released": True,
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=lambda pid: pid == 4321,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_stop_record_live_process"
+        )
+        self.assertIn(
+            "autopilot_supervisor_stop_record_live_process", payload["blockers"]
+        )
+
+    def test_live_supervisor_without_lock_reports_orphan_blocker(self) -> None:
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "pid": 4321,
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=lambda pid: pid == 4321,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_live_without_lock"
+        )
+        self.assertIn("autopilot_supervisor_live_without_lock", payload["blockers"])
+        # A stale cycle status must not mask the inconsistency.
+        self.assertNotEqual(supervisor["state"], "completed")
+
+    def test_dead_supervisor_without_stop_record_is_not_reported_stopped(self) -> None:
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "pid": 4321,
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=lambda pid: False,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_exited_without_stop_record"
+        )
+
+    def test_stop_record_without_pid_is_inconsistent(self) -> None:
+        checked: list[int] = []
+
+        def process_exists(pid: int) -> bool:
+            checked.append(pid)
+            return False
+
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "process_exited": True,
+                "lock_released": True,
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=process_exists,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_stop_record_missing_pid"
+        )
+        self.assertIn(
+            "autopilot_supervisor_stop_record_missing_pid", payload["blockers"]
+        )
+        # Absence was never claimed from a process check, because there is no
+        # PID to check.
+        self.assertEqual(checked, [])
+
+    def test_started_record_without_pid_is_inconsistent(self) -> None:
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=lambda pid: False,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_record_missing_pid"
+        )
 
 
 class ExternalRunSupervisorTests(unittest.TestCase):

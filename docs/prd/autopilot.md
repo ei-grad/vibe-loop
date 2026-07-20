@@ -119,14 +119,41 @@ fencing token. Once signal cleanup begins, repeated supported signals must be
 coalesced until bounded child and backend cleanup completes so a second signal
 cannot interrupt fenced release.
 
+Detached-start readiness must be proven by a local trusted contract, not by
+lock-wire metadata. The supervisor appends its own started record only after
+installing termination handlers, and the launcher verifies that record before
+declaring the detached supervisor live. Backends are entitled to quarantine
+unknown wire fields, so a lock-metadata readiness flag is not an admissible
+signal.
+
 An already-absent process with a remaining lock requires the separate
-`autopilot stop --recover-stale --run-id <exact-run>` path. Recovery privately
-re-reads and requires the backend's nonblank local fencing token, rejects a
-live owner or run mismatch, releases through the configured directory or
-command backend, and verifies absence afterward. Fencing tokens must not be
-accepted in argv or rendered in diagnostics. Successful ordinary, signal, and
-recovery exits append a terminal supervisor record only after lock release;
-status reports that lifecycle as `stopped` independently from `last_cycle`.
+`autopilot stop --recover-stale --run-id <exact-run>` path. Recovery requires
+the exact recorded run and the fencing generation this installation last
+successfully acquired, read from a local record rather than from the backend
+status being recovered; comparing a backend token against itself would fence
+nothing. Only a granted acquire may advance that record: a refused acquire
+against the very lock being recovered must not fence the operator out of it. A
+generation this installation never issued, a live owner, or a run mismatch all
+fail closed. Recovery releases through the configured directory or command
+backend and verifies absence afterward. Fencing tokens must not be accepted in
+argv or rendered in diagnostics.
+
+Successful ordinary, signal, and recovery exits append a terminal supervisor
+record only after lock release. Status reports `stopped` only when such a
+terminal record exists AND the recorded process is verifiably absent. A stop
+record with a live process, a live process without the singleton lock, a
+vanished process with no terminal record, or any supervisor record carrying no
+PID at all must each report an `inconsistent` supervisor state with a specific
+blocker, so an unresolved supervisor is never presented as a clean stop or
+masked by an older cycle status. A record without a PID is inconsistent by
+construction: absence cannot be verified against an identity that was never
+recorded. Recovery therefore never writes a terminal record without a PID. A
+command-backed lock is entitled to record no PID; recovery must then derive the
+exact PID from the matching local `autopilot_supervisor_started` record for the
+requested run, verify that exact process absent, release with the exact run and
+locally minted generation, and prove lock absence so the singleton is
+immediately reacquirable. Only when no PID exists in the lock or the local
+records does recovery refuse outright.
 
 Related implementation IDs: `AUTO-03`.
 

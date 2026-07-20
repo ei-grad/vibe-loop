@@ -20,8 +20,24 @@ from pathlib import Path
 from unittest.mock import patch
 
 import vibe_loop.cli as cli_module
+from vibe_loop.autopilot import (
+    AUTOPILOT_RECORD_SCHEMA_VERSION,
+    collect_supervisor_status,
+    stop_detached_autopilot,
+)
 from vibe_loop.cli import main
-from vibe_loop.locks import AUTOPILOT_LOCK_NAME, LockManager
+from vibe_loop.config import load_config
+from vibe_loop.locks import (
+    AUTOPILOT_LOCK_NAME,
+    LockBusy,
+    LockManager,
+    build_lock_manager,
+)
+from vibe_loop.runs import (
+    AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+    RunStore,
+    utc_now_iso,
+)
 
 
 @contextmanager
@@ -8195,6 +8211,408 @@ class AutopilotCliTests(unittest.TestCase):
                 for launched_pid, launched_group in launched:
                     stop_test_process_group(launched_pid, launched_group)
 
+    @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
+    def test_command_backend_start_stop_restart_without_metadata_echo(self) -> None:
+        """Full lifecycle against a non-leased command-backed singleton lock.
+
+        The adapter quarantines unknown wire fields, so detached start can only
+        verify readiness through the local supervisor-started record.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(
+                repo,
+                PLAN.replace("| TASK-01 | P0 | Next |", "| TASK-01 | P0 | Done |"),
+            )
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            launched: list[tuple[int, int]] = []
+
+            def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [sys.executable, "-m", "vibe_loop", "autopilot", *args],
+                    cwd=repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+
+            start = run_cli("start", "--repo", str(repo), "--interval", "30", "--json")
+            self.assertEqual(start.returncode, 0, start.stderr)
+            launch = json.loads(start.stdout)
+            pid = launch["pid"]
+            launched.append((pid, launch["process_group_id"]))
+
+            try:
+                held = command_lock_state(state_path)[AUTOPILOT_LOCK_NAME]
+                self.assertEqual(held["run_id"], launch["run_id"])
+                self.assertEqual(held["pid"], pid)
+                self.assertNotIn("stop_ready", held)
+                self.assertNotIn("lease_seconds", held)
+
+                stop = run_cli("stop", "--repo", str(repo), "--json")
+                self.assertEqual(stop.returncode, 0, stop.stderr)
+                stop_payload = json.loads(stop.stdout)
+                self.assertTrue(stop_payload["stopped"])
+                self.assertTrue(stop_payload["lock_released"])
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
+                self.assertNotIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+                restart = run_cli(
+                    "start", "--repo", str(repo), "--interval", "30", "--json"
+                )
+                self.assertEqual(restart.returncode, 0, restart.stderr)
+                restarted = json.loads(restart.stdout)
+                launched.append((restarted["pid"], restarted["process_group_id"]))
+                self.assertNotEqual(restarted["run_id"], launch["run_id"])
+                self.assertEqual(run_cli("stop", "--repo", str(repo)).returncode, 0)
+            finally:
+                for launched_pid, launched_group in launched:
+                    stop_test_process_group(launched_pid, launched_group)
+
+    def test_command_backend_fenced_recovery_rejects_wrong_run_and_token(self) -> None:
+        """Stale recovery on a command backend is fenced by run ID and token."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            # A dead owner: no lease means the lock cannot expire on its own.
+            dead_pid = spawn_and_reap_pid()
+            manager.acquire_autopilot(
+                run_id="autopilot-dead", metadata={"pid": dead_pid}
+            )
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+            absent = {dead_pid: False}
+
+            wrong_run = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-other",
+                process_exists=lambda checked: absent.get(checked, False),
+            )
+            self.assertFalse(wrong_run.stopped)
+            self.assertEqual(
+                wrong_run.blocker, "autopilot_stale_recovery_owner_mismatch"
+            )
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+            # Wrong token: the backend reports a generation this installation
+            # never minted, which the local counter must refuse to match.
+            held = command_lock_state(state_path)
+            held[AUTOPILOT_LOCK_NAME]["fencing_token"] = "9999"
+            state_path.write_text(json.dumps(held), encoding="utf-8")
+            wrong_token = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=lambda checked: absent.get(checked, False),
+            )
+            self.assertFalse(wrong_token.stopped)
+            self.assertEqual(
+                wrong_token.blocker, "autopilot_stale_recovery_fencing_mismatch"
+            )
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+            self.assertNotIn("9999", json.dumps(wrong_token.to_json()))
+
+            # Exact run plus the locally minted generation releases the lock.
+            held[AUTOPILOT_LOCK_NAME]["fencing_token"] = manager.local_fencing_token(
+                AUTOPILOT_LOCK_NAME
+            )
+            state_path.write_text(json.dumps(held), encoding="utf-8")
+            recovered = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=lambda checked: absent.get(checked, False),
+            )
+            self.assertTrue(recovered.stopped, recovered.blocker)
+            self.assertTrue(recovered.recovered)
+            self.assertNotIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+            # The singleton is immediately reacquirable after recovery.
+            manager.acquire_autopilot(run_id="autopilot-next", metadata={"pid": 4242})
+            self.assertEqual(
+                command_lock_state(state_path)[AUTOPILOT_LOCK_NAME]["run_id"],
+                "autopilot-next",
+            )
+
+    def test_command_backend_recovery_requires_a_local_fencing_token(self) -> None:
+        """Without a local generation record, recovery refuses to release."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            dead_pid = spawn_and_reap_pid()
+            manager.acquire_autopilot(
+                run_id="autopilot-dead", metadata={"pid": dead_pid}
+            )
+            token_file = (
+                config.state_path
+                / "locks"
+                / ".fencing-tokens"
+                / f"{AUTOPILOT_LOCK_NAME}.acquired"
+            )
+            self.assertTrue(token_file.is_file())
+            token_file.unlink()
+
+            result = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=lambda checked: False,
+            )
+
+            self.assertFalse(result.stopped)
+            self.assertEqual(
+                result.blocker, "autopilot_stale_recovery_missing_fencing_token"
+            )
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+    def test_recovery_does_not_report_release_for_an_unidentified_holder(self) -> None:
+        """A held lock reporting no run ID is not a successor; it fails closed.
+
+        Post-release verification treats a differing run ID as a successor that
+        legitimately took the singleton. A backend that quarantines `run_id` out
+        of its status payload must not thereby make a still-held lock read as
+        released and earn a terminal stop record.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            dead_pid = spawn_and_reap_pid()
+            manager.acquire_autopilot(
+                run_id="autopilot-dead", metadata={"pid": dead_pid}
+            )
+            # The release lands, then the lock reappears without an identity.
+            held = command_lock_state(state_path)
+            anonymous = dict(held[AUTOPILOT_LOCK_NAME])
+            anonymous.pop("run_id", None)
+
+            original_release = manager.backend.release_with_timeout
+
+            def release_then_reappear(
+                task_lock: object, *, timeout_seconds: float | None = None
+            ) -> None:
+                original_release(task_lock, timeout_seconds=timeout_seconds)
+                state_path.write_text(
+                    json.dumps({AUTOPILOT_LOCK_NAME: anonymous}), encoding="utf-8"
+                )
+
+            with patch.object(
+                manager.backend, "release_with_timeout", release_then_reappear
+            ):
+                with patch(
+                    "vibe_loop.autopilot.build_lock_manager", return_value=manager
+                ):
+                    result = stop_detached_autopilot(
+                        config,
+                        recovery=True,
+                        run_id="autopilot-dead",
+                        process_exists=lambda checked: False,
+                    )
+
+            self.assertFalse(result.stopped)
+            self.assertEqual(
+                result.blocker, "autopilot_stale_recovery_backend_release_failed"
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self.assertEqual(
+                collect_supervisor_status(
+                    run_store,
+                    process_exists=lambda checked: False,
+                ).state,
+                "idle",
+            )
+
+    def test_command_backend_recovery_derives_pid_from_local_started_record(
+        self,
+    ) -> None:
+        """The reported failure: a PID-less singleton with a local started record.
+
+        Loopyard stores neither lease nor PID for the supervisor lock, so the
+        exact identity must come from this installation's own started record.
+        Recovery derives that PID, verifies it absent, releases with the exact
+        run and locally minted generation, proves the lock is gone, and leaves
+        the singleton immediately reacquirable.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            dead_pid = spawn_and_reap_pid()
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                    "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                    "occurred_at": utc_now_iso(),
+                    "repo": str(config.repo),
+                    "run_id": "autopilot-dead",
+                    "pid": dead_pid,
+                    "log": str(config.state_path / "autopilot" / "dead.log"),
+                }
+            )
+            manager.acquire_autopilot(run_id="autopilot-dead", metadata={})
+            held = command_lock_state(state_path)
+            held[AUTOPILOT_LOCK_NAME].pop("pid", None)
+            state_path.write_text(json.dumps(held), encoding="utf-8")
+            live_pids = {dead_pid: True}
+
+            def checker(checked: int) -> bool:
+                return live_pids.get(checked, False)
+
+            live_owner = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=checker,
+            )
+            self.assertFalse(live_owner.stopped)
+            self.assertEqual(live_owner.pid, dead_pid)
+            self.assertEqual(live_owner.blocker, "autopilot_stale_recovery_live_owner")
+            live_pids[dead_pid] = False
+
+            wrong_run = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-other",
+                process_exists=checker,
+            )
+            # A run the lock does not name is rejected as a mismatch before any
+            # identity is derived from it, and the lock is left untouched.
+            self.assertFalse(wrong_run.stopped)
+            self.assertEqual(
+                wrong_run.blocker, "autopilot_stale_recovery_owner_mismatch"
+            )
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+            # The reported operator sequence: a refused `autopilot start` against
+            # the stale lock must not burn the local generation and lock the
+            # recovery path out of the singleton it exists to release.
+            for _ in range(3):
+                with self.assertRaises(LockBusy):
+                    manager.acquire_autopilot(
+                        run_id="autopilot-retry", metadata={"pid": os.getpid()}
+                    )
+
+            recovered = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=checker,
+            )
+
+            self.assertTrue(recovered.stopped, recovered.blocker)
+            self.assertTrue(recovered.recovered)
+            self.assertEqual(recovered.pid, dead_pid)
+            self.assertNotIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+            # The terminal record carries the derived PID, so status can verify
+            # absence and report a clean stop rather than an inconsistent one.
+            self.assertEqual(
+                collect_supervisor_status(run_store, process_exists=checker).state,
+                "stopped",
+            )
+            manager.acquire_autopilot(run_id="autopilot-next", metadata={})
+            self.assertEqual(
+                command_lock_state(state_path)[AUTOPILOT_LOCK_NAME]["run_id"],
+                "autopilot-next",
+            )
+
+    def test_recovery_with_no_recorded_pid_anywhere_fails_closed(self) -> None:
+        """A PID-less lock with no local started record refuses to release.
+
+        Recovery must never produce a terminal stop record without a PID: status
+        could not then verify the exact process is absent.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            manager.acquire_autopilot(run_id="autopilot-dead", metadata={})
+            # The reported failure: a singleton held with neither lease nor PID.
+            held = command_lock_state(state_path)
+            held[AUTOPILOT_LOCK_NAME].pop("pid", None)
+            state_path.write_text(json.dumps(held), encoding="utf-8")
+
+            result = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=lambda checked: False,
+            )
+
+            self.assertFalse(result.stopped)
+            self.assertEqual(result.blocker, "autopilot_stale_recovery_missing_pid")
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self.assertEqual(
+                collect_supervisor_status(
+                    run_store,
+                    process_exists=lambda checked: False,
+                ).state,
+                "idle",
+            )
+
     def test_doctor_reports_redacted_autopilot_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
@@ -8691,6 +9109,121 @@ def shell_command(*args: str) -> str:
     if sys.platform == "win32":
         return subprocess.list2cmdline(list(args))
     return shlex.join(args)
+
+
+QUARANTINING_LOCK_ADAPTER = '''\
+"""Stateful command lock adapter that quarantines unknown wire metadata.
+
+Mirrors the Loopyard ADR 0018 contract: fields the backend does not know are
+dropped rather than echoed, so vibe-loop cannot smuggle coordination state
+through lock metadata.
+"""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+KNOWN_FIELDS = {
+    "task_id",
+    "run_id",
+    "pid",
+    "host",
+    "fencing_token",
+    "lease_seconds",
+    "heartbeat_at",
+    "acquired_at",
+    "schema_version",
+    "record_type",
+    "resource",
+    "path",
+}
+
+state_path = Path(__ADAPTER_STATE__)
+operation = os.environ["VIBE_LOOP_LOCK_OPERATION"]
+task_id = os.environ.get("VIBE_LOOP_LOCK_TASK_ID", "")
+metadata = json.loads(os.environ.get("VIBE_LOOP_LOCK_METADATA_JSON") or "{}")
+metadata = {key: value for key, value in metadata.items() if key in KNOWN_FIELDS}
+
+try:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+except OSError:
+    state = {}
+
+
+def save() -> None:
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+
+if operation == "acquire":
+    if task_id in state:
+        print(json.dumps({"acquired": False, "metadata": state[task_id]}))
+        sys.exit(0)
+    state[task_id] = metadata
+    save()
+    print(json.dumps({"acquired": True, "metadata": metadata}))
+elif operation == "update":
+    if task_id not in state:
+        print(json.dumps({"updated": False}))
+        sys.exit(0)
+    merged = dict(state[task_id])
+    merged.update(metadata)
+    state[task_id] = merged
+    save()
+    print(json.dumps({"updated": True, "metadata": merged}))
+elif operation == "release":
+    state.pop(task_id, None)
+    save()
+    print(json.dumps({"released": True}))
+elif operation == "status":
+    held = state.get(task_id)
+    if held is None:
+        print(json.dumps({"locked": False}))
+    else:
+        print(json.dumps({"locked": True, "metadata": held}))
+elif operation == "list":
+    print(json.dumps({"locks": list(state.values())}))
+else:
+    print(json.dumps({}))
+'''
+
+
+def spawn_and_reap_pid() -> int:
+    """PID of a process that has already exited and been reaped."""
+
+    process = subprocess.Popen([sys.executable, "-c", ""])
+    process.wait()
+    return process.pid
+
+
+def write_command_lock_adapter(repo: Path) -> tuple[str, Path]:
+    """Install the quarantining adapter; return its command and state file."""
+
+    state_path = repo / "lock_state.json"
+    adapter = repo / "lock_adapter.py"
+    adapter.write_text(
+        QUARANTINING_LOCK_ADAPTER.replace("__ADAPTER_STATE__", repr(str(state_path))),
+        encoding="utf-8",
+    )
+    return f"{sys.executable} {adapter}", state_path
+
+
+def command_lock_toml(command: str) -> str:
+    return (
+        "[locks]\n"
+        'type = "command"\n'
+        f"acquire_command = {command!r}\n"
+        f"release_command = {command!r}\n"
+        f"status_command = {command!r}\n"
+        f"list_command = {command!r}\n"
+    )
+
+
+def command_lock_state(state_path: Path) -> dict[str, object]:
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except OSError:
+        return {}
 
 
 def init_planning_repo(repo: Path, plan_text: str) -> None:

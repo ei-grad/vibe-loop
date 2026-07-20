@@ -353,7 +353,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Success requires both the recorded process to exit and its singleton "
             "lock to be absent. --recover-stale only releases an absent local "
             "owner's lock with the exact recorded run identity and private fencing "
-            "token."
+            "token; when the lock records no PID, the exact process is taken from "
+            "the local supervisor-started record for that run and verified absent."
         ),
     )
     add_repo_argument(autopilot_stop)

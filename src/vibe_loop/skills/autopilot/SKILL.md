@@ -109,10 +109,29 @@ vibe-loop autopilot stop --repo <repo> --recover-stale \
   --run-id <exact-supervisor-run-id> --json
 ```
 
-Recovery reads the private local fencing token from the configured lock backend
-and refuses live, foreign, missing-token, or run-mismatched ownership. Never put
-a fencing token in argv, logs, prompts, or diagnostics. Directory and command
-lock backends use the same manager release and post-release verification path.
+Recovery reads the fencing generation this installation last successfully
+acquired, recorded under the lock root only when a backend actually granted the
+lock, then requires the backend to report that same generation. A refused
+acquire — a fenced `autopilot start` against the stale lock — must not advance
+it, or recovery would be locked out of the singleton it exists to release. It
+refuses live, foreign, missing-token, mismatched-token, or run-mismatched
+ownership. Never put a fencing token in argv, logs, prompts,
+or diagnostics. Directory and command lock backends use the same manager release
+and post-release verification path.
+
+A command-backed singleton may hold no PID of its own. Recovery then takes the
+exact PID from this installation's local `autopilot_supervisor_started` record
+for the requested run and verifies that exact process is absent before
+releasing. With no PID in either place the run is unverifiable, and recovery
+refuses it as `autopilot_stale_recovery_missing_pid` rather than writing a
+terminal record that status could never confirm.
+
+A supervisor state of `inconsistent` is a blocker, not a stop. It means the
+terminal stop record and the recorded process disagree — a stop record whose
+process is still alive, a live supervisor that no longer holds the singleton
+lock, or a vanished supervisor that never recorded its termination. Investigate
+the reported blocker and the recorded PID before starting a replacement
+supervisor; do not treat it as a clean `stopped`.
 
 ## Wake / Wait
 

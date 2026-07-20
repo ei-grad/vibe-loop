@@ -374,6 +374,30 @@ class AutopilotRecoveryTests(unittest.TestCase):
         self.assertEqual(len(set(tokens)), 32)
         self.assertEqual(sorted(map(int, tokens)), list(range(1, 33)))
 
+    def test_acquire_releases_a_lock_whose_generation_cannot_be_recorded(self) -> None:
+        class GrantingBackend(AutopilotRecoveryTests.Backend):
+            def acquire(self, task_id, run_id, metadata=None):
+                return locks.TaskLock(
+                    task_id=task_id,
+                    path=self.path_for(task_id),
+                    metadata={"run_id": run_id, "fencing_token": "7"},
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = GrantingBackend(root, {})
+            manager = locks.LockManager(root, backend=backend)
+            with patch.object(
+                locks,
+                "record_acquired_fencing_token",
+                side_effect=OSError("read-only lock root"),
+            ):
+                with self.assertRaises(OSError):
+                    manager.acquire("TASK-1", "run-1")
+
+            self.assertIsNotNone(backend.released)
+            self.assertEqual(locks.read_acquired_fencing_token(root, "TASK-1"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

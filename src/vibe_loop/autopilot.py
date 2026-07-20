@@ -40,7 +40,6 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     build_lock_manager,
-    fencing_token_value,
     redact_fencing_token_payload,
 )
 from vibe_loop.retry import parse_limit_wall_reset_delay
@@ -157,6 +156,7 @@ class SupervisorStatus:
     cycle_id: str = ""
     observed_at: str = ""
     record: dict[str, Any] | None = None
+    blocker: str = ""
 
     def to_json(self) -> dict[str, object]:
         payload = {
@@ -167,6 +167,7 @@ class SupervisorStatus:
             "cycle_id": self.cycle_id,
             "observed_at": self.observed_at,
             "record": self.record or {},
+            "blocker": self.blocker,
         }
         redacted = redact_fencing_token_payload(payload)
         assert isinstance(redacted, dict)
@@ -371,6 +372,7 @@ def collect_project_status(
             workspace_diagnostics=workspace_diagnostics,
             integration_lock=integration_lock,
             agent_diagnostics=agent_blockers,
+            supervisor=supervisor,
         )
     )
     observations = tuple(
@@ -702,21 +704,50 @@ def collect_supervisor_status(
                 record=record,
             )
     newest_record = supervisor_records[-1] if supervisor_records else None
-    if (
-        newest_record is not None
-        and newest_record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
-    ):
-        return supervisor_status_from_record(newest_record, state="stopped")
-    if (
-        supervisor_lock is not None
-        and not supervisor_lock.locked
-        and newest_record is not None
-        and (
-            (record_pid := int_value(newest_record.get("pid"))) is None
-            or not process_checker(record_pid)
+    # A clean "stopped" is only credible when an explicit terminal stop record
+    # exists AND the recorded process is really gone. A record alone can be
+    # written by a supervisor that then hangs, and an unlocked singleton lock
+    # alone can mean the supervisor lost its lock while still running.
+    if newest_record is not None:
+        record_pid = int_value(newest_record.get("pid"))
+        record_is_terminal = (
+            newest_record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
         )
-    ):
-        return supervisor_status_from_record(newest_record, state="stopped")
+        # Absence is only verifiable against a recorded PID. A record without one
+        # leaves the supervisor's fate unknown, so it can never justify "stopped".
+        process_absent = record_pid is not None and not process_checker(record_pid)
+        if record_is_terminal:
+            if record_pid is None:
+                return supervisor_status_from_record(
+                    newest_record,
+                    state="inconsistent",
+                    blocker="autopilot_supervisor_stop_record_missing_pid",
+                )
+            if process_absent:
+                return supervisor_status_from_record(newest_record, state="stopped")
+            return supervisor_status_from_record(
+                newest_record,
+                state="inconsistent",
+                blocker="autopilot_supervisor_stop_record_live_process",
+            )
+        if supervisor_lock is not None and not supervisor_lock.locked:
+            if record_pid is None:
+                return supervisor_status_from_record(
+                    newest_record,
+                    state="inconsistent",
+                    blocker="autopilot_supervisor_record_missing_pid",
+                )
+            if process_absent:
+                return supervisor_status_from_record(
+                    newest_record,
+                    state="inconsistent",
+                    blocker="autopilot_supervisor_exited_without_stop_record",
+                )
+            return supervisor_status_from_record(
+                newest_record,
+                state="inconsistent",
+                blocker="autopilot_supervisor_live_without_lock",
+            )
     if supervisor_lock is None and newest_record is not None:
         pid = int_value(newest_record.get("pid"))
         if pid and process_checker(pid):
@@ -751,6 +782,7 @@ def supervisor_status_from_record(
     record: dict[str, Any],
     *,
     state: str,
+    blocker: str = "",
 ) -> SupervisorStatus:
     return SupervisorStatus(
         state=state,
@@ -760,6 +792,7 @@ def supervisor_status_from_record(
         cycle_id=str(record.get("cycle_id") or ""),
         observed_at=str(record.get("occurred_at") or ""),
         record=record,
+        blocker=blocker,
     )
 
 
@@ -845,8 +878,11 @@ def project_blockers(
     workspace_diagnostics: tuple[dict[str, object], ...],
     integration_lock: dict[str, object],
     agent_diagnostics: tuple[str, ...] = (),
+    supervisor: SupervisorStatus | None = None,
 ) -> list[str]:
     blockers: list[str] = []
+    if supervisor is not None and supervisor.blocker:
+        blockers.append(supervisor.blocker)
     if not git_status.available:
         blockers.append(f"git_state_unavailable: {git_status.error}")
     if git_status.dirty:
@@ -1185,6 +1221,7 @@ def start_detached_autopilot(
     deadline = time_module.monotonic() + max(0.0, verification_timeout)
     blocker = "detached_autopilot_verification_timeout"
     verified = False
+    run_store = RunStore(config.state_path / "runs.jsonl")
     try:
         while True:
             status = lock_manager.autopilot_status()
@@ -1195,7 +1232,16 @@ def start_detached_autopilot(
                 and status.state in {"held", "unknown"}
                 and lock_pid == process.pid
                 and lock_run_id
-                and status.metadata.get("stop_ready") is True
+                # Stop readiness is proven by the supervisor's own local started
+                # record, which it writes only after installing termination
+                # handlers. A lock-metadata flag would not survive backends that
+                # quarantine unknown wire fields.
+                and autopilot_supervisor_started_recorded(
+                    run_store,
+                    repo=config.repo,
+                    run_id=lock_run_id,
+                    pid=process.pid,
+                )
             ):
                 if (
                     process.poll() is not None
@@ -1204,7 +1250,7 @@ def start_detached_autopilot(
                 ):
                     blocker = "detached_autopilot_process_identity_unverified"
                     break
-                RunStore(config.state_path / "runs.jsonl").append_record(
+                run_store.append_record(
                     {
                         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
                         "record_type": AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -1414,6 +1460,58 @@ def detached_autopilot_identity(
     return None
 
 
+def supervisor_lock_released(status: IntegrationLockStatus, run_id: str) -> bool:
+    """True when the singleton lock is no longer held by `run_id`.
+
+    A successor supervisor that acquires the lock between polls must not read as
+    a failed release. An owner the backend reports without a run ID is not such a
+    successor: it is an unidentified holder, so it fails closed rather than
+    letting a still-held lock pass as released.
+    """
+
+    if not status.locked:
+        return True
+    current_run_id = str(status.metadata.get("run_id") or "")
+    return bool(current_run_id) and current_run_id != run_id
+
+
+def autopilot_supervisor_started_pid(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    run_id: str,
+) -> int | None:
+    """PID this installation recorded for a supervisor run, or None.
+
+    `run_autopilot` appends this record only after `enable_termination_signals`,
+    so its presence is the local trusted contract that a detached supervisor can
+    honor a stop signal through its normal cleanup path. It is also the only
+    local witness of which process held the lock when the backend keeps no PID.
+    """
+
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE:
+            continue
+        if str(record.get("repo") or "") != str(repo):
+            continue
+        if str(record.get("run_id") or "") != run_id:
+            continue
+        return int_value(record.get("pid"))
+    return None
+
+
+def autopilot_supervisor_started_recorded(
+    run_store: RunStore,
+    *,
+    repo: Path,
+    run_id: str,
+    pid: int,
+) -> bool:
+    """True once the supervisor recorded that its termination handlers are live."""
+
+    return autopilot_supervisor_started_pid(run_store, repo=repo, run_id=run_id) == pid
+
+
 def append_autopilot_stopped_record(
     run_store: RunStore,
     *,
@@ -1423,6 +1521,7 @@ def append_autopilot_stopped_record(
     stop_mode: str,
     signal_number: int | None = None,
     process_exited: bool = True,
+    lock_released: bool = True,
 ) -> None:
     record: dict[str, object] = {
         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
@@ -1433,7 +1532,7 @@ def append_autopilot_stopped_record(
         "pid": pid,
         "stop_mode": stop_mode,
         "process_exited": process_exited,
-        "lock_released": True,
+        "lock_released": lock_released,
     }
     if signal_number is not None:
         record["signal"] = signal.Signals(signal_number).name
@@ -1530,6 +1629,30 @@ def stop_detached_autopilot(
                     + ("foreign_host" if owner_host else "missing_host")
                 ),
             )
+        if run_id and owner_run_id and owner_run_id != run_id:
+            # Reject a run the lock does not name before deriving any identity
+            # from it, so the operator sees the real mismatch rather than a
+            # downstream consequence of it.
+            return AutopilotStopResult(
+                repo=config.repo,
+                stopped=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                process_exited=not owner_live,
+                blocker="autopilot_stale_recovery_owner_mismatch",
+            )
+        if pid is None and run_id:
+            # A command-backed singleton may record no PID at all. The exact
+            # identity then comes from this installation's own started record
+            # for that run, the only local witness of which process held the
+            # lock. Absence is still verified against that exact PID below.
+            pid = autopilot_supervisor_started_pid(
+                run_store,
+                repo=config.repo,
+                run_id=run_id,
+            )
+            owner_live = pid is not None and checker(pid)
         if owner_live:
             return AutopilotStopResult(
                 repo=config.repo,
@@ -1539,9 +1662,17 @@ def stop_detached_autopilot(
                 pid=pid,
                 blocker="autopilot_stale_recovery_live_owner",
             )
-        local_fencing_token = fencing_token_value(status.metadata.get("fencing_token"))
+        # Read the generation this installation last minted, not the one the
+        # backend reports: comparing the backend's token against itself would
+        # always succeed and fence nothing.
+        local_fencing_token = lock_manager.local_fencing_token(AUTOPILOT_LOCK_NAME)
         if not run_id:
             blocker = "autopilot_stale_recovery_missing_run_id"
+        elif pid is None:
+            # Neither the lock nor the local started record named a process, so
+            # absence cannot be verified and no terminal record written here
+            # could ever justify "stopped".
+            blocker = "autopilot_stale_recovery_missing_pid"
         elif not local_fencing_token:
             blocker = "autopilot_stale_recovery_missing_fencing_token"
         else:
@@ -1560,6 +1691,7 @@ def stop_detached_autopilot(
             released = lock_manager.recover_stale_autopilot(
                 run_id=run_id,
                 fencing_token=local_fencing_token,
+                verified_pid=pid,
                 process_exists=checker,
                 command_timeout_seconds=backend_timeout(),
             )
@@ -1576,10 +1708,11 @@ def stop_detached_autopilot(
                 blocker = "autopilot_stale_recovery_lock_changed"
             else:
                 try:
-                    lock_released = not lock_manager.autopilot_status(
+                    current = lock_manager.autopilot_status(
                         process_exists=checker,
                         command_timeout_seconds=backend_timeout(),
-                    ).locked
+                    )
+                    lock_released = supervisor_lock_released(current, run_id)
                 except (LockBackendError, OSError):
                     lock_released = False
                 if not lock_released:
@@ -1810,7 +1943,7 @@ def stop_verified_detached_autopilot(
                     pid=identity.pid,
                     blocker="autopilot_stop_backend_status_failed",
                 )
-            lock_released = not current.locked
+            lock_released = supervisor_lock_released(current, identity.run_id)
             if process_exited and lock_released:
                 append_autopilot_stopped_record(
                     run_store,
@@ -3776,9 +3909,6 @@ def run_autopilot(
     termination_signal: int | None = None
     try:
         enable_termination_signals()
-        lock_metadata = dict(lock.metadata)
-        lock_metadata["stop_ready"] = True
-        lock = lock_manager.update(lock, lock_metadata)
         heartbeat.start()
         run_store.append_record(
             {
@@ -3968,7 +4098,7 @@ def run_autopilot(
     finally:
         try:
             heartbeat.stop()
-            lock_manager.release_autopilot(
+            released = lock_manager.release_autopilot(
                 run_id=supervisor_run_id,
                 fencing_token=fencing_token,
                 command_timeout_seconds=30.0,
@@ -3983,6 +4113,7 @@ def run_autopilot(
                 ),
                 signal_number=termination_signal,
                 process_exited=False,
+                lock_released=released,
             )
         finally:
             signal_stack.close()
