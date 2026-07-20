@@ -297,6 +297,11 @@ diagnostics make integration unsafe. Worktree and branch handling stay outside
 the CLI runtime — put that policy in repository instructions or the agent
 command.
 
+Fencing tokens remain internal lock capabilities. CLI JSON, worker/status
+views, troubleshooting output, and persisted run diagnostics replace fencing
+fields with `<redacted>` while retaining stable mismatch reasons and safe
+owner/path context.
+
 ### Status and diagnostics
 
 ```bash
@@ -423,21 +428,60 @@ A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
 work and exits when a cycle is idle or blocked; with `--interval N` it stays
-resident, sleeping `N` seconds between cycles until `--max-cycles` or an
-interrupt. `--jobs`, `--ask-agent`, `--continue-on-failure`, `--max-slices`, and
+resident until `--max-cycles` or an interrupt. Idle cycles use bounded adaptive
+task-source rechecks: the first listing follows `planning_recheck_seconds`
+(60s by default), delays double up to `idle_poll_max_seconds` (600s by default),
+and the last delay is shortened to preserve the outer interval deadline. A
+default 30-minute empty interval therefore performs five fallback listings, not
+roughly 30; each poll derives its runnable set from that single task snapshot.
+Task-source command timeouts are shortened to the remaining interval budget so
+a failing source cannot overrun the deadline. Fallback candidate filtering uses
+the cycle's active-run/conflict snapshot instead of issuing separately timed
+lock-backend queries; lock-only changes wake through the configured adapter or
+the outer deadline. Each wait appends an `autopilot_idle_wait` record with the
+wake reason, deadline, runnable count, poll/adapter counts, and bounded source
+or adapter errors. `--jobs`, `--ask-agent`, `--continue-on-failure`,
+`--max-slices`, and
 `--max-tasks` are forwarded to each child; `--min-ready` sets the minimum
-runnable depth required before launching. If the queue is below that depth and
-no explicit `[autopilot] planning_command` is configured, the cycle records
-`planning_unconfigured` with the low/no-runnable observation instead of
-authoring new tasks itself. A single supervisor lock prevents duplicates; Ctrl-C
+runnable depth required before launching. The value must be a positive integer;
+zero is rejected so an empty queue can never satisfy the launch gate. If the
+queue is below that depth and no explicit `[autopilot] planning_command` is
+configured, native planning first asks the read-only analysis runner for a
+strict decision and objective. A reasoned plan decision launches a separate
+read-write `agent.command` worker with an `orchestrated-vibe-loop` planning
+prompt; only that worker may author task content. The supervisor never edits the
+task source: it journals the decision plus started/terminal worker lifecycle,
+honors the configured worker timeout, terminates the worker process group on a
+timeout or interrupt, and re-reads runnable depth after the worker exits. Invalid
+analysis output fails closed without launching the write-capable worker, and a
+post-worker task-source error remains explicit. A configured planning command
+retains precedence. A single supervisor lock prevents duplicates; Ctrl-C
 terminates the in-flight child and releases the lock.
+
+An explicit `[autopilot] idle_wake_command` can replace clock-only sleeping
+between fallback listings with a trusted long-poll adapter. Each invocation is
+bounded by the current adaptive delay and receives that delay, the cycle ID,
+and outer deadline literally through `VIBE_LOOP_IDLE_WAIT_SECONDS`,
+`VIBE_LOOP_IDLE_CYCLE_ID`, and `VIBE_LOOP_IDLE_DEADLINE`. It returns
+`{"woke":false}` or `{"woke":true,"reason":"task_change"}`; an
+`operator_message` reason may include an `event` object whose `id`, `at`,
+`sender`, and `session_ref` metadata are journaled. Message content and adapter
+stdout/stderr are not journaled. Invalid, failed, or timed-out adapters are
+recorded by error category and use the same adaptive fallback budget, so they
+cannot create a spin loop. Adapter stdout is capped at 64 KiB before JSON
+parsing, allowed event strings at 1 KiB each, and the journaled event at 4 KiB.
+The command is trusted, user-authored configuration;
+generated task profiles cannot introduce it. Validated per-project registry
+context is copied into this adapter environment using the same literal selector
+boundary as task-source and lock adapters.
 
 **`projects`** manages an optional multi-project registry (`register`, `list`,
 `remove`, `status`). It records repo paths and display names in a small JSON file
 (default `~/.vibe-loop/projects.json`, `--registry` to override); each project
 keeps its own state directory. A repeated `register --context NAME=VALUE` option
 adds bounded, non-secret selectors for repositories whose command-backed task
-source or lock adapter needs distinct context such as `LOOPYARD_PROJECT`.
+source, lock adapter, or idle-wake adapter needs distinct context such as
+`LOOPYARD_PROJECT`.
 Selectors are copied literally into only those subprocess environments, never
 shell-interpolated or added to global `os.environ`. Names must be selector-
 shaped, with suffixes such as `_PROJECT`, `_BOARD`, `_TENANT`, `_WORKSPACE`,
@@ -529,20 +573,24 @@ type = "directory"
 # these.
 # jobs = 2
 # interval_seconds = 60.0
-# min_ready = 1
+# min_ready = 1              # positive integer; zero is invalid
+# planning_recheck_seconds = 60.0  # initial idle fallback delay; minimum 5s
+# idle_poll_max_seconds = 600.0    # exponential idle fallback cap; minimum 5s
 require_clean_repo = true   # set false to let a dirty tree run a cycle
 # Safe default: inspect and journal eligible worktrees without removing them.
 # Set to "reap" only as an explicit operator opt-in; existing safety guards remain.
 worktree_disposition = "report-only"
 # Optional user-authored maintenance hooks, redacted in status/doctor JSON.
 # A failing health command blocks the launch; planning runs when the runnable
-# queue is below min_ready; if planning is not configured, the cycle records
-# planning_unconfigured. Summary runs after a launch; troubleshoot runs after a
+# queue is below min_ready. When no planning command is configured, native
+# read-only planning detection may delegate task authoring to a separate
+# read-write worker. Summary runs after a launch; troubleshoot runs after a
 # failed child. Generated profiles can never introduce these hooks.
 # health_command = "scripts/health.sh"
 # summary_command = "scripts/summary.sh"
 # troubleshoot_command = "scripts/troubleshoot.sh"
 # planning_command = "scripts/plan.sh"
+# idle_wake_command = "scripts/wait-for-change.sh"
 ```
 
 When `--repo` points at a Git linked worktree without its own `.vibe-loop.toml`,
@@ -748,7 +796,7 @@ lowercase statuses should configure lowercase entries. This keeps an explicit
 allowlist from silently accepting additional status spellings.
 
 Setting any explicit source key — `type`, `plan_path`, `plan_paths`, `profile`,
-`list`, `next`, `probe`, `reset` — disables generated cache as the active
+`list`, `next`, `probe`, `activate`, `reset` — disables generated cache as the active
 source. Non-source settings such as `runnable_statuses` still override matching
 generated fields without disabling the generated parser.
 
@@ -759,6 +807,7 @@ generated fields without disabling the generated parser.
 type = "command"
 list = "my-task-tool list --json"
 probe = "my-task-tool show {task_id} --json"
+activate = "my-task-tool activate {task_id} --run {run_id} --json"
 reset = "my-task-tool reset {task_id}"
 ```
 
@@ -772,15 +821,26 @@ optional traceability fields — `requirement_ids`, `spec_paths`, `design_refs`,
 `approval_state`, `source_fingerprints` — emitted in task JSON, analytics,
 promotion, and worker prompts when present.
 
+`activate` is required before a command-backed source can launch a worker. Once
+the exact task lock is held, vibe-loop invokes this command with shell-quoted
+`{task_id}` and `{run_id}` values. The adapter must atomically compare-and-set
+the project-owned task from one configured runnable status to a non-runnable
+in-progress status, then return that normalized task as one JSON object.
+Vibe-loop confirms the returned
+ID, rejects terminal, blocked, or still-runnable statuses, records `run_started`,
+and only then launches the worker. A missing, failed, timed-out, malformed, or
+unconfirmed activation releases only that run's task lock and launches no
+worker; it does not reset task state or touch a workspace. Continuation attempts
+probe and confirm the prior non-runnable state without repeating the fresh
+compare-and-set.
+
 `reset` is an optional hook, templated with `{task_id}`, that asks the backend
-to return a claimed task to its runnable state. A worker claims its task
-(runnable → active) in the backend itself; if it then dies on a provider limit
-wall before any terminal transition, the task is left claimed with no live
-vibe-loop lock and would never be re-dispatched. When the supervisor classifies
-a run as a limit wall it invokes this hook for the affected task so the next
-cycle can pick it up again. Absent hook, backend status is left untouched
-(vibe-loop never mutates project-owned status on its own); a hook that fails is
-logged and non-fatal.
+to return an activated task to its runnable state. If a worker dies on a
+provider limit wall before any terminal transition, the task is left active
+with no live vibe-loop lock and would never be re-dispatched. When the
+supervisor classifies a run as a limit wall it invokes this hook for the
+affected task so the next cycle can pick it up again. Absent hook, backend
+status is left untouched; a hook that fails is logged and non-fatal.
 
 **Spec gates** (read-only diagnostics by default). `doctor` and `specs check`
 report unapproved tasks, stale fingerprints, missing requirement IDs, and

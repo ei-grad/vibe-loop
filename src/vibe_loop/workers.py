@@ -21,6 +21,7 @@ from vibe_loop.locks import (
     lock_lease_expired,
     numeric_value,
     pid_exists,
+    redact_fencing_token_payload,
     validate_lock_fencing_token,
 )
 from vibe_loop.runs import (
@@ -565,7 +566,9 @@ class WorkerView:
             "result_metadata": self.result_metadata,
         }
         payload.update(self.lifecycle_progress.to_json())
-        return payload
+        redacted = redact_fencing_token_payload(payload)
+        assert isinstance(redacted, dict)
+        return redacted
 
 
 ProcessExists = Callable[[int], bool]
@@ -650,11 +653,7 @@ def active_task_lock_for_claim(
                 raise WorkspaceClaimError(
                     "fencing_token_mismatch",
                     "workspace claim refused: fencing token mismatch",
-                    details={
-                        "expected_token": exc.expected_token,
-                        "actual_token": exc.actual_token,
-                        "lock_path": str(exc.path),
-                    },
+                    details={"lock_path": str(exc.path)},
                 ) from exc
             return TaskLock(task_id=task_id, path=path, metadata=metadata)
     if matching_task:

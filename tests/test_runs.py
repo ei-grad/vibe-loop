@@ -8,6 +8,9 @@ from pathlib import Path
 from vibe_loop.runs import (
     AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
+    AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+    AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_RECORD_TYPES,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     KNOWN_RECORD_TYPES,
@@ -249,6 +252,37 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["lock_kind"], "task")
         self.assertEqual(payload["resources"], ["db"])
         self.assertTrue(payload["occurred_at"])
+
+    def test_append_record_redacts_nested_fencing_token_fields(self) -> None:
+        expected_token = "persisted-expected-fencing-canary"
+        actual_token = "persisted-actual-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            store = RunStore(path)
+
+            store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "reason": "fencing_token_mismatch",
+                    "details": {
+                        "expected_token": expected_token,
+                        "nested": {"actual_token": actual_token},
+                        "lock_path": "/safe/lock/path",
+                    },
+                }
+            )
+
+            raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+
+        self.assertNotIn(expected_token, raw)
+        self.assertNotIn(actual_token, raw)
+        self.assertEqual(payload["details"]["expected_token"], "<redacted>")
+        self.assertEqual(payload["details"]["nested"]["actual_token"], "<redacted>")
+        self.assertEqual(payload["details"]["lock_path"], "/safe/lock/path")
 
     def test_run_started_event_writes_trailer_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -736,6 +770,19 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, "autopilot_worktree_reap")
         self.assertIn(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, AUTOPILOT_RECORD_TYPES)
         self.assertIn(AUTOPILOT_WORKTREE_REAP_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_native_planning_record_types_registered(self) -> None:
+        for record_type in (
+            AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+            AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+        ):
+            self.assertIn(record_type, AUTOPILOT_RECORD_TYPES)
+            self.assertIn(record_type, KNOWN_RECORD_TYPES)
+
+    def test_idle_wait_record_type_registered(self) -> None:
+        self.assertEqual(AUTOPILOT_IDLE_WAIT_RECORD_TYPE, "autopilot_idle_wait")
+        self.assertIn(AUTOPILOT_IDLE_WAIT_RECORD_TYPE, AUTOPILOT_RECORD_TYPES)
+        self.assertIn(AUTOPILOT_IDLE_WAIT_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
     def test_read_records_keeps_worktree_reap_record_and_out_of_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

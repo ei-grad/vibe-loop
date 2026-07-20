@@ -11,7 +11,11 @@ workflow.
 
 Acceptance must cover single-task `run-next`, serial `run-until-done`,
 environment variables passed to workers, worker prompt addendum, and the rule
-that workers own their slice lifecycle.
+that workers own their slice lifecycle. For command-backed sources it must also
+cover exact task-lock acquisition followed by project adapter activation and
+non-runnable-state confirmation before `run_started`, worker launch, workspace
+claim, or edit. Missing or unconfirmed activation must fail closed without
+resetting project state or touching another worker's lock or workspace.
 
 Related implementation IDs: `PAR-01`, `PAR-03`, `PAR-05`.
 
@@ -116,6 +120,13 @@ run share `run_id`; lock records carry `task_id`.
 Events are diagnostic and inspectable, not authoritative for task status. The
 task source remains the authority for task completion state.
 
+Fencing tokens are internal lock capabilities, not diagnostic metadata. Raw
+tokens must not be persisted in run records or emitted through CLI JSON,
+worker, status, doctor, or troubleshooting views. Fencing failures retain a
+stable `fencing_token_mismatch` reason plus non-sensitive owner and lock-path
+context. Readers redact fencing fields in historical records as well as new
+writes so legacy diagnostics cannot re-expose a token.
+
 `runs.jsonl` must also be able to expose trailer-ready run context for
 repository-owned tools that persist task evidence in git or project worklogs.
 This context should include bounded, non-secret values such as task IDs suitable
@@ -132,9 +143,10 @@ Acceptance must cover new record types appended without breaking existing
 readers, unknown type tolerance, correlation by `run_id` and `task_id`, payload
 schema per type, trailer-ready context availability before worker commits when
 possible, session-observed updates when native session IDs appear, redaction of
-raw command configuration, omission of model metadata that cannot be observed or
-safely inferred, `started_at` on run results and emitted run events, and the rule
-that lifecycle events do not replace task-source authority.
+raw command configuration and fencing tokens, omission of model metadata that
+cannot be observed or safely inferred, `started_at` on run results and emitted
+run events, and the rule that lifecycle events do not replace task-source
+authority.
 
 Related implementation IDs: `RT-01`, `RT-05`, `RT-07`.
 

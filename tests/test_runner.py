@@ -36,6 +36,7 @@ from vibe_loop.runner import (
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     AgentRuntimeContext,
     SchedulerLockBusy,
+    TaskActivationError,
     VibeRunner,
     active_lock_conflict_domains,
     build_batch_selection_prompt,
@@ -132,6 +133,23 @@ def file_fingerprint(path: Path, relative_path: str) -> dict[str, object]:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_activate_task_before_launch_rejects_empty_status(self) -> None:
+        class EmptyStatusSource:
+            def activate(self, *args: object, **kwargs: object) -> Task:
+                return Task(task_id="TASK-01", title="Task", status="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            runner._source = EmptyStatusSource()
+
+            with self.assertRaisesRegex(TaskActivationError, "empty status"):
+                runner.activate_task_before_launch(
+                    Task(task_id="TASK-01", title="Task", status="Next"),
+                    "run-1",
+                    {},
+                    continuation=False,
+                )
+
     def test_selection_prompt_includes_recent_logs(self) -> None:
         task = Task(task_id="LIVE-04", title="Realtime reconcile", status="Next")
 
@@ -3660,6 +3678,123 @@ class TransientWorkerFailureTests(unittest.TestCase):
         sleep.assert_not_called()
         self.assertEqual([result.restart_count for result in results], [0, 1])
         self.assertEqual(results[-1].classification, "completed")
+
+    def test_parallel_loop_rescans_ready_work_before_retry_cooldown_sleep(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker"),
+                    supervision=SupervisionConfig(
+                        max_restarts=1,
+                        cooldown_seconds=3600,
+                    ),
+                )
+            )
+            log_path = repo / "transient.log"
+            log_path.write_text("overloaded, please wait\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [
+                    Task(
+                        task_id="TASK-A",
+                        title="Cooling task",
+                        status="Next",
+                        order=1,
+                        resources=("provider",),
+                        conflict_domains_known=True,
+                    ),
+                    Task(
+                        task_id="TASK-B",
+                        title="Conflict holder",
+                        status="Next",
+                        order=2,
+                        resources=("shared",),
+                        conflict_domains_known=True,
+                    ),
+                    Task(
+                        task_id="TASK-C",
+                        title="Newly eligible work",
+                        status="Next",
+                        order=3,
+                        resources=("shared",),
+                        conflict_domains_known=True,
+                    ),
+                ]
+            )
+            runner._source = source
+            clock = [0.0]
+            c_started_at: list[float] = []
+            original_list_candidates = runner.list_candidates
+            stale_post_completion_scan = False
+
+            def run_task(task: Task) -> RunResult:
+                restart_count = runner.current_restart_count(task.task_id)
+                if task.task_id == "TASK-A" and restart_count == 0:
+                    return RunResult(
+                        run_id="run-a-0",
+                        task_id=task.task_id,
+                        classification="failed",
+                        exit_code=1,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                if task.task_id == "TASK-C":
+                    c_started_at.append(clock[0])
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id=f"run-{task.task_id.lower()}-{restart_count}",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / f"{task.task_id.lower()}.log",
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            def list_candidates(exclude: set[str] | None = None) -> list[Task]:
+                nonlocal stale_post_completion_scan
+                candidates = original_list_candidates(exclude=exclude)
+                excluded = exclude or set()
+                if (
+                    not stale_post_completion_scan
+                    and "TASK-A" in excluded
+                    and "TASK-B" not in excluded
+                    and any(task.task_id == "TASK-C" for task in candidates)
+                ):
+                    stale_post_completion_scan = True
+                    return []
+                return candidates
+
+            def advance_clock(delay: float) -> None:
+                clock[0] += delay
+
+            runner.run_task = run_task
+            runner.list_candidates = list_candidates
+            with (
+                patch(
+                    "vibe_loop.runner.time.monotonic",
+                    side_effect=lambda: clock[0],
+                ),
+                patch("vibe_loop.runner.time.sleep", side_effect=advance_clock),
+            ):
+                results = runner.run_until_done_parallel(
+                    ask_agent=False,
+                    max_slices=0,
+                    continue_on_failure=False,
+                    jobs=2,
+                    max_tasks=3,
+                )
+
+        self.assertTrue(stale_post_completion_scan)
+        self.assertEqual(c_started_at, [0.0])
+        self.assertEqual(
+            sum(result.classification == "completed" for result in results),
+            3,
+        )
 
     def test_parallel_loop_requeues_ready_retry_while_other_task_is_running(
         self,

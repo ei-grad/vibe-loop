@@ -10,6 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
+from vibe_loop.locks import redact_fencing_token_payload
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover
@@ -45,6 +47,9 @@ AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE = "autopilot_supervisor_started"
 AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE = "autopilot_supervisor_observed"
 AUTOPILOT_COMMAND_RESULT_RECORD_TYPE = "autopilot_command_result"
 AUTOPILOT_WORKTREE_REAP_RECORD_TYPE = "autopilot_worktree_reap"
+AUTOPILOT_PLANNING_DECISION_RECORD_TYPE = "autopilot_planning_decision"
+AUTOPILOT_PLANNING_WORKER_RECORD_TYPE = "autopilot_planning_worker"
+AUTOPILOT_IDLE_WAIT_RECORD_TYPE = "autopilot_idle_wait"
 AUTOPILOT_RECORD_TYPES = frozenset(
     {
         AUTOPILOT_CYCLE_RECORD_TYPE,
@@ -52,6 +57,9 @@ AUTOPILOT_RECORD_TYPES = frozenset(
         AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
         AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
         AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+        AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
+        AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
+        AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     }
 )
 LIFECYCLE_RECORD_TYPES = frozenset(
@@ -218,7 +226,7 @@ class WorkerReport:
             raise ValueError("worker report task_id is required")
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "run_id": self.run_id,
             "task_id": self.task_id,
             "status": self.status,
@@ -227,6 +235,9 @@ class WorkerReport:
             "metadata": self.metadata,
             "reported_at": self.reported_at,
         }
+        redacted = redact_fencing_token_payload(payload)
+        assert isinstance(redacted, dict)
+        return redacted
 
     def to_record(self) -> dict[str, object]:
         record = self.to_json()
@@ -684,11 +695,13 @@ class RunStore:
         self.append_record(event.to_record())
 
     def append_record(self, record: dict[str, object]) -> None:
+        redacted = redact_fencing_token_payload(record)
+        assert isinstance(redacted, dict)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
             with append_record_lock(self.path):
                 with self.path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+                    handle.write(json.dumps(redacted, separators=(",", ":")) + "\n")
                     handle.flush()
 
     def read_records(self) -> list[dict[str, Any]]:
@@ -703,7 +716,9 @@ class RunStore:
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict) and is_known_record_type(payload):
-                records.append(payload)
+                redacted = redact_fencing_token_payload(payload)
+                assert isinstance(redacted, dict)
+                records.append(redacted)
         return records
 
     def recent_records(self, max_runs: int = 5) -> list[dict[str, Any]]:

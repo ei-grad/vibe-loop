@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from vibe_loop.cli import main
 from vibe_loop.config import TaskSourceConfig, load_config
@@ -783,7 +784,18 @@ class EvalExampleTests(unittest.TestCase):
             status = json.loads(status_out.getvalue())
 
             run_out = StringIO()
-            with redirect_stdout(run_out), redirect_stderr(StringIO()):
+            with (
+                patch(
+                    "vibe_loop.autopilot.VibeRunner.run_analysis_agent",
+                    return_value={
+                        "should_plan": False,
+                        "reason": "the eval fixture is intentionally bounded",
+                        "objective": "",
+                    },
+                ),
+                redirect_stdout(run_out),
+                redirect_stderr(StringIO()),
+            ):
                 run_code = main(
                     [
                         "autopilot",
@@ -812,9 +824,9 @@ class EvalExampleTests(unittest.TestCase):
         self.assertTrue(summary["started"])
         self.assertEqual(len(summary["cycles"]), 1)
         cycle = summary["cycles"][0]
-        # A high --min-ready keeps the supervisor from launching a child, so the
-        # one cycle stays idle (agent available) or blocked (agent absent in CI);
-        # either way it never spawns run-until-done and never mutates the repo.
+        # A high --min-ready invokes native read-only planning detection. The
+        # stub returns no-plan, so the cycle never launches either a planning
+        # worker or run-until-done and never mutates the repository.
         self.assertIn(cycle["status"], {"idle", "blocked"})
         self.assertEqual(cycle["child_log"], "")
         self.assertIn(run_code, {0, 1})

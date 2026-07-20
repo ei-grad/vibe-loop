@@ -52,14 +52,19 @@ repository's configured runtime journal, such as `.vibe-loop/runs.jsonl`, rather
 than a separate hidden state file.
 
 Records include `autopilot_cycle`, `autopilot_supervisor_started`,
-`autopilot_supervisor_observed`, and `autopilot_command_result`. Each record
+`autopilot_supervisor_observed`, `autopilot_command_result`, and
+`autopilot_idle_wait`. Each cycle record
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
 Cycle and supervisor records also carry the configured worktree-disposition
 policy. Worktree-disposition records carry that policy plus candidate counts,
 evidence, reasons, and outcomes. Existing run readers must keep tolerating
-unknown record types.
+unknown record types. Idle-wait records carry the originating cycle id, outer
+deadline, wake reason, runnable count, task-source poll count, wake-adapter call
+count, and bounded source/adapter error categories. This provenance must
+distinguish a task change, deadline, operator message, and a failing source
+without persisting operator-message content.
 
 Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`.
 
@@ -74,7 +79,16 @@ Acceptance must cover child command construction, log redirection under the
 configured state directory, pid/log observation, no duplicate supervisor
 launch, one-cycle mode, bounded cycle counts, foreground interval sleeping,
 signal behavior, and classification of clean drain versus restartable exit
-versus blocked state.
+versus blocked state. Idle foreground waits use an adaptive full-list fallback
+whose delays grow to a configured cap while preserving the outer interval
+deadline; repeated task-source or wake-adapter failures must not spin. With the
+default settings, a 30-minute empty interval performs substantially fewer than
+30 task-source listings. Each logical fallback poll performs one task-source
+listing, derives runnable work from that snapshot, and bounds a command-backed
+listing by the remaining absolute monotonic deadline. Candidate filtering uses
+the cycle's active-run/conflict snapshot so the fallback does not introduce an
+independently timed lock-backend query; a lock-only change is observed through
+the trusted wake adapter or at the outer deadline.
 
 `autopilot run` remains the foreground supervisor contract. On POSIX systems,
 `autopilot start` must provide the supported detached lifecycle by starting
@@ -102,7 +116,8 @@ planning commands, but only when those commands are explicitly user-authored in
 Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status
 JSON, low-ready queue handling, and the rule that generated task-source
-profiles cannot introduce maintenance commands.
+profiles cannot introduce maintenance commands. An explicitly configured
+`planning_command` takes precedence over native planning.
 
 Related implementation IDs: `AUTO-04`.
 
@@ -229,7 +244,11 @@ in the generated-task-profile forbidden keys, and a runner entry point that
 launches the analysis agent and parses its strict structured (JSON) decision
 using the same prompt-delivery and shell-preparation validation as the existing
 selection path. The analysis agent must not be granted write/edit tools and must
-not be required for routine read-only status commands.
+not be required for routine read-only status commands. For native low-ready
+planning, it receives bounded queue and worker evidence and returns only a
+strict `should_plan`, reason, and objective decision. It never authors task
+content; a separate invocation of the configured read-write worker command
+performs any requested queue replenishment.
 
 Related implementation IDs: `AUTO-12`, `AUTO-18`.
 
@@ -302,10 +321,21 @@ behaviors while preserving the non-destructive recovery boundary
 opt-in (`PRD-AUT-010`), native disk-health
 checks, a native "what landed" git-log summary, native troubleshoot detection
 derived from `runs.jsonl`, and native planning that invokes the configured agent
-rather than requiring a separate `planning_command` script. Project-authored
-`[autopilot]` maintenance commands (`PRD-AUT-005`) continue to override or
-augment the native behaviors; native behavior is the default, not a replacement
-for explicit configuration.
+rather than requiring a separate `planning_command` script. Native planning is
+split into two stages: the read-only analysis runner decides whether and what to
+plan from bounded runtime evidence plus repository-local planning sources; only
+a separate read-write worker launched through `agent.command` may author task
+content. The supervisor validates and journals the decision, launches the
+worker when requested, records its started and terminal lifecycle (including
+PID, log, configured worker timeout, and before/after runnable depth), and
+re-reads rather than mutating the task source. Post-worker task-source failures
+remain explicit instead of becoming a zero count. Malformed decisions fail
+closed without launching a write-capable worker. The two stages use the
+registered `autopilot_planning_decision` and `autopilot_planning_worker` record
+types.
+Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
+override or augment the native behaviors; native behavior is the default, not a
+replacement for explicit configuration.
 
 Acceptance must cover each native behavior landing as an independently
 reviewable slice, every native action appearing in the append-only journal
@@ -421,3 +451,20 @@ resolution, literal environment delivery, schema validation, bounded command
 execution, safe errors, and unchanged behavior when no adapter is configured.
 
 Related implementation IDs: `AUTO-22`.
+
+Autopilot may also use an explicit trusted `[autopilot] idle_wake_command`
+between adaptive task-source fallback listings. The command receives the
+current wait budget, cycle id, and outer deadline through literal environment
+values rather than shell interpolation. Validated registry runtime selectors
+use the same literal adapter-environment boundary. The command returns
+`{"woke":false}` or a validated `task_change`/`operator_message` wake reason
+with optional bounded event metadata. Each invocation is time-bounded; invalid,
+failed, or timed-out commands are journaled by safe category and fall back to
+the same adaptive wait budget. Adapter output, permitted event fields, and total
+journaled event size are byte-bounded. Message content and adapter stdout/stderr
+are not journaled. Generated task-source profiles cannot introduce this command.
+
+Autopilot acceptance must cover prompt change/message wakes, literal environment
+delivery, schema validation, deadline preservation, adaptive fallback polling,
+bounded error provenance, and unchanged clock/task-source behavior when no wake
+adapter is configured.

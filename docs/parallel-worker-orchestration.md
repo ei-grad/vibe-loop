@@ -14,8 +14,10 @@ while making `vibe-loop run-until-done --jobs N` useful for unattended work.
 
 1. The supervisor reads the task graph and recent run logs.
 2. It selects up to `N` ready, unlocked, mutually compatible tasks.
-3. It locks each task and spawns one finite worker per task with the configured
-   `agent.command`, defaulting to `codex exec '$vibe-loop <task_id>'`.
+3. It locks each task. For command-backed task sources it then invokes the
+   required project lifecycle adapter and confirms the task is non-runnable
+   before spawning one finite worker with the configured `agent.command`,
+   defaulting to `codex exec '$vibe-loop <task_id>'`.
 4. Each worker writes to its own run log and performs the full slice lifecycle.
 5. Workers may claim their branch/worktree in the active task lock after they
    create or adopt that workspace, making workspace ownership visible without
@@ -38,6 +40,12 @@ results are missing or ambiguous.
 - `runs.jsonl` is run history, not the task graph. Worker reports classify
   individual attempts; they do not replace Markdown plan rows, command-backed
   tracker state, or any other active task source.
+- Command-backed worker launches require an explicit `task_source.activate`
+  lifecycle adapter. Under the acquired exact task lock, the adapter owns the
+  runnable-to-in-progress compare-and-set and returns normalized post-state for
+  confirmation. Activation precedes `run_started`, worker process creation, and
+  any possible workspace claim or edit. Failures release only that task lock,
+  launch nothing, and never reset ambiguous project state.
 - Keeping task state in the active task source is a deliberate design choice.
   Agents and humans working without the `vibe-loop` supervisor must be able to
   manage task status through the same project-owned plan, tracker, or adapter.
@@ -85,7 +93,11 @@ results are missing or ambiguous.
 - `main-integration acquire` performs the same claimed-workspace sanity check
   for the acquiring worker before the final integration section. A claim with
   stale or warning diagnostics blocks acquisition and returns the diagnostic
-  payload with manual recovery hints.
+  payload with manual recovery hints. The sole exception is a clean, correctly
+  claimed worktree whose current head exactly equals local `main`: an
+  `branch_already_merged` warning is then a safe no-op integration case, so a
+  reviewed slice that required no repository commit can finish without a fake
+  commit.
 
 ## Non-Goals
 

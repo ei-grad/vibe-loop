@@ -39,7 +39,10 @@ in `.vibe-loop.toml`.
 
 Acceptance must cover array and `{"tasks":[...]}` list output, probe behavior,
 required fields, optional conflict domains, adapter failure diagnostics, and no
-substitution of generated discovery when an explicit adapter fails.
+substitution of generated discovery when an explicit adapter fails. Worker
+execution must additionally require an explicit activation command that owns
+the runnable-to-in-progress compare-and-set and returns normalized post-state;
+read-only list and probe operations remain available without activation.
 
 Related implementation IDs: `DISC-01`, `DISC-04`, `PAR-08`.
 

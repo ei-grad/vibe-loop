@@ -957,6 +957,162 @@ class MarkdownPlanTests(unittest.TestCase):
             self.assertTrue(invoked)
             self.assertEqual(marker.read_text(encoding="utf-8"), "TASK-42")
 
+    def test_command_task_source_activate_returns_confirmed_task(self) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            captured["command"] = args[0]
+            captured["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout='{"id":"TASK-42","title":"Claimed","status":"active"}',
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    activate_command="activate {task_id} --run {run_id}",
+                ),
+                runtime_context={"PROJECT_SELECTOR": "configured"},
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                task = source.activate(
+                    "TASK-42",
+                    "run-7",
+                    runtime_context={"VIBE_LOOP_FENCING_TOKEN": "generation-3"},
+                )
+
+        self.assertIsNotNone(task)
+        self.assertEqual(task.task_id, "TASK-42")
+        self.assertEqual(task.status, "active")
+        self.assertEqual(captured["command"], "activate TASK-42 --run run-7")
+        environment = captured["env"]
+        assert isinstance(environment, dict)
+        self.assertEqual(environment["PROJECT_SELECTOR"], "configured")
+        self.assertEqual(environment["VIBE_LOOP_FENCING_TOKEN"], "generation-3")
+
+    def test_command_task_source_activate_is_required_for_fresh_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(type="command", list_command="list-tasks"),
+            )
+
+            with self.assertRaisesRegex(ValueError, "requires task_source.activate"):
+                source.activate("TASK-42", "run-7")
+
+    def test_command_task_source_activate_quotes_template_values(self) -> None:
+        captured: list[str] = []
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            captured.append(str(args[0]))
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout=(
+                    '{"id":"TASK-42; touch /tmp/injected","title":"Claimed",'
+                    '"status":"active"}'
+                ),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    activate_command="activate {task_id} --run {run_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                source.activate(
+                    "TASK-42; touch /tmp/injected",
+                    "run-7; touch /tmp/run-injected",
+                )
+
+        self.assertEqual(
+            captured,
+            [
+                "activate 'TASK-42; touch /tmp/injected' --run "
+                "'run-7; touch /tmp/run-injected'"
+            ],
+        )
+
+    def test_command_task_source_activate_rejects_unknown_template_field(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    activate_command="activate {unsupported}",
+                ),
+            )
+
+            with self.assertRaisesRegex(ValueError, "may only use"):
+                source.activate("TASK-42", "run-7")
+
+    def test_command_task_source_continuation_confirms_without_reactivation(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            calls.append(str(args[0]))
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout='{"id":"TASK-42","title":"Claimed","status":"active"}',
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    activate_command="activate {task_id} --run {run_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                task = source.activate("TASK-42", "run-8", continuation=True)
+
+        self.assertIsNotNone(task)
+        self.assertEqual(calls, ["probe TASK-42"])
+
+    def test_command_task_source_continuation_rejects_missing_task(self) -> None:
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout="null",
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    activate_command="activate {task_id} --run {run_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                with self.assertRaisesRegex(ValueError, "returned no task"):
+                    source.activate("TASK-42", "run-8", continuation=True)
+
     def test_command_task_source_reset_without_hook_is_noop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

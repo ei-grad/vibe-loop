@@ -73,6 +73,7 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     build_lock_manager,
+    redact_fencing_token_payload,
 )
 from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.runner import VibeRunner
@@ -766,10 +767,10 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-tasks", type=int, default=0)
     parser.add_argument(
         "--min-ready",
-        type=int,
+        type=positive_int_argument,
         default=None,
         help=(
-            "Minimum runnable tasks required before launching a child "
+            "Positive minimum runnable tasks required before launching a child "
             "(overrides [autopilot] min_ready; default 1)"
         ),
     )
@@ -1048,7 +1049,13 @@ def redacted_task_source_config(task_source) -> dict[str, object]:
 
 def redact_task_source_payload(payload: dict[str, object]) -> dict[str, object]:
     redacted = dict(payload)
-    for key in ("list_command", "next_command", "probe_command", "reset_command"):
+    for key in (
+        "list_command",
+        "next_command",
+        "probe_command",
+        "activate_command",
+        "reset_command",
+    ):
         configured = bool(redacted.pop(key, None))
         redacted[f"{key}_configured"] = configured
         redacted[f"{key}_redacted"] = configured
@@ -1084,6 +1091,7 @@ def redacted_autopilot_config(autopilot) -> dict[str, object]:
         "summary_command",
         "troubleshoot_command",
         "planning_command",
+        "idle_wake_command",
     ):
         configured = bool(payload.pop(key, None))
         payload[f"{key}_configured"] = configured
@@ -1718,8 +1726,6 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 args,
                 "fencing_token_mismatch",
                 exc.metadata,
-                expected_token=exc.expected_token,
-                actual_token=exc.actual_token,
             )
         except LockBackendError as exc:
             return print_lock_mutation_refused(args, "lock_unavailable", {}, str(exc))
@@ -1728,7 +1734,9 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             "task_id": task_id,
             "run_id": run_id,
             "heartbeat_at": task_lock.metadata.get("heartbeat_at"),
-            "fencing_token": task_lock.metadata.get("fencing_token"),
+            "fencing_token": "<redacted>"
+            if task_lock.metadata.get("fencing_token")
+            else "",
         }
         if json_requested(args):
             print(json.dumps(payload, indent=2))
@@ -1804,13 +1812,11 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
                     file=sys.stderr,
                 )
             return 1
-        except LockFencingMismatch as exc:
+        except LockFencingMismatch:
             status = manager.main_integration_status()
             payload = {
                 "released": False,
                 "error": "fencing_token_mismatch",
-                "expected_token": exc.expected_token,
-                "actual_token": exc.actual_token,
                 "status": status.to_json(),
             }
             if json_requested(args):
@@ -1880,7 +1886,8 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
 
     if args.tasks_command == "locks":
         runner = VibeRunner(config)
-        locks = runner.lock_manager.list_locks()
+        locks = redact_fencing_token_payload(runner.lock_manager.list_locks())
+        assert isinstance(locks, list)
         if args.json:
             print(json.dumps(locks, indent=2))
         else:
@@ -2426,21 +2433,15 @@ def print_lock_mutation_refused(
     error: str,
     metadata: dict[str, object],
     message: str = "",
-    *,
-    expected_token: str = "",
-    actual_token: str = "",
 ) -> int:
     payload: dict[str, object] = {
         "heartbeat": False,
         "updated": False,
         "error": error,
-        "metadata": metadata,
+        "metadata": redact_fencing_token_payload(metadata),
     }
     if message:
         payload["message"] = message
-    if expected_token or actual_token:
-        payload["expected_token"] = expected_token
-        payload["actual_token"] = actual_token
     if json_requested(args):
         print(json.dumps(payload, indent=2))
     else:
@@ -2756,6 +2757,12 @@ def main_integration_workspace_preflight_error(
             continue
         if view.active.workspace is None or not view.workspace_diagnostics:
             return None
+        if main_equivalent_workspace_is_integration_noop(
+            view,
+            repo=config.repo,
+            main_branch=config.main_branch,
+        ):
+            return None
         return {
             "error": "workspace_preflight_failed",
             "message": (
@@ -2775,6 +2782,45 @@ def main_integration_workspace_preflight_error(
             "exit_code": 1,
         }
     return None
+
+
+def main_equivalent_workspace_is_integration_noop(
+    view: WorkerView,
+    *,
+    repo: Path,
+    main_branch: str,
+) -> bool:
+    if (
+        len(view.workspace_diagnostics) != 1
+        or view.workspace_diagnostics[0].code != "branch_already_merged"
+    ):
+        return False
+    claim = view.active.workspace
+    state = view.workspace_git_state
+    if (
+        claim is None
+        or state is None
+        or claim.task_id != view.active.task_id
+        or claim.run_id != view.active.run_id
+        or not state.worktree_exists
+        or not state.worktree_listed
+        or state.dirty
+        or state.current_branch != claim.branch
+        or not state.head_commit
+    ):
+        return False
+    result = run_git(
+        repo,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{main_branch}^{{commit}}",
+    )
+    return bool(
+        result is not None
+        and result.returncode == 0
+        and result.stdout.strip() == state.head_commit
+    )
 
 
 def active_run_started_at(
@@ -2807,6 +2853,16 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def positive_int_argument(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return parsed
 
 

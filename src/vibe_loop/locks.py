@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import signal
 import shutil
 import socket
@@ -37,6 +38,17 @@ AUTOPILOT_LOCK_SCHEMA_VERSION = 1
 COMMAND_LOCK_MAX_OUTPUT_BYTES = 128 * 1024
 COMMAND_LOCK_TIMEOUT_SECONDS = 30.0
 METADATA_REPLACE_TIMEOUT_SECONDS = 5.0
+FENCING_TOKEN_REDACTION = "<redacted>"
+FENCING_TOKEN_FIELDS = frozenset({"fencing_token", "expected_token", "actual_token"})
+MIN_OPAQUE_FENCING_TOKEN_REDACTION_LENGTH = 8
+QUOTED_FENCING_DIAGNOSTIC_PATTERN = re.compile(
+    r"(?i)([\"']?(?:fencing_token|expected_token|actual_token)[\"']?"
+    r"\s*[:=]\s*[\"'])([^\"']*)([\"'])"
+)
+UNQUOTED_FENCING_DIAGNOSTIC_PATTERN = re.compile(
+    r"(?i)(\b(?:fencing_token|expected_token|actual_token)\b\s*[:=]\s*)"
+    r"([^\s,;}\]]+)"
+)
 
 
 class LockBusy(RuntimeError):
@@ -77,10 +89,7 @@ class LockFencingMismatch(RuntimeError):
         self.metadata = metadata
         self.expected_token = expected_token
         self.actual_token = actual_token
-        super().__init__(
-            f"lock fencing token mismatch: {path} "
-            f"expected={expected_token} actual={actual_token}"
-        )
+        super().__init__(f"lock fencing token mismatch: {path}")
 
 
 class LockBackendError(RuntimeError):
@@ -104,7 +113,7 @@ class IntegrationLockStatus:
     stale_reason: str | None = None
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload = {
             "resource": MAIN_INTEGRATION_LOCK_NAME,
             "locked": self.locked,
             "state": self.state,
@@ -122,6 +131,9 @@ class IntegrationLockStatus:
             "fencing_token": fencing_token_value(self.metadata.get("fencing_token")),
             "metadata": self.metadata,
         }
+        redacted = redact_fencing_token_payload(payload)
+        assert isinstance(redacted, dict)
+        return redacted
 
 
 ProcessExists = Callable[[int], bool]
@@ -840,7 +852,13 @@ class CommandLockBackend:
                 stderr = read_command_output(stderr_file, setting_name, "stderr")
         if returncode != 0:
             detail = truncate_diagnostic(
-                redact_runtime_context_values(stderr.strip(), self.runtime_context)
+                redact_fencing_token_diagnostic(
+                    redact_runtime_context_values(
+                        stderr.strip(),
+                        self.runtime_context,
+                    ),
+                    metadata,
+                )
             )
             suffix = f": {detail}" if detail else ""
             raise LockBackendError(
@@ -1278,6 +1296,59 @@ def fencing_token_value(value: object) -> str:
     if isinstance(value, (int, str)):
         return str(value)
     return ""
+
+
+def redact_fencing_token_payload(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {
+            key: (
+                FENCING_TOKEN_REDACTION
+                if key in FENCING_TOKEN_FIELDS and item not in (None, "")
+                else redact_fencing_token_payload(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_fencing_token_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_fencing_token_payload(item) for item in value)
+    return value
+
+
+def redact_fencing_token_diagnostic(
+    diagnostic: str,
+    metadata: Mapping[str, object],
+) -> str:
+    redacted = QUOTED_FENCING_DIAGNOSTIC_PATTERN.sub(
+        rf"\1{FENCING_TOKEN_REDACTION}\3",
+        diagnostic,
+    )
+    redacted = UNQUOTED_FENCING_DIAGNOSTIC_PATTERN.sub(
+        rf"\1{FENCING_TOKEN_REDACTION}",
+        redacted,
+    )
+    for token in sorted(fencing_token_values(metadata), key=len, reverse=True):
+        if len(token) >= MIN_OPAQUE_FENCING_TOKEN_REDACTION_LENGTH:
+            redacted = redacted.replace(token, FENCING_TOKEN_REDACTION)
+    return redacted
+
+
+def fencing_token_values(value: object) -> set[str]:
+    if isinstance(value, Mapping):
+        values = {
+            fencing_token_value(item)
+            for key, item in value.items()
+            if key in FENCING_TOKEN_FIELDS and fencing_token_value(item)
+        }
+        for item in value.values():
+            values.update(fencing_token_values(item))
+        return values
+    if isinstance(value, (list, tuple)):
+        values: set[str] = set()
+        for item in value:
+            values.update(fencing_token_values(item))
+        return values
+    return set()
 
 
 def numeric_value(value: object) -> int | float | None:
