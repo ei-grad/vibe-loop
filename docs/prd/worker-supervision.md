@@ -53,14 +53,23 @@ Classifications that do not settle the run, such as `timed_out` and
 classification. Finalization must not depend on the enclosing `run-until-done`
 process, whose next dispatch or idle transition would otherwise race it.
 
-The settled outcome and the lock release form one finalization boundary. The
-release operation itself carries the settled outcome, so releasing the lock and
-finalizing external provenance cannot disagree: there is no ordering in which
-the lock is given up while the external run stays `unknown` even though the
-supervisor settled on `completed`. The supervisor additionally publishes the
-outcome into the live lock before release for the benefit of status readers;
-that publish is advisory, and a backend failure there is reported without
-changing what the release finalizes or masking the recorded `run_result`.
+The settled outcome and the lock release form one fail-closed finalization
+boundary. A provenance-mirroring backend finalizes a run from the lock row it has
+already stored and discards whatever the release call carries, so storing the
+outcome is the only operation that can settle the run and it gates the release.
+When the store succeeds the lock is released normally. When it fails for any
+backend, ownership, fencing, or I/O reason, no release is issued, no
+`lock_released` event is recorded, and a typed finalization failure is surfaced
+alongside a `lock_finalization_failed` event; the lock stays held under the same
+run id and fencing token, so it remains recoverable. There is therefore no
+ordering in which the lock is given up while the external run stays `unknown`
+even though the supervisor settled on `completed`. The recorded `run_result` is
+durable before finalization is attempted and is never masked by this failure.
+
+An `unknown` outcome is exempt from the gate: it is what a backend records for a
+run it was told nothing about, so a failed store loses no information, and
+blocking release there would strand the lock of an interrupted or report-less
+run.
 
 Related implementation IDs: `PAR-03`, `PAR-05`.
 

@@ -32,7 +32,12 @@ from vibe_loop.config import (
     resolve_task_agent,
     shell_quote,
 )
-from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.locks import (
+    LockBusy,
+    LockManager,
+    LockOwnerMismatch,
+    SettledOutcomeNotPersisted,
+)
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
@@ -4716,16 +4721,12 @@ class RecordingLockManager(LockManager):
         self.events.append(("update", dict(metadata)))
         return super().update(task_lock, metadata)
 
-    def release(self, task_lock, **kwargs) -> None:
+    def release(self, task_lock) -> None:
         task_id = str(task_lock.metadata.get("task_id") or "")
-        observed = dict(self.status(task_id) or {})
-        # A backend finalizes on what the release call hands it, which includes
-        # the settled outcome the caller carries even if the live lock row never
-        # received it.
-        if kwargs.get("settled_outcome"):
-            observed["outcome"] = kwargs["settled_outcome"]
-        self.events.append(("release", observed))
-        super().release(task_lock, **kwargs)
+        # What a backend finalizes on is the stored lock row, not anything the
+        # release call carries.
+        self.events.append(("release", dict(self.status(task_id) or {})))
+        super().release(task_lock)
 
     def outcome_at_release(self, task_id: str) -> str:
         for kind, metadata in self.events:
@@ -4970,7 +4971,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # though the task source would now probe as done.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "unknown")
 
-    def test_publish_failure_does_not_mask_recorded_result(self) -> None:
+    def test_publish_failure_surfaces_without_losing_the_recorded_result(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
         done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
@@ -4978,25 +4979,30 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 directory, [task], {"T-1": done}
             )
             original_update = lock_manager.update
-            calls: list[int] = []
 
             def failing_update(task_lock, metadata):
-                calls.append(1)
                 if "outcome" in metadata:
                     raise LockBusy(task_lock.path, {"reason": "backend unavailable"})
                 return original_update(task_lock, metadata)
 
             lock_manager.update = failing_update
 
-            result = self._run_task(
-                runner, task, self._reporting_worker(runner, "completed")
-            )
+            with self.assertRaises(SettledOutcomeNotPersisted):
+                self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
 
-            self.assertEqual(result.classification, "completed")
+            # The classification is durable before finalization is attempted, so
+            # the failure reports an unfinalized lock rather than losing the run.
             self.assertEqual(
-                runner.run_store.read_records()[-1].get("classification"),
-                "completed",
+                [
+                    record.get("classification")
+                    for record in runner.run_store.read_records()
+                    if record.get("record_type") == "run_result"
+                ],
+                ["completed"],
             )
+            self.assertIsNotNone(lock_manager.status("T-1"))
 
     def test_lock_released_event_carries_the_settled_outcome(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
@@ -5130,10 +5136,15 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
     def _provenance_adapter(self, root: Path) -> str:
         """A command lock adapter that mirrors run provenance, as Loopyard does.
 
-        It opens an external run at acquire, keeps the lock row it was last
-        handed, and finalizes the run's outcome at release from what the release
-        call gives it, falling back to the stored row. An outcome it never
-        receives stays ``unknown`` - which is exactly the reproduced defect.
+        It opens an external run at acquire and finalizes that run at release
+        from the lock row it has already stored. Release-time metadata is
+        deliberately discarded, matching the verified backend constraint that
+        ``lock_wire_release`` persists nothing: only a prior update can settle
+        the run, and an outcome that never reached the stored row stays
+        ``unknown`` - which is exactly the reproduced defect.
+
+        Touching ``fail_update`` under the state directory makes every outcome
+        update fail, standing in for a backend that rejects the settling write.
         """
 
         adapter = root / "provenance_adapter.py"
@@ -5156,14 +5167,17 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             "elif operation == 'status':\n"
             "    print(json.dumps({'locked': bool(held), 'metadata': held or {}}))\n"
             "elif operation == 'release':\n"
-            "    outcome = (metadata.get('outcome')\n"
-            "               or (held or {}).get('outcome') or 'unknown')\n"
+            "    outcome = (held or {}).get('outcome') or 'unknown'\n"
             "    record = runs.get(run_id) or {'task_id': task_id}\n"
             "    record['outcome'] = outcome\n"
             "    runs[run_id] = record\n"
             "    runs_path.write_text(json.dumps(runs))\n"
             "    held_path.unlink(missing_ok=True)\n"
             "    print(json.dumps({'released': True}))\n"
+            "elif (operation == 'update' and metadata.get('outcome')\n"
+            "      and (root / 'fail_update').exists()):\n"
+            "    sys.stderr.write('outcome update rejected')\n"
+            "    print(json.dumps({'updated': False}))\n"
             "else:\n"
             "    runs.setdefault(run_id, {'task_id': task_id, 'outcome': 'unknown'})\n"
             "    runs_path.write_text(json.dumps(runs))\n"
@@ -5255,33 +5269,51 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             self.assertEqual(results[0].classification, "completed")
             self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
 
-    def test_command_backend_finalizes_completed_when_publish_fails(self) -> None:
+    def test_command_backend_update_failure_blocks_unknown_finalizing_release(
+        self,
+    ) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
         done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
             self._attach_provenance_backend(runner, root)
-            lock_manager = runner.lock_manager
-            original_update = lock_manager.update
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "fail_update").write_text("")
 
-            def failing_update(task_lock, metadata):
-                # The pre-release publish is the fragile step; it must not be
-                # the only path by which the backend learns the outcome.
-                if "outcome" in metadata:
-                    raise LockBusy(task_lock.path, {"reason": "backend unavailable"})
-                return original_update(task_lock, metadata)
+            with self.assertRaises(SettledOutcomeNotPersisted) as raised:
+                self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
 
-            lock_manager.update = failing_update
-
-            result = self._run_task(
-                runner, task, self._reporting_worker(runner, "completed")
+            self.assertEqual(raised.exception.outcome, "completed")
+            # Releasing here is what produced completed-locally /
+            # unknown-externally: the backend discards release metadata, so an
+            # unsettled row can only finalize as unknown. No release may happen.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            held = runner.lock_manager.status("T-1")
+            self.assertIsNotNone(held)
+            self.assertNotEqual(held.get("outcome"), "completed")
+            records = runner.run_store.read_records()
+            events = [
+                record
+                for record in records
+                if record.get("record_type")
+                in {"lock_released", "lock_finalization_failed"}
+            ]
+            self.assertEqual(
+                [event["record_type"] for event in events],
+                ["lock_finalization_failed"],
             )
-
-            self.assertEqual(result.classification, "completed")
-            # A publish failure followed by a clean release is precisely the
-            # state that produced completed-locally / unknown-externally.
-            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+            self.assertIs(events[0]["released"], False)
+            self.assertEqual(events[0]["outcome"], "completed")
+            # The run itself still classified correctly; only finalization failed.
+            classifications = [
+                record["classification"]
+                for record in records
+                if record.get("record_type") == "run_result"
+            ]
+            self.assertEqual(classifications, ["completed"])
 
     def test_command_backend_keeps_unsettled_runs_unknown(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")

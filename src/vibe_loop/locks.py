@@ -96,6 +96,27 @@ class LockBackendError(RuntimeError):
     pass
 
 
+class SettledOutcomeNotPersisted(RuntimeError):
+    """A run's settled outcome could not be stored on its task lock row.
+
+    A provenance-mirroring backend finalizes the run from the lock row it has
+    already stored; release-time metadata is discarded. Releasing after a failed
+    outcome update would therefore finalize the run as unknown while the local
+    RunResult says otherwise, so the release is refused and the lock is left
+    held and recoverable by its exact run id and fencing token.
+    """
+
+    def __init__(self, task_id: str, run_id: str, outcome: str, cause: BaseException):
+        self.task_id = task_id
+        self.run_id = run_id
+        self.outcome = outcome
+        self.cause = cause
+        super().__init__(
+            f"could not persist settled outcome {outcome} on the lock for "
+            f"{task_id} (run {run_id}): {cause}; lock left held for recovery"
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TaskLock:
     task_id: str
@@ -209,26 +230,47 @@ class LockManager:
             preserve_runtime_lock_fields(metadata, current.metadata),
         )
 
-    def release(
+    def release(self, task_lock: TaskLock) -> None:
+        self.release_with_timeout(task_lock)
+
+    def release_settled(
         self,
         task_lock: TaskLock,
+        metadata: dict[str, object],
         *,
-        settled_outcome: str | None = None,
-        settled_classification: str | None = None,
+        outcome: str,
     ) -> None:
-        self.release_with_timeout(
-            task_lock,
-            settled_outcome=settled_outcome,
-            settled_classification=settled_classification,
-        )
+        """Store the settled outcome on the lock row, then release.
+
+        Backends that mirror run provenance finalize from the stored lock row
+        and discard whatever the release call carries, so the update is the only
+        operation that can settle the run. It is therefore a gate: if it fails,
+        no release is issued and the lock stays held for recovery.
+        """
+
+        try:
+            settled_lock = self.update(task_lock, metadata)
+        except (
+            LockBusy,
+            LockBackendError,
+            LockOwnerMismatch,
+            LockFencingMismatch,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise SettledOutcomeNotPersisted(
+                task_lock.task_id,
+                str(task_lock.metadata.get("run_id") or ""),
+                outcome,
+                exc,
+            ) from exc
+        self.release(settled_lock)
 
     def release_with_timeout(
         self,
         task_lock: TaskLock,
         *,
         timeout_seconds: float | None = None,
-        settled_outcome: str | None = None,
-        settled_classification: str | None = None,
     ) -> None:
         deadline = command_deadline(timeout_seconds)
         current = self._backend_status(task_lock.task_id, timeout_seconds)
@@ -244,17 +286,6 @@ class LockManager:
             current,
             path=current_path,
         )
-        # The release call is the operation a provenance-mirroring backend
-        # finalizes the run on, so the caller's settled outcome travels with it
-        # rather than depending on an earlier update having landed. Without
-        # this, a failed pre-release publish still released cleanly and left the
-        # external run finalized as unknown while the local RunResult said
-        # completed. Local backends ignore the extra metadata.
-        if settled_outcome:
-            current = dict(current)
-            current["outcome"] = settled_outcome
-            if settled_classification:
-                current["classification"] = settled_classification
         current_lock = TaskLock(
             task_id=task_lock.task_id,
             path=current_path,

@@ -48,6 +48,7 @@ from vibe_loop.locks import (
     LockFencingMismatch,
     LockManager,
     LockOwnerMismatch,
+    SettledOutcomeNotPersisted,
     TaskLock,
     build_lock_manager,
     fencing_token_value,
@@ -64,12 +65,14 @@ from vibe_loop.retry import (
 from vibe_loop.runs import (
     LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
+    UNKNOWN_RUN_OUTCOME,
     WorkerReport,
     settled_run_outcome,
     utc_now_iso,
@@ -1113,26 +1116,29 @@ class VibeRunner:
                 active_state.to_lock_metadata(),
             )
 
-        def publish_settled_outcome() -> None:
-            # Publishes the settled outcome to observers of the live lock while
-            # this supervisor still owns it, so a status reader between
-            # classification and release sees the same conclusion. Deferring to
-            # the enclosing run-until-done child's exit would race the next
-            # dispatch. This publish is advisory: the release below carries the
-            # settled outcome itself, so a backend hiccup here changes neither
-            # the durable RunResult nor what the backend finalizes on.
+        def settle_outcome_and_release() -> None:
+            # A backend that mirrors run provenance finalizes the run from the
+            # lock row it has already stored and discards release-time payloads,
+            # so writing the settled outcome onto that row is the only operation
+            # that can settle the run. It runs while this supervisor still owns
+            # the lock: deferring to the enclosing run-until-done child's exit
+            # would race the next dispatch.
             nonlocal active_state
             # Same guard the observation callbacks use: a reader thread that
             # outlives the streaming call would otherwise replace active_state
-            # from a pre-publish snapshot and re-publish the lock without the
-            # settled outcome.
+            # from a pre-publish snapshot and drop the settled outcome.
             with observation_lock:
                 active_state = active_state.with_settled_outcome(
                     settled_outcome,
                     settled_classification,
                 )
+                metadata = active_state.to_lock_metadata()
+            if settled_outcome == UNKNOWN_RUN_OUTCOME:
+                # Unknown is what a backend records for a run it was told
+                # nothing about, so a failed update loses no information and
+                # must not strand the lock of an interrupted or report-less run.
                 try:
-                    update_active_task_lock()
+                    self.lock_manager.update(task_lock, metadata)
                 except (
                     LockBusy,
                     LockBackendError,
@@ -1145,6 +1151,13 @@ class VibeRunner:
                         f"could not publish settled outcome {settled_outcome} "
                         f"for {task.task_id} before lock release: {exc}"
                     )
+                self.lock_manager.release(task_lock)
+                return
+            self.lock_manager.release_settled(
+                task_lock,
+                metadata,
+                outcome=settled_outcome,
+            )
 
         def record_agent_observation(observation: AgentRuntimeObservation) -> None:
             nonlocal active_state
@@ -1519,12 +1532,31 @@ class VibeRunner:
             )
             return result
         finally:
-            publish_settled_outcome()
-            self.lock_manager.release(
-                task_lock,
-                settled_outcome=settled_outcome,
-                settled_classification=settled_classification,
-            )
+            try:
+                settle_outcome_and_release()
+            except SettledOutcomeNotPersisted as exc:
+                # No release happened, so no lock_released event may be claimed:
+                # the lock is still held under this run id and fencing token and
+                # is recoverable. The RunResult is already durable, so the
+                # failure is surfaced rather than silently reconciled.
+                report_status(str(exc))
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.lock_event(
+                        LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+                        run_id=run_id,
+                        task_id=task.task_id,
+                        lock_kind="task",
+                        lock_path=task_lock.path,
+                        payload={
+                            "started_at": active_state.started_at,
+                            "outcome": settled_outcome,
+                            "classification": settled_classification,
+                            "reason": str(exc.cause),
+                            "released": False,
+                        },
+                    )
+                )
+                raise
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
                     LOCK_RELEASED_RECORD_TYPE,
