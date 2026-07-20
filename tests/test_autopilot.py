@@ -3308,6 +3308,54 @@ class NativePlanningTests(unittest.TestCase):
         self.assertEqual(records[2]["phase"], "terminal")
         self.assertEqual(records[2]["runnable_after"], 2)
 
+    def test_claimed_new_task_stays_productive_in_real_collection_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml='[task_source]\nrunnable_statuses = ["Next"]\n',
+            )
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def worker_launcher(command, *, on_start, **kwargs):
+                on_start(4242)
+                write_plan(
+                    repo,
+                    [
+                        ("TASK-01", "Next", "", "ready slice"),
+                        (
+                            "TASK-02",
+                            "Active",
+                            "",
+                            "new task claimed before the post-worker snapshot",
+                        ),
+                    ],
+                )
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-claimed-created-task",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "the ready queue is below its target",
+                    "objective": "add one reviewed dependency-ready task",
+                },
+                worker_launcher=worker_launcher,
+            )
+
+        self.assertEqual(result.worker.runnable_before, 1)
+        self.assertEqual(result.worker.runnable_after, 1)
+        self.assertEqual(result.worker.created_task_ids, ("TASK-02",))
+        self.assertEqual(result.worker.created_count, 1)
+        self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_PRODUCTIVE)
+
     def test_invalid_analysis_response_never_launches_write_worker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -4714,6 +4762,7 @@ class PlanningSourceFingerprintTests(unittest.TestCase):
             done=counts.get("done", 0),
             blocked=counts.get("blocked", 0),
             runnable_tasks=tuple(tasks),
+            source_tasks=tuple(tasks),
         )
 
     def _task(self, task_id: str, title: str = "t", priority: str = "normal") -> dict:
@@ -4757,6 +4806,16 @@ class PlanningSourceFingerprintTests(unittest.TestCase):
         after = self._queue(tasks, total=10, active=4, done=5, blocked=0)
         self.assertEqual(
             planning_source_fingerprint(before), planning_source_fingerprint(after)
+        )
+
+    def test_lifecycle_status_churn_does_not_change_the_fingerprint(self) -> None:
+        before_task = self._task("a")
+        after_task = {**before_task, "status": "active"}
+        self.assertEqual(
+            planning_source_fingerprint(self._queue([before_task])),
+            planning_source_fingerprint(
+                self._queue([after_task], runnable=0, active=1)
+            ),
         )
 
 

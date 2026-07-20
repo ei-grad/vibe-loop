@@ -138,6 +138,7 @@ class TaskQueueStatus:
     blocked: int = 0
     statuses: dict[str, int] = dataclasses.field(default_factory=dict)
     runnable_tasks: tuple[dict[str, object], ...] = ()
+    source_tasks: tuple[dict[str, object], ...] = ()
     source_error: str = ""
 
     def to_json(self) -> dict[str, object]:
@@ -545,6 +546,7 @@ def collect_task_queue_status(
         blocked=count_statuses(statuses, BLOCKED_QUEUE_STATUSES),
         statuses=statuses,
         runnable_tasks=tuple(task_summary(task) for task in runnable),
+        source_tasks=tuple(task.to_json() for task in tasks),
     )
 
 
@@ -2742,7 +2744,8 @@ class NativePlanningWorkerResult:
     timed_out: bool = False
     task_source_error: str = ""
     error: str = ""
-    # Task identities that appeared in the runnable set across the launch.
+    # Task identities that appeared in the authoritative task source across the
+    # launch, including tasks claimed before the post-launch snapshot.
     # ``None`` means the post-launch snapshot was unreadable, so nothing can be
     # claimed about what planning created; an empty tuple means it created
     # nothing. Identities are used instead of the runnable count delta because
@@ -2863,22 +2866,25 @@ def planning_source_fingerprint(queue: TaskQueueStatus) -> str:
     changed fingerprint is the "task source materially changed" signal that
     releases the unproductive-outcome backoff.
 
-    Built from runnable task identity and content rather than status counters:
-    swapping one runnable task for another keeps every count identical but is a
-    genuinely different board, while ``active``/``done`` counters churn as
-    unrelated workers claim and finish work that planning was never asked about.
+    Built from every task's identity and content rather than lifecycle status
+    or status counters: swapping one task for another keeps every count
+    identical but is a genuinely different board, while unrelated workers
+    claiming and finishing tasks must not manufacture new planning evidence.
     """
+    source_tasks = queue.source_tasks or queue.runnable_tasks
     identity = "\n".join(
         sorted(
-            "\x1f".join(
-                str(task.get(field) or "")
-                for field in ("id", "title", "status", "priority")
+            json.dumps(
+                {key: value for key, value in task.items() if key != "status"},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
             )
-            for task in queue.runnable_tasks
+            for task in source_tasks
         )
     )
     digest = hashlib.sha256(identity.encode("utf-8", "replace")).hexdigest()[:16]
-    return f"{queue.total}:{queue.runnable}:{digest}"
+    return f"{len(source_tasks)}:{digest}"
 
 
 PLANNING_OUTCOME_SCAN_MAX_RECORDS = 500
@@ -3461,13 +3467,13 @@ def run_native_planning(
         if task_source_error:
             created_count = None
         else:
-            before_ids = {
-                str(task.get("id") or "") for task in status.queue.runnable_tasks
-            }
+            before_tasks = status.queue.source_tasks or status.queue.runnable_tasks
+            after_tasks = queue_after.source_tasks or queue_after.runnable_tasks
+            before_ids = {str(task.get("id") or "") for task in before_tasks}
             created_task_ids = tuple(
                 sorted(
                     task_id
-                    for task in queue_after.runnable_tasks
+                    for task in after_tasks
                     if (task_id := str(task.get("id") or ""))
                     and task_id not in before_ids
                 )

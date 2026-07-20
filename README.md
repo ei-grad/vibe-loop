@@ -555,7 +555,10 @@ The backoff extends the idle wait rather than blocking it: a task source that
 reaches `min_ready` still wakes the next cycle early, stop requests are still
 honoured, and `next_wake` reports the deadline the supervisor actually sleeps to.
 A launch that creates tasks, or a materially changed task source, clears the
-outcome gate; only time clears the daily cap, which counts every launch that
+outcome gate. Created identities and change detection use the complete task
+source rather than only its runnable subset, so a new task claimed before the
+post-planning read remains productive; lifecycle-only status churn does not
+reset the gate. Only time clears the daily cap, which counts every launch that
 reached a provider including one interrupted before it could record an outcome.
 Provider and infrastructure failures stay distinct from `invalid_plan` and never
 extend the unproductive streak. `vibe-loop autopilot status` names the

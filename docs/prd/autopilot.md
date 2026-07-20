@@ -447,12 +447,13 @@ quality; folding them into `invalid_plan` would back off planning for six hours
 because of a misconfigured path. They are recorded as `analysis_error`,
 `worker_error`, or `task_source_error` accordingly.
 
-Productivity is decided from authoritative created-task evidence - the task
-identities that appeared across the launch - not from the runnable-count delta.
-Concurrent claims and completions move that count independently of planning, so
-the delta can call a productive launch unproductive (workers claimed tasks while
-planning ran) or credit planning for work it never authored (a completion
-unblocked dependents).
+Productivity is decided from authoritative created-task evidence - identities
+new to the complete normalized task-source listing across the launch - not from
+the runnable-count delta. A task claimed before the post-worker listing remains
+present in that complete source and therefore remains credited to the planning
+launch. Concurrent claims and completions move the runnable count independently
+of planning, so the delta can call a productive launch unproductive or credit
+planning for work it never authored when a completion unblocks dependents.
 
 Two independent gates then withhold planning, and the later deadline governs:
 
@@ -476,11 +477,12 @@ as an unresolvable agent executable.
 The outcome gate is evidence-based and releases when the evidence changes: a
 launch is compared against a fingerprint of the task source it acted on, and a
 materially changed board (or a productive launch) clears the streak. That
-fingerprint is built from runnable task identity and content, so swapping one
-runnable task for another is detected even though every count is unchanged,
-while `active`/`done` counter churn from unrelated workers is not mistaken for
-fresh planning evidence. The daily cap is a spend ceiling, not an evidence gate,
-so a changed fingerprint does not lift it.
+fingerprint is built from the complete normalized task-source identity and
+content, excluding lifecycle status. A same-cardinality task replacement or
+content/source edit is therefore detected even though every count is unchanged,
+while `active`/`done` transitions and counter churn from unrelated workers are
+not mistaken for fresh planning evidence. The daily cap is a spend ceiling, not
+an evidence gate, so a changed fingerprint does not lift it.
 
 The backoff extends the idle wait budget rather than adding a blocking sleep, so
 it can never shorten an operator's configured interval, only lengthen it, and so
