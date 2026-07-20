@@ -721,6 +721,52 @@ class AutopilotStatusTests(unittest.TestCase):
             supervisor["blocker"], "autopilot_supervisor_exited_without_stop_record"
         )
 
+    def test_stop_record_without_pid_is_inconsistent(self) -> None:
+        checked: list[int] = []
+
+        def process_exists(pid: int) -> bool:
+            checked.append(pid)
+            return False
+
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "process_exited": True,
+                "lock_released": True,
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=process_exists,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_stop_record_missing_pid"
+        )
+        self.assertIn(
+            "autopilot_supervisor_stop_record_missing_pid", payload["blockers"]
+        )
+        # Absence was never claimed from a process check, because there is no
+        # PID to check.
+        self.assertEqual(checked, [])
+
+    def test_started_record_without_pid_is_inconsistent(self) -> None:
+        payload = self._status_with_supervisor_record(
+            {
+                "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                "run_id": "autopilot-1",
+                "occurred_at": "2026-05-09T00:00:02+00:00",
+            },
+            process_exists=lambda pid: False,
+        )
+
+        supervisor = payload["supervisor"]
+        self.assertEqual(supervisor["state"], "inconsistent")
+        self.assertEqual(
+            supervisor["blocker"], "autopilot_supervisor_record_missing_pid"
+        )
+
 
 class ExternalRunSupervisorTests(unittest.TestCase):
     def _store_with_records(

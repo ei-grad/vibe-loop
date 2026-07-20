@@ -139,10 +139,14 @@ argv or rendered in diagnostics.
 Successful ordinary, signal, and recovery exits append a terminal supervisor
 record only after lock release. Status reports `stopped` only when such a
 terminal record exists AND the recorded process is verifiably absent. A stop
-record with a live process, a live process without the singleton lock, or a
-vanished process with no terminal record must each report an `inconsistent`
-supervisor state with a specific blocker, so an unresolved supervisor is never
-presented as a clean stop or masked by an older cycle status.
+record with a live process, a live process without the singleton lock, a
+vanished process with no terminal record, or any supervisor record carrying no
+PID at all must each report an `inconsistent` supervisor state with a specific
+blocker, so an unresolved supervisor is never presented as a clean stop or
+masked by an older cycle status. A record without a PID is inconsistent by
+construction: absence cannot be verified against an identity that was never
+recorded. Recovery therefore refuses a lock with no recorded PID rather than
+releasing it and writing an unverifiable terminal record.
 
 Related implementation IDs: `AUTO-03`.
 

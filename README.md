@@ -400,8 +400,12 @@ and a matching blocker is reported rather than a clean stop:
 still running), `autopilot_supervisor_live_without_lock` (a live supervisor that
 no longer holds the singleton lock), and
 `autopilot_supervisor_exited_without_stop_record` (the process is gone but never
-recorded its own termination). These blockers surface in the `ProjectStatus`
-payload so a stale cycle status cannot mask an unresolved supervisor.
+recorded its own termination). A record with no PID at all is likewise
+inconsistent — absence cannot be verified against an identity that was never
+recorded — and reports `autopilot_supervisor_stop_record_missing_pid` or
+`autopilot_supervisor_record_missing_pid`. These blockers surface in the
+`ProjectStatus` payload so a stale cycle status cannot mask an unresolved
+supervisor.
 
 **`start`** is the supported detached launcher on POSIX systems. It starts the
 same foreground `autopilot run` supervisor in a new session with standard input

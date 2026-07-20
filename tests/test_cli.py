@@ -20,10 +20,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 import vibe_loop.cli as cli_module
-from vibe_loop.autopilot import stop_detached_autopilot
+from vibe_loop.autopilot import collect_supervisor_status, stop_detached_autopilot
 from vibe_loop.cli import main
 from vibe_loop.config import load_config
 from vibe_loop.locks import AUTOPILOT_LOCK_NAME, LockManager, build_lock_manager
+from vibe_loop.runs import RunStore
 
 
 @contextmanager
@@ -8379,6 +8380,52 @@ class AutopilotCliTests(unittest.TestCase):
                 result.blocker, "autopilot_stale_recovery_missing_fencing_token"
             )
             self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+
+    def test_recovery_without_a_recorded_pid_fails_closed(self) -> None:
+        """A PID-less lock is unverifiable, so recovery refuses to release it.
+
+        Recovery must never produce a terminal stop record without a PID: status
+        could not then verify the exact process is absent.
+        """
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            command, state_path = write_command_lock_adapter(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                command_lock_toml(command), encoding="utf-8"
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+                runtime_context=config.runtime_environment,
+            )
+            manager.acquire_autopilot(run_id="autopilot-dead", metadata={})
+            # The reported failure: a singleton held with neither lease nor PID.
+            held = command_lock_state(state_path)
+            held[AUTOPILOT_LOCK_NAME].pop("pid", None)
+            state_path.write_text(json.dumps(held), encoding="utf-8")
+
+            result = stop_detached_autopilot(
+                config,
+                recovery=True,
+                run_id="autopilot-dead",
+                process_exists=lambda checked: False,
+            )
+
+            self.assertFalse(result.stopped)
+            self.assertEqual(result.blocker, "autopilot_stale_recovery_missing_pid")
+            self.assertIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self.assertEqual(
+                collect_supervisor_status(
+                    run_store,
+                    process_exists=lambda checked: False,
+                ).state,
+                "idle",
+            )
 
     def test_doctor_reports_redacted_autopilot_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -692,8 +692,16 @@ def collect_supervisor_status(
         record_is_terminal = (
             newest_record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
         )
-        process_absent = record_pid is None or not process_checker(record_pid)
+        # Absence is only verifiable against a recorded PID. A record without one
+        # leaves the supervisor's fate unknown, so it can never justify "stopped".
+        process_absent = record_pid is not None and not process_checker(record_pid)
         if record_is_terminal:
+            if record_pid is None:
+                return supervisor_status_from_record(
+                    newest_record,
+                    state="inconsistent",
+                    blocker="autopilot_supervisor_stop_record_missing_pid",
+                )
             if process_absent:
                 return supervisor_status_from_record(newest_record, state="stopped")
             return supervisor_status_from_record(
@@ -702,6 +710,12 @@ def collect_supervisor_status(
                 blocker="autopilot_supervisor_stop_record_live_process",
             )
         if supervisor_lock is not None and not supervisor_lock.locked:
+            if record_pid is None:
+                return supervisor_status_from_record(
+                    newest_record,
+                    state="inconsistent",
+                    blocker="autopilot_supervisor_record_missing_pid",
+                )
             if process_absent:
                 return supervisor_status_from_record(
                     newest_record,
@@ -1215,9 +1229,6 @@ def start_detached_autopilot(
                 ):
                     blocker = "detached_autopilot_process_identity_unverified"
                     break
-                if not process_birth_id:
-                    blocker = "detached_autopilot_process_identity_unverified"
-                    break
                 run_store.append_record(
                     {
                         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
@@ -1587,6 +1598,10 @@ def stop_detached_autopilot(
         local_fencing_token = lock_manager.local_fencing_token(AUTOPILOT_LOCK_NAME)
         if not run_id:
             blocker = "autopilot_stale_recovery_missing_run_id"
+        elif pid is None:
+            # Without a PID from either the lock or the local records, absence
+            # cannot be verified and no terminal record could justify "stopped".
+            blocker = "autopilot_stale_recovery_missing_pid"
         elif not local_fencing_token:
             blocker = "autopilot_stale_recovery_missing_fencing_token"
         else:
