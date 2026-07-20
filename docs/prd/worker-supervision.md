@@ -71,7 +71,7 @@ run it was told nothing about, so a failed store loses no information, and
 blocking release there would strand the lock of an interrupted or report-less
 run.
 
-Three ordering rules keep the two stores in agreement:
+Four ordering rules keep the two stores in agreement:
 
 - A settled outcome is only publishable once the local `run_result` append has
   succeeded. External provenance may never claim a completion vibe-loop itself
@@ -80,11 +80,16 @@ Three ordering rules keep the two stores in agreement:
   (`completed`, `failed`, `blocked`) may only be replaced by another terminal
   one. A same-owner update carrying no outcome, or still carrying `unknown` —
   a heartbeat refreshing from a snapshot read before settlement — keeps the
-  stored outcome and its classification instead of reopening the run. Row
-  precedence alone is not enough, because a command backend offers no
-  compare-and-swap and the racing writer's own read of the row may predate
-  settlement too; the settling `LockManager` also reapplies the outcome it
-  settled to every later update for that run, until the lock is released.
+  stored outcome and its classification instead of reopening the run.
+- Row precedence only holds if every writer merges against the row its own write
+  lands on, and a command backend offers no compare-and-swap to guarantee that.
+  `LockManager.update` therefore takes read, preserve and write as one critical
+  section, serialized across processes by a per-task file lock under the lock
+  root. This is the same single-host assumption the local fencing-token ledger
+  already makes: the supervisor, `vibe-loop worker heartbeat` and the workspace
+  claim all write a task lock from the host that owns its lock root. A backend
+  whose writers are genuinely distributed would need conditional updates in the
+  backend itself.
 - A recovery attempt that exhausts the unknown-run recovery budget settles as
   `failed`, not `unknown`. That run records the terminal `failed` result
   itself, before releasing its lock, and the recovery driver reuses it, so the

@@ -4739,24 +4739,19 @@ class SynchronizedHeartbeatLockManager(LockManager):
     """Runs a real ``LockManager.heartbeat`` across the settling update.
 
     The heartbeat is the production one: it reads the lock row, then writes
-    that snapshot back with a fresh ``heartbeat_at``. Here its reads are held
-    before the settling update and its write released after, so it carries the
-    genuinely stale pre-settlement pair - a stored ``outcome=unknown`` /
-    ``classification=unknown`` written by an earlier unsettled publication -
-    into a row the backend has already finalized as completed.
-
-    ``hold_after_reads`` selects how much of the heartbeat is stale. One holds
-    only the caller's snapshot, so the write path still re-reads a settled row.
-    Two holds the re-read inside ``update`` as well, which is the window a
-    command backend cannot close with a compare-and-swap: both of the
-    heartbeat's views of the row predate settlement.
+    that snapshot back with a fresh ``heartbeat_at``. Here its caller-level read
+    is held before the settling update and its write released after, so it
+    carries the genuinely stale pre-settlement pair - a stored
+    ``outcome=unknown`` / ``classification=unknown`` written by an earlier
+    unsettled publication - into a row the backend has already finalized as
+    completed. The write path still merges against a re-read of the row, so
+    stored precedence is what has to keep the outcome terminal.
     """
 
     HEARTBEAT_WAIT_SECONDS = 10.0
 
-    def __init__(self, *args, hold_after_reads: int = 1, **kwargs) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.hold_after_reads = hold_after_reads
         self._reads = 0
         self.read_done = threading.Event()
         self.settled = threading.Event()
@@ -4788,10 +4783,9 @@ class SynchronizedHeartbeatLockManager(LockManager):
         if self._on_heartbeat_thread():
             self._reads += 1
             if self._reads == 1:
-                self.heartbeat_snapshot = dict(current.metadata)
-            if self._reads == self.hold_after_reads:
                 # Hold this view of the row until the settling update stored a
                 # terminal outcome, so the write back is unambiguously stale.
+                self.heartbeat_snapshot = dict(current.metadata)
                 self.read_done.set()
                 self.settled.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
         return current
@@ -4822,6 +4816,110 @@ class SynchronizedHeartbeatLockManager(LockManager):
             self.settled.set()
             thread.join(timeout=self.HEARTBEAT_WAIT_SECONDS)
         return settled
+
+
+class ParkedWriteBackend:
+    """Lock backend that parks inside ``update`` once the caller has merged.
+
+    Modelling the racing writer at the backend write - not at its read - is the
+    point: by then it has already decided the exact row it intends to store, so
+    nothing downstream of the merge can repair a stale outcome.
+    """
+
+    WAIT_SECONDS = 10.0
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.at_write = threading.Event()
+        self.proceed = threading.Event()
+
+    def acquire(self, task_id, run_id, metadata=None):
+        return self.inner.acquire(task_id, run_id, metadata=metadata)
+
+    def update(self, task_lock, metadata):
+        self.at_write.set()
+        self.proceed.wait(timeout=self.WAIT_SECONDS)
+        return self.inner.update(task_lock, metadata)
+
+    def release(self, task_lock) -> None:
+        self.inner.release(task_lock)
+
+    def status(self, task_id):
+        return self.inner.status(task_id)
+
+    def list_locks(self):
+        return self.inner.list_locks()
+
+    def path_for(self, task_id):
+        return self.inner.path_for(task_id)
+
+
+class ForeignHeartbeatLockManager(LockManager):
+    """Settles while a heartbeat from another process is parked mid-update.
+
+    The racing writer is a separate ``LockManager`` over its own backend
+    instance, the way ``vibe-loop worker heartbeat`` runs it: the settling
+    process shares no memory with it and cannot know what it merged. It is
+    parked after reading the pre-settlement row and merging its stale
+    ``unknown`` pair, immediately before the backend write - the window a
+    backend without compare-and-swap cannot close by row precedence alone.
+    """
+
+    WAIT_SECONDS = 10.0
+    # Bounded release for the correct ordering, where settlement is blocked
+    # behind the parked writer and would otherwise never reach its own write.
+    UNBLOCK_SECONDS = 0.75
+
+    def __init__(self, *args, writer_backend: ParkedWriteBackend, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.writer_backend = writer_backend
+        self.writer_metadata: dict[str, object] | None = None
+        self.writer_error: BaseException | None = None
+        self.injected = False
+
+    def _run_writer(self, task_lock) -> None:
+        writer = LockManager(self.lock_root, backend=self.writer_backend)
+        try:
+            refreshed = writer.heartbeat(
+                task_id=task_lock.task_id,
+                run_id=str(task_lock.metadata.get("run_id") or ""),
+                fencing_token=str(task_lock.metadata.get("fencing_token") or "")
+                or None,
+                heartbeat_at="2026-07-20T00:00:00Z",
+            )
+            self.writer_metadata = dict(refreshed.metadata)
+        except BaseException as exc:  # surfaced by the test, never swallowed
+            self.writer_error = exc
+
+    def update(self, task_lock, metadata):
+        if (
+            self.injected
+            or str(metadata.get("outcome") or "")
+            not in locks_module.TERMINAL_LOCK_OUTCOMES
+        ):
+            return super().update(task_lock, metadata)
+        self.injected = True
+        # The row an earlier unsettled publication left behind, written straight
+        # through the backend so the settling manager's own gate does not see it.
+        stored = self.current_lock(task_lock.task_id)
+        unsettled = dict(stored.metadata)
+        unsettled["outcome"] = "unknown"
+        unsettled["classification"] = "unknown"
+        self.backend.update(stored, unsettled)
+        thread = threading.Thread(target=self._run_writer, args=(task_lock,))
+        thread.start()
+        self.writer_backend.at_write.wait(timeout=self.WAIT_SECONDS)
+        unblock = threading.Timer(
+            self.UNBLOCK_SECONDS,
+            self.writer_backend.proceed.set,
+        )
+        unblock.start()
+        try:
+            return super().update(task_lock, metadata)
+        finally:
+            unblock.cancel()
+            self.writer_backend.proceed.set()
+            thread.join(timeout=self.WAIT_SECONDS)
 
 
 class StubTaskSource:
@@ -5414,7 +5512,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         records = json.loads(runs_path.read_text())
         return {run_id: str(record["outcome"]) for run_id, record in records.items()}
 
-    def _assert_stale_heartbeat_keeps_completed(self, hold_after_reads: int) -> None:
+    def test_command_backend_survives_a_stale_heartbeat_before_release(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
         done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
         with tempfile.TemporaryDirectory() as directory:
@@ -5425,7 +5523,6 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             manager = SynchronizedHeartbeatLockManager(
                 runner.config.state_path / "locks",
                 backend=command_backend,
-                hold_after_reads=hold_after_reads,
             )
             runner._lock_manager = manager
 
@@ -5447,14 +5544,42 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
 
-    def test_command_backend_survives_a_stale_heartbeat_before_release(self) -> None:
-        self._assert_stale_heartbeat_keeps_completed(hold_after_reads=1)
+    def test_command_backend_orders_settlement_after_a_parked_foreign_write(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            command_backend = runner.lock_manager.backend
+            writer_backend = ParkedWriteBackend(
+                locks_module.CommandLockBackend(
+                    repo=root,
+                    lock_root=runner.config.state_path / "locks",
+                    acquire_command=self._provenance_adapter(root),
+                    release_command=self._provenance_adapter(root),
+                    status_command=self._provenance_adapter(root),
+                    list_command=self._provenance_adapter(root),
+                )
+            )
+            manager = ForeignHeartbeatLockManager(
+                runner.config.state_path / "locks",
+                backend=command_backend,
+                writer_backend=writer_backend,
+            )
+            runner._lock_manager = manager
 
-    def test_command_backend_survives_a_fully_stale_heartbeat_write(self) -> None:
-        # Both of the heartbeat's reads predate settlement, so the row it
-        # merges against is stale as well: only the settling manager's own
-        # record can keep the write from reopening the run.
-        self._assert_stale_heartbeat_keeps_completed(hold_after_reads=2)
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            self.assertTrue(manager.injected)
+            self.assertIsNone(manager.writer_error)
+            # The foreign heartbeat did store its stale pair - it was parked
+            # holding it, so nothing could rewrite it - which is why ordering,
+            # not row precedence, has to be what keeps the run settled.
+            self.assertEqual((manager.writer_metadata or {}).get("outcome"), "unknown")
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
 
     def test_command_backend_publishes_nothing_without_a_durable_result(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
