@@ -492,10 +492,13 @@ child's workers, and any process they detached into a separate session running
 under PID 1 — still holding task locks and still burning provider quota after
 the operator was told the run stopped. The drain set comes only from this
 installation's own records: the child identity the cycle recorded before waiting
-on it, the active-run locks in this repository's own lock root, and the process
-ancestry rooted at those verified processes. Names, process-group sweeps, and
-ambient process listings are never used, so a peer installation's work is never
-touched.
+on it, the worker-process identity recorded immediately after `Popen`, the
+active-run locks in this repository's own lock root, and the process ancestry
+rooted at those verified processes. A command lock backend may quarantine the
+group, session, and birth fields from its status projection; in that case the
+local worker record restores only omitted fields after an exact task, run, PID,
+host, and supervisor match. Names, process-group sweeps, and ambient process
+listings are never used, so a peer installation's work is never touched.
 
 A worker is verified on its own recorded birth identity, not on its child still
 being alive — a worker orphans to PID 1 precisely because that child died, so

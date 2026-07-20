@@ -93,6 +93,7 @@ from vibe_loop.workers import (
     git_worktree_remove,
     pid_exists,
     record_expired_locks,
+    restore_projected_worker_process_identity,
 )
 
 RunUntilDoneLauncher = Callable[..., int]
@@ -1704,6 +1705,7 @@ def autopilot_child_pids(
 
 def live_active_run_states(
     lock_manager: LockManager,
+    run_store: RunStore,
     *,
     process_exists: ProcessExists,
     timeout_seconds: float | None = None,
@@ -1719,11 +1721,13 @@ def live_active_run_states(
         locks = lock_manager.list_locks(timeout_seconds=timeout_seconds)
     except (LockBackendError, OSError):
         return (), "autopilot_stop_worker_lock_enumeration_failed"
+    records = run_store.read_records()
     live: list[ActiveRunState] = []
     for metadata in locks:
         active = ActiveRunState.from_lock_metadata(dict(metadata))
         if active is None or active.worker_pid is None:
             continue
+        active = restore_projected_worker_process_identity(active, records)
         if not process_exists(active.worker_pid):
             continue
         live.append(active)
@@ -1770,6 +1774,7 @@ def collect_owned_stop_roots(
 
     live_states, enumeration_blocker = live_active_run_states(
         lock_manager,
+        run_store,
         process_exists=process_exists,
         timeout_seconds=timeout_seconds,
     )

@@ -39,6 +39,7 @@ from vibe_loop.locks import (
     SettledOutcomeNotPersisted,
     TaskLock,
 )
+from vibe_loop.processes import read_process_node
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,

@@ -105,6 +105,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+    RunLifecycleEvent,
     RunResult,
     RunStore,
     WorkerReport,
@@ -2097,6 +2098,9 @@ class AutopilotStopDrainTests(unittest.TestCase):
         child_birth_id: str | None = None,
         worker_birth_id: str | None = None,
         record_child: bool = True,
+        project_worker_identity: bool = True,
+        project_worker_host: bool = True,
+        project_worker_supervisor: bool = True,
     ):
         configured_repo(repo, [("TASK-01", "Planned", "", "in flight slice")])
         config = load_config(repo)
@@ -2158,10 +2162,40 @@ class AutopilotStopDrainTests(unittest.TestCase):
             ),
             supervisor_pid=CHILD_PID,
         )
+        projected_worker_state = worker_state
+        if not project_worker_identity:
+            projected_worker_state = dataclasses.replace(
+                worker_state,
+                worker_process_group_id=None,
+                worker_session_id=None,
+                worker_process_birth_id="",
+            )
+        if not project_worker_host:
+            projected_worker_state = dataclasses.replace(
+                projected_worker_state,
+                host="",
+            )
+        if not project_worker_supervisor:
+            projected_worker_state = dataclasses.replace(
+                projected_worker_state,
+                supervisor_pid=None,
+            )
         task_lock = manager.acquire(
             "TASK-01",
             "run-task-01",
-            metadata=worker_state.to_lock_metadata(),
+            metadata=projected_worker_state.to_lock_metadata(),
+        )
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.worker_process_started(
+                run_id=worker_state.run_id,
+                task_id=worker_state.task_id,
+                worker_pid=worker_state.worker_pid or WORKER_PID,
+                supervisor_pid=worker_state.supervisor_pid or CHILD_PID,
+                process_group_id=worker_state.worker_process_group_id,
+                session_id=worker_state.worker_session_id,
+                process_birth_id=worker_state.worker_process_birth_id,
+                host=worker_state.host,
+            )
         )
         return config, manager, holder, run_store, task_lock
 
@@ -2258,6 +2292,68 @@ class AutopilotStopDrainTests(unittest.TestCase):
         )
         self.assertEqual(sorted(closed), sorted(pid_for_fd)[:-1])
         self.assertIsNone(lock_after)
+
+    def test_stop_restores_worker_identity_quarantined_from_lock_projection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config, manager, holder, _run_store, _task_lock = (
+                self._drained_installation(
+                    Path(directory),
+                    project_worker_identity=False,
+                )
+            )
+            result, signals, _closed, pid_for_fd = self._stop(
+                config,
+                manager,
+                holder,
+            )
+
+        signalled_pids = [
+            pid_for_fd[pidfd] for pidfd, number in signals if number == signal.SIGTERM
+        ]
+        self.assertTrue(result.stopped, result.blocker)
+        self.assertEqual(
+            signalled_pids,
+            [REVIEWER_PID, WORKER_PID, CHILD_PID, SUPERVISOR_PID],
+        )
+
+    def test_incomplete_projected_worker_owner_blocks_without_signals(self) -> None:
+        cases = (
+            (
+                {"project_worker_host": False},
+                "autopilot_stop_identity_unverified:worker_birth_id_missing:TASK-01",
+            ),
+            (
+                {"project_worker_supervisor": False},
+                "autopilot_stop_identity_unverified:worker_unattributable:TASK-01",
+            ),
+        )
+        for overrides, expected_blocker in cases:
+            with self.subTest(expected_blocker=expected_blocker):
+                with tempfile.TemporaryDirectory() as directory:
+                    config, manager, holder, _run_store, _task_lock = (
+                        self._drained_installation(
+                            Path(directory),
+                            project_worker_identity=False,
+                            **overrides,
+                        )
+                    )
+                    try:
+                        result, signals, _closed, _pid_for_fd = self._stop(
+                            config,
+                            manager,
+                            holder,
+                        )
+                    finally:
+                        manager.release_autopilot(
+                            run_id="autopilot-1",
+                            fencing_token=str(holder.metadata["fencing_token"]),
+                        )
+
+                self.assertFalse(result.stopped)
+                self.assertEqual(result.blocker, expected_blocker)
+                self.assertEqual(signals, [])
 
     def test_success_requires_every_descendant_to_exit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

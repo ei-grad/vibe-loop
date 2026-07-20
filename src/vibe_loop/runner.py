@@ -1319,6 +1319,22 @@ class VibeRunner:
                             identity.process_birth_id if identity else ""
                         ),
                     )
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.worker_process_started(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            worker_pid=worker_pid,
+                            supervisor_pid=active_state.supervisor_pid or os.getpid(),
+                            process_group_id=(
+                                identity.process_group_id if identity else None
+                            ),
+                            session_id=identity.session_id if identity else None,
+                            process_birth_id=(
+                                identity.process_birth_id if identity else ""
+                            ),
+                            host=active_state.host,
+                        )
+                    )
                     update_active_task_lock()
                     report_status(
                         "worker process started "
@@ -4694,8 +4710,40 @@ def run_streaming_command(
         env=env,
         **popen_kwargs,
     )
-    if on_start is not None:
-        on_start(process.pid)
+    try:
+        if on_start is not None:
+            on_start(process.pid)
+    # Startup callbacks persist ownership evidence. Every failure, including
+    # interruption, must reap the new group before that evidence can be lost.
+    except BaseException:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass
+        except OSError:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
+        except OSError:
+            pass
+        finally:
+            for pipe in (process.stdout, process.stderr):
+                if pipe is None:
+                    continue
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+        raise
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()

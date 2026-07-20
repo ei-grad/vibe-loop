@@ -7,7 +7,7 @@ import shlex
 import shutil
 import socket
 import subprocess
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,7 @@ from vibe_loop.processes import process_birth_identity
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
     RUN_RECORD_TYPE,
+    WORKER_PROCESS_STARTED_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKER_REPORT_RECORD_TYPE,
@@ -1298,7 +1299,11 @@ def build_worker_views(
         else None
     )
     views: list[WorkerView] = []
-    for active in load_active_run_states(lock_manager):
+    for projected_active in load_active_run_states(lock_manager):
+        active = restore_projected_worker_process_identity(
+            projected_active,
+            records,
+        )
         result = result_by_run_id.get(active.run_id)
         if (
             result is not None
@@ -1360,6 +1365,75 @@ def build_worker_views(
             )
         )
     return views
+
+
+def restore_projected_worker_process_identity(
+    active: ActiveRunState,
+    records: Sequence[dict[str, Any]],
+) -> ActiveRunState:
+    """Restore identity fields omitted by a command lock's public projection.
+
+    The local start record is independent evidence captured from the exact
+    ``Popen`` child. It is usable only for the same task, run, PID, host, and
+    supervisor. Existing projected values are never replaced, so conflicting
+    backend identity still reaches the normal fail-closed mismatch checks.
+    """
+
+    if (
+        active.worker_pid is None
+        or not active.run_id
+        or not active.task_id
+        or not active.host
+        or active.supervisor_pid is None
+    ):
+        return active
+    for record in reversed(records):
+        if record.get("record_type") != WORKER_PROCESS_STARTED_RECORD_TYPE:
+            continue
+        if record.get("run_id") != active.run_id:
+            continue
+        if optional_string(record.get("task_id")) != active.task_id:
+            continue
+        if optional_int(record.get("worker_pid")) != active.worker_pid:
+            continue
+        record_host = optional_string(record.get("host"))
+        if not record_host:
+            continue
+        if active.host != record_host:
+            continue
+        record_supervisor_pid = optional_int(record.get("supervisor_pid"))
+        if record_supervisor_pid is None:
+            continue
+        if active.supervisor_pid != record_supervisor_pid:
+            continue
+        return dataclasses.replace(
+            active,
+            worker_process_group_id=(
+                active.worker_process_group_id
+                if active.worker_process_group_id is not None
+                else optional_int(record.get("worker_process_group_id"))
+            ),
+            worker_session_id=(
+                active.worker_session_id
+                if active.worker_session_id is not None
+                else optional_int(record.get("worker_session_id"))
+            ),
+            worker_process_birth_id=(
+                active.worker_process_birth_id
+                or optional_string(record.get("worker_process_birth_id"))
+            ),
+            pid_source=(
+                active.pid_source
+                if active.pid_source != "legacy_pid"
+                else optional_string(record.get("pid_source")) or active.pid_source
+            ),
+            pid_scope=(
+                active.pid_scope
+                or optional_string(record.get("pid_scope"))
+                or "configured_command_process"
+            ),
+        )
+    return active
 
 
 def worker_lifecycle_progress(
