@@ -26,6 +26,7 @@ from vibe_loop.config import (
     VibeConfig,
     command_template_uses_field,
     format_agent_command,
+    require_project_binding,
     resolve_task_agent,
     prepare_shell_command,
 )
@@ -484,16 +485,25 @@ class VibeRunner:
         self.config = config
         self._source: TaskSource | None = None
         self._source_resolution: RuntimeTaskSourceResolution | None = None
-        self.lock_manager = build_lock_manager(
-            config.repo,
-            config.state_path / "locks",
-            config.locks,
-            runtime_context=config.runtime_environment,
-        )
+        self._lock_manager: LockManager | None = None
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
+
+    @property
+    def lock_manager(self) -> LockManager:
+        if self._lock_manager is None:
+            # Querying a command lock backend is as much a cross-project
+            # effect as listing tasks, so construction is gated the same way.
+            require_project_binding(self.config)
+            self._lock_manager = build_lock_manager(
+                self.config.repo,
+                self.config.state_path / "locks",
+                self.config.locks,
+                runtime_context=self.config.runtime_environment,
+            )
+        return self._lock_manager
 
     @property
     def source_resolution(self) -> RuntimeTaskSourceResolution:
@@ -504,6 +514,10 @@ class VibeRunner:
     @property
     def source(self) -> TaskSource:
         if self._source is None:
+            # Listing tasks is already an observable cross-project effect for
+            # a command backend, so the binding gates construction rather than
+            # only the dispatch entry points.
+            require_project_binding(self.config)
             self._source = build_task_source(
                 self.config.repo,
                 self.source_resolution.task_source,
@@ -1600,6 +1614,7 @@ class VibeRunner:
         exclude: set[str] | None = None,
         restart_counts: dict[str, int] | None = None,
     ) -> RunResult | None:
+        require_project_binding(self.config)
         candidates = self.list_candidates(exclude=exclude)
         if not candidates:
             return None
@@ -1632,6 +1647,7 @@ class VibeRunner:
     ) -> list[RunResult]:
         if jobs < 1:
             raise ValueError("run-until-done --jobs must be at least 1")
+        require_project_binding(self.config)
         self.run_store.append_record(
             {
                 "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,

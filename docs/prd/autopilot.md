@@ -252,6 +252,59 @@ diagnostics.
 
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-06`.
 
+## PRD-AUT-020 Command Backend Project Binding
+
+A command-backed task source or lock adapter that routes by an ambient
+environment selector binds repository A to project B whenever that selector is
+absent or wrong in the launching shell. Ambient export guidance is not an
+enforceable contract: it fails silently, and the resulting cross-project
+supervisor lock and queue analysis look valid.
+
+A repository must therefore be able to declare its namespace binding explicitly
+in configuration. A `[project_binding]` table names the required selector
+variables in `require` and may pin their values in `context`. A required
+selector resolves from exactly two explicit sources: the per-project registry
+`context` for that entry, or the repository's own pinned `context`. A value
+present only in the ambient process environment does not resolve it.
+
+Resolution must fail closed before any observable effect. `autopilot run`,
+`autopilot start`, `run-until-done`, and `run-next` refuse a missing, ambient-
+only, or conflicting binding before acquiring the singleton supervisor lock,
+before acquiring any task lock, before listing tasks, and before launching a
+planning or worker child. Diagnostics name the variable and the failure reason
+(`unset`, `ambient_only`, `conflict`) and never echo the ambient or configured
+value.
+
+Structured status reports the resolved binding so operators can verify routing
+without reading configuration: each required selector appears with its resolved
+value and the source that supplied it, alongside every context name injected
+into adapter subprocesses. Required names are validated as namespace selectors,
+which is what makes their values reportable; any other declared context name is
+redacted. This block is exempt from registry-context value redaction in
+aggregate and per-project status output, because redacting it would erase the
+routing fact in exactly the registry-driven multi-project case that needs it.
+
+Status must not itself cross projects. When a declared binding is unresolved,
+status reports the diagnostics as blockers and a queue `source_error` without
+invoking the task source or lock adapter, so an unbound repository never
+displays another project's queue or locks under its own path. Unresolved
+bindings appear as project blockers in the same payload.
+
+Selector names are compared verbatim, matching environment-variable semantics:
+two names differing only in case are two distinct selectors, and each must be
+supplied on its own.
+
+Binding must survive process launch. Detached start and registry-driven launches
+transport registry context to the child out of band and drop the ambient copy of
+every bound name from the child environment, so a stale shell export cannot
+reach an adapter if the child's own resolution changes.
+
+The table is optional. A command backend that already scopes its project
+explicitly in the command string has no ambiguity to close and keeps working
+unchanged with no `[project_binding]` declared.
+
+Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-06`.
+
 ## PRD-AUT-008 TUI And WebUI Readiness
 
 > **Superseded (removed from vibe-loop).** The in-tree `autopilot tui` (Textual)

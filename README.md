@@ -382,6 +382,52 @@ vibe-loop autopilot projects status --json
 vibe-loop wait-helper --pid 12345 --json
 ```
 
+### Command backend project binding
+
+A command-backed task source or lock adapter that selects its project from an
+ambient environment variable will bind this repository to whatever project the
+launching shell happened to point at. Declare the binding instead of exporting
+it:
+
+```toml
+[project_binding]
+require = ["LOOPYARD_PROJECT"]
+
+[project_binding.context]
+LOOPYARD_PROJECT = "vibe-loop"
+```
+
+`require` lists the namespace selectors this repository's command adapters must
+receive. Each one resolves from exactly two explicit sources: the pinned
+`[project_binding.context]` above, or the `--context NAME=VALUE` recorded for
+this repo in the project registry. A value present only in the ambient
+environment does not resolve it — that is the ambiguity this table closes.
+
+`autopilot run`, `autopilot start`, `run-until-done`, and `run-next` refuse an
+unresolved binding *before* acquiring the supervisor lock, acquiring any task
+lock, listing tasks, or launching a child. The diagnostic names the variable and
+the reason (`project_binding_unset:…`, `project_binding_ambient_only:…`,
+`project_binding_conflict:…`) and never echoes the value. `autopilot status`
+reports the same diagnostics as blockers rather than failing.
+
+`autopilot status --json` includes a `project_binding` block reporting each
+required selector's resolved value and whether it came from `config` or
+`runtime_context`, so routing is verifiable without reading configuration. It
+also lists `injected_names`: every context name handed to adapter subprocesses,
+including any that is not required. `autopilot projects status/inspect` reports
+the same block; it is the one part of the payload that survives registry-context
+redaction, because required names are validated selector-shaped and their values
+are the routing fact being checked. Any other declared context name is redacted.
+
+When the binding is unresolved, `autopilot status` does not query the task
+source or lock adapter at all — it reports the diagnostic as a blocker and a
+`source_error`, rather than showing another project's queue under this repo's
+path.
+
+The table is optional. A command backend that already names its project inside
+the command string (`loopyard -p vibe-loop task list`) has nothing ambiguous to
+close and keeps working with no `[project_binding]` at all.
+
 **`status`** collects a read-only snapshot — queue counts, runnable tasks, active
 workers, stale locks, workspace diagnostics, git refs/dirty state, the
 main-integration lock, supervisor state, blockers, and the last cycle. It never
@@ -542,7 +588,8 @@ boundary as task-source and lock adapters.
 keeps its own state directory. A repeated `register --context NAME=VALUE` option
 adds bounded, non-secret selectors for repositories whose command-backed task
 source, lock adapter, or idle-wake adapter needs distinct context such as
-`LOOPYARD_PROJECT`.
+`LOOPYARD_PROJECT`. A repo that also lists that name in `[project_binding]
+require` gets the registry value as its enforced binding.
 Selectors are copied literally into only those subprocess environments, never
 shell-interpolated or added to global `os.environ`. Names must be selector-
 shaped, with suffixes such as `_PROJECT`, `_BOARD`, `_TENANT`, `_WORKSPACE`,

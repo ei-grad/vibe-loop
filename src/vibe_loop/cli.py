@@ -38,6 +38,8 @@ from vibe_loop.autopilot import (
     WaitResult,
 )
 from vibe_loop.config import (
+    ProjectBindingError,
+    require_project_binding,
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
     AUTOPILOT_WORKTREE_DISPOSITION_POLICIES,
@@ -1683,6 +1685,7 @@ def local_demo_config_from_args(
 
 
 def dispatch_worker(args: argparse.Namespace, config) -> int:
+    require_project_binding(config)
     if args.worker_command == "claim-workspace":
         run_id, task_id = worker_identity_from_args(args)
         if not run_id or not task_id:
@@ -1696,6 +1699,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             config.repo,
             config.state_path / "locks",
             config.locks,
+            runtime_context=config.runtime_environment,
         )
         run_store = RunStore(config.state_path / "runs.jsonl")
         try:
@@ -1768,6 +1772,7 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
             config.repo,
             config.state_path / "locks",
             config.locks,
+            runtime_context=config.runtime_environment,
         )
         try:
             task_lock = manager.heartbeat(
@@ -1807,10 +1812,12 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
 
 
 def dispatch_main_integration(args: argparse.Namespace, config) -> int:
+    require_project_binding(config)
     manager = build_lock_manager(
         config.repo,
         config.state_path / "locks",
         config.locks,
+        runtime_context=config.runtime_environment,
     )
     run_store = RunStore(config.state_path / "runs.jsonl")
     if args.main_integration_command == "status":
@@ -2072,6 +2079,10 @@ def read_only_task_operation(config, operation):
     except GeneratedTaskSourceRuntimeError as exc:
         raise RuntimeError(str(exc)) from exc
     except AgentResolutionError:
+        raise
+    except ProjectBindingError:
+        # A ValueError subclass, but generated-cache guidance points at the
+        # wrong remedy for a routing failure.
         raise
     except (FileNotFoundError, ValueError) as exc:
         message = read_only_generated_cache_message(config)
@@ -2446,10 +2457,12 @@ def validate_report_fencing(args: argparse.Namespace, config) -> int | None:
     fencing_token = fencing_token_from_args(args)
     if not fencing_token:
         return None
+    require_project_binding(config)
     manager = build_lock_manager(
         config.repo,
         config.state_path / "locks",
         config.locks,
+        runtime_context=config.runtime_environment,
     )
     try:
         manager.validate_owner(

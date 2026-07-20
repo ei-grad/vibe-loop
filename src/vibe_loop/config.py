@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import math
+import os
 import re
 import shlex
 import shutil
@@ -10,7 +11,7 @@ import string
 import subprocess
 import sys
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -95,6 +96,7 @@ DEFAULT_RUNNABLE_STATUSES = ("Active", "Next", "Planned")
 GENERATED_TASK_PROFILE_CACHE_FILE = "generated-task-source.json"
 GENERATED_TASK_PROFILE_SCHEMA_VERSION = 1
 GENERATED_TASK_PROFILE_PROMPT_VERSION = 1
+RUNTIME_CONTEXT_REDACTION = "<runtime-context-redacted>"
 REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES = 16
 REGISTRY_RUNTIME_CONTEXT_MAX_VALUE_BYTES = 4096
 REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES = 16 * 1024
@@ -199,6 +201,12 @@ LOCKS_COMMAND_KEYS = frozenset(
     {"acquire_command", "release_command", "status_command", "list_command"}
 )
 LOCKS_CONFIG_KEYS = frozenset({"type", "lease_seconds"}) | LOCKS_COMMAND_KEYS
+PROJECT_BINDING_CONFIG_KEYS = frozenset({"require", "context"})
+PROJECT_BINDING_SOURCE_CONFIG = "config"
+PROJECT_BINDING_SOURCE_RUNTIME_CONTEXT = "runtime_context"
+PROJECT_BINDING_REASON_UNSET = "unset"
+PROJECT_BINDING_REASON_AMBIENT_ONLY = "ambient_only"
+PROJECT_BINDING_REASON_CONFLICT = "conflict"
 AUTOPILOT_COMMAND_KEYS = frozenset(
     {
         "health_command",
@@ -733,6 +741,94 @@ class LockConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProjectBindingConfig:
+    """Declared per-repository namespace binding for command adapters.
+
+    ``require`` names the selector variables that command-backed task sources
+    and locks must receive from an explicit source. ``context`` pins their
+    values in repository configuration.
+    """
+
+    require: tuple[str, ...] = ()
+    context: tuple[tuple[str, str], ...] = ()
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.require or self.context)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "declared": self.declared,
+            "require": list(self.require),
+            "context_names": [name for name, _value in self.context],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedBindingEntry:
+    name: str
+    value: str
+    source: str
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "source": self.source,
+            "value": (
+                self.value
+                if registry_runtime_context_name_is_selector(self.name.upper())
+                else RUNTIME_CONTEXT_REDACTION
+            ),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectBindingDiagnostic:
+    name: str
+    reason: str
+
+    @property
+    def code(self) -> str:
+        return f"project_binding_{self.reason}:{self.name}"
+
+    def to_json(self) -> dict[str, object]:
+        return {"name": self.name, "reason": self.reason, "code": self.code}
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedProjectBinding:
+    declared: bool = False
+    entries: tuple[ResolvedBindingEntry, ...] = ()
+    diagnostics: tuple[ProjectBindingDiagnostic, ...] = ()
+    injected_names: tuple[str, ...] = ()
+
+    @property
+    def blocker(self) -> str | None:
+        return self.diagnostics[0].code if self.diagnostics else None
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "declared": self.declared,
+            "resolved": [entry.to_json() for entry in self.entries],
+            "diagnostics": [item.to_json() for item in self.diagnostics],
+            # Every name handed to adapter subprocesses, not just the required
+            # ones: an unrequired selector still influences routing, so the
+            # report would overstate its authority by hiding it.
+            "injected_names": list(self.injected_names),
+        }
+
+
+class ProjectBindingError(ValueError):
+    def __init__(self, binding: ResolvedProjectBinding) -> None:
+        super().__init__(
+            "command backend project binding is unresolved: "
+            + ", ".join(item.code for item in binding.diagnostics)
+        )
+        self.binding = binding
+
+
+@dataclasses.dataclass(frozen=True)
 class SpecDiagnosticsConfig:
     require_approved: bool = False
     require_current_fingerprints: bool = False
@@ -781,6 +877,9 @@ class VibeConfig:
         default_factory=SupervisionConfig
     )
     locks: LockConfig = dataclasses.field(default_factory=LockConfig)
+    project_binding: ProjectBindingConfig = dataclasses.field(
+        default_factory=ProjectBindingConfig
+    )
     autopilot: AutopilotConfig = dataclasses.field(default_factory=AutopilotConfig)
     specs: SpecDiagnosticsConfig = dataclasses.field(
         default_factory=SpecDiagnosticsConfig
@@ -800,7 +899,11 @@ class VibeConfig:
 
     @property
     def runtime_environment(self) -> dict[str, str]:
-        return dict(self.runtime_context)
+        # Registry-supplied context wins over repository pins; a disagreement
+        # between the two is refused separately by resolve_project_binding.
+        environment = dict(self.project_binding.context)
+        environment.update(self.runtime_context)
+        return environment
 
     def config_report(self) -> dict[str, object]:
         return {
@@ -825,6 +928,7 @@ def load_config(
     agent_routing = parse_agent_routing(agent_table, agent_profiles)
     supervision = parse_supervision(data.get("supervision", {}))
     locks = parse_locks(data.get("locks", {}))
+    project_binding = parse_project_binding(data.get("project_binding", {}))
     autopilot = parse_autopilot(data.get("autopilot", {}))
     specs = parse_specs(data.get("specs", {}))
     return VibeConfig(
@@ -844,6 +948,7 @@ def load_config(
         completion=completion,
         supervision=supervision,
         locks=locks,
+        project_binding=project_binding,
         autopilot=autopilot,
         specs=specs,
         runtime_context=normalize_registry_runtime_context(runtime_context),
@@ -1850,6 +1955,145 @@ def parse_locks(data: object) -> LockConfig:
         ),
         explicit_keys=explicit_keys,
     )
+
+
+def parse_project_binding(data: object) -> ProjectBindingConfig:
+    table = expect_table(data, "project_binding")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - PROJECT_BINDING_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            f"project_binding contains unsupported keys: {', '.join(unknown_keys)}"
+        )
+    require = parse_project_binding_require(table.get("require"))
+    try:
+        context = normalize_registry_runtime_context(table.get("context"))
+    except ValueError as exc:
+        raise ValueError(f"project_binding.context is invalid: {exc}") from exc
+    return ProjectBindingConfig(
+        require=require,
+        context=context,
+        explicit_keys=explicit_keys,
+    )
+
+
+def parse_project_binding_require(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise ValueError("project_binding.require must be a list of variable names")
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError(
+                "project_binding.require entries must be non-empty strings"
+            )
+        name = item.strip()
+        if not REGISTRY_RUNTIME_CONTEXT_NAME_RE.match(name):
+            raise ValueError(
+                f"project_binding.require name is not a valid variable: {name}"
+            )
+        normalized = name.upper()
+        if registry_runtime_context_name_is_dangerous(normalized):
+            raise ValueError(f"project_binding.require name is not allowed: {name}")
+        if not registry_runtime_context_name_is_selector(normalized):
+            allowed = ", ".join(sorted(REGISTRY_RUNTIME_CONTEXT_SELECTOR_SUFFIXES))
+            raise ValueError(
+                f"project_binding.require name must be a namespace selector "
+                f"ending in one of: {allowed} (got {name})"
+            )
+        # Deduplicated verbatim, not by normalized case: environment variable
+        # names are case-sensitive, so DEMO_PROJECT and Demo_Project are two
+        # distinct selectors and each must be supplied on its own.
+        if name in seen:
+            raise ValueError(f"project_binding.require lists {name} more than once")
+        seen.add(name)
+        names.append(name)
+    if len(names) > REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES:
+        raise ValueError(
+            "project_binding.require lists too many names "
+            f"(maximum {REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES})"
+        )
+    return tuple(names)
+
+
+def resolve_project_binding(
+    config: VibeConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ResolvedProjectBinding:
+    """Resolve declared namespace selectors from explicit sources only.
+
+    A value inherited solely from the ambient process environment is refused:
+    that is the routing ambiguity this binding exists to close.
+    """
+
+    binding = config.project_binding
+    injected_names = tuple(sorted(config.runtime_environment))
+    if not binding.require:
+        return ResolvedProjectBinding(
+            declared=binding.declared,
+            injected_names=injected_names,
+        )
+    ambient = os.environ if environ is None else environ
+    pinned = dict(binding.context)
+    supplied = dict(config.runtime_context)
+    entries: list[ResolvedBindingEntry] = []
+    diagnostics: list[ProjectBindingDiagnostic] = []
+    for name in binding.require:
+        pinned_value = pinned.get(name)
+        supplied_value = supplied.get(name)
+        if (
+            pinned_value is not None
+            and supplied_value is not None
+            and pinned_value != supplied_value
+        ):
+            diagnostics.append(
+                ProjectBindingDiagnostic(name, PROJECT_BINDING_REASON_CONFLICT)
+            )
+            continue
+        if supplied_value is not None:
+            entries.append(
+                ResolvedBindingEntry(
+                    name,
+                    supplied_value,
+                    PROJECT_BINDING_SOURCE_RUNTIME_CONTEXT,
+                )
+            )
+            continue
+        if pinned_value is not None:
+            entries.append(
+                ResolvedBindingEntry(
+                    name,
+                    pinned_value,
+                    PROJECT_BINDING_SOURCE_CONFIG,
+                )
+            )
+            continue
+        reason = (
+            PROJECT_BINDING_REASON_AMBIENT_ONLY
+            if ambient.get(name) is not None
+            else PROJECT_BINDING_REASON_UNSET
+        )
+        diagnostics.append(ProjectBindingDiagnostic(name, reason))
+    return ResolvedProjectBinding(
+        declared=True,
+        entries=tuple(entries),
+        diagnostics=tuple(diagnostics),
+        injected_names=injected_names,
+    )
+
+
+def require_project_binding(
+    config: VibeConfig,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ResolvedProjectBinding:
+    binding = resolve_project_binding(config, environ=environ)
+    if binding.diagnostics:
+        raise ProjectBindingError(binding)
+    return binding
 
 
 def parse_specs(data: object) -> SpecDiagnosticsConfig:

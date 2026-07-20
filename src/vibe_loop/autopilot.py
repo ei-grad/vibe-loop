@@ -11,7 +11,7 @@ import sys
 import tempfile
 import threading
 import time as time_module
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,10 +21,13 @@ from vibe_loop.config import (
     AgentResolutionError,
     REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES,
     REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES,
+    RUNTIME_CONTEXT_REDACTION,
+    ResolvedProjectBinding,
     VibeConfig,
     command_template_uses_field,
     format_agent_command,
     load_config,
+    resolve_project_binding,
     normalize_registry_runtime_context,
     normalize_registry_runtime_context_assignments,
     prepare_shell_command,
@@ -238,6 +241,9 @@ class ProjectStatus:
     last_cycle: CycleSummary | None = None
     next_wake: str = ""
     runtime_context: tuple[tuple[str, str], ...] = ()
+    project_binding: ResolvedProjectBinding = dataclasses.field(
+        default_factory=ResolvedProjectBinding
+    )
 
     def to_json(self) -> dict[str, object]:
         payload = {
@@ -268,6 +274,11 @@ class ProjectStatus:
         assert isinstance(redacted, dict)
         fencing_redacted = redact_fencing_token_payload(redacted)
         assert isinstance(fencing_redacted, dict)
+        # Attached after redaction on purpose: declared binding names are
+        # validated as namespace selectors, so their resolved values are the
+        # routing fact operators need and are not secret-shaped. Anything else
+        # is redacted by ResolvedBindingEntry.to_json itself.
+        fencing_redacted["project_binding"] = self.project_binding.to_json()
         return fencing_redacted
 
 
@@ -318,6 +329,39 @@ def collect_project_status(
     *,
     process_exists: ProcessExists | None = None,
 ) -> ProjectStatus:
+    project_binding = resolve_project_binding(config)
+    if project_binding.blocker is not None:
+        # Querying the task source or lock adapter now would route this
+        # repository's status through whatever project the ambient
+        # environment names. Report the binding failure instead; git state is
+        # local and stays safe to collect.
+        return ProjectStatus(
+            repo=config.repo,
+            display_name=config.repo.name,
+            state_dir=config.state_path,
+            collected_at=utc_now_iso(),
+            main_branch=config.main_branch,
+            git=collect_git_status(
+                config.repo,
+                config.main_branch,
+                ignored_dirty_paths=(config.state_path,),
+            ),
+            queue=TaskQueueStatus(source_error=project_binding.blocker),
+            agent=config.agent.to_json(),
+            worktree_disposition_policy=config.autopilot.worktree_disposition,
+            # Supervisor liveness is only observable through the lock adapter,
+            # which is exactly what must not be queried here. Report it as
+            # unknown rather than letting the "idle" default read as a checked
+            # fact; the run journal below is local and stays accurate.
+            supervisor=SupervisorStatus(
+                state="unknown",
+                blocker=project_binding.blocker,
+            ),
+            last_cycle=latest_cycle_summary(RunStore(config.state_path / "runs.jsonl")),
+            blockers=tuple(item.code for item in project_binding.diagnostics),
+            runtime_context=config.runtime_context,
+            project_binding=project_binding,
+        )
     lock_manager = build_lock_manager(
         config.repo,
         config.state_path / "locks",
@@ -366,6 +410,7 @@ def collect_project_status(
     )
     blockers = tuple(
         project_blockers(
+            project_binding=project_binding,
             git_status=git_status,
             queue_status=queue_status,
             stale_locks=stale_locks,
@@ -398,6 +443,7 @@ def collect_project_status(
         last_cycle=last_cycle,
         next_wake=last_cycle.next_wake if last_cycle is not None else "",
         runtime_context=config.runtime_context,
+        project_binding=project_binding,
     )
 
 
@@ -879,8 +925,11 @@ def project_blockers(
     integration_lock: dict[str, object],
     agent_diagnostics: tuple[str, ...] = (),
     supervisor: SupervisorStatus | None = None,
+    project_binding: ResolvedProjectBinding | None = None,
 ) -> list[str]:
     blockers: list[str] = []
+    if project_binding is not None:
+        blockers.extend(item.code for item in project_binding.diagnostics)
     if supervisor is not None and supervisor.blocker:
         blockers.append(supervisor.blocker)
     if not git_status.available:
@@ -1143,6 +1192,14 @@ def start_detached_autopilot(
             blocker=f"detached_autopilot_unsupported_platform:{sys.platform}",
         )
 
+    binding = resolve_project_binding(config)
+    if binding.blocker is not None:
+        return DetachedAutopilotLaunch(
+            repo=config.repo,
+            started=False,
+            blocker=binding.blocker,
+        )
+
     lock_manager = build_lock_manager(
         config.repo,
         config.state_path / "locks",
@@ -1180,7 +1237,8 @@ def start_detached_autopilot(
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     child_environment, context_file = runtime_context_subprocess_transport(
-        config.runtime_context
+        config.runtime_context,
+        bound_names=config.project_binding.require,
     )
     pass_fds = (context_file.fileno(),) if context_file is not None else ()
     try:
@@ -1996,10 +2054,17 @@ def stop_verified_detached_autopilot(
 
 def runtime_context_subprocess_transport(
     runtime_context: tuple[tuple[str, str], ...],
+    *,
+    bound_names: Sequence[str] = (),
 ) -> tuple[dict[str, str], BinaryIO | None]:
     environment = os.environ.copy()
     environment.pop(AUTOPILOT_RUNTIME_CONTEXT_FD_ENV, None)
     for name, _value in runtime_context:
+        environment.pop(name, None)
+    # A declared binding is re-resolved by the child from repository config or
+    # the transported context; dropping the ambient copy keeps a stale shell
+    # export from reaching adapters if that resolution ever changes.
+    for name in bound_names:
         environment.pop(name, None)
     if not runtime_context:
         return environment, None
@@ -2075,6 +2140,7 @@ def launch_run_until_done(
     log_path: Path,
     on_start: Callable[[int], None] | None = None,
     runtime_context: tuple[tuple[str, str], ...] = (),
+    bound_names: Sequence[str] = (),
 ) -> int:
     """Run ``run-until-done`` as a child process, streaming output to a log.
 
@@ -2088,7 +2154,8 @@ def launch_run_until_done(
     if hasattr(os, "setsid"):
         popen_kwargs["start_new_session"] = True
     child_environment, context_file = runtime_context_subprocess_transport(
-        runtime_context
+        runtime_context,
+        bound_names=bound_names,
     )
     if context_file is not None:
         popen_kwargs["pass_fds"] = (context_file.fileno(),)
@@ -3807,6 +3874,16 @@ def run_autopilot(
     """
     min_ready = require_positive_min_ready(min_ready)
 
+    supervisor_run_id = new_run_id("autopilot")
+    binding = resolve_project_binding(config)
+    if binding.blocker is not None:
+        return AutopilotRunSummary(
+            repo=config.repo,
+            run_id=supervisor_run_id,
+            started=False,
+            blocker=binding.blocker,
+        )
+
     process_checker = process_exists if process_exists is not None else pid_exists
     sleeper = sleep if sleep is not None else time_module.sleep
     if launcher is None:
@@ -3824,6 +3901,7 @@ def run_autopilot(
                 log_path=log_path,
                 on_start=on_start,
                 runtime_context=config.runtime_context,
+                bound_names=config.project_binding.require,
             )
 
     else:
@@ -3835,7 +3913,6 @@ def run_autopilot(
         config.locks,
         runtime_context=config.runtime_environment,
     )
-    supervisor_run_id = new_run_id("autopilot")
 
     signal_stack = ExitStack()
 
@@ -4132,7 +4209,7 @@ def iso_after(seconds: float) -> str:
 
 
 PROJECT_REGISTRY_SCHEMA_VERSION = 1
-RUNTIME_CONTEXT_REDACTION = "<runtime-context-redacted>"
+PROJECT_BINDING_PRESERVED_KEYS = ("project_binding",)
 
 
 def default_registry_path() -> Path:
@@ -4157,16 +4234,41 @@ def redact_runtime_context_text(
 def redact_runtime_context_payload(
     value: object,
     runtime_context: tuple[tuple[str, str], ...],
+    *,
+    preserve_keys: tuple[str, ...] = PROJECT_BINDING_PRESERVED_KEYS,
 ) -> object:
+    """Redact runtime-context values from a payload.
+
+    ``preserve_keys`` names subtrees that are left untouched. The resolved
+    project binding is one: it reports validated namespace selectors, which
+    are precisely the routing fact an operator needs, and value redaction
+    would otherwise erase it wherever a binding came from registry context.
+    """
+
     if isinstance(value, str):
         return redact_runtime_context_text(value, runtime_context)
     if isinstance(value, dict):
         return {
-            key: redact_runtime_context_payload(item, runtime_context)
+            key: (
+                item
+                if key in preserve_keys
+                else redact_runtime_context_payload(
+                    item,
+                    runtime_context,
+                    preserve_keys=preserve_keys,
+                )
+            )
             for key, item in value.items()
         }
     if isinstance(value, (list, tuple)):
-        return [redact_runtime_context_payload(item, runtime_context) for item in value]
+        return [
+            redact_runtime_context_payload(
+                item,
+                runtime_context,
+                preserve_keys=preserve_keys,
+            )
+            for item in value
+        ]
     return value
 
 

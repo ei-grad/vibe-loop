@@ -57,6 +57,17 @@ instruction or session end.
 
 Before launching, confirm:
 
+- for a command-backed task source or lock adapter, the repository's project
+  namespace is bound in configuration, not exported into your shell. Check
+  `vibe-loop autopilot status --json` and read `project_binding`: each required
+  selector must appear under `resolved` with the value you expect. Never rely on
+  `export LOOPYARD_PROJECT=...` to route a supervisor — an unset or wrong export
+  silently binds this repository to another project's board and locks. If the
+  repo declares `[project_binding] require` and the value is unpinned,
+  `autopilot run/start` refuses with `project_binding_unset:<NAME>`,
+  `project_binding_ambient_only:<NAME>`, or `project_binding_conflict:<NAME>`;
+  fix the repository config or the registry entry rather than exporting the
+  variable.
 - `main` is clean.
 - `vibe-loop doctor` reports no stale task or integration locks blocking
   selection.
