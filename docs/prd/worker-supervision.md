@@ -50,10 +50,17 @@ the lock, so a command lock backend that mirrors run provenance finalizes the
 run from the supervisor's own conclusion rather than inferring one at release.
 Classifications that do not settle the run, such as `timed_out` and
 `limit_wall`, publish `unknown`; so does any exit that never reached
-classification. Publishing must precede the lock release and must not depend on
-the enclosing `run-until-done` process, whose next dispatch or idle transition
-would otherwise race it. A backend failure while publishing is reported but
-never masks the recorded `run_result`.
+classification. Finalization must not depend on the enclosing `run-until-done`
+process, whose next dispatch or idle transition would otherwise race it.
+
+The settled outcome and the lock release form one finalization boundary. The
+release operation itself carries the settled outcome, so releasing the lock and
+finalizing external provenance cannot disagree: there is no ordering in which
+the lock is given up while the external run stays `unknown` even though the
+supervisor settled on `completed`. The supervisor additionally publishes the
+outcome into the live lock before release for the benefit of status readers;
+that publish is advisory, and a backend failure there is reported without
+changing what the release finalizes or masking the recorded `run_result`.
 
 Related implementation IDs: `PAR-03`, `PAR-05`.
 

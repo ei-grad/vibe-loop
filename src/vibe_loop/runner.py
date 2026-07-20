@@ -1114,13 +1114,13 @@ class VibeRunner:
             )
 
         def publish_settled_outcome() -> None:
-            # Runs while this supervisor still owns the task lock, so a lock
-            # backend that mirrors run provenance sees the settled outcome
-            # before the release that finalizes the run there. Releasing first
-            # would leave the backend to infer an outcome it cannot know, and
-            # deferring to the enclosing run-until-done child's exit would race
-            # the next dispatch. Best effort: the authoritative RunResult is
-            # already durable, so a backend hiccup must not mask it.
+            # Publishes the settled outcome to observers of the live lock while
+            # this supervisor still owns it, so a status reader between
+            # classification and release sees the same conclusion. Deferring to
+            # the enclosing run-until-done child's exit would race the next
+            # dispatch. This publish is advisory: the release below carries the
+            # settled outcome itself, so a backend hiccup here changes neither
+            # the durable RunResult nor what the backend finalizes on.
             nonlocal active_state
             # Same guard the observation callbacks use: a reader thread that
             # outlives the streaming call would otherwise replace active_state
@@ -1520,7 +1520,11 @@ class VibeRunner:
             return result
         finally:
             publish_settled_outcome()
-            self.lock_manager.release(task_lock)
+            self.lock_manager.release(
+                task_lock,
+                settled_outcome=settled_outcome,
+                settled_classification=settled_classification,
+            )
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
                     LOCK_RELEASED_RECORD_TYPE,

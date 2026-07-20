@@ -209,14 +209,26 @@ class LockManager:
             preserve_runtime_lock_fields(metadata, current.metadata),
         )
 
-    def release(self, task_lock: TaskLock) -> None:
-        self.release_with_timeout(task_lock)
+    def release(
+        self,
+        task_lock: TaskLock,
+        *,
+        settled_outcome: str | None = None,
+        settled_classification: str | None = None,
+    ) -> None:
+        self.release_with_timeout(
+            task_lock,
+            settled_outcome=settled_outcome,
+            settled_classification=settled_classification,
+        )
 
     def release_with_timeout(
         self,
         task_lock: TaskLock,
         *,
         timeout_seconds: float | None = None,
+        settled_outcome: str | None = None,
+        settled_classification: str | None = None,
     ) -> None:
         deadline = command_deadline(timeout_seconds)
         current = self._backend_status(task_lock.task_id, timeout_seconds)
@@ -232,6 +244,17 @@ class LockManager:
             current,
             path=current_path,
         )
+        # The release call is the operation a provenance-mirroring backend
+        # finalizes the run on, so the caller's settled outcome travels with it
+        # rather than depending on an earlier update having landed. Without
+        # this, a failed pre-release publish still released cleanly and left the
+        # external run finalized as unknown while the local RunResult said
+        # completed. Local backends ignore the extra metadata.
+        if settled_outcome:
+            current = dict(current)
+            current["outcome"] = settled_outcome
+            if settled_classification:
+                current["classification"] = settled_classification
         current_lock = TaskLock(
             task_id=task_lock.task_id,
             path=current_path,

@@ -4716,10 +4716,16 @@ class RecordingLockManager(LockManager):
         self.events.append(("update", dict(metadata)))
         return super().update(task_lock, metadata)
 
-    def release(self, task_lock) -> None:
+    def release(self, task_lock, **kwargs) -> None:
         task_id = str(task_lock.metadata.get("task_id") or "")
-        self.events.append(("release", dict(self.status(task_id) or {})))
-        super().release(task_lock)
+        observed = dict(self.status(task_id) or {})
+        # A backend finalizes on what the release call hands it, which includes
+        # the settled outcome the caller carries even if the live lock row never
+        # received it.
+        if kwargs.get("settled_outcome"):
+            observed["outcome"] = kwargs["settled_outcome"]
+        self.events.append(("release", observed))
+        super().release(task_lock, **kwargs)
 
     def outcome_at_release(self, task_id: str) -> str:
         for kind, metadata in self.events:
@@ -5120,6 +5126,178 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             release_index = operations.index("release")
             self.assertLess(last_update, release_index)
             self.assertEqual(calls[last_update]["metadata"].get("outcome"), "completed")
+
+    def _provenance_adapter(self, root: Path) -> str:
+        """A command lock adapter that mirrors run provenance, as Loopyard does.
+
+        It opens an external run at acquire, keeps the lock row it was last
+        handed, and finalizes the run's outcome at release from what the release
+        call gives it, falling back to the stored row. An outcome it never
+        receives stays ``unknown`` - which is exactly the reproduced defect.
+        """
+
+        adapter = root / "provenance_adapter.py"
+        adapter.write_text(
+            "import json, os, pathlib, sys\n"
+            "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
+            "task_id = os.environ['VIBE_LOOP_LOCK_TASK_ID']\n"
+            "run_id = os.environ['VIBE_LOOP_LOCK_RUN_ID']\n"
+            "metadata = json.loads(os.environ['VIBE_LOOP_LOCK_METADATA_JSON'])\n"
+            "root = pathlib.Path(sys.argv[1])\n"
+            "root.mkdir(parents=True, exist_ok=True)\n"
+            "held_path = root / (task_id + '.held.json')\n"
+            "runs_path = root / 'runs.json'\n"
+            "runs = json.loads(runs_path.read_text()) if runs_path.exists() else {}\n"
+            "held = json.loads(held_path.read_text()) if held_path.exists() else None\n"
+            "if operation == 'list':\n"
+            "    locks = [json.loads(p.read_text())\n"
+            "             for p in sorted(root.glob('*.held.json'))]\n"
+            "    print(json.dumps({'locks': locks}))\n"
+            "elif operation == 'status':\n"
+            "    print(json.dumps({'locked': bool(held), 'metadata': held or {}}))\n"
+            "elif operation == 'release':\n"
+            "    outcome = (metadata.get('outcome')\n"
+            "               or (held or {}).get('outcome') or 'unknown')\n"
+            "    record = runs.get(run_id) or {'task_id': task_id}\n"
+            "    record['outcome'] = outcome\n"
+            "    runs[run_id] = record\n"
+            "    runs_path.write_text(json.dumps(runs))\n"
+            "    held_path.unlink(missing_ok=True)\n"
+            "    print(json.dumps({'released': True}))\n"
+            "else:\n"
+            "    runs.setdefault(run_id, {'task_id': task_id, 'outcome': 'unknown'})\n"
+            "    runs_path.write_text(json.dumps(runs))\n"
+            "    held_path.write_text(json.dumps(metadata))\n"
+            "    print(json.dumps({'acquired': True, 'metadata': metadata}))\n"
+        )
+        return f"{sys.executable} {adapter} {root / 'state'}"
+
+    @staticmethod
+    def _external_outcomes(root: Path) -> dict[str, str]:
+        runs_path = root / "state" / "runs.json"
+        if not runs_path.exists():
+            return {}
+        records = json.loads(runs_path.read_text())
+        return {
+            str(record["task_id"]): str(record["outcome"])
+            for record in records.values()
+        }
+
+    def _attach_provenance_backend(self, runner: VibeRunner, root: Path) -> None:
+        command = self._provenance_adapter(root)
+        runner._lock_manager = LockManager(
+            runner.config.state_path / "locks",
+            backend=locks_module.CommandLockBackend(
+                repo=root,
+                lock_root=runner.config.state_path / "locks",
+                acquire_command=command,
+                release_command=command,
+                status_command=command,
+                list_command=command,
+            ),
+        )
+
+    def test_command_backend_finalizes_completed_across_next_dispatch(self) -> None:
+        first = Task(task_id="T-1", title="First", status="Next", agent="worker")
+        second = Task(task_id="T-2", title="Second", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, source = self._build_runner(
+                directory,
+                [first, second],
+                {
+                    task_id: Task(task_id=task_id, title=task_id, status="Done")
+                    for task_id in ("T-1", "T-2")
+                },
+            )
+            self._attach_provenance_backend(runner, root)
+            reporting = self._reporting_worker(runner, "completed")
+
+            def fake_run(command, cwd, log, **kwargs):
+                source.mark_dispatched((kwargs.get("env") or {})["VIBE_LOOP_TASK_ID"])
+                return reporting(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        results = runner.run_until_done(continue_on_failure=True)
+
+            self.assertEqual(
+                [result.classification for result in results[:2]],
+                ["completed", "completed"],
+            )
+            # The external provenance store - not the command text - is the
+            # evidence: dispatching the next task must not leave the finished
+            # run finalized as unknown.
+            self.assertEqual(
+                self._external_outcomes(root),
+                {"T-1": "completed", "T-2": "completed"},
+            )
+
+    def test_command_backend_finalizes_completed_when_cycle_goes_idle(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, source = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            reporting = self._reporting_worker(runner, "completed")
+
+            def fake_run(command, cwd, log, **kwargs):
+                source.mark_dispatched((kwargs.get("env") or {})["VIBE_LOOP_TASK_ID"])
+                return reporting(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        results = runner.run_until_done(continue_on_failure=True)
+
+            self.assertEqual(results[0].classification, "completed")
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    def test_command_backend_finalizes_completed_when_publish_fails(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            lock_manager = runner.lock_manager
+            original_update = lock_manager.update
+
+            def failing_update(task_lock, metadata):
+                # The pre-release publish is the fragile step; it must not be
+                # the only path by which the backend learns the outcome.
+                if "outcome" in metadata:
+                    raise LockBusy(task_lock.path, {"reason": "backend unavailable"})
+                return original_update(task_lock, metadata)
+
+            lock_manager.update = failing_update
+
+            result = self._run_task(
+                runner, task, self._reporting_worker(runner, "completed")
+            )
+
+            self.assertEqual(result.classification, "completed")
+            # A publish failure followed by a clean release is precisely the
+            # state that produced completed-locally / unknown-externally.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    def test_command_backend_keeps_unsettled_runs_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": None})
+            self._attach_provenance_backend(runner, root)
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "completed", report=False),
+            )
+
+            self.assertNotEqual(result.classification, "completed")
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
 
 
 class SettledRunOutcomeTests(unittest.TestCase):
