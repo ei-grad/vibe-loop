@@ -31,16 +31,21 @@ text-only final summary and tear down; structured tool calls, child-process
 launches, filesystem or task mutations, review launches, and unbounded reasoning
 past that boundary are a policy violation. On observing such activity the
 supervisor records a `post_report_activity` lifecycle event and conservatively
-stops the exact worker process group after verifying, by process-birth ID, that
-the live PID is still the worker it launched — never by broad process killing,
-and never touching a recycled or unrelated group. The already accepted report
-stays authoritative: enforced teardown neither downgrades a completed result to
-unknown nor creates a retry, and finalization/next-task dispatch still waits for
-the worker process to exit. Post-report elapsed time and attributable provider
-usage are recorded separately from the useful implementation/review spend so
-quota diagnostics can isolate teardown burn. The wrapper stays compatible with
-Codex JSON and Claude stream-json, including a worker that exits immediately
-after reporting and one that emits a short final text summary.
+stops the exact worker process group. This enforcement is fail-closed: it
+signals only on a positive process-birth-ID match confirming the live PID is
+still the worker it launched, and stands down when identity cannot be verified
+rather than risk a recycled or unrelated group — never by broad process killing.
+The already accepted report — the first terminal report the supervisor observed
+— stays authoritative: enforced teardown neither downgrades a completed result to
+unknown nor creates a retry, a later contradicting report cannot override it, and
+finalization/next-task dispatch still waits for the worker process to exit.
+Post-report elapsed time and attributable provider usage are recorded separately
+from the useful implementation/review spend so quota diagnostics can isolate
+teardown burn; because provider usage events carry cumulative totals, the
+attributable post-report usage is the delta from the cumulative snapshot taken at
+the boundary, not the raw event. The wrapper stays compatible with Codex JSON and
+Claude stream-json, including a worker that exits immediately after reporting and
+one that emits a short final text summary.
 
 Related implementation IDs: `PAR-01`, `PAR-03`, `PAR-05`.
 

@@ -4777,10 +4777,16 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         self.assertTrue(snapshot.enforced_stop)
         self.assertTrue(snapshot.identity_verified)
 
-    def test_post_report_usage_accrues_only_after_report(self) -> None:
+    def test_post_report_usage_reports_only_teardown_delta(self) -> None:
+        # Provider result/turn events carry cumulative totals. The useful
+        # implementation spend before the report must not be attributed to the
+        # post-report teardown; only the delta from the boundary snapshot is.
         monitor = PostReportActivityMonitor("anthropic")
         pre = json.dumps(
-            {"type": "result", "usage": {"input_tokens": 5, "output_tokens": 1}}
+            {
+                "type": "result",
+                "usage": {"input_tokens": 100000, "output_tokens": 800},
+            }
         )
         monitor.observe_line(pre)
         self.assertFalse(monitor.snapshot().usage.available)
@@ -4789,13 +4795,31 @@ class PostReportActivityMonitorTests(unittest.TestCase):
             json.dumps(
                 {
                     "type": "result",
-                    "usage": {"input_tokens": 435000, "output_tokens": 900},
+                    "usage": {"input_tokens": 100100, "output_tokens": 900},
                 }
             )
         )
         usage = monitor.snapshot().usage
         self.assertTrue(usage.available)
-        self.assertEqual(usage.values["input_tokens"], 435000)
+        # Only the 100 input / 100 output tokens spent after the boundary.
+        self.assertEqual(usage.values["input_tokens"], 100)
+        self.assertEqual(usage.values["output_tokens"], 100)
+
+    def test_post_report_usage_empty_when_no_additional_spend(self) -> None:
+        # A cumulative event repeated after the report with no new spend must
+        # not re-attribute the whole run as teardown burn.
+        monitor = PostReportActivityMonitor("anthropic")
+        event = json.dumps(
+            {
+                "type": "result",
+                "usage": {"input_tokens": 100000, "output_tokens": 800},
+            }
+        )
+        monitor.observe_line(event)
+        monitor.mark_report_observed()
+        monitor.observe_line(event)
+        usage = monitor.snapshot().usage
+        self.assertFalse(usage.available)
 
 
 class FakePostReportMonitor:
@@ -4860,6 +4884,35 @@ class PostReportWatchdogTests(unittest.TestCase):
                 poll_seconds=0.001,
                 post_report_monitor=monitor,
                 identity_ok=lambda: False,
+                post_report_activity_grace_seconds=0.0,
+            )
+        self.assertEqual(killed, [])
+        self.assertFalse(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_post_report_enforcement_is_fail_closed_without_verified_identity(self):
+        # Post-report teardown must NOT signal when birth identity cannot be
+        # positively verified, even though the lenient hang/timeout guard would
+        # (identity_ok True). This is the fail-closed guarantee: an unverifiable
+        # PID may name a recycled, unrelated group.
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        monitor = FakePostReportMonitor(violates=True)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                post_report_monitor=monitor,
+                identity_ok=lambda: True,
+                identity_verified_ok=lambda: False,
                 post_report_activity_grace_seconds=0.0,
             )
         self.assertEqual(killed, [])
@@ -5873,6 +5926,55 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # The backend that finalizes external run provenance at release
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_first_accepted_report_survives_a_later_differing_report(self) -> None:
+        # A worker that files ``completed``, has that report accepted (observed
+        # by the watchdog), then files a second ``failed`` report before teardown
+        # must still finalize from the first accepted report.
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+
+            def fake_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                run_id = env["VIBE_LOOP_RUN_ID"]
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status="completed",
+                        message="completed via worker report",
+                    )
+                )
+                # The supervisor accepts the first report here.
+                reap_check = kwargs.get("reap_check")
+                if reap_check is not None:
+                    self.assertTrue(reap_check())
+                # A misbehaving worker then files a contradicting report.
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status="failed",
+                        message="spurious later report",
+                    )
+                )
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            result = self._run_task(runner, task, fake_run)
+
+            self.assertEqual(result.classification, "completed")
+            self.assertEqual(
+                runner.run_store.latest_worker_report(result.run_id).status,
+                "failed",
+            )
 
     def test_settled_outcome_published_before_next_dispatch(self) -> None:
         first = Task(task_id="T-1", title="First", status="Next", agent="worker")

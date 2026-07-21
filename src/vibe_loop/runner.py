@@ -807,15 +807,47 @@ class PostReportActivity:
         return bool(self.activity_kind)
 
 
+def _post_report_usage_delta(
+    baseline: Mapping[str, int | float], final: ProviderUsage
+) -> ProviderUsage:
+    """Attribute only the usage a worker accrued after its terminal report.
+
+    Provider ``result``/``turn.completed`` usage events carry cumulative
+    run/turn totals, so the raw post-boundary event still includes every token
+    spent on the useful implementation/review before the report. Subtracting the
+    cumulative snapshot captured at the boundary yields the teardown-only burn.
+    Non-positive fields are dropped (a per-turn, non-cumulative event can leave a
+    field unchanged or lower), so an empty delta means no additional post-report
+    spend was attributable.
+    """
+    if not final.available:
+        return final
+    delta: dict[str, int | float] = {}
+    for key, value in final.values.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        base = baseline.get(key, 0)
+        base_num = (
+            base if isinstance(base, (int, float)) and not isinstance(base, bool) else 0
+        )
+        diff = value - base_num
+        if diff > 0:
+            delta[key] = diff
+    return dataclasses.replace(final, values=delta, raw=delta)
+
+
 class PostReportActivityMonitor:
     """Attributes a worker's post-terminal-report stream output.
 
-    The monitor is inert until ``mark_report_observed`` fires. From that point
-    every stream line is post-report teardown: its provider usage accrues
-    separately so quota diagnostics can distinguish teardown burn from useful
-    implementation/review, and any structured tool/child activity is recorded as
-    a policy violation. Thread-safe: stream threads call ``observe_line`` while
-    the supervision watchdog marks the boundary and reads ``violation``.
+    Usage is observed across the whole stream so a cumulative snapshot is
+    available at the boundary; the monitor stays inert for activity/violation
+    accounting until ``mark_report_observed`` fires. From that point every stream
+    line is post-report teardown: any structured tool/child activity is recorded
+    as a policy violation, and the teardown-only provider usage (the delta from
+    the boundary snapshot) is reported separately so quota diagnostics can
+    distinguish teardown burn from useful implementation/review. Thread-safe:
+    stream threads call ``observe_line`` while the supervision watchdog marks the
+    boundary and reads ``violation``.
     """
 
     def __init__(
@@ -829,13 +861,19 @@ class PostReportActivityMonitor:
         self._lock = threading.Lock()
         self._reported_at: float | None = None
         self._usage_observer = ProviderUsageObserver(provider)
+        self._baseline_usage_values: dict[str, int | float] = {}
         self._activity_kind = ""
         self._activity_count = 0
 
     def mark_report_observed(self, at: float | None = None) -> None:
+        # Snapshot cumulative usage-so-far outside the monitor lock (the usage
+        # observer holds its own) so the post-report delta excludes the useful
+        # pre-report spend.
+        baseline = dict(self._usage_observer.usage.values)
         with self._lock:
             if self._reported_at is None:
                 self._reported_at = at if at is not None else self._monotonic()
+                self._baseline_usage_values = baseline
 
     @property
     def reported(self) -> bool:
@@ -843,13 +881,14 @@ class PostReportActivityMonitor:
             return self._reported_at is not None
 
     def observe_line(self, line: str) -> None:
+        # Usage accrues over the whole run so the boundary snapshot is accurate;
+        # the observer holds its own lock, so call it outside the monitor lock to
+        # keep a single, consistent lock order.
+        self._usage_observer.observe_line(line)
         with self._lock:
             active = self._reported_at is not None
         if not active:
             return
-        # The usage observer holds its own lock; call it outside the monitor
-        # lock to keep a single, consistent lock order.
-        self._usage_observer.observe_line(line)
         kind = classify_post_report_activity(line)
         if not kind:
             return
@@ -870,21 +909,30 @@ class PostReportActivityMonitor:
         identity_verified: bool = False,
         until: float | None = None,
     ) -> PostReportActivity:
+        final_usage = self._usage_observer.usage
         with self._lock:
             reported = self._reported_at is not None
+            baseline = dict(self._baseline_usage_values)
+            activity_kind = self._activity_kind
+            activity_count = self._activity_count
             seconds = 0.0
             if reported:
                 end = until if until is not None else self._monotonic()
                 seconds = max(0.0, end - self._reported_at)
-            return PostReportActivity(
-                reported=reported,
-                seconds=seconds,
-                activity_kind=self._activity_kind,
-                activity_count=self._activity_count,
-                enforced_stop=enforced_stop,
-                identity_verified=identity_verified,
-                usage=self._usage_observer.usage,
-            )
+        usage = (
+            _post_report_usage_delta(baseline, final_usage)
+            if reported
+            else unavailable_usage(self._provider, "post_report_boundary_not_reached")
+        )
+        return PostReportActivity(
+            reported=reported,
+            seconds=seconds,
+            activity_kind=activity_kind,
+            activity_count=activity_count,
+            enforced_stop=enforced_stop,
+            identity_verified=identity_verified,
+            usage=usage,
+        )
 
 
 class VibeRunner:
@@ -1405,6 +1453,10 @@ class VibeRunner:
         agent_skill_ref_prefix = agent.skill_ref_prefix or ""
         agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
+        # The first terminal report the supervisor observes is the accepted one;
+        # capturing it keeps classification authoritative even if a misbehaving
+        # worker files a second, differing report before post-report teardown.
+        first_accepted_report: WorkerReport | None = None
         worker_pid_value: int | None = None
         worker_process_group_id: int | None = None
         worker_timed_out = False
@@ -1844,11 +1896,14 @@ class VibeRunner:
                     # step and intends to exit; if it then hangs (e.g. held by
                     # orphaned background children) the watchdog reaps it so the
                     # slot and task lock are released instead of wedging for
-                    # hours.
-                    return (
-                        self.run_store.latest_worker_report(run_id, task.task_id)
-                        is not None
-                    )
+                    # hours. The first report seen here is the accepted terminal
+                    # report; latch it so a later differing report cannot
+                    # override the classification.
+                    nonlocal first_accepted_report
+                    report = self.run_store.latest_worker_report(run_id, task.task_id)
+                    if report is not None and first_accepted_report is None:
+                        first_accepted_report = report
+                    return report is not None
 
                 stage_machine.transition(
                     RunStage.IMPLEMENTING,
@@ -1982,9 +2037,15 @@ class VibeRunner:
                 report_status(f"session_id_source={session_id_source}", log)
                 if transcript_path:
                     report_status(f"transcript={transcript_path}", log)
-                worker_report = self.run_store.latest_worker_report(
-                    run_id,
-                    task.task_id,
+                # Prefer the first report the watchdog accepted; only fall back
+                # to a disk read when the worker exited before any poll observed
+                # one (e.g. an immediate post-report exit).
+                worker_report = (
+                    first_accepted_report
+                    or self.run_store.latest_worker_report(
+                        run_id,
+                        task.task_id,
+                    )
                 )
                 if worker_report is not None:
                     report_status(
@@ -5521,6 +5582,7 @@ def wait_with_reap_watchdog(
     monotonic: Callable[[], float] = time.monotonic,
     post_report_monitor: PostReportActivityMonitor | None = None,
     identity_ok: Callable[[], bool] | None = None,
+    identity_verified_ok: Callable[[], bool] | None = None,
     post_report_activity_grace_seconds: float = 0.0,
 ) -> WaitOutcome:
     """Wait for a worker, reaping it if it hangs or overruns its report.
@@ -5546,10 +5608,18 @@ def wait_with_reap_watchdog(
       set. This bounds the quota a worker burns by continuing to act past its
       accepted terminal report while leaving that report authoritative.
 
-    ``identity_ok`` gates every signal: it must confirm the live PID is still the
-    worker this supervisor launched (by process-birth ID) before the group is
-    touched, so a recycled PID's unrelated group is never signalled. When it is
-    ``None`` the historical unconditional reap is preserved.
+    Identity gating differs by path. ``identity_ok`` guards the historical
+    hang/timeout reaps: it confirms the live PID is still the worker this
+    supervisor launched (by process-birth ID), but when birth identity is
+    unavailable (non-Linux, or an unreadable ``/proc``) it cannot prove a
+    mismatch and preserves the historical unconditional reap so a genuinely hung
+    worker is still released; ``None`` disables the guard entirely. The new
+    post-report enforcement path instead uses ``identity_verified_ok`` and is
+    fail-closed: it stops the group only on a positive birth-ID match, so when
+    identity cannot be verified it stands down rather than risk signalling a
+    recycled, unrelated group -- the accepted report is already authoritative, so
+    declining to enforce is safe. When ``identity_verified_ok`` is ``None`` it
+    falls back to ``identity_ok``.
 
     ``monotonic`` is injectable so tests can drive the deadline with a fake
     clock instead of a real wall-clock sleep.
@@ -5567,6 +5637,18 @@ def wait_with_reap_watchdog(
             return identity_ok()
         # An unreadable identity is not proof the group is ours: fail closed and
         # do not signal rather than risk an unrelated process group.
+        except Exception:
+            return False
+
+    def _identity_verified_for_enforcement() -> bool:
+        gate = identity_verified_ok or identity_ok
+        if gate is None:
+            return True
+        try:
+            return gate()
+        # Post-report enforcement is fail-closed: an unverifiable identity must
+        # not signal a possibly-recycled, unrelated group. The accepted report
+        # already stands, so standing down is the safe choice.
         except Exception:
             return False
 
@@ -5624,14 +5706,15 @@ def wait_with_reap_watchdog(
                     "process group to bound post-report quota burn",
                     log,
                 )
-                if _identity_permits_signal():
+                if _identity_verified_for_enforcement():
                     terminate_worker_process_group(process, log)
                     return WaitOutcome(process.wait(), post_report_enforced=True)
-                # The live PID is no longer our worker (it exited on its own);
-                # the accepted report stands and no group is signalled.
+                # Identity could not be positively verified: the live PID may be
+                # a recycled, unrelated group, so enforcement stands down. The
+                # accepted report is already authoritative.
                 report_status(
-                    f"worker pid={process.pid} no longer matches its recorded "
-                    "process identity; not signalling",
+                    f"worker pid={process.pid} process identity not verified; "
+                    "not signalling post-report teardown",
                     log,
                 )
                 return WaitOutcome(process.wait())
@@ -5733,9 +5816,19 @@ def run_streaming_command(
 
     def identity_ok() -> bool:
         # Non-Linux (or an unreadable birth ID) cannot prove a mismatch, so
-        # preserve the historical unconditional reap.
+        # preserve the historical unconditional reap for hang/timeout.
         if not expected_birth_id:
             return True
+        node = read_process_node(process.pid)
+        return node is not None and node.process_birth_id == expected_birth_id
+
+    def identity_verified() -> bool:
+        # Fail-closed gate for post-report enforcement: only a positive
+        # birth-ID match authorizes stopping the group. A missing birth ID is
+        # not a match, so enforcement stands down rather than risk an unrelated,
+        # recycled process group.
+        if not expected_birth_id:
+            return False
         node = read_process_node(process.pid)
         return node is not None and node.process_birth_id == expected_birth_id
 
@@ -5782,6 +5875,7 @@ def run_streaming_command(
         timeout_seconds=timeout_seconds,
         post_report_monitor=post_report_monitor,
         identity_ok=identity_ok,
+        identity_verified_ok=identity_verified,
         post_report_activity_grace_seconds=post_report_activity_grace_seconds,
     )
     stdout_thread.join()
