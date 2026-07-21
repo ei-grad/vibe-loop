@@ -65,8 +65,15 @@ those surfaces to higher-level PRDs, requirements, and task artifacts.
 
 ## Architecture Decisions
 
-- `vibe-loop` is a supervisor, not a branch/worktree manager. Worker agents own
-  branch/worktree setup, implementation, review, and repo-approved integration.
+- `vibe-loop run` owns the complete bounded task lifecycle deterministically:
+  workspace provisioning, implementation launch, gates, review routing,
+  remediation budgets, integration, task provenance, and recovery are runtime
+  transitions, while model sessions propose work and mutate lifecycle state
+  only through explicit fenced runtime commands
+  (`docs/prd/run-orchestration.md`). The legacy worker-owned mode — worker
+  agents owning branch/worktree setup, review, and repo-approved integration
+  with the runtime as a thin supervisor — remains a supported compatibility
+  mode during the staged migration.
 - Task discovery is explicit-first. User-authored config and command adapters
   win over generated parser profiles.
 - Generated task-source profiles are non-executable descriptions over bounded

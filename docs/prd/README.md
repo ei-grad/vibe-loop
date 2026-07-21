@@ -34,6 +34,7 @@ plan IDs stable when adding PRD coverage.
 | `PRD-EVL-*` | `evals-release.md` | Local skill eval suites, artifact schema, aggregate reporting, external benchmark adapters, and release gates. |
 | `PRD-SDE-*` | `spec-driven-execution.md` | Execution-engine support for spec-driven workflows, task-layer adapters, traceability, gates, drift checks, worker context, and completion evidence. |
 | `PRD-AUT-*` | `autopilot.md` | Persistent autopilot supervision, reusable status core, append-only cycle records, future multi-project management, and status-boundary readiness. _(In-tree TUI/WebUI removed; dashboards now in loopyard.)_ |
+| `PRD-ORC-*` | `run-orchestration.md` | Deterministic runtime-owned task lifecycle inside `vibe-loop run`: run contracts, workspace pre-provisioning, runtime gates, reviewer routing/continuation, findings ledger, integration and task provenance, stage-typed quotas, and worker-owned-mode migration. |
 
 Plan rows should cite PRD IDs in `Scope`, `Acceptance`, or `Evidence` when a
 slice implements or changes a contract. A single plan row may satisfy multiple
