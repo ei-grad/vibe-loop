@@ -31,15 +31,20 @@ classification, finalization) with legal-transition enforcement; typed failure
 transitions (`limit_wall`, `timed_out`, `stage_failed`, `blocked`,
 `cancelled`) from every stage; journal-ahead recording so every transition is
 derivable after process death; rejection of lifecycle mutations attempted
-through model output text; and a per-transition ownership map naming the
+through model output text; a journaled task-source settlement step with a
+named owner for every post-activation failure transition, so a task moved out
+of the runnable set by activation can never be stranded in-progress by a
+failure that releases the lock; and a per-transition ownership map naming the
 responsible component for every state mutation and external process launch.
 
 Related implementation IDs: `ORC-03` (`orc-lifecycle-state-machine`).
 
 ## PRD-ORC-002 Resolved Run Contract
 
-Each supervised run must resolve a versioned run contract before any workspace
-or repository mutation and record it durably. The contract carries: mode,
+Each supervised run must resolve a versioned run contract after task-lock
+acquisition and before task-source activation — activation is the first
+authoritative task-status mutation, so the contract must be durable before it
+— and therefore before any workspace or repository mutation. The contract carries: mode,
 implementer and reviewer routes (provider/model/effort/command identity),
 gate list as typed references to allowlisted configured commands, review and
 remediation budgets, integration and task-provenance settings, and the
@@ -123,10 +128,15 @@ Related implementation IDs: `ORC-06`
 
 Findings must persist as durable ledger records (stable id, severity, summary,
 evidence, files, state) owned by the runtime. Review passes are budgeted: at
-most the contract's initial passes plus targeted-closure passes per stable
-candidate, with closure passes rechecking recorded findings rather than
-re-reviewing from scratch. A materially changed candidate may reset the budget
-only through an explicit journaled decision. Reviewer concurrency is bounded
+most the contract's initial passes plus targeted-closure passes per candidate
+lineage, with closure passes rechecking recorded findings rather than
+re-reviewing from scratch. Budget decisions use mechanical input only — the
+candidate fingerprint (head commit plus changed paths) recorded with each
+verdict; the runtime never resets a budget autonomously and no implementer or
+reviewer output can. Exhaustion parks the run as a typed review-budget
+failure with the ledger preserved; the only reset is a new dispatch with a
+fresh contract, journaled as scheduler or operator action. Reviewer
+concurrency is bounded
 separately from implementation jobs; `jobs=1` still means one implementation
 task per project. Status surfaces whether a task is implementing, reviewing,
 remediating, or integrating.
@@ -144,11 +154,16 @@ Related implementation IDs: `ORC-06`
 The final refresh, verification, fast-forward merge, and main verification
 must be executed by the runtime inside the advisory main-integration lock
 window, honoring the existing `PRD-WRK-007` lock semantics and the
-no-commit `branch_already_merged` no-op case. Task-source completion must be
-performed through an explicit `task_source.complete` adapter when configured,
-after successful integration and before the terminal report; when the adapter
-is not configured, completion provenance remains external and is recorded as
-such. Ordering is invariant and recoverable: review verdict before
+no-commit `branch_already_merged` no-op case. In runtime-owned mode the
+contract must declare a completion path and contract validation fails closed
+before any mutation when none is available: either the runtime performs the
+transition through an explicit `task_source.complete` adapter under the held
+lock, or the contract declares external-confirmed completion and the runtime
+confirms the authoritative done state by probing the task source before
+recording provenance and reporting completed — a probe still showing the task
+in progress parks the run blocked with the integrated candidate preserved.
+Completion is never silently delegated back to prose. Ordering is invariant
+and recoverable: review verdict before
 integration, integration before provenance, provenance before the completed
 report, durable local result before external settlement (`PRD-WRK-003`
 unchanged).
@@ -217,7 +232,11 @@ Related implementation IDs: `ORC-10` (`orc-scheduler-separation`).
 
 An explicit `[orchestration] mode` selects worker-owned (initial default) or
 runtime-owned orchestration; the active mode and contract are recorded per
-run. Migration proceeds in independently shippable phases that never silently
+run, and a run may never record a mode it does not execute — while the
+runtime-owned path is incomplete, selecting it fails closed with an
+actionable not-yet-available diagnostic instead of silently executing the
+worker-owned lifecycle. Migration proceeds in independently shippable phases
+that never silently
 weaken repository review policy: a repository-mandated reviewer becomes an
 enforced runtime route before the prose that mandated it is relaxed. New
 journal record types are additive; existing readers tolerate them; runs

@@ -127,7 +127,8 @@ reconstructable after process death at any boundary.
 stateDiagram-v2
     [*] --> scheduled
     scheduled --> lock_acquired
-    lock_acquired --> activated
+    lock_acquired --> contract_resolved : validate + record run contract
+    contract_resolved --> activated
     activated --> workspace_ready : provision/adopt + runtime claim
     workspace_ready --> implementing : launch implementer
     implementing --> candidate_ready : exit + candidate collection
@@ -159,6 +160,20 @@ Failure transitions exist from every stage and are typed, not collapsed:
   fenced release, workspace preserved.
 - `crashed` — no event written; derived on resume from the journal prefix.
 
+Every post-activation failure transition includes a journaled task-source
+settlement step with a named owner: activation moved the task out of the
+runnable set, so a failure that releases the task lock without settling the
+task source would strand the task in-progress forever. `TaskSourceSettler`
+(new; generalizes the scheduler's `_reset_task_source_status` /
+`task_source.reset` hook into the `run` lifecycle) invokes the configured
+reset hook under the held lock for `limit_wall`, `timed_out`, `cancelled`,
+and non-terminal `stage_failed` outcomes, and records the settlement (or its
+absence, when no hook is configured) before the lock is released. Terminal
+`failed`/`blocked` outcomes leave the task-source state to its authoritative
+owner exactly as today, with the settlement record stating so. Recovery
+re-runs an unconfirmed settlement after a crash between the hook and its
+record.
+
 Recovery: `run` (or the scheduler's unknown-run recovery) resumes from the
 last journaled stage instead of restarting the whole lifecycle from scratch.
 A crash between an effect and its confirmation event resolves by
@@ -185,7 +200,8 @@ stage records) unless noted; existing components keep their current homes.
 | Findings-ledger persistence and verdict validation | `ReviewRouter` + `RunStore` |
 | Remediation/closure budgets | orchestration state machine |
 | Integration lock, merge, ff, main verification | `Integrator` (new; uses `LockManager.acquire_main_integration_with_wait`) |
-| Task-source completion transition | `TaskSourceCompleter` (new; `task_source.complete` adapter) |
+| Task-source completion transition | `TaskSourceCompleter` (new; `task_source.complete` adapter or probe-confirmed external completion) |
+| Post-activation failure task-source settlement | `TaskSourceSettler` (new; moves the scheduler's `task_source.reset` invocation into the `run` lifecycle) |
 | Classification, durable result, settlement | `VibeRunner.classify` / `record_result` / `settle_outcome_and_release` (existing) |
 | Unknown-run recovery driver | `VibeRunner.drive_unknown_recovery` (existing, extended to stage-aware resume) |
 
@@ -203,8 +219,11 @@ unknown-type tolerance, no secrets/fencing tokens, no raw command strings).
 New record types:
 
 - `run_contract_resolved` — the resolved contract (below) with source
-  identities and digest; appended after activation and before any workspace
-  or repository mutation.
+  identities and digest; appended after the task lock is acquired and before
+  task-source activation. Activation is itself an authoritative task-status
+  mutation, so the contract must be durable first: a crash between the two
+  recovers with the contract that governs the activated task already on
+  record.
 - `workspace_provisioned` — mode (`created` | `adopted` | `preserved`),
   branch, worktree path, base commit, prior-state evidence for adoption;
   the runtime-authored `workspace_claim` follows it.
@@ -230,7 +249,7 @@ New record types:
 Ordered invariants (each later item requires the durable record of every
 earlier one; recovery re-derives position from this order):
 
-1. lock acquired → 2. activation confirmed → 3. contract resolved →
+1. lock acquired → 2. contract resolved → 3. activation confirmed →
 4. workspace provisioned + claimed → 5. implementer launched →
 6. candidate recorded → 7. gates passed → 8. review verdict recorded →
 9. integration result → 10. task provenance committed →
@@ -256,7 +275,7 @@ recorded as `run_contract_resolved` before any mutation:
                "max_initial_passes": 1, "max_closure_passes": 2, "concurrency_budget": 1},
   "gates": [{"id": "tests", "command_key": "completion.commands[1]"}],
   "integration": {"enabled": true, "verify_on_main": ["..."]},
-  "task_provenance": {"complete_adapter": "task_source.complete"},
+  "task_provenance": {"mode": "adapter | external-confirmed", "complete_adapter": "task_source.complete"},
   "remediation": {"max_rounds": 2}
 }
 ```
@@ -326,10 +345,15 @@ implementation retries.
   transcript is gone, the runtime records `continuation_fallback` with the
   reason and passes the prior findings ledger and session artifacts as
   explicit context instead — the fallback is recorded, never silent.
-- Budgets are runtime-enforced: at most the contract's initial passes plus
-  closure passes per stable candidate; a materially changed candidate (new
-  commits beyond remediation of recorded findings) may reset the budget only
-  through an explicit journaled decision.
+- Budgets are runtime-enforced from mechanical input only: the candidate
+  fingerprint (head commit plus changed-path set) recorded with each verdict.
+  Any candidate change enters remediation and consumes the remaining closure
+  budget; the runtime never resets a budget autonomously, and no implementer
+  or reviewer output can. When the budget is exhausted without closure, the
+  run parks as `stage_failed(review_budget_exhausted)` with the findings
+  ledger preserved. The only reset mechanism is a new dispatch — a fresh
+  `run` with a fresh contract — which requires scheduler or operator action
+  and is journaled as such.
 - Status (`workers`, `runs inspect`, autopilot status) exposes whether a task
   is implementing, reviewing, remediating, or integrating, with per-stage
   timestamps derived from `stage_transition` records.
@@ -435,6 +459,12 @@ Config: `[orchestration] mode = "worker-owned" | "runtime-owned"`, default
 per run, so mixed histories stay interpretable. Generated profiles cannot set
 orchestration keys (same rule as other executable-adjacent config).
 
+Mode availability is staged: a run may never record a mode it does not
+execute. ORC-02 parses and records the key but rejects
+`mode = "runtime-owned"` with an actionable not-yet-available diagnostic;
+the value becomes accepted only when the slice completing the runtime-owned
+path (ORC-10) lands. Until then the only accepted value is the default.
+
 Phases (each independently shippable; worker-owned mode keeps working
 throughout, and no repository review policy is silently weakened — a repo's
 mandated reviewer becomes an enforced route before the prose that mandated it
@@ -464,9 +494,18 @@ Compatibility specifics:
   an explicit recorded fallback until the CLI supports it.
 - **Command-backed Loopyard tasks:** `task_source.activate` already exists;
   a new optional `task_source.complete` adapter lets the runtime own the
-  done-transition. Without it, completion stays worker-owned (or manual) and
-  the runtime records that provenance was external — mirroring activation's
-  introduction.
+  done-transition. In runtime-owned mode the contract must declare one of two
+  completion paths, and contract validation fails closed before any mutation
+  when neither is available: `adapter` (the runtime invokes
+  `task_source.complete` under the held lock) or `external-confirmed` (an
+  authorized external actor — worker step, human, or tracker automation —
+  performs the transition, and the runtime confirms the authoritative done
+  state by probing the task source before recording
+  `task_provenance_committed` and reporting completed; a probe that still
+  shows the task in progress parks the run `blocked` with the integrated
+  candidate preserved and a precise diagnostic). Completion is never silently
+  delegated back to prose. Worker-owned mode keeps today's behavior
+  unchanged.
 - **Existing run journals:** all new types are additive; existing readers
   ignore them; `derive_run_lifecycle` gains stages only for runs that
   recorded them.
