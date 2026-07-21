@@ -847,11 +847,16 @@ def test_quota_forecast_normalizes_only_bounded_reset_jitter() -> None:
         ("account-a", 1785760857),
         ("account-b", 1785156057),
         ("decrease", 1785156057),
+        ("duplicate-reset", 1785156057),
     }
     decrease = forecasts[("decrease", 1785156057)]
     assert decrease["first_observed_at"] == "2026-07-21T11:00:00+00:00"
     assert decrease["last_observed_at"] == "2026-07-21T12:00:00+00:00"
     assert decrease["burn_rate_percent_per_hour"] == 3
+    duplicate_reset = forecasts[("duplicate-reset", 1785156057)]
+    assert duplicate_reset["first_observed_at"] == "2026-07-21T10:00:00+00:00"
+    assert duplicate_reset["last_observed_at"] == "2026-07-21T11:00:00+00:00"
+    assert duplicate_reset["burn_rate_percent_per_hour"] == 91
     assert all(item["scope"] != "malformed" for item in openai["snapshots"])
 
     anthropic = providers["anthropic"]

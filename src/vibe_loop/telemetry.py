@@ -1022,24 +1022,25 @@ def _quota_forecasts(snapshots: list[dict[str, object]]) -> list[dict[str, objec
                 reset_clusters[-1][1].append(candidate)
 
         for normalized_reset_at, candidates in reset_clusters:
-            # A duplicate provider timestamp has no ordering signal. Prefer the
-            # highest usage, then reset second, so input order cannot alter a forecast.
-            distinct_by_time: dict[str, dict[str, object]] = {}
+            candidates_by_time: dict[str, list[dict[str, object]]] = defaultdict(list)
             for candidate in candidates:
-                observed_at = str(candidate["observed_at"])
-                prior = distinct_by_time.get(observed_at)
-                if prior is None or (
-                    float(candidate["used_percent"]),
-                    int(candidate["resets_at"]),
-                ) > (
-                    float(prior["used_percent"]),
-                    int(prior["resets_at"]),
-                ):
-                    distinct_by_time[observed_at] = candidate
-            distinct = [distinct_by_time[item] for item in sorted(distinct_by_time)]
+                candidates_by_time[str(candidate["observed_at"])].append(candidate)
 
             current_window: list[dict[str, object]] = []
-            for candidate in distinct:
+            for observed_at in sorted(candidates_by_time):
+                same_time = candidates_by_time[observed_at]
+                usages = {float(item["used_percent"]) for item in same_time}
+                # Unequal usage at one timestamp has no reliable order. Treat the
+                # lowest value as the post-reset baseline instead of risking a bridge.
+                if len(usages) > 1:
+                    current_window = []
+                candidate = min(
+                    same_time,
+                    key=lambda item: (
+                        float(item["used_percent"]),
+                        -int(item["resets_at"]),
+                    ),
+                )
                 if current_window and float(candidate["used_percent"]) < float(
                     current_window[-1]["used_percent"]
                 ):
