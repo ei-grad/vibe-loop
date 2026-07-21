@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import shlex
@@ -840,6 +841,53 @@ def git_status_lines(
     ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[str]:
     return git_lines(repo, *git_status_args(repo, ignored_dirty_paths))
+
+
+def git_dirty_snapshot(
+    repo: Path,
+    *,
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> tuple[list[str], str]:
+    status = git_status_lines(repo, ignored_dirty_paths=ignored_dirty_paths)
+    excludes = git_status_exclude_pathspecs(repo, ignored_dirty_paths)
+    scope = ("--", ".", *excludes)
+    evidence: list[str] = ["status", *status]
+    for label, args in (
+        ("worktree", ("diff", "--binary", "--no-ext-diff", *scope)),
+        ("index", ("diff", "--cached", "--binary", "--no-ext-diff", *scope)),
+    ):
+        result = run_git(repo, *args)
+        if result.returncode != 0:
+            raise WorkspaceClaimError(
+                "git_state_unavailable",
+                "workspace dirty snapshot could not be read",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+        evidence.extend((label, result.stdout))
+    untracked = run_git(
+        repo,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+        *scope,
+    )
+    if untracked.returncode != 0:
+        raise WorkspaceClaimError(
+            "git_state_unavailable",
+            "workspace untracked files could not be read",
+            details={"stderr": untracked.stderr.strip()},
+        )
+    for relative in sorted(path for path in untracked.stdout.split("\0") if path):
+        evidence.extend(
+            (
+                "untracked",
+                relative,
+                git_text(repo, "hash-object", "--no-filters", "--", relative),
+            )
+        )
+    digest = hashlib.sha256("\0".join(evidence).encode()).hexdigest()
+    return status, digest
 
 
 def git_status_args(repo: Path, ignored_dirty_paths: Iterable[Path]) -> tuple[str, ...]:

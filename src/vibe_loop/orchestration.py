@@ -2837,6 +2837,11 @@ class WorkspaceProvisioner:
         recovery_run_id: str = "",
         recovery_branch: str = "",
         recovery_worktree: Path | None = None,
+        recovery_git_common_dir: Path | None = None,
+        recovery_base_commit: str = "",
+        recovery_head_commit: str = "",
+        recovery_dirty_snapshot: Sequence[str] | None = None,
+        recovery_dirty_fingerprint: str = "",
     ) -> ProvisionedWorkspace:
         from vibe_loop.runs import RunLifecycleEvent
         from vibe_loop.workers import claim_worker_workspace
@@ -2854,6 +2859,11 @@ class WorkspaceProvisioner:
             worktree=worktree,
             base_commit=base_commit,
             recovery_run_id=recovery_run_id,
+            recovery_git_common_dir=recovery_git_common_dir,
+            recovery_base_commit=recovery_base_commit,
+            recovery_head_commit=recovery_head_commit,
+            recovery_dirty_snapshot=recovery_dirty_snapshot,
+            recovery_dirty_fingerprint=recovery_dirty_fingerprint,
         )
         try:
             self.run_store.append_lifecycle_event(
@@ -3004,8 +3014,13 @@ class WorkspaceProvisioner:
         worktree: Path,
         base_commit: str,
         recovery_run_id: str,
+        recovery_git_common_dir: Path | None,
+        recovery_base_commit: str,
+        recovery_head_commit: str,
+        recovery_dirty_snapshot: Sequence[str] | None,
+        recovery_dirty_fingerprint: str,
     ) -> ProvisionedWorkspace:
-        from vibe_loop.workers import build_workspace_git_context, git_status_lines
+        from vibe_loop.workers import build_workspace_git_context, git_dirty_snapshot
 
         if branch == self.main_branch or worktree == self.repo:
             raise WorkspaceProvisionError(
@@ -3122,6 +3137,37 @@ class WorkspaceProvisioner:
                 "existing workspace ownership record has no base commit",
                 details={"owner_run_id": str(owner.get("run_id") or "")},
             )
+        if recovery_base_commit and owner_base != recovery_base_commit:
+            raise WorkspaceProvisionError(
+                "recovery_base_changed",
+                "recovery workspace base no longer matches the pending intent",
+                details={
+                    "expected_base": recovery_base_commit,
+                    "actual_base": owner_base,
+                },
+            )
+        if recovery_head_commit and head != recovery_head_commit:
+            raise WorkspaceProvisionError(
+                "recovery_head_changed",
+                "recovery workspace HEAD moved after the pending intent was recorded",
+                details={
+                    "expected_head": recovery_head_commit,
+                    "actual_head": head,
+                },
+            )
+        if recovery_git_common_dir is not None:
+            actual_common_dir = self._git_common_dir_at(worktree)
+            if actual_common_dir != recovery_git_common_dir.resolve():
+                raise WorkspaceProvisionError(
+                    "recovery_git_common_dir_changed",
+                    "recovery workspace belongs to a different git repository",
+                    details={
+                        "expected_git_common_dir": str(
+                            recovery_git_common_dir.resolve()
+                        ),
+                        "actual_git_common_dir": str(actual_common_dir),
+                    },
+                )
         if (
             self._git_returncode_at(
                 worktree,
@@ -3154,10 +3200,33 @@ class WorkspaceProvisioner:
                     "selected_base": base_commit,
                 },
             )
-        dirty = git_status_lines(
+        dirty, dirty_fingerprint = git_dirty_snapshot(
             worktree,
             ignored_dirty_paths=self.ignored_dirty_paths,
         )
+        if recovery_dirty_snapshot is not None and tuple(dirty) != tuple(
+            recovery_dirty_snapshot
+        ):
+            raise WorkspaceProvisionError(
+                "recovery_dirty_snapshot_changed",
+                "recovery workspace dirt changed after the pending intent was recorded",
+                details={
+                    "expected_dirty_summary": list(recovery_dirty_snapshot)[:20],
+                    "actual_dirty_summary": dirty[:20],
+                },
+            )
+        if (
+            recovery_dirty_fingerprint
+            and dirty_fingerprint != recovery_dirty_fingerprint
+        ):
+            raise WorkspaceProvisionError(
+                "recovery_dirty_content_changed",
+                "recovery workspace content changed after the pending intent",
+                details={
+                    "expected_dirty_fingerprint": recovery_dirty_fingerprint,
+                    "actual_dirty_fingerprint": dirty_fingerprint,
+                },
+            )
         if dirty and not recovery_run_id:
             raise WorkspaceProvisionError(
                 "dirty_existing_workspace",
@@ -3342,6 +3411,12 @@ class WorkspaceProvisioner:
                 details={"git_args": list(args), "stderr": result.stderr.strip()},
             )
         return result.stdout.strip()
+
+    def _git_common_dir_at(self, worktree: Path) -> Path:
+        raw = Path(self._git_text_at(worktree, "rev-parse", "--git-common-dir"))
+        if not raw.is_absolute():
+            raw = worktree / raw
+        return raw.resolve()
 
     def _git_returncode(self, *args: str) -> int:
         return self._git_returncode_at(self.repo, *args)

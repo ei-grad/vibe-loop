@@ -39,6 +39,7 @@ from vibe_loop.locks import (
     SettledOutcomeNotPersisted,
 )
 from vibe_loop.processes import read_process_node
+from vibe_loop.orchestration import WorkspaceProvisionError
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
@@ -3444,8 +3445,8 @@ class TransientWorkerFailureTests(unittest.TestCase):
             record for record in records if record.get("record_type") == "task_recovery"
         ]
         phases = [record["phase"] for record in recovery_records]
-        self.assertEqual(phases, ["launched", "outcome"])
-        self.assertEqual(recovery_records[1]["outcome"], "completed")
+        self.assertEqual(phases, ["pending", "launched", "outcome"])
+        self.assertEqual(recovery_records[2]["outcome"], "completed")
         restart_records = [
             record
             for record in records
@@ -3558,7 +3559,47 @@ class TransientWorkerFailureTests(unittest.TestCase):
 
     def test_recover_unknown_run_carries_workspace_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Tester"], cwd=repo, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "tester@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            worktree = Path(directory) / "auto-01"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "auto-01-branch", str(worktree)],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             runner = VibeRunner(
                 VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
             )
@@ -3575,8 +3616,9 @@ class TransientWorkerFailureTests(unittest.TestCase):
                     "task_id": "TASK-01",
                     "run_id": "run-1",
                     "branch": "auto-01-branch",
-                    "worktree": "/tmp/auto-01",
-                    "head_commit": "deadbeef",
+                    "worktree": str(worktree),
+                    "base_commit": base,
+                    "head_commit": base,
                 }
             )
             captured: list[RecoveryContext | None] = []
@@ -3615,8 +3657,10 @@ class TransientWorkerFailureTests(unittest.TestCase):
         assert recovery is not None
         self.assertTrue(recovery.workspace_claimed)
         self.assertEqual(recovery.branch, "auto-01-branch")
-        self.assertEqual(recovery.worktree, str(Path("/tmp/auto-01")))
-        self.assertEqual(recovery.head_commit, "deadbeef")
+        self.assertEqual(recovery.worktree, str(worktree))
+        self.assertEqual(recovery.head_commit, base)
+        self.assertEqual(recovery.base_commit, base)
+        self.assertTrue(recovery.git_common_dir)
         self.assertEqual(recovery.transcript_path, "/tmp/transcript.jsonl")
         self.assertEqual(recovery.wrapper_log, str(log_path))
 
@@ -3741,7 +3785,15 @@ class TransientWorkerFailureTests(unittest.TestCase):
             if record.get("record_type") == "task_recovery"
             and record.get("phase") == "launched"
         ]
-        self.assertEqual(len(launched), 1)
+        self.assertEqual(launched, [])
+        deferred = [
+            record
+            for record in records
+            if record.get("record_type") == "task_recovery"
+            and record.get("phase") == "deferred"
+        ]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]["attempt"], 1)
         outcomes = [
             record
             for record in records
@@ -3749,6 +3801,254 @@ class TransientWorkerFailureTests(unittest.TestCase):
             and record.get("phase") == "outcome"
         ]
         self.assertEqual(outcomes, [])
+
+    def test_pending_recovery_survives_prelaunch_failure_and_supervisor_restart(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            log_path = repo / "run-1.log"
+            log_path.write_text("parked\n", encoding="utf-8")
+            transcript_path = repo / "session.jsonl"
+            transcript_path.write_text("{}\n", encoding="utf-8")
+            task = Task(task_id="TASK-01", title="Task 1", status="Next", order=1)
+            first = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            first._source = MutableTaskSource([task])
+
+            def blocked_before_launch(
+                task: Task,
+                *,
+                recovery: RecoveryContext | None = None,
+            ) -> RunResult:
+                raise WorkspaceProvisionError(
+                    "dirty_primary_worktree",
+                    "primary worktree is temporarily dirty",
+                )
+
+            first.run_task = blocked_before_launch
+            prior = RunResult(
+                run_id="run-1",
+                task_id=task.task_id,
+                classification="unknown",
+                exit_code=0,
+                log_path=log_path,
+                start_main="aaa",
+                end_main="aaa",
+                session_id="session-1",
+                session_id_source="observed",
+                transcript_path=str(transcript_path),
+            )
+
+            self.assertIsNone(
+                first.recover_unknown_run(prior, attempt=1, max_attempts=3)
+            )
+            records_after_block = first.run_store.read_records()
+            self.assertEqual(len(first.run_store.pending_recovery_records()), 1)
+            self.assertFalse(
+                any(
+                    record.get("record_type") == "task_restart"
+                    for record in records_after_block
+                )
+            )
+
+            second = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            source = MutableTaskSource([task])
+            second._source = source
+            captured: list[RecoveryContext] = []
+
+            def complete_recovery(
+                task: Task,
+                *,
+                recovery: RecoveryContext | None = None,
+            ) -> RunResult:
+                assert recovery is not None
+                captured.append(recovery)
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-2",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            second.run_task = complete_recovery
+            results = second.run_until_done_serial()
+
+            self.assertEqual(
+                [result.classification for result in results], ["completed"]
+            )
+            self.assertEqual(captured[0].attempt, 1)
+            self.assertEqual(captured[0].prior_session_id, "session-1")
+            self.assertEqual(second.run_store.pending_recovery_records(), [])
+            restart_records = [
+                record
+                for record in second.run_store.read_records()
+                if record.get("record_type") == "task_restart"
+            ]
+            self.assertEqual(len(restart_records), 1)
+            self.assertEqual(restart_records[0]["restart_count"], 1)
+
+    def test_crash_after_worker_launch_advances_and_refreshes_recovery_intent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init", "-b", "main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Tester"], cwd=repo, check=True
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "tester@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "baseline"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            worktree = root / "task-worktree"
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "task/TASK-01", str(worktree)],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            (worktree / "preserved.txt").write_text("work\n", encoding="utf-8")
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            first_intent = {
+                "task_id": "TASK-01",
+                "prior_run_id": "run-1",
+                "prior_classification": "unknown",
+                "attempt": 1,
+                "max_attempts": 3,
+                "workspace_claimed": True,
+                "dirty_snapshot": [],
+            }
+            runner.run_store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="unknown",
+                    exit_code=0,
+                    log_path=root / "run-1.log",
+                    start_main=base,
+                    end_main=base,
+                    recovery_intent=first_intent,
+                )
+            )
+            runner.run_store.append_record(
+                {
+                    "record_type": "workspace_claim",
+                    "event_type": "workspace_claimed",
+                    "task_id": "TASK-01",
+                    "run_id": "run-2",
+                    "branch": "task/TASK-01",
+                    "worktree": str(worktree),
+                    "base_commit": base,
+                    "head_commit": base,
+                    "dirty": True,
+                    "dirty_summary": ["?? preserved.txt"],
+                }
+            )
+            runner.run_store.append_lifecycle_event(
+                runner_module.RunLifecycleEvent.worker_process_started(
+                    run_id="run-2",
+                    task_id="TASK-01",
+                    worker_pid=123,
+                    supervisor_pid=12,
+                    process_group_id=123,
+                    session_id=123,
+                    process_birth_id="birth",
+                    host="host",
+                    recovery_payload=first_intent,
+                )
+            )
+
+            contexts = runner.pending_recovery_contexts()
+
+            self.assertEqual(len(contexts), 1)
+            recovery = contexts[0]
+            self.assertEqual(recovery.prior_run_id, "run-2")
+            self.assertEqual(recovery.attempt, 2)
+            self.assertTrue(recovery.workspace_claimed)
+            self.assertIn("?? preserved.txt", recovery.dirty_snapshot)
+            self.assertTrue(recovery.dirty_fingerprint)
+            pending = runner.run_store.pending_recovery_records()
+            self.assertEqual(len(pending), 1)
+            self.assertNotIn("needs_identity_refresh", pending[0])
+
+    def test_crash_after_final_recovery_launch_exhausts_durable_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            runner.run_store.append_lifecycle_event(
+                runner_module.RunLifecycleEvent.worker_process_started(
+                    run_id="run-final",
+                    task_id="TASK-01",
+                    worker_pid=123,
+                    supervisor_pid=12,
+                    process_group_id=123,
+                    session_id=123,
+                    process_birth_id="birth",
+                    host="host",
+                    recovery_payload={
+                        "task_id": "TASK-01",
+                        "prior_run_id": "run-before-final",
+                        "prior_classification": "unknown",
+                        "attempt": 3,
+                        "max_attempts": 3,
+                        "workspace_claimed": False,
+                        "dirty_snapshot": [],
+                    },
+                )
+            )
+
+            contexts = runner.pending_recovery_contexts()
+
+            self.assertEqual(contexts, [])
+            self.assertEqual(runner._durably_exhausted_recovery_tasks, {"TASK-01"})
+            failed = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_result"
+            ]
+            self.assertEqual(len(failed), 1)
+            self.assertEqual(failed[0]["classification"], "failed")
+            self.assertEqual(
+                failed[0]["classification_source"], "recovery_budget_exhausted"
+            )
 
     def test_parallel_loop_recovers_unknown_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

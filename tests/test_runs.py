@@ -1122,6 +1122,124 @@ class RunStoreTests(unittest.TestCase):
     def test_task_recovery_record_type_is_known_and_lifecycle(self) -> None:
         self.assertIn(TASK_RECOVERY_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
+    def test_pending_recovery_is_durable_and_visible_in_run_status(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_recovery(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    phase="pending",
+                    prior_run_id="run-1",
+                    attempt=2,
+                    max_attempts=3,
+                    payload={
+                        "prior_classification": "unknown",
+                        "workspace_claimed": True,
+                        "dirty_snapshot": ["M staged.txt", "?? unstaged.txt"],
+                    },
+                )
+            )
+
+            pending = store.pending_recovery_records()
+            view = store.inspect_run("run-1")
+
+            self.assertEqual(len(pending), 1)
+            self.assertIsNotNone(view)
+            assert view is not None
+            payload = view.to_json()
+            self.assertTrue(payload["recovery_pending"])
+            self.assertEqual(payload["recovery_attempt"], 2)
+            self.assertEqual(payload["recovery_max_attempts"], 3)
+
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_recovery(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    phase="launched",
+                    prior_run_id="run-1",
+                    attempt=2,
+                    max_attempts=3,
+                )
+            )
+
+            self.assertEqual(store.pending_recovery_records(), [])
+            refreshed = store.inspect_run("run-1")
+            assert refreshed is not None
+            self.assertFalse(refreshed.to_json()["recovery_pending"])
+
+    def test_worker_launch_atomically_charges_embedded_recovery_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = RunStore(root / "runs.jsonl")
+            first_intent = {
+                "task_id": "TASK-01",
+                "prior_run_id": "run-1",
+                "prior_classification": "unknown",
+                "attempt": 1,
+                "max_attempts": 3,
+                "workspace_claimed": False,
+                "dirty_snapshot": [],
+            }
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="unknown",
+                    exit_code=0,
+                    log_path=root / "run-1.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                    recovery_intent=first_intent,
+                )
+            )
+            self.assertEqual(
+                store.pending_recovery_records()[0]["attempt"],
+                1,
+            )
+
+            store.append_lifecycle_event(
+                RunLifecycleEvent.worker_process_started(
+                    run_id="run-2",
+                    task_id="TASK-01",
+                    worker_pid=123,
+                    supervisor_pid=12,
+                    process_group_id=123,
+                    session_id=123,
+                    process_birth_id="birth",
+                    host="host",
+                    recovery_payload=first_intent,
+                )
+            )
+            launched_pending = store.pending_recovery_records()
+            self.assertEqual(len(launched_pending), 1)
+            self.assertEqual(launched_pending[0]["prior_run_id"], "run-2")
+            self.assertEqual(launched_pending[0]["attempt"], 2)
+            self.assertTrue(launched_pending[0]["needs_identity_refresh"])
+
+            second_intent = {
+                **first_intent,
+                "prior_run_id": "run-2",
+                "attempt": 2,
+            }
+            store.append_result(
+                RunResult(
+                    run_id="run-2",
+                    task_id="TASK-01",
+                    classification="unknown",
+                    exit_code=0,
+                    log_path=root / "run-2.log",
+                    start_main="aaa",
+                    end_main="aaa",
+                    recovery_intent=second_intent,
+                )
+            )
+
+            pending = store.pending_recovery_records()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["prior_run_id"], "run-2")
+            self.assertEqual(pending[0]["attempt"], 2)
+
     def test_list_runs_groups_records_by_run_and_uses_latest_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

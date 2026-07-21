@@ -22,6 +22,7 @@ ACTIONABLE_RUNTIME_EVENT_KINDS = frozenset(
         "provider_account_wall",
         "provider_quota_wall",
         "recovery_exhausted",
+        "recovery_pending",
         "supervisor_inconsistent",
     }
 )
@@ -298,6 +299,8 @@ def runtime_event_from_journal_record(
 
 def _journal_actionable_kind(record: Mapping[str, Any]) -> str | None:
     record_type = _string(record.get("record_type"))
+    if record_type == "run_result" and isinstance(record.get("recovery_intent"), dict):
+        return "recovery_pending"
     if record_type in ACTIONABLE_RUNTIME_EVENT_KINDS:
         if record_type.startswith("provider_") and record.get("verified") is not True:
             return None
@@ -309,6 +312,11 @@ def _journal_actionable_kind(record: Mapping[str, Any]) -> str | None:
         and record.get("exhausted") is True
     ):
         return "recovery_exhausted"
+    if record_type == "task_recovery" and record.get("phase") in {
+        "pending",
+        "deferred",
+    }:
+        return "recovery_pending"
     if (
         record_type == "autopilot_supervisor_observed"
         and record.get("observed_state") == "inconsistent"

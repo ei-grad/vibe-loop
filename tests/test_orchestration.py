@@ -61,7 +61,7 @@ from vibe_loop.runner import VibeRunner
 from vibe_loop.locks import LockManager
 from vibe_loop.runs import RunLifecycleEvent, RunStore, WorkerReport
 from vibe_loop.tasks import Task
-from vibe_loop.workers import claim_worker_workspace
+from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
 class OrchestrationConfigTests(unittest.TestCase):
@@ -2599,6 +2599,164 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(recovered.mode, "preserved")
             self.assertTrue(recovered.dirty_at_adoption)
             self.assertTrue((first.worktree / "uncommitted.txt").exists())
+
+    def test_recovery_accepts_matching_staged_and_unstaged_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            first = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            (first.worktree / "staged.txt").write_text("staged\n", encoding="utf-8")
+            git(first.worktree, "add", "staged.txt")
+            (first.worktree / "unstaged.txt").write_text("unstaged\n", encoding="utf-8")
+            snapshot_lines, dirty_fingerprint = git_dirty_snapshot(first.worktree)
+            snapshot = tuple(snapshot_lines)
+            common_dir = Path(
+                git(first.worktree, "rev-parse", "--git-common-dir").stdout.strip()
+            )
+            if not common_dir.is_absolute():
+                common_dir = first.worktree / common_dir
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            recovered = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=token,
+                recovery_run_id="run-1",
+                recovery_branch=first.branch,
+                recovery_worktree=first.worktree,
+                recovery_git_common_dir=common_dir.resolve(),
+                recovery_base_commit=base,
+                recovery_head_commit=base,
+                recovery_dirty_snapshot=snapshot,
+                recovery_dirty_fingerprint=dirty_fingerprint,
+            )
+
+            self.assertEqual(recovered.mode, "preserved")
+            self.assertTrue((first.worktree / "staged.txt").exists())
+            self.assertTrue((first.worktree / "unstaged.txt").exists())
+
+    def test_recovery_rejects_head_common_dir_and_dirty_snapshot_changes(self) -> None:
+        cases = (
+            ("head", "recovery_head_changed"),
+            ("common_dir", "recovery_git_common_dir_changed"),
+            ("dirty", "recovery_dirty_snapshot_changed"),
+            ("dirty_content", "recovery_dirty_content_changed"),
+        )
+        for mutation, expected_code in cases:
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory) / "repo"
+                    init_git_repo(repo)
+                    manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+                    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+                    first = WorkspaceProvisioner(
+                        repo=repo,
+                        main_branch="main",
+                        lock_manager=manager,
+                        run_store=store,
+                    ).provision(
+                        task_id="TASK-01",
+                        run_id="run-1",
+                        base_commit=base,
+                        fencing_token=token,
+                    )
+                    manager.release(manager.current_lock("TASK-01"))
+                    expected_head = base
+                    expected_snapshot: tuple[str, ...] = ()
+                    expected_fingerprint = git_dirty_snapshot(first.worktree)[1]
+                    raw_common = Path(
+                        git(
+                            first.worktree, "rev-parse", "--git-common-dir"
+                        ).stdout.strip()
+                    )
+                    expected_common = (
+                        raw_common
+                        if raw_common.is_absolute()
+                        else first.worktree / raw_common
+                    ).resolve()
+                    if mutation == "head":
+                        (first.worktree / "commit.txt").write_text(
+                            "moved\n", encoding="utf-8"
+                        )
+                        git(first.worktree, "add", "commit.txt")
+                        git(first.worktree, "commit", "-m", "move head")
+                    elif mutation == "common_dir":
+                        expected_common = Path(directory) / "different.git"
+                    elif mutation == "dirty":
+                        (first.worktree / "foreign.txt").write_text(
+                            "foreign\n", encoding="utf-8"
+                        )
+                    else:
+                        (first.worktree / "tracked.txt").write_text(
+                            "first\n", encoding="utf-8"
+                        )
+                        git(first.worktree, "add", "tracked.txt")
+                        (first.worktree / "README.md").write_text(
+                            "first unstaged\n", encoding="utf-8"
+                        )
+                        expected_snapshot, expected_fingerprint = git_dirty_snapshot(
+                            first.worktree
+                        )
+                        (first.worktree / "tracked.txt").write_text(
+                            "second\n", encoding="utf-8"
+                        )
+                        git(first.worktree, "add", "tracked.txt")
+                        (first.worktree / "README.md").write_text(
+                            "second unstaged\n", encoding="utf-8"
+                        )
+                    manager, _, token = acquire_run(
+                        repo,
+                        "TASK-01",
+                        "run-2",
+                        store=store,
+                    )
+
+                    with self.assertRaises(WorkspaceProvisionError) as raised:
+                        WorkspaceProvisioner(
+                            repo=repo,
+                            main_branch="main",
+                            lock_manager=manager,
+                            run_store=store,
+                        ).provision(
+                            task_id="TASK-01",
+                            run_id="run-2",
+                            base_commit=base,
+                            fencing_token=token,
+                            recovery_run_id="run-1",
+                            recovery_branch=first.branch,
+                            recovery_worktree=first.worktree,
+                            recovery_git_common_dir=expected_common,
+                            recovery_base_commit=base,
+                            recovery_head_commit=expected_head,
+                            recovery_dirty_snapshot=expected_snapshot,
+                            recovery_dirty_fingerprint=expected_fingerprint,
+                        )
+
+                    self.assertEqual(raised.exception.code, expected_code)
 
     def test_recovery_allows_main_to_advance_from_recorded_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

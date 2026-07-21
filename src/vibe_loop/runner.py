@@ -122,6 +122,7 @@ from vibe_loop.workers import (
     WorkspaceClaim,
     active_run_is_live,
     build_worker_views,
+    git_dirty_snapshot,
 )
 
 try:
@@ -1212,6 +1213,7 @@ class VibeRunner:
         # released its lock, keyed by run id and consumed by the recovery
         # driver so the verdict is written exactly once.
         self._exhausted_recovery_results: dict[str, RunResult] = {}
+        self._durably_exhausted_recovery_tasks: set[str] = set()
 
     @property
     def lock_manager(self) -> LockManager:
@@ -1913,6 +1915,23 @@ class VibeRunner:
                     if recovery is not None and recovery.worktree
                     else None
                 ),
+                recovery_git_common_dir=(
+                    Path(recovery.git_common_dir)
+                    if recovery is not None and recovery.git_common_dir
+                    else None
+                ),
+                recovery_base_commit=(
+                    recovery.base_commit if recovery is not None else ""
+                ),
+                recovery_head_commit=(
+                    recovery.head_commit if recovery is not None else ""
+                ),
+                recovery_dirty_snapshot=(
+                    recovery.dirty_snapshot if recovery is not None else None
+                ),
+                recovery_dirty_fingerprint=(
+                    recovery.dirty_fingerprint if recovery is not None else ""
+                ),
             )
             claimed_state = ActiveRunState.from_lock_metadata(
                 self.lock_manager.status(task.task_id) or {}
@@ -2237,6 +2256,11 @@ class VibeRunner:
                                 identity.process_birth_id if identity else ""
                             ),
                             host=active_state.host,
+                            recovery_payload=(
+                                recovery_context_payload(recovery)
+                                if recovery is not None
+                                else None
+                            ),
                         )
                     )
                     update_active_task_lock()
@@ -2588,6 +2612,21 @@ class VibeRunner:
                     post_report=post_report_stats,
                 ),
             )
+            if (
+                result.classification == "unknown"
+                and self.config.supervision.recover_unknown_runs
+            ):
+                recovery_attempt = 1 if recovery is None else recovery.attempt + 1
+                if recovery_attempt <= self.config.supervision.max_restarts:
+                    next_recovery = self.build_recovery_context(
+                        result,
+                        attempt=recovery_attempt,
+                        max_attempts=self.config.supervision.max_restarts,
+                    )
+                    result = dataclasses.replace(
+                        result,
+                        recovery_intent=recovery_context_payload(next_recovery),
+                    )
             self.record_result(result)
             # Only a durable local RunResult may be published externally. Until
             # the append succeeds there is nothing for provenance to agree with,
@@ -2917,6 +2956,81 @@ class VibeRunner:
                 }
             )
 
+    def pending_recovery_contexts(self) -> list[RecoveryContext]:
+        contexts: list[RecoveryContext] = []
+        for record in self.run_store.pending_recovery_records():
+            if record.get("charged_attempt_exhausted") is True:
+                task_id = str(record.get("task_id") or "")
+                run_id = str(record.get("prior_run_id") or "")
+                max_attempts = record.get("max_attempts")
+                if task_id and run_id and isinstance(max_attempts, int):
+                    exhausted = RunResult(
+                        run_id=run_id,
+                        task_id=task_id,
+                        classification="unknown",
+                        exit_code=1,
+                        log_path=Path(str(record.get("log") or "")),
+                        start_main="",
+                        end_main="",
+                    )
+                    self.record_recovery_budget_exhausted(
+                        exhausted,
+                        max_attempts,
+                    )
+                    self._durably_exhausted_recovery_tasks.add(task_id)
+                continue
+            context: RecoveryContext | None
+            if record.get("needs_identity_refresh") is True:
+                prior_run_id = record.get("prior_run_id")
+                task_id = record.get("task_id")
+                attempt = record.get("attempt")
+                max_attempts = record.get("max_attempts")
+                if (
+                    not isinstance(prior_run_id, str)
+                    or not prior_run_id
+                    or not isinstance(task_id, str)
+                    or not task_id
+                    or isinstance(attempt, bool)
+                    or not isinstance(attempt, int)
+                    or isinstance(max_attempts, bool)
+                    or not isinstance(max_attempts, int)
+                ):
+                    context = None
+                else:
+                    prior = RunResult(
+                        run_id=prior_run_id,
+                        task_id=task_id,
+                        classification="unknown",
+                        exit_code=0,
+                        log_path=Path(str(record.get("log") or "")),
+                        start_main="",
+                        end_main="",
+                        session_id=str(record.get("session_id") or ""),
+                        session_id_source=str(record.get("session_id_source") or ""),
+                        transcript_path=str(record.get("transcript_path") or ""),
+                    )
+                    context = self.build_recovery_context(
+                        prior,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                    if record.get("workspace_claimed") is True and not (
+                        context.workspace_claimed
+                    ):
+                        context = None
+                    else:
+                        self.record_recovery_phase(context, phase="pending")
+            else:
+                context = recovery_context_from_record(record)
+            if context is None:
+                report_status(
+                    "ignoring malformed durable recovery intent; manual inspection "
+                    "is required"
+                )
+                continue
+            contexts.append(context)
+        return contexts
+
     def run_until_done_serial(
         self,
         ask_agent: bool = False,
@@ -2936,6 +3050,44 @@ class VibeRunner:
         recovery_attempts: dict[str, int] = {}
         completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
+            pending_contexts = self.pending_recovery_contexts()
+            skipped.update(self._durably_exhausted_recovery_tasks)
+            pending = next(
+                (
+                    recovery
+                    for recovery in pending_contexts
+                    if recovery.task_id not in skipped | yielded
+                ),
+                None,
+            )
+            if pending is not None:
+                result = self.resume_pending_recovery(pending)
+                if result is None:
+                    skipped.add(pending.task_id)
+                    continue
+                recovery_attempts[pending.task_id] = pending.attempt
+                results.append(result)
+                if result.classification == "unknown":
+                    result = self.drive_unknown_recovery(
+                        result,
+                        attempts=recovery_attempts,
+                        results=results,
+                    )
+                if result.classification == "completed":
+                    transient_retries.pop(result.task_id, None)
+                    recovery_attempts.pop(result.task_id, None)
+                    yielded.add(result.task_id)
+                    completed_count += 1
+                    if max_tasks > 0 and completed_count >= max_tasks:
+                        break
+                    continue
+                skipped.add(result.task_id)
+                if not continue_on_failure and result.classification in {
+                    "failed",
+                    "unknown",
+                }:
+                    break
+                continue
             result = self.run_next(
                 ask_agent=ask_agent,
                 exclude=skipped | yielded,
@@ -3031,6 +3183,36 @@ class VibeRunner:
         command_validated = False
         announced = False
         stop_after_running = False
+
+        pending_contexts = self.pending_recovery_contexts()
+        skipped.update(self._durably_exhausted_recovery_tasks)
+        for recovery in pending_contexts:
+            if max_slices > 0 and len(results) >= max_slices:
+                break
+            result = self.resume_pending_recovery(recovery)
+            if result is None:
+                skipped.add(recovery.task_id)
+                continue
+            recovery_attempts[recovery.task_id] = recovery.attempt
+            results.append(result)
+            if result.classification == "unknown":
+                result = self.drive_unknown_recovery(
+                    result,
+                    attempts=recovery_attempts,
+                    results=results,
+                )
+            if result.classification == "completed":
+                completed_count += 1
+                recovery_attempts.pop(result.task_id, None)
+                if max_tasks > 0 and completed_count >= max_tasks:
+                    return results
+            else:
+                skipped.add(result.task_id)
+                if not continue_on_failure and result.classification in {
+                    "failed",
+                    "unknown",
+                }:
+                    return results
 
         with ThreadPoolExecutor(
             max_workers=jobs,
@@ -3416,7 +3598,6 @@ class VibeRunner:
                     f"{current.task_id} after {max_attempts} attempt(s)"
                 )
                 return terminal
-            attempts[current.task_id] = attempt
             recovered = self.recover_unknown_run(
                 current,
                 attempt=attempt,
@@ -3424,9 +3605,106 @@ class VibeRunner:
             )
             if recovered is None:
                 return current
+            attempts[current.task_id] = attempt
             results.append(recovered)
             current = recovered
         return current
+
+    def record_recovery_phase(
+        self,
+        recovery: RecoveryContext,
+        *,
+        phase: str,
+        recovery_run_id: str = "",
+        outcome: str = "",
+        blocker: str = "",
+    ) -> None:
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_recovery(
+                run_id=recovery.prior_run_id,
+                task_id=recovery.task_id,
+                phase=phase,
+                prior_run_id=recovery.prior_run_id,
+                attempt=recovery.attempt,
+                max_attempts=recovery.max_attempts,
+                branch=recovery.branch,
+                worktree=recovery.worktree,
+                transcript_path=recovery.transcript_path,
+                wrapper_log=recovery.wrapper_log,
+                outcome=outcome,
+                payload={
+                    **recovery_context_payload(recovery),
+                    "recovery_run_id": recovery_run_id,
+                    "blocker": blocker,
+                },
+            )
+        )
+
+    def recovery_phase_recorded(
+        self,
+        recovery: RecoveryContext,
+        phase: str,
+    ) -> bool:
+        for record in self.run_store.read_records():
+            if (
+                record.get("record_type") == "task_recovery"
+                and record.get("prior_run_id") == recovery.prior_run_id
+                and record.get("attempt") == recovery.attempt
+                and record.get("phase") == phase
+            ):
+                return True
+            launch = record.get("recovery_launch")
+            if (
+                phase == "launched"
+                and isinstance(launch, dict)
+                and launch.get("prior_run_id") == recovery.prior_run_id
+                and launch.get("attempt") == recovery.attempt
+            ):
+                return True
+        return False
+
+    def build_recovery_context(
+        self,
+        prior_result: RunResult,
+        *,
+        attempt: int,
+        max_attempts: int,
+    ) -> RecoveryContext:
+        claim_record = self.run_store.latest_workspace_claim_record(
+            prior_result.task_id,
+            prior_result.run_id,
+        )
+        claim = (
+            WorkspaceClaim.from_json(claim_record) if claim_record is not None else None
+        )
+        base_commit = ""
+        head_commit = ""
+        git_common_dir = ""
+        dirty_snapshot: tuple[str, ...] = ()
+        dirty_fingerprint = ""
+        if claim is not None:
+            base_commit = claim.base_commit
+            head_commit, git_common_dir, dirty_snapshot, dirty_fingerprint = (
+                capture_recovery_workspace_snapshot(claim)
+            )
+        return RecoveryContext(
+            task_id=prior_result.task_id,
+            prior_run_id=prior_result.run_id,
+            prior_classification=prior_result.classification,
+            branch=claim.branch if claim is not None else "",
+            worktree=str(claim.worktree.resolve()) if claim is not None else "",
+            head_commit=head_commit,
+            transcript_path=prior_result.transcript_path,
+            wrapper_log=str(prior_result.log_path),
+            attempt=attempt,
+            max_attempts=max_attempts,
+            workspace_claimed=claim is not None,
+            prior_session_id=resumable_prior_session_id(prior_result),
+            base_commit=base_commit,
+            git_common_dir=git_common_dir,
+            dirty_snapshot=dirty_snapshot,
+            dirty_fingerprint=dirty_fingerprint,
+        )
 
     def recover_unknown_run(
         self,
@@ -3435,8 +3713,33 @@ class VibeRunner:
         attempt: int,
         max_attempts: int,
     ) -> RunResult | None:
+        recovery = next(
+            (
+                context
+                for record in self.run_store.pending_recovery_records()
+                if (context := recovery_context_from_record(record)) is not None
+                and context.task_id == prior_result.task_id
+                and context.prior_run_id == prior_result.run_id
+                and context.attempt == attempt
+                and context.max_attempts == max_attempts
+            ),
+            None,
+        )
+        if recovery is None:
+            recovery = self.build_recovery_context(
+                prior_result,
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            self.record_recovery_phase(recovery, phase="pending")
+        return self.resume_pending_recovery(recovery)
+
+    def resume_pending_recovery(
+        self,
+        recovery: RecoveryContext,
+    ) -> RunResult | None:
         try:
-            task = self.source.probe(prior_result.task_id)
+            task = self.source.probe(recovery.task_id)
         except (subprocess.SubprocessError, OSError, ValueError) as exc:
             # The classification probe falls through to "unknown" on a probe
             # failure, which routes here; a command-backed probe that keeps
@@ -3445,88 +3748,98 @@ class VibeRunner:
             # skip below.
             report_status(
                 "unknown-run recovery skipped: task-source probe failed for "
-                f"{prior_result.task_id}: {exc}"
+                f"{recovery.task_id}: {exc}"
+            )
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="task_source_probe_failed",
             )
             return None
         if task is None:
             report_status(
                 "unknown-run recovery skipped: task "
-                f"{prior_result.task_id} no longer present in task source"
+                f"{recovery.task_id} no longer present in task source"
+            )
+            self.record_recovery_phase(
+                recovery,
+                phase="cancelled",
+                blocker="task_absent",
             )
             return None
-        claim_record = self.run_store.latest_workspace_claim_record(
-            prior_result.task_id,
-            prior_result.run_id,
-        )
-        claim = (
-            WorkspaceClaim.from_json(claim_record) if claim_record is not None else None
-        )
-        recovery = RecoveryContext(
-            task_id=prior_result.task_id,
-            prior_run_id=prior_result.run_id,
-            prior_classification=prior_result.classification,
-            branch=claim.branch if claim is not None else "",
-            worktree=str(claim.worktree) if claim is not None else "",
-            head_commit=claim.head_commit if claim is not None else "",
-            transcript_path=prior_result.transcript_path,
-            wrapper_log=str(prior_result.log_path),
-            attempt=attempt,
-            max_attempts=max_attempts,
-            workspace_claimed=claim is not None,
-            prior_session_id=resumable_prior_session_id(prior_result),
-        )
-        self.run_store.append_lifecycle_event(
-            RunLifecycleEvent.task_recovery(
-                run_id=prior_result.run_id,
-                task_id=prior_result.task_id,
-                phase="launched",
-                prior_run_id=prior_result.run_id,
-                attempt=attempt,
-                max_attempts=max_attempts,
-                branch=recovery.branch,
-                worktree=recovery.worktree,
-                transcript_path=recovery.transcript_path,
-                wrapper_log=recovery.wrapper_log,
-            )
-        )
         report_status(
-            f"launching unknown-run recovery for {prior_result.task_id} "
-            f"(attempt {attempt}/{max_attempts}, prior run {prior_result.run_id})"
+            f"launching unknown-run recovery for {recovery.task_id} "
+            f"(attempt {recovery.attempt}/{recovery.max_attempts}, "
+            f"prior run {recovery.prior_run_id})"
         )
         try:
             result = self.run_task(task, recovery=recovery)
         except AttemptCircuitOpen as exc:
             report_status(str(exc))
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="attempt_circuit_open",
+            )
             return None
         except LockBusy:
             report_status(
                 "unknown-run recovery deferred: task locked during acquire: "
-                f"{prior_result.task_id}"
+                f"{recovery.task_id}"
+            )
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="task_lock_busy",
             )
             return None
+        except WorkspaceProvisionError as exc:
+            report_status(
+                "unknown-run recovery deferred before worker launch: "
+                f"{recovery.task_id}: {exc.code}"
+            )
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker=exc.code,
+            )
+            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            report_status(
+                "unknown-run recovery deferred before worker launch: "
+                f"{recovery.task_id}: {type(exc).__name__}"
+            )
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="pre_launch_io_error",
+            )
+            return None
+        if not self.recovery_phase_recorded(recovery, "launched"):
+            self.record_recovery_phase(
+                recovery,
+                phase="launched",
+                recovery_run_id=result.run_id,
+            )
         # Reuse the task_restart counter/record so the recovery attempt is
         # visible in runs/workers output and an unknown->recover->unknown cycle
         # cannot loop past the configured budget.
         self.record_task_restart(
             result,
-            attempt,
+            recovery.attempt,
             exhausted=False,
             reason="unknown_run_recovery",
         )
-        self.run_store.append_lifecycle_event(
-            RunLifecycleEvent.task_recovery(
-                run_id=result.run_id,
-                task_id=prior_result.task_id,
-                phase="outcome",
-                prior_run_id=prior_result.run_id,
-                attempt=attempt,
-                max_attempts=max_attempts,
-                outcome=result.classification,
-            )
+        self.record_recovery_phase(
+            recovery,
+            phase="outcome",
+            recovery_run_id=result.run_id,
+            outcome=result.classification,
         )
         report_status(
-            f"unknown-run recovery for {prior_result.task_id} "
-            f"(attempt {attempt}/{max_attempts}) classified {result.classification}"
+            f"unknown-run recovery for {recovery.task_id} "
+            f"(attempt {recovery.attempt}/{recovery.max_attempts}) "
+            f"classified {result.classification}"
         )
         return result
 
@@ -3733,6 +4046,127 @@ class RecoveryContext:
     # resume is enabled, the continuation runs `claude -p --resume <id>` to keep
     # the prior turn's full context instead of a from-scratch fresh worker.
     prior_session_id: str = ""
+    base_commit: str = ""
+    git_common_dir: str = ""
+    dirty_snapshot: tuple[str, ...] = ()
+    dirty_fingerprint: str = ""
+
+
+def capture_recovery_workspace_snapshot(
+    claim: WorkspaceClaim,
+) -> tuple[str, str, tuple[str, ...], str]:
+    worktree = claim.worktree.resolve()
+
+    def git_text(*args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(worktree), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise WorkspaceProvisionError(
+                "recovery_identity_unavailable",
+                "recovery workspace identity could not be inspected",
+            ) from exc
+        if result.returncode != 0:
+            raise WorkspaceProvisionError(
+                "recovery_identity_unavailable",
+                "recovery workspace identity could not be inspected",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+        return result.stdout.strip()
+
+    branch = git_text("branch", "--show-current")
+    if branch != claim.branch:
+        raise WorkspaceProvisionError(
+            "recovery_branch_changed",
+            "recovery workspace branch changed before intent recording",
+            details={"expected_branch": claim.branch, "actual_branch": branch},
+        )
+    head_commit = git_text("rev-parse", "--verify", "HEAD")
+    raw_common_dir = Path(git_text("rev-parse", "--git-common-dir"))
+    if not raw_common_dir.is_absolute():
+        raw_common_dir = worktree / raw_common_dir
+    dirty_snapshot, dirty_fingerprint = git_dirty_snapshot(worktree)
+    return (
+        head_commit,
+        str(raw_common_dir.resolve()),
+        tuple(dirty_snapshot),
+        dirty_fingerprint,
+    )
+
+
+def recovery_context_payload(recovery: RecoveryContext) -> dict[str, object]:
+    return {
+        "task_id": recovery.task_id,
+        "prior_run_id": recovery.prior_run_id,
+        "prior_classification": recovery.prior_classification,
+        "prior_session_id": recovery.prior_session_id,
+        "workspace_claimed": recovery.workspace_claimed,
+        "owner_task_id": recovery.task_id,
+        "owner_run_id": recovery.prior_run_id,
+        "branch": recovery.branch,
+        "worktree": recovery.worktree,
+        "base_commit": recovery.base_commit,
+        "head_commit": recovery.head_commit,
+        "git_common_dir": recovery.git_common_dir,
+        "dirty_snapshot": list(recovery.dirty_snapshot),
+        "dirty_fingerprint": recovery.dirty_fingerprint,
+        "transcript_path": recovery.transcript_path,
+        "wrapper_log": recovery.wrapper_log,
+        "attempt": recovery.attempt,
+        "max_attempts": recovery.max_attempts,
+    }
+
+
+def recovery_context_from_record(
+    record: Mapping[str, object],
+) -> RecoveryContext | None:
+    required_strings = {
+        key: record.get(key)
+        for key in ("task_id", "prior_run_id", "prior_classification")
+    }
+    if not all(isinstance(value, str) and value for value in required_strings.values()):
+        return None
+    attempt = record.get("attempt")
+    max_attempts = record.get("max_attempts")
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt < 1
+        or isinstance(max_attempts, bool)
+        or not isinstance(max_attempts, int)
+        or max_attempts < attempt
+    ):
+        return None
+    dirty = record.get("dirty_snapshot")
+    if not isinstance(dirty, list) or not all(isinstance(line, str) for line in dirty):
+        return None
+
+    def text_value(key: str) -> str:
+        value = record.get(key)
+        return value if isinstance(value, str) else ""
+
+    return RecoveryContext(
+        task_id=str(required_strings["task_id"]),
+        prior_run_id=str(required_strings["prior_run_id"]),
+        prior_classification=str(required_strings["prior_classification"]),
+        branch=text_value("branch"),
+        worktree=text_value("worktree"),
+        head_commit=text_value("head_commit"),
+        transcript_path=text_value("transcript_path"),
+        wrapper_log=text_value("wrapper_log"),
+        attempt=attempt,
+        max_attempts=max_attempts,
+        workspace_claimed=record.get("workspace_claimed") is True,
+        prior_session_id=text_value("prior_session_id"),
+        base_commit=text_value("base_commit"),
+        git_common_dir=text_value("git_common_dir"),
+        dirty_snapshot=tuple(dirty),
+        dirty_fingerprint=text_value("dirty_fingerprint"),
+    )
 
 
 def build_recovery_prompt_section(recovery: RecoveryContext) -> str:

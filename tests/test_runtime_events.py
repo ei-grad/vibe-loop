@@ -36,6 +36,7 @@ def test_actionable_allowlist_is_small_and_explicit() -> None:
         "provider_account_wall",
         "provider_quota_wall",
         "recovery_exhausted",
+        "recovery_pending",
         "supervisor_inconsistent",
     }
 
@@ -50,6 +51,14 @@ def test_actionable_allowlist_is_small_and_explicit() -> None:
             "disk_blocked",
         ),
         ({"record_type": "task_restart", "exhausted": True}, "recovery_exhausted"),
+        (
+            {"record_type": "task_recovery", "phase": "pending"},
+            "recovery_pending",
+        ),
+        (
+            {"record_type": "run_result", "recovery_intent": {"attempt": 1}},
+            "recovery_pending",
+        ),
         (
             {
                 "record_type": "autopilot_supervisor_observed",

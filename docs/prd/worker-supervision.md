@@ -201,6 +201,20 @@ identifiers against the current active task lock. The supervisor must not guess
 or auto-claim a path; owner mismatches and unsafe-workspace diagnostics fail
 closed.
 
+Before launching a continuation, the supervisor journals a durable
+`task_recovery` pending intent containing the prior run/session, exact claim
+owner, branch and absolute worktree, git common directory, recorded base,
+current HEAD, content-sensitive staged/unstaged/untracked snapshot, and bounded
+attempt ordinal. A later
+supervisor may resume only that identity. Renames, replacements, new dirt, HEAD
+movement, ambiguous ownership, and conflicting live claims fail closed. A
+pre-launch deferral remains pending at the same attempt ordinal; the attempt is
+charged atomically by `worker_process_started`, and an unknown result carries
+its next pending intent in the same durable result record. Run status exposes
+`recovery_pending`, `recovery_attempt`, and `recovery_max_attempts`, and
+wait-helper journal polling maps pending/deferred recovery records to the
+allowlisted `recovery_pending` runtime event.
+
 Related implementation IDs: `PAR-10`, `PAR-11`, `SKILL-01`.
 
 ## PRD-WRK-007 Main Integration Lock
