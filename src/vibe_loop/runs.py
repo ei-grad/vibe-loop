@@ -46,6 +46,9 @@ RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKSPACE_PROVISIONED_RECORD_TYPE = "workspace_provisioned"
 CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
 GATE_RESULT_RECORD_TYPE = "gate_result"
+REVIEW_STARTED_RECORD_TYPE = "review_started"
+REVIEW_VERDICT_RECORD_TYPE = "review_verdict"
+FINDING_RECORDED_RECORD_TYPE = "finding_recorded"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
@@ -107,6 +110,9 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         WORKSPACE_PROVISIONED_RECORD_TYPE,
         CANDIDATE_RECORDED_RECORD_TYPE,
         GATE_RESULT_RECORD_TYPE,
+        REVIEW_STARTED_RECORD_TYPE,
+        REVIEW_VERDICT_RECORD_TYPE,
+        FINDING_RECORDED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
@@ -675,6 +681,51 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=GATE_RESULT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_started(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_STARTED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_verdict(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_VERDICT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def finding_recorded(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=FINDING_RECORDED_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,

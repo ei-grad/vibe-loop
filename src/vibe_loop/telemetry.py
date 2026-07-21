@@ -17,10 +17,12 @@ PHASES = frozenset(
     {
         "planning",
         "implementation",
+        "initial_review",
         "focused_validation",
         "full_validation",
         "review",
         "remediation",
+        "targeted_closure",
         "integration",
     }
 )

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import MappingProxyType
@@ -14,6 +16,7 @@ from unittest.mock import patch
 import vibe_loop.runner as runner_module
 from vibe_loop.config import (
     AgentConfig,
+    AgentResolutionError,
     AgentSelection,
     CompletionConfig,
     OrchestrationConfig,
@@ -22,13 +25,22 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
 )
 from vibe_loop.orchestration import (
+    CandidateRecord,
     CandidateCollectionError,
     CandidateCollector,
     GateExecutionError,
     GateRemediationExhausted,
+    GateResult,
+    GateRunSummary,
     GateRunner,
     LEGAL_STAGE_TRANSITIONS,
     RuntimeGateController,
+    ReviewBudgetExhausted,
+    ReviewConcurrencyBudget,
+    ReviewFinding,
+    ReviewLimitWallError,
+    ReviewRouter,
+    ReviewStageResultError,
     STAGE_FAILURES,
     IllegalStageTransitionError,
     RunContractProposal,
@@ -42,7 +54,7 @@ from vibe_loop.orchestration import (
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.locks import LockManager
-from vibe_loop.runs import RunStore, WorkerReport
+from vibe_loop.runs import RunLifecycleEvent, RunStore, WorkerReport
 from vibe_loop.tasks import Task
 from vibe_loop.workers import claim_worker_workspace
 
@@ -901,6 +913,509 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(executor_calls, [])
         self.assertEqual(len(remediation_summaries), 1)
         self.assertTrue(remediation_summaries[0].results[0].resumed)
+
+
+class ReviewRouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name)
+        self.store = RunStore(self.repo / "runs.jsonl")
+        self.candidate = CandidateRecord(
+            branch="vibe-loop/TASK-01",
+            worktree=self.repo,
+            base_main="a" * 40,
+            head_commit="b" * 40,
+            changed_paths=("src/example.py",),
+            source="derived",
+        )
+        self.gates = GateRunSummary(
+            candidate=self.candidate,
+            results=(
+                GateResult(
+                    config_key="completion.commands[0]",
+                    exit_class="passed",
+                    exit_code=0,
+                    duration_seconds=0.5,
+                    log_reference=str(self.repo / "gate.log"),
+                    evidence_digest="sha256:" + "c" * 64,
+                    candidate_fingerprint=self.candidate.fingerprint,
+                ),
+            ),
+            candidate_recorded=True,
+        )
+
+    def agent(self, provider: str, *, command: str | None = None) -> AgentConfig:
+        return AgentConfig(
+            command=command
+            or f"{provider} review --model {{model}} --effort {{effort}} {{prompt}}",
+            command_source="explicit",
+            model="review-model",
+            model_source="explicit",
+            effort="high",
+            effort_source="explicit",
+            agent_kind=provider,
+            agent_kind_source="explicit",
+            executable_kind=provider,
+            profile_name="review",
+        )
+
+    def router(
+        self,
+        provider: str,
+        executor,
+        *,
+        initial: int = 1,
+        closure: int = 2,
+    ) -> ReviewRouter:
+        return ReviewRouter(
+            reviewer=self.agent(provider),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=initial,
+            max_closure_passes=closure,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=executor,
+        )
+
+    def test_routes_cross_provider_matrices_with_provenance_and_usage(self) -> None:
+        cases = (
+            (
+                "claude",
+                "codex",
+                {"type": "turn.completed", "usage": {"input_tokens": 12}},
+            ),
+            (
+                "codex",
+                "claude",
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 13},
+                    "num_turns": 1,
+                },
+            ),
+        )
+        for implementer, reviewer, usage_event in cases:
+            with self.subTest(implementer=implementer, reviewer=reviewer):
+                commands: list[str] = []
+
+                def execute(command: str, **kwargs):
+                    commands.append(command)
+                    output = "\n".join(
+                        (
+                            json.dumps(usage_event),
+                            json.dumps(
+                                {
+                                    "verdict": "approve",
+                                    "findings": [],
+                                    "session_id": f"{reviewer}-session",
+                                    "session_id_source": "provider",
+                                    "continuation_ordinal": 0,
+                                }
+                            ),
+                        )
+                    )
+                    return subprocess.CompletedProcess(command, 0, stdout=output)
+
+                self.store = RunStore(self.repo / f"{reviewer}.jsonl")
+                result = self.router(reviewer, execute).review(self.gates)
+
+                self.assertTrue(result.approved)
+                self.assertIn("review-model", commands[0])
+                self.assertIn("high", commands[0])
+                records = self.store.read_records()
+                self.assertEqual(
+                    [record["record_type"] for record in records],
+                    ["review_started", "review_verdict"],
+                )
+                verdict = records[-1]
+                self.assertEqual(verdict["route"]["provider"], reviewer)
+                self.assertEqual(verdict["route"]["model"], "review-model")
+                self.assertEqual(verdict["route"]["effort"], "high")
+                self.assertEqual(verdict["stats"]["phase"], "initial_review")
+                self.assertIn("input_tokens", verdict["stats"])
+
+    def test_malformed_reask_findings_ledger_and_budget(self) -> None:
+        outputs = iter(
+            (
+                "not json",
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "candidate can bypass review",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "session-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        result = router.review(self.gates)
+
+        self.assertEqual(result.verdict, "findings")
+        self.assertEqual(result.attempt_ordinal, 2)
+        self.assertEqual(
+            [
+                finding.finding_id
+                for finding in router.ledger.open(self.candidate.fingerprint)
+            ],
+            ["F1"],
+        )
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        router.stage_machine = machine
+        remediated_gates = dataclasses.replace(
+            self.gates,
+            candidate=dataclasses.replace(self.candidate, head_commit="c" * 40),
+        )
+        with self.assertRaises(ReviewBudgetExhausted):
+            router.review(remediated_gates)
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertIn("review_budget_exhausted", transitions[-1]["reason"])
+        self.assertEqual(
+            [record["record_type"] for record in self.store.read_records()],
+            [
+                "review_started",
+                "review_verdict",
+                "review_started",
+                "review_verdict",
+                "finding_recorded",
+            ],
+        )
+
+    def test_targeted_closure_updates_ledger_and_phase(self) -> None:
+        initial = ReviewFinding(
+            finding_id="F1",
+            severity="P1",
+            summary="candidate can bypass review",
+            evidence="reproduction",
+            files=("src/example.py",),
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.finding_recorded(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "finding_id": initial.finding_id,
+                    "severity": initial.severity,
+                    "summary": initial.summary,
+                    "evidence": initial.evidence,
+                    "files": list(initial.files),
+                    "lines": [],
+                    "state": initial.state,
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "pass_kind": "initial",
+                },
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            output = json.dumps(
+                {
+                    "verdict": "approve",
+                    "findings": [
+                        {
+                            "id": "F1",
+                            "severity": "P1",
+                            "summary": "candidate can bypass review",
+                            "evidence": "focused reproduction now passes",
+                            "files": ["src/example.py"],
+                            "lines": ["12"],
+                            "state": "remediated",
+                        }
+                    ],
+                    "session_id": "session-1",
+                    "session_id_source": "provider",
+                    "continuation_ordinal": 1,
+                }
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        router = self.router("claude", execute)
+        remediated_candidate = dataclasses.replace(
+            self.candidate,
+            head_commit="c" * 40,
+        )
+        remediated_gates = dataclasses.replace(
+            self.gates,
+            candidate=remediated_candidate,
+        )
+        result = router.review(remediated_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertEqual(router.ledger.open(), ())
+        verdict = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ][0]
+        self.assertEqual(verdict["phase"], "targeted_closure")
+        self.assertEqual(verdict["continuation_ordinal"], 1)
+
+    def test_limit_wall_is_typed_to_reviewer_route_without_reask(self) -> None:
+        outputs = iter(
+            (
+                (1, "You've hit your usage limit; resets at 3pm UTC"),
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [],
+                            "session_id": "review-1",
+                            "session_id_source": "provider",
+                            "continuation_ordinal": 0,
+                        }
+                    ),
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            returncode, output = next(outputs)
+            return subprocess.CompletedProcess(command, returncode, stdout=output)
+
+        router = self.router("codex", execute)
+        with self.assertRaises(ReviewLimitWallError) as raised:
+            router.review(self.gates)
+
+        self.assertEqual(raised.exception.phase, "initial_review")
+        result = router.review(self.gates)
+        self.assertEqual(result.pass_ordinal, 1)
+        records = self.store.read_records()
+        wall = records[1]
+        self.assertEqual(wall["retry_classification"], "limit_wall")
+        self.assertEqual(wall["route"]["provider"], "codex")
+
+    def test_missing_prompt_delivery_fails_before_launch(self) -> None:
+        router = ReviewRouter(
+            reviewer=self.agent(
+                "codex",
+                command="codex review --model {model} --effort {effort}",
+            ),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=(),
+            max_initial_passes=1,
+            max_closure_passes=0,
+            concurrency=ReviewConcurrencyBudget(1),
+        )
+
+        with self.assertRaisesRegex(AgentResolutionError, "must include.*prompt"):
+            router.review(self.gates)
+        self.assertEqual(self.store.read_records(), [])
+
+    def test_open_finding_routes_to_remediation_and_cannot_reach_integration(
+        self,
+    ) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "completion can bypass review",
+                                "evidence": "worker reported completed",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        result = router.review(self.gates)
+
+        self.assertEqual(result.verdict, "findings")
+        self.assertEqual(machine.stage, RunStage.REMEDIATION)
+        self.assertNotIn(
+            RunStage.INTEGRATION.value,
+            [transition["to_stage"] for transition in transitions],
+        )
+
+    def test_reviewer_concurrency_budget_is_independent_and_bounded(self) -> None:
+        budget = ReviewConcurrencyBudget(1)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def first() -> None:
+            with budget.slot():
+                first_entered.set()
+                release_first.wait(2)
+
+        def second() -> None:
+            with budget.slot():
+                second_entered.set()
+
+        first_thread = threading.Thread(target=first)
+        second_thread = threading.Thread(target=second)
+        first_thread.start()
+        self.assertTrue(first_entered.wait(1))
+        second_thread.start()
+        self.assertFalse(second_entered.wait(0.05))
+        release_first.set()
+        first_thread.join(1)
+        second_thread.join(1)
+
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(budget.peak, 1)
+        self.assertEqual(budget.active, 0)
+
+    def test_later_approval_cannot_bypass_open_finding(self) -> None:
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "completion can bypass review",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "review-2",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        first = self.router("codex", execute, initial=2)
+        first.review(self.gates)
+        machine = RunLifecycleStateMachine(lambda _transition: None)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        second = self.router("codex", execute, initial=2)
+        second.stage_machine = machine
+
+        second.review(self.gates)
+
+        self.assertEqual(machine.stage, RunStage.REMEDIATION)
+        self.assertEqual(
+            [finding.finding_id for finding in second.ledger.open()], ["F1"]
+        )
+
+    def test_error_verdict_is_typed_failure_not_remediation(self) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                        "retry_classification": "fatal",
+                    }
+                ),
+            )
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        with self.assertRaises(ReviewStageResultError):
+            router.review(self.gates)
+
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertNotIn(
+            RunStage.REMEDIATION.value,
+            [transition["to_stage"] for transition in transitions],
+        )
 
 
 class RunContractJournalTests(unittest.TestCase):

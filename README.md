@@ -299,8 +299,9 @@ attempts as avoidable burn, while a same-session review resume stays distinct.
 Ordinary workers default to the `implementation` phase. A workflow that knows a
 more specific phase can report it with allowlisted metadata, for example
 `--metadata-json '{"phase":"review","work_kind":"review"}'`. Valid phases are
-`planning`, `implementation`, `focused_validation`, `full_validation`, `review`,
-`remediation`, and `integration`; repeated-candidate diagnostics accept only the
+`planning`, `implementation`, `initial_review`, `focused_validation`,
+`full_validation`, `review`, `remediation`, `targeted_closure`, and
+`integration`; repeated-candidate diagnostics accept only the
 `review` and `discovery` work kinds. Arbitrary metadata is not copied into usage
 stats.
 
@@ -905,6 +906,15 @@ commands = [
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
 
+# Runtime-owned orchestration is landing in dependency-ordered slices. Keep
+# worker-owned compatibility mode until the migration default flip is released.
+[orchestration]
+mode = "worker-owned"
+# reviewer_profile = "review"
+# max_initial_review_passes = 1
+# max_closure_review_passes = 2
+# reviewer_concurrency_budget = 1
+
 [supervision]
 max_restarts = 3
 cooldown_seconds = 30.0
@@ -1113,6 +1123,49 @@ profile's model; otherwise the profile model is used. The per-task `agent`,
 `model`, and `hazards` fields come from command-backed task sources that emit
 them in task JSON (`"agent": "claude-opus"`, `"model": "sonnet"`, `"hazards":
 ["abi"]`); sources that omit them are unaffected.
+
+### Runtime reviewer route
+
+The resolved run contract can select a reviewer independently from the
+implementation worker by naming an agent profile in
+`orchestration.reviewer_profile`:
+
+```toml
+[agent]
+kind = "claude"
+model = "opus"
+effort = "medium"
+
+[agent.profiles.review]
+kind = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+command = "codex review {prompt}"
+
+[orchestration]
+mode = "worker-owned"
+reviewer_profile = "review"
+max_initial_review_passes = 1
+max_closure_review_passes = 2
+reviewer_concurrency_budget = 1
+```
+
+The reviewer command must accept `{prompt}` so the runtime can deliver the
+typed candidate, gate evidence, policy references, and prior findings. The
+review route records its profile, provider, model, effort, session identity
+when supplied, duration, native usage when available, and retry/continuation
+ordinals. Initial and closure passes have separate budgets, and reviewer
+concurrency is bounded separately from implementation `--jobs`; `--jobs 1`
+continues to mean one implementation task.
+
+Reviewer output is one schema-validated JSON verdict. Findings are persisted in
+a candidate-scoped ledger, malformed output gets one bounded re-ask, and a
+provider limit wall is attributed to the reviewer route without consuming the
+implementation restart budget. Runtime usage phases are `initial_review` and
+`targeted_closure`; compatibility worker reports may continue using `review`.
+Same-session continuation and the runtime-owned mode switch land in subsequent
+orchestration slices. Until then, `mode = "worker-owned"` preserves the existing
+worker-owned review lifecycle and `mode = "runtime-owned"` fails closed.
 
 ### Locks
 

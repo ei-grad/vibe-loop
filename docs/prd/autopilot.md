@@ -922,6 +922,12 @@ restart events before aggregation.
 
 Quota activity distinguishes implementation, review, resumed review, planning,
 validation, remediation, integration, failed attempts, and restarted attempts.
+Runtime-owned review refines review usage into `initial_review` and
+`targeted_closure`, stamps that phase from lifecycle position, and attributes a
+typed provider wall to the configured reviewer route. Reviewer concurrency is a
+separate contract budget from implementation `jobs`, so a reviewer wall pauses
+that route without consuming the task restart budget or reducing the meaning of
+`jobs = 1` to less than one implementation task.
 Repeated unchanged-candidate review in new sessions and repeated failed
 attempts are avoidable-burn diagnostics. Same-session review continuation is a
 separate informational diagnostic. Telemetry does not switch providers or

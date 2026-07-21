@@ -9,17 +9,23 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, TextIO
 
 from vibe_loop.config import (
     AgentConfig,
+    AgentResolutionError,
     AgentSelection,
     OrchestrationConfig,
     VibeConfig,
     agent_command_provider,
+    command_template_uses_field,
+    format_agent_command,
     parse_orchestration,
 )
+from vibe_loop.retry import LimitWallSignal, detect_limit_wall
+from vibe_loop.telemetry import ProviderUsage, ProviderUsageObserver, unavailable_usage
 
 
 RUN_CONTRACT_VERSION = 1
@@ -28,6 +34,10 @@ WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
 CANDIDATE_RECORD_SOURCE_KINDS = ("worker_command", "derived")
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
+REVIEW_VERDICTS = ("approve", "findings", "error")
+REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
+FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
+FINDING_STATES = ("open", "remediated", "accepted", "rejected")
 
 
 class RunStage(enum.StrEnum):
@@ -97,6 +107,40 @@ class CandidateCollectionError(RuntimeError):
 
 class GateExecutionError(RuntimeError):
     pass
+
+
+class ReviewExecutionError(RuntimeError):
+    pass
+
+
+class ReviewBudgetExhausted(ReviewExecutionError):
+    def __init__(self, pass_kind: str, limit: int) -> None:
+        self.pass_kind = pass_kind
+        self.limit = limit
+        super().__init__(f"review budget exhausted for {pass_kind}: limit={limit}")
+
+
+class ReviewLimitWallError(ReviewExecutionError):
+    def __init__(
+        self,
+        signal: LimitWallSignal,
+        *,
+        route: str,
+        phase: str,
+    ) -> None:
+        self.signal = signal
+        self.route = route
+        self.phase = phase
+        detail = f" ({signal.reset_text})" if signal.reset_text else ""
+        super().__init__(f"reviewer limit wall on {route}: {signal.marker}{detail}")
+
+
+class ReviewStageResultError(ReviewExecutionError):
+    def __init__(self, retry_classification: str) -> None:
+        self.retry_classification = retry_classification
+        super().__init__(
+            f"reviewer returned typed {retry_classification} error verdict"
+        )
 
 
 class GateRemediationExhausted(GateExecutionError):
@@ -712,6 +756,728 @@ class GateRunSummary:
             )
 
 
+@dataclasses.dataclass(frozen=True)
+class ReviewFinding:
+    finding_id: str
+    severity: str
+    summary: str
+    evidence: str
+    files: tuple[str, ...]
+    lines: tuple[str, ...] = ()
+    state: str = "open"
+
+    @classmethod
+    def from_payload(cls, value: object) -> ReviewFinding:
+        if not isinstance(value, Mapping):
+            raise ReviewExecutionError("review finding must be a JSON object")
+        finding_id = value.get("id")
+        severity = value.get("severity")
+        summary = value.get("summary")
+        evidence = value.get("evidence")
+        files = value.get("files")
+        lines = value.get("lines", [])
+        state = value.get("state", "open")
+        if not isinstance(finding_id, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", finding_id
+        ):
+            raise ReviewExecutionError("review finding id is invalid")
+        if severity not in FINDING_SEVERITIES:
+            raise ReviewExecutionError(
+                "review finding severity must be one of: "
+                + ", ".join(FINDING_SEVERITIES)
+            )
+        if not isinstance(summary, str) or not summary.strip():
+            raise ReviewExecutionError("review finding summary is required")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise ReviewExecutionError("review finding evidence is required")
+        if not isinstance(files, list) or not all(
+            isinstance(path, str) and path for path in files
+        ):
+            raise ReviewExecutionError("review finding files must be a JSON array")
+        if not isinstance(lines, list) or not all(
+            isinstance(line, str) and line for line in lines
+        ):
+            raise ReviewExecutionError("review finding lines must be a JSON array")
+        if state not in FINDING_STATES:
+            raise ReviewExecutionError(
+                "review finding state must be one of: " + ", ".join(FINDING_STATES)
+            )
+        return cls(
+            finding_id=finding_id,
+            severity=str(severity),
+            summary=summary.strip(),
+            evidence=evidence.strip(),
+            files=tuple(files),
+            lines=tuple(lines),
+            state=str(state),
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "id": self.finding_id,
+            "severity": self.severity,
+            "summary": self.summary,
+            "evidence": self.evidence,
+            "files": list(self.files),
+            "lines": list(self.lines),
+            "state": self.state,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewRequest:
+    run_id: str
+    task_id: str
+    candidate: CandidateRecord
+    gate_results: tuple[GateResult, ...]
+    policy_references: tuple[str, ...]
+    pass_kind: str = "initial"
+    prior_findings: tuple[ReviewFinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (
+            self.pass_kind != "initial"
+            and re.fullmatch(r"closure:[1-9][0-9]*", self.pass_kind) is None
+        ):
+            raise ValueError("review pass kind must be initial or closure:<ordinal>")
+        if self.pass_kind == "initial" and self.prior_findings:
+            raise ValueError("initial review cannot carry prior findings")
+        if self.pass_kind != "initial" and not self.prior_findings:
+            raise ValueError("closure review requires prior findings")
+
+    @property
+    def phase(self) -> str:
+        return "initial_review" if self.pass_kind == "initial" else "targeted_closure"
+
+    @property
+    def family(self) -> str:
+        return "initial" if self.pass_kind == "initial" else "closure"
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "candidate": {
+                **self.candidate.to_payload(),
+                "diff_source": (
+                    f"git diff {self.candidate.base_main}..."
+                    f"{self.candidate.head_commit}"
+                ),
+            },
+            "gate_evidence": [result.to_payload() for result in self.gate_results],
+            "policy_references": list(self.policy_references),
+            "pass_kind": self.pass_kind,
+            "prior_findings": [finding.to_payload() for finding in self.prior_findings],
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewResult:
+    verdict: str
+    findings: tuple[ReviewFinding, ...]
+    session_id: str
+    session_id_source: str
+    continuation_ordinal: int
+    retry_classification: str
+    usage: ProviderUsage
+    duration_seconds: float
+    pass_kind: str
+    pass_ordinal: int
+    attempt_ordinal: int
+
+    @property
+    def approved(self) -> bool:
+        return self.verdict == "approve"
+
+
+class ReviewConcurrencyBudget:
+    def __init__(self, limit: int) -> None:
+        if limit <= 0:
+            raise ValueError("reviewer concurrency budget must be positive")
+        self.limit = limit
+        self._semaphore = threading.BoundedSemaphore(limit)
+        self._state_lock = threading.Lock()
+        self._active = 0
+        self._peak = 0
+
+    @property
+    def active(self) -> int:
+        with self._state_lock:
+            return self._active
+
+    @property
+    def peak(self) -> int:
+        with self._state_lock:
+            return self._peak
+
+    @contextmanager
+    def slot(self):
+        self._semaphore.acquire()
+        with self._state_lock:
+            self._active += 1
+            self._peak = max(self._peak, self._active)
+        try:
+            yield
+        finally:
+            with self._state_lock:
+                self._active -= 1
+            self._semaphore.release()
+
+
+class FindingsLedger:
+    def __init__(self, run_store: object, run_id: str, task_id: str) -> None:
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+
+    def current(self, candidate_fingerprint: str = "") -> tuple[ReviewFinding, ...]:
+        findings: dict[str, ReviewFinding] = {}
+        for record in self.run_store.read_records():
+            if (
+                record.get("record_type") != "finding_recorded"
+                or record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+                or (
+                    candidate_fingerprint
+                    and record.get("candidate_fingerprint") != candidate_fingerprint
+                )
+            ):
+                continue
+            payload = {
+                "id": record.get("finding_id"),
+                "severity": record.get("severity"),
+                "summary": record.get("summary"),
+                "evidence": record.get("evidence"),
+                "files": record.get("files"),
+                "lines": record.get("lines", []),
+                "state": record.get("state"),
+            }
+            try:
+                finding = ReviewFinding.from_payload(payload)
+            except ReviewExecutionError:
+                continue
+            findings[finding.finding_id] = finding
+        return tuple(findings.values())
+
+    def open(self, candidate_fingerprint: str = "") -> tuple[ReviewFinding, ...]:
+        return tuple(
+            finding
+            for finding in self.current(candidate_fingerprint)
+            if finding.state == "open"
+        )
+
+
+ReviewExecutor = Callable[..., subprocess.CompletedProcess[str]]
+
+
+class ReviewRouter:
+    def __init__(
+        self,
+        *,
+        reviewer: AgentConfig,
+        reviewer_profile: str,
+        run_store: object,
+        run_id: str,
+        task_id: str,
+        worktree: Path,
+        policy_references: Sequence[str],
+        max_initial_passes: int,
+        max_closure_passes: int,
+        concurrency: ReviewConcurrencyBudget,
+        stage_machine: RunLifecycleStateMachine | None = None,
+        limit_wall_patterns: Sequence[str] | None = None,
+        executor: ReviewExecutor = subprocess.run,
+    ) -> None:
+        if max_initial_passes <= 0:
+            raise ValueError("max_initial_passes must be positive")
+        if max_closure_passes < 0:
+            raise ValueError("max_closure_passes must be non-negative")
+        self.reviewer = reviewer
+        self.reviewer_profile = reviewer_profile
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+        self.worktree = worktree
+        self.policy_references = tuple(policy_references)
+        self.max_initial_passes = max_initial_passes
+        self.max_closure_passes = max_closure_passes
+        self.concurrency = concurrency
+        self.stage_machine = stage_machine
+        self.limit_wall_patterns = limit_wall_patterns
+        self.executor = executor
+        self.ledger = FindingsLedger(run_store, run_id, task_id)
+
+    def review(
+        self,
+        gate_summary: GateRunSummary,
+        *,
+        pass_kind: str = "initial",
+        prior_findings: Sequence[ReviewFinding] | None = None,
+    ) -> ReviewResult:
+        gate_summary.require_review_ready()
+        candidate = gate_summary.candidate
+        if prior_findings is None:
+            prior = self.ledger.open() if pass_kind.startswith("closure:") else ()
+        else:
+            prior = tuple(prior_findings)
+        request = ReviewRequest(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            candidate=candidate,
+            gate_results=gate_summary.results,
+            policy_references=self.policy_references,
+            pass_kind=pass_kind,
+            prior_findings=prior,
+        )
+        pass_ordinal = self._next_pass_ordinal(request)
+        limit = (
+            self.max_initial_passes
+            if request.family == "initial"
+            else self.max_closure_passes
+        )
+        if pass_ordinal > limit:
+            if self.stage_machine is not None:
+                self.stage_machine.fail(
+                    StageFailure.STAGE_FAILED,
+                    reason=f"review_budget_exhausted:{request.family}:limit={limit}",
+                )
+            raise ReviewBudgetExhausted(request.family, limit)
+        self._transition_to_review(request)
+        malformed: ReviewExecutionError | None = None
+        for attempt_ordinal in (1, 2):
+            try:
+                result = self._launch(
+                    request,
+                    pass_ordinal=pass_ordinal,
+                    attempt_ordinal=attempt_ordinal,
+                    reask=attempt_ordinal == 2,
+                )
+            except ReviewExecutionError as exc:
+                malformed = exc
+                if attempt_ordinal == 1 and str(exc).startswith("malformed review"):
+                    continue
+                if str(exc).startswith("malformed review"):
+                    self._fail_stage_for_result("fatal")
+                raise
+            self._record_findings(request, result.findings)
+            self._transition_from_review(result)
+            return result
+        assert malformed is not None
+        raise malformed
+
+    def _launch(
+        self,
+        request: ReviewRequest,
+        *,
+        pass_ordinal: int,
+        attempt_ordinal: int,
+        reask: bool,
+    ) -> ReviewResult:
+        command_template = self.reviewer.require_command()
+        if not command_template_uses_field(command_template, "prompt"):
+            raise AgentResolutionError(
+                "reviewer command must include {prompt}; otherwise the typed "
+                "review request cannot be delivered"
+            )
+        prompt = self._prompt(request, reask=reask)
+        command = format_agent_command(
+            command_template,
+            prompt=prompt,
+            model=self.reviewer.model,
+            effort=self.reviewer.effort,
+            profile=self.reviewer_profile,
+        )
+        route = self._route_payload()
+        self._append_event(
+            "review_started",
+            {
+                "pass_kind": request.pass_kind,
+                "pass_ordinal": pass_ordinal,
+                "attempt_ordinal": attempt_ordinal,
+                "candidate_fingerprint": request.candidate.fingerprint,
+                "phase": request.phase,
+                "route": route,
+            },
+        )
+        started = time.monotonic()
+        with self.concurrency.slot():
+            try:
+                completed = self.executor(
+                    command,
+                    cwd=self.worktree,
+                    shell=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except OSError as exc:
+                duration = max(0.0, time.monotonic() - started)
+                self._record_error(
+                    request,
+                    route,
+                    pass_ordinal,
+                    attempt_ordinal,
+                    "fatal",
+                    duration,
+                    unavailable_usage(
+                        self._usage_provider(), "provider_usage_not_reported"
+                    ),
+                )
+                self._fail_stage_for_result("fatal")
+                raise ReviewExecutionError(
+                    f"reviewer command could not be executed: {type(exc).__name__}"
+                ) from exc
+        duration = max(0.0, time.monotonic() - started)
+        output = completed.stdout or ""
+        observer = ProviderUsageObserver(self._usage_provider())
+        for line in output.splitlines():
+            observer.observe_line(line)
+        usage = observer.usage
+        wall = detect_limit_wall(output, self.limit_wall_patterns)
+        if wall is not None:
+            self._record_error(
+                request,
+                route,
+                pass_ordinal,
+                attempt_ordinal,
+                "limit_wall",
+                duration,
+                usage,
+            )
+            self._fail_stage_for_result("limit_wall")
+            raise ReviewLimitWallError(
+                wall,
+                route=str(route["command_key"]),
+                phase=request.phase,
+            )
+        if completed.returncode != 0:
+            self._record_error(
+                request,
+                route,
+                pass_ordinal,
+                attempt_ordinal,
+                "fatal",
+                duration,
+                usage,
+            )
+            self._fail_stage_for_result("fatal")
+            raise ReviewExecutionError(
+                f"reviewer command failed with exit code {completed.returncode}"
+            )
+        try:
+            result = self._parse_result(
+                output,
+                request=request,
+                pass_ordinal=pass_ordinal,
+                attempt_ordinal=attempt_ordinal,
+                usage=usage,
+                duration=duration,
+            )
+        except ReviewExecutionError:
+            self._record_error(
+                request,
+                route,
+                pass_ordinal,
+                attempt_ordinal,
+                "transient" if not reask else "fatal",
+                duration,
+                usage,
+            )
+            raise
+        self._append_event(
+            "review_verdict",
+            self._result_payload(result, request, route),
+        )
+        if result.verdict == "error":
+            self._fail_stage_for_result(result.retry_classification)
+            if result.retry_classification == "limit_wall":
+                raise ReviewLimitWallError(
+                    LimitWallSignal(marker="reviewer reported limit wall"),
+                    route=str(route["command_key"]),
+                    phase=request.phase,
+                )
+            raise ReviewStageResultError(result.retry_classification)
+        return result
+
+    def _parse_result(
+        self,
+        output: str,
+        *,
+        request: ReviewRequest,
+        pass_ordinal: int,
+        attempt_ordinal: int,
+        usage: ProviderUsage,
+        duration: float,
+    ) -> ReviewResult:
+        payload: object | None = None
+        for line in reversed(output.splitlines()):
+            try:
+                candidate = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, Mapping) and "verdict" in candidate:
+                payload = candidate
+                break
+        if not isinstance(payload, Mapping):
+            raise ReviewExecutionError("malformed review output: missing JSON verdict")
+        verdict = payload.get("verdict")
+        raw_findings = payload.get("findings", [])
+        if verdict not in REVIEW_VERDICTS or not isinstance(raw_findings, list):
+            raise ReviewExecutionError(
+                "malformed review output: invalid verdict schema"
+            )
+        try:
+            findings = tuple(ReviewFinding.from_payload(item) for item in raw_findings)
+        except ReviewExecutionError as exc:
+            raise ReviewExecutionError(f"malformed review output: {exc}") from exc
+        if request.family == "initial" and verdict == "approve" and findings:
+            raise ReviewExecutionError(
+                "malformed review output: approve verdict cannot include findings"
+            )
+        if verdict == "findings" and not findings:
+            raise ReviewExecutionError(
+                "malformed review output: findings verdict requires findings"
+            )
+        if request.family == "initial" and any(
+            finding.state != "open" for finding in findings
+        ):
+            raise ReviewExecutionError(
+                "malformed review output: initial findings must be open"
+            )
+        if request.family == "closure":
+            prior_ids = {finding.finding_id for finding in request.prior_findings}
+            result_ids = {finding.finding_id for finding in findings}
+            if result_ids != prior_ids:
+                raise ReviewExecutionError(
+                    "malformed review output: closure must return every prior finding exactly once"
+                )
+            has_open = any(finding.state == "open" for finding in findings)
+            if (verdict == "approve" and has_open) or (
+                verdict == "findings" and not has_open
+            ):
+                raise ReviewExecutionError(
+                    "malformed review output: closure verdict must match finding states"
+                )
+        session_id = payload.get("session_id", "")
+        session_id_source = payload.get("session_id_source", "")
+        continuation_ordinal = payload.get("continuation_ordinal", 0)
+        retry_classification = payload.get(
+            "retry_classification", "fatal" if verdict == "error" else "ok"
+        )
+        if not isinstance(session_id, str) or not isinstance(session_id_source, str):
+            raise ReviewExecutionError(
+                "malformed review output: invalid session identity"
+            )
+        if (
+            isinstance(continuation_ordinal, bool)
+            or not isinstance(continuation_ordinal, int)
+            or continuation_ordinal < 0
+        ):
+            raise ReviewExecutionError(
+                "malformed review output: invalid continuation ordinal"
+            )
+        if retry_classification not in REVIEW_RETRY_CLASSIFICATIONS:
+            raise ReviewExecutionError(
+                "malformed review output: invalid retry classification"
+            )
+        if verdict != "error" and retry_classification != "ok":
+            raise ReviewExecutionError(
+                "malformed review output: non-error verdict must classify as ok"
+            )
+        return ReviewResult(
+            verdict=str(verdict),
+            findings=findings,
+            session_id=session_id,
+            session_id_source=session_id_source,
+            continuation_ordinal=continuation_ordinal,
+            retry_classification=str(retry_classification),
+            usage=usage,
+            duration_seconds=duration,
+            pass_kind=request.pass_kind,
+            pass_ordinal=pass_ordinal,
+            attempt_ordinal=attempt_ordinal,
+        )
+
+    def _prompt(self, request: ReviewRequest, *, reask: bool) -> str:
+        instruction = (
+            "The previous response was malformed. Return only one JSON object. "
+            if reask
+            else ""
+        )
+        return (
+            instruction
+            + "Review the candidate described by this request. Return exactly one "
+            "JSON object with verdict (approve|findings|error), findings, session_id, "
+            "session_id_source, and continuation_ordinal. Each finding requires id, "
+            "severity (P0-P3), summary, evidence, files, lines, and state.\n"
+            + json.dumps(request.to_payload(), sort_keys=True, ensure_ascii=False)
+        )
+
+    def _next_pass_ordinal(self, request: ReviewRequest) -> int:
+        count = 0
+        for record in self.run_store.read_records():
+            if (
+                record.get("record_type") == "review_verdict"
+                and record.get("run_id") == self.run_id
+                and record.get("task_id") == self.task_id
+                and record.get("verdict") in {"approve", "findings"}
+            ):
+                recorded_kind = record.get("pass_kind")
+                family = (
+                    "initial"
+                    if recorded_kind == "initial"
+                    else "closure"
+                    if isinstance(recorded_kind, str)
+                    and recorded_kind.startswith("closure:")
+                    else ""
+                )
+                if family == request.family:
+                    count += 1
+        return count + 1
+
+    def _record_findings(
+        self,
+        request: ReviewRequest,
+        findings: Sequence[ReviewFinding],
+    ) -> None:
+        for finding in findings:
+            self._append_event(
+                "finding_recorded",
+                {
+                    "finding_id": finding.finding_id,
+                    "severity": finding.severity,
+                    "summary": finding.summary,
+                    "evidence": finding.evidence,
+                    "files": list(finding.files),
+                    "lines": list(finding.lines),
+                    "state": finding.state,
+                    "candidate_fingerprint": request.candidate.fingerprint,
+                    "pass_kind": request.pass_kind,
+                },
+            )
+
+    def _record_error(
+        self,
+        request: ReviewRequest,
+        route: Mapping[str, object],
+        pass_ordinal: int,
+        attempt_ordinal: int,
+        retry_classification: str,
+        duration: float,
+        usage: ProviderUsage,
+    ) -> None:
+        result = ReviewResult(
+            verdict="error",
+            findings=(),
+            session_id="",
+            session_id_source="",
+            continuation_ordinal=0,
+            retry_classification=retry_classification,
+            usage=usage,
+            duration_seconds=duration,
+            pass_kind=request.pass_kind,
+            pass_ordinal=pass_ordinal,
+            attempt_ordinal=attempt_ordinal,
+        )
+        self._append_event(
+            "review_verdict",
+            self._result_payload(result, request, route),
+        )
+
+    def _result_payload(
+        self,
+        result: ReviewResult,
+        request: ReviewRequest,
+        route: Mapping[str, object],
+    ) -> dict[str, object]:
+        return {
+            "pass_kind": result.pass_kind,
+            "pass_ordinal": result.pass_ordinal,
+            "attempt_ordinal": result.attempt_ordinal,
+            "candidate_fingerprint": request.candidate.fingerprint,
+            "verdict": result.verdict,
+            "findings_count": len(result.findings),
+            "session_id": result.session_id,
+            "session_id_source": result.session_id_source,
+            "continuation_ordinal": result.continuation_ordinal,
+            "retry_classification": result.retry_classification,
+            "duration_seconds": result.duration_seconds,
+            "phase": request.phase,
+            "route": dict(route),
+            "stats": result.usage.to_stats(
+                phase=request.phase,
+                wall_time_seconds=result.duration_seconds,
+                candidate_fingerprint=request.candidate.fingerprint,
+                work_kind="review",
+            ),
+        }
+
+    def _route_payload(self) -> dict[str, object]:
+        provider = agent_command_provider(
+            self.reviewer.command or "",
+            self.reviewer.executable_kind or self.reviewer.agent_kind,
+        )
+        return {
+            "profile": self.reviewer_profile,
+            "provider": provider or "unknown",
+            "model": self.reviewer.model,
+            "effort": self.reviewer.effort,
+            "command_key": (
+                f"agent.profiles.{self.reviewer_profile}.command"
+                if self.reviewer_profile
+                else "agent.command"
+            ),
+        }
+
+    def _usage_provider(self) -> str:
+        provider = self._route_payload()["provider"]
+        return {"codex": "openai", "claude": "anthropic"}.get(str(provider), "unknown")
+
+    def _transition_to_review(self, request: ReviewRequest) -> None:
+        if self.stage_machine is None:
+            return
+        stage = RunStage.REVIEW if request.family == "initial" else RunStage.CLOSURE
+        self.stage_machine.transition(
+            stage, reason=f"review_started:{request.pass_kind}"
+        )
+
+    def _transition_from_review(self, result: ReviewResult) -> None:
+        if self.stage_machine is None:
+            return
+        destination = (
+            RunStage.INTEGRATION
+            if result.approved and not self.ledger.open()
+            else RunStage.REMEDIATION
+        )
+        self.stage_machine.transition(
+            destination,
+            reason=f"review_verdict:{result.verdict}",
+        )
+
+    def _fail_stage_for_result(self, retry_classification: str) -> None:
+        if self.stage_machine is None:
+            return
+        failure = {
+            "limit_wall": StageFailure.LIMIT_WALL,
+            "timeout": StageFailure.TIMED_OUT,
+        }.get(retry_classification, StageFailure.STAGE_FAILED)
+        self.stage_machine.fail(
+            failure,
+            reason=f"reviewer_error:{retry_classification}",
+        )
+
+    def _append_event(self, record_type: str, payload: Mapping[str, object]) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        factory = getattr(RunLifecycleEvent, record_type)
+        self.run_store.append_lifecycle_event(
+            factory(run_id=self.run_id, task_id=self.task_id, payload=payload)
+        )
+
+
 GateExecutor = Callable[..., subprocess.CompletedProcess[str]]
 
 
@@ -1102,12 +1868,27 @@ class RunContractResolver:
             primary_source = contributors[-1]
 
         implementer = route_payload(agent_selection.config, agent_selection.profile)
-        reviewer_profile = effective.reviewer_profile
+        configured_reviewer_profile = effective.reviewer_profile
+        reviewer_profile = configured_reviewer_profile
         if reviewer_profile is None:
             reviewer_agent = agent_selection.config
             reviewer_profile = agent_selection.profile
         else:
             reviewer_agent = self.config.agent_profiles[reviewer_profile]
+        reviewer_command = reviewer_agent.command
+        if configured_reviewer_profile is not None and reviewer_command is None:
+            reviewer_agent.require_command()
+        if configured_reviewer_profile is not None and not command_template_uses_field(
+            reviewer_command or "", "prompt"
+        ):
+            command_key = (
+                f"agent.profiles.{reviewer_profile}.command"
+                if reviewer_profile
+                else "agent.command"
+            )
+            raise AgentResolutionError(
+                f"{command_key} must include {{prompt}} for reviewer request delivery"
+            )
 
         payload: dict[str, object] = {
             "contract_version": RUN_CONTRACT_VERSION,
