@@ -16,7 +16,14 @@ from pathlib import Path
 from unittest import mock
 
 from vibe_loop.autopilot import (
+    AUTOPILOT_DISK_CAPACITY_BLOCKER,
+    DISK_HEALTH_CRITICAL,
+    DISK_HEALTH_OK,
     AutopilotCycleResult,
+    DiskCapacitySample,
+    DiskHealthCycleResult,
+    run_disk_health,
+    statvfs_capacity_probe,
     AutopilotTerminationRequested,
     CycleSummary,
     IdleWaitResult,
@@ -97,6 +104,7 @@ from vibe_loop.locks import (
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
@@ -6333,6 +6341,195 @@ def planning_launch_records(
         }
         for seconds_ago, cycle_id in entries
     ]
+
+
+GIB = 1024 * 1024 * 1024
+
+
+def _capacity_probe(
+    *,
+    total_bytes: int,
+    free_bytes: int,
+    total_inodes: int = 1_000_000,
+    free_inodes: int = 800_000,
+):
+    def probe(path: Path) -> DiskCapacitySample:
+        return DiskCapacitySample(
+            path=str(path),
+            total_bytes=total_bytes,
+            free_bytes=free_bytes,
+            total_inodes=total_inodes,
+            free_inodes=free_inodes,
+        )
+
+    return probe
+
+
+def _failing_probe(path: Path) -> DiskCapacitySample:
+    raise OSError("statvfs failed")
+
+
+class DiskHealthCheckTests(unittest.TestCase):
+    def _run(self, probe) -> DiskHealthCycleResult:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            return run_disk_health(config, cycle_id="c1", probe=probe)
+
+    def test_healthy_disk_reports_ok_without_blocker(self) -> None:
+        result = self._run(_capacity_probe(total_bytes=100 * GIB, free_bytes=50 * GIB))
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+        self.assertEqual(result.blocker, "")
+        self.assertEqual([target.label for target in result.targets], ["repo", "state"])
+        self.assertTrue(all(not target.critical for target in result.targets))
+
+    def test_exhausted_free_space_is_a_blocker(self) -> None:
+        result = self._run(
+            _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_CRITICAL)
+        self.assertEqual(result.blocker, AUTOPILOT_DISK_CAPACITY_BLOCKER)
+        self.assertIn("free_bytes", result.targets[0].pressure)
+
+    def test_small_disk_low_on_bytes_but_roomy_is_not_a_blocker(self) -> None:
+        # 400 MiB free is below the absolute floor but is 39% of a 1 GiB disk:
+        # proportionally roomy, so not a genuine exhaustion signal.
+        result = self._run(
+            _capacity_probe(total_bytes=GIB, free_bytes=400 * 1024 * 1024)
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+
+    def test_huge_disk_low_percentage_but_ample_bytes_is_not_a_blocker(self) -> None:
+        # Below 2% free but still 1 GiB available on a 100 TiB volume.
+        result = self._run(
+            _capacity_probe(total_bytes=100 * 1024 * GIB, free_bytes=GIB)
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+
+    def test_exhausted_inodes_is_a_blocker(self) -> None:
+        result = self._run(
+            _capacity_probe(
+                total_bytes=100 * GIB,
+                free_bytes=50 * GIB,
+                total_inodes=1_000_000,
+                free_inodes=5_000,
+            )
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_CRITICAL)
+        self.assertIn("free_inodes", result.targets[0].pressure)
+
+    def test_filesystem_without_inode_accounting_ignores_inode_pressure(self) -> None:
+        result = self._run(
+            _capacity_probe(
+                total_bytes=100 * GIB,
+                free_bytes=50 * GIB,
+                total_inodes=0,
+                free_inodes=0,
+            )
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+
+    def test_probe_error_is_a_non_blocking_observation(self) -> None:
+        result = self._run(_failing_probe)
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+        self.assertEqual(result.blocker, "")
+        self.assertEqual(result.probe_errors, 2)
+        self.assertTrue(all(target.sample is None for target in result.targets))
+        self.assertTrue(all(target.error for target in result.targets))
+
+    def test_record_mirrors_maintenance_shape(self) -> None:
+        result = self._run(
+            _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
+        )
+        record = result.to_record(Path("/repo"))
+
+        self.assertEqual(record["record_type"], AUTOPILOT_DISK_HEALTH_RECORD_TYPE)
+        self.assertEqual(record["status"], DISK_HEALTH_CRITICAL)
+        self.assertEqual(record["blocker"], AUTOPILOT_DISK_CAPACITY_BLOCKER)
+        self.assertEqual(record["repo"], "/repo")
+        self.assertEqual(record["cycle_id"], "c1")
+        self.assertIn("thresholds", record)
+        self.assertEqual(len(record["targets"]), 2)
+
+    def test_default_probe_reads_real_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sample = statvfs_capacity_probe(Path(directory))
+
+        self.assertGreater(sample.total_bytes, 0)
+        self.assertGreaterEqual(sample.free_bytes, 0)
+
+
+class DiskHealthCycleTests(unittest.TestCase):
+    def _disk_records(self, config) -> list[dict[str, object]]:
+        records = RunStore(config.state_path / "runs.jsonl").read_records()
+        return [
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_DISK_HEALTH_RECORD_TYPE
+        ]
+
+    def _runner(self, probe):
+        def runner(config, *, cycle_id):
+            return run_disk_health(config, cycle_id=cycle_id, probe=probe)
+
+        return runner
+
+    def test_capacity_blocker_withholds_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                disk_health_runner=self._runner(
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
+                ),
+            )
+            disk_records = self._disk_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertIn(AUTOPILOT_DISK_CAPACITY_BLOCKER, cycle.blockers)
+        self.assertIn(f"disk_health:{DISK_HEALTH_CRITICAL}", cycle.actions)
+        self.assertEqual(len(launched), 0)
+        self.assertEqual(len(disk_records), 1)
+        self.assertEqual(disk_records[0]["status"], DISK_HEALTH_CRITICAL)
+
+    def test_healthy_disk_records_observation_and_allows_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                disk_health_runner=self._runner(
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=50 * GIB)
+                ),
+            )
+            disk_records = self._disk_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertNotIn(AUTOPILOT_DISK_CAPACITY_BLOCKER, cycle.blockers)
+        self.assertIn(f"disk_health:{DISK_HEALTH_OK}", cycle.actions)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(len(disk_records), 1)
+        self.assertEqual(disk_records[0]["status"], DISK_HEALTH_OK)
 
 
 class PlanningSourceFingerprintTests(unittest.TestCase):

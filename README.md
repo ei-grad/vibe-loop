@@ -629,9 +629,21 @@ primary worktree and never dirty or unmerged work-in-progress. Every cycle
 journals the configured policy, candidate evidence, reasons, outcomes, and
 `worktree_disposition_policy:*`, `worktree_disposition_candidates:N`, and
 `reaped_worktrees:N` action tags.
+Each cycle also runs a native, read-only disk-health check even when no
+`health_command` is configured. It probes the repository and state directory for
+free-space and inode pressure against bounded thresholds and journals one
+`autopilot_disk_health` record plus a `disk_health:ok|critical` action tag. A
+target is only a genuine capacity blocker when both an absolute reserve
+(512 MiB free / 10,000 free inodes) and a proportional reserve (2% free) are
+exhausted, so a large disk that is proportionally low but has ample bytes, and a
+small disk low on bytes but proportionally roomy, are not misreported.
+Filesystems that do not expose inode counts skip the inode check. A genuine
+capacity blocker withholds launch (`autopilot_disk_capacity_low`); the check
+never deletes or truncates anything, and an unreadable path is recorded as a
+non-blocking observation rather than a blocker.
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
-task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
+task source, an unavailable agent command, or exhausted disk/inode capacity. `--once` runs one cycle. Without `--interval`, it drains runnable
 work and exits when a cycle is idle or blocked; with `--interval N` it stays
 resident until `--max-cycles` or an interrupt. Idle cycles use bounded adaptive
 task-source rechecks: the first listing follows `planning_recheck_seconds`

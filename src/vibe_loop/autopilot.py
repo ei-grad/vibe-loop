@@ -67,6 +67,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
@@ -3404,6 +3405,232 @@ def run_maintenance_command(
     )
 
 
+# Bounded capacity thresholds for the native disk-health check (PRD-AUT-012).
+# A target is a genuine capacity blocker only when BOTH an absolute reserve and
+# a proportional reserve are exhausted, so a large disk with a low percentage
+# but ample bytes, and a small disk low on bytes but proportionally roomy, are
+# not misreported as capacity failures.
+AUTOPILOT_DISK_MIN_FREE_BYTES = 512 * 1024 * 1024
+AUTOPILOT_DISK_MIN_FREE_FRACTION = 0.02
+AUTOPILOT_DISK_MIN_FREE_INODES = 10_000
+AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION = 0.02
+DISK_HEALTH_OK = "ok"
+DISK_HEALTH_CRITICAL = "critical"
+AUTOPILOT_DISK_CAPACITY_BLOCKER = "autopilot_disk_capacity_low"
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskHealthThresholds:
+    """Bounded free-space/inode floors the disk-health check compares against."""
+
+    min_free_bytes: int = AUTOPILOT_DISK_MIN_FREE_BYTES
+    min_free_fraction: float = AUTOPILOT_DISK_MIN_FREE_FRACTION
+    min_free_inodes: int = AUTOPILOT_DISK_MIN_FREE_INODES
+    min_free_inode_fraction: float = AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "min_free_bytes": self.min_free_bytes,
+            "min_free_fraction": self.min_free_fraction,
+            "min_free_inodes": self.min_free_inodes,
+            "min_free_inode_fraction": self.min_free_inode_fraction,
+        }
+
+
+DEFAULT_DISK_HEALTH_THRESHOLDS = DiskHealthThresholds()
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskCapacitySample:
+    """A capacity reading for one filesystem path.
+
+    ``total_inodes == 0`` marks a filesystem that does not expose an inode
+    count (some FUSE/network mounts); inode pressure is treated as not
+    applicable there rather than as exhaustion.
+    """
+
+    path: str
+    total_bytes: int
+    free_bytes: int
+    total_inodes: int
+    free_inodes: int
+
+    @property
+    def free_bytes_fraction(self) -> float:
+        if self.total_bytes <= 0:
+            return 1.0
+        return self.free_bytes / self.total_bytes
+
+    @property
+    def free_inodes_fraction(self) -> float:
+        if self.total_inodes <= 0:
+            return 1.0
+        return self.free_inodes / self.total_inodes
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "total_bytes": self.total_bytes,
+            "free_bytes": self.free_bytes,
+            "free_bytes_fraction": self.free_bytes_fraction,
+            "total_inodes": self.total_inodes,
+            "free_inodes": self.free_inodes,
+            "free_inodes_fraction": self.free_inodes_fraction,
+        }
+
+
+# Reads a filesystem capacity sample for a path. Defaults to ``os.statvfs``;
+# injected in tests so acceptance never depends on real disk state.
+DiskCapacityProbe = Callable[[Path], DiskCapacitySample]
+
+
+def statvfs_capacity_probe(path: Path) -> DiskCapacitySample:
+    stat = os.statvfs(path)
+    return DiskCapacitySample(
+        path=str(path),
+        total_bytes=stat.f_frsize * stat.f_blocks,
+        free_bytes=stat.f_frsize * stat.f_bavail,
+        total_inodes=stat.f_files,
+        free_inodes=stat.f_favail,
+    )
+
+
+def _evaluate_capacity_pressure(
+    sample: DiskCapacitySample, thresholds: DiskHealthThresholds
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if (
+        sample.free_bytes < thresholds.min_free_bytes
+        and sample.free_bytes_fraction < thresholds.min_free_fraction
+    ):
+        reasons.append("free_bytes")
+    if (
+        sample.total_inodes > 0
+        and sample.free_inodes < thresholds.min_free_inodes
+        and sample.free_inodes_fraction < thresholds.min_free_inode_fraction
+    ):
+        reasons.append("free_inodes")
+    return tuple(reasons)
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskCapacityTarget:
+    """One probed path, its reading, and any exhausted-reserve reasons."""
+
+    label: str
+    path: str
+    sample: DiskCapacitySample | None
+    pressure: tuple[str, ...]
+    error: str
+
+    @property
+    def critical(self) -> bool:
+        return bool(self.pressure)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "label": self.label,
+            "path": self.path,
+            "sample": self.sample.to_json() if self.sample is not None else None,
+            "pressure": list(self.pressure),
+            "error": self.error,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskHealthCycleResult:
+    """Outcome of one cycle's native disk-health check (PRD-AUT-011/012).
+
+    Mirrors the maintenance-command-result record shape: a single typed
+    ``autopilot_disk_health`` record carries the thresholds and per-target
+    evidence. A probe error is a non-blocking observation, not a capacity
+    blocker: an unreadable path can never be a *genuine* exhaustion signal, and
+    the non-destructive boundary (PRD-AUT-006) forbids acting on ambiguity.
+    """
+
+    cycle_id: str
+    thresholds: DiskHealthThresholds
+    targets: tuple[DiskCapacityTarget, ...]
+
+    @property
+    def status(self) -> str:
+        if any(target.critical for target in self.targets):
+            return DISK_HEALTH_CRITICAL
+        return DISK_HEALTH_OK
+
+    @property
+    def blocker(self) -> str:
+        if self.status == DISK_HEALTH_CRITICAL:
+            return AUTOPILOT_DISK_CAPACITY_BLOCKER
+        return ""
+
+    @property
+    def probe_errors(self) -> int:
+        return sum(1 for target in self.targets if target.error)
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "blocker": self.blocker,
+            "thresholds": self.thresholds.to_json(),
+            "targets": [target.to_json() for target in self.targets],
+        }
+
+
+DiskHealthRunner = Callable[..., DiskHealthCycleResult]
+
+
+def run_disk_health(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    probe: DiskCapacityProbe = statvfs_capacity_probe,
+    thresholds: DiskHealthThresholds = DEFAULT_DISK_HEALTH_THRESHOLDS,
+) -> DiskHealthCycleResult:
+    """Run the native, read-only disk-health check for the cycle.
+
+    Probes the repository and state directory for free-space/inode pressure
+    against bounded thresholds. The probe is dependency-injected so tests never
+    depend on real disk state. This step never deletes, truncates, or otherwise
+    mutates anything: it only reports pressure and, on a genuine capacity
+    blocker, signals the cycle to withhold launch (PRD-AUT-006).
+    """
+    targets: list[DiskCapacityTarget] = []
+    for label, path in (("repo", config.repo), ("state", config.state_path)):
+        try:
+            sample = probe(path)
+        except OSError as error:
+            targets.append(
+                DiskCapacityTarget(
+                    label=label,
+                    path=str(path),
+                    sample=None,
+                    pressure=(),
+                    error=str(error),
+                )
+            )
+            continue
+        targets.append(
+            DiskCapacityTarget(
+                label=label,
+                path=str(path),
+                sample=sample,
+                pressure=_evaluate_capacity_pressure(sample, thresholds),
+                error="",
+            )
+        )
+    return DiskHealthCycleResult(
+        cycle_id=cycle_id,
+        thresholds=thresholds,
+        targets=tuple(targets),
+    )
+
+
 # Returns the parsed JSON decision payload (or ``None``) for a disposition
 # prompt. Defaults to ``VibeRunner.run_analysis_agent`` (PRD-AUT-009); injected
 # in tests so the read-only analysis agent never runs as a real subprocess.
@@ -4559,6 +4786,7 @@ def execute_autopilot_cycle(
     run_store: RunStore,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
+    disk_health_runner: DiskHealthRunner = run_disk_health,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
@@ -4609,12 +4837,20 @@ def execute_autopilot_cycle(
     if disposition.agent_error:
         actions.append("worktree_disposition_agent_error")
 
+    disk_health = disk_health_runner(config, cycle_id=cycle_id)
+    run_store.append_record(disk_health.to_record(config.repo))
+    actions.append(f"disk_health:{disk_health.status}")
+    if disk_health.probe_errors:
+        actions.append(f"disk_health_probe_errors:{disk_health.probe_errors}")
+
     blocker_list = list(status.blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
         blocker_list.remove("repo_dirty")
         actions.append("repo_dirty_ignored")
     if cleanup_errors:
         blocker_list.append("stale_lock_cleanup_failed")
+    if disk_health.blocker:
+        blocker_list.append(disk_health.blocker)
 
     def run_maintenance(kind: str) -> MaintenanceCommandResult | None:
         command = config.autopilot.maintenance_command(kind)
@@ -5360,6 +5596,7 @@ def run_autopilot(
     launcher: RunUntilDoneLauncher | None = None,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
+    disk_health_runner: DiskHealthRunner = run_disk_health,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     idle_waiter: Callable[..., IdleWaitResult] = wait_for_idle_change,
     idle_wake_command_runner: Callable[..., dict[str, object] | None] = (
@@ -5525,6 +5762,7 @@ def run_autopilot(
                 run_store=run_store,
                 maintenance_runner=maintenance_runner,
                 worktree_disposition_runner=worktree_disposition_runner,
+                disk_health_runner=disk_health_runner,
                 native_planning_runner=native_planning_runner,
             )
             idle_wait_seconds = interval
