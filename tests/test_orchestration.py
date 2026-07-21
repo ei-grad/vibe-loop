@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +22,13 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
 )
 from vibe_loop.orchestration import (
+    CandidateCollectionError,
+    CandidateCollector,
+    GateExecutionError,
+    GateRemediationExhausted,
+    GateRunner,
     LEGAL_STAGE_TRANSITIONS,
+    RuntimeGateController,
     STAGE_FAILURES,
     IllegalStageTransitionError,
     RunContractProposal,
@@ -422,6 +430,477 @@ class RunLifecycleStateMachineTests(unittest.TestCase):
         gate_records = [record for record in records if record["to_stage"] == "gates"]
         self.assertEqual([record["ordinal"] for record in candidate_records], [1, 2])
         self.assertEqual([record["ordinal"] for record in gate_records], [1, 2])
+
+
+class RuntimeGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        init_git_repo(self.repo)
+        self.base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-b", "worker/task-01")
+        (self.repo / "tracked.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(self.repo, "commit", "-m", "candidate")
+        self.head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.store = RunStore(self.repo / ".vibe-loop" / "runs.jsonl")
+        self.collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+
+    def test_candidate_declaration_and_derivation_are_validated_and_recorded(
+        self,
+    ) -> None:
+        declared = self.collector.collect_declared(
+            head_commit=self.head,
+            base_main=self.base,
+            changed_paths=("tracked.txt",),
+        )
+        derived = self.collector.collect_derived()
+
+        self.assertEqual(declared.head_commit, self.head)
+        self.assertEqual(declared.changed_paths, ("tracked.txt",))
+        self.assertEqual(declared.source, "worker_command")
+        self.assertEqual(derived.source, "derived")
+        self.assertEqual(declared.fingerprint, derived.fingerprint)
+        records = self.store.read_records()
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            ["candidate_recorded", "candidate_recorded"],
+        )
+
+        with self.assertRaisesRegex(
+            CandidateCollectionError, "does not match the claimed workspace"
+        ):
+            self.collector.collect_declared(head_commit=self.base)
+
+    def test_candidate_rejects_uncommitted_tracked_changes(self) -> None:
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            CandidateCollectionError, "uncommitted tracked changes"
+        ):
+            self.collector.collect_derived()
+
+    def test_gate_records_redacted_evidence_and_invalidates_mutating_gate(
+        self,
+    ) -> None:
+        command_canary = "printf 'mutated\\n' >> tracked.txt"
+        candidate = self.collector.collect_derived()
+        runner = GateRunner(
+            completion_commands=(command_canary,),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+        )
+
+        summary = runner.run(candidate)
+
+        self.assertFalse(summary.passed)
+        self.assertEqual(summary.results[0].exit_class, "candidate_changed")
+        with self.assertRaises(GateExecutionError):
+            summary.require_review_ready()
+        gate_record = self.store.read_records()[-1]
+        self.assertEqual(gate_record["command_key"], "completion.commands[0]")
+        self.assertNotIn(command_canary, json.dumps(gate_record))
+
+    def test_gate_detects_tracked_mutation_that_is_restored_before_exit(self) -> None:
+        mutation_script = (
+            "from pathlib import Path; import time; "
+            "path = Path('tracked.txt'); original = path.read_bytes(); "
+            "path.write_bytes(b'temporary mutation\\n'); time.sleep(0.08); "
+            "path.write_bytes(original); time.sleep(0.03)"
+        )
+        command = shlex.join([sys.executable, "-c", mutation_script])
+        candidate = self.collector.collect_derived()
+        summary = GateRunner(
+            completion_commands=(command,),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "transient-gates",
+            candidate_poll_seconds=0.005,
+        ).run(candidate)
+
+        self.assertEqual(summary.results[0].exit_code, 0)
+        self.assertEqual(summary.results[0].exit_class, "candidate_changed")
+        self.assertTrue(self.collector.matches(candidate))
+
+    def test_passing_gates_do_not_authorize_unrecorded_candidate(self) -> None:
+        unrecorded_store = RunStore(self.repo / ".vibe-loop" / "unrecorded.jsonl")
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=unrecorded_store,
+            run_id="run-unrecorded",
+            task_id="TASK-01",
+        )
+        candidate = collector.snapshot(source="derived")
+        summary = GateRunner(
+            completion_commands=("true",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=collector,
+            run_store=unrecorded_store,
+            run_id="run-unrecorded",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "unrecorded-gates",
+        ).run(candidate)
+
+        self.assertTrue(summary.passed)
+        self.assertFalse(summary.candidate_recorded)
+        with self.assertRaises(GateExecutionError):
+            summary.require_review_ready()
+
+    def test_gate_resume_skips_recorded_pass_and_preserves_recorded_failure(
+        self,
+    ) -> None:
+        candidate = self.collector.collect_derived()
+        calls: list[str] = []
+
+        def crash_on_second(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(command, 0)
+
+        first = GateRunner(
+            completion_commands=("first", "second"),
+            gate_keys=("completion.commands[0]", "completion.commands[1]"),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=crash_on_second,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            first.run(candidate)
+
+        resumed_calls: list[str] = []
+
+        def pass_gate(command, **kwargs):
+            resumed_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        resumed = GateRunner(
+            completion_commands=("first", "second"),
+            gate_keys=("completion.commands[0]", "completion.commands[1]"),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(candidate)
+
+        self.assertTrue(resumed.passed)
+        self.assertEqual(resumed_calls, ["second"])
+        self.assertTrue(resumed.results[0].resumed)
+
+        Path(resumed.results[0].log_reference).write_text(
+            "tampered\n", encoding="utf-8"
+        )
+        resumed_calls.clear()
+        after_tamper = GateRunner(
+            completion_commands=("first", "second"),
+            gate_keys=("completion.commands[0]", "completion.commands[1]"),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(candidate)
+        self.assertTrue(after_tamper.passed)
+        self.assertEqual(resumed_calls, ["first"])
+
+        failed_store = RunStore(self.repo / ".vibe-loop" / "failed.jsonl")
+        failed_collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=failed_store,
+            run_id="run-2",
+            task_id="TASK-01",
+        )
+        failed_candidate = failed_collector.collect_derived()
+        failed = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=failed_collector,
+            run_store=failed_store,
+            run_id="run-2",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "failed-gates",
+        )
+        self.assertFalse(failed.run(failed_candidate).passed)
+
+        def unexpected_executor(*args, **kwargs):
+            self.fail("a recorded failed gate must route to remediation")
+
+        replay = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=failed_collector,
+            run_store=failed_store,
+            run_id="run-2",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "failed-gates",
+            executor=unexpected_executor,
+        ).run(failed_candidate)
+        self.assertFalse(replay.passed)
+        self.assertTrue(replay.results[0].resumed)
+
+    def test_remediation_budget_is_journaled_and_exhaustion_is_typed(self) -> None:
+        candidate = self.collector.collect_derived()
+        stage_records: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: stage_records.append(transition.to_payload())
+        )
+        for stage in (RunStage.ACTIVATION, RunStage.WORKSPACE, RunStage.IMPLEMENTING):
+            machine.transition(stage, reason="setup")
+        runner = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "controller-gates",
+        )
+
+        def remediate(round_number, _summary):
+            (self.repo / "tracked.txt").write_text(
+                f"candidate {round_number}\n", encoding="utf-8"
+            )
+            git(self.repo, "add", "tracked.txt")
+            git(self.repo, "commit", "-m", f"remediation {round_number}")
+
+        controller = RuntimeGateController(
+            candidate_collector=self.collector,
+            gate_runner=runner,
+            stage_machine=machine,
+            max_remediation_rounds=1,
+            remediation_launcher=remediate,
+        )
+
+        with self.assertRaises(GateRemediationExhausted) as raised:
+            controller.run(candidate)
+
+        self.assertEqual(raised.exception.max_rounds, 1)
+        self.assertEqual(
+            [record["to_stage"] for record in stage_records],
+            [
+                "activation",
+                "workspace",
+                "implementing",
+                "candidate",
+                "gates",
+                "remediation",
+                "candidate",
+                "gates",
+                "classification",
+            ],
+        )
+        self.assertEqual(stage_records[-1]["failure"], "stage_failed")
+
+    def test_controller_resumes_candidate_and_gate_journal_boundaries(self) -> None:
+        candidate_records: list[dict[str, object]] = []
+
+        def journal(transition) -> None:
+            candidate_records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+
+        candidate_machine = RunLifecycleStateMachine(journal)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+        ):
+            candidate_machine.transition(stage, reason="setup")
+        restored_candidate = RunLifecycleStateMachine.from_records(
+            candidate_records, journal
+        )
+        candidate_summary = RuntimeGateController(
+            candidate_collector=self.collector,
+            gate_runner=GateRunner(
+                completion_commands=("true",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "candidate-resume",
+            ),
+            stage_machine=restored_candidate,
+            max_remediation_rounds=1,
+            remediation_launcher=lambda _round, _summary: self.fail(
+                "passing candidate recovery must not remediate"
+            ),
+        ).run()
+        self.assertTrue(candidate_summary.passed)
+
+        gate_store = RunStore(self.repo / ".vibe-loop" / "gate-resume.jsonl")
+        gate_collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=gate_store,
+            run_id="run-gates",
+            task_id="TASK-01",
+        )
+        gate_candidate = gate_collector.collect_derived()
+        gate_records: list[dict[str, object]] = []
+
+        def gate_journal(transition) -> None:
+            gate_records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+
+        gate_machine = RunLifecycleStateMachine(gate_journal)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            gate_machine.transition(stage, reason="setup")
+        initial_calls: list[str] = []
+
+        def crash_second(command, **kwargs):
+            initial_calls.append(command)
+            if len(initial_calls) == 2:
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(command, 0)
+
+        with self.assertRaises(KeyboardInterrupt):
+            GateRunner(
+                completion_commands=("first", "second"),
+                gate_keys=("completion.commands[0]", "completion.commands[1]"),
+                candidate_collector=gate_collector,
+                run_store=gate_store,
+                run_id="run-gates",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "gate-boundary",
+                executor=crash_second,
+            ).run(gate_candidate)
+        pending_calls: list[str] = []
+
+        def pass_pending(command, **kwargs):
+            pending_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        restored_gates = RunLifecycleStateMachine.from_records(
+            gate_records, gate_journal
+        )
+        gate_summary = RuntimeGateController(
+            candidate_collector=gate_collector,
+            gate_runner=GateRunner(
+                completion_commands=("first", "second"),
+                gate_keys=("completion.commands[0]", "completion.commands[1]"),
+                candidate_collector=gate_collector,
+                run_store=gate_store,
+                run_id="run-gates",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "gate-boundary",
+                executor=pass_pending,
+            ),
+            stage_machine=restored_gates,
+            max_remediation_rounds=1,
+            remediation_launcher=lambda _round, _summary: self.fail(
+                "passing gate recovery must not remediate"
+            ),
+        ).run()
+        self.assertTrue(gate_summary.passed)
+        self.assertEqual(pending_calls, ["second"])
+
+    def test_controller_routes_recorded_gate_failure_without_rerunning_it(
+        self,
+    ) -> None:
+        failure_store = RunStore(self.repo / ".vibe-loop" / "failure-resume.jsonl")
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=failure_store,
+            run_id="run-failure",
+            task_id="TASK-01",
+        )
+        candidate = collector.collect_derived()
+        stage_records: list[dict[str, object]] = []
+
+        def journal(transition) -> None:
+            stage_records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+
+        machine = RunLifecycleStateMachine(journal)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        failing_runner = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=collector,
+            run_store=failure_store,
+            run_id="run-failure",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "failure-boundary",
+        )
+        self.assertFalse(failing_runner.run(candidate).passed)
+        executor_calls: list[str] = []
+        remediation_summaries = []
+
+        def unexpected_executor(command, **kwargs):
+            executor_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        def observe_remediation(_round, summary):
+            remediation_summaries.append(summary)
+            raise RuntimeError("remediation relaunched")
+
+        restored = RunLifecycleStateMachine.from_records(stage_records, journal)
+        with self.assertRaisesRegex(RuntimeError, "remediation relaunched"):
+            RuntimeGateController(
+                candidate_collector=collector,
+                gate_runner=GateRunner(
+                    completion_commands=("false",),
+                    gate_keys=("completion.commands[0]",),
+                    candidate_collector=collector,
+                    run_store=failure_store,
+                    run_id="run-failure",
+                    task_id="TASK-01",
+                    log_dir=self.repo / ".vibe-loop" / "failure-boundary",
+                    executor=unexpected_executor,
+                ),
+                stage_machine=restored,
+                max_remediation_rounds=1,
+                remediation_launcher=observe_remediation,
+            ).run()
+
+        self.assertEqual(executor_calls, [])
+        self.assertEqual(len(remediation_summaries), 1)
+        self.assertTrue(remediation_summaries[0].results[0].resumed)
 
 
 class RunContractJournalTests(unittest.TestCase):

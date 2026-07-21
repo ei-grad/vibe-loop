@@ -372,6 +372,11 @@ vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \
   --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
   --branch "$BRANCH" --worktree "$WORKTREE"
 
+# Declare the committed candidate from the claimed workspace.
+vibe-loop worker candidate --repo "$VIBE_LOOP_REPO" \
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
+  --head "$(git rev-parse HEAD)"
+
 # Serialize the refresh/verify/fast-forward-merge critical section.
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
   --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" --wait --timeout 300
@@ -395,6 +400,12 @@ the agent with that worktree as cwd. `main-integration acquire --wait --timeout
 N` waits for a live or unknown holder; stale locks are reported, never stolen.
 If the active task lock has a workspace claim, acquisition is blocked when the
 claim's diagnostics make integration unsafe.
+
+`worker candidate` requires the active fencing capability and a prior workspace
+claim. It derives the recorded base and changed paths from Git, rejects a
+declared HEAD that does not match the clean tracked workspace, and records only
+candidate identity. Runtime-owned gates use that record; worker-owned runs keep
+their existing completion behavior.
 
 Fencing tokens remain internal lock capabilities. CLI JSON, worker/status
 views, troubleshooting output, and persisted run diagnostics replace fencing

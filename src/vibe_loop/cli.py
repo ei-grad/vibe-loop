@@ -79,6 +79,7 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
 )
 from vibe_loop.locks import integration_lock_waitable
+from vibe_loop.orchestration import CandidateCollectionError, CandidateCollector
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
@@ -108,10 +109,12 @@ from vibe_loop.task_views import (
 )
 from vibe_loop.tasks import Task
 from vibe_loop.workers import (
+    ActiveRunState,
     StaleLock,
     WorkerView,
     WorkspaceClaimError,
     build_worker_views,
+    active_task_lock_for_claim,
     claim_worker_workspace,
     clean_stale_locks,
     collect_stale_locks,
@@ -504,6 +507,18 @@ def build_parser() -> argparse.ArgumentParser:
     claim_workspace.add_argument("--worktree", type=Path, required=True)
     claim_workspace.add_argument("--base-commit", default="")
     claim_workspace.add_argument("--fencing-token", default="")
+    candidate = worker_subparsers.add_parser(
+        "candidate",
+        help="Record a fenced candidate declaration for the claimed workspace",
+    )
+    add_repo_argument(candidate)
+    candidate.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    candidate.add_argument("--run-id", default="")
+    candidate.add_argument("--task-id", default="")
+    candidate.add_argument("--head", required=True)
+    candidate.add_argument("--base-main", default="")
+    candidate.add_argument("--changed-path", action="append", default=[])
+    candidate.add_argument("--fencing-token", default="")
     heartbeat = worker_subparsers.add_parser(
         "heartbeat",
         help="Refresh the heartbeat timestamp on an active task lock",
@@ -1876,6 +1891,77 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 "worker workspace claimed "
                 f"task={task_id} run={run_id} branch={claim.branch} "
                 f"worktree={claim.worktree}"
+            )
+        return 0
+
+    if args.worker_command == "candidate":
+        run_id, task_id = worker_identity_from_args(args)
+        if not run_id or not task_id:
+            print(
+                "worker candidate requires --run-id and --task-id "
+                "or VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID",
+                file=sys.stderr,
+            )
+            return 2
+        fencing_token = fencing_token_from_args(args)
+        if not fencing_token:
+            print("worker candidate requires an active fencing token", file=sys.stderr)
+            return 2
+        require_project_binding(config)
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+            runtime_context=config.runtime_environment,
+        )
+        run_store = RunStore(config.state_path / "runs.jsonl")
+        try:
+            lock = active_task_lock_for_claim(
+                manager,
+                task_id=task_id,
+                run_id=run_id,
+                fencing_token=fencing_token,
+            )
+            active = ActiveRunState.from_lock_metadata(lock.metadata)
+            if active is None or active.workspace is None:
+                raise CandidateCollectionError(
+                    "candidate_workspace_missing",
+                    "candidate declaration requires a claimed workspace",
+                )
+            claim = active.workspace
+            collector = CandidateCollector(
+                worktree=claim.worktree,
+                branch=claim.branch,
+                base_main=claim.base_commit,
+                run_store=run_store,
+                run_id=run_id,
+                task_id=task_id,
+            )
+            recorded = collector.collect_declared(
+                head_commit=args.head,
+                base_main=args.base_main,
+                changed_paths=args.changed_path,
+            )
+        except (WorkspaceClaimError, CandidateCollectionError) as exc:
+            code = getattr(exc, "code", "candidate_rejected")
+            payload = {
+                "recorded": False,
+                "error": code,
+                "message": str(exc),
+                "details": getattr(exc, "details", {}),
+            }
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"worker candidate refused: {code}: {exc}", file=sys.stderr)
+            return 1
+        payload = {"recorded": True, "candidate": recorded.to_payload()}
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                "worker candidate recorded "
+                f"task={task_id} run={run_id} head={recorded.head_commit}"
             )
         return 0
 

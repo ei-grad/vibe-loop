@@ -68,6 +68,7 @@ from vibe_loop.orchestration import (
     StageFailure,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
+    run_configured_command,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
@@ -3256,15 +3257,10 @@ class VibeRunner:
     def run_completion_checks(self, log) -> str:
         for command in self.config.completion.commands:
             report_status(f"completion check started: {command}", log)
-            result = subprocess.run(
+            result = run_configured_command(
                 command,
-                cwd=self.config.repo,
-                shell=True,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                worktree=self.config.repo,
+                log=log,
             )
             report_status(
                 f"completion check exit_code={result.returncode}: {command}", log

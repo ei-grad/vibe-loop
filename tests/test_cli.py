@@ -4922,6 +4922,150 @@ class CliTests(unittest.TestCase):
         self.assertEqual(workers_stderr.getvalue(), "")
         self.assertEqual(workers_payload[0]["workspace"], workspace)
 
+    def test_worker_candidate_records_claimed_head_and_rejects_wrong_fence(
+        self,
+    ) -> None:
+        fencing_token = "candidate-fencing-canary"
+        wrong_token = "wrong-candidate-fencing-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_planning_repo(repo, PLAN)
+            base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            subprocess.run(
+                ["git", "checkout", "-b", "worker/TASK-01"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            (repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+            subprocess.run(["git", "add", "candidate.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "candidate"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            active_lock = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            active_lock.mkdir(parents=True)
+            (active_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "TASK-01",
+                        "run_id": "run-1",
+                        "pid": os.getpid(),
+                        "worker_pid": os.getpid(),
+                        "host": socket.gethostname(),
+                        "started_at": "2026-07-21T00:00:00+00:00",
+                        "base_main": base,
+                        "fencing_token": fencing_token,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claim_stdout = StringIO()
+            with redirect_stdout(claim_stdout):
+                claim_exit = main(
+                    [
+                        "worker",
+                        "claim-workspace",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--branch",
+                        "worker/TASK-01",
+                        "--worktree",
+                        str(repo),
+                        "--fencing-token",
+                        fencing_token,
+                        "--json",
+                    ]
+                )
+            candidate_stdout = StringIO()
+            candidate_stderr = StringIO()
+            with redirect_stdout(candidate_stdout), redirect_stderr(candidate_stderr):
+                candidate_exit = main(
+                    [
+                        "worker",
+                        "candidate",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--head",
+                        head,
+                        "--base-main",
+                        base,
+                        "--changed-path",
+                        "candidate.txt",
+                        "--fencing-token",
+                        fencing_token,
+                        "--json",
+                    ]
+                )
+            wrong_stdout = StringIO()
+            wrong_stderr = StringIO()
+            with redirect_stdout(wrong_stdout), redirect_stderr(wrong_stderr):
+                wrong_exit = main(
+                    [
+                        "worker",
+                        "candidate",
+                        "--repo",
+                        str(repo),
+                        "--run-id",
+                        "run-1",
+                        "--task-id",
+                        "TASK-01",
+                        "--head",
+                        head,
+                        "--fencing-token",
+                        wrong_token,
+                        "--json",
+                    ]
+                )
+            records_text = (repo / ".vibe-loop" / "runs.jsonl").read_text(
+                encoding="utf-8"
+            )
+            records = [json.loads(line) for line in records_text.splitlines()]
+
+        payload = json.loads(candidate_stdout.getvalue())
+        wrong_payload = json.loads(wrong_stdout.getvalue())
+        rendered_wrong = wrong_stdout.getvalue() + wrong_stderr.getvalue()
+        self.assertEqual(claim_exit, 0)
+        self.assertEqual(candidate_exit, 0)
+        self.assertEqual(candidate_stderr.getvalue(), "")
+        self.assertTrue(payload["recorded"])
+        self.assertEqual(payload["candidate"]["head_commit"], head)
+        self.assertEqual(payload["candidate"]["base_main"], base)
+        self.assertEqual(payload["candidate"]["changed_paths"], ["candidate.txt"])
+        self.assertEqual(records[-1]["record_type"], "candidate_recorded")
+        self.assertEqual(records[-1]["source"], "worker_command")
+        self.assertEqual(wrong_exit, 1)
+        self.assertEqual(wrong_payload["error"], "fencing_token_mismatch")
+        self.assertNotIn(fencing_token, rendered_wrong)
+        self.assertNotIn(wrong_token, rendered_wrong)
+
     def test_worker_claim_workspace_rejects_owner_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

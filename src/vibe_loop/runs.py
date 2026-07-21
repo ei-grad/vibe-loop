@@ -44,6 +44,8 @@ LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
 RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKSPACE_PROVISIONED_RECORD_TYPE = "workspace_provisioned"
+CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
+GATE_RESULT_RECORD_TYPE = "gate_result"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
@@ -101,6 +103,8 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         RUN_STARTED_RECORD_TYPE,
         RUN_CONTRACT_RESOLVED_RECORD_TYPE,
         WORKSPACE_PROVISIONED_RECORD_TYPE,
+        CANDIDATE_RECORDED_RECORD_TYPE,
+        GATE_RESULT_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
@@ -639,6 +643,36 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=WORKSPACE_PROVISIONED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def candidate_recorded(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=CANDIDATE_RECORDED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def gate_result(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=GATE_RESULT_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,

@@ -6,9 +6,11 @@ import hashlib
 import json
 import re
 import subprocess
+import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from vibe_loop.config import (
     AgentConfig,
@@ -24,6 +26,8 @@ RUN_CONTRACT_VERSION = 1
 RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
 WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
+CANDIDATE_RECORD_SOURCE_KINDS = ("worker_command", "derived")
+GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 
 
 class RunStage(enum.StrEnum):
@@ -76,6 +80,33 @@ LEGAL_STAGE_TRANSITIONS: Mapping[RunStage, frozenset[RunStage]] = {
 
 class StageTransitionError(RuntimeError):
     pass
+
+
+class CandidateCollectionError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        self.code = code
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
+class GateExecutionError(RuntimeError):
+    pass
+
+
+class GateRemediationExhausted(GateExecutionError):
+    def __init__(self, max_rounds: int, failed_gate_keys: Sequence[str]) -> None:
+        self.max_rounds = max_rounds
+        self.failed_gate_keys = tuple(failed_gate_keys)
+        super().__init__(
+            "gate remediation exhausted after "
+            f"{max_rounds} round(s): {', '.join(self.failed_gate_keys)}"
+        )
 
 
 class IllegalStageTransitionError(StageTransitionError):
@@ -137,6 +168,9 @@ class RunLifecycleStateMachine:
         if self._stage is None:
             return 0
         return self._ordinals.get(self._stage, 0)
+
+    def ordinal_for(self, stage: RunStage) -> int:
+        return self._ordinals.get(stage, 0)
 
     def transition(
         self,
@@ -259,6 +293,727 @@ def derive_stage_progress(
             occurred_at=occurred_at if isinstance(occurred_at, str) else "",
         )
     return latest
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateRecord:
+    branch: str
+    worktree: Path
+    base_main: str
+    head_commit: str
+    changed_paths: tuple[str, ...]
+    source: str
+
+    def __post_init__(self) -> None:
+        if self.source not in CANDIDATE_RECORD_SOURCE_KINDS:
+            raise ValueError(
+                "candidate source must be one of: "
+                + ", ".join(CANDIDATE_RECORD_SOURCE_KINDS)
+            )
+
+    @property
+    def fingerprint(self) -> str:
+        return sha256_digest(
+            {
+                "branch": self.branch,
+                "base_main": self.base_main,
+                "head_commit": self.head_commit,
+                "changed_paths": list(self.changed_paths),
+            }
+        )
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "branch": self.branch,
+            "worktree": str(self.worktree),
+            "base_main": self.base_main,
+            "head_commit": self.head_commit,
+            "changed_paths": list(self.changed_paths),
+            "source": self.source,
+            "candidate_fingerprint": self.fingerprint,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> CandidateRecord | None:
+        if record.get("record_type") != "candidate_recorded":
+            return None
+        branch = record.get("branch")
+        worktree = record.get("worktree")
+        base_main = record.get("base_main")
+        head_commit = record.get("head_commit")
+        changed_paths = record.get("changed_paths")
+        source = record.get("source")
+        if (
+            not isinstance(branch, str)
+            or not isinstance(worktree, str)
+            or not isinstance(base_main, str)
+            or not isinstance(head_commit, str)
+            or not isinstance(changed_paths, list)
+            or not all(isinstance(path, str) for path in changed_paths)
+            or source not in CANDIDATE_RECORD_SOURCE_KINDS
+        ):
+            return None
+        candidate = cls(
+            branch=branch,
+            worktree=Path(worktree),
+            base_main=base_main,
+            head_commit=head_commit,
+            changed_paths=tuple(changed_paths),
+            source=str(source),
+        )
+        if record.get("candidate_fingerprint") != candidate.fingerprint:
+            return None
+        return candidate
+
+
+class CandidateCollector:
+    def __init__(
+        self,
+        *,
+        worktree: Path,
+        branch: str,
+        base_main: str,
+        run_store: object,
+        run_id: str,
+        task_id: str,
+    ) -> None:
+        self.worktree = worktree.resolve()
+        self.branch = branch
+        self.base_main = base_main
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+
+    def collect_derived(self) -> CandidateRecord:
+        candidate = self.snapshot(source="derived")
+        self._record(candidate)
+        return candidate
+
+    def collect_declared(
+        self,
+        *,
+        head_commit: str,
+        base_main: str = "",
+        changed_paths: Sequence[str] = (),
+    ) -> CandidateRecord:
+        candidate = self.snapshot(source="worker_command")
+        mismatches: dict[str, object] = {}
+        if head_commit != candidate.head_commit:
+            mismatches["head_commit"] = {
+                "declared": head_commit,
+                "observed": candidate.head_commit,
+            }
+        if base_main and base_main != candidate.base_main:
+            mismatches["base_main"] = {
+                "declared": base_main,
+                "observed": candidate.base_main,
+            }
+        if changed_paths:
+            declared_paths = tuple(sorted(set(changed_paths)))
+            if declared_paths != candidate.changed_paths:
+                mismatches["changed_paths"] = {
+                    "declared": list(declared_paths),
+                    "observed": list(candidate.changed_paths),
+                }
+        if mismatches:
+            raise CandidateCollectionError(
+                "candidate_declaration_mismatch",
+                "candidate declaration does not match the claimed workspace",
+                details={"mismatched_fields": sorted(mismatches)},
+            )
+        self._record(candidate)
+        return candidate
+
+    def snapshot(self, *, source: str) -> CandidateRecord:
+        observed_branch = self._git_text("branch", "--show-current")
+        if observed_branch != self.branch:
+            raise CandidateCollectionError(
+                "candidate_branch_mismatch",
+                "candidate workspace branch does not match the active claim",
+                details={"expected": self.branch, "observed": observed_branch},
+            )
+        head_commit = self._git_text("rev-parse", "--verify", "HEAD")
+        resolved_base = self._git_text("rev-parse", "--verify", self.base_main)
+        if (
+            self._git_result(
+                "merge-base", "--is-ancestor", resolved_base, head_commit
+            ).returncode
+            != 0
+        ):
+            raise CandidateCollectionError(
+                "candidate_base_mismatch",
+                "candidate head does not descend from the recorded base main",
+                details={"base_main": resolved_base, "head_commit": head_commit},
+            )
+        tracked_status = self._git_text(
+            "status", "--porcelain=v1", "--untracked-files=no"
+        )
+        if tracked_status:
+            raise CandidateCollectionError(
+                "candidate_tracked_changes",
+                "candidate workspace has uncommitted tracked changes",
+                details={"status": tracked_status.splitlines()[:20]},
+            )
+        changed = self._git_bytes(
+            "diff",
+            "--name-only",
+            "--diff-filter=ACDMRTUXB",
+            "-z",
+            f"{resolved_base}...{head_commit}",
+        )
+        changed_paths = tuple(
+            sorted(
+                path.decode("utf-8", "surrogateescape")
+                for path in changed.split(b"\0")
+                if path
+            )
+        )
+        return CandidateRecord(
+            branch=self.branch,
+            worktree=self.worktree,
+            base_main=resolved_base,
+            head_commit=head_commit,
+            changed_paths=changed_paths,
+            source=source,
+        )
+
+    def matches(self, candidate: CandidateRecord) -> bool:
+        try:
+            return (
+                self.snapshot(source=candidate.source).fingerprint
+                == candidate.fingerprint
+            )
+        except CandidateCollectionError:
+            return False
+
+    def matches_during_gate(self, candidate: CandidateRecord) -> bool:
+        try:
+            if self._git_text("rev-parse", "--verify", "HEAD") != candidate.head_commit:
+                return False
+            return not self._git_text(
+                "status", "--porcelain=v1", "--untracked-files=no"
+            )
+        except CandidateCollectionError:
+            return False
+
+    def tracked_state_marker(self) -> str:
+        digest = hashlib.sha256()
+        for raw_path in self._git_bytes("ls-files", "-z").split(b"\0"):
+            if not raw_path:
+                continue
+            relative = raw_path.decode("utf-8", "surrogateescape")
+            path = self.worktree / relative
+            digest.update(raw_path)
+            digest.update(b"\0")
+            try:
+                stat = path.lstat()
+            except OSError as exc:
+                digest.update(f"missing:{type(exc).__name__}".encode())
+            else:
+                digest.update(
+                    (
+                        f"{stat.st_mode}:{stat.st_ino}:{stat.st_size}:"
+                        f"{stat.st_mtime_ns}:{stat.st_ctime_ns}"
+                    ).encode()
+                )
+            digest.update(b"\0")
+        return "sha256:" + digest.hexdigest()
+
+    def is_recorded(self, candidate: CandidateRecord) -> bool:
+        for record in self.run_store.read_records():
+            if (
+                record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+            ):
+                continue
+            recorded = CandidateRecord.from_record(record)
+            if (
+                recorded is not None
+                and self._belongs_to_claim(recorded)
+                and recorded.fingerprint == candidate.fingerprint
+            ):
+                return True
+        return False
+
+    def ensure_recorded(self, candidate: CandidateRecord) -> None:
+        if not self.matches(candidate):
+            raise CandidateCollectionError(
+                "candidate_changed",
+                "candidate no longer matches the claimed workspace",
+            )
+        if not self.is_recorded(candidate):
+            self._record(candidate)
+
+    def latest_recorded(self) -> CandidateRecord | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+            ):
+                continue
+            candidate = CandidateRecord.from_record(record)
+            if candidate is not None and self._belongs_to_claim(candidate):
+                return candidate
+        return None
+
+    def _belongs_to_claim(self, candidate: CandidateRecord) -> bool:
+        return (
+            candidate.branch == self.branch
+            and candidate.worktree.resolve() == self.worktree
+        )
+
+    def _record(self, candidate: CandidateRecord) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.candidate_recorded(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=candidate.to_payload(),
+            )
+        )
+
+    def _git_text(self, *args: str) -> str:
+        result = self._git_result(*args)
+        if result.returncode != 0:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate Git state could not be read",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+        return result.stdout.strip()
+
+    def _git_bytes(self, *args: str) -> bytes:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=self.worktree,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate Git state could not be read",
+                details={"error": str(exc)},
+            ) from exc
+        if result.returncode != 0:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate Git state could not be read",
+                details={
+                    "git_args": list(args),
+                    "stderr": result.stderr.decode("utf-8", "replace").strip(),
+                },
+            )
+        return result.stdout
+
+    def _git_result(self, *args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=self.worktree,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as exc:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate Git state could not be read",
+                details={"error": str(exc)},
+            ) from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class GateResult:
+    config_key: str
+    exit_class: str
+    exit_code: int | None
+    duration_seconds: float
+    log_reference: str
+    evidence_digest: str
+    candidate_fingerprint: str
+    resumed: bool = False
+
+    @property
+    def passed(self) -> bool:
+        return self.exit_class == "passed"
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "gate_id": self.config_key,
+            "command_key": self.config_key,
+            "exit_class": self.exit_class,
+            "duration_seconds": self.duration_seconds,
+            "log_reference": self.log_reference,
+            "evidence_digest": self.evidence_digest,
+            "candidate_fingerprint": self.candidate_fingerprint,
+        }
+        if self.exit_code is not None:
+            payload["exit_code"] = self.exit_code
+        return payload
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> GateResult | None:
+        if record.get("record_type") != "gate_result":
+            return None
+        config_key = record.get("command_key")
+        exit_class = record.get("exit_class")
+        duration = record.get("duration_seconds")
+        log_reference = record.get("log_reference")
+        evidence_digest = record.get("evidence_digest")
+        fingerprint = record.get("candidate_fingerprint")
+        exit_code = record.get("exit_code")
+        if (
+            not isinstance(config_key, str)
+            or exit_class not in GATE_EXIT_CLASSES
+            or isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not isinstance(log_reference, str)
+            or not isinstance(evidence_digest, str)
+            or not isinstance(fingerprint, str)
+            or isinstance(exit_code, bool)
+            or (exit_code is not None and not isinstance(exit_code, int))
+        ):
+            return None
+        return cls(
+            config_key=config_key,
+            exit_class=str(exit_class),
+            exit_code=exit_code,
+            duration_seconds=float(duration),
+            log_reference=log_reference,
+            evidence_digest=evidence_digest,
+            candidate_fingerprint=fingerprint,
+            resumed=True,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class GateRunSummary:
+    candidate: CandidateRecord
+    results: tuple[GateResult, ...]
+    candidate_recorded: bool
+
+    @property
+    def passed(self) -> bool:
+        return all(result.passed for result in self.results)
+
+    @property
+    def failed_gate_keys(self) -> tuple[str, ...]:
+        return tuple(result.config_key for result in self.results if not result.passed)
+
+    def require_review_ready(self) -> None:
+        if not self.candidate_recorded or not self.passed:
+            raise GateExecutionError(
+                "review requires a recorded candidate and passing gate evidence"
+            )
+
+
+GateExecutor = Callable[..., subprocess.CompletedProcess[str]]
+
+
+class GateRunner:
+    def __init__(
+        self,
+        *,
+        completion_commands: Sequence[str],
+        gate_keys: Sequence[str],
+        candidate_collector: CandidateCollector,
+        run_store: object,
+        run_id: str,
+        task_id: str,
+        log_dir: Path,
+        executor: GateExecutor = subprocess.run,
+        candidate_poll_seconds: float = 0.25,
+    ) -> None:
+        self.completion_commands = tuple(completion_commands)
+        self.gate_keys = tuple(gate_keys)
+        self.candidate_collector = candidate_collector
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+        self.log_dir = log_dir
+        self.executor = executor
+        if candidate_poll_seconds <= 0:
+            raise ValueError("candidate_poll_seconds must be positive")
+        self.candidate_poll_seconds = candidate_poll_seconds
+
+    def run(self, candidate: CandidateRecord) -> GateRunSummary:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        prior = self._prior_results(candidate)
+        results: list[GateResult] = []
+        for index, config_key in enumerate(self.gate_keys):
+            existing = prior.get(config_key)
+            if existing is not None:
+                results.append(existing)
+                if not existing.passed:
+                    break
+                continue
+            result = self._run_gate(index, config_key, candidate)
+            self._record(result)
+            results.append(result)
+            if not result.passed:
+                break
+        return GateRunSummary(
+            candidate=candidate,
+            results=tuple(results),
+            candidate_recorded=self.candidate_collector.is_recorded(candidate),
+        )
+
+    def _run_gate(
+        self,
+        index: int,
+        config_key: str,
+        candidate: CandidateRecord,
+    ) -> GateResult:
+        command = self._command(config_key)
+        fingerprint = candidate.fingerprint.removeprefix("sha256:")[:16]
+        log_path = self.log_dir / f"gate-{fingerprint}-{index + 1}.log"
+        started = time.monotonic()
+        exit_code: int | None = None
+        if not self.candidate_collector.matches(candidate):
+            exit_class = "candidate_changed"
+            log_path.write_text(
+                "candidate changed before gate execution\n", encoding="utf-8"
+            )
+        else:
+            tracked_state_before = self.candidate_collector.tracked_state_marker()
+            candidate_changed = threading.Event()
+            monitor_stop = threading.Event()
+
+            def monitor_candidate() -> None:
+                while not monitor_stop.wait(self.candidate_poll_seconds):
+                    if not self.candidate_collector.matches_during_gate(candidate):
+                        candidate_changed.set()
+                        return
+
+            monitor = threading.Thread(
+                target=monitor_candidate,
+                name=f"vibe-loop-gate-candidate-{index + 1}",
+                daemon=True,
+            )
+            monitor.start()
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    result = run_configured_command(
+                        command,
+                        worktree=self.candidate_collector.worktree,
+                        log=log,
+                        executor=self.executor,
+                    )
+                exit_code = result.returncode
+                exit_class = "passed" if exit_code == 0 else "failed"
+            except OSError:
+                log_path.write_text(
+                    "gate command could not be executed\n", encoding="utf-8"
+                )
+                exit_class = "execution_error"
+            finally:
+                monitor_stop.set()
+                monitor.join()
+            if candidate_changed.is_set() or not self.candidate_collector.matches(
+                candidate
+            ):
+                exit_class = "candidate_changed"
+            else:
+                try:
+                    tracked_state_changed = (
+                        self.candidate_collector.tracked_state_marker()
+                        != tracked_state_before
+                    )
+                except CandidateCollectionError:
+                    tracked_state_changed = True
+                if tracked_state_changed:
+                    exit_class = "candidate_changed"
+        duration = max(0.0, time.monotonic() - started)
+        evidence_digest = "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
+        return GateResult(
+            config_key=config_key,
+            exit_class=exit_class,
+            exit_code=exit_code,
+            duration_seconds=duration,
+            log_reference=str(log_path),
+            evidence_digest=evidence_digest,
+            candidate_fingerprint=candidate.fingerprint,
+        )
+
+    def _prior_results(self, candidate: CandidateRecord) -> dict[str, GateResult]:
+        prior: dict[str, GateResult] = {}
+        for record in self.run_store.read_records():
+            if (
+                record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+            ):
+                continue
+            result = GateResult.from_record(record)
+            if result is None or result.candidate_fingerprint != candidate.fingerprint:
+                continue
+            if not gate_evidence_is_valid(result):
+                continue
+            prior[result.config_key] = result
+        return prior
+
+    def _command(self, config_key: str) -> str:
+        match = re.fullmatch(r"completion\.commands\[(\d+)]", config_key)
+        if match is None:
+            raise GateExecutionError(
+                f"gate key is not an allowlisted completion command reference: {config_key}"
+            )
+        index = int(match.group(1))
+        if index >= len(self.completion_commands):
+            raise GateExecutionError(
+                f"gate key references an unavailable command: {config_key}"
+            )
+        return self.completion_commands[index]
+
+    def _record(self, result: GateResult) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.gate_result(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=result.to_payload(),
+            )
+        )
+
+
+RemediationLauncher = Callable[[int, GateRunSummary], None]
+
+
+def run_configured_command(
+    command: str,
+    *,
+    worktree: Path,
+    log: TextIO,
+    executor: GateExecutor = subprocess.run,
+) -> subprocess.CompletedProcess[str]:
+    return executor(
+        command,
+        cwd=worktree,
+        shell=True,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def gate_evidence_is_valid(result: GateResult) -> bool:
+    try:
+        digest = (
+            "sha256:"
+            + hashlib.sha256(Path(result.log_reference).read_bytes()).hexdigest()
+        )
+    except OSError:
+        return False
+    return digest == result.evidence_digest
+
+
+class RuntimeGateController:
+    def __init__(
+        self,
+        *,
+        candidate_collector: CandidateCollector,
+        gate_runner: GateRunner,
+        stage_machine: RunLifecycleStateMachine,
+        max_remediation_rounds: int,
+        remediation_launcher: RemediationLauncher,
+    ) -> None:
+        if max_remediation_rounds < 0:
+            raise ValueError("max_remediation_rounds must be non-negative")
+        self.candidate_collector = candidate_collector
+        self.gate_runner = gate_runner
+        self.stage_machine = stage_machine
+        self.max_remediation_rounds = max_remediation_rounds
+        self.remediation_launcher = remediation_launcher
+
+    def run(self, candidate: CandidateRecord | None = None) -> GateRunSummary:
+        remediation_round = self.stage_machine.ordinal_for(RunStage.REMEDIATION)
+        if self.stage_machine.stage is RunStage.REMEDIATION:
+            previous_candidate = self._recorded_candidate()
+            previous = self.gate_runner.run(previous_candidate)
+            if previous.passed:
+                raise GateExecutionError(
+                    "remediation recovery requires recorded failing gate evidence"
+                )
+            self.remediation_launcher(remediation_round, previous)
+            self.stage_machine.transition(
+                RunStage.CANDIDATE,
+                reason=f"remediation_candidate_collection:{remediation_round}",
+            )
+        while True:
+            if self.stage_machine.stage is RunStage.IMPLEMENTING:
+                self.stage_machine.transition(
+                    RunStage.CANDIDATE,
+                    reason="candidate_collection_started",
+                )
+            if self.stage_machine.stage is RunStage.CANDIDATE:
+                if candidate is None:
+                    current = self.candidate_collector.collect_derived()
+                else:
+                    self.candidate_collector.ensure_recorded(candidate)
+                    current = candidate
+                candidate = None
+                self.stage_machine.transition(
+                    RunStage.GATES, reason="runtime_gates_started"
+                )
+            elif self.stage_machine.stage is RunStage.GATES:
+                current = self._recorded_candidate()
+                if (
+                    candidate is not None
+                    and candidate.fingerprint != current.fingerprint
+                ):
+                    raise GateExecutionError(
+                        "resume candidate does not match the durable candidate record"
+                    )
+                candidate = None
+            else:
+                stage = self.stage_machine.stage
+                raise GateExecutionError(
+                    "runtime gate controller cannot resume from stage "
+                    f"{stage.value if stage is not None else '<initial>'}"
+                )
+            summary = self.gate_runner.run(current)
+            if summary.passed:
+                summary.require_review_ready()
+                return summary
+            if remediation_round >= self.max_remediation_rounds:
+                self.stage_machine.fail(
+                    StageFailure.STAGE_FAILED,
+                    reason=(
+                        "gate_remediation_exhausted:"
+                        f"max_rounds={self.max_remediation_rounds}"
+                    ),
+                )
+                raise GateRemediationExhausted(
+                    self.max_remediation_rounds, summary.failed_gate_keys
+                )
+            remediation_round += 1
+            self.stage_machine.transition(
+                RunStage.REMEDIATION,
+                reason=(
+                    f"gate_failure:round={remediation_round}/"
+                    f"{self.max_remediation_rounds}"
+                ),
+            )
+            self.remediation_launcher(remediation_round, summary)
+            self.stage_machine.transition(
+                RunStage.CANDIDATE,
+                reason=f"remediation_candidate_collection:{remediation_round}",
+            )
+
+    def _recorded_candidate(self) -> CandidateRecord:
+        candidate = self.candidate_collector.latest_recorded()
+        if candidate is None:
+            raise GateExecutionError(
+                "runtime gates require a durable candidate_recorded event"
+            )
+        return candidate
 
 
 @dataclasses.dataclass(frozen=True)
