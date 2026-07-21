@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -154,6 +156,52 @@ class WriteMetadataTests(unittest.TestCase):
                 if entry.name.endswith(".tmp")
             ]
             self.assertEqual(leftover, [])
+
+
+class DirectoryLockStatusTests(unittest.TestCase):
+    def test_status_waits_for_acquire_metadata_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = locks.DirectoryLockBackend(root)
+            lock_path = backend.path_for("TASK-01")
+            write_started = threading.Event()
+            allow_write = threading.Event()
+            status_attempted = threading.Event()
+            real_write_metadata = locks.write_metadata
+            real_metadata_lock = locks.metadata_update_lock
+
+            def blocked_write(path: Path, metadata: dict[str, object]) -> None:
+                if path == lock_path:
+                    write_started.set()
+                    self.assertTrue(allow_write.wait(1.0))
+                real_write_metadata(path, metadata)
+
+            @contextlib.contextmanager
+            def tracked_metadata_lock(path: Path):
+                if path == lock_path and write_started.is_set():
+                    status_attempted.set()
+                with real_metadata_lock(path):
+                    yield
+
+            with (
+                patch("vibe_loop.locks.write_metadata", side_effect=blocked_write),
+                patch(
+                    "vibe_loop.locks.metadata_update_lock",
+                    side_effect=tracked_metadata_lock,
+                ),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                acquire = executor.submit(backend.acquire, "TASK-01", "run-1")
+                self.assertTrue(write_started.wait(1.0))
+                status = executor.submit(backend.status, "TASK-01")
+                self.assertTrue(status_attempted.wait(1.0))
+                self.assertFalse(status.done())
+                allow_write.set()
+                acquired = acquire.result(timeout=1.0)
+                observed = status.result(timeout=1.0)
+
+        self.assertEqual(observed["run_id"], "run-1")
+        self.assertEqual(observed["pid"], acquired.metadata["pid"])
 
 
 class CommandLockContextTests(unittest.TestCase):

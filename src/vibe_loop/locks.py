@@ -925,9 +925,12 @@ class DirectoryLockBackend:
 
     def status(self, task_id: str) -> dict[str, object] | None:
         path = self.path_for(task_id)
-        if not path.exists() or not path.is_dir():
+        if not self.lock_root.exists():
             return None
-        metadata = read_metadata(path)
+        with metadata_update_lock(path):
+            if not path.exists() or not path.is_dir():
+                return None
+            metadata = read_metadata(path)
         metadata.setdefault("task_id", task_id)
         metadata["path"] = str(path)
         return metadata

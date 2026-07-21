@@ -1447,6 +1447,7 @@ def start_detached_autopilot(
     deadline = time_module.monotonic() + max(0.0, verification_timeout)
     blocker = "detached_autopilot_verification_timeout"
     verified = False
+    candidate_run_id = ""
     run_store = RunStore(config.state_path / "runs.jsonl")
     try:
         while True:
@@ -1469,6 +1470,7 @@ def start_detached_autopilot(
                     pid=process.pid,
                 )
             ):
+                candidate_run_id = lock_run_id
                 if (
                     process.poll() is not None
                     or process_group_id != process.pid
@@ -1527,6 +1529,7 @@ def start_detached_autopilot(
             cleanup_error = cleanup_detached_candidate(
                 process,
                 lock_manager=lock_manager,
+                run_id=candidate_run_id,
             )
             if cleanup_error:
                 cleanup_error = redact_runtime_context_text(
@@ -1549,6 +1552,7 @@ def cleanup_detached_candidate(
     process: subprocess.Popen[str],
     *,
     lock_manager: LockManager,
+    run_id: str = "",
 ) -> str:
     errors: list[str] = []
     try:
@@ -1572,11 +1576,28 @@ def cleanup_detached_candidate(
         status = lock_manager.autopilot_status()
         lock_pid = int_value(status.metadata.get("pid"))
         lock_run_id = str(status.metadata.get("run_id") or "")
-        if status.locked and lock_pid == process.pid and lock_run_id:
+        matching_candidate = (
+            status.locked
+            and lock_run_id
+            and (
+                (run_id and lock_run_id == run_id)
+                or (not run_id and lock_pid == process.pid)
+            )
+            and (lock_pid is None or lock_pid == process.pid)
+        )
+        if matching_candidate:
             lock_manager.release_autopilot(
                 run_id=lock_run_id,
                 fencing_token=str(status.metadata.get("fencing_token") or ""),
             )
+            status = lock_manager.autopilot_status()
+            if (
+                status.locked
+                and str(status.metadata.get("run_id") or "") == lock_run_id
+            ):
+                errors.append("candidate_autopilot_lock_persisted")
+        elif status.locked and run_id and lock_run_id == run_id:
+            errors.append("candidate_autopilot_lock_pid_mismatch")
     # Cleanup must preserve the original actionable verification failure even
     # when a third-party lock adapter has an unenumerated operational failure.
     except Exception as exc:

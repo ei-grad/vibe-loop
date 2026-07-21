@@ -91,6 +91,7 @@ from vibe_loop.autopilot import (
     run_worktree_disposition,
     sleep_until_stop,
     start_detached_autopilot,
+    cleanup_detached_candidate,
     OwnedProcessIdentity,
     drain_owned_process_tree,
     open_process_pidfd,
@@ -1337,6 +1338,95 @@ class AutopilotRunTests(unittest.TestCase):
                 config.locks,
             )
             self.assertIsNone(manager.status(AUTOPILOT_LOCK_NAME))
+
+    def test_cleanup_releases_matching_candidate_lock_without_pid(self) -> None:
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = 0
+        candidate_status = mock.Mock(
+            locked=True,
+            metadata={
+                "run_id": "autopilot-candidate",
+                "fencing_token": "test-fencing-token",
+            },
+        )
+        available_status = mock.Mock(locked=False, metadata={})
+        lock_manager = mock.Mock()
+        lock_manager.autopilot_status.side_effect = [
+            candidate_status,
+            available_status,
+        ]
+
+        cleanup_error = cleanup_detached_candidate(
+            process,
+            lock_manager=lock_manager,
+            run_id="autopilot-candidate",
+        )
+
+        self.assertEqual(cleanup_error, "")
+        lock_manager.release_autopilot.assert_called_once_with(
+            run_id="autopilot-candidate",
+            fencing_token="test-fencing-token",
+        )
+
+    def test_cleanup_preserves_pidless_lock_without_verified_run(self) -> None:
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = 0
+        lock_manager = mock.Mock()
+        lock_manager.autopilot_status.return_value = mock.Mock(
+            locked=True,
+            metadata={"run_id": "autopilot-foreign"},
+        )
+
+        cleanup_error = cleanup_detached_candidate(
+            process,
+            lock_manager=lock_manager,
+        )
+
+        self.assertEqual(cleanup_error, "")
+        lock_manager.release_autopilot.assert_not_called()
+
+    def test_cleanup_rejects_a_candidate_lock_that_persists_after_release(self) -> None:
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = 0
+        candidate_status = mock.Mock(
+            locked=True,
+            metadata={
+                "run_id": "autopilot-candidate",
+                "pid": process.pid,
+                "fencing_token": "test-fencing-token",
+            },
+        )
+        lock_manager = mock.Mock()
+        lock_manager.autopilot_status.side_effect = [
+            candidate_status,
+            candidate_status,
+        ]
+
+        cleanup_error = cleanup_detached_candidate(
+            process,
+            lock_manager=lock_manager,
+            run_id="autopilot-candidate",
+        )
+
+        self.assertEqual(cleanup_error, "candidate_autopilot_lock_persisted")
+
+    def test_cleanup_rejects_matching_run_with_different_pid(self) -> None:
+        process = mock.Mock(pid=4321)
+        process.poll.return_value = 0
+        lock_manager = mock.Mock()
+        lock_manager.autopilot_status.return_value = mock.Mock(
+            locked=True,
+            metadata={"run_id": "autopilot-candidate", "pid": 9876},
+        )
+
+        cleanup_error = cleanup_detached_candidate(
+            process,
+            lock_manager=lock_manager,
+            run_id="autopilot-candidate",
+        )
+
+        self.assertEqual(cleanup_error, "candidate_autopilot_lock_pid_mismatch")
+        lock_manager.release_autopilot.assert_not_called()
 
     @unittest.skipUnless(sys.platform == "linux", "verified stop requires Linux")
     def test_start_preserves_command_lock_runtime_context(self) -> None:
