@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -717,71 +718,119 @@ CODEX_ITEM_ENVELOPE_TYPES = frozenset(
 )
 
 
-def _content_blocks_have_type(content: object, kinds: frozenset[str]) -> bool:
+# Codex event/envelope types that *complete* a tool call started by an earlier
+# begin/started event carrying the same correlation id. Tracked separately from
+# the start events so a pre-boundary tool that only finishes after the report is
+# not mistaken for fresh post-report activity (F2).
+CODEX_COMPLETION_EVENT_TYPES = frozenset(
+    {"exec_command_end", "exec_command_output_delta", "patch_apply_end"}
+)
+CODEX_ITEM_COMPLETION_ENVELOPE_TYPES = frozenset(
+    {"item.updated", "item.completed", "response.output_item.done"}
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ActivityEvent:
+    """A structured tool/command event in a worker stream line.
+
+    ``tool_id`` correlates a start with its later completion; it is empty when
+    the dialect did not carry one. ``is_completion`` marks the closing half of a
+    call (a Claude ``tool_result``, a Codex ``*_end``/``item.completed``) so a
+    pre-boundary call finishing after the report is not counted as new activity.
+    """
+
+    kind: str
+    tool_id: str
+    is_completion: bool
+
+
+def _string_id(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _first_block_of_type(content: object, kinds: frozenset[str]) -> Mapping | None:
     if not isinstance(content, list):
-        return False
-    return any(
-        isinstance(block, Mapping) and block.get("type") in kinds for block in content
-    )
+        return None
+    for block in content:
+        if isinstance(block, Mapping) and block.get("type") in kinds:
+            return block
+    return None
 
 
-def _classify_claude_post_report_activity(payload: Mapping[str, object]) -> str:
-    event_type = payload.get("type")
-    message = payload.get("message")
-    content = message.get("content") if isinstance(message, Mapping) else None
-    if event_type == "assistant" and _content_blocks_have_type(
-        content, CLAUDE_TOOL_CONTENT_TYPES
-    ):
-        return "tool_call"
-    if event_type == "user" and _content_blocks_have_type(
-        content, CLAUDE_TOOL_RESULT_CONTENT_TYPES
-    ):
-        return "tool_result"
+def _codex_call_id(event: Mapping[str, object]) -> str:
+    for key in ("call_id", "id"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
     return ""
 
 
-def _classify_codex_post_report_activity(payload: Mapping[str, object]) -> str:
+def _claude_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None:
+    event_type = payload.get("type")
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    block = _first_block_of_type(content, CLAUDE_TOOL_CONTENT_TYPES)
+    if event_type == "assistant" and block is not None:
+        return ActivityEvent("tool_call", _string_id(block.get("id")), False)
+    block = _first_block_of_type(content, CLAUDE_TOOL_RESULT_CONTENT_TYPES)
+    if event_type == "user" and block is not None:
+        return ActivityEvent("tool_result", _string_id(block.get("tool_use_id")), True)
+    return None
+
+
+def _codex_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None:
     event = payload
     nested = payload.get("payload")
     if isinstance(nested, Mapping):
         event = nested
     event_type = event.get("type")
     if not isinstance(event_type, str):
-        return ""
+        return None
     if event_type in CODEX_TOOL_EVENT_TYPES:
-        return "tool_call"
+        is_completion = event_type in CODEX_COMPLETION_EVENT_TYPES
+        return ActivityEvent("tool_call", _codex_call_id(event), is_completion)
     if event_type in CODEX_ITEM_ENVELOPE_TYPES:
         item = event.get("item")
         item_type = item.get("type") if isinstance(item, Mapping) else None
         if isinstance(item_type, str) and item_type in CODEX_TOOL_ITEM_TYPES:
-            return "tool_call"
-    return ""
+            is_completion = event_type in CODEX_ITEM_COMPLETION_ENVELOPE_TYPES
+            return ActivityEvent("tool_call", _string_id(item.get("id")), is_completion)
+    return None
 
 
-def classify_post_report_activity(line: str) -> str:
-    """Classify a worker stream line emitted after its terminal report.
+def classify_post_report_event(line: str) -> ActivityEvent | None:
+    """Parse a worker stream line into a structured tool/command event.
 
-    Returns a non-empty activity kind (``tool_call``/``tool_result``) when the
-    line is structured tool/command/file activity in either the Claude
-    stream-json or Codex JSON dialect, and ``""`` for a bounded text-only
-    summary, usage/session events, or anything unparseable. Detection is by
-    event shape, not substring, so a summary that merely mentions a tool name is
-    not flagged.
+    Returns an :class:`ActivityEvent` when the line is structured tool/command/
+    file activity in either the Claude stream-json or Codex JSON dialect, and
+    ``None`` for a bounded text-only summary, usage/session events, or anything
+    unparseable. Detection is by event shape, not substring, so a summary that
+    merely mentions a tool name is not flagged.
     """
     text = line.strip()
     if text.startswith("data:"):
         text = text.removeprefix("data:").strip()
     if not text.startswith("{"):
-        return ""
+        return None
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        return ""
+        return None
     if not isinstance(payload, dict):
-        return ""
-    return _classify_claude_post_report_activity(
-        payload
-    ) or _classify_codex_post_report_activity(payload)
+        return None
+    return _claude_activity_event(payload) or _codex_activity_event(payload)
+
+
+def classify_post_report_activity(line: str) -> str:
+    """Return the activity kind of a worker stream line, ``""`` when benign.
+
+    Thin wrapper over :func:`classify_post_report_event` that keeps the kind
+    label (``tool_call``/``tool_result``) for callers that do not need the
+    correlation id.
+    """
+    event = classify_post_report_event(line)
+    return event.kind if event is not None else ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -836,18 +885,52 @@ def _post_report_usage_delta(
     return dataclasses.replace(final, values=delta, raw=delta)
 
 
+def worker_report_persistence_epoch(report: WorkerReport | None) -> float | None:
+    """Return a report's persistence instant as a wall-clock epoch, or ``None``.
+
+    The monitor stamps observed stream lines with ``time.time()`` and partitions
+    them against this instant, so a report with an unparseable timestamp yields
+    ``None`` and the monitor falls back to the watchdog observation time.
+    """
+    if report is None or not report.reported_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(report.reported_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
+
+
+# Upper bound on structured-activity events buffered before the watchdog marks
+# the boundary. The reconciliation window is only the lag between report
+# persistence and the next watchdog poll, so a few thousand recent events is
+# ample; the cap bounds memory on a pathological pre-report burst.
+POST_REPORT_PENDING_BUFFER = 4096
+
+
 class PostReportActivityMonitor:
     """Attributes a worker's post-terminal-report stream output.
 
     Usage is observed across the whole stream so a cumulative snapshot is
-    available at the boundary; the monitor stays inert for activity/violation
-    accounting until ``mark_report_observed`` fires. From that point every stream
-    line is post-report teardown: any structured tool/child activity is recorded
-    as a policy violation, and the teardown-only provider usage (the delta from
-    the boundary snapshot) is reported separately so quota diagnostics can
-    distinguish teardown burn from useful implementation/review. Thread-safe:
-    stream threads call ``observe_line`` while the supervision watchdog marks the
-    boundary and reads ``violation``.
+    available at the boundary. The report boundary is a wall-clock instant -- the
+    report's own persistence time -- not the moment the watchdog happens to
+    notice it, so structured activity emitted after persistence but before the
+    watchdog polls is still attributed rather than lost (F1). Because the monitor
+    cannot know the boundary until ``mark_report_observed`` fires, it buffers
+    pre-mark structured events and reconciles them against the boundary at mark
+    time; activity that arrives after the mark is attributed live.
+
+    A tool call that started before the boundary but only completes after it
+    (including the worker's own ``vibe-loop report`` invocation and its result)
+    is correlated by id and ignored, so only genuinely fresh post-report tool
+    starts -- and orphan completions with no observed start -- count as a policy
+    violation (F2). The teardown-only provider usage (the delta from the boundary
+    snapshot) is reported separately so quota diagnostics can distinguish
+    teardown burn from useful implementation/review. Thread-safe: stream threads
+    call ``observe_line`` while the supervision watchdog marks the boundary and
+    reads ``violation``.
     """
 
     def __init__(
@@ -855,25 +938,50 @@ class PostReportActivityMonitor:
         provider: str,
         *,
         monotonic: Callable[[], float] = time.monotonic,
+        wallclock: Callable[[], float] = time.time,
     ) -> None:
         self._provider = provider
         self._monotonic = monotonic
+        self._wallclock = wallclock
         self._lock = threading.Lock()
         self._reported_at: float | None = None
+        self._boundary_wall: float | None = None
         self._usage_observer = ProviderUsageObserver(provider)
         self._baseline_usage_values: dict[str, int | float] = {}
         self._activity_kind = ""
         self._activity_count = 0
+        # Wall time of the first observed start for each correlation id, used to
+        # tell a pre-boundary tool finishing apart from a fresh post-report call.
+        self._start_wall: dict[str, float] = {}
+        # Structured events seen before the boundary is known, reconciled once
+        # ``mark_report_observed`` supplies the persistence instant.
+        self._pending: deque[tuple[float, ActivityEvent]] = deque(
+            maxlen=POST_REPORT_PENDING_BUFFER
+        )
 
-    def mark_report_observed(self, at: float | None = None) -> None:
+    def mark_report_observed(
+        self,
+        at: float | None = None,
+        *,
+        boundary_wall: float | None = None,
+    ) -> None:
         # Snapshot cumulative usage-so-far outside the monitor lock (the usage
         # observer holds its own) so the post-report delta excludes the useful
-        # pre-report spend.
+        # pre-report spend. ``boundary_wall`` is the report's persistence time;
+        # without it (unit callers, or an unparseable report timestamp) the mark
+        # instant is used, which only attributes activity seen after the mark.
         baseline = dict(self._usage_observer.usage.values)
         with self._lock:
-            if self._reported_at is None:
-                self._reported_at = at if at is not None else self._monotonic()
-                self._baseline_usage_values = baseline
+            if self._reported_at is not None:
+                return
+            self._reported_at = at if at is not None else self._monotonic()
+            self._boundary_wall = (
+                boundary_wall if boundary_wall is not None else self._wallclock()
+            )
+            self._baseline_usage_values = baseline
+            for wall, event in self._pending:
+                self._attribute_locked(wall, event)
+            self._pending.clear()
 
     @property
     def reported(self) -> bool:
@@ -885,22 +993,57 @@ class PostReportActivityMonitor:
         # the observer holds its own lock, so call it outside the monitor lock to
         # keep a single, consistent lock order.
         self._usage_observer.observe_line(line)
-        with self._lock:
-            active = self._reported_at is not None
-        if not active:
+        event = classify_post_report_event(line)
+        if event is None:
             return
-        kind = classify_post_report_activity(line)
-        if not kind:
-            return
+        wall = self._wallclock()
         with self._lock:
-            self._activity_count += 1
-            if not self._activity_kind:
-                self._activity_kind = kind
+            if event.tool_id and not event.is_completion:
+                self._start_wall.setdefault(event.tool_id, wall)
+            if self._boundary_wall is None:
+                self._pending.append((wall, event))
+            else:
+                self._attribute_locked(wall, event)
+
+    def _attribute_locked(self, wall: float, event: ActivityEvent) -> None:
+        # Caller holds the lock and the boundary is set. Only activity at or
+        # after the report-persistence boundary is teardown. A completion whose
+        # start id we have already seen is either a pre-boundary tool finishing
+        # or a post-boundary start already counted, so it is never double
+        # counted; an orphan completion with no observed start is treated as
+        # fresh post-report activity.
+        if self._boundary_wall is None or wall < self._boundary_wall:
+            return
+        if event.is_completion and event.tool_id and event.tool_id in self._start_wall:
+            return
+        self._activity_count += 1
+        if not self._activity_kind:
+            self._activity_kind = event.kind
 
     @property
     def violation(self) -> bool:
         with self._lock:
             return bool(self._activity_kind)
+
+    def _post_report_usage(
+        self,
+        reported: bool,
+        baseline: Mapping[str, int | float],
+        final: ProviderUsage,
+    ) -> ProviderUsage:
+        if not reported:
+            return unavailable_usage(self._provider, "post_report_boundary_not_reached")
+        if not final.available:
+            return final
+        if not baseline:
+            # No usage was observed before the boundary, so the only signal is an
+            # end-of-run cumulative total that covers the whole run rather than
+            # just teardown. Attributing it all to the post-report window would
+            # overstate teardown burn, so decline to attribute (F5).
+            return unavailable_usage(
+                self._provider, "post_report_usage_end_only_cumulative"
+            )
+        return _post_report_usage_delta(baseline, final)
 
     def snapshot(
         self,
@@ -919,11 +1062,7 @@ class PostReportActivityMonitor:
             if reported:
                 end = until if until is not None else self._monotonic()
                 seconds = max(0.0, end - self._reported_at)
-        usage = (
-            _post_report_usage_delta(baseline, final_usage)
-            if reported
-            else unavailable_usage(self._provider, "post_report_boundary_not_reached")
-        )
+        usage = self._post_report_usage(reported, baseline, final_usage)
         return PostReportActivity(
             reported=reported,
             seconds=seconds,
@@ -1905,6 +2044,11 @@ class VibeRunner:
                         first_accepted_report = report
                     return report is not None
 
+                def report_persistence_epoch() -> float | None:
+                    # The accepted report's own persistence instant, so the
+                    # monitor attributes only activity emitted after it.
+                    return worker_report_persistence_epoch(first_accepted_report)
+
                 stage_machine.transition(
                     RunStage.IMPLEMENTING,
                     reason="worker_process_launch",
@@ -1918,6 +2062,7 @@ class VibeRunner:
                     on_start=record_worker_pid,
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
+                    report_persistence_epoch=report_persistence_epoch,
                     timeout_seconds=self.config.supervision.worker_timeout_seconds,
                     provider=(
                         command_context.model_provider
@@ -5584,6 +5729,7 @@ def wait_with_reap_watchdog(
     identity_ok: Callable[[], bool] | None = None,
     identity_verified_ok: Callable[[], bool] | None = None,
     post_report_activity_grace_seconds: float = 0.0,
+    report_boundary_wall: Callable[[], float | None] | None = None,
 ) -> WaitOutcome:
     """Wait for a worker, reaping it if it hangs or overruns its report.
 
@@ -5608,21 +5754,22 @@ def wait_with_reap_watchdog(
       set. This bounds the quota a worker burns by continuing to act past its
       accepted terminal report while leaving that report authoritative.
 
-    Identity gating differs by path. ``identity_ok`` guards the historical
-    hang/timeout reaps: it confirms the live PID is still the worker this
-    supervisor launched (by process-birth ID), but when birth identity is
-    unavailable (non-Linux, or an unreadable ``/proc``) it cannot prove a
-    mismatch and preserves the historical unconditional reap so a genuinely hung
-    worker is still released; ``None`` disables the guard entirely. The new
-    post-report enforcement path instead uses ``identity_verified_ok`` and is
-    fail-closed: it stops the group only on a positive birth-ID match, so when
-    identity cannot be verified it stands down rather than risk signalling a
-    recycled, unrelated group -- the accepted report is already authoritative, so
-    declining to enforce is safe. When ``identity_verified_ok`` is ``None`` it
-    falls back to ``identity_ok``.
+    Identity gating is fail-closed on every reap path (hang, timeout, and
+    post-report enforcement): the group is signalled only on a positive
+    process-birth-ID match confirming the live PID is still the worker this
+    supervisor launched. When identity cannot be positively verified -- a
+    mismatch, a vanished PID, or an unreadable birth ID (non-Linux, or an
+    unreadable ``/proc``) -- the reap stands down rather than risk signalling a
+    recycled, unrelated process group. ``identity_verified_ok`` provides the
+    positive-match gate; it falls back to ``identity_ok`` when ``None``, and when
+    both are ``None`` the guard is disabled. This makes report-hang and timeout
+    termination require the same positively verified birth identity as
+    post-report enforcement.
 
     ``monotonic`` is injectable so tests can drive the deadline with a fake
-    clock instead of a real wall-clock sleep.
+    clock instead of a real wall-clock sleep. ``report_boundary_wall`` returns
+    the report's persistence wall-clock instant so the monitor can attribute
+    activity emitted between persistence and this watchdog's observation of it.
     """
     deadline: float | None = None
     if timeout_seconds is not None and timeout_seconds > 0:
@@ -5630,27 +5777,44 @@ def wait_with_reap_watchdog(
     if reap_check is None and deadline is None:
         return WaitOutcome(process.wait())
 
-    def _identity_permits_signal() -> bool:
-        if identity_ok is None:
-            return True
-        try:
-            return identity_ok()
-        # An unreadable identity is not proof the group is ours: fail closed and
-        # do not signal rather than risk an unrelated process group.
-        except Exception:
-            return False
-
-    def _identity_verified_for_enforcement() -> bool:
+    def _identity_verified() -> bool:
         gate = identity_verified_ok or identity_ok
         if gate is None:
             return True
         try:
             return gate()
-        # Post-report enforcement is fail-closed: an unverifiable identity must
-        # not signal a possibly-recycled, unrelated group. The accepted report
-        # already stands, so standing down is the safe choice.
+        # An unverifiable identity is not proof the group is ours: fail closed
+        # and do not signal rather than risk a recycled, unrelated group. Every
+        # reap path is bounded by an already-authoritative signal (an accepted
+        # report or a wall-clock deadline), so declining to reap is safe.
         except Exception:
             return False
+
+    report_marked = False
+
+    def _mark_boundary() -> None:
+        nonlocal report_marked
+        report_marked = True
+        if post_report_monitor is None:
+            return
+        boundary_wall = report_boundary_wall() if report_boundary_wall else None
+        post_report_monitor.mark_report_observed(
+            monotonic(), boundary_wall=boundary_wall
+        )
+
+    def _reconcile_boundary_on_exit() -> None:
+        # The worker exited before a poll observed its report (F1). Mark the
+        # boundary from the persisted report so structured activity it emitted
+        # after reporting is still attributed, even though there is no live
+        # process left to stop.
+        if report_marked or post_report_monitor is None or reap_check is None:
+            return
+        try:
+            eligible_now = reap_check()
+        except Exception:
+            eligible_now = False
+        if eligible_now:
+            _mark_boundary()
 
     def _reap_for_timeout() -> WaitOutcome:
         report_status(
@@ -5659,13 +5823,12 @@ def wait_with_reap_watchdog(
             "group so the task returns to runnable and the batch proceeds",
             log,
         )
-        if _identity_permits_signal():
+        if _identity_verified():
             terminate_worker_process_group(process, log)
         return WaitOutcome(process.wait(), timed_out=True)
 
     reap_eligible_since: float | None = None
     activity_eligible_since: float | None = None
-    report_marked = False
     while True:
         wait_for = poll_seconds
         if deadline is not None:
@@ -5674,9 +5837,12 @@ def wait_with_reap_watchdog(
                 return _reap_for_timeout()
             wait_for = min(poll_seconds, remaining)
         try:
-            return WaitOutcome(process.wait(timeout=wait_for))
+            exit_code = process.wait(timeout=wait_for)
         except subprocess.TimeoutExpired:
             pass
+        else:
+            _reconcile_boundary_on_exit()
+            return WaitOutcome(exit_code)
         if deadline is not None and monotonic() - deadline >= 0:
             return _reap_for_timeout()
         eligible = False
@@ -5688,9 +5854,7 @@ def wait_with_reap_watchdog(
             except Exception:
                 eligible = False
         if eligible and not report_marked:
-            report_marked = True
-            if post_report_monitor is not None:
-                post_report_monitor.mark_report_observed(monotonic())
+            _mark_boundary()
         if (
             post_report_monitor is not None
             and report_marked
@@ -5706,7 +5870,7 @@ def wait_with_reap_watchdog(
                     "process group to bound post-report quota burn",
                     log,
                 )
-                if _identity_verified_for_enforcement():
+                if _identity_verified():
                     terminate_worker_process_group(process, log)
                     return WaitOutcome(process.wait(), post_report_enforced=True)
                 # Identity could not be positively verified: the live PID may be
@@ -5731,7 +5895,7 @@ def wait_with_reap_watchdog(
                 "reaping process group to release its slot",
                 log,
             )
-            if _identity_permits_signal():
+            if _identity_verified():
                 terminate_worker_process_group(process, log)
             return WaitOutcome(process.wait())
 
@@ -5749,6 +5913,7 @@ def run_streaming_command(
     reap_grace_seconds: float = 120.0,
     reap_poll_seconds: float = 10.0,
     post_report_activity_grace_seconds: float = 0.0,
+    report_persistence_epoch: Callable[[], float | None] | None = None,
     timeout_seconds: float | None = None,
     provider: str = "unknown",
 ) -> StreamingCommandResult:
@@ -5877,6 +6042,7 @@ def run_streaming_command(
         identity_ok=identity_ok,
         identity_verified_ok=identity_verified,
         post_report_activity_grace_seconds=post_report_activity_grace_seconds,
+        report_boundary_wall=report_persistence_epoch,
     )
     stdout_thread.join()
     stderr_thread.join()

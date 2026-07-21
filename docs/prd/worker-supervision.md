@@ -35,15 +35,30 @@ stops the exact worker process group. This enforcement is fail-closed: it
 signals only on a positive process-birth-ID match confirming the live PID is
 still the worker it launched, and stands down when identity cannot be verified
 rather than risk a recycled or unrelated group — never by broad process killing.
+The same positively verified birth identity gates the report-hang and wall-clock
+timeout reaps, so no reap path signals an unverified group.
 The already accepted report — the first terminal report the supervisor observed
 — stays authoritative: enforced teardown neither downgrades a completed result to
 unknown nor creates a retry, a later contradicting report cannot override it, and
 finalization/next-task dispatch still waits for the worker process to exit.
+
+The boundary is the report's own persistence instant, not the moment the
+supervisor's poll notices it, so structured activity emitted after persistence
+but before that poll — including a worker that reports, acts, and exits inside a
+single poll window — is buffered and attributed rather than lost. A tool call
+that started before the boundary and only completes after it (the worker's own
+`vibe-loop report` invocation and its result included) is correlated by call id
+and not counted as fresh post-report activity; only genuinely new post-report
+tool starts, and completions with no observed start, are violations.
+
 Post-report elapsed time and attributable provider usage are recorded separately
 from the useful implementation/review spend so quota diagnostics can isolate
 teardown burn; because provider usage events carry cumulative totals, the
 attributable post-report usage is the delta from the cumulative snapshot taken at
-the boundary, not the raw event. The wrapper stays compatible with Codex JSON and
+the boundary, not the raw event. When the only usage signal is an end-of-run
+cumulative total emitted after the report — with no boundary snapshot to subtract
+— the post-report usage is left unavailable rather than mislabeling the whole
+run as teardown burn. The wrapper stays compatible with Codex JSON and
 Claude stream-json, including a worker that exits immediately after reporting and
 one that emits a short final text summary.
 

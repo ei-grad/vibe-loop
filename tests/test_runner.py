@@ -43,6 +43,7 @@ from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     CURRENT_RUN_WORKSPACE_CLAIM_COMMAND,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
+    ActivityEvent,
     AgentLimitWallError,
     AgentRuntimeContext,
     PostReportActivityMonitor,
@@ -64,6 +65,7 @@ from vibe_loop.runner import (
     format_agent_command,
     build_resume_continuation_prompt,
     classify_post_report_activity,
+    classify_post_report_event,
     inject_claude_resume,
     inject_claude_session_id,
     inject_structured_usage_output,
@@ -86,6 +88,7 @@ from vibe_loop.runner import (
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
     wait_with_reap_watchdog,
+    worker_report_persistence_epoch,
     worker_usage_provenance,
 )
 from vibe_loop.runs import (
@@ -4729,6 +4732,60 @@ class ClassifyPostReportActivityTests(unittest.TestCase):
         self.assertEqual(classify_post_report_activity("just some prose\n"), "")
         self.assertEqual(classify_post_report_activity("{not json"), "")
 
+    def test_event_carries_claude_tool_use_id_as_a_start(self) -> None:
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash"}]
+                },
+            }
+        )
+        event = classify_post_report_event(line)
+        self.assertEqual(event, ActivityEvent("tool_call", "toolu_1", False))
+
+    def test_event_carries_claude_tool_result_id_as_a_completion(self) -> None:
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": "toolu_1"}]
+                },
+            }
+        )
+        event = classify_post_report_event(line)
+        self.assertEqual(event, ActivityEvent("tool_result", "toolu_1", True))
+
+    def test_event_codex_exec_begin_and_end_correlate_by_call_id(self) -> None:
+        begin = classify_post_report_event(
+            json.dumps({"type": "exec_command_begin", "call_id": "c1"})
+        )
+        end = classify_post_report_event(
+            json.dumps({"type": "exec_command_end", "call_id": "c1"})
+        )
+        self.assertEqual(begin, ActivityEvent("tool_call", "c1", False))
+        self.assertEqual(end, ActivityEvent("tool_call", "c1", True))
+
+    def test_event_codex_item_started_and_completed_correlate_by_id(self) -> None:
+        started = classify_post_report_event(
+            json.dumps(
+                {
+                    "type": "item.started",
+                    "item": {"type": "command_execution", "id": "i1"},
+                }
+            )
+        )
+        completed = classify_post_report_event(
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "command_execution", "id": "i1"},
+                }
+            )
+        )
+        self.assertEqual(started, ActivityEvent("tool_call", "i1", False))
+        self.assertEqual(completed, ActivityEvent("tool_call", "i1", True))
+
 
 class PostReportActivityMonitorTests(unittest.TestCase):
     def _tool_line(self) -> str:
@@ -4821,6 +4878,106 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         usage = monitor.snapshot().usage
         self.assertFalse(usage.available)
 
+    def _tool_use(self, tool_id: str) -> str:
+        return json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [{"type": "tool_use", "id": tool_id, "name": "Bash"}]
+                },
+            }
+        )
+
+    def _tool_result(self, tool_id: str) -> str:
+        return json.dumps(
+            {
+                "type": "user",
+                "message": {
+                    "content": [{"type": "tool_result", "tool_use_id": tool_id}]
+                },
+            }
+        )
+
+    def test_activity_between_persistence_and_mark_is_reconciled(self) -> None:
+        # A tool call emitted after the report persisted (wall 120) but before
+        # the watchdog marked the boundary is buffered and, once the boundary is
+        # marked at the persistence instant (100), counted rather than lost (F1).
+        # A tool call from before persistence (wall 80) stays benign.
+        wall = FakeMonotonicClock([80.0, 120.0])
+        monitor = PostReportActivityMonitor("anthropic", wallclock=wall)
+        monitor.observe_line(self._tool_use("pre"))
+        monitor.observe_line(self._tool_use("post"))
+        self.assertFalse(monitor.violation)
+        monitor.mark_report_observed(boundary_wall=100.0)
+        self.assertTrue(monitor.violation)
+        snapshot = monitor.snapshot()
+        self.assertEqual(snapshot.activity_kind, "tool_call")
+        self.assertEqual(snapshot.activity_count, 1)
+
+    def test_pre_boundary_tool_completing_after_report_is_ignored(self) -> None:
+        # A tool that started before the report (wall 80) and only completes
+        # after it (wall 130) -- e.g. the worker's own vibe-loop report call and
+        # its result -- is correlated by id and not counted as fresh activity.
+        wall = FakeMonotonicClock([80.0, 130.0])
+        monitor = PostReportActivityMonitor("anthropic", wallclock=wall)
+        monitor.observe_line(self._tool_use("t0"))
+        monitor.observe_line(self._tool_result("t0"))
+        monitor.mark_report_observed(boundary_wall=100.0)
+        self.assertFalse(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 0)
+
+    def test_fresh_post_boundary_tool_start_is_a_violation(self) -> None:
+        wall = FakeMonotonicClock([150.0])
+        monitor = PostReportActivityMonitor("anthropic", wallclock=wall)
+        monitor.mark_report_observed(boundary_wall=100.0)
+        monitor.observe_line(self._tool_use("fresh"))
+        self.assertTrue(monitor.violation)
+        self.assertEqual(monitor.snapshot().activity_count, 1)
+
+    def test_end_only_cumulative_usage_is_not_labeled_post_report(self) -> None:
+        # The only usage signal is a single cumulative total emitted after the
+        # report. Attributing the whole run as teardown burn would be wrong, so
+        # post-report usage is left unavailable (F5).
+        monitor = PostReportActivityMonitor("anthropic")
+        monitor.mark_report_observed()
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 100000, "output_tokens": 800},
+                }
+            )
+        )
+        usage = monitor.snapshot().usage
+        self.assertFalse(usage.available)
+        self.assertEqual(
+            usage.unavailable_reason, "post_report_usage_end_only_cumulative"
+        )
+
+    def test_report_persistence_epoch_parses_reported_at(self) -> None:
+        report = WorkerReport(
+            run_id="run-1",
+            task_id="TASK-01",
+            status="completed",
+            reported_at="2026-07-21T12:00:00+00:00",
+        )
+        epoch = worker_report_persistence_epoch(report)
+        self.assertIsNotNone(epoch)
+        self.assertEqual(
+            epoch,
+            datetime.datetime(2026, 7, 21, 12, 0, 0, tzinfo=datetime.UTC).timestamp(),
+        )
+
+    def test_report_persistence_epoch_is_none_for_unparseable(self) -> None:
+        self.assertIsNone(worker_report_persistence_epoch(None))
+        report = WorkerReport(
+            run_id="run-1",
+            task_id="TASK-01",
+            status="completed",
+            reported_at="not-a-timestamp",
+        )
+        self.assertIsNone(worker_report_persistence_epoch(report))
+
 
 class FakePostReportMonitor:
     """Watchdog-facing stand-in whose violation state is deterministic."""
@@ -4829,7 +4986,9 @@ class FakePostReportMonitor:
         self._violates = violates
         self.mark_calls: list[float | None] = []
 
-    def mark_report_observed(self, at: float | None = None) -> None:
+    def mark_report_observed(
+        self, at: float | None = None, *, boundary_wall: float | None = None
+    ) -> None:
         self.mark_calls.append(at)
 
     @property
@@ -4964,6 +5123,55 @@ class PostReportWatchdogTests(unittest.TestCase):
         self.assertFalse(result.post_report_enforced)
         self.assertFalse(result.timed_out)
 
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_hang_reap_requires_positively_verified_identity(self):
+        # F3: report-hang termination is fail-closed on identity too. A lenient
+        # identity_ok=True must not reap when the strict verified gate says the
+        # birth identity could not be positively confirmed.
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=0.0,
+                poll_seconds=0.001,
+                identity_ok=lambda: True,
+                identity_verified_ok=lambda: False,
+            )
+        self.assertEqual(killed, [])
+        self.assertFalse(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_timeout_reap_requires_positively_verified_identity(self):
+        # F3: wall-clock timeout termination is fail-closed on identity too.
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=None,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                timeout_seconds=0.01,
+                monotonic=FakeMonotonicClock([0.0, 0.02, 0.03]),
+                identity_ok=lambda: True,
+                identity_verified_ok=lambda: False,
+            )
+        self.assertEqual(killed, [])
+        self.assertTrue(result.timed_out)
+
 
 class RunStreamingPostReportTests(unittest.TestCase):
     def _run(self, body: str, **kwargs):
@@ -5040,6 +5248,33 @@ class RunStreamingPostReportTests(unittest.TestCase):
         # dispatch can overlap an unfinalized process.
         self.assertTrue(pids)
         self.assertIsNone(read_process_node(pids[0]))
+
+    def test_tool_activity_before_a_poll_is_still_recorded(self):
+        # F1: a worker that reports, invokes a tool, and exits within a single
+        # poll window is gone before the watchdog ever marks the boundary. The
+        # exit-time reconciliation still marks the boundary from the persisted
+        # report so the post-report tool call is attributed, even though there
+        # is no live process left to stop.
+        boundary = time.time()
+        result = self._run(
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'type': 'assistant', 'message': "
+            "{'content': [{'type': 'tool_use', 'id': 'x', 'name': 'Bash'}]}}) "
+            "+ '\\n')\n"
+            "sys.stdout.flush()\n",
+            reap_check=lambda: True,
+            report_persistence_epoch=lambda: boundary,
+            reap_grace_seconds=60.0,
+            reap_poll_seconds=5.0,
+            provider="anthropic",
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+        self.assertIsNotNone(result.post_report)
+        self.assertTrue(result.post_report.reported)
+        self.assertTrue(result.post_report.violation)
+        self.assertEqual(result.post_report.activity_kind, "tool_call")
+        self.assertFalse(result.post_report.enforced_stop)
 
 
 def write_analysis_stub(path: Path, *, stdout: str = "", exit_code: int = 0) -> None:
