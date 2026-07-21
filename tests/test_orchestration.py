@@ -3264,7 +3264,9 @@ class RunContractJournalTests(unittest.TestCase):
                 self.assertIn("workspace_provisioned", launch_record_types)
                 self.assertIn("workspace_claim", launch_record_types)
                 self.assertNotEqual(cwd, repo)
+                self.assertEqual(env["VIBE_LOOP_REPO"], str(cwd.resolve()))
                 self.assertEqual(env["VIBE_LOOP_WORKTREE"], str(cwd))
+                self.assertNotIn("VIBE_LOOP_PRIMARY_REPO", env)
                 self.assertEqual(
                     env["VIBE_LOOP_BRANCH"],
                     git(cwd, "branch", "--show-current").stdout.strip(),

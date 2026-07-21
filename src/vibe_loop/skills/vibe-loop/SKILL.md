@@ -109,6 +109,13 @@ workspace and before implementation edits. Treat that ownership data as
 diagnostic coordination state only: it never authorizes automatic cleanup,
 branch deletion, resets, lock stealing, or central merge-queue behavior.
 
+For CLI-supervised workers, the CLI-provided repository path, worktree path,
+current directory, and Git top-level must resolve to the same canonical claimed
+task workspace. Never edit tracked files or run gates or review against an
+absolute repository path outside that workspace. Worker report and
+integration-lock helpers accept the task-workspace path and resolve their
+runtime-owned primary-repository control state internally.
+
 For a CLI-launched command-backed task, the supervisor must acquire the exact
 task lock, invoke the repository-configured lifecycle adapter, and confirm a
 non-runnable in-progress task state before starting the worker process. The

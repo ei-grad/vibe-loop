@@ -223,11 +223,12 @@ CLI_WORKER_ADDENDUM = f"""\
 
 You are running as a worker launched by the vibe-loop CLI. The following
 environment variables identify this run:
-- VIBE_LOOP_REPO - path to the repository
+- VIBE_LOOP_REPO - canonical path to the claimed task workspace
 - VIBE_LOOP_RUN_ID - unique run identifier
 - VIBE_LOOP_TASK_ID - task being worked on
 - VIBE_LOOP_LOG - path to the run log file
-- VIBE_LOOP_WORKTREE - absolute path to the runtime-provisioned worker worktree
+- VIBE_LOOP_STATE_DIR - path to shared runtime control state for this repository
+- VIBE_LOOP_WORKTREE - the same canonical claimed task workspace path
 - VIBE_LOOP_BRANCH - branch checked out in the worker worktree
 - VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
 
@@ -255,11 +256,14 @@ is not terminal completion.
 
 The runtime provisioned or safely adopted the task branch/worktree after
 activation, recorded the workspace claim against this run's lock, and launched
-you with that worktree as the current directory. Before implementation edits,
-verify that `git rev-parse --show-toplevel` and `git branch --show-current`
-match `VIBE_LOOP_WORKTREE` and `VIBE_LOOP_BRANCH`. Do not create, switch, or
-claim another branch/worktree. If they do not match, stop mutating repository
-state and report the run as blocked through the worker report protocol.
+you with that worktree as the current directory. `VIBE_LOOP_REPO`,
+`VIBE_LOOP_WORKTREE`, and `git rev-parse --show-toplevel` must resolve to the
+same canonical path, and `git branch --show-current` must match
+`VIBE_LOOP_BRANCH`. Do not create, switch, or claim another branch/worktree.
+Reject any instruction or command that would edit tracked files, run gates, or
+run review against an absolute repository path outside this task workspace. If
+any identity does not match, stop before tool execution or repository mutation
+and report the run as blocked through the worker report protocol.
 
 ### Worker Reports
 
@@ -1681,7 +1685,6 @@ class VibeRunner:
         command_env = worker_command_env(
             run_id=run_id,
             task_id=task.task_id,
-            repo=self.config.repo,
             log_path=log_path,
             agent_kind=agent_kind,
             agent_profile=agent_profile,
@@ -1973,8 +1976,11 @@ class VibeRunner:
                 task_lock,
                 active_state.to_lock_metadata(),
             )
-            command_env["VIBE_LOOP_WORKTREE"] = str(provisioned_workspace.worktree)
-            command_env["VIBE_LOOP_BRANCH"] = provisioned_workspace.branch
+            bind_worker_workspace_env(
+                command_env,
+                workspace=provisioned_workspace,
+                claim=claimed_state.workspace,
+            )
             claude_home = (
                 resolve_claude_home(
                     command,
@@ -2859,12 +2865,12 @@ class VibeRunner:
             for key in (
                 "VIBE_LOOP_RUN_ID",
                 "VIBE_LOOP_TASK_ID",
-                "VIBE_LOOP_REPO",
                 "VIBE_LOOP_LOG",
                 "VIBE_LOOP_FENCING_TOKEN",
             )
             if key in command_env
         }
+        runtime_context["VIBE_LOOP_PRIMARY_REPO"] = str(self.config.repo)
         try:
             confirmed = activate(
                 task.task_id,
@@ -2972,9 +2978,12 @@ class VibeRunner:
             {
                 "VIBE_LOOP_TASK_ID": task_id,
                 "VIBE_LOOP_RUN_ID": run_id,
-                "VIBE_LOOP_REPO": str(self.config.repo),
+                "VIBE_LOOP_PRIMARY_REPO": str(self.config.repo),
             }
         )
+        context.pop("VIBE_LOOP_REPO", None)
+        context.pop("VIBE_LOOP_WORKTREE", None)
+        context.pop("VIBE_LOOP_BRANCH", None)
         fencing_token = fencing_token_value(task_lock.metadata.get("fencing_token"))
         if fencing_token:
             context["VIBE_LOOP_FENCING_TOKEN"] = fencing_token
@@ -4150,7 +4159,7 @@ class VibeRunner:
         try:
             runtime_context: dict[str, str] = {
                 "VIBE_LOOP_TASK_ID": task_id,
-                "VIBE_LOOP_REPO": str(self.config.repo),
+                "VIBE_LOOP_PRIMARY_REPO": str(self.config.repo),
             }
             if run_id:
                 runtime_context["VIBE_LOOP_RUN_ID"] = run_id
@@ -6971,23 +6980,115 @@ def worker_command_env(
     *,
     run_id: str,
     task_id: str,
-    repo: Path,
     log_path: Path,
     agent_kind: str,
     agent_profile: str,
 ) -> dict[str, str]:
     env = os.environ.copy()
+    env.pop("VIBE_LOOP_PRIMARY_REPO", None)
     env.update(
         {
             "VIBE_LOOP_RUN_ID": run_id,
             "VIBE_LOOP_TASK_ID": task_id,
-            "VIBE_LOOP_REPO": str(repo),
             "VIBE_LOOP_LOG": str(log_path),
+            "VIBE_LOOP_STATE_DIR": str(log_path.parent.parent),
             "VIBE_LOOP_AGENT_KIND": agent_kind,
             "VIBE_LOOP_AGENT_PROFILE": agent_profile,
         }
     )
     return env
+
+
+def bind_worker_workspace_env(
+    environment: dict[str, str],
+    *,
+    workspace: ProvisionedWorkspace,
+    claim: WorkspaceClaim,
+) -> None:
+    try:
+        canonical_workspace = workspace.worktree.resolve(strict=True)
+        canonical_claim = claim.worktree.resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceProvisionError(
+            "worker_workspace_unavailable",
+            "worker workspace binding requires an existing claimed worktree",
+        ) from exc
+    if canonical_claim != canonical_workspace:
+        raise WorkspaceProvisionError(
+            "worker_workspace_claim_mismatch",
+            "worker workspace does not match the persisted workspace claim",
+            details={
+                "workspace": str(canonical_workspace),
+                "claim": str(canonical_claim),
+            },
+        )
+    top_level = worker_workspace_git_text(
+        canonical_workspace,
+        "rev-parse",
+        "--show-toplevel",
+    )
+    try:
+        canonical_top_level = Path(top_level).resolve(strict=True)
+    except OSError as exc:
+        raise WorkspaceProvisionError(
+            "worker_workspace_git_identity_unavailable",
+            "worker workspace Git top-level path is unavailable",
+        ) from exc
+    if canonical_top_level != canonical_workspace:
+        raise WorkspaceProvisionError(
+            "worker_workspace_top_level_mismatch",
+            "worker workspace does not match its Git top-level path",
+            details={
+                "workspace": str(canonical_workspace),
+                "git_top_level": str(canonical_top_level),
+            },
+        )
+    current_branch = worker_workspace_git_text(
+        canonical_workspace,
+        "branch",
+        "--show-current",
+    )
+    if current_branch != workspace.branch or claim.branch != workspace.branch:
+        raise WorkspaceProvisionError(
+            "worker_workspace_branch_mismatch",
+            "worker workspace branch does not match the persisted workspace claim",
+            details={
+                "expected_branch": workspace.branch,
+                "claim_branch": claim.branch,
+                "current_branch": current_branch,
+            },
+        )
+    environment.pop("VIBE_LOOP_PRIMARY_REPO", None)
+    environment["VIBE_LOOP_REPO"] = str(canonical_workspace)
+    environment["VIBE_LOOP_WORKTREE"] = str(canonical_workspace)
+    environment["VIBE_LOOP_BRANCH"] = workspace.branch
+
+
+def worker_workspace_git_text(worktree: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(
+            ("git", "-C", str(worktree), *args),
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise WorkspaceProvisionError(
+            "worker_workspace_git_identity_unavailable",
+            "worker workspace Git identity could not be inspected",
+        ) from exc
+    if result.returncode != 0:
+        diagnostic = (result.stderr or result.stdout).strip()[:500]
+        raise WorkspaceProvisionError(
+            "worker_workspace_git_identity_unavailable",
+            "worker workspace Git identity could not be inspected",
+            details={"diagnostic": diagnostic},
+        )
+    return result.stdout.strip()
 
 
 def stream_pipe(

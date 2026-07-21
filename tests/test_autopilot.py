@@ -1462,7 +1462,7 @@ class AutopilotRunTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / "adapter.py").write_text(
-                "import json, os\n"
+                "import json, os, subprocess\n"
                 "from pathlib import Path\n"
                 "selector = os.environ['PROJECT_SELECTOR']\n"
                 "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
@@ -1507,15 +1507,21 @@ class AutopilotRunTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / "agent.py").write_text(
-                "import json, os\n"
+                "import json, os, subprocess\n"
                 "from pathlib import Path\n"
                 "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
-                "(repo / '.vibe-loop' / 'worker-env.json').write_text(json.dumps({\n"
+                "(Path(os.environ['VIBE_LOOP_STATE_DIR']) / 'worker-env.json').write_text(json.dumps({\n"
                 "    'selector': 'PROJECT_SELECTOR' in os.environ,\n"
                 "    'transport': 'VIBE_LOOP_AUTOPILOT_RUNTIME_CONTEXT_FD' in os.environ,\n"
                 "}))\n"
                 "plan = repo / 'PLAN.md'\n"
-                "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'))\n",
+                "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'))\n"
+                "listing = subprocess.run(['git', 'worktree', 'list', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True).stdout\n"
+                "primary = Path(listing.splitlines()[0].removeprefix('worktree '))\n"
+                "branch = subprocess.run(['git', 'branch', '--show-current'], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()\n"
+                "subprocess.run(['git', 'add', '-A'], cwd=repo, check=True)\n"
+                "subprocess.run(['git', 'commit', '-m', 'complete test worker'], cwd=repo, check=True, capture_output=True)\n"
+                "subprocess.run(['git', 'merge', '--ff-only', branch], cwd=primary, check=True, capture_output=True)\n",
                 encoding="utf-8",
             )
             run(

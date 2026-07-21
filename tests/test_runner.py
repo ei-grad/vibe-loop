@@ -43,6 +43,7 @@ from vibe_loop.locks import (
 from vibe_loop.processes import read_process_node
 from vibe_loop.orchestration import (
     IntegrationResult,
+    ProvisionedWorkspace,
     RunLifecycleStateMachine,
     RunStage,
     WorkspaceProvisionError,
@@ -58,6 +59,7 @@ from vibe_loop.runner import (
     TaskActivationError,
     VibeRunner,
     active_lock_conflict_domains,
+    bind_worker_workspace_env,
     build_batch_selection_prompt,
     build_run_context_payload,
     build_run_worker_prompt,
@@ -114,6 +116,7 @@ from vibe_loop.workers import (
     StaleLock,
     clean_stale_locks,
     collect_stale_locks,
+    WorkspaceClaim,
 )
 
 
@@ -181,6 +184,130 @@ def file_fingerprint(path: Path, relative_path: str) -> dict[str, object]:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_worker_workspace_environment_uses_canonical_claimed_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            worktree = root / "worktree"
+            symlink = root / "worktree-link"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "test@example.com"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Test User"],
+                cwd=repo,
+                check=True,
+            )
+            (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "base"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            subprocess.run(
+                ["git", "worktree", "add", "-b", "task/test", str(worktree)],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+            )
+            symlink.symlink_to(worktree, target_is_directory=True)
+            relative_symlink = Path(os.path.relpath(symlink, Path.cwd()))
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            workspace = ProvisionedWorkspace(
+                mode="created",
+                branch="task/test",
+                worktree=relative_symlink,
+                base_commit=head,
+                head_commit=head,
+            )
+            claim = WorkspaceClaim(
+                task_id="test",
+                run_id="run",
+                branch="task/test",
+                worktree=symlink,
+                base_commit=head,
+                head_commit=head,
+                current_branch="task/test",
+                dirty=False,
+                dirty_summary=(),
+            )
+            environment = {"VIBE_LOOP_PRIMARY_REPO": str(repo)}
+
+            bind_worker_workspace_env(
+                environment,
+                workspace=workspace,
+                claim=claim,
+            )
+
+            self.assertEqual(environment["VIBE_LOOP_REPO"], str(worktree.resolve()))
+            self.assertEqual(environment["VIBE_LOOP_WORKTREE"], str(worktree.resolve()))
+            self.assertEqual(environment["VIBE_LOOP_BRANCH"], "task/test")
+            self.assertNotIn("VIBE_LOOP_PRIMARY_REPO", environment)
+            primary_common = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            task_common = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(
+                (repo / primary_common).resolve(),
+                (worktree / task_common).resolve(),
+            )
+
+    def test_worker_workspace_environment_rejects_claim_mismatch(self) -> None:
+        workspace = ProvisionedWorkspace(
+            mode="created",
+            branch="task/test",
+            worktree=Path.cwd(),
+            base_commit="base",
+            head_commit="head",
+        )
+        claim = WorkspaceClaim(
+            task_id="test",
+            run_id="run",
+            branch="task/test",
+            worktree=Path.cwd().parent,
+            base_commit="base",
+            head_commit="head",
+            current_branch="task/test",
+            dirty=False,
+            dirty_summary=(),
+        )
+        environment = {"VIBE_LOOP_PRIMARY_REPO": "/primary"}
+
+        with self.assertRaisesRegex(
+            WorkspaceProvisionError,
+            "persisted workspace claim",
+        ):
+            bind_worker_workspace_env(
+                environment,
+                workspace=workspace,
+                claim=claim,
+            )
+
+        self.assertNotIn("VIBE_LOOP_REPO", environment)
+        self.assertEqual(environment["VIBE_LOOP_PRIMARY_REPO"], "/primary")
+
     def test_activate_task_before_launch_rejects_empty_status(self) -> None:
         class EmptyStatusSource:
             def activate(self, *args: object, **kwargs: object) -> Task:
@@ -6512,6 +6639,7 @@ class RuntimeOwnedTaskSource(StubTaskSource):
     def __init__(self, task: Task) -> None:
         super().__init__([task], {task.task_id: task})
         self.status = "ready"
+        self.activate_context: dict[str, str] = {}
         self.complete_context: dict[str, str] = {}
         self.settlement_context: dict[str, str] = {}
 
@@ -6527,6 +6655,7 @@ class RuntimeOwnedTaskSource(StubTaskSource):
         continuation: bool = False,
         runtime_context: dict[str, str] | None = None,
     ) -> Task:
+        self.activate_context = dict(runtime_context or {})
         self.status = "active"
         self.mark_dispatched(task_id)
         return self.probe(task_id)
@@ -6798,6 +6927,17 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             self.assertEqual(source.complete_context["VIBE_LOOP_RUN_ID"], result.run_id)
             self.assertEqual(source.complete_context["VIBE_LOOP_TASK_ID"], "T-1")
+            self.assertEqual(
+                source.activate_context["VIBE_LOOP_PRIMARY_REPO"],
+                str(runner.config.repo),
+            )
+            self.assertNotIn("VIBE_LOOP_REPO", source.activate_context)
+            self.assertEqual(
+                source.complete_context["VIBE_LOOP_PRIMARY_REPO"],
+                str(runner.config.repo),
+            )
+            self.assertNotIn("VIBE_LOOP_REPO", source.complete_context)
+            self.assertNotIn("VIBE_LOOP_WORKTREE", source.complete_context)
             release_metadata = next(
                 metadata for kind, metadata in lock_manager.events if kind == "release"
             )
@@ -6872,6 +7012,12 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             self.assertEqual(
                 source.settlement_context["VIBE_LOOP_RUN_ID"], result.run_id
             )
+            self.assertEqual(
+                source.settlement_context["VIBE_LOOP_PRIMARY_REPO"],
+                str(runner.config.repo),
+            )
+            self.assertNotIn("VIBE_LOOP_REPO", source.settlement_context)
+            self.assertNotIn("VIBE_LOOP_WORKTREE", source.settlement_context)
             release_metadata = next(
                 metadata for kind, metadata in lock_manager.events if kind == "release"
             )
@@ -7784,6 +7930,10 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
 
             def timing_out_worker(command, cwd, log, **kwargs):
+                environment = kwargs["env"]
+                self.assertEqual(environment["VIBE_LOOP_REPO"], str(cwd.resolve()))
+                self.assertEqual(environment["VIBE_LOOP_WORKTREE"], str(cwd.resolve()))
+                self.assertNotIn("VIBE_LOOP_PRIMARY_REPO", environment)
                 on_start = kwargs.get("on_start")
                 if on_start is not None:
                     on_start(os.getpid())

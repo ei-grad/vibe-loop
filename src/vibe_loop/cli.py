@@ -44,6 +44,7 @@ from vibe_loop.config import (
     AGENT_DEFAULT_POLICY_SOURCE,
     AUTOPILOT_WORKTREE_DISPOSITION_POLICIES,
     AgentResolutionError,
+    git_main_worktree_path,
     load_config,
 )
 from vibe_loop.eval_runner import (
@@ -1012,10 +1013,20 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_attempt_circuit(args, config)
 
     if args.command == "main-integration":
-        return dispatch_main_integration(args, config)
+        try:
+            control_config = worker_control_config(args, config)
+        except WorkerWorkspaceContextError as exc:
+            print(f"worker workspace context refused: {exc}", file=sys.stderr)
+            return 2
+        return dispatch_main_integration(args, control_config)
 
     if args.command == "report":
-        report_error = validate_report_fencing(args, config)
+        try:
+            control_config = worker_control_config(args, config)
+        except WorkerWorkspaceContextError as exc:
+            print(f"worker workspace context refused: {exc}", file=sys.stderr)
+            return 2
+        report_error = validate_report_fencing(args, control_config)
         if report_error is not None:
             return report_error
         report = WorkerReport(
@@ -1027,7 +1038,7 @@ def dispatch(args: argparse.Namespace) -> int:
             metadata=parse_metadata_json(args.metadata_json),
             fencing_token=fencing_token_from_args(args),
         )
-        RunStore(config.state_path / "runs.jsonl").append_report(report)
+        RunStore(control_config.state_path / "runs.jsonl").append_report(report)
         print(json.dumps(report.to_json(), indent=2))
         return 0
 
@@ -2857,8 +2868,8 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
 
 
 def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:
-    run_id = args.run_id or os.environ.get("VIBE_LOOP_RUN_ID", "")
-    task_id = args.task_id or os.environ.get("VIBE_LOOP_TASK_ID", "")
+    run_id = getattr(args, "run_id", "") or os.environ.get("VIBE_LOOP_RUN_ID", "")
+    task_id = getattr(args, "task_id", "") or os.environ.get("VIBE_LOOP_TASK_ID", "")
     return run_id, task_id
 
 
@@ -2903,6 +2914,126 @@ def validate_report_fencing(args: argparse.Namespace, config) -> int | None:
         print(f"worker report refused: {exc}", file=sys.stderr)
         return 1
     return None
+
+
+class WorkerWorkspaceContextError(RuntimeError):
+    pass
+
+
+def worker_control_config(args: argparse.Namespace, config):
+    run_id, task_id = worker_identity_from_args(args)
+    environment_run_id = os.environ.get("VIBE_LOOP_RUN_ID", "")
+    environment_task_id = os.environ.get("VIBE_LOOP_TASK_ID", "")
+    repo_value = os.environ.get("VIBE_LOOP_REPO")
+    worktree_value = os.environ.get("VIBE_LOOP_WORKTREE")
+    branch_value = os.environ.get("VIBE_LOOP_BRANCH")
+    if repo_value is None and worktree_value is None:
+        return config
+    if not repo_value or not worktree_value or not branch_value:
+        raise WorkerWorkspaceContextError(
+            "VIBE_LOOP_REPO, VIBE_LOOP_WORKTREE, and VIBE_LOOP_BRANCH must all be set"
+        )
+    try:
+        expected_repo = Path(repo_value).resolve(strict=True)
+        expected_worktree = Path(worktree_value).resolve(strict=True)
+        requested_repo = config.repo.resolve(strict=True)
+    except OSError as exc:
+        raise WorkerWorkspaceContextError(
+            "worker repository paths must resolve to existing directories"
+        ) from exc
+    same_worker_identity = bool(
+        run_id
+        and task_id
+        and run_id == environment_run_id
+        and task_id == environment_task_id
+    )
+    if not same_worker_identity:
+        raise WorkerWorkspaceContextError(
+            "worker helper identity must match VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID"
+        )
+    if expected_repo != expected_worktree or requested_repo != expected_worktree:
+        raise WorkerWorkspaceContextError(
+            "--repo, VIBE_LOOP_REPO, and VIBE_LOOP_WORKTREE must resolve to "
+            "the same claimed task workspace"
+        )
+    top_level = run_git(requested_repo, "rev-parse", "--show-toplevel")
+    if top_level is None or top_level.returncode != 0:
+        raise WorkerWorkspaceContextError(
+            "claimed task workspace Git identity is unavailable"
+        )
+    try:
+        canonical_top_level = Path(top_level.stdout.strip()).resolve(strict=True)
+    except OSError as exc:
+        raise WorkerWorkspaceContextError(
+            "claimed task workspace Git top-level is unavailable"
+        ) from exc
+    if canonical_top_level != requested_repo:
+        raise WorkerWorkspaceContextError(
+            "claimed task workspace does not match its Git top-level"
+        )
+    current_branch = run_git(requested_repo, "branch", "--show-current")
+    if (
+        current_branch is None
+        or current_branch.returncode != 0
+        or current_branch.stdout.strip() != branch_value
+    ):
+        raise WorkerWorkspaceContextError(
+            "claimed task workspace branch does not match VIBE_LOOP_BRANCH"
+        )
+    primary_repo = git_main_worktree_path(requested_repo)
+    if primary_repo is None:
+        raise WorkerWorkspaceContextError(
+            "primary repository control context could not be resolved"
+        )
+    try:
+        canonical_primary = primary_repo.resolve(strict=True)
+    except OSError as exc:
+        raise WorkerWorkspaceContextError(
+            "primary repository control context is unavailable"
+        ) from exc
+    control_config = load_config(
+        canonical_primary,
+        runtime_context=dict(config.runtime_context),
+    )
+    manager = build_lock_manager(
+        control_config.repo,
+        control_config.state_path / "locks",
+        control_config.locks,
+        runtime_context=control_config.runtime_environment,
+    )
+    try:
+        task_lock = active_task_lock_for_claim(
+            manager,
+            task_id=task_id,
+            run_id=run_id,
+            fencing_token=fencing_token_from_args(args) or None,
+        )
+    except (WorkspaceClaimError, LockBackendError) as exc:
+        raise WorkerWorkspaceContextError(
+            "matching active task workspace claim is unavailable"
+        ) from exc
+    active = ActiveRunState.from_lock_metadata(task_lock.metadata)
+    claim = active.workspace if active is not None else None
+    if claim is None:
+        raise WorkerWorkspaceContextError(
+            "matching active task lock has no persisted workspace claim"
+        )
+    try:
+        claimed_worktree = claim.worktree.resolve(strict=True)
+    except OSError as exc:
+        raise WorkerWorkspaceContextError(
+            "persisted task workspace claim is unavailable"
+        ) from exc
+    if (
+        claim.task_id != task_id
+        or claim.run_id != run_id
+        or claim.branch != branch_value
+        or claimed_worktree != requested_repo
+    ):
+        raise WorkerWorkspaceContextError(
+            "worker context does not match the persisted task workspace claim"
+        )
+    return control_config
 
 
 def resolve_report_commit(repo: Path, commit: str) -> str:

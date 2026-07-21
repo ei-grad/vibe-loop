@@ -105,6 +105,13 @@ results are missing or ambiguous.
   The command requires a matching active task lock, verifies that the worktree
   is currently on the claimed branch, updates the active lock, and appends a
   `workspace_claim` run record.
+- Supervised workers receive `VIBE_LOOP_REPO` and `VIBE_LOOP_WORKTREE` bound to
+  the same canonical claimed task worktree, which is also their cwd and Git
+  top-level. Tracked edits, gates, and review commands must not target an
+  absolute path outside that workspace. Runtime task-source adapters use the
+  separate `VIBE_LOOP_PRIMARY_REPO` context; that primary path is not exported
+  to the worker command. Worker report and integration-lock helpers resolve
+  shared primary control state internally from the task worktree.
 - `workers --json` and `doctor --json` cross-check claimed workspace metadata
   against `git worktree list`, the current claimed worktree status, and branch
   containment in `main` or `origin/main`. They emit diagnostic codes and manual

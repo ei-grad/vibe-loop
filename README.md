@@ -361,6 +361,10 @@ records an operator reset.
 Workers can report status and serialize final integration while the supervisor
 run is active. `claim-workspace` remains available for compatibility and manual
 worker flows; normal supervised launches are already claimed by the runtime.
+For supervised workers, `VIBE_LOOP_REPO` and `VIBE_LOOP_WORKTREE` are the same
+canonical claimed task-worktree path. Agent edits, gates, and review commands
+must remain in that workspace. Report and integration-lock commands resolve the
+shared primary-repository control state internally from the task worktree.
 
 ```bash
 # Report final status (authoritative for classifying that run).
@@ -1061,8 +1065,12 @@ Claude commands receive `--effort {effort}`. Supported values are `minimal`,
 commands stay authoritative: when first-class effort is configured, they must
 use `{effort}` and must not also embed a provider-specific effort flag. Workers
 also get `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`,
-`VIBE_LOOP_LOG`, `VIBE_LOOP_AGENT_KIND`, and `VIBE_LOOP_AGENT_PROFILE` in their
-environment. The agent values come from the effective task profile, so
+`VIBE_LOOP_WORKTREE`, `VIBE_LOOP_BRANCH`, `VIBE_LOOP_LOG`,
+`VIBE_LOOP_STATE_DIR`, `VIBE_LOOP_AGENT_KIND`, and `VIBE_LOOP_AGENT_PROFILE` in
+their environment.
+Both repository variables resolve to the canonical claimed task worktree; the
+primary repository is not exported to the worker. The agent values come from
+the effective task profile, so
 repository-owned commit hooks can use the same provenance as run telemetry. The
 profile value is empty for the default `[agent]`. `selection_command` receives a
 `{prompt}` with the candidate list and recent run context. Single-task selection
