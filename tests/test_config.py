@@ -1748,6 +1748,64 @@ class AgentProfileRoutingTests(unittest.TestCase):
             "claude -p --model {model} {prompt}",
         )
 
+    def test_kind_defaults_include_configured_effort(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\nmodel = "gpt-5.4"\neffort = "xhigh"\n\n'
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n'
+            'model = "opus"\n'
+            'effort = "high"\n'
+        )
+
+        self.assertEqual(config.agent.effort, "xhigh")
+        self.assertEqual(config.agent.effort_source, "explicit")
+        self.assertEqual(
+            config.agent.command,
+            "codex exec -c model_reasoning_effort={effort} -m {model} {prompt}",
+        )
+        self.assertEqual(config.agent_profiles["opus"].effort, "high")
+        self.assertEqual(config.agent_profiles["opus"].effort_source, "explicit")
+        self.assertEqual(
+            config.agent_profiles["opus"].command,
+            "claude -p --effort {effort} --model {model} {prompt}",
+        )
+
+    def test_effort_rejects_unknown_and_provider_incompatible_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "agent.effort must be one of"):
+            self._load_with_both_clis('[agent]\neffort = "turbo"\n')
+
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "claude"\neffort = "xhigh"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "not supported by claude"):
+            config.agent.require_command()
+
+    def test_explicit_effort_commands_require_placeholder_without_conflict(
+        self,
+    ) -> None:
+        conflict = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\neffort = "high"\n'
+            'command = "codex exec -c model_reasoning_effort=high {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "already embeds"):
+            conflict.agent.require_command()
+
+        missing = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "high"\n'
+            'command = "worker {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "cannot receive"):
+            missing.agent.require_command()
+
+        placeholder = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "high"\n'
+            'command = "worker --effort {effort} {prompt}"\n'
+        )
+        self.assertEqual(
+            placeholder.agent.require_command(), "worker --effort {effort} {prompt}"
+        )
+        self.assertEqual(placeholder.agent.to_json()["effort"], "high")
+
     def test_profile_resolves_command_through_kind_defaults(self) -> None:
         config = self._load_with_both_clis(
             '[agent]\nkind = "codex"\n\n[agent.profiles.opus]\nkind = "claude"\n'
@@ -1868,7 +1926,8 @@ class AgentProfileRoutingTests(unittest.TestCase):
         config = self._load_with_both_clis(
             '[agent]\nkind = "codex"\n\n'
             "[agent.profiles.opus]\n"
-            'kind = "claude"\n\n'
+            'kind = "claude"\n'
+            'effort = "high"\n\n'
             "[[agent.routing]]\n"
             'profile = "opus"\n'
             'match_hazards_any = ["abi"]\n'
@@ -1877,7 +1936,11 @@ class AgentProfileRoutingTests(unittest.TestCase):
         default = Task(task_id="D", title="t", status="Next")
         routed_selection = resolve_task_agent(config, routed)
         self.assertEqual(routed_selection.profile, "opus")
-        self.assertEqual(routed_selection.config.command, "claude -p {prompt}")
+        self.assertEqual(
+            routed_selection.config.command,
+            "claude -p --effort {effort} {prompt}",
+        )
+        self.assertEqual(routed_selection.config.effort, "high")
         default_selection = resolve_task_agent(config, default)
         self.assertEqual(default_selection.profile, "")
         self.assertEqual(default_selection.config.command, "codex exec {prompt}")
@@ -1911,7 +1974,8 @@ class AgentProfileRoutingTests(unittest.TestCase):
     def test_task_only_model_updates_inferred_but_not_explicit_command(self) -> None:
         config = self._load_with_both_clis(
             "[agent.profiles.inferred]\n"
-            'kind = "claude"\n\n'
+            'kind = "claude"\n'
+            'effort = "high"\n\n'
             "[agent.profiles.explicit]\n"
             'kind = "claude"\n'
             'command = "worker {prompt}"\n'
@@ -1940,8 +2004,9 @@ class AgentProfileRoutingTests(unittest.TestCase):
 
         self.assertEqual(
             inferred.config.command,
-            "claude -p --model {model} {prompt}",
+            "claude -p --effort {effort} --model {model} {prompt}",
         )
+        self.assertEqual(inferred.config.effort, "high")
         self.assertEqual(explicit.config.command, "worker {prompt}")
 
     def test_resolve_task_agent_unknown_profile_fails_closed(self) -> None:

@@ -814,6 +814,7 @@ state_dir = ".vibe-loop"
 # Optional when kind = "auto" and Codex or Claude is available on PATH.
 kind = "auto"
 # model = "gpt-5.4"  # optional; inferred commands add the kind-specific flag
+# effort = "high"    # optional; inferred commands add the provider-specific flag
 command = "codex exec {prompt}"
 selection_command = "codex exec {prompt}"
 # analysis_command runs a read-only agent for autopilot decisions; the default is
@@ -943,8 +944,15 @@ absent, generated prompts are unchanged.
 
 `agent.command` receives `{task_id}`, `{run_id}`, a shell-quoted `{prompt}`
 (skill reference, normalized task context, CLI addendum), and a shell-quoted
-`{model}` when `agent.model` or the task's `model` field resolves one. A template
-that references `{model}` fails before launch when no model is resolved. Workers
+`{model}` when `agent.model` or the task's `model` field resolves one. It also
+receives a shell-quoted `{effort}` when `agent.effort` resolves one. Templates
+that reference either field fail before launch when its value is unresolved.
+Omitted Codex commands receive `-c model_reasoning_effort={effort}`; omitted
+Claude commands receive `--effort {effort}`. Supported values are `minimal`,
+`low`, `medium`, `high`, and `xhigh` for Codex, while Claude accepts `low`,
+`medium`, and `high`; an incompatible value fails before launch. Explicit
+commands stay authoritative: when first-class effort is configured, they must
+use `{effort}` and must not also embed a provider-specific effort flag. Workers
 also get `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`,
 `VIBE_LOOP_LOG`, `VIBE_LOOP_AGENT_KIND`, and `VIBE_LOOP_AGENT_PROFILE` in their
 environment. The agent values come from the effective task profile, so
@@ -984,6 +992,7 @@ kind = "codex"            # default profile: fast, separate quota
 [agent.profiles.claude-opus]
 kind = "claude"
 model = "opus"
+effort = "high"
 
 [[agent.routing]]
 profile = "claude-opus"
@@ -993,14 +1002,20 @@ match_paths_glob = ["kernel/**"]            # optional extra constraint
 
 Each `[agent.profiles.<name>]` table takes the agent-selection fields from
 `[agent]` (`kind`, `model`, `command`, `selection_command`, `analysis_command`,
-and dialect fields) and resolves through the same machinery.
+`effort`, and dialect fields) and resolves through the same machinery.
 `worker_prompt_extra` remains top-level repository policy rather than a
 profile-specific field. A profile with `kind = "claude"` and `model = "opus"`
 gets `claude -p --model {model} {prompt}` without an explicit command; omitting
 `model` preserves the bare `claude -p {prompt}` default. Codex uses
-`codex exec -m {model} {prompt}`. The top-level `[agent]` remains the default
+`codex exec -m {model} {prompt}`. Setting `effort = "high"` adds the matching
+native effort flag to all inferred worker, selection, analysis, and generated
+profile commands. The top-level `[agent]` remains the default
 profile. With no profiles and no routing, behavior is identical to a single
 `[agent]`.
+
+Task selection occurs before a task profile is known, so its command uses the
+default `[agent]` model and effort. Worker execution, recovery, and the
+post-selection provenance use the selected profile's effective values.
 
 `[[agent.routing]]` is an ordered list. Each rule names a `profile` and one or
 more match predicates evaluated against the task; a rule matches when **all** of

@@ -296,11 +296,25 @@ class ActiveRunState:
             model_provider_source=(
                 optional_string(metadata.get("model_provider_source")) or ""
             ),
-            model_id=optional_string(metadata.get("model_id")) or "",
-            model_id_source=optional_string(metadata.get("model_id_source")) or "",
-            reasoning_effort=optional_string(metadata.get("reasoning_effort")) or "",
+            model_id=(
+                optional_string(metadata.get("model_id"))
+                or optional_string(metadata.get("model"))
+                or ""
+            ),
+            model_id_source=(
+                optional_string(metadata.get("model_id_source"))
+                or optional_string(metadata.get("model_source"))
+                or ""
+            ),
+            reasoning_effort=(
+                optional_string(metadata.get("reasoning_effort"))
+                or optional_string(metadata.get("effort"))
+                or ""
+            ),
             reasoning_effort_source=(
-                optional_string(metadata.get("reasoning_effort_source")) or ""
+                optional_string(metadata.get("reasoning_effort_source"))
+                or optional_string(metadata.get("effort_source"))
+                or ""
             ),
             trailer_context=optional_mapping(metadata.get("trailer_context")),
             trailer_context_sources=optional_mapping(
@@ -441,8 +455,12 @@ class ActiveRunState:
             "model_provider_source": self.model_provider_source,
             "model_id": self.model_id,
             "model_id_source": self.model_id_source,
+            "model": self.model_id,
+            "model_source": self.model_id_source,
             "reasoning_effort": self.reasoning_effort,
             "reasoning_effort_source": self.reasoning_effort_source,
+            "effort": self.reasoning_effort,
+            "effort_source": self.reasoning_effort_source,
             "trailer_context": self.trailer_context,
             "trailer_context_sources": self.trailer_context_sources,
             "restart_count": self.restart_count,
@@ -601,8 +619,12 @@ class WorkerView:
             "model_provider_source": self.active.model_provider_source,
             "model_id": self.active.model_id,
             "model_id_source": self.active.model_id_source,
+            "model": self.active.model_id,
+            "model_source": self.active.model_id_source,
             "reasoning_effort": self.active.reasoning_effort,
             "reasoning_effort_source": self.active.reasoning_effort_source,
+            "effort": self.active.reasoning_effort,
+            "effort_source": self.active.reasoning_effort_source,
             "trailer_context": self.active.trailer_context,
             "trailer_context_sources": self.active.trailer_context_sources,
             "restart_count": self.active.restart_count,

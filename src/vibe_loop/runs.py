@@ -264,12 +264,16 @@ class RunResult:
         if self.model_provider_source:
             payload["model_provider_source"] = self.model_provider_source
         if self.model_id:
+            payload["model"] = self.model_id
             payload["model_id"] = self.model_id
         if self.model_id_source:
+            payload["model_source"] = self.model_id_source
             payload["model_id_source"] = self.model_id_source
         if self.reasoning_effort:
+            payload["effort"] = self.reasoning_effort
             payload["reasoning_effort"] = self.reasoning_effort
         if self.reasoning_effort_source:
+            payload["effort_source"] = self.reasoning_effort_source
             payload["reasoning_effort_source"] = self.reasoning_effort_source
         if self.trailer_context:
             payload["trailer_context"] = self.trailer_context
@@ -736,11 +740,15 @@ class RunHistoryView:
             model_provider_source=latest_text(valid_records, "model_provider_source"),
             model_id=latest_text(valid_records, "model_id"),
             model_id_source=latest_text(valid_records, "model_id_source"),
-            reasoning_effort=latest_text(valid_records, "reasoning_effort"),
+            reasoning_effort=(
+                latest_text(valid_records, "reasoning_effort")
+                or latest_text(valid_records, "effort")
+            ),
             reasoning_effort_source=latest_text(
                 valid_records,
                 "reasoning_effort_source",
-            ),
+            )
+            or latest_text(valid_records, "effort_source"),
             trailer_context=latest_mapping(valid_records, "trailer_context"),
             trailer_context_sources=latest_mapping(
                 valid_records,
@@ -781,8 +789,12 @@ class RunHistoryView:
             "model_provider_source": self.model_provider_source,
             "model_id": self.model_id,
             "model_id_source": self.model_id_source,
+            "model": self.model_id,
+            "model_source": self.model_id_source,
             "reasoning_effort": self.reasoning_effort,
             "reasoning_effort_source": self.reasoning_effort_source,
+            "effort": self.reasoning_effort,
+            "effort_source": self.reasoning_effort_source,
             "trailer_context": self.trailer_context,
             "trailer_context_sources": self.trailer_context_sources,
             "classification_source": self.classification_source,

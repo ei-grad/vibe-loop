@@ -1987,6 +1987,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent"]["skill_ref_prefix"], "$")
         self.assertEqual(payload["agent"]["detected"]["available"], ["codex"])
 
+    def test_doctor_reports_configured_model_and_effort_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(bin_dir / "codex", "raise SystemExit(0)\n")
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nkind = "codex"\nmodel = "gpt-5.4"\neffort = "high"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["agent"]["model"], "gpt-5.4")
+        self.assertEqual(payload["agent"]["model_source"], "explicit")
+        self.assertEqual(payload["agent"]["effort"], "high")
+        self.assertEqual(payload["agent"]["effort_source"], "explicit")
+
     def test_doctor_reports_codex_first_policy_with_both_agents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

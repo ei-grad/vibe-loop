@@ -153,6 +153,8 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].model_id, "gpt-5.5")
         self.assertEqual(loaded[0].model_id_source, "native:stdout:json.model")
         self.assertEqual(loaded[0].reasoning_effort, "high")
+        self.assertEqual(task_lock.metadata["model"], "gpt-5.5")
+        self.assertEqual(task_lock.metadata["effort"], "high")
         self.assertEqual(loaded[0].trailer_context["model_id"], "gpt-5.5")
         self.assertEqual(
             loaded[0].trailer_context_sources["model_id"],

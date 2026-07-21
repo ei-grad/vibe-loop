@@ -2714,6 +2714,16 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(context.model_id, "gpt-5.5")
         self.assertEqual(context.reasoning_effort, "high")
 
+    def test_command_context_accepts_provider_neutral_effort_flag(self) -> None:
+        context = parse_agent_runtime_context_from_command(
+            "claude -p --model opus --effort medium"
+        )
+
+        self.assertEqual(context.model_provider, "anthropic")
+        self.assertEqual(context.model_id, "opus")
+        self.assertEqual(context.reasoning_effort, "medium")
+        self.assertEqual(context.reasoning_effort_source, "command_arg:--effort")
+
     def test_streaming_command_reports_started_process_pid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "cmd.py"
@@ -4827,6 +4837,21 @@ class AgentCommandModelTests(unittest.TestCase):
             f"{shell_quote('inspect repo')}",
         )
 
+    def test_format_agent_command_substitutes_shell_quoted_effort(self) -> None:
+        command = format_agent_command(
+            "worker --effort {effort} {prompt}",
+            prompt="inspect repo",
+            model=None,
+            effort="high",
+            task_id="TASK-01",
+            profile="opus",
+        )
+
+        self.assertEqual(
+            command,
+            f"worker --effort high {shell_quote('inspect repo')}",
+        )
+
     def test_format_agent_command_without_model_field_is_unchanged(self) -> None:
         expected = f"worker {shell_quote('inspect repo')}"
         for model in (None, "opus"):
@@ -5057,6 +5082,31 @@ class SessionIdInjectionTests(unittest.TestCase):
             runtime_context=AgentRuntimeContext(),
         )
         self.assertNotIn("transcript_path", payload)
+
+    def test_run_context_payload_exposes_public_model_and_effort_aliases(self) -> None:
+        payload = build_run_context_payload(
+            task_id="T-1",
+            run_id="r-1",
+            started_at="2026-01-01T00:00:00Z",
+            session_id="r-1",
+            session_id_source="fallback:run_id",
+            agent_kind="codex",
+            agent_kind_source="explicit",
+            agent_prompt_dialect="codex",
+            agent_prompt_dialect_source="explicit",
+            agent_skill_ref_prefix="$",
+            agent_skill_ref_prefix_source="explicit",
+            runtime_context=AgentRuntimeContext(
+                model_id="gpt-5.4",
+                model_id_source="command_arg:-m",
+                reasoning_effort="high",
+                reasoning_effort_source="command_config:model_reasoning_effort",
+            ),
+        )
+
+        self.assertEqual(payload["model"], "gpt-5.4")
+        self.assertEqual(payload["effort"], "high")
+        self.assertEqual(payload["trailer_context"]["effort"], "high")
 
 
 class RecordingLockManager(LockManager):

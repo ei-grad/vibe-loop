@@ -4922,6 +4922,7 @@ def run_native_planning(
             command_template,
             prompt=build_native_planning_worker_prompt(config, decision),
             model=config.agent.model,
+            effort=config.agent.effort,
         )
         command = inject_structured_usage_output(command, config.agent.agent_kind)
         worker_context = parse_agent_runtime_context_from_command(command)

@@ -40,6 +40,29 @@ from vibe_loop.runs import (
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_run_result_exposes_public_model_and_effort_aliases(self) -> None:
+        result = RunResult(
+            run_id="run-effort",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("run.log"),
+            start_main="abc",
+            end_main="def",
+            model_id="gpt-5.4",
+            model_id_source="command_arg:-m",
+            reasoning_effort="high",
+            reasoning_effort_source="command_config:model_reasoning_effort",
+        )
+
+        payload = result.to_json()
+
+        self.assertEqual(payload["model"], "gpt-5.4")
+        self.assertEqual(payload["effort"], "high")
+        self.assertEqual(
+            payload["effort_source"], "command_config:model_reasoning_effort"
+        )
+
     def test_run_result_json_uses_stable_finished_at(self) -> None:
         result = RunResult(
             run_id="run-1",

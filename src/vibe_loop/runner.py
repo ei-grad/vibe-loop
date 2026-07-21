@@ -432,12 +432,25 @@ class AgentRuntimeContext:
             payload["model_provider"] = self.model_provider
             payload["model_provider_source"] = self.model_provider_source
         if self.model_id:
+            payload["model"] = self.model_id
+            payload["model_source"] = self.model_id_source
             payload["model_id"] = self.model_id
             payload["model_id_source"] = self.model_id_source
         if self.reasoning_effort:
+            payload["effort"] = self.reasoning_effort
+            payload["effort_source"] = self.reasoning_effort_source
             payload["reasoning_effort"] = self.reasoning_effort
             payload["reasoning_effort_source"] = self.reasoning_effort_source
         return payload
+
+
+def configured_agent_effort_context(agent: AgentConfig) -> AgentRuntimeContext:
+    if agent.effort is None:
+        return AgentRuntimeContext()
+    return AgentRuntimeContext(
+        reasoning_effort=agent.effort,
+        reasoning_effort_source=f"config:agent.effort:{agent.effort_source}",
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -767,6 +780,7 @@ class VibeRunner:
             command_template,
             prompt=prompt,
             model=self.config.agent.model,
+            effort=self.config.agent.effort,
         )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
@@ -813,6 +827,7 @@ class VibeRunner:
             command_template,
             prompt=prompt,
             model=self.config.agent.model,
+            effort=self.config.agent.effort,
         )
         command_str = inject_structured_usage_output(
             command_str, self.config.agent.agent_kind
@@ -889,6 +904,7 @@ class VibeRunner:
             command_template,
             prompt=prompt,
             model=self.config.agent.model,
+            effort=self.config.agent.effort,
         )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
@@ -1072,6 +1088,7 @@ class VibeRunner:
             effective_template,
             prompt=worker_prompt,
             model=agent.model,
+            effort=agent.effort,
             task=task,
             profile=agent_profile,
             task_id=task.task_id,
@@ -1105,7 +1122,9 @@ class VibeRunner:
                 transcript_start_offset = Path(transcript_path).stat().st_size
             except OSError:
                 transcript_start_offset = 0
-        command_context = parse_agent_runtime_context_from_command(command)
+        command_context = configured_agent_effort_context(agent).prefer(
+            parse_agent_runtime_context_from_command(command)
+        )
         agent_prompt_dialect = agent.prompt_dialect or ""
         agent_prompt_dialect_source = agent.prompt_dialect_source
         agent_skill_ref_prefix = agent.skill_ref_prefix or ""
@@ -4246,10 +4265,13 @@ def parse_agent_runtime_context_from_command(command: str) -> AgentRuntimeContex
 
         value = None
         source = ""
-        if token == "--reasoning-effort" and index + 1 < len(argv):
+        if token in {"--effort", "--reasoning-effort"} and index + 1 < len(argv):
             value = argv[index + 1]
-            source = "command_arg:--reasoning-effort"
+            source = f"command_arg:{token}"
             index += 1
+        elif token.startswith("--effort="):
+            value = token.split("=", 1)[1]
+            source = "command_arg:--effort"
         elif token.startswith("--reasoning-effort="):
             value = token.split("=", 1)[1]
             source = "command_arg:--reasoning-effort"
@@ -4312,7 +4334,7 @@ def parse_agent_runtime_context_from_config_arg(value: str) -> AgentRuntimeConte
             model_provider=cleaned,
             model_provider_source=source,
         )
-    if normalized_key in {"model_reasoning_effort", "reasoning_effort"}:
+    if normalized_key in {"effort", "model_reasoning_effort", "reasoning_effort"}:
         cleaned = clean_reasoning_effort_value(raw_value)
         if not cleaned:
             return AgentRuntimeContext()
@@ -4659,7 +4681,9 @@ def parse_agent_runtime_context_from_json_payload(
         bare_model,
     )
     reasoning_effort = first_clean_agent_context_value(
+        payload.get("effort"),
         payload.get("reasoning_effort"),
+        model_mapping.get("effort"),
         model_mapping.get("reasoning_effort"),
         clean_value=clean_reasoning_effort_value,
     )
@@ -4687,7 +4711,7 @@ def parse_agent_runtime_context_from_text_line(
         value = clean_agent_context_value(match.group("value"))
         if not value:
             continue
-        if key == "reasoning_effort":
+        if key in {"effort", "reasoning_effort"}:
             value = clean_reasoning_effort_value(match.group("value"))
             if not value:
                 continue
@@ -4794,9 +4818,13 @@ def build_trailer_context(
         context["model_provider"] = runtime_context.model_provider
         sources["model_provider"] = runtime_context.model_provider_source
     if runtime_context.model_id:
+        context["model"] = runtime_context.model_id
+        sources["model"] = runtime_context.model_id_source
         context["model_id"] = runtime_context.model_id
         sources["model_id"] = runtime_context.model_id_source
     if runtime_context.reasoning_effort:
+        context["effort"] = runtime_context.reasoning_effort
+        sources["effort"] = runtime_context.reasoning_effort_source
         context["reasoning_effort"] = runtime_context.reasoning_effort
         sources["reasoning_effort"] = runtime_context.reasoning_effort_source
     return context, sources
