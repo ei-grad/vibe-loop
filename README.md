@@ -283,6 +283,21 @@ status, and report `blocked` with a precise reason instead of parking again. It
 builds on the existing claimed branch/worktree and never deletes, resets,
 steals, or merges another worker's committed work.
 
+The prior run's workspace claim is stale evidence after that run releases its
+task lock. Before a recovery worker mutates the preserved workspace or starts a
+gate, build, test, review, or integration attempt, it verifies the real branch
+and absolute worktree path and explicitly claims them against the current run id
+and active task lock. The supervisor does not guess or auto-claim the preserved
+path, so ownership mismatches and unsafe-workspace diagnostics continue to fail
+closed.
+
+Generated worker prompts also treat asynchronous work as part of the finite
+headless turn. A worker must await or collect every Agent/Task/Workflow
+subagent, gate, build, test, or other worker-started operation before returning,
+then finish review, integration, and reporting or explicitly report `blocked`
+or `failed`; a progress summary while background work remains in flight is not
+a terminal outcome.
+
 Recovery is bounded by the same per-task budget as transient restarts
 (`supervision.max_restarts`): each attempt is counted through the `task_restart`
 record, and once the budget is exhausted the run is left with a terminal

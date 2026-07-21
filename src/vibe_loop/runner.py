@@ -193,6 +193,13 @@ in a prompt, report, command argument, tool payload, log, or summary, or expose
 it by any other means. Use it only through the environment for the lock
 protocol commands that require it."""
 
+CURRENT_RUN_WORKSPACE_CLAIM_COMMAND = (
+    'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\\n'
+    '  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\\n'
+    '  --branch "$(git branch --show-current)" \\\n'
+    '  --worktree "$(git rev-parse --show-toplevel)"'
+)
+
 CLI_WORKER_ADDENDUM = f"""\
 
 ## vibe-loop CLI Coordination
@@ -216,22 +223,32 @@ activation is project task-source state; it is not a worker report and does not
 complete the task. If repository evidence contradicts that confirmed state,
 stop before workspace mutation and report the run as blocked.
 
+### Headless Completion
+
+A headless worker must not end its turn while any asynchronous
+Agent/Task/Workflow subagent, gate, build, test, or other worker-started
+operation remains in flight. Before returning, await or collect every result,
+then finish review, integration, and reporting, or explicitly report the run as
+blocked or failed. Launching background work and returning a progress summary
+is not terminal completion.
+
 ### Workspace Claim
 
 After creating or choosing your task branch/worktree, and before implementation
-edits, attach that workspace to the active task lock:
+edits, verify its real branch and absolute path. Run this command from inside
+that verified worktree to attach it to the active task lock:
 
 ```bash
-vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\
-  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
-  --branch <branch-name> --worktree <absolute-worktree-path>
+{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}
 ```
 
-Use the real branch name and absolute worktree path, not the placeholders. If
-the claim fails with an owner mismatch, missing active task lock, mismatched
-branch/worktree, or unsafe workspace diagnostic, stop mutating repository state
-and report the run as blocked through the worker report protocol. Workspace
-claims are advisory visibility metadata only; they do not permit deleting,
+The quoted Git-derived values keep branch names and paths as single literal
+arguments. If the claim fails with an owner mismatch, missing active task lock,
+mismatched branch/worktree, or unsafe workspace diagnostic, stop mutating
+repository state and report the run as blocked through the worker report
+protocol.
+Workspace claims are advisory visibility metadata only;
+they do not permit deleting,
 resetting, cleaning, merging, or stealing another worker's branch/worktree.
 
 ### Worker Reports
@@ -2808,12 +2825,12 @@ class RecoveryContext:
 def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
     if recovery.workspace_claimed:
         workspace_lines = (
-            f"- Claimed branch: `{recovery.branch}`\n"
-            f"- Claimed worktree: `{recovery.worktree}`\n"
+            f"- Prior run's recorded branch: `{recovery.branch}`\n"
+            f"- Prior run's recorded worktree: `{recovery.worktree}`\n"
         )
         if recovery.head_commit:
             workspace_lines += (
-                f"- Claimed worktree HEAD at claim time: `{recovery.head_commit}`\n"
+                f"- Prior run's recorded HEAD at claim time: `{recovery.head_commit}`\n"
             )
     else:
         workspace_lines = (
@@ -2839,13 +2856,29 @@ def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
         f"{workspace_lines}"
         f"{transcript_line}"
         f"- Prior wrapper log: `{recovery.wrapper_log}`\n\n"
+        "### Current-run workspace claim\n\n"
+        "Any workspace claim shown above belonged to the prior run's released "
+        "lock generation. It is stale evidence only and does not attach that "
+        "workspace to the CURRENT active task lock. Verify the real branch and "
+        "absolute worktree path, then make the current-run claim before any new "
+        "mutation, gate, build, test, review, or integration attempt:\n\n"
+        "```bash\n"
+        f"{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}\n"
+        "```\n\n"
+        "Run this command from inside the verified worktree; its quoted Git "
+        "lookups derive the exact branch and worktree arguments. Do not claim a "
+        "guessed path. If the claim fails or the preserved workspace cannot be "
+        "verified safely, stop before mutation and report `blocked` through the "
+        "worker report protocol.\n\n"
         "### What to do\n\n"
         "1. Investigate what the previous session did and why it ended without "
         "a proper status: read the prior transcript and wrapper log, and "
-        "inspect the claimed branch/worktree for committed-but-unmerged work.\n"
-        "2. Continue on the existing claimed branch/worktree — do not delete, "
-        "reset, steal, or re-create another worker's workspace; build on the "
-        "committed work rather than discarding it.\n"
+        "inspect the prior run's recorded branch/worktree for "
+        "committed-but-unmerged work.\n"
+        "2. After the current-run claim succeeds, continue on the verified "
+        "existing branch/worktree — do not delete, reset, steal, or re-create "
+        "another worker's workspace; build on the committed work rather than "
+        "discarding it.\n"
         "3. Finish the slice through review and integration when permitted, "
         "then emit a proper status (`completed`/`blocked`/`failed`) via the "
         "worker report protocol.\n"
@@ -2864,9 +2897,12 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
     session launched long-running proofs/checks in the background and the
     headless turn ended before they finished.
     """
-    workspace_line = (
-        f"- Your claimed worktree: `{recovery.worktree}`\n" if recovery.worktree else ""
-    )
+    workspace_lines = ""
+    if recovery.workspace_claimed:
+        workspace_lines = (
+            f"- Prior run's recorded branch: `{recovery.branch}`\n"
+            f"- Prior run's recorded worktree: `{recovery.worktree}`\n"
+        )
     return (
         "## Continue this run (resumed session)\n\n"
         f"This is the SAME session for task `{recovery.task_id}`, resumed because "
@@ -2876,11 +2912,24 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
         "The most likely cause: you launched long-running proofs/checks in the "
         "background and this headless turn ended before they finished. Do NOT "
         "restart from scratch.\n\n"
-        f"{workspace_line}"
-        "1. Check the results of any background commands you started (their log "
+        f"{workspace_lines}"
+        "Those prior-run workspace details are stale evidence only. Verify the "
+        "real branch and absolute worktree path, then attach that workspace to "
+        "the CURRENT active task lock before any new mutation, gate, build, "
+        "test, review, or integration attempt:\n\n"
+        "```bash\n"
+        f"{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}\n"
+        "```\n\n"
+        "Run this command from inside the verified worktree; its quoted Git "
+        "lookups derive the exact branch and worktree arguments. Do not claim a "
+        "guessed path. If the claim fails or the workspace cannot be verified "
+        "safely, stop before mutation and report `blocked`.\n\n"
+        "1. Await or collect the results of any asynchronous Agent/Task/Workflow "
+        "subagent or background command you started (including its log "
         "files / exit status); re-run any remaining required gates in the "
         "FOREGROUND so this turn does not end before they complete.\n"
-        "2. Finish the slice through review and integration when permitted, "
+        "2. After the current-run workspace claim succeeds, finish the slice "
+        "through review and integration when permitted, "
         "building on your existing committed work — do not delete, reset, or "
         "re-create the workspace.\n"
         "3. Emit a proper terminal status via the worker report protocol, using "

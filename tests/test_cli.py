@@ -585,10 +585,12 @@ class CliTests(unittest.TestCase):
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
 
         task_activation = CLI_WORKER_ADDENDUM.index("### Task Activation")
+        headless_completion = CLI_WORKER_ADDENDUM.index("### Headless Completion")
         workspace_claim = CLI_WORKER_ADDENDUM.index("### Workspace Claim")
         worker_reports = CLI_WORKER_ADDENDUM.index("### Worker Reports")
         integration_locking = CLI_WORKER_ADDENDUM.index("### Integration Locking")
-        self.assertLess(task_activation, workspace_claim)
+        self.assertLess(task_activation, headless_completion)
+        self.assertLess(headless_completion, workspace_claim)
         self.assertLess(workspace_claim, worker_reports)
         self.assertLess(worker_reports, integration_locking)
 
@@ -602,8 +604,14 @@ class CliTests(unittest.TestCase):
             CLI_WORKER_ADDENDUM,
         )
         self.assertIn("vibe-loop worker claim-workspace", CLI_WORKER_ADDENDUM)
-        self.assertIn("--branch <branch-name>", CLI_WORKER_ADDENDUM)
-        self.assertIn("--worktree <absolute-worktree-path>", CLI_WORKER_ADDENDUM)
+        self.assertIn('--branch "$(git branch --show-current)"', CLI_WORKER_ADDENDUM)
+        self.assertIn(
+            '--worktree "$(git rev-parse --show-toplevel)"', CLI_WORKER_ADDENDUM
+        )
+        self.assertIn("single literal\narguments", CLI_WORKER_ADDENDUM)
+        self.assertIn("Agent/Task/Workflow", CLI_WORKER_ADDENDUM)
+        self.assertIn("await or collect every result", CLI_WORKER_ADDENDUM)
+        self.assertIn("returning a progress summary", CLI_WORKER_ADDENDUM)
         self.assertRegex(
             CLI_WORKER_ADDENDUM,
             r"claim fails with an owner mismatch[\s\S]*report the run as blocked",

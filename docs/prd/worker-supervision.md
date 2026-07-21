@@ -19,6 +19,12 @@ launch, workspace claim, or edit. Missing or unconfirmed activation must fail
 closed without resetting project state or touching another worker's lock or
 workspace.
 
+The generated prompt must make a headless worker's terminal boundary explicit:
+it cannot return while any worker-started asynchronous Agent/Task/Workflow
+subagent, gate, build, test, or other operation remains in flight. It must await
+or collect those results and finish review, integration, and reporting, or emit
+an explicit `blocked` or `failed` report.
+
 Related implementation IDs: `PAR-01`, `PAR-03`, `PAR-05`.
 
 ## PRD-WRK-002 Task Locks And Run Records
@@ -144,6 +150,15 @@ Acceptance must cover claim command inputs, matching active task lock, current
 branch verification, branch/worktree path recording, base commit, current HEAD,
 dirty-at-claim summary, `workspace_claim` run record, and no branch/worktree
 creation, deletion, reset, merge, or cleanup by the claim command.
+
+An unknown-run recovery may use the prior claim to locate a preserved
+branch/worktree, but that record belongs to the released prior lock generation
+and is stale evidence only. Before any new mutation, gate, build, test, review,
+or integration attempt, the recovery worker must verify the actual branch and
+absolute worktree path and claim them explicitly with the current run and task
+identifiers against the current active task lock. The supervisor must not guess
+or auto-claim a path; owner mismatches and unsafe-workspace diagnostics fail
+closed.
 
 Related implementation IDs: `PAR-10`, `PAR-11`, `SKILL-01`.
 

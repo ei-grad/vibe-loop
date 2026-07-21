@@ -41,6 +41,7 @@ from vibe_loop.locks import (
 from vibe_loop.processes import read_process_node
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
+    CURRENT_RUN_WORKSPACE_CLAIM_COMMAND,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     AgentLimitWallError,
     AgentRuntimeContext,
@@ -223,6 +224,87 @@ class RunnerTests(unittest.TestCase):
                     prompt.index("### Integration Locking"),
                 )
 
+    def test_initial_worker_prompt_requires_async_work_to_settle(self) -> None:
+        task = Task(task_id="ASYNC-01", title="Finish async work", status="Next")
+
+        for skill_prefix in ("$", "/"):
+            with self.subTest(skill_prefix=skill_prefix):
+                token = "initial-generation-7"
+                with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                    prompt = build_worker_prompt(
+                        skill_prefix,
+                        task,
+                        VibeConfig(repo=Path(".")),
+                    )
+
+                self.assertTrue(prompt.startswith(f"{skill_prefix}vibe-loop ASYNC-01"))
+                self.assertIn("### Headless Completion", prompt)
+                self.assertIn("Agent/Task/Workflow", prompt)
+                self.assertIn("await or collect every result", prompt)
+                self.assertIn("returning a progress summary", prompt)
+                self.assertIn(
+                    'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"', prompt
+                )
+                self.assertIn('--run-id "$VIBE_LOOP_RUN_ID"', prompt)
+                self.assertIn('--task-id "$VIBE_LOOP_TASK_ID"', prompt)
+                self.assertNotIn(token, prompt)
+                self.assertLess(
+                    prompt.index("### Headless Completion"),
+                    prompt.index("### Worker Reports"),
+                )
+
+    def test_workspace_claim_command_preserves_shell_metacharacters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "work tree"
+            branch = "topic$(touch${IFS}injected)"
+            subprocess.run(
+                ["git", "init", "-b", branch, str(worktree)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            capture = root / "capture.py"
+            capture.write_text(
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            command = CURRENT_RUN_WORKSPACE_CLAIM_COMMAND.replace(
+                "vibe-loop worker claim-workspace",
+                f"{shell_quote(sys.executable)} {shell_quote(str(capture))}",
+            )
+            run = subprocess.run(
+                command,
+                cwd=worktree,
+                env={
+                    **os.environ,
+                    "VIBE_LOOP_REPO": str(worktree),
+                    "VIBE_LOOP_RUN_ID": "run-1",
+                    "VIBE_LOOP_TASK_ID": "task-1",
+                },
+                check=True,
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+
+            self.assertEqual(
+                json.loads(run.stdout),
+                [
+                    "--repo",
+                    str(worktree),
+                    "--run-id",
+                    "run-1",
+                    "--task-id",
+                    "task-1",
+                    "--branch",
+                    branch,
+                    "--worktree",
+                    str(worktree.resolve()),
+                ],
+            )
+            self.assertFalse((worktree / "injected").exists())
+
     def test_worker_prompt_extension_applies_after_profile_routing(self) -> None:
         extension = "Repository integration policy wins."
         config = VibeConfig(
@@ -280,29 +362,42 @@ class RunnerTests(unittest.TestCase):
             prior_session_id="session-1",
         )
 
-        for resuming, branch_marker in (
-            (False, "## Unknown-Run Recovery"),
-            (True, "## Continue this run (resumed session)"),
-        ):
-            with self.subTest(resuming=resuming):
-                token = "recovery-generation-11"
-                with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
-                    prompt = build_run_worker_prompt(
-                        "$",
-                        task,
-                        config,
-                        recovery=recovery,
-                        resuming=resuming,
-                    )
+        for skill_prefix in ("$", "/"):
+            for resuming, branch_marker in (
+                (False, "## Unknown-Run Recovery"),
+                (True, "## Continue this run (resumed session)"),
+            ):
+                with self.subTest(skill_prefix=skill_prefix, resuming=resuming):
+                    token = "recovery-generation-11"
+                    with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                        prompt = build_run_worker_prompt(
+                            skill_prefix,
+                            task,
+                            config,
+                            recovery=recovery,
+                            resuming=resuming,
+                        )
 
-                self.assertIn(branch_marker, prompt)
-                self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
-                self.assertNotIn(token, prompt)
-                self.assertGreater(
-                    prompt.index("## Repository Worker Prompt Extension"),
-                    prompt.index(branch_marker),
-                )
-                self.assertTrue(prompt.endswith(extension))
+                    self.assertIn(branch_marker, prompt)
+                    if not resuming:
+                        self.assertTrue(
+                            prompt.startswith(f"{skill_prefix}vibe-loop {task.task_id}")
+                        )
+                    self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
+                    self.assertIn("CURRENT active task lock", prompt)
+                    self.assertIn(
+                        'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"',
+                        prompt,
+                    )
+                    self.assertIn('--run-id "$VIBE_LOOP_RUN_ID"', prompt)
+                    self.assertIn('--task-id "$VIBE_LOOP_TASK_ID"', prompt)
+                    self.assertIn("stale evidence only", prompt)
+                    self.assertNotIn(token, prompt)
+                    self.assertGreater(
+                        prompt.index("## Repository Worker Prompt Extension"),
+                        prompt.index(branch_marker),
+                    )
+                    self.assertTrue(prompt.endswith(extension))
 
     def test_worker_prompt_omits_repo_extension_when_unset(self) -> None:
         task = Task(task_id="POLICY-02", title="Default policy", status="Next")
@@ -1097,6 +1192,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("/tmp/wt/task-01", prompt)
         self.assertIn("$VIBE_LOOP_RUN_ID", prompt)
         self.assertIn("background", prompt)
+        self.assertIn("Agent/Task/Workflow", prompt)
+        self.assertIn("CURRENT active task lock", prompt)
+        self.assertIn("claim-workspace", prompt)
+        self.assertLess(
+            prompt.index("claim-workspace"),
+            prompt.index("finish the slice"),
+        )
         # Must NOT be the from-scratch recovery brief.
         self.assertNotIn("Investigate what the previous session did", prompt)
 
@@ -3237,6 +3339,14 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertIn("/tmp/run-1.log", section)
         self.assertIn("attempt 2 of 3", section)
         self.assertIn("do NOT park", section)
+        self.assertIn("stale evidence only", section)
+        self.assertIn("CURRENT active task lock", section)
+        self.assertIn(
+            'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"', section
+        )
+        self.assertLess(
+            section.index("claim-workspace"), section.index("Finish the slice")
+        )
 
     def test_build_recovery_prompt_section_notes_missing_claim(self) -> None:
         recovery = RecoveryContext(
@@ -3257,6 +3367,8 @@ class TransientWorkerFailureTests(unittest.TestCase):
 
         self.assertIn("No `workspace_claim` record", section)
         self.assertIn("transcript: not captured", section)
+        self.assertIn("Verify the real branch", section)
+        self.assertIn("claim-workspace", section)
 
     def test_serial_loop_recovers_unknown_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
