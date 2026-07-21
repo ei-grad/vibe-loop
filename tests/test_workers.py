@@ -29,7 +29,13 @@ from vibe_loop.workers import (
     KEEP_DIRTY_WORKTREE,
     KEEP_GIT_STATE_UNAVAILABLE,
     KEEP_LIVE_CLAIM,
+    KEEP_OWNERSHIP_UNVERIFIED,
     KEEP_PRIMARY_WORKTREE,
+    KEEP_REMOTE_MAIN_NOT_CONTAINED,
+    KEEP_REMOTE_MAIN_UNAVAILABLE,
+    KEEP_STALE_CLAIM,
+    KEEP_TERMINAL_COMMIT_MISMATCH,
+    KEEP_TERMINAL_STATUS_UNSUCCESSFUL,
     KEEP_UNMERGED_WORKTREE,
     ActiveRunState,
     StaleLock,
@@ -2101,13 +2107,18 @@ def make_disposition_evidence(
     claiming_task_id: str = "",
     claim_state: str = "",
     claim_is_live: bool = False,
+    ownership_error: str = "",
+    terminal_status: str = "completed",
+    terminal_commit: str = "deadbee",
 ) -> WorktreeDispositionEvidence:
     return WorktreeDispositionEvidence(
         path=path,
         branch=branch,
         head_commit=head_commit,
         is_primary=is_primary,
-        merged=merged,
+        local_main_contained=merged,
+        remote_main_contained=merged,
+        remote_main_error="",
         merged_into=merged_into if merged else (),
         dirty=dirty,
         dirty_summary=dirty_summary,
@@ -2116,6 +2127,9 @@ def make_disposition_evidence(
         claiming_task_id=claiming_task_id,
         claim_state=claim_state,
         claim_is_live=claim_is_live,
+        ownership_error=ownership_error,
+        terminal_status=terminal_status,
+        terminal_commit=terminal_commit,
     )
 
 
@@ -2169,7 +2183,8 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
 
         merged = by_path[merged_tree.resolve()]
         self.assertFalse(merged.is_primary)
-        self.assertTrue(merged.merged)
+        self.assertTrue(merged.local_main_contained)
+        self.assertFalse(merged.remote_main_contained)
         self.assertIn("main", merged.merged_into)
         self.assertFalse(merged.dirty)
         self.assertEqual(merged.claiming_run_id, "run-merged")
@@ -2177,6 +2192,8 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
         self.assertTrue(merged.claim_is_live)
         self.assertFalse(merged.reapable)
         self.assertIn(KEEP_LIVE_CLAIM, merged.keep_guardrails)
+        self.assertIn(KEEP_REMOTE_MAIN_UNAVAILABLE, merged.keep_guardrails)
+        self.assertIn(KEEP_TERMINAL_STATUS_UNSUCCESSFUL, merged.keep_guardrails)
 
         wip = by_path[wip_tree.resolve()]
         self.assertFalse(wip.merged)
@@ -2187,7 +2204,9 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
         self.assertIn(KEEP_DIRTY_WORKTREE, wip.keep_guardrails)
         self.assertIn(KEEP_UNMERGED_WORKTREE, wip.keep_guardrails)
 
-    def test_evidence_marks_dead_claim_as_not_live(self) -> None:
+    def test_evidence_reaps_only_remote_contained_completed_released_claim(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             repo = base / "repo"
@@ -2201,13 +2220,27 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
             git(orphan, "add", "feature.txt")
             git(orphan, "commit", "-m", "orphan work")
             git(repo, "merge", "--ff-only", "worker/ORPHAN")
-            acquire_worker_lock(
-                manager,
-                repo=repo,
+            git(repo, "update-ref", "refs/remotes/origin/main", "main")
+            head = git(orphan, "rev-parse", "HEAD").stdout.strip()
+            claim = WorkspaceClaim(
                 task_id="ORPHAN",
                 run_id="run-orphan",
                 branch="worker/ORPHAN",
                 worktree=orphan,
+                base_commit=head,
+                head_commit=head,
+                current_branch="worker/ORPHAN",
+                dirty=False,
+                dirty_summary=(),
+            )
+            run_store.append_record(claim.to_json())
+            run_store.append_report(
+                WorkerReport(
+                    task_id="ORPHAN",
+                    run_id="run-orphan",
+                    status="completed",
+                    commit=head,
+                )
             )
 
             evidence = collect_worktree_disposition_evidence(
@@ -2223,7 +2256,151 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
         orphan_evidence = by_path[orphan.resolve()]
         self.assertEqual(orphan_evidence.claiming_run_id, "run-orphan")
         self.assertFalse(orphan_evidence.claim_is_live)
+        self.assertEqual(orphan_evidence.claim_state, "released")
+        self.assertTrue(orphan_evidence.local_main_contained)
+        self.assertTrue(orphan_evidence.remote_main_contained)
+        self.assertEqual(orphan_evidence.terminal_status, "completed")
         self.assertTrue(orphan_evidence.reapable)
+
+    def test_evidence_preserves_crash_windows_before_completed_remote_success(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+
+            orphan = base / "orphan"
+            git(repo, "worktree", "add", "-b", "worker/ORPHAN", str(orphan), "main")
+            (orphan / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(orphan, "add", "feature.txt")
+            git(orphan, "commit", "-m", "orphan work")
+            head = git(orphan, "rev-parse", "HEAD").stdout.strip()
+            git(repo, "merge", "--ff-only", "worker/ORPHAN")
+            claim = WorkspaceClaim(
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="worker/ORPHAN",
+                worktree=orphan,
+                base_commit=head,
+                head_commit=head,
+                current_branch="worker/ORPHAN",
+                dirty=False,
+                dirty_summary=(),
+            )
+            run_store.append_record(claim.to_json())
+
+            before_push = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            git(repo, "update-ref", "refs/remotes/origin/main", "main")
+            before_report = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            run_store.append_report(
+                WorkerReport(
+                    task_id="ORPHAN",
+                    run_id="run-orphan",
+                    status="completed",
+                    commit=head,
+                )
+            )
+            acquire_worker_lock(
+                manager,
+                repo=repo,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="worker/ORPHAN",
+                worktree=orphan,
+            )
+            during_stale_lock_recovery = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        before_push_item = {item.path: item for item in before_push}[orphan.resolve()]
+        before_report_item = {item.path: item for item in before_report}[
+            orphan.resolve()
+        ]
+        stale_item = {item.path: item for item in during_stale_lock_recovery}[
+            orphan.resolve()
+        ]
+        self.assertIn(KEEP_REMOTE_MAIN_UNAVAILABLE, before_push_item.keep_guardrails)
+        self.assertIn(
+            KEEP_TERMINAL_STATUS_UNSUCCESSFUL,
+            before_report_item.keep_guardrails,
+        )
+        self.assertIn(KEEP_STALE_CLAIM, stale_item.keep_guardrails)
+
+    def test_evidence_preserves_ambiguous_or_unsuccessful_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            orphan = base / "orphan"
+            git(repo, "worktree", "add", "-b", "worker/ORPHAN", str(orphan), "main")
+            (orphan / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(orphan, "add", "feature.txt")
+            git(orphan, "commit", "-m", "orphan work")
+            git(repo, "merge", "--ff-only", "worker/ORPHAN")
+            git(repo, "update-ref", "refs/remotes/origin/main", "main")
+            head = git(orphan, "rev-parse", "HEAD").stdout.strip()
+            for task_id, run_id, status in (
+                ("ORPHAN", "run-one", "blocked"),
+                ("OTHER", "run-two", "completed"),
+            ):
+                run_store.append_record(
+                    WorkspaceClaim(
+                        task_id=task_id,
+                        run_id=run_id,
+                        branch="worker/ORPHAN",
+                        worktree=orphan,
+                        base_commit=head,
+                        head_commit=head,
+                        current_branch="worker/ORPHAN",
+                        dirty=False,
+                        dirty_summary=(),
+                    ).to_json()
+                )
+                run_store.append_report(
+                    WorkerReport(
+                        task_id=task_id,
+                        run_id=run_id,
+                        status=status,
+                        commit=head,
+                    )
+                )
+
+            evidence = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+
+        item = {item.path: item for item in evidence}[orphan.resolve()]
+        self.assertFalse(item.reapable)
+        self.assertIn(KEEP_OWNERSHIP_UNVERIFIED, item.keep_guardrails)
 
 
 class FakeWorktreeSideEffects:
@@ -2314,6 +2491,79 @@ class WorktreeDispositionExecuteTests(unittest.TestCase):
         self.assertEqual(outcomes[0].applied, "refused")
         self.assertIn(KEEP_UNMERGED_WORKTREE, outcomes[0].guardrails)
         self.assertEqual(effects.removed, [])
+
+    def test_refuses_terminal_statuses_other_than_completed(self) -> None:
+        for status in ("", "blocked", "failed", "unknown"):
+            with self.subTest(status=status or "missing_report"):
+                effects = FakeWorktreeSideEffects()
+                outcomes = execute_worktree_disposition(
+                    [
+                        make_disposition_evidence(
+                            Path("/tmp/orphan"),
+                            terminal_status=status,
+                        )
+                    ],
+                    [
+                        WorktreeDispositionDecision(
+                            worktree=Path("/tmp/orphan"), action="reap"
+                        )
+                    ],
+                    remove_worktree=effects.remove_worktree,
+                    delete_branch=effects.delete_branch,
+                )
+
+                self.assertEqual(outcomes[0].applied, "refused")
+                self.assertIn(
+                    KEEP_TERMINAL_STATUS_UNSUCCESSFUL,
+                    outcomes[0].guardrails,
+                )
+                self.assertEqual(effects.removed, [])
+
+    def test_refuses_completed_report_for_a_different_commit(self) -> None:
+        effects = FakeWorktreeSideEffects()
+        outcomes = execute_worktree_disposition(
+            [
+                make_disposition_evidence(
+                    Path("/tmp/orphan"),
+                    terminal_commit="other-commit",
+                )
+            ],
+            [WorktreeDispositionDecision(worktree=Path("/tmp/orphan"), action="reap")],
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_TERMINAL_COMMIT_MISMATCH, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+
+    def test_refuses_missing_or_noncontained_remote_main(self) -> None:
+        for remote_error, remote_contained, expected in (
+            ("remote main ref is unavailable", False, KEEP_REMOTE_MAIN_UNAVAILABLE),
+            ("", False, KEEP_REMOTE_MAIN_NOT_CONTAINED),
+        ):
+            with self.subTest(expected=expected):
+                effects = FakeWorktreeSideEffects()
+                outcomes = execute_worktree_disposition(
+                    [
+                        dataclasses.replace(
+                            make_disposition_evidence(Path("/tmp/orphan")),
+                            remote_main_error=remote_error,
+                            remote_main_contained=remote_contained,
+                        )
+                    ],
+                    [
+                        WorktreeDispositionDecision(
+                            worktree=Path("/tmp/orphan"), action="reap"
+                        )
+                    ],
+                    remove_worktree=effects.remove_worktree,
+                    delete_branch=effects.delete_branch,
+                )
+
+                self.assertEqual(outcomes[0].applied, "refused")
+                self.assertIn(expected, outcomes[0].guardrails)
+                self.assertEqual(effects.removed, [])
 
     def test_refuses_to_reap_live_claimed_worktree(self) -> None:
         evidence = [

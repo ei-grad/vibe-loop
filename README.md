@@ -673,8 +673,10 @@ a branch. Only an explicit `[autopilot] worktree_disposition = "reap"` setting o
 `--worktree-disposition reap` CLI override opts in to automatic disposition.
 Under that policy, the read-only analysis agent must return a reasoned reap
 decision and the executor still limits removal (`git worktree remove` plus
-`git branch -d`) to merged, clean, non-live-claimed leftovers — never the
-primary worktree and never dirty or unmerged work-in-progress. Every cycle
+`git branch -d`) to clean leftovers with one released workspace claim, a
+matching completed worker report, and containment in both local and remote
+`main` — never the primary worktree, an ambiguous or stale claim, or dirty and
+unmerged work-in-progress. Every cycle
 journals the configured policy, candidate evidence, reasons, outcomes, and
 `worktree_disposition_policy:*`, `worktree_disposition_candidates:N`, and
 `reaped_worktrees:N` action tags.

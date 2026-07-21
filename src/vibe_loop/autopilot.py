@@ -3994,8 +3994,9 @@ def build_worktree_disposition_prompt(
     return (
         "You are a read-only autopilot analysis agent deciding whether orphaned "
         "git worktrees may be reaped. Each candidate below already passed the "
-        "mechanical safety guardrails (merged, clean, not claimed by a live "
-        "run); the executor re-checks those guardrails independently, so a reap "
+        "mechanical safety guardrails (contained by local and remote main, "
+        "clean, unambiguously owned by a completed run, and not claimed by a "
+        "live or stale run); the executor re-checks those guardrails independently, so a reap "
         "decision is honored only when they still hold. Return ONLY a JSON "
         'object of the form {"decisions": [{"worktree": "<path>", '
         '"action": "keep" | "reap", "reason": "<short reason>"}]}. Decide reap '

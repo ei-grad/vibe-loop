@@ -138,7 +138,7 @@ from vibe_loop.processes import (
     read_process_node,
     read_process_table,
 )
-from vibe_loop.workers import ActiveRunState, WorkerView
+from vibe_loop.workers import ActiveRunState, WorkerView, WorkspaceClaim
 
 
 def stop_test_process_group(pid: int, process_group_id: int) -> None:
@@ -5987,11 +5987,53 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         run(repo, "git", "worktree", "add", "-b", "orphan", str(worktree), "main")
         return repo, worktree
 
+    def _record_reap_success(
+        self,
+        repo: Path,
+        worktree: Path,
+        run_store: RunStore,
+        *,
+        task_id: str,
+        run_id: str,
+        branch: str,
+    ) -> None:
+        head = run(worktree, "git", "rev-parse", "HEAD").stdout.strip()
+        run(repo, "git", "update-ref", "refs/remotes/origin/main", "main")
+        run_store.append_record(
+            WorkspaceClaim(
+                task_id=task_id,
+                run_id=run_id,
+                branch=branch,
+                worktree=worktree,
+                base_commit=head,
+                head_commit=head,
+                current_branch=branch,
+                dirty=False,
+                dirty_summary=(),
+            ).to_json()
+        )
+        run_store.append_report(
+            WorkerReport(
+                task_id=task_id,
+                run_id=run_id,
+                status="completed",
+                commit=head,
+            )
+        )
+
     def test_reaps_merged_clean_unclaimed_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo, worktree = self._orphan_repo(directory)
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
             removed: list[Path] = []
             deleted: list[str] = []
             prompts: list[str] = []
@@ -6041,6 +6083,14 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             )
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
 
             result = run_worktree_disposition(
                 config,
@@ -6083,6 +6133,14 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             repo, worktree = self._orphan_repo(directory)
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
 
             def analysis_runner(prompt, output_path):
                 return {
@@ -6118,6 +6176,14 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             run(worktree, "git", "commit", "-m", "wip")
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
             calls: list[str] = []
 
             def analysis_runner(prompt, output_path):
@@ -6145,6 +6211,14 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             (worktree / "dirty.txt").write_text("dirty\n", encoding="utf-8")
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
 
             def analysis_runner(prompt, output_path):
                 raise AssertionError("agent must not run for guarded worktrees")
@@ -6167,6 +6241,14 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             repo, worktree = self._orphan_repo(directory)
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
 
             result = run_worktree_disposition(
                 config,
@@ -6188,6 +6270,14 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             repo, worktree = self._orphan_repo(directory)
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                worktree,
+                run_store,
+                task_id="ORPHAN",
+                run_id="run-orphan",
+                branch="orphan",
+            )
 
             result = run_worktree_disposition(
                 config,
@@ -6244,6 +6334,22 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
             )
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_reap_success(
+                repo,
+                first_worktree,
+                run_store,
+                task_id="ORPHAN-1",
+                run_id="run-orphan-1",
+                branch="orphan",
+            )
+            self._record_reap_success(
+                repo,
+                second_worktree,
+                run_store,
+                task_id="ORPHAN-2",
+                run_id="run-orphan-2",
+                branch="orphan-2",
+            )
 
             result = run_worktree_disposition(
                 config,

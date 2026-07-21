@@ -210,6 +210,7 @@ stateDiagram-v2
 
 The cycle delegates: `Summarize` and `Troubleshoot` run read-only subagents,
 `Plan` runs `orchestrated-vibe-loop` in a worktree with independent review,
-`Disposition` reaps only orphaned, merged, clean, non-live-claimed worktrees
-under evidence-gated guardrails. Recovery is non-destructive — it never deletes
+`Disposition` reaps only clean, unambiguously owned remnants with a completed
+worker report and containment in both local and remote `main`, under
+evidence-gated guardrails. Recovery is non-destructive — it never deletes
 worktrees, resets branches, or steals locks outside those bounded exceptions.

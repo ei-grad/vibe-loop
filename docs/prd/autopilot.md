@@ -314,9 +314,10 @@ failure as explicit blockers or observations rather than destructive cleanup
 triggers; stale locks with a still-live or PID-unobserved owner remain blocking,
 while stale locks with a missing worker process are recovered and audited; and
 default worktree disposition reports eligible candidates without deletion, and
-explicit `reap` disposition removes only orphaned, non-dirty,
-merged-or-disposable, non-live-claimed worktrees under the `PRD-AUT-010`
-guardrails while keeping all salvageable work-in-progress.
+explicit `reap` disposition removes only clean remnants with unambiguous
+released ownership, a matching completed worker report, and containment in
+both local and remote `main`, under the `PRD-AUT-010` guardrails while keeping
+all salvageable work-in-progress.
 
 Unknown-run recovery (`PRD-AUT-014`) does not breach this boundary: it launches
 a new continuation worker against the existing claimed branch/worktree and never

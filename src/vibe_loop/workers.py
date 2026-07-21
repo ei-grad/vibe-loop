@@ -1857,6 +1857,13 @@ KEEP_PRIMARY_WORKTREE = "primary_worktree"
 KEEP_GIT_STATE_UNAVAILABLE = "git_state_unavailable"
 KEEP_LIVE_CLAIM = "live_claim"
 KEEP_DIRTY_WORKTREE = "dirty_worktree"
+KEEP_LOCAL_MAIN_NOT_CONTAINED = "local_main_not_contained"
+KEEP_REMOTE_MAIN_UNAVAILABLE = "remote_main_unavailable"
+KEEP_REMOTE_MAIN_NOT_CONTAINED = "remote_main_not_contained"
+KEEP_OWNERSHIP_UNVERIFIED = "ownership_unverified"
+KEEP_STALE_CLAIM = "stale_claim"
+KEEP_TERMINAL_STATUS_UNSUCCESSFUL = "terminal_status_unsuccessful"
+KEEP_TERMINAL_COMMIT_MISMATCH = "terminal_commit_mismatch"
 KEEP_UNMERGED_WORKTREE = "unmerged_worktree"
 
 
@@ -1876,7 +1883,9 @@ class WorktreeDispositionEvidence:
     branch: str
     head_commit: str
     is_primary: bool
-    merged: bool
+    local_main_contained: bool
+    remote_main_contained: bool
+    remote_main_error: str
     merged_into: tuple[str, ...]
     dirty: bool
     dirty_summary: tuple[str, ...]
@@ -1885,6 +1894,14 @@ class WorktreeDispositionEvidence:
     claiming_task_id: str
     claim_state: str
     claim_is_live: bool
+    ownership_error: str
+    terminal_status: str
+    terminal_commit: str
+
+    @property
+    def merged(self) -> bool:
+        """Compatibility summary for callers that only need both containment checks."""
+        return self.local_main_contained and self.remote_main_contained
 
     @property
     def keep_guardrails(self) -> tuple[str, ...]:
@@ -1901,6 +1918,9 @@ class WorktreeDispositionEvidence:
             "branch": self.branch,
             "head_commit": self.head_commit,
             "is_primary": self.is_primary,
+            "local_main_contained": self.local_main_contained,
+            "remote_main_contained": self.remote_main_contained,
+            "remote_main_error": self.remote_main_error,
             "merged": self.merged,
             "merged_into": list(self.merged_into),
             "dirty": self.dirty,
@@ -1910,6 +1930,9 @@ class WorktreeDispositionEvidence:
             "claiming_task_id": self.claiming_task_id,
             "claim_state": self.claim_state,
             "claim_is_live": self.claim_is_live,
+            "ownership_error": self.ownership_error,
+            "terminal_status": self.terminal_status,
+            "terminal_commit": self.terminal_commit,
             "keep_guardrails": list(self.keep_guardrails),
             "reapable": self.reapable,
         }
@@ -1922,8 +1945,8 @@ def worktree_keep_guardrails(
 
     The executor enforces these independently of the agent so an erroneous or
     stale ``reap`` decision can never remove the primary worktree, a worktree
-    whose git state is unreadable, a worktree claimed by a live run, or dirty /
-    unmerged work-in-progress.
+    whose git state is unreadable, lacks unambiguous successful ownership, is
+    only locally merged, is claimed by a live or stale run, or is dirty.
     """
     reasons: list[str] = []
     if evidence.is_primary:
@@ -1934,8 +1957,21 @@ def worktree_keep_guardrails(
         reasons.append(KEEP_LIVE_CLAIM)
     if evidence.dirty:
         reasons.append(KEEP_DIRTY_WORKTREE)
-    if not evidence.merged:
+    if not evidence.local_main_contained:
+        reasons.append(KEEP_LOCAL_MAIN_NOT_CONTAINED)
         reasons.append(KEEP_UNMERGED_WORKTREE)
+    if evidence.remote_main_error:
+        reasons.append(KEEP_REMOTE_MAIN_UNAVAILABLE)
+    elif not evidence.remote_main_contained:
+        reasons.append(KEEP_REMOTE_MAIN_NOT_CONTAINED)
+    if evidence.ownership_error:
+        reasons.append(KEEP_OWNERSHIP_UNVERIFIED)
+    if evidence.claim_state == "stale":
+        reasons.append(KEEP_STALE_CLAIM)
+    if evidence.terminal_status != "completed":
+        reasons.append(KEEP_TERMINAL_STATUS_UNSUCCESSFUL)
+    if evidence.terminal_commit != evidence.head_commit:
+        reasons.append(KEEP_TERMINAL_COMMIT_MISMATCH)
     return tuple(reasons)
 
 
@@ -1956,7 +1992,7 @@ def collect_worktree_disposition_evidence(
         main_branch=main_branch,
         ignored_dirty_paths=ignored_dirty_paths,
     )
-    claims_by_path = worktree_claims_by_path(
+    claims_by_path, claims_by_branch = worktree_claims_by_path(
         lock_manager,
         run_store,
         repo=repo,
@@ -1974,24 +2010,39 @@ def collect_worktree_disposition_evidence(
             context.ignored_dirty_paths,
         )
         merged_into: tuple[str, ...] = ()
+        remote_main_error = ""
         if entry.branch and not is_primary:
             merged_into = merged_branch_targets(repo, entry.branch, main_branch)
-        claim = claims_by_path.get(path)
+            if not git_ref_exists(repo, remote_main_ref(main_branch)):
+                remote_main_error = "remote main ref is unavailable"
+        claims = [*claims_by_path.get(path, ())]
+        if entry.branch:
+            claims.extend(claims_by_branch.get(entry.branch, ()))
+        owner, ownership_error = resolve_worktree_claim_owner(
+            claims,
+            path=path,
+            branch=entry.branch,
+        )
         evidence.append(
             WorktreeDispositionEvidence(
                 path=path,
                 branch=entry.branch,
                 head_commit=entry.head,
                 is_primary=is_primary,
-                merged=bool(merged_into),
+                local_main_contained=main_branch in merged_into,
+                remote_main_contained=(f"origin/{main_branch}" in merged_into),
+                remote_main_error=remote_main_error,
                 merged_into=merged_into,
                 dirty=dirty,
                 dirty_summary=dirty_summary,
                 git_state_error=git_state_error,
-                claiming_run_id=claim.run_id if claim is not None else "",
-                claiming_task_id=claim.task_id if claim is not None else "",
-                claim_state=claim.state if claim is not None else "",
-                claim_is_live=claim.is_live if claim is not None else False,
+                claiming_run_id=owner.run_id if owner is not None else "",
+                claiming_task_id=owner.task_id if owner is not None else "",
+                claim_state=owner.state if owner is not None else "",
+                claim_is_live=owner.is_live if owner is not None else False,
+                ownership_error=ownership_error,
+                terminal_status=owner.terminal_status if owner is not None else "",
+                terminal_commit=owner.terminal_commit if owner is not None else "",
             )
         )
     return evidence
@@ -2001,8 +2052,12 @@ def collect_worktree_disposition_evidence(
 class _WorktreeClaim:
     run_id: str
     task_id: str
+    branch: str
+    worktree: Path
     state: str
     is_live: bool
+    terminal_status: str
+    terminal_commit: str
 
 
 def worktree_claims_by_path(
@@ -2014,8 +2069,12 @@ def worktree_claims_by_path(
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
     ignored_dirty_paths: Iterable[Path] = (),
-) -> dict[Path, _WorktreeClaim]:
-    claims: dict[Path, _WorktreeClaim] = {}
+) -> tuple[
+    dict[Path, tuple[_WorktreeClaim, ...]], dict[str, tuple[_WorktreeClaim, ...]]
+]:
+    records = run_store.read_records()
+    reports = worker_reports_by_owner(records)
+    claims: list[_WorktreeClaim] = []
     for view in build_worker_views(
         lock_manager,
         run_store,
@@ -2028,17 +2087,90 @@ def worktree_claims_by_path(
         claim = view.active.workspace
         if claim is None:
             continue
-        claims[claim.worktree.resolve()] = _WorktreeClaim(
-            run_id=view.active.run_id,
-            task_id=view.active.task_id,
-            state=view.state,
-            is_live=active_run_is_live(
-                view.active,
-                current_host=current_host,
-                process_exists=process_exists,
-            ),
+        report = reports.get((view.active.task_id, view.active.run_id))
+        claims.append(
+            _WorktreeClaim(
+                run_id=view.active.run_id,
+                task_id=view.active.task_id,
+                branch=claim.branch,
+                worktree=claim.worktree.resolve(),
+                state=view.state,
+                is_live=active_run_is_live(
+                    view.active,
+                    current_host=current_host,
+                    process_exists=process_exists,
+                ),
+                terminal_status=report.status if report is not None else "",
+                terminal_commit=report.commit if report is not None else "",
+            )
         )
-    return claims
+    active_owners = {
+        (claim.task_id, claim.run_id, claim.branch, claim.worktree) for claim in claims
+    }
+    for record in records:
+        if record.get("record_type") != WORKSPACE_CLAIM_RECORD_TYPE:
+            continue
+        claim = WorkspaceClaim.from_json(record)
+        if claim is None:
+            continue
+        identity = (claim.task_id, claim.run_id, claim.branch, claim.worktree.resolve())
+        if identity in active_owners:
+            continue
+        report = reports.get((claim.task_id, claim.run_id))
+        claims.append(
+            _WorktreeClaim(
+                run_id=claim.run_id,
+                task_id=claim.task_id,
+                branch=claim.branch,
+                worktree=claim.worktree.resolve(),
+                state="released",
+                is_live=False,
+                terminal_status=report.status if report is not None else "",
+                terminal_commit=report.commit if report is not None else "",
+            )
+        )
+    claims_by_path: dict[Path, list[_WorktreeClaim]] = {}
+    claims_by_branch: dict[str, list[_WorktreeClaim]] = {}
+    for claim in claims:
+        claims_by_path.setdefault(claim.worktree, []).append(claim)
+        if claim.branch:
+            claims_by_branch.setdefault(claim.branch, []).append(claim)
+    return (
+        {path: tuple(items) for path, items in claims_by_path.items()},
+        {branch: tuple(items) for branch, items in claims_by_branch.items()},
+    )
+
+
+def worker_reports_by_owner(
+    records: Sequence[dict[str, Any]],
+) -> dict[tuple[str, str], WorkerReport]:
+    reports: dict[tuple[str, str], WorkerReport] = {}
+    for record in records:
+        report = WorkerReport.from_record(record)
+        if report is None:
+            continue
+        reports.setdefault((report.task_id, report.run_id), report)
+    return reports
+
+
+def resolve_worktree_claim_owner(
+    claims: Iterable[_WorktreeClaim],
+    *,
+    path: Path,
+    branch: str,
+) -> tuple[_WorktreeClaim | None, str]:
+    unique = {
+        (claim.task_id, claim.run_id, claim.branch, claim.worktree): claim
+        for claim in claims
+    }
+    if not unique:
+        return None, "no durable workspace claim"
+    if len(unique) != 1:
+        return None, "multiple task/run claims match this worktree or branch"
+    owner = next(iter(unique.values()))
+    if owner.worktree != path or not branch or owner.branch != branch:
+        return None, "workspace claim does not match the listed branch and path"
+    return owner, ""
 
 
 def worktree_dirty_state(
