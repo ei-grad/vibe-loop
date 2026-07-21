@@ -1680,18 +1680,21 @@ def parse_agent_effort(value: object, setting: str) -> str | None:
 
 
 def agent_command_provider(command: str, fallback: str | None) -> str:
-    if fallback in AGENT_PROVIDER_EFFORT_VALUES:
-        return fallback
+    # A recognizable explicit executable is authoritative: it outranks the
+    # declared kind, so a Codex kind pointing at a Claude command is validated
+    # against Claude. An identifiable-but-unknown executable fails closed to ""
+    # rather than inventing the kind's provider identity. The kind fallback is
+    # used only when the command carries no executable token to inspect.
     try:
         argv = shlex.split(command)
     except ValueError:
-        return ""
+        argv = []
     for token in argv:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
             continue
         executable = Path(token).name
         return executable if executable in AGENT_PROVIDER_EFFORT_VALUES else ""
-    return ""
+    return fallback if fallback in AGENT_PROVIDER_EFFORT_VALUES else ""
 
 
 def command_embeds_native_effort(command: str) -> bool:
@@ -1700,10 +1703,17 @@ def command_embeds_native_effort(command: str) -> bool:
     except ValueError:
         return False
     for index, token in enumerate(argv):
+        # A placeholder flag such as `--effort {effort}` does not embed a fixed
+        # effort; keep scanning so a later fixed flag (e.g. `--effort low`) is
+        # still detected instead of short-circuiting on the placeholder.
         if token in {"--effort", "--reasoning-effort"}:
-            return index + 1 < len(argv) and "{effort}" not in argv[index + 1]
+            if index + 1 < len(argv) and "{effort}" not in argv[index + 1]:
+                return True
+            continue
         if token.startswith(("--effort=", "--reasoning-effort=")):
-            return "{effort}" not in token.split("=", 1)[1]
+            if "{effort}" not in token.split("=", 1)[1]:
+                return True
+            continue
         if token in {"-c", "--config"} and index + 1 < len(argv):
             token = argv[index + 1]
         elif token.startswith(("-c=", "--config=")):

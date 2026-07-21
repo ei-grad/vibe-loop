@@ -124,7 +124,7 @@ SESSION_ID_RE = re.compile(
 )
 AGENT_CONTEXT_RE = re.compile(
     r"\b(?P<key>model(?:[_ -]?(?:provider|id))?|provider|"
-    r"reasoning[_ -]?effort)\s*[:=]\s*"
+    r"reasoning[_ -]?effort|effort)\s*[:=]\s*"
     r"(?P<value>\"[^\"]+\"|'[^']+'|[^\s,;]+)",
     re.IGNORECASE,
 )

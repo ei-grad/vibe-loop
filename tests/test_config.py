@@ -14,6 +14,8 @@ from vibe_loop.config import (
     SUPERVISION_DEFAULT_MAX_RESTARTS,
     SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
     VibeConfig,
+    agent_command_provider,
+    command_embeds_native_effort,
     detect_agent_clis,
     load_config,
     normalize_registry_runtime_context,
@@ -1805,6 +1807,56 @@ class AgentProfileRoutingTests(unittest.TestCase):
             placeholder.agent.require_command(), "worker --effort {effort} {prompt}"
         )
         self.assertEqual(placeholder.agent.to_json()["effort"], "high")
+
+    def test_recognizable_executable_outranks_kind_for_effort_compat(self) -> None:
+        # Finding 1 (P1): a Codex kind with an explicit Claude command must be
+        # validated against Claude, not the declared kind, so an xhigh value
+        # unsupported by Claude fails closed instead of launching Claude with it.
+        mislabeled = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\neffort = "xhigh"\n'
+            'command = "claude -p --effort {effort} {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "not supported by claude"):
+            mislabeled.agent.require_command()
+
+        # The inverse must not reject a valid Codex command that a Claude kind
+        # mislabels: Codex accepts xhigh, so the recognized executable wins.
+        inverse = self._load_with_both_clis(
+            '[agent]\nkind = "claude"\neffort = "xhigh"\n'
+            "command = "
+            '"codex exec -c model_reasoning_effort={effort} {prompt}"\n'
+        )
+        self.assertEqual(
+            inverse.agent.require_command(),
+            "codex exec -c model_reasoning_effort={effort} {prompt}",
+        )
+
+        # An unrecognized custom executable fails closed: no provider identity is
+        # invented, so provider-specific validation is skipped and the delivered
+        # placeholder command stands.
+        self.assertEqual(
+            agent_command_provider("mywrapper --effort {effort}", "codex"), ""
+        )
+        custom = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "xhigh"\n'
+            'command = "mywrapper --effort {effort} {prompt}"\n'
+        )
+        self.assertEqual(
+            custom.agent.require_command(), "mywrapper --effort {effort} {prompt}"
+        )
+
+    def test_duplicate_effort_flag_after_placeholder_is_rejected(self) -> None:
+        # Finding 2 (P2): a later fixed effort flag must be detected even when a
+        # placeholder flag appears first; the scan must not short-circuit.
+        self.assertTrue(
+            command_embeds_native_effort("worker --effort {effort} --effort low")
+        )
+        conflict = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "high"\n'
+            'command = "worker --effort {effort} --effort low {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "already embeds"):
+            conflict.agent.require_command()
 
     def test_profile_resolves_command_through_kind_defaults(self) -> None:
         config = self._load_with_both_clis(
