@@ -1865,6 +1865,7 @@ KEEP_STALE_CLAIM = "stale_claim"
 KEEP_TERMINAL_STATUS_UNSUCCESSFUL = "terminal_status_unsuccessful"
 KEEP_TERMINAL_COMMIT_MISMATCH = "terminal_commit_mismatch"
 KEEP_UNMERGED_WORKTREE = "unmerged_worktree"
+KEEP_EVIDENCE_CHANGED = "evidence_changed"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2272,6 +2273,9 @@ class WorktreeDispositionOutcome:
 # wires the real ``git_worktree_remove`` / ``git_branch_delete`` wrappers below.
 WorktreeRemover = Callable[[Path], str]
 BranchDeleter = Callable[[str], str]
+WorktreeDispositionRevalidator = Callable[
+    [WorktreeDispositionEvidence, str], tuple[str, ...]
+]
 
 
 def execute_worktree_disposition(
@@ -2280,12 +2284,16 @@ def execute_worktree_disposition(
     *,
     remove_worktree: WorktreeRemover,
     delete_branch: BranchDeleter,
+    revalidate: WorktreeDispositionRevalidator | None = None,
 ) -> list[WorktreeDispositionOutcome]:
     """Apply per-worktree keep/reap decisions within the disposition guardrails.
 
     A ``reap`` decision is honored only when no keep-guardrail applies; otherwise
     the worktree is refused and kept. Per-decision and per-action outcomes are
-    returned for journaling. Side effects are injected so tests never run git.
+    returned for journaling. When provided, ``revalidate`` collects fresh
+    mechanical evidence immediately before each destructive action and returns
+    guardrail codes that require preservation. Side effects are injected so
+    tests never run git.
     """
     decision_by_path = {decision.worktree.resolve(): decision for decision in decisions}
     outcomes: list[WorktreeDispositionOutcome] = []
@@ -2319,6 +2327,23 @@ def execute_worktree_disposition(
             )
             continue
         actions: list[WorktreeReapAction] = []
+        refreshed_guardrails = (
+            revalidate(item, "worktree_remove") if revalidate is not None else ()
+        )
+        if refreshed_guardrails:
+            outcomes.append(
+                WorktreeDispositionOutcome(
+                    worktree=item.path,
+                    branch=item.branch,
+                    requested=requested,
+                    applied="refused",
+                    reason=reason,
+                    guardrails=tuple(
+                        dict.fromkeys((*guardrails, *refreshed_guardrails))
+                    ),
+                )
+            )
+            continue
         remove_error = remove_worktree(item.path)
         actions.append(
             WorktreeReapAction(
@@ -2329,7 +2354,15 @@ def execute_worktree_disposition(
             )
         )
         if not remove_error and item.branch:
-            delete_error = delete_branch(item.branch)
+            refreshed_guardrails = (
+                revalidate(item, "branch_delete") if revalidate is not None else ()
+            )
+            delete_error = (
+                "evidence changed before branch deletion: "
+                + ", ".join(refreshed_guardrails)
+                if refreshed_guardrails
+                else delete_branch(item.branch)
+            )
             actions.append(
                 WorktreeReapAction(
                     kind="branch_delete",
@@ -2346,11 +2379,69 @@ def execute_worktree_disposition(
                 requested=requested,
                 applied=applied,
                 reason=reason,
-                guardrails=guardrails,
+                guardrails=tuple(dict.fromkeys((*guardrails, *refreshed_guardrails))),
                 actions=tuple(actions),
             )
         )
     return outcomes
+
+
+def worktree_branch_delete_revalidation_guardrails(
+    approved: WorktreeDispositionEvidence,
+    refreshed: Iterable[WorktreeDispositionEvidence],
+    *,
+    lock_manager: LockManager,
+    run_store: RunStore,
+    repo: Path,
+    main_branch: str,
+    current_host: str | None = None,
+    process_exists: ProcessExists | None = None,
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> tuple[str, ...]:
+    """Fail closed if a branch changed ownership before its deletion."""
+    refreshed_items = tuple(refreshed)
+    if any(
+        item.path == approved.path or item.branch == approved.branch
+        for item in refreshed_items
+    ):
+        return (KEEP_EVIDENCE_CHANGED,)
+    if git_ref_commit(repo, local_branch_ref(approved.branch)) != approved.head_commit:
+        return (KEEP_EVIDENCE_CHANGED,)
+    merged_into = merged_branch_targets(repo, approved.branch, main_branch)
+    if main_branch not in merged_into:
+        return (KEEP_EVIDENCE_CHANGED,)
+    if not git_ref_exists(repo, remote_main_ref(main_branch)):
+        return (KEEP_EVIDENCE_CHANGED,)
+    if f"origin/{main_branch}" not in merged_into:
+        return (KEEP_EVIDENCE_CHANGED,)
+    claims_by_path, claims_by_branch = worktree_claims_by_path(
+        lock_manager,
+        run_store,
+        repo=repo,
+        main_branch=main_branch,
+        current_host=current_host,
+        process_exists=process_exists,
+        ignored_dirty_paths=ignored_dirty_paths,
+    )
+    claims = [*claims_by_path.get(approved.path, ())]
+    claims.extend(claims_by_branch.get(approved.branch, ()))
+    owner, ownership_error = resolve_worktree_claim_owner(
+        claims,
+        path=approved.path,
+        branch=approved.branch,
+    )
+    if ownership_error or owner is None:
+        return (KEEP_EVIDENCE_CHANGED,)
+    if (
+        owner.run_id != approved.claiming_run_id
+        or owner.task_id != approved.claiming_task_id
+        or owner.state != approved.claim_state
+        or owner.is_live != approved.claim_is_live
+        or owner.terminal_status != approved.terminal_status
+        or owner.terminal_commit != approved.terminal_commit
+    ):
+        return (KEEP_EVIDENCE_CHANGED,)
+    return ()
 
 
 def git_worktree_remove(repo: Path, worktree: Path) -> str:

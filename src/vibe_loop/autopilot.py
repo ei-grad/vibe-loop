@@ -100,6 +100,7 @@ from vibe_loop.telemetry import (
 )
 from vibe_loop.workers import (
     ActiveRunState,
+    KEEP_EVIDENCE_CHANGED,
     ProcessExists,
     StaleLock,
     WorktreeDispositionDecision,
@@ -115,6 +116,7 @@ from vibe_loop.workers import (
     pid_exists,
     record_expired_locks,
     restore_projected_worker_process_identity,
+    worktree_branch_delete_revalidation_guardrails,
 )
 
 RunUntilDoneLauncher = Callable[..., int]
@@ -4044,6 +4046,7 @@ def run_worktree_disposition(
     analysis_runner: AnalysisRunner | None = None,
     remove_worktree: Callable[[Path], str] | None = None,
     delete_branch: Callable[[str], str] | None = None,
+    evidence_collector: Callable[[], list[WorktreeDispositionEvidence]] | None = None,
 ) -> WorktreeDispositionCycleResult:
     """Run the native, evidence-gated worktree-disposition health step.
 
@@ -4060,14 +4063,20 @@ def run_worktree_disposition(
         config.locks,
         runtime_context=config.runtime_environment,
     )
-    evidence = collect_worktree_disposition_evidence(
-        lock_manager,
-        run_store,
-        repo=config.repo,
-        main_branch=config.main_branch,
-        process_exists=process_exists,
-        ignored_dirty_paths=(config.state_path,),
-    )
+
+    def collect_evidence() -> list[WorktreeDispositionEvidence]:
+        if evidence_collector is not None:
+            return evidence_collector()
+        return collect_worktree_disposition_evidence(
+            lock_manager,
+            run_store,
+            repo=config.repo,
+            main_branch=config.main_branch,
+            process_exists=process_exists,
+            ignored_dirty_paths=(config.state_path,),
+        )
+
+    evidence = collect_evidence()
     reapable = [item for item in evidence if item.reapable]
     agent_invoked = False
     agent_error = ""
@@ -4112,11 +4121,34 @@ def run_worktree_disposition(
         lambda worktree: git_worktree_remove(config.repo, worktree)
     )
     deleter = delete_branch or (lambda branch: git_branch_delete(config.repo, branch))
+
+    def revalidate(
+        approved: WorktreeDispositionEvidence,
+        action: str,
+    ) -> tuple[str, ...]:
+        refreshed = {item.path.resolve(): item for item in collect_evidence()}
+        current = refreshed.get(approved.path.resolve())
+        if action == "worktree_remove":
+            if current != approved:
+                return (KEEP_EVIDENCE_CHANGED,)
+            return current.keep_guardrails
+        return worktree_branch_delete_revalidation_guardrails(
+            approved,
+            refreshed.values(),
+            lock_manager=lock_manager,
+            run_store=run_store,
+            repo=config.repo,
+            main_branch=config.main_branch,
+            process_exists=process_exists,
+            ignored_dirty_paths=(config.state_path,),
+        )
+
     outcomes = execute_worktree_disposition(
         evidence,
         decisions,
         remove_worktree=remover,
         delete_branch=deleter,
+        revalidate=revalidate,
     )
     return WorktreeDispositionCycleResult(
         cycle_id=cycle_id,

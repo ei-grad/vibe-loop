@@ -138,7 +138,13 @@ from vibe_loop.processes import (
     read_process_node,
     read_process_table,
 )
-from vibe_loop.workers import ActiveRunState, WorkerView, WorkspaceClaim
+from vibe_loop.workers import (
+    KEEP_EVIDENCE_CHANGED,
+    ActiveRunState,
+    WorkerView,
+    WorkspaceClaim,
+    collect_worktree_disposition_evidence,
+)
 
 
 def stop_test_process_group(pid: int, process_group_id: int) -> None:
@@ -6056,7 +6062,10 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
                 run_store=run_store,
                 process_exists=lambda pid: False,
                 analysis_runner=analysis_runner,
-                remove_worktree=lambda path: removed.append(path) or "",
+                remove_worktree=lambda path: (
+                    removed.append(path)
+                    or run(repo, "git", "worktree", "remove", str(path)).stderr
+                ),
                 delete_branch=lambda branch: deleted.append(branch) or "",
             )
 
@@ -6074,6 +6083,103 @@ class WorktreeDispositionCycleTests(unittest.TestCase):
         self.assertEqual(record["candidates"], 1)
         self.assertEqual(record["reaped"], 1)
         self.assertEqual(record["status"], "ok")
+
+    def test_reap_refuses_every_post_analysis_evidence_race(self) -> None:
+        cases = {
+            "new_live_claim": lambda item: dataclasses.replace(
+                item,
+                claim_state="running",
+                claim_is_live=True,
+            ),
+            "new_stale_claim": lambda item: dataclasses.replace(
+                item,
+                claim_state="stale",
+            ),
+            "new_dirty_state": lambda item: dataclasses.replace(
+                item,
+                dirty=True,
+                dirty_summary=(" M changed.py",),
+            ),
+            "local_containment_changed": lambda item: dataclasses.replace(
+                item,
+                local_main_contained=False,
+                merged_into=("origin/main",),
+            ),
+            "remote_containment_changed": lambda item: dataclasses.replace(
+                item,
+                remote_main_contained=False,
+                merged_into=("main",),
+            ),
+            "ownership_became_ambiguous": lambda item: dataclasses.replace(
+                item,
+                ownership_error="multiple task/run claims match this worktree or branch",
+            ),
+            "candidate_disappeared": lambda _item: None,
+            "candidate_replaced": lambda item: dataclasses.replace(
+                item,
+                head_commit="replacement",
+            ),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(race=name), tempfile.TemporaryDirectory() as directory:
+                repo, worktree = self._orphan_repo(directory)
+                config = load_config(repo)
+                run_store = RunStore(config.state_path / "runs.jsonl")
+                self._record_reap_success(
+                    repo,
+                    worktree,
+                    run_store,
+                    task_id="ORPHAN",
+                    run_id="run-orphan",
+                    branch="orphan",
+                )
+                manager = LockManager(config.state_path / "locks")
+                initial = collect_worktree_disposition_evidence(
+                    manager,
+                    run_store,
+                    repo=repo,
+                    main_branch="main",
+                    process_exists=lambda _pid: False,
+                    ignored_dirty_paths=(config.state_path,),
+                )
+                candidate = next(
+                    item
+                    for item in initial
+                    if item.path.resolve() == worktree.resolve()
+                )
+                changed = mutate(candidate)
+                snapshots = [initial, [] if changed is None else [changed]]
+
+                result = run_worktree_disposition(
+                    config,
+                    cycle_id="c1",
+                    run_store=run_store,
+                    process_exists=lambda _pid: False,
+                    analysis_runner=lambda _prompt, _output: {
+                        "decisions": [
+                            {
+                                "worktree": str(worktree),
+                                "action": "reap",
+                                "reason": "orphan",
+                            }
+                        ]
+                    },
+                    remove_worktree=lambda _path: self.fail(
+                        "race must preserve worktree"
+                    ),
+                    delete_branch=lambda _branch: self.fail(
+                        "race must preserve branch"
+                    ),
+                    evidence_collector=lambda: snapshots.pop(0),
+                )
+
+                outcome = next(
+                    item
+                    for item in result.outcomes
+                    if item.worktree.resolve() == worktree.resolve()
+                )
+                self.assertEqual(outcome.applied, "refused")
+                self.assertIn(KEEP_EVIDENCE_CHANGED, outcome.guardrails)
 
     def test_report_only_default_journals_candidate_without_side_effects(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

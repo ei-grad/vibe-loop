@@ -27,6 +27,7 @@ from vibe_loop.runs import (
 )
 from vibe_loop.workers import (
     KEEP_DIRTY_WORKTREE,
+    KEEP_EVIDENCE_CHANGED,
     KEEP_GIT_STATE_UNAVAILABLE,
     KEEP_LIVE_CLAIM,
     KEEP_OWNERSHIP_UNVERIFIED,
@@ -2448,6 +2449,47 @@ class WorktreeDispositionExecuteTests(unittest.TestCase):
         kinds = [action.kind for action in outcomes[0].actions]
         self.assertEqual(kinds, ["worktree_remove", "branch_delete"])
         self.assertTrue(all(action.ok for action in outcomes[0].actions))
+
+    def test_revalidates_before_each_destructive_action(self) -> None:
+        evidence = [
+            make_disposition_evidence(Path("/tmp/orphan"), branch="worker/ORPHAN")
+        ]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/orphan"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+        actions: list[str] = []
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+            revalidate=lambda _item, action: actions.append(action) or (),
+        )
+
+        self.assertEqual(outcomes[0].applied, "reaped")
+        self.assertEqual(actions, ["worktree_remove", "branch_delete"])
+
+    def test_refuses_reap_when_revalidation_changes_evidence(self) -> None:
+        evidence = [make_disposition_evidence(Path("/tmp/orphan"))]
+        decisions = [
+            WorktreeDispositionDecision(worktree=Path("/tmp/orphan"), action="reap")
+        ]
+        effects = FakeWorktreeSideEffects()
+
+        outcomes = execute_worktree_disposition(
+            evidence,
+            decisions,
+            remove_worktree=effects.remove_worktree,
+            delete_branch=effects.delete_branch,
+            revalidate=lambda _item, _action: (KEEP_EVIDENCE_CHANGED,),
+        )
+
+        self.assertEqual(outcomes[0].applied, "refused")
+        self.assertIn(KEEP_EVIDENCE_CHANGED, outcomes[0].guardrails)
+        self.assertEqual(effects.removed, [])
+        self.assertEqual(effects.deleted, [])
 
     def test_refuses_to_reap_dirty_worktree(self) -> None:
         evidence = [
