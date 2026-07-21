@@ -192,11 +192,20 @@ completion-path rule, so a missing settlement path can never be discovered
 post-activation. (This repository currently configures `activate` without
 `reset`; adding the hook is a migration prerequisite for runtime-owned
 mode.) Sources without an activation adapter have no authoritative
-in-progress state to strand; settlement records `not_applicable`. A failed
-settlement attempt or a crash between the adapter and its record leaves an
-unconfirmed settlement in the journal; the lock is still released after the
-attempt is recorded, and recovery re-runs the settlement until the task
-source reflects an authoritative non-in-progress state.
+in-progress state to strand; settlement records `not_applicable`.
+
+`task_source_settled` records only a confirmed settlement: the authoritative
+task source observed non-in-progress after the adapter call (or probe). A
+failed settlement attempt, or a crash between the adapter and its record,
+instead appends `task_source_settlement_attempted`; that record never
+satisfies the settlement step, the durable-outcome settlement gate, or
+fenced task-lock release. The run enters `settlement_pending`, retains the
+task lock, and retries settlement with bounded backoff. If the process dies
+while `settlement_pending`, stage-aware fenced recovery — using that run's
+exact private lock identity — re-runs the settlement, confirms the
+authoritative task source non-in-progress, appends `task_source_settled`,
+and only then releases the lock. Generic stale-lock cleanup must never
+release a settlement-pending lock ahead of this recovery path.
 
 Recovery: `run` (or the scheduler's unknown-run recovery) resumes from the
 last journaled stage instead of restarting the whole lifecycle from scratch.
@@ -269,10 +278,15 @@ New record types:
 - `integration_result` — merged ref movement, verification evidence,
   no-op case (`branch_already_merged`).
 - `task_provenance_committed` — task-source completion adapter result.
-- `task_source_settled` — failure-settlement outcome: intent (`requeue` |
-  `park` | `not_applicable`), adapter identity redacted to its configured
-  key, park-to-requeue fallback flag, confirmation state, and the resulting
-  authoritative status when probed.
+- `task_source_settlement_attempted` — a settlement attempt that failed or
+  could not be confirmed: intent, adapter identity redacted to its
+  configured key, error class, retry ordinal. Never a substitute for
+  `task_source_settled`.
+- `task_source_settled` — confirmed failure-settlement outcome: intent
+  (`requeue` | `park` | `not_applicable`), adapter identity redacted to its
+  configured key, park-to-requeue fallback flag, and the confirmed
+  authoritative status. Appended only after the task source is observed
+  non-in-progress, never for a merely attempted adapter call.
 
 Ordered invariants (each later item requires the durable record of every
 earlier one; recovery re-derives position from this order):
@@ -286,9 +300,11 @@ earlier one; recovery re-derives position from this order):
 The existing `PRD-WRK-003` settlement gate (11→12→13) is preserved unchanged.
 Post-activation failure transitions share the same tail with task-source
 settlement first: failure event → `task_source_settled` durable → 11 → 12 →
-13. An unconfirmed settlement record satisfies the ordering for release
-liveness, but recovery must re-run the settlement until confirmed before the
-task is considered settled.
+13. Only a confirmed `task_source_settled` record satisfies the settlement
+step: `task_source_settlement_attempted` never advances the tail, so the run
+holds at `settlement_pending` with the task lock retained (retrying with
+bounded backoff) until confirmation, and after process death the fenced
+settlement-recovery path above is the only route to 13.
 
 ## Typed Stage Contracts
 
@@ -559,8 +575,10 @@ Compatibility specifics:
   tests — after each of the 13 ordered invariants — asserting resume lands in
   the correct stage, never duplicates an effect (activation CAS, claim,
   merge, completion adapter), never loses the durable-result-before-
-  settlement gate, and re-runs an unconfirmed task-source settlement until
-  confirmed.
+  settlement gate, and recovers a `settlement_pending` run only through the
+  fenced settlement path (confirm non-in-progress, append
+  `task_source_settled`, then release); stale-lock cleanup fixtures must
+  fail to release a settlement-pending lock.
 - **Process supervision:** stage subprocess-group termination on timeout and
   cancel; reap watchdog behavior per stage; no orphaned reviewer processes.
 - **Provider walls:** fixtures for implementer-route and reviewer-route walls
@@ -601,7 +619,7 @@ re-scoped into this sequence rather than duplicated.
 | ORC-06 | `run-until-done-supervisor-review-routing` (re-scoped) | ORC-05 | `ReviewRouter`: `[review]` route config, `ReviewRequest`/`ReviewResult` typed I/O, findings ledger records, verdict validation, reviewer concurrency budget, per-route limit walls, stage-phase usage attribution. Covers `PRD-ORC-005/006/008`. |
 | ORC-07 | `orc-reviewer-continuation` | ORC-06 | Same-session remediation/closure resume where supported; provider capability table; `continuation_fallback` records; budget semantics for changed candidates. |
 | ORC-08 | `orc-runtime-integration` | ORC-05, ORC-06 | `Integrator`: integration-lock window, merge-from-main, verification, ff-merge, main verification, no-op merged case, `integration_result`. |
-| ORC-09 | `orc-task-provenance-completion` | ORC-08 | `task_source.complete` adapter + `TaskSourceCompleter`; `TaskSourceSettler` + `task_source_settled` failure settlement (requeue/park intents, park-to-requeue fallback, fail-closed contract validation on activation-capable sources); ordering invariant (integration → provenance → report); compat when unconfigured. |
+| ORC-09 | `orc-task-provenance-completion` | ORC-08 | `task_source.complete` adapter + `TaskSourceCompleter`; `TaskSourceSettler` + `task_source_settled` failure settlement (requeue/park intents, park-to-requeue fallback, fail-closed contract validation on activation-capable sources, `task_source_settlement_attempted` + `settlement_pending` lock retention with fenced settlement recovery); ordering invariant (integration → provenance → report); compat when unconfigured. |
 | ORC-10 | `orc-scheduler-separation` | ORC-07, ORC-09 | `run-until-done` schedules `run` lifecycles only; supervised-mode addendum slimming; skill-package updates for both operating modes; invariant-bypass test suite. |
 | ORC-11 | `orc-migration-default-flip` | ORC-10 | Default `runtime-owned`; migration docs; worker-owned mode regression matrix pinned; eval/demo stories; removal criteria documented (not executed). |
 

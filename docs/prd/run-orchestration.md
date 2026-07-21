@@ -179,17 +179,27 @@ an optional `task_source.park` adapter, with a recorded fallback to
 `requeue` when park is unconfigured — journaled as `task_source_settled`
 before the fenced lock release. On an activation-capable task source the
 contract must include a settlement path; contract validation fails closed
-before any mutation when `task_source.reset` is absent. Leaving a task
-in-progress after lock release is never a legal settlement outcome;
-recovery re-runs unconfirmed settlements until the task source reflects an
-authoritative non-in-progress state.
+before any mutation when `task_source.reset` is absent.
+`task_source_settled` records only a confirmed settlement — the
+authoritative task source observed non-in-progress — never a merely
+attempted adapter call. A failed or unconfirmed attempt is journaled as
+`task_source_settlement_attempted` and satisfies neither the settlement
+step, the durable-outcome settlement gate, nor fenced lock release: the run
+remains `settlement_pending`, retains the task lock, and retries with
+bounded backoff. After process death, stage-aware fenced recovery must use
+the run's exact private lock identity, confirm the authoritative task
+source non-in-progress, append `task_source_settled`, and only then
+release; generic stale-lock cleanup must not release a settlement-pending
+lock. Leaving a task in-progress after lock release is never a legal
+settlement outcome.
 
 Acceptance must cover the integration window and verification steps, conflict
 and verification-failure transitions, the no-op case, adapter-configured and
 unconfigured provenance paths, requeue and park settlement intents with
 fallback recording, settlement-path fail-closed contract validation,
-unconfirmed-settlement recovery, ordering enforcement, and crash recovery at
-each boundary without duplicated effects.
+settlement-pending lock retention with fenced settlement recovery (including
+stale-lock cleanup refusing settlement-pending locks), ordering enforcement,
+and crash recovery at each boundary without duplicated effects.
 
 Related implementation IDs: `ORC-08` (`orc-runtime-integration`), `ORC-09`
 (`orc-task-provenance-completion`).
