@@ -32,12 +32,15 @@ transitions (`limit_wall`, `timed_out`, `stage_failed`, `blocked`,
 `cancelled`) from every stage; journal-ahead recording so every transition is
 derivable after process death; rejection of lifecycle mutations attempted
 through model output text; a journaled task-source settlement step with a
-named owner for every post-activation failure transition, so a task moved out
-of the runnable set by activation can never be stranded in-progress by a
-failure that releases the lock; and a per-transition ownership map naming the
-responsible component for every state mutation and external process launch.
+named owner for every post-activation failure transition — including
+terminal `blocked`/`stage_failed` outcomes and crash-derived failures — so a
+task moved out of the runnable set by activation can never be stranded
+in-progress by a failure that releases the lock (settlement mechanism:
+`PRD-ORC-007`); and a per-transition ownership map naming the responsible
+component for every state mutation and external process launch.
 
-Related implementation IDs: `ORC-03` (`orc-lifecycle-state-machine`).
+Related implementation IDs: `ORC-03` (`orc-lifecycle-state-machine`),
+`ORC-09` (`orc-task-provenance-completion`, task-source settlement).
 
 ## PRD-ORC-002 Resolved Run Contract
 
@@ -168,9 +171,24 @@ integration, integration before provenance, provenance before the completed
 report, durable local result before external settlement (`PRD-WRK-003`
 unchanged).
 
+Failure settlement is the completion path's counterpart. Every
+post-activation failure transition must settle the task source under the
+held lock with a typed intent — `requeue` to the runnable state via
+`task_source.reset`, or `park` into the source's non-runnable held state via
+an optional `task_source.park` adapter, with a recorded fallback to
+`requeue` when park is unconfigured — journaled as `task_source_settled`
+before the fenced lock release. On an activation-capable task source the
+contract must include a settlement path; contract validation fails closed
+before any mutation when `task_source.reset` is absent. Leaving a task
+in-progress after lock release is never a legal settlement outcome;
+recovery re-runs unconfirmed settlements until the task source reflects an
+authoritative non-in-progress state.
+
 Acceptance must cover the integration window and verification steps, conflict
 and verification-failure transitions, the no-op case, adapter-configured and
-unconfigured provenance paths, ordering enforcement, and crash recovery at
+unconfigured provenance paths, requeue and park settlement intents with
+fallback recording, settlement-path fail-closed contract validation,
+unconfirmed-settlement recovery, ordering enforcement, and crash recovery at
 each boundary without duplicated effects.
 
 Related implementation IDs: `ORC-08` (`orc-runtime-integration`), `ORC-09`

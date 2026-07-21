@@ -160,19 +160,43 @@ Failure transitions exist from every stage and are typed, not collapsed:
   fenced release, workspace preserved.
 - `crashed` — no event written; derived on resume from the journal prefix.
 
-Every post-activation failure transition includes a journaled task-source
-settlement step with a named owner: activation moved the task out of the
-runnable set, so a failure that releases the task lock without settling the
-task source would strand the task in-progress forever. `TaskSourceSettler`
-(new; generalizes the scheduler's `_reset_task_source_status` /
-`task_source.reset` hook into the `run` lifecycle) invokes the configured
-reset hook under the held lock for `limit_wall`, `timed_out`, `cancelled`,
-and non-terminal `stage_failed` outcomes, and records the settlement (or its
-absence, when no hook is configured) before the lock is released. Terminal
-`failed`/`blocked` outcomes leave the task-source state to its authoritative
-owner exactly as today, with the settlement record stating so. Recovery
-re-runs an unconfirmed settlement after a crash between the hook and its
-record.
+Every post-activation failure transition — including terminal `blocked` and
+`stage_failed` outcomes — includes a journaled task-source settlement step
+with a named owner: activation moved the task out of the runnable set, so
+releasing the task lock without an authoritative task-source transition
+would strand the task in-progress forever. `TaskSourceSettler` (new;
+generalizes the scheduler's `_reset_task_source_status` /
+`task_source.reset` hook into the `run` lifecycle) settles under the held
+lock with a typed intent and appends a durable `task_source_settled` record
+before the fenced release:
+
+- `requeue` — `limit_wall`, `timed_out`, `cancelled`, and `stage_failed`
+  outcomes classified retryable: the `task_source.reset` adapter returns the
+  task to its runnable state, preserving today's limit-wall/timeout
+  semantics.
+- `park` — `blocked` and `stage_failed` outcomes classified terminal
+  (review or remediation budget exhausted, non-retryable failure): the
+  optional `task_source.park` adapter moves the task to the source's
+  non-runnable held state (for Loopyard, `on-hold`). When no park adapter is
+  configured, settlement falls back to `requeue`, records the fallback, and
+  the scheduler's restart/backoff budgets plus recent-run evidence keep the
+  requeued task from hot-looping. Leaving the task in-progress is never a
+  legal settlement result.
+
+Crash-derived (`crashed`) outcomes settle during stage-aware recovery under
+the same intent rules. On an activation-capable task source (one that
+configures `task_source.activate`, so activation mutates authoritative
+status), a settlement path is required: contract validation fails closed
+before any mutation when `task_source.reset` is absent, mirroring the
+completion-path rule, so a missing settlement path can never be discovered
+post-activation. (This repository currently configures `activate` without
+`reset`; adding the hook is a migration prerequisite for runtime-owned
+mode.) Sources without an activation adapter have no authoritative
+in-progress state to strand; settlement records `not_applicable`. A failed
+settlement attempt or a crash between the adapter and its record leaves an
+unconfirmed settlement in the journal; the lock is still released after the
+attempt is recorded, and recovery re-runs the settlement until the task
+source reflects an authoritative non-in-progress state.
 
 Recovery: `run` (or the scheduler's unknown-run recovery) resumes from the
 last journaled stage instead of restarting the whole lifecycle from scratch.
@@ -201,7 +225,7 @@ stage records) unless noted; existing components keep their current homes.
 | Remediation/closure budgets | orchestration state machine |
 | Integration lock, merge, ff, main verification | `Integrator` (new; uses `LockManager.acquire_main_integration_with_wait`) |
 | Task-source completion transition | `TaskSourceCompleter` (new; `task_source.complete` adapter or probe-confirmed external completion) |
-| Post-activation failure task-source settlement | `TaskSourceSettler` (new; moves the scheduler's `task_source.reset` invocation into the `run` lifecycle) |
+| Post-activation failure task-source settlement (requeue/park, every failure transition) | `TaskSourceSettler` (new; moves the scheduler's `task_source.reset` invocation into the `run` lifecycle) |
 | Classification, durable result, settlement | `VibeRunner.classify` / `record_result` / `settle_outcome_and_release` (existing) |
 | Unknown-run recovery driver | `VibeRunner.drive_unknown_recovery` (existing, extended to stage-aware resume) |
 
@@ -245,6 +269,10 @@ New record types:
 - `integration_result` — merged ref movement, verification evidence,
   no-op case (`branch_already_merged`).
 - `task_provenance_committed` — task-source completion adapter result.
+- `task_source_settled` — failure-settlement outcome: intent (`requeue` |
+  `park` | `not_applicable`), adapter identity redacted to its configured
+  key, park-to-requeue fallback flag, confirmation state, and the resulting
+  authoritative status when probed.
 
 Ordered invariants (each later item requires the durable record of every
 earlier one; recovery re-derives position from this order):
@@ -256,6 +284,11 @@ earlier one; recovery re-derives position from this order):
 11. durable `RunResult` → 12. settled outcome published → 13. fenced release.
 
 The existing `PRD-WRK-003` settlement gate (11→12→13) is preserved unchanged.
+Post-activation failure transitions share the same tail with task-source
+settlement first: failure event → `task_source_settled` durable → 11 → 12 →
+13. An unconfirmed settlement record satisfies the ordering for release
+liveness, but recovery must re-run the settlement until confirmed before the
+task is considered settled.
 
 ## Typed Stage Contracts
 
@@ -275,7 +308,8 @@ recorded as `run_contract_resolved` before any mutation:
                "max_initial_passes": 1, "max_closure_passes": 2, "concurrency_budget": 1},
   "gates": [{"id": "tests", "command_key": "completion.commands[1]"}],
   "integration": {"enabled": true, "verify_on_main": ["..."]},
-  "task_provenance": {"mode": "adapter | external-confirmed", "complete_adapter": "task_source.complete"},
+  "task_provenance": {"mode": "adapter | external-confirmed", "complete_adapter": "task_source.complete",
+                      "settlement": {"requeue_adapter": "task_source.reset", "park_adapter": "task_source.park | null"}},
   "remediation": {"max_rounds": 2}
 }
 ```
@@ -504,8 +538,11 @@ Compatibility specifics:
   `task_provenance_committed` and reporting completed; a probe that still
   shows the task in progress parks the run `blocked` with the integrated
   candidate preserved and a precise diagnostic). Completion is never silently
-  delegated back to prose. Worker-owned mode keeps today's behavior
-  unchanged.
+  delegated back to prose. Failure settlement follows the same fail-closed
+  rule: a source that configures `task_source.activate` must also configure
+  `task_source.reset` (optionally `task_source.park` for terminal parking)
+  before runtime-owned mode will resolve a contract. Worker-owned mode keeps
+  today's behavior unchanged.
 - **Existing run journals:** all new types are additive; existing readers
   ignore them; `derive_run_lifecycle` gains stages only for runs that
   recorded them.
@@ -521,8 +558,9 @@ Compatibility specifics:
 - **Crash recovery at every boundary:** parametrized kill-between-events
   tests — after each of the 13 ordered invariants — asserting resume lands in
   the correct stage, never duplicates an effect (activation CAS, claim,
-  merge, completion adapter), and never loses the durable-result-before-
-  settlement gate.
+  merge, completion adapter), never loses the durable-result-before-
+  settlement gate, and re-runs an unconfirmed task-source settlement until
+  confirmed.
 - **Process supervision:** stage subprocess-group termination on timeout and
   cancel; reap watchdog behavior per stage; no orphaned reviewer processes.
 - **Provider walls:** fixtures for implementer-route and reviewer-route walls
@@ -563,7 +601,7 @@ re-scoped into this sequence rather than duplicated.
 | ORC-06 | `run-until-done-supervisor-review-routing` (re-scoped) | ORC-05 | `ReviewRouter`: `[review]` route config, `ReviewRequest`/`ReviewResult` typed I/O, findings ledger records, verdict validation, reviewer concurrency budget, per-route limit walls, stage-phase usage attribution. Covers `PRD-ORC-005/006/008`. |
 | ORC-07 | `orc-reviewer-continuation` | ORC-06 | Same-session remediation/closure resume where supported; provider capability table; `continuation_fallback` records; budget semantics for changed candidates. |
 | ORC-08 | `orc-runtime-integration` | ORC-05, ORC-06 | `Integrator`: integration-lock window, merge-from-main, verification, ff-merge, main verification, no-op merged case, `integration_result`. |
-| ORC-09 | `orc-task-provenance-completion` | ORC-08 | `task_source.complete` adapter + `TaskSourceCompleter`; ordering invariant (integration → provenance → report); compat when unconfigured. |
+| ORC-09 | `orc-task-provenance-completion` | ORC-08 | `task_source.complete` adapter + `TaskSourceCompleter`; `TaskSourceSettler` + `task_source_settled` failure settlement (requeue/park intents, park-to-requeue fallback, fail-closed contract validation on activation-capable sources); ordering invariant (integration → provenance → report); compat when unconfigured. |
 | ORC-10 | `orc-scheduler-separation` | ORC-07, ORC-09 | `run-until-done` schedules `run` lifecycles only; supervised-mode addendum slimming; skill-package updates for both operating modes; invariant-bypass test suite. |
 | ORC-11 | `orc-migration-default-flip` | ORC-10 | Default `runtime-owned`; migration docs; worker-owned mode regression matrix pinned; eval/demo stories; removal criteria documented (not executed). |
 
