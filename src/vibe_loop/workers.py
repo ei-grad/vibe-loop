@@ -1685,6 +1685,7 @@ class StaleLock:
     started_at: str = ""
     settled_outcome: str = ""
     settled_classification: str = ""
+    settlement_pending: bool = False
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1695,6 +1696,7 @@ class StaleLock:
             "kind": self.kind,
             "recovery_command": self.recovery_command,
             "started_at": self.started_at,
+            "settlement_pending": self.settlement_pending,
         }
 
 
@@ -1709,7 +1711,9 @@ def collect_stale_locks(
     ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[StaleLock]:
     stale: list[StaleLock] = []
-    pending_settlements = pending_settlements_by_run_id(run_store.read_records())
+    records = run_store.read_records()
+    pending_settlements = pending_settlements_by_run_id(records)
+    source_settlement_pending = task_source_settlement_pending_run_ids(records)
     for view in build_worker_views(
         lock_manager,
         run_store,
@@ -1739,6 +1743,7 @@ def collect_stale_locks(
                 started_at=view.active.started_at,
                 settled_outcome=settlement[0],
                 settled_classification=settlement[1],
+                settlement_pending=view.active.run_id in source_settlement_pending,
             )
         )
 
@@ -1811,6 +1816,38 @@ def pending_settlements_by_run_id(
     return pending
 
 
+def task_source_settlement_pending_run_ids(
+    records: Sequence[dict[str, Any]],
+) -> set[str]:
+    pending: set[str] = set()
+    runtime_owned: set[str] = set()
+    for record in records:
+        run_id = optional_string(record.get("run_id"))
+        if not run_id:
+            continue
+        record_type = record.get("record_type")
+        if record_type == "run_contract_resolved" and record.get("mode") == (
+            "runtime-owned"
+        ):
+            runtime_owned.add(run_id)
+        elif (
+            record_type == "stage_transition"
+            and record.get("accepted") is True
+            and record.get("to_stage") == "activation"
+            and run_id in runtime_owned
+        ):
+            pending.add(run_id)
+        elif record_type == "task_source_settlement_attempted":
+            pending.add(run_id)
+        elif record_type in {
+            "task_provenance_committed",
+            "task_source_settled",
+            LOCK_RELEASED_RECORD_TYPE,
+        }:
+            pending.discard(run_id)
+    return pending
+
+
 @dataclasses.dataclass(frozen=True)
 class CleanResult:
     cleaned: list[StaleLock]
@@ -1824,6 +1861,15 @@ def clean_stale_locks(
     cleaned: list[StaleLock] = []
     errors: list[tuple[StaleLock, str]] = []
     for lock in stale_locks:
+        if lock.settlement_pending:
+            errors.append(
+                (
+                    lock,
+                    "task-source settlement pending; stage-aware fenced recovery "
+                    "must settle the authoritative source before release",
+                )
+            )
+            continue
         if lock_manager is not None:
             try:
                 released = lock_manager.release_stale_lock(

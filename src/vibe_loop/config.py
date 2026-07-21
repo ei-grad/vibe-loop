@@ -283,7 +283,9 @@ TASK_SOURCE_SOURCE_KEYS = frozenset(
         "next",
         "probe",
         "activate",
+        "complete",
         "reset",
+        "park",
         "profile",
     }
 )
@@ -295,7 +297,9 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "next",
         "probe",
         "activate",
+        "complete",
         "reset",
+        "park",
         "selection_command",
         "locks",
         "lock_backend",
@@ -689,6 +693,10 @@ class TaskSourceConfig:
     # selected task from a runnable state to a project-owned in-progress state
     # and returns the normalized post-transition task JSON for confirmation.
     activate_command: str | None = None
+    # Optional runtime-owned completion adapter. The command performs the
+    # project-owned terminal transition and returns the normalized task JSON
+    # that confirms it.
+    complete_command: str | None = None
     # Optional operator wiring: a command that asks a command-backed task
     # backend to return a claimed task to its runnable state, templated with
     # {task_id}. The supervisor invokes it when a run hits a provider limit
@@ -696,6 +704,10 @@ class TaskSourceConfig:
     # worker launch and the worker died before any terminal transition. Absent
     # hook leaves project-owned task status unchanged.
     reset_command: str | None = None
+    # Optional runtime-owned terminal-failure adapter. It moves an activated
+    # task into the source's held state and returns normalized task JSON for
+    # confirmation. When absent, settlement falls back to reset/requeue.
+    park_command: str | None = None
     # Wall-clock ceiling applied to every task-source subprocess invocation
     # (list at cycle start, activate before launch, probe during
     # classification/recovery, and the reset hook). A hung backend command — a
@@ -735,7 +747,9 @@ class TaskSourceConfig:
             "next_command": self.next_command,
             "probe_command": self.probe_command,
             "activate_command": self.activate_command,
+            "complete_command": self.complete_command,
             "reset_command": self.reset_command,
+            "park_command": self.park_command,
             "command_timeout_seconds": self.command_timeout_seconds,
             "runnable_statuses": list(self.runnable_statuses),
             "respect_source_order": self.respect_source_order,
@@ -2069,7 +2083,9 @@ def parse_task_source(data: object) -> TaskSourceConfig:
         next_command=optional_string(table.get("next")),
         probe_command=optional_string(table.get("probe")),
         activate_command=optional_string(table.get("activate")),
+        complete_command=optional_string(table.get("complete")),
         reset_command=optional_string(table.get("reset")),
+        park_command=optional_string(table.get("park")),
         command_timeout_seconds=positive_float(
             table.get("command_timeout_seconds"),
             120.0,

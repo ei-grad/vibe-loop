@@ -53,6 +53,9 @@ REVIEW_BUDGET_RECORD_TYPE = "review_budget"
 CONTINUATION_FALLBACK_RECORD_TYPE = "continuation_fallback"
 FINDING_RECORDED_RECORD_TYPE = "finding_recorded"
 INTEGRATION_RESULT_RECORD_TYPE = "integration_result"
+TASK_PROVENANCE_COMMITTED_RECORD_TYPE = "task_provenance_committed"
+TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE = "task_source_settlement_attempted"
+TASK_SOURCE_SETTLED_RECORD_TYPE = "task_source_settled"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
@@ -121,6 +124,9 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         CONTINUATION_FALLBACK_RECORD_TYPE,
         FINDING_RECORDED_RECORD_TYPE,
         INTEGRATION_RESULT_RECORD_TYPE,
+        TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
+        TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE,
+        TASK_SOURCE_SETTLED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
@@ -797,6 +803,51 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=INTEGRATION_RESULT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def task_provenance_committed(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def task_source_settlement_attempted(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def task_source_settled(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=TASK_SOURCE_SETTLED_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,
@@ -2006,6 +2057,12 @@ def record_status(record: dict[str, Any]) -> str:
         phase = string_value(record.get("phase")) or "recovery"
         outcome = string_value(record.get("outcome"))
         return f"{phase}:{outcome}" if outcome else phase
+    if record_type == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
+        return string_value(record.get("confirmed_status")) or "committed"
+    if record_type == TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE:
+        return "settlement_pending"
+    if record_type == TASK_SOURCE_SETTLED_RECORD_TYPE:
+        return string_value(record.get("confirmed_status")) or "settled"
     if record_type in {
         LOCK_ACQUIRED_RECORD_TYPE,
         LOCK_RELEASED_RECORD_TYPE,

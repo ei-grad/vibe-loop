@@ -198,10 +198,11 @@ Precedence is resolved before cache loading performs parser validation:
 
 1. User-authored command adapters in `.vibe-loop.toml` are authoritative. If
    `task_source.type = "command"` or any of `task_source.list`,
-   `task_source.next`, `task_source.probe`, `task_source.activate`, or
-   `task_source.reset` is explicitly set, generated
-   discovery is disabled for the active source. Adapter failures are reported as
-   adapter failures, not replaced by generated discovery.
+   `task_source.next`, `task_source.probe`, `task_source.activate`,
+   `task_source.complete`, `task_source.reset`, or `task_source.park` is
+   explicitly set, generated discovery is disabled for the active source.
+   Adapter failures are reported as adapter failures, not replaced by generated
+   discovery.
 2. User-authored non-command source selectors are authoritative. Explicit
    `task_source.type`, `task_source.plan_path`, `task_source.plan_paths`, or
    `task_source.profile` disable generated discovery for the active source.

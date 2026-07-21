@@ -251,7 +251,12 @@ class TaskSource(Protocol):
         """
         ...
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> bool:
         """Request the backend return a claimed task to its runnable state.
 
         Returns True when a reset hook is configured and was invoked, False
@@ -259,6 +264,26 @@ class TaskSource(Protocol):
         command-backed source can carry a reset command; file-based sources
         have no hook and return False.
         """
+        ...
+
+    def complete(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        """Perform and confirm a configured project-owned completion."""
+        ...
+
+    def park(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        """Perform and confirm a configured project-owned park transition."""
         ...
 
 
@@ -378,7 +403,12 @@ class MarkdownPlanSource:
     ) -> Task | None:
         return None
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> bool:
         return False
 
 
@@ -484,7 +514,12 @@ class MarkdownProfileSource:
     ) -> Task | None:
         return None
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> bool:
         return False
 
 
@@ -520,7 +555,12 @@ class RalphexMarkdownSource:
     ) -> Task | None:
         return None
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> bool:
         return False
 
 
@@ -565,7 +605,12 @@ class SpecToolMarkdownSource:
     ) -> Task | None:
         return None
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> bool:
         return False
 
 
@@ -2246,7 +2291,12 @@ class CommandTaskSource:
             )
         return task_from_mapping(payload, 0)
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> bool:
         if not self.config.reset_command:
             return False
         command = self.config.reset_command.format(task_id=task_id)
@@ -2254,9 +2304,73 @@ class CommandTaskSource:
             self.repo,
             command,
             timeout=self.config.command_timeout_seconds,
-            runtime_context=self.runtime_context,
+            runtime_context=self._runtime_context(runtime_context),
         )
         return True
+
+    def complete(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        if not self.config.complete_command:
+            return None
+        return self._run_transition_adapter(
+            "complete",
+            self.config.complete_command,
+            task_id,
+            run_id,
+            runtime_context,
+        )
+
+    def park(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> Task | None:
+        if not self.config.park_command:
+            return None
+        return self._run_transition_adapter(
+            "park",
+            self.config.park_command,
+            task_id,
+            run_id,
+            runtime_context,
+        )
+
+    def _run_transition_adapter(
+        self,
+        adapter: str,
+        command_template: str,
+        task_id: str,
+        run_id: str,
+        runtime_context: Mapping[str, str] | None,
+    ) -> Task:
+        try:
+            command = command_template.format(
+                task_id=shlex.quote(task_id),
+                run_id=shlex.quote(run_id),
+            )
+        except (KeyError, IndexError, ValueError) as exc:
+            raise ValueError(
+                f"task_source.{adapter} may only use {{task_id}} and {{run_id}} "
+                "template fields"
+            ) from exc
+        payload = run_json_command(
+            self.repo,
+            command,
+            timeout=self.config.command_timeout_seconds,
+            runtime_context=self._runtime_context(runtime_context),
+        )
+        if not isinstance(payload, dict):
+            raise ValueError(
+                f"task_source.{adapter} must return one normalized task JSON object"
+            )
+        return task_from_mapping(payload, 0)
 
     def _runtime_context(
         self,

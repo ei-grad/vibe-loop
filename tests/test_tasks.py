@@ -1061,6 +1061,67 @@ class MarkdownPlanTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "may only use"):
                 source.activate("TASK-42", "run-7")
 
+    def test_command_task_source_completion_and_park_return_confirmation(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            command = str(args[0])
+            calls.append(command)
+            status = "done" if command.startswith("complete") else "on-hold"
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout=json.dumps(
+                    {"id": "TASK unsafe", "title": "Task", "status": status}
+                ),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    complete_command="complete {task_id} --run {run_id}",
+                    park_command="park {task_id} --run {run_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                completed = source.complete("TASK unsafe", "run unsafe")
+                parked = source.park("TASK unsafe", "run unsafe")
+
+        self.assertIsNotNone(completed)
+        self.assertTrue(completed.done)
+        self.assertIsNotNone(parked)
+        self.assertEqual(parked.status, "on-hold")
+        self.assertEqual(
+            calls,
+            [
+                "complete 'TASK unsafe' --run 'run unsafe'",
+                "park 'TASK unsafe' --run 'run unsafe'",
+            ],
+        )
+
+    def test_command_task_source_completion_rejects_unconfirmed_shape(self) -> None:
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(args[0], 0, stdout="[]", stderr="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    complete_command="complete {task_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                with self.assertRaisesRegex(ValueError, "normalized task JSON"):
+                    source.complete("TASK-42", "run-7")
+
     def test_command_task_source_continuation_confirms_without_reactivation(
         self,
     ) -> None:
@@ -1240,7 +1301,15 @@ class MarkdownPlanTests(unittest.TestCase):
                 with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
                     self.assertEqual(source.list_tasks(), [])
                     self.assertEqual(source.probe("TASK-1").task_id, "TASK-1")
-                    self.assertTrue(source.reset("TASK-1"))
+                    self.assertTrue(
+                        source.reset(
+                            "TASK-1",
+                            runtime_context={
+                                "VIBE_LOOP_RUN_ID": "run-1",
+                                "VIBE_LOOP_FENCING_TOKEN": "dynamic-generation",
+                            },
+                        )
+                    )
                 inherited_after = os.environ["PROJECT_SELECTOR"]
 
         self.assertEqual(inherited_after, "host-selector")
@@ -1256,6 +1325,12 @@ class MarkdownPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             len({identity for _command, _environment, identity in calls}), 3
+        )
+        reset_environment = calls[-1][1]
+        self.assertEqual(reset_environment["VIBE_LOOP_RUN_ID"], "run-1")
+        self.assertEqual(
+            reset_environment["VIBE_LOOP_FENCING_TOKEN"],
+            "dynamic-generation",
         )
 
     def test_command_task_source_redacts_active_token_from_json_output(self) -> None:

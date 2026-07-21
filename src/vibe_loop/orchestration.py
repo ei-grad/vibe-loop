@@ -21,6 +21,7 @@ from vibe_loop.config import (
     AgentResolutionError,
     AgentSelection,
     OrchestrationConfig,
+    TaskSourceConfig,
     VibeConfig,
     agent_command_provider,
     command_template_uses_field,
@@ -28,6 +29,7 @@ from vibe_loop.config import (
     parse_orchestration,
 )
 from vibe_loop.retry import LimitWallSignal, detect_limit_wall
+from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
 from vibe_loop.telemetry import ProviderUsage, ProviderUsageObserver, unavailable_usage
 
 
@@ -3404,6 +3406,493 @@ class Integrator:
         )
 
 
+class TaskSourceCompletionError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskProvenanceResult:
+    mode: str
+    adapter: str
+    confirmed_status: str
+    integration_outcome: str
+    recovered: bool = False
+
+    def to_payload(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+class TaskSourceCompleter:
+    """Commit project-owned completion after durable runtime integration."""
+
+    def __init__(
+        self,
+        *,
+        source: TaskSource,
+        task_source_config: TaskSourceConfig,
+        mode: str,
+        lock_manager: object,
+        task_lock: object,
+        run_store: object,
+        run_id: str,
+        task_id: str,
+        runtime_context: Mapping[str, str] | None = None,
+        stage_machine: RunLifecycleStateMachine | None = None,
+    ) -> None:
+        if mode not in {"adapter", "external-confirmed"}:
+            raise ValueError(f"unsupported task provenance mode: {mode}")
+        self.source = source
+        self.task_source_config = task_source_config
+        self.mode = mode
+        self.lock_manager = lock_manager
+        self.task_lock = task_lock
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+        self.runtime_context = dict(runtime_context or {})
+        self.stage_machine = stage_machine
+
+    def complete(self) -> TaskProvenanceResult:
+        self._validate_lock_owner()
+        prior = self._prior_result()
+        if prior is not None:
+            return prior
+        if self._completed_report_exists():
+            raise TaskSourceCompletionError(
+                "completed_report_precedes_provenance",
+                "completed run result cannot precede task provenance",
+            )
+        integration = self._completed_integration()
+        if integration is None:
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance requires a durable completed integration_result",
+            )
+        if (
+            self.stage_machine is not None
+            and self.stage_machine.stage is not RunStage.PROVENANCE
+        ):
+            if self.stage_machine.stage is not RunStage.INTEGRATION:
+                raise TaskSourceCompletionError(
+                    "integration_stage_not_current",
+                    "task provenance may only follow the integration stage",
+                )
+            self.stage_machine.transition(
+                RunStage.PROVENANCE,
+                reason="integration_confirmed",
+            )
+
+        confirmed = self._probe("completion_probe_failed")
+        recovered = confirmed is not None and confirmed.done
+        if not recovered and self.mode == "adapter":
+            if not self.task_source_config.complete_command:
+                raise self._blocked_error(
+                    "completion_adapter_unconfigured",
+                    "runtime-owned adapter completion requires task_source.complete",
+                )
+            try:
+                confirmed = self.source.complete(
+                    self.task_id,
+                    self.run_id,
+                    runtime_context=self.runtime_context,
+                )
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                raise self._blocked_error(
+                    "completion_adapter_failed",
+                    "task_source.complete failed; integrated candidate preserved: "
+                    f"{type(exc).__name__}",
+                ) from exc
+        if confirmed is None or confirmed.task_id != self.task_id or not confirmed.done:
+            code = (
+                "external_completion_unconfirmed"
+                if self.mode == "external-confirmed"
+                else "completion_adapter_unconfirmed"
+            )
+            raise self._blocked_error(
+                code,
+                "authoritative task source does not confirm completion; "
+                "integrated candidate preserved",
+            )
+        result = TaskProvenanceResult(
+            mode=self.mode,
+            adapter=(
+                "task_source.complete"
+                if self.mode == "adapter"
+                else "task_source.probe"
+            ),
+            confirmed_status=confirmed.status,
+            integration_outcome=integration.outcome,
+            recovered=recovered,
+        )
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_provenance_committed(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=result.to_payload(),
+            )
+        )
+        return result
+
+    def _validate_lock_owner(self) -> None:
+        token = getattr(self.task_lock, "metadata", {}).get("fencing_token")
+        self.lock_manager.validate_owner(
+            task_id=self.task_id,
+            run_id=self.run_id,
+            fencing_token=token if isinstance(token, str) else None,
+        )
+
+    def _probe(self, code: str) -> Task | None:
+        try:
+            return self.source.probe(self.task_id)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise self._blocked_error(
+                code,
+                f"authoritative task-source probe failed: {type(exc).__name__}",
+            ) from exc
+
+    def _blocked_error(self, code: str, message: str) -> TaskSourceCompletionError:
+        if self.stage_machine is not None and self.stage_machine.stage not in {
+            RunStage.CLASSIFICATION,
+            RunStage.FINALIZATION,
+        }:
+            self.stage_machine.fail(StageFailure.BLOCKED, reason=code)
+        return TaskSourceCompletionError(code, message)
+
+    def _completed_integration(self) -> IntegrationResult | None:
+        result = None
+        for record in self.run_store.read_records():
+            if (
+                record.get("run_id") == self.run_id
+                and record.get("task_id") == self.task_id
+            ):
+                candidate = IntegrationResult.from_record(record)
+                if candidate is not None and candidate.completed:
+                    result = candidate
+        return result
+
+    def _completed_report_exists(self) -> bool:
+        return any(
+            record.get("record_type") in {None, "run_result"}
+            and record.get("run_id") == self.run_id
+            and record.get("task_id") == self.task_id
+            and record.get("classification") == "completed"
+            for record in self.run_store.read_records()
+        )
+
+    def _prior_result(self) -> TaskProvenanceResult | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("record_type") != "task_provenance_committed"
+                or record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+            ):
+                continue
+            try:
+                return TaskProvenanceResult(
+                    mode=str(record["mode"]),
+                    adapter=str(record["adapter"]),
+                    confirmed_status=str(record["confirmed_status"]),
+                    integration_outcome=str(record["integration_outcome"]),
+                    recovered=bool(record.get("recovered")),
+                )
+            except KeyError:
+                return None
+        return None
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskSourceSettlementResult:
+    intent: str
+    adapter: str
+    confirmed_status: str
+    fallback_to_requeue: bool
+    attempts: int
+    settled: bool
+    recovered: bool = False
+
+    @property
+    def settlement_pending(self) -> bool:
+        return not self.settled
+
+    def to_payload(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+
+class TaskSourceSettler:
+    """Settle an activated task source before its fenced lock may release."""
+
+    def __init__(
+        self,
+        *,
+        source: TaskSource,
+        task_source_config: TaskSourceConfig,
+        lock_manager: object,
+        task_lock: object,
+        run_store: object,
+        run_id: str,
+        task_id: str,
+        runtime_context: Mapping[str, str] | None = None,
+        max_attempts: int = 3,
+        backoff_seconds: float = 1.0,
+        sleeper: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("settlement max_attempts must be positive")
+        if backoff_seconds < 0:
+            raise ValueError("settlement backoff_seconds cannot be negative")
+        self.source = source
+        self.task_source_config = task_source_config
+        self.lock_manager = lock_manager
+        self.task_lock = task_lock
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+        self.runtime_context = dict(runtime_context or {})
+        self.max_attempts = max_attempts
+        self.backoff_seconds = backoff_seconds
+        self.sleeper = sleeper
+
+    def settle(self, intent: str) -> TaskSourceSettlementResult:
+        if intent not in {"requeue", "park"}:
+            raise ValueError(f"unsupported task-source settlement intent: {intent}")
+        self._validate_lock_owner()
+        prior = self._prior_result()
+        if prior is not None:
+            return prior
+        if not self.task_source_config.activate_command:
+            return self._record_settled(
+                TaskSourceSettlementResult(
+                    intent="not_applicable",
+                    adapter="none",
+                    confirmed_status="not_applicable",
+                    fallback_to_requeue=False,
+                    attempts=0,
+                    settled=True,
+                )
+            )
+        if not self.task_source_config.reset_command:
+            raise TaskSourceCompletionError(
+                "settlement_adapter_unconfigured",
+                "activation-capable task source requires task_source.reset",
+            )
+        fallback = intent == "park" and not self.task_source_config.park_command
+        effective_intent = "requeue" if fallback else intent
+        adapter = (
+            "task_source.park" if effective_intent == "park" else "task_source.reset"
+        )
+        try:
+            confirmed = self._probe_for_settlement()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            confirmed = None
+        if self._confirmed(confirmed, effective_intent):
+            return self._record_settled(
+                TaskSourceSettlementResult(
+                    intent=intent,
+                    adapter=adapter,
+                    confirmed_status=confirmed.status if confirmed is not None else "",
+                    fallback_to_requeue=fallback,
+                    attempts=0,
+                    settled=True,
+                    recovered=True,
+                )
+            )
+
+        for attempt in range(1, self.max_attempts + 1):
+            error_class = "unconfirmed_status"
+            try:
+                if effective_intent == "park":
+                    self.source.park(
+                        self.task_id,
+                        self.run_id,
+                        runtime_context=self.runtime_context,
+                    )
+                else:
+                    self.source.reset(
+                        self.task_id,
+                        runtime_context=self.runtime_context,
+                    )
+                confirmed = self._probe_for_settlement()
+            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                error_class = type(exc).__name__
+                confirmed = None
+            if self._confirmed(confirmed, effective_intent):
+                return self._record_settled(
+                    TaskSourceSettlementResult(
+                        intent=intent,
+                        adapter=adapter,
+                        confirmed_status=(
+                            confirmed.status if confirmed is not None else ""
+                        ),
+                        fallback_to_requeue=fallback,
+                        attempts=attempt,
+                        settled=True,
+                    )
+                )
+            self._record_attempt(
+                intent=intent,
+                adapter=adapter,
+                fallback=fallback,
+                attempt=attempt,
+                error_class=error_class,
+                confirmed_status=confirmed.status if confirmed is not None else "",
+            )
+            if attempt < self.max_attempts:
+                self.sleeper(self.backoff_seconds * attempt)
+        return TaskSourceSettlementResult(
+            intent=intent,
+            adapter=adapter,
+            confirmed_status=confirmed.status if confirmed is not None else "",
+            fallback_to_requeue=fallback,
+            attempts=self.max_attempts,
+            settled=False,
+        )
+
+    def recover_and_release(self, intent: str) -> TaskSourceSettlementResult:
+        result = self.settle(intent)
+        if not result.settled:
+            return result
+        classification = self._durable_classification()
+        if classification is None:
+            raise TaskSourceCompletionError(
+                "durable_outcome_not_recorded",
+                "task-source settlement recovery cannot release before the "
+                "durable run result",
+            )
+        self._validate_lock_owner()
+        from vibe_loop.runs import (
+            LOCK_RELEASED_RECORD_TYPE,
+            RunLifecycleEvent,
+            settled_run_outcome,
+        )
+
+        outcome = settled_run_outcome(classification)
+        metadata = dict(self.task_lock.metadata)
+        metadata["outcome"] = outcome
+        metadata["classification"] = classification
+        self.lock_manager.release_settled(
+            self.task_lock,
+            metadata,
+            outcome=outcome,
+        )
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                LOCK_RELEASED_RECORD_TYPE,
+                run_id=self.run_id,
+                task_id=self.task_id,
+                lock_kind="task",
+                lock_path=self.task_lock.path,
+                payload={"reason": "task_source_settlement_recovered"},
+            )
+        )
+        return dataclasses.replace(result, recovered=True)
+
+    def _durable_classification(self) -> str | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("record_type") in {None, "run_result"}
+                and record.get("run_id") == self.run_id
+                and record.get("task_id") == self.task_id
+            ):
+                classification = record.get("classification")
+                return classification if isinstance(classification, str) else None
+        return None
+
+    def _validate_lock_owner(self) -> None:
+        token = getattr(self.task_lock, "metadata", {}).get("fencing_token")
+        self.lock_manager.validate_owner(
+            task_id=self.task_id,
+            run_id=self.run_id,
+            fencing_token=token if isinstance(token, str) else None,
+        )
+
+    def _probe_for_settlement(self) -> Task | None:
+        return self.source.probe(self.task_id)
+
+    def _confirmed(self, task: Task | None, intent: str) -> bool:
+        if task is None or task.task_id != self.task_id:
+            return False
+        status = task.status.casefold()
+        if intent == "requeue":
+            return status in {
+                candidate.casefold()
+                for candidate in self.task_source_config.runnable_statuses
+            }
+        return status in BLOCKED_FAMILY_STATUSES or status in {
+            "on-hold",
+            "on_hold",
+            "parked",
+        }
+
+    def _record_attempt(
+        self,
+        *,
+        intent: str,
+        adapter: str,
+        fallback: bool,
+        attempt: int,
+        error_class: str,
+        confirmed_status: str,
+    ) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_source_settlement_attempted(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload={
+                    "intent": intent,
+                    "adapter": adapter,
+                    "fallback_to_requeue": fallback,
+                    "retry_ordinal": attempt,
+                    "error_class": error_class,
+                    "confirmed_status": confirmed_status,
+                    "settlement_pending": True,
+                },
+            )
+        )
+
+    def _record_settled(
+        self, result: TaskSourceSettlementResult
+    ) -> TaskSourceSettlementResult:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_source_settled(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=result.to_payload(),
+            )
+        )
+        return result
+
+    def _prior_result(self) -> TaskSourceSettlementResult | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("record_type") != "task_source_settled"
+                or record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+            ):
+                continue
+            try:
+                return TaskSourceSettlementResult(
+                    intent=str(record["intent"]),
+                    adapter=str(record["adapter"]),
+                    confirmed_status=str(record["confirmed_status"]),
+                    fallback_to_requeue=bool(record["fallback_to_requeue"]),
+                    attempts=int(record["attempts"]),
+                    settled=bool(record["settled"]),
+                    recovered=bool(record.get("recovered")),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
+
 def resolve_completion_command(
     completion_commands: Sequence[str], command_key: str
 ) -> str:
@@ -3529,6 +4018,28 @@ class RunContractResolver:
                 f"{command_key} must include {{prompt}} for reviewer request delivery"
             )
 
+        if effective.mode == "runtime-owned":
+            if "task_provenance_mode" not in effective.explicit_keys:
+                raise ValueError(
+                    "runtime-owned orchestration requires an explicit "
+                    "orchestration.task_provenance_mode completion path"
+                )
+            if (
+                effective.task_provenance_mode == "adapter"
+                and self.config.task_source.complete_command is None
+            ):
+                raise ValueError(
+                    "runtime-owned adapter completion requires task_source.complete"
+                )
+            if (
+                self.config.task_source.activate_command is not None
+                and self.config.task_source.reset_command is None
+            ):
+                raise ValueError(
+                    "runtime-owned activation-capable task source requires "
+                    "task_source.reset"
+                )
+
         payload: dict[str, object] = {
             "contract_version": RUN_CONTRACT_VERSION,
             "mode": effective.mode,
@@ -3564,11 +4075,19 @@ class RunContractResolver:
                         if self.config.task_source.reset_command is not None
                         else None
                     ),
-                    "park_adapter": None,
+                    "park_adapter": (
+                        "task_source.park"
+                        if self.config.task_source.park_command is not None
+                        else None
+                    ),
                 },
             },
             "remediation": {"max_rounds": effective.max_remediation_rounds},
         }
+        task_provenance = payload["task_provenance"]
+        assert isinstance(task_provenance, dict)
+        if self.config.task_source.complete_command is not None:
+            task_provenance["complete_adapter"] = "task_source.complete"
         return ResolvedRunContract(payload=payload, digest=sha256_digest(payload))
 
 

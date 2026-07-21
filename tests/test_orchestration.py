@@ -21,6 +21,7 @@ from vibe_loop.config import (
     AgentSelection,
     CompletionConfig,
     OrchestrationConfig,
+    TaskSourceConfig,
     VibeConfig,
     load_config,
     reject_generated_command_adapters,
@@ -35,6 +36,7 @@ from vibe_loop.orchestration import (
     GateRunSummary,
     GateRunner,
     Integrator,
+    IntegrationResult,
     LEGAL_STAGE_TRANSITIONS,
     RuntimeGateController,
     ReviewBudgetExhausted,
@@ -52,6 +54,9 @@ from vibe_loop.orchestration import (
     RunLifecycleStateMachine,
     RunStage,
     StageFailure,
+    TaskSourceCompleter,
+    TaskSourceCompletionError,
+    TaskSourceSettler,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
     derive_stage_progress,
@@ -65,8 +70,8 @@ from vibe_loop.locks import (
     LockFencingMismatch,
     LockManager,
 )
-from vibe_loop.runs import RunLifecycleEvent, RunStore, WorkerReport
-from vibe_loop.tasks import Task
+from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore, WorkerReport
+from vibe_loop.tasks import CommandTaskSource, Task
 from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
@@ -293,6 +298,91 @@ class RunContractResolverTests(unittest.TestCase):
         source = contract.payload["source"]
         assert isinstance(source, dict)
         self.assertTrue(str(source["digest"]).startswith("sha256:"))
+
+    def test_runtime_owned_contract_requires_declared_completion_and_settlement(
+        self,
+    ) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        cases = (
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
+                TaskSourceConfig(),
+                "explicit.*task_provenance_mode",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    task_provenance_mode="adapter",
+                    explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+                ),
+                TaskSourceConfig(),
+                "requires task_source.complete",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    task_provenance_mode="external-confirmed",
+                    explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+                ),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list",
+                    activate_command="activate {task_id}",
+                ),
+                "requires task_source.reset",
+            ),
+        )
+        for orchestration, task_source, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                config = VibeConfig(
+                    repo=Path("/repo"),
+                    agent=agent,
+                    orchestration=orchestration,
+                    task_source=task_source,
+                )
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    RunContractResolver(config).resolve(
+                        AgentSelection(agent, "", "default")
+                    )
+
+    def test_runtime_owned_contract_records_allowlisted_source_adapters(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                task_provenance_mode="adapter",
+                explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                activate_command="activate {task_id}",
+                complete_command="complete {task_id}",
+                reset_command="reset {task_id}",
+                park_command="park {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"],
+            {
+                "mode": "adapter",
+                "complete_adapter": "task_source.complete",
+                "settlement": {
+                    "requeue_adapter": "task_source.reset",
+                    "park_adapter": "task_source.park",
+                },
+            },
+        )
 
 
 class RunLifecycleStateMachineTests(unittest.TestCase):
@@ -1585,6 +1675,375 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertTrue(all(result.completed for result in results))
         self.assertFalse(self.manager.main_integration_status().locked)
+
+
+class MutableTaskSource:
+    def __init__(self, status: str = "active") -> None:
+        self.status = status
+        self.complete_calls = 0
+        self.reset_calls = 0
+        self.park_calls = 0
+        self.reset_context: dict[str, str] = {}
+        self.reset_status = "ready"
+        self.park_status = "on-hold"
+
+    def probe(self, task_id: str) -> Task:
+        return Task(task_id=task_id, title="Task", status=self.status)
+
+    def complete(self, task_id: str, run_id: str, **kwargs: object) -> Task:
+        self.complete_calls += 1
+        self.status = "done"
+        return self.probe(task_id)
+
+    def reset(self, task_id: str, **kwargs: object) -> bool:
+        self.reset_calls += 1
+        runtime_context = kwargs.get("runtime_context")
+        if isinstance(runtime_context, dict):
+            self.reset_context = runtime_context
+        self.status = self.reset_status
+        return True
+
+    def park(self, task_id: str, run_id: str, **kwargs: object) -> Task:
+        self.park_calls += 1
+        self.status = self.park_status
+        return self.probe(task_id)
+
+
+class TaskSourceProvenanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        init_git_repo(self.repo)
+        self.manager, self.store, _token = acquire_run(self.repo, "TASK-01", "run-1")
+        self.task_lock = self.manager.current_lock("TASK-01")
+
+    def record_integration(self) -> None:
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.integration_result(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload=IntegrationResult(
+                    outcome="merged",
+                    status="completed",
+                    reason="",
+                    branch="worker/TASK-01",
+                    candidate_head="a" * 40,
+                    refreshed_head="b" * 40,
+                    main_before="c" * 40,
+                    main_after="b" * 40,
+                ).to_payload(),
+            )
+        )
+
+    def completer(
+        self,
+        source: MutableTaskSource,
+        *,
+        mode: str = "adapter",
+    ) -> TaskSourceCompleter:
+        return TaskSourceCompleter(
+            source=source,
+            task_source_config=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                activate_command="activate {task_id}",
+                complete_command=(
+                    "complete {task_id} --run {run_id}" if mode == "adapter" else None
+                ),
+                reset_command="reset {task_id}",
+            ),
+            mode=mode,
+            lock_manager=self.manager,
+            task_lock=self.task_lock,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+
+    def settler(
+        self,
+        source: MutableTaskSource,
+        *,
+        park: bool = True,
+        max_attempts: int = 3,
+        runtime_context: MappingProxyType | None = None,
+    ) -> TaskSourceSettler:
+        return TaskSourceSettler(
+            source=source,
+            task_source_config=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                activate_command="activate {task_id}",
+                reset_command="reset {task_id}",
+                park_command="park {task_id}" if park else None,
+                runnable_statuses=("ready",),
+            ),
+            lock_manager=self.manager,
+            task_lock=self.task_lock,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            runtime_context=dict(runtime_context or {}),
+            max_attempts=max_attempts,
+            backoff_seconds=0,
+        )
+
+    def test_completion_requires_durable_integration_before_adapter(self) -> None:
+        source = MutableTaskSource()
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "durable completed integration_result"
+        ):
+            self.completer(source).complete()
+
+        self.assertEqual(source.complete_calls, 0)
+        self.assertEqual(self.store.read_records(), [])
+
+    def test_completion_rejects_completed_report_before_provenance(self) -> None:
+        self.record_integration()
+        self.store.append_result(
+            RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="completed",
+                exit_code=0,
+                log_path=self.repo / "run.log",
+                start_main="a" * 40,
+                end_main="b" * 40,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "cannot precede task provenance"
+        ):
+            self.completer(MutableTaskSource()).complete()
+
+    def test_adapter_completion_records_order_and_recovers_without_duplicate(
+        self,
+    ) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        completer = self.completer(source)
+
+        first = completer.complete()
+        second = completer.complete()
+
+        self.assertEqual(first.confirmed_status, "done")
+        self.assertEqual(first, second)
+        self.assertEqual(source.complete_calls, 1)
+        record_types = [record["record_type"] for record in self.store.read_records()]
+        self.assertLess(
+            record_types.index("integration_result"),
+            record_types.index("task_provenance_committed"),
+        )
+
+    def test_loopyard_style_adapter_enforces_transition_evidence_end_to_end(
+        self,
+    ) -> None:
+        self.record_integration()
+        state_path = self.repo / "loopyard-state.json"
+        script_path = self.repo / "loopyard-adapter.py"
+        state_path.write_text(
+            json.dumps({"status": "active", "commits": []}), encoding="utf-8"
+        )
+        script_path.write_text(
+            "import json, pathlib, sys\n"
+            f"state_path = pathlib.Path({str(state_path)!r})\n"
+            "state = json.loads(state_path.read_text())\n"
+            "if sys.argv[1] == 'complete':\n"
+            "    if not state['commits']:\n"
+            "        raise SystemExit(3)\n"
+            "    state['status'] = 'done'\n"
+            "    state_path.write_text(json.dumps(state))\n"
+            "print(json.dumps({'id': sys.argv[2], 'title': 'Task', "
+            "'status': state['status']}))\n",
+            encoding="utf-8",
+        )
+        command_prefix = (
+            f"{shlex.quote(sys.executable)} {shlex.quote(str(script_path))}"
+        )
+        config = TaskSourceConfig(
+            type="command",
+            list_command=f"{command_prefix} probe TASK-01",
+            probe_command=f"{command_prefix} probe {{task_id}}",
+            activate_command=f"{command_prefix} activate {{task_id}}",
+            complete_command=f"{command_prefix} complete {{task_id}} --run {{run_id}}",
+            reset_command=f"{command_prefix} reset {{task_id}}",
+        )
+        source = CommandTaskSource(self.repo, config)
+        completer = TaskSourceCompleter(
+            source=source,
+            task_source_config=config,
+            mode="adapter",
+            lock_manager=self.manager,
+            task_lock=self.task_lock,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "task_source.complete failed"
+        ):
+            completer.complete()
+
+        state_path.write_text(
+            json.dumps({"status": "active", "commits": ["a" * 40]}),
+            encoding="utf-8",
+        )
+        result = completer.complete()
+
+        self.assertEqual(result.confirmed_status, "done")
+        self.assertEqual(
+            json.loads(state_path.read_text(encoding="utf-8"))["status"],
+            "done",
+        )
+
+    def test_crash_after_external_transition_is_probe_confirmed(self) -> None:
+        self.record_integration()
+        source = MutableTaskSource("done")
+
+        result = self.completer(source).complete()
+
+        self.assertTrue(result.recovered)
+        self.assertEqual(source.complete_calls, 0)
+
+    def test_idempotent_completion_revalidates_exact_lock_generation(self) -> None:
+        self.record_integration()
+        completer = self.completer(MutableTaskSource())
+        completer.complete()
+        self.manager.release(self.task_lock)
+        replacement = self.manager.acquire(
+            "TASK-01",
+            "run-1",
+            metadata=run_lock_metadata(self.repo, "TASK-01", "run-1"),
+        )
+        self.assertNotEqual(
+            replacement.metadata["fencing_token"],
+            self.task_lock.metadata["fencing_token"],
+        )
+
+        with self.assertRaises(LockFencingMismatch):
+            completer.complete()
+
+    def test_external_confirmed_path_fails_closed_while_source_is_active(self) -> None:
+        self.record_integration()
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "does not confirm completion"
+        ):
+            self.completer(
+                MutableTaskSource("active"), mode="external-confirmed"
+            ).complete()
+
+        self.assertNotIn(
+            "task_provenance_committed",
+            [record["record_type"] for record in self.store.read_records()],
+        )
+
+    def test_requeue_and_park_settlement_confirm_authoritative_status(self) -> None:
+        source = MutableTaskSource()
+
+        parked = self.settler(source).settle("park")
+
+        self.assertTrue(parked.settled)
+        self.assertEqual(parked.confirmed_status, "on-hold")
+        self.assertEqual(source.park_calls, 1)
+        self.assertEqual(source.reset_calls, 0)
+
+    def test_requeue_receives_dynamic_fenced_runtime_context(self) -> None:
+        source = MutableTaskSource()
+        context = MappingProxyType(
+            {
+                "VIBE_LOOP_RUN_ID": "run-1",
+                "VIBE_LOOP_FENCING_TOKEN": "dynamic-generation",
+            }
+        )
+
+        result = self.settler(source, runtime_context=context).settle("requeue")
+
+        self.assertTrue(result.settled)
+        self.assertEqual(source.reset_context, dict(context))
+
+    def test_missing_park_adapter_records_requeue_fallback(self) -> None:
+        source = MutableTaskSource()
+
+        result = self.settler(source, park=False).settle("park")
+
+        self.assertTrue(result.settled)
+        self.assertEqual(result.intent, "park")
+        self.assertTrue(result.fallback_to_requeue)
+        self.assertEqual(source.reset_calls, 1)
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "task_source_settled")
+        self.assertTrue(record["fallback_to_requeue"])
+
+    def test_idempotent_settlement_revalidates_exact_lock_generation(self) -> None:
+        settler = self.settler(MutableTaskSource())
+        settler.settle("park")
+        self.manager.release(self.task_lock)
+        replacement = self.manager.acquire(
+            "TASK-01",
+            "run-1",
+            metadata=run_lock_metadata(self.repo, "TASK-01", "run-1"),
+        )
+        self.assertNotEqual(
+            replacement.metadata["fencing_token"],
+            self.task_lock.metadata["fencing_token"],
+        )
+
+        with self.assertRaises(LockFencingMismatch):
+            settler.settle("park")
+
+    def test_unconfirmed_settlement_retains_lock_until_fenced_recovery(self) -> None:
+        source = MutableTaskSource()
+        source.reset_status = "active"
+
+        pending = self.settler(source, max_attempts=2).settle("requeue")
+
+        self.assertTrue(pending.settlement_pending)
+        self.assertTrue(self.manager.is_locked("TASK-01"))
+        attempted = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "task_source_settlement_attempted"
+        ]
+        self.assertEqual(len(attempted), 2)
+        self.assertNotIn(
+            "task_source_settled",
+            [record["record_type"] for record in self.store.read_records()],
+        )
+
+        source.reset_status = "ready"
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "cannot release before the durable run result"
+        ):
+            self.settler(source).recover_and_release("requeue")
+        self.assertTrue(self.manager.is_locked("TASK-01"))
+
+        self.store.append_result(
+            RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="failed",
+                exit_code=1,
+                log_path=self.repo / "run.log",
+                start_main="a" * 40,
+                end_main="a" * 40,
+            )
+        )
+        recovered = self.settler(source).recover_and_release("requeue")
+
+        self.assertTrue(recovered.settled)
+        self.assertTrue(recovered.recovered)
+        self.assertFalse(self.manager.is_locked("TASK-01"))
+        record_types = [record["record_type"] for record in self.store.read_records()]
+        self.assertLess(
+            record_types.index("task_source_settled"),
+            len(record_types) - 1,
+        )
+        self.assertEqual(record_types[-1], "lock_released")
 
 
 class ReviewRouterTests(unittest.TestCase):

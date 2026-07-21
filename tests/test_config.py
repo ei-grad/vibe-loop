@@ -1365,6 +1365,34 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsNone(config.task_source.activate_command)
 
+    def test_task_source_completion_and_park_hooks_are_explicit_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "command"\n'
+                'list = "tracker list"\n'
+                'complete = "tracker complete {task_id} --run {run_id}"\n'
+                'park = "tracker park {task_id} --run {run_id}"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(
+            config.task_source.complete_command,
+            "tracker complete {task_id} --run {run_id}",
+        )
+        self.assertEqual(
+            config.task_source.park_command,
+            "tracker park {task_id} --run {run_id}",
+        )
+        self.assertEqual(
+            config.task_source.explicit_source_keys,
+            ("complete", "list", "park", "type"),
+        )
+        self.assertFalse(config.task_source.allows_generated_cache)
+
     def test_task_source_reset_hook_defaults_to_none(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1488,6 +1516,8 @@ class ConfigTests(unittest.TestCase):
             {"type": "command"},
             {"parser": {"list": "tracker list --json"}},
             {"task_source": {"probe": "tracker show {task_id} --json"}},
+            {"task_source": {"complete": "tracker complete {task_id}"}},
+            {"task_source": {"park": "tracker park {task_id}"}},
             {"locks": {"type": "command"}},
             {"lock_backend": {"acquire_command": "lock acquire"}},
             {"profile": {"status_command": "lock status"}},

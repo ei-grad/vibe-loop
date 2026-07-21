@@ -1802,6 +1802,103 @@ class StaleLockTests(unittest.TestCase):
         self.assertEqual(stale[0].stale_reason, "result_recorded")
         self.assertEqual(stale[0].settled_outcome, "completed")
 
+    def test_generic_cleanup_refuses_task_source_settlement_pending_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.task_source_settlement_attempted(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    payload={
+                        "intent": "requeue",
+                        "adapter": "task_source.reset",
+                        "retry_ordinal": 1,
+                        "error_class": "unconfirmed_status",
+                    },
+                )
+            )
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            result = clean_stale_locks(stale, manager)
+
+            self.assertEqual(len(stale), 1)
+            self.assertTrue(stale[0].settlement_pending)
+            self.assertEqual(result.cleaned, [])
+            self.assertIn("stage-aware fenced recovery", result.errors[0][1])
+            self.assertTrue(manager.is_locked("TASK-01"))
+
+    def test_generic_cleanup_refuses_activated_runtime_run_before_first_attempt(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=100,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    contract={"mode": "runtime-owned"},
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    transition=StageTransition(
+                        from_stage=None,
+                        to_stage=RunStage.ACTIVATION,
+                        reason="run_contract_resolved",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            result = clean_stale_locks(stale, manager)
+
+            self.assertEqual(len(stale), 1)
+            self.assertTrue(stale[0].settlement_pending)
+            self.assertEqual(result.cleaned, [])
+            self.assertTrue(manager.is_locked("TASK-01"))
+
     def test_collect_does_not_apply_an_unrelated_terminal_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

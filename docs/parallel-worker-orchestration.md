@@ -57,6 +57,12 @@ results are missing or ambiguous.
   confirmation. Activation precedes runtime workspace provisioning/claim and
   worker process creation. Failures release only that task lock, launch nothing,
   and never reset ambiguous project state.
+- Runtime-owned completion and post-activation failure settlement remain
+  project-owned through explicit task-source adapters. `task_source.complete`
+  confirms done only after integration; `task_source.reset` confirms requeue;
+  optional `task_source.park` confirms a held terminal-failure state. Failed or
+  unconfirmed settlement retains the exact task lock for fenced recovery, and
+  generic stale-lock cleanup refuses that settlement-pending generation.
 - Keeping task state in the active task source is a deliberate design choice.
   Agents and humans working without the `vibe-loop` supervisor must be able to
   manage task status through the same project-owned plan, tracker, or adapter.

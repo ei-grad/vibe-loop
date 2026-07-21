@@ -1265,9 +1265,10 @@ lowercase statuses should configure lowercase entries. This keeps an explicit
 allowlist from silently accepting additional status spellings.
 
 Setting any explicit source key — `type`, `plan_path`, `plan_paths`, `profile`,
-`list`, `next`, `probe`, `activate`, `reset` — disables generated cache as the active
-source. Non-source settings such as `runnable_statuses` still override matching
-generated fields without disabling the generated parser.
+`list`, `next`, `probe`, `activate`, `complete`, `reset`, `park` — disables
+generated cache as the active source. Non-source settings such as
+`runnable_statuses` still override matching generated fields without disabling
+the generated parser.
 
 **Command-backed sources** read tasks from an issue tracker or custom tool:
 
@@ -1277,7 +1278,9 @@ type = "command"
 list = "my-task-tool list --json"
 probe = "my-task-tool show {task_id} --json"
 activate = "my-task-tool activate {task_id} --run {run_id} --json"
+complete = "my-task-tool complete {task_id} --run {run_id} --json"
 reset = "my-task-tool reset {task_id}"
+park = "my-task-tool park {task_id} --run {run_id} --json"
 ```
 
 `list` returns a JSON array or `{"tasks":[...]}`. Each task should include `id`,
@@ -1310,6 +1313,16 @@ with no live vibe-loop lock and would never be re-dispatched. When the
 supervisor classifies a run as a limit wall it invokes this hook for the
 affected task so the next cycle can pick it up again. Absent hook, backend
 status is left untouched; a hook that fails is logged and non-fatal.
+
+`complete` and `park` are optional runtime-owned lifecycle adapters. Both accept
+shell-quoted `{task_id}` and `{run_id}` values and return one normalized task
+JSON object. `complete` must confirm a terminal done status after integration;
+`park` must confirm the source's non-runnable held status for terminal failure
+settlement. Runtime-owned adapter completion fails contract validation without
+`complete`, and any runtime-owned activation-capable source fails validation
+without `reset`. A missing `park` uses a recorded reset/requeue fallback.
+Completion and failure settlement run while the exact task lock remains held;
+an unconfirmed settlement retains that lock for stage-aware fenced recovery.
 
 **Spec gates** (read-only diagnostics by default). `doctor` and `specs check`
 report unapproved tasks, stale fingerprints, missing requirement IDs, and
