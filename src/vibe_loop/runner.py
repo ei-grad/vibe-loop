@@ -66,6 +66,11 @@ from vibe_loop.orchestration import (
     RunLifecycleStateMachine,
     RunStage,
     StageFailure,
+    TaskProvenanceResult,
+    TaskSourceCompleter,
+    TaskSourceCompletionError,
+    TaskSourceSettlementResult,
+    TaskSourceSettler,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
     inject_claude_session,
@@ -1709,6 +1714,10 @@ class VibeRunner:
         # and not a completion.
         settled_outcome = "unknown"
         settled_classification = ""
+        runtime_owned = False
+        activated_runtime_owned = False
+        task_source_terminal_confirmed = True
+        durable_run_result_recorded = False
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -1810,6 +1819,13 @@ class VibeRunner:
                     RunStage.FINALIZATION,
                     reason="pre_launch_failure",
                 )
+            if activated_runtime_owned and not task_source_terminal_confirmed:
+                report_status(
+                    "retained task lock after runtime-owned activation failure "
+                    f"for stage-aware task-source settlement: {task.task_id} "
+                    f"run_id={run_id}"
+                )
+                return
             self.lock_manager.release(task_lock)
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
@@ -1827,6 +1843,7 @@ class VibeRunner:
 
         try:
             run_contract = RunContractResolver(self.config).resolve(agent_selection)
+            runtime_owned = run_contract.payload["mode"] == "runtime-owned"
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.run_contract_resolved(
                     run_id=run_id,
@@ -1839,12 +1856,19 @@ class VibeRunner:
                 reason="run_contract_resolved",
             )
             pre_launch_failure_reason = "task_activation_failed"
+            activated_runtime_owned = (
+                runtime_owned
+                and self.source_resolution.task_source.activate_command is not None
+            )
+            task_source_terminal_confirmed = not activated_runtime_owned
             activated_task = self.activate_task_before_launch(
                 task,
                 run_id,
                 command_env,
                 continuation=continuation,
             )
+            activated_runtime_owned = runtime_owned and activated_task is not None
+            task_source_terminal_confirmed = not activated_runtime_owned
         except KeyboardInterrupt:
             finalize_pre_launch_failure(StageFailure.CANCELLED)
             raise
@@ -2020,7 +2044,7 @@ class VibeRunner:
                 active_state.to_lock_metadata(),
             )
 
-        def settle_outcome_and_release() -> None:
+        def settle_outcome_and_release() -> bool:
             # A backend that mirrors run provenance finalizes the run from the
             # lock row it has already stored and discards release-time payloads,
             # so writing the settled outcome onto that row is the only operation
@@ -2028,6 +2052,10 @@ class VibeRunner:
             # the lock: deferring to the enclosing run-until-done child's exit
             # would race the next dispatch.
             nonlocal active_state
+            if runtime_owned and not durable_run_result_recorded:
+                return False
+            if activated_runtime_owned and not task_source_terminal_confirmed:
+                return False
             # Same guard the observation callbacks use: a reader thread that
             # outlives the streaming call would otherwise replace active_state
             # from a pre-publish snapshot and drop the settled outcome.
@@ -2056,12 +2084,13 @@ class VibeRunner:
                         f"for {task.task_id} before lock release: {exc}"
                     )
                 self.lock_manager.release(task_lock)
-                return
+                return True
             self.lock_manager.release_settled(
                 task_lock,
                 metadata,
                 outcome=settled_outcome,
             )
+            return True
 
         def record_agent_observation(observation: AgentRuntimeObservation) -> None:
             nonlocal active_state
@@ -2156,7 +2185,11 @@ class VibeRunner:
                 threshold=self.config.supervision.cross_run_attempt_threshold,
             )
             if circuit_state.open:
-                self._reset_task_source_status(task.task_id)
+                self._reset_task_source_status(
+                    task.task_id,
+                    run_id=run_id,
+                    task_lock=task_lock,
+                )
                 raise AttemptCircuitOpen(circuit_state)
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(
@@ -2492,6 +2525,46 @@ class VibeRunner:
                 output_tail,
                 timed_out=worker_timed_out,
             )
+            if runtime_owned and classification.status == "completed":
+                stage_machine = RunLifecycleStateMachine.from_records(
+                    [
+                        record
+                        for record in self.run_store.read_records()
+                        if record.get("run_id") == run_id
+                        and record.get("task_id") == task.task_id
+                    ],
+                    lambda transition: self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.stage_transition(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            transition=transition,
+                        )
+                    ),
+                )
+                task_provenance = run_contract.payload.get("task_provenance")
+                provenance_mode = (
+                    str(task_provenance.get("mode"))
+                    if isinstance(task_provenance, Mapping)
+                    else ""
+                )
+                try:
+                    self.complete_runtime_task_source(
+                        task_id=task.task_id,
+                        run_id=run_id,
+                        task_lock=task_lock,
+                        runtime_context=command_env,
+                        mode=provenance_mode,
+                        stage_machine=stage_machine,
+                    )
+                except TaskSourceCompletionError as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        exc.code,
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                else:
+                    task_source_terminal_confirmed = True
             usage_phase, usage_work_kind = worker_usage_provenance(worker_report)
             if classification.status == "limit_wall" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
@@ -2509,11 +2582,20 @@ class VibeRunner:
                     RunStage.CLASSIFICATION,
                     reason=classification.source,
                 )
-            else:
+            elif stage_machine.stage is not RunStage.CLASSIFICATION:
                 stage_machine.fail(
                     stage_failure,
                     reason=classification.source,
                 )
+            if runtime_owned and classification.status != "completed":
+                settlement = self.settle_runtime_task_source(
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    task_lock=task_lock,
+                    runtime_context=command_env,
+                    classification=classification.status,
+                )
+                task_source_terminal_confirmed = settlement.settled
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.run_state_transition(
                     run_id=run_id,
@@ -2628,6 +2710,7 @@ class VibeRunner:
                         recovery_intent=recovery_context_payload(next_recovery),
                     )
             self.record_result(result)
+            durable_run_result_recorded = True
             # Only a durable local RunResult may be published externally. Until
             # the append succeeds there is nothing for provenance to agree with,
             # so an append that raises leaves the run settling as unknown.
@@ -2682,7 +2765,7 @@ class VibeRunner:
             raise
         finally:
             try:
-                settle_outcome_and_release()
+                released = settle_outcome_and_release()
             except SettledOutcomeNotPersisted as exc:
                 # No release happened, so no lock_released event may be claimed:
                 # the lock is still held under this run id and fencing token and
@@ -2706,20 +2789,26 @@ class VibeRunner:
                     )
                 )
                 raise
-            self.run_store.append_lifecycle_event(
-                RunLifecycleEvent.lock_event(
-                    LOCK_RELEASED_RECORD_TYPE,
-                    run_id=run_id,
-                    task_id=task.task_id,
-                    lock_kind="task",
-                    lock_path=task_lock.path,
-                    payload={
-                        "started_at": active_state.started_at,
-                        "outcome": settled_outcome,
-                        "classification": settled_classification,
-                    },
+            if not released:
+                report_status(
+                    "retained task lock for stage-aware task-source settlement "
+                    f"recovery: {task.task_id} run_id={run_id}"
                 )
-            )
+            else:
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.lock_event(
+                        LOCK_RELEASED_RECORD_TYPE,
+                        run_id=run_id,
+                        task_id=task.task_id,
+                        lock_kind="task",
+                        lock_path=task_lock.path,
+                        payload={
+                            "started_at": active_state.started_at,
+                            "outcome": settled_outcome,
+                            "classification": settled_classification,
+                        },
+                    )
+                )
 
     def acquire_scheduled_task_lock(
         self,
@@ -2815,6 +2904,83 @@ class VibeRunner:
                 "worker was not launched"
             )
         return confirmed
+
+    def complete_runtime_task_source(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        task_lock: TaskLock,
+        runtime_context: Mapping[str, str],
+        mode: str,
+        stage_machine: RunLifecycleStateMachine,
+    ) -> TaskProvenanceResult:
+        return TaskSourceCompleter(
+            source=self.source,
+            task_source_config=self.source_resolution.task_source,
+            mode=mode,
+            lock_manager=self.lock_manager,
+            task_lock=task_lock,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task_id,
+            runtime_context=self.task_source_runtime_context(
+                task_id=task_id,
+                run_id=run_id,
+                task_lock=task_lock,
+                runtime_context=runtime_context,
+            ),
+            stage_machine=stage_machine,
+        ).complete()
+
+    def settle_runtime_task_source(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        task_lock: TaskLock,
+        runtime_context: Mapping[str, str],
+        classification: str,
+    ) -> TaskSourceSettlementResult:
+        intent = "park" if classification in {"blocked", "failed"} else "requeue"
+        return TaskSourceSettler(
+            source=self.source,
+            task_source_config=self.source_resolution.task_source,
+            lock_manager=self.lock_manager,
+            task_lock=task_lock,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task_id,
+            runtime_context=self.task_source_runtime_context(
+                task_id=task_id,
+                run_id=run_id,
+                task_lock=task_lock,
+                runtime_context=runtime_context,
+            ),
+        ).settle(intent)
+
+    def task_source_runtime_context(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        task_lock: TaskLock,
+        runtime_context: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
+        context = dict(runtime_context or {})
+        context.update(
+            {
+                "VIBE_LOOP_TASK_ID": task_id,
+                "VIBE_LOOP_RUN_ID": run_id,
+                "VIBE_LOOP_REPO": str(self.config.repo),
+            }
+        )
+        fencing_token = fencing_token_value(task_lock.metadata.get("fencing_token"))
+        if fencing_token:
+            context["VIBE_LOOP_FENCING_TOKEN"] = fencing_token
+        else:
+            context.pop("VIBE_LOOP_FENCING_TOKEN", None)
+        return context
 
     def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
         lock_path = (
@@ -3934,7 +4100,11 @@ class VibeRunner:
         # already released (run_task's finally), so the task now sits active in
         # the backend with no live lock and would never be re-dispatched. An
         # operator-configured reset hook returns it to its runnable state.
-        self._reset_task_source_status(result.task_id)
+        if not self._run_uses_runtime_owned_orchestration(result.run_id):
+            self._reset_task_source_status(
+                result.task_id,
+                run_id=result.run_id,
+            )
 
     def _report_worker_timeout(self, result: RunResult) -> None:
         report_status(
@@ -3949,9 +4119,27 @@ class VibeRunner:
         # in the backend with no live lock and would never be re-dispatched. The
         # reset hook returns it to its runnable state, mirroring the limit-wall
         # recovery path.
-        self._reset_task_source_status(result.task_id)
+        if not self._run_uses_runtime_owned_orchestration(result.run_id):
+            self._reset_task_source_status(
+                result.task_id,
+                run_id=result.run_id,
+            )
 
-    def _reset_task_source_status(self, task_id: str) -> None:
+    def _run_uses_runtime_owned_orchestration(self, run_id: str) -> bool:
+        return any(
+            record.get("record_type") == "run_contract_resolved"
+            and record.get("run_id") == run_id
+            and record.get("mode") == "runtime-owned"
+            for record in self.run_store.read_records()
+        )
+
+    def _reset_task_source_status(
+        self,
+        task_id: str,
+        *,
+        run_id: str = "",
+        task_lock: TaskLock | None = None,
+    ) -> None:
         reset_hook = getattr(self.source, "reset", None)
         if reset_hook is None:
             report_status(
@@ -3960,7 +4148,20 @@ class VibeRunner:
             )
             return
         try:
-            reset = reset_hook(task_id)
+            runtime_context: dict[str, str] = {
+                "VIBE_LOOP_TASK_ID": task_id,
+                "VIBE_LOOP_REPO": str(self.config.repo),
+            }
+            if run_id:
+                runtime_context["VIBE_LOOP_RUN_ID"] = run_id
+            if task_lock is not None:
+                runtime_context = self.task_source_runtime_context(
+                    task_id=task_id,
+                    run_id=run_id,
+                    task_lock=task_lock,
+                    runtime_context=runtime_context,
+                )
+            reset = reset_hook(task_id, runtime_context=runtime_context)
         except (subprocess.SubprocessError, OSError) as exc:
             report_status(
                 f"task-source reset hook failed for {task_id}: {exc}; "

@@ -25,9 +25,11 @@ from vibe_loop.config import (
     AgentRoutingRule,
     AgentResolutionError,
     CompletionConfig,
+    OrchestrationConfig,
     SpecDiagnosticsConfig,
     SupervisionConfig,
     SUPERVISION_DEFAULT_MAX_RESTARTS,
+    TaskSourceConfig,
     VibeConfig,
     resolve_task_agent,
     shell_quote,
@@ -39,7 +41,12 @@ from vibe_loop.locks import (
     SettledOutcomeNotPersisted,
 )
 from vibe_loop.processes import read_process_node
-from vibe_loop.orchestration import WorkspaceProvisionError
+from vibe_loop.orchestration import (
+    IntegrationResult,
+    RunLifecycleStateMachine,
+    RunStage,
+    WorkspaceProvisionError,
+)
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
@@ -95,6 +102,7 @@ from vibe_loop.runs import (
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     SETTLED_RUN_OUTCOMES,
     WORKER_REPORT_STATUSES,
+    RunLifecycleEvent,
     RunResult,
     WorkerReport,
     settled_run_outcome,
@@ -127,6 +135,7 @@ class MutableTaskSource:
         self._reset_hook = reset_hook
         self._reset_error = reset_error
         self.reset_calls: list[str] = []
+        self.reset_contexts: list[dict[str, str]] = []
 
     def list_tasks(self) -> list[Task]:
         with self._lock:
@@ -144,9 +153,15 @@ class MutableTaskSource:
             None,
         )
 
-    def reset(self, task_id: str) -> bool:
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: dict[str, str] | None = None,
+    ) -> bool:
         with self._lock:
             self.reset_calls.append(task_id)
+            self.reset_contexts.append(dict(runtime_context or {}))
         if self._reset_error is not None:
             raise self._reset_error
         return self._reset_hook
@@ -6493,6 +6508,62 @@ class StubTaskSource:
         self._dispatched.add(task_id)
 
 
+class RuntimeOwnedTaskSource(StubTaskSource):
+    def __init__(self, task: Task) -> None:
+        super().__init__([task], {task.task_id: task})
+        self.status = "ready"
+        self.complete_context: dict[str, str] = {}
+        self.settlement_context: dict[str, str] = {}
+
+    def probe(self, task_id: str) -> Task:
+        self.probe_calls.append(task_id)
+        return Task(task_id=task_id, title="Task", status=self.status, agent="worker")
+
+    def activate(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        continuation: bool = False,
+        runtime_context: dict[str, str] | None = None,
+    ) -> Task:
+        self.status = "active"
+        self.mark_dispatched(task_id)
+        return self.probe(task_id)
+
+    def complete(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        runtime_context: dict[str, str] | None = None,
+    ) -> Task:
+        self.complete_context = dict(runtime_context or {})
+        self.status = "done"
+        return self.probe(task_id)
+
+    def reset(
+        self,
+        task_id: str,
+        *,
+        runtime_context: dict[str, str] | None = None,
+    ) -> bool:
+        self.settlement_context = dict(runtime_context or {})
+        self.status = "ready"
+        return True
+
+    def park(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        runtime_context: dict[str, str] | None = None,
+    ) -> Task:
+        self.settlement_context = dict(runtime_context or {})
+        self.status = "on-hold"
+        return self.probe(task_id)
+
+
 class SettledOutcomeFinalizationTests(unittest.TestCase):
     """Regression cover for completed runs finalizing as ``unknown``.
 
@@ -6590,6 +6661,79 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
         return fake_run
 
+    def _enable_runtime_owned_task_source(
+        self,
+        runner: VibeRunner,
+        task: Task,
+    ) -> RuntimeOwnedTaskSource:
+        runner.config = dataclasses.replace(
+            runner.config,
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                probe_command="probe {task_id}",
+                activate_command="activate {task_id} {run_id}",
+                complete_command="complete {task_id} {run_id}",
+                reset_command="reset {task_id}",
+                park_command="park {task_id} {run_id}",
+                runnable_statuses=("ready",),
+            ),
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                task_provenance_mode="adapter",
+                explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+            ),
+        )
+        runner._source_resolution = None
+        source = RuntimeOwnedTaskSource(task)
+        runner._source = source
+        return source
+
+    def _record_runtime_integration(
+        self,
+        runner: VibeRunner,
+        run_id: str,
+        task_id: str,
+    ) -> None:
+        records = [
+            record
+            for record in runner.run_store.read_records()
+            if record.get("run_id") == run_id and record.get("task_id") == task_id
+        ]
+        machine = RunLifecycleStateMachine.from_records(
+            records,
+            lambda transition: runner.run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id=run_id,
+                    task_id=task_id,
+                    transition=transition,
+                )
+            ),
+        )
+        for stage in (
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REVIEW,
+            RunStage.INTEGRATION,
+        ):
+            machine.transition(stage, reason="runtime_test_stage")
+        runner.run_store.append_lifecycle_event(
+            RunLifecycleEvent.integration_result(
+                run_id=run_id,
+                task_id=task_id,
+                payload=IntegrationResult(
+                    outcome="merged",
+                    status="completed",
+                    reason="",
+                    branch=f"vibe-loop/{task_id}",
+                    candidate_head="b" * 40,
+                    refreshed_head="b" * 40,
+                    main_before="a" * 40,
+                    main_after="b" * 40,
+                ).to_payload(),
+            )
+        )
+
     def _run_task(self, runner: VibeRunner, task: Task, fake_run) -> RunResult:
         with patch.object(runner, "ensure_spec_execution_gate"):
             with patch("vibe_loop.runner.run_streaming_command", fake_run):
@@ -6611,6 +6755,226 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # The backend that finalizes external run provenance at release
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_runtime_owned_completion_commits_provenance_before_result(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def fake_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                run_id = env["VIBE_LOOP_RUN_ID"]
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                self._record_runtime_integration(runner, run_id, task_id)
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status="completed",
+                    )
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            result = self._run_task(runner, task, fake_run)
+
+            records = runner.run_store.read_records()
+            record_types = [record.get("record_type") for record in records]
+            self.assertEqual(result.classification, "completed")
+            self.assertLess(
+                record_types.index("integration_result"),
+                record_types.index("task_provenance_committed"),
+            )
+            self.assertLess(
+                record_types.index("task_provenance_committed"),
+                record_types.index("run_result"),
+            )
+            self.assertLess(
+                record_types.index("run_result"),
+                record_types.index("lock_released"),
+            )
+            self.assertEqual(source.complete_context["VIBE_LOOP_RUN_ID"], result.run_id)
+            self.assertEqual(source.complete_context["VIBE_LOOP_TASK_ID"], "T-1")
+            release_metadata = next(
+                metadata for kind, metadata in lock_manager.events if kind == "release"
+            )
+            self.assertEqual(
+                source.complete_context["VIBE_LOOP_FENCING_TOKEN"],
+                release_metadata["fencing_token"],
+            )
+
+    def test_runtime_owned_result_append_failure_retains_fenced_lock(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            def fake_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                run_id = env["VIBE_LOOP_RUN_ID"]
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                self._record_runtime_integration(runner, run_id, task_id)
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status="completed",
+                    )
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            with patch.object(
+                runner,
+                "record_result",
+                side_effect=OSError("run journal unavailable"),
+            ):
+                with self.assertRaisesRegex(OSError, "run journal unavailable"):
+                    self._run_task(runner, task, fake_run)
+
+            record_types = [
+                record.get("record_type") for record in runner.run_store.read_records()
+            ]
+            self.assertIn("task_provenance_committed", record_types)
+            self.assertNotIn("run_result", record_types)
+            self.assertNotIn("lock_released", record_types)
+            self.assertTrue(lock_manager.is_locked("T-1"))
+
+    def test_runtime_owned_failure_settles_before_result_and_release(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "blocked"),
+            )
+
+            records = runner.run_store.read_records()
+            record_types = [record.get("record_type") for record in records]
+            self.assertEqual(result.classification, "blocked")
+            self.assertLess(
+                record_types.index("task_source_settled"),
+                record_types.index("run_result"),
+            )
+            self.assertLess(
+                record_types.index("run_result"),
+                record_types.index("lock_released"),
+            )
+            self.assertEqual(source.status, "on-hold")
+            self.assertEqual(
+                source.settlement_context["VIBE_LOOP_RUN_ID"], result.run_id
+            )
+            release_metadata = next(
+                metadata for kind, metadata in lock_manager.events if kind == "release"
+            )
+            self.assertEqual(
+                source.settlement_context["VIBE_LOOP_FENCING_TOKEN"],
+                release_metadata["fencing_token"],
+            )
+
+    def test_runtime_owned_completion_without_integration_parks_as_blocked(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "completed"),
+            )
+
+            record_types = [
+                record.get("record_type") for record in runner.run_store.read_records()
+            ]
+            self.assertEqual(result.classification, "blocked")
+            self.assertIn("durable completed integration_result", result.message)
+            self.assertNotIn("task_provenance_committed", record_types)
+            self.assertLess(
+                record_types.index("task_source_settled"),
+                record_types.index("run_result"),
+            )
+            self.assertEqual(source.status, "on-hold")
+
+    def test_runtime_owned_activation_crash_retains_lock_before_first_attempt(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def crashing_activate(*args, **kwargs):
+                source.status = "active"
+                raise OSError("activation response lost")
+
+            source.activate = crashing_activate  # type: ignore[method-assign]
+
+            with self.assertRaises(TaskActivationError):
+                self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+            records = runner.run_store.read_records()
+            self.assertTrue(lock_manager.is_locked("T-1"))
+            self.assertNotIn(
+                "task_source_settlement_attempted",
+                [record.get("record_type") for record in records],
+            )
+            stale = collect_stale_locks(
+                lock_manager,
+                runner.run_store,
+                current_host=socket.gethostname(),
+                process_exists=lambda pid: False,
+            )
+            clean_result = clean_stale_locks(stale, lock_manager)
+            self.assertEqual(len(stale), 1)
+            self.assertTrue(stale[0].settlement_pending)
+            self.assertEqual(clean_result.cleaned, [])
+            self.assertTrue(lock_manager.is_locked("T-1"))
+
+    def test_runtime_owned_requeue_reset_receives_live_fencing_context(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def timed_out_worker(command, cwd, log, **kwargs):
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGKILL,
+                    timed_out=True,
+                )
+
+            result = self._run_task(runner, task, timed_out_worker)
+
+            release_metadata = next(
+                metadata for kind, metadata in lock_manager.events if kind == "release"
+            )
+            self.assertEqual(result.classification, "timed_out")
+            self.assertEqual(source.status, "ready")
+            self.assertEqual(
+                source.settlement_context["VIBE_LOOP_RUN_ID"], result.run_id
+            )
+            self.assertEqual(source.settlement_context["VIBE_LOOP_TASK_ID"], "T-1")
+            self.assertEqual(
+                source.settlement_context["VIBE_LOOP_FENCING_TOKEN"],
+                release_metadata["fencing_token"],
+            )
 
     def test_first_accepted_report_survives_a_later_differing_report(self) -> None:
         # A worker that files ``completed``, has that report accepted (observed
