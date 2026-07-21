@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -3485,13 +3486,27 @@ DiskCapacityProbe = Callable[[Path], DiskCapacitySample]
 
 
 def statvfs_capacity_probe(path: Path) -> DiskCapacitySample:
-    stat = os.statvfs(path)
+    # ``os.statvfs`` exposes inode accounting but is POSIX-only. On platforms
+    # without it (Windows), fall back to the portable ``shutil.disk_usage`` for
+    # byte capacity and mark inodes as not accounted (``total_inodes == 0``), so
+    # the OS-independent cycle keeps checking free space instead of aborting.
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is not None:
+        stat = statvfs(path)
+        return DiskCapacitySample(
+            path=str(path),
+            total_bytes=stat.f_frsize * stat.f_blocks,
+            free_bytes=stat.f_frsize * stat.f_bavail,
+            total_inodes=stat.f_files,
+            free_inodes=stat.f_favail,
+        )
+    usage = shutil.disk_usage(path)
     return DiskCapacitySample(
         path=str(path),
-        total_bytes=stat.f_frsize * stat.f_blocks,
-        free_bytes=stat.f_frsize * stat.f_bavail,
-        total_inodes=stat.f_files,
-        free_inodes=stat.f_favail,
+        total_bytes=usage.total,
+        free_bytes=usage.free,
+        total_inodes=0,
+        free_inodes=0,
     )
 
 

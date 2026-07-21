@@ -6466,6 +6466,24 @@ class DiskHealthCheckTests(unittest.TestCase):
         self.assertGreater(sample.total_bytes, 0)
         self.assertGreaterEqual(sample.free_bytes, 0)
 
+    def test_default_probe_falls_back_when_statvfs_unavailable(self) -> None:
+        # Simulate a platform without os.statvfs (e.g. Windows): the probe must
+        # still report byte capacity via the portable shutil.disk_usage and mark
+        # inodes N/A rather than raising AttributeError and aborting the cycle.
+        # shutil.disk_usage itself routes through os.statvfs on POSIX, so it is
+        # stubbed here to stand in for the Windows byte-capacity backend.
+        usage = mock.Mock(total=100 * GIB, free=50 * GIB)
+        with (
+            mock.patch.object(os, "statvfs", None),
+            mock.patch("vibe_loop.autopilot.shutil.disk_usage", return_value=usage),
+        ):
+            sample = statvfs_capacity_probe(Path("/whatever"))
+
+        self.assertEqual(sample.total_bytes, 100 * GIB)
+        self.assertEqual(sample.free_bytes, 50 * GIB)
+        self.assertEqual(sample.total_inodes, 0)
+        self.assertEqual(sample.free_inodes_fraction, 1.0)
+
 
 class DiskHealthCycleTests(unittest.TestCase):
     def _disk_records(self, config) -> list[dict[str, object]]:
