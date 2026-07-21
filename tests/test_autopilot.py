@@ -16,7 +16,24 @@ from pathlib import Path
 from unittest import mock
 
 from vibe_loop.autopilot import (
+    AUTOPILOT_DISK_CAPACITY_BLOCKER,
+    DISK_HEALTH_CRITICAL,
+    DISK_HEALTH_OK,
     AutopilotCycleResult,
+    CYCLE_SUMMARY_BOOTSTRAP,
+    CYCLE_SUMMARY_LANDED,
+    CYCLE_SUMMARY_UNAVAILABLE,
+    CYCLE_SUMMARY_UNCHANGED,
+    DiskCapacitySample,
+    DiskHealthCycleResult,
+    LANDED_SUMMARY_MAX_COMMITS,
+    LandedCommit,
+    disk_health_thresholds_for,
+    git_landed_commits,
+    latest_cycle_main_ref,
+    run_cycle_summary,
+    run_disk_health,
+    statvfs_capacity_probe,
     AutopilotTerminationRequested,
     CycleSummary,
     IdleWaitResult,
@@ -41,6 +58,7 @@ from vibe_loop.autopilot import (
     PLANNING_UNPRODUCTIVE_OUTCOMES,
     classify_planning_outcome,
     planning_outcome_backoff,
+    planning_outcome_record,
     planning_provider_launched,
     planning_source_fingerprint,
     NativePlanningWorkerInterrupted,
@@ -96,6 +114,8 @@ from vibe_loop.locks import (
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
+    AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
@@ -4677,6 +4697,115 @@ class AutopilotIdleWaitTests(unittest.TestCase):
 
 
 class NativePlanningTests(unittest.TestCase):
+    def test_mixed_command_providers_override_unavailable_usage_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            claude_stub = repo / "claude"
+            claude_stub.write_text(
+                "#!/usr/bin/env python3\n"
+                'print(\'\'\'{"should_plan":true,"reason":"queue low",'
+                '"objective":"add one task"}\'\'\')\n',
+                encoding="utf-8",
+            )
+            claude_stub.chmod(0o755)
+            base_config = load_config(repo)
+            config = dataclasses.replace(
+                base_config,
+                agent=dataclasses.replace(
+                    base_config.agent,
+                    command="codex exec -m openai-model {prompt}",
+                    analysis_command=(
+                        f"{claude_stub} -p --model claude-model {{prompt}}"
+                    ),
+                    agent_kind="auto",
+                ),
+            )
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
+                on_start(4242)
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-mixed-provider",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                worker_launcher=worker_launcher,
+            )
+            run_store.append_record(
+                planning_outcome_record(
+                    repo,
+                    cycle_id="cycle-mixed-provider",
+                    outcome="zero_created",
+                    fingerprint="fingerprint",
+                    runnable_before=result.worker.runnable_before,
+                    runnable_after=result.worker.runnable_after,
+                    model_provider=result.model_provider,
+                    model_id=result.model_id,
+                    stats=result.stats,
+                )
+            )
+            persisted = run_store.read_records()[-1]
+
+        self.assertEqual(result.model_provider, "mixed")
+        self.assertEqual(result.model_id, "mixed")
+        self.assertEqual(persisted["model_provider"], "mixed")
+        self.assertEqual(persisted["model_id"], "mixed")
+
+    def test_explicit_worker_model_persists_in_planning_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "codex exec -m gpt-explicit {prompt}"\n',
+                encoding="utf-8",
+            )
+            config = load_config(repo)
+            status = collect_project_status(config)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
+                self.assertIn("-m gpt-explicit", command)
+                on_start(4242)
+                return NativePlanningProcessResult(exit_code=0, pid=4242)
+
+            result = run_native_planning(
+                config,
+                cycle_id="cycle-model",
+                status=status,
+                min_ready=2,
+                run_store=run_store,
+                analysis_runner=lambda prompt, output_path: {
+                    "should_plan": True,
+                    "reason": "queue is below target",
+                    "objective": "add one task",
+                },
+                worker_launcher=worker_launcher,
+            )
+            run_store.append_record(
+                planning_outcome_record(
+                    repo,
+                    cycle_id="cycle-model",
+                    outcome="zero_created",
+                    fingerprint="fingerprint",
+                    runnable_before=result.worker.runnable_before,
+                    runnable_after=result.worker.runnable_after,
+                    model_provider=result.model_provider,
+                    model_id=result.model_id,
+                    stats=result.stats,
+                )
+            )
+            persisted = run_store.read_records()[-1]
+
+        self.assertEqual(result.model_provider, "openai")
+        self.assertEqual(result.model_id, "gpt-explicit")
+        self.assertEqual(persisted["model_provider"], "openai")
+        self.assertEqual(persisted["model_id"], "gpt-explicit")
+
     def test_read_only_no_plan_decision_journals_skipped_worker_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -6223,6 +6352,515 @@ def planning_launch_records(
         }
         for seconds_ago, cycle_id in entries
     ]
+
+
+GIB = 1024 * 1024 * 1024
+
+
+def _capacity_probe(
+    *,
+    total_bytes: int,
+    free_bytes: int,
+    total_inodes: int = 1_000_000,
+    free_inodes: int = 800_000,
+):
+    def probe(path: Path) -> DiskCapacitySample:
+        return DiskCapacitySample(
+            path=str(path),
+            total_bytes=total_bytes,
+            free_bytes=free_bytes,
+            total_inodes=total_inodes,
+            free_inodes=free_inodes,
+        )
+
+    return probe
+
+
+def _failing_probe(path: Path) -> DiskCapacitySample:
+    raise OSError("statvfs failed")
+
+
+class DiskHealthCheckTests(unittest.TestCase):
+    def _run(self, probe) -> DiskHealthCycleResult:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            return run_disk_health(config, cycle_id="c1", probe=probe)
+
+    def test_healthy_disk_reports_ok_without_blocker(self) -> None:
+        result = self._run(_capacity_probe(total_bytes=100 * GIB, free_bytes=50 * GIB))
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+        self.assertEqual(result.blocker, "")
+        self.assertEqual([target.label for target in result.targets], ["repo", "state"])
+        self.assertTrue(all(not target.critical for target in result.targets))
+
+    def test_exhausted_free_space_is_a_blocker(self) -> None:
+        result = self._run(
+            _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_CRITICAL)
+        self.assertEqual(result.blocker, AUTOPILOT_DISK_CAPACITY_BLOCKER)
+        self.assertIn("free_bytes", result.targets[0].pressure)
+
+    def test_small_disk_low_on_bytes_but_roomy_is_not_a_blocker(self) -> None:
+        # 400 MiB free is below the absolute floor but is 39% of a 1 GiB disk:
+        # proportionally roomy, so not a genuine exhaustion signal.
+        result = self._run(
+            _capacity_probe(total_bytes=GIB, free_bytes=400 * 1024 * 1024)
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+
+    def test_huge_disk_low_percentage_but_ample_bytes_is_not_a_blocker(self) -> None:
+        # Below 2% free but still 1 GiB available on a 100 TiB volume.
+        result = self._run(
+            _capacity_probe(total_bytes=100 * 1024 * GIB, free_bytes=GIB)
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+
+    def test_exhausted_inodes_is_a_blocker(self) -> None:
+        result = self._run(
+            _capacity_probe(
+                total_bytes=100 * GIB,
+                free_bytes=50 * GIB,
+                total_inodes=1_000_000,
+                free_inodes=5_000,
+            )
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_CRITICAL)
+        self.assertIn("free_inodes", result.targets[0].pressure)
+
+    def test_filesystem_without_inode_accounting_ignores_inode_pressure(self) -> None:
+        result = self._run(
+            _capacity_probe(
+                total_bytes=100 * GIB,
+                free_bytes=50 * GIB,
+                total_inodes=0,
+                free_inodes=0,
+            )
+        )
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+
+    def test_probe_error_is_a_non_blocking_observation(self) -> None:
+        result = self._run(_failing_probe)
+
+        self.assertEqual(result.status, DISK_HEALTH_OK)
+        self.assertEqual(result.blocker, "")
+        self.assertEqual(result.probe_errors, 2)
+        self.assertTrue(all(target.sample is None for target in result.targets))
+        self.assertTrue(all(target.error for target in result.targets))
+
+    def test_record_mirrors_maintenance_shape(self) -> None:
+        result = self._run(
+            _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
+        )
+        record = result.to_record(Path("/repo"))
+
+        self.assertEqual(record["record_type"], AUTOPILOT_DISK_HEALTH_RECORD_TYPE)
+        self.assertEqual(record["status"], DISK_HEALTH_CRITICAL)
+        self.assertEqual(record["blocker"], AUTOPILOT_DISK_CAPACITY_BLOCKER)
+        self.assertEqual(record["repo"], "/repo")
+        self.assertEqual(record["cycle_id"], "c1")
+        self.assertIn("thresholds", record)
+        self.assertEqual(len(record["targets"]), 2)
+
+    def _run_with_toml(self, probe, extra_toml: str) -> DiskHealthCycleResult:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=extra_toml,
+            )
+            config = load_config(repo)
+            return run_disk_health(config, cycle_id="c1", probe=probe)
+
+    def test_configured_reserve_blocks_sample_that_default_allows(self) -> None:
+        # 3.4 GiB free on a 242 GiB volume clears the native 512 MiB floor, so
+        # the default cycle records ok. An 8 GiB project reserve turns the same
+        # sample into a genuine capacity blocker (matches the task evidence).
+        sample = _capacity_probe(total_bytes=242 * GIB, free_bytes=int(3.4 * GIB))
+
+        default_result = self._run(sample)
+        self.assertEqual(default_result.status, DISK_HEALTH_OK)
+
+        configured_result = self._run_with_toml(
+            sample,
+            "[autopilot.disk_reserve]\nmin_free_bytes = 8589934592\n",
+        )
+        self.assertEqual(configured_result.status, DISK_HEALTH_CRITICAL)
+        self.assertEqual(configured_result.blocker, AUTOPILOT_DISK_CAPACITY_BLOCKER)
+        self.assertIn("free_bytes", configured_result.targets[0].pressure)
+        record = configured_result.to_record(Path("/repo"))
+        self.assertEqual(record["thresholds"]["min_free_bytes"], 8589934592)
+
+    def test_configured_thresholds_resolve_defaults_for_unset_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[autopilot.disk_reserve]\nmin_free_bytes = 8589934592\n",
+            )
+            thresholds = disk_health_thresholds_for(load_config(repo))
+
+        self.assertEqual(thresholds.min_free_bytes, 8589934592)
+        # Unset axes keep the reviewed AUTO-15 defaults.
+        self.assertEqual(thresholds.min_free_fraction, 0.02)
+        self.assertEqual(thresholds.min_free_inodes, 10_000)
+        self.assertEqual(thresholds.min_free_inode_fraction, 0.02)
+
+    def test_default_probe_reads_real_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sample = statvfs_capacity_probe(Path(directory))
+
+        self.assertGreater(sample.total_bytes, 0)
+        self.assertGreaterEqual(sample.free_bytes, 0)
+
+    def test_default_probe_falls_back_when_statvfs_unavailable(self) -> None:
+        # Simulate a platform without os.statvfs (e.g. Windows): the probe must
+        # still report byte capacity via the portable shutil.disk_usage and mark
+        # inodes N/A rather than raising AttributeError and aborting the cycle.
+        # shutil.disk_usage itself routes through os.statvfs on POSIX, so it is
+        # stubbed here to stand in for the Windows byte-capacity backend.
+        usage = mock.Mock(total=100 * GIB, free=50 * GIB)
+        with (
+            mock.patch.object(os, "statvfs", None, create=True),
+            mock.patch("vibe_loop.autopilot.shutil.disk_usage", return_value=usage),
+        ):
+            sample = statvfs_capacity_probe(Path("/whatever"))
+
+        self.assertEqual(sample.total_bytes, 100 * GIB)
+        self.assertEqual(sample.free_bytes, 50 * GIB)
+        self.assertEqual(sample.total_inodes, 0)
+        self.assertEqual(sample.free_inodes_fraction, 1.0)
+
+
+class DiskHealthCycleTests(unittest.TestCase):
+    def _disk_records(self, config) -> list[dict[str, object]]:
+        records = RunStore(config.state_path / "runs.jsonl").read_records()
+        return [
+            record
+            for record in records
+            if record["record_type"] == AUTOPILOT_DISK_HEALTH_RECORD_TYPE
+        ]
+
+    def _runner(self, probe):
+        def runner(config, *, cycle_id):
+            return run_disk_health(config, cycle_id=cycle_id, probe=probe)
+
+        return runner
+
+    def test_capacity_blocker_withholds_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                disk_health_runner=self._runner(
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
+                ),
+            )
+            disk_records = self._disk_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertIn(AUTOPILOT_DISK_CAPACITY_BLOCKER, cycle.blockers)
+        self.assertIn(f"disk_health:{DISK_HEALTH_CRITICAL}", cycle.actions)
+        self.assertEqual(len(launched), 0)
+        self.assertEqual(len(disk_records), 1)
+        self.assertEqual(disk_records[0]["status"], DISK_HEALTH_CRITICAL)
+
+    def test_healthy_disk_records_observation_and_allows_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                disk_health_runner=self._runner(
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=50 * GIB)
+                ),
+            )
+            disk_records = self._disk_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertNotIn(AUTOPILOT_DISK_CAPACITY_BLOCKER, cycle.blockers)
+        self.assertIn(f"disk_health:{DISK_HEALTH_OK}", cycle.actions)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(len(disk_records), 1)
+        self.assertEqual(disk_records[0]["status"], DISK_HEALTH_OK)
+
+
+class CycleSummaryUnitTests(unittest.TestCase):
+    def _config(self, repo: Path):
+        configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+        return load_config(repo)
+
+    def test_bootstrap_when_no_prior_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+
+            def git_landed(*a, **k):  # pragma: no cover - must not be called
+                raise AssertionError("bootstrap must not walk history")
+
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref=None,
+                current_main_ref="deadbeef",
+                git_landed=git_landed,
+            )
+
+        self.assertTrue(result.bootstrap)
+        self.assertEqual(result.status, CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertEqual(result.commit_count, 0)
+        self.assertEqual(result.action, "cycle_summary:bootstrap:0")
+
+    def test_bootstrap_wins_over_unresolvable_current_ref_on_first_cycle(self) -> None:
+        # First cycle (no prior recorded ref) where the current main ref also
+        # cannot be resolved: the acceptance ties bootstrap to the absence of a
+        # prior ref, so it must record bootstrap rather than unavailable.
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref=None,
+                current_main_ref="",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertTrue(result.bootstrap)
+        self.assertEqual(result.error, "")
+
+    def test_prior_cycle_with_empty_ref_is_unavailable_not_bootstrap(self) -> None:
+        # A prior cycle exists but recorded no resolved endpoint (git was
+        # unavailable then). With the current ref now resolved, the span cannot
+        # be derived, so this is unavailable, not a mislabeled bootstrap.
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c2",
+                prior_main_ref="",
+                current_main_ref="new",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNAVAILABLE)
+        self.assertFalse(result.bootstrap)
+        self.assertEqual(result.error, "prior_main_ref_unavailable")
+
+    def test_unavailable_when_current_ref_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="cafe",
+                current_main_ref="",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNAVAILABLE)
+        self.assertEqual(result.error, "main_ref_unavailable")
+
+    def test_unchanged_when_refs_equal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="samesha",
+                current_main_ref="samesha",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNCHANGED)
+        self.assertEqual(result.commit_count, 0)
+
+    def test_landed_records_bounded_commit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            captured: dict[str, object] = {}
+
+            def git_landed(repo, *, since_ref, until_ref, max_commits):
+                captured.update(
+                    since_ref=since_ref, until_ref=until_ref, max_commits=max_commits
+                )
+                return (
+                    (LandedCommit("abc123", "add thing"),),
+                    False,
+                    "",
+                )
+
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="old",
+                current_main_ref="new",
+                git_landed=git_landed,
+            )
+
+        self.assertEqual(captured["since_ref"], "old")
+        self.assertEqual(captured["until_ref"], "new")
+        self.assertEqual(captured["max_commits"], LANDED_SUMMARY_MAX_COMMITS)
+        self.assertEqual(result.status, CYCLE_SUMMARY_LANDED)
+        self.assertEqual(result.action, "cycle_summary:landed:1")
+        record = result.to_record(config.repo)
+        self.assertEqual(record["record_type"], AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE)
+        self.assertEqual(record["since_ref"], "old")
+        self.assertEqual(record["until_ref"], "new")
+        self.assertEqual(
+            record["commits"], [{"commit": "abc123", "subject": "add thing"}]
+        )
+
+    def test_truncation_marks_action_and_bounds_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="old",
+                current_main_ref="new",
+                git_landed=lambda *a, **k: (
+                    (LandedCommit("a", "x"), LandedCommit("b", "y")),
+                    True,
+                    "",
+                ),
+            )
+
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.action, "cycle_summary:landed:2+")
+
+    def test_git_error_records_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="rewritten",
+                current_main_ref="new",
+                git_landed=lambda *a, **k: ((), False, "fatal: bad revision"),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNAVAILABLE)
+        self.assertEqual(result.error, "fatal: bad revision")
+
+    def test_default_probe_reads_real_commits_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            run(repo, "git", "add", "f.txt")
+            run(repo, "git", "commit", "-m", "base")
+            base = git_text(repo, "rev-parse", "HEAD")
+            for index in range(3):
+                (repo / "f.txt").write_text(f"line {index}\n", encoding="utf-8")
+                run(repo, "git", "commit", "-am", f"change {index}")
+            head = git_text(repo, "rev-parse", "HEAD")
+
+            commits, truncated, error = git_landed_commits(
+                repo, since_ref=base, until_ref=head, max_commits=2
+            )
+
+        self.assertEqual(error, "")
+        self.assertTrue(truncated)
+        self.assertEqual(len(commits), 2)
+        # Newest first.
+        self.assertEqual(commits[0].subject, "change 2")
+
+
+class CycleSummaryCycleTests(unittest.TestCase):
+    def _summary_records(self, config) -> list[dict[str, object]]:
+        return [
+            record
+            for record in RunStore(config.state_path / "runs.jsonl").read_records()
+            if record["record_type"] == AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE
+        ]
+
+    def test_first_cycle_records_bootstrap_without_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 0,
+            )
+            records = self._summary_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertIn("cycle_summary:bootstrap:0", cycle.actions)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertTrue(records[0]["bootstrap"])
+
+    def test_second_cycle_summarizes_commits_landed_since_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            calls: list[int] = []
+
+            def launcher(*a, **k):
+                # Land a distinct commit on main only on the first dispatch, so
+                # the second cycle sees exactly one commit landed since cycle 1.
+                calls.append(1)
+                if len(calls) == 1:
+                    (repo / "landed.txt").write_text("done\n", encoding="utf-8")
+                    run(repo, "git", "add", "landed.txt")
+                    run(repo, "git", "commit", "-m", "land the slice")
+                return 0
+
+            summary = run_autopilot(
+                config,
+                once=False,
+                max_cycles=2,
+                interval=0,
+                launcher=launcher,
+            )
+            records = self._summary_records(config)
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["status"], CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertEqual(records[1]["status"], CYCLE_SUMMARY_LANDED)
+        self.assertEqual(records[1]["commit_count"], 1)
+        self.assertEqual(records[1]["commits"][0]["subject"], "land the slice")
+        self.assertIn("cycle_summary:landed:1", summary.cycles[1].actions)
+
+    def test_latest_cycle_main_ref_reads_prior_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self.assertIsNone(latest_cycle_main_ref(run_store))
+
+            run_autopilot(config, once=True, launcher=lambda *a, **k: 0)
+            head = git_text(repo, "rev-parse", "--verify", "refs/heads/main")
+
+            self.assertEqual(latest_cycle_main_ref(run_store), head)
 
 
 class PlanningSourceFingerprintTests(unittest.TestCase):

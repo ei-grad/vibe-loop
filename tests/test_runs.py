@@ -40,6 +40,29 @@ from vibe_loop.runs import (
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_run_result_exposes_public_model_and_effort_aliases(self) -> None:
+        result = RunResult(
+            run_id="run-effort",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("run.log"),
+            start_main="abc",
+            end_main="def",
+            model_id="gpt-5.4",
+            model_id_source="command_arg:-m",
+            reasoning_effort="high",
+            reasoning_effort_source="command_config:model_reasoning_effort",
+        )
+
+        payload = result.to_json()
+
+        self.assertEqual(payload["model"], "gpt-5.4")
+        self.assertEqual(payload["effort"], "high")
+        self.assertEqual(
+            payload["effort_source"], "command_config:model_reasoning_effort"
+        )
+
     def test_run_result_json_uses_stable_finished_at(self) -> None:
         result = RunResult(
             run_id="run-1",
@@ -59,6 +82,98 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(first["session_id_source"], "fallback:run_id")
         self.assertEqual(first["started_at"], "2026-05-09T00:00:00+00:00")
         self.assertEqual(first["finished_at"], second["finished_at"])
+
+    def test_run_result_stats_round_trip_and_redact_sensitive_fields(self) -> None:
+        result = RunResult(
+            run_id="run-usage",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+            stats={
+                "schema_version": 1,
+                "phase": "implementation",
+                "usage_source": "native:codex:turn.completed",
+                "usage_version": "codex-jsonl-v1",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "provider_usage": {
+                    "input_tokens": 12,
+                    "reasoning_output_tokens": 2,
+                    "prompt": "PROMPT CANARY",
+                },
+                "prompt": "PROMPT CANARY",
+                "credential": "sk-secret-canary",
+                "token": "TOKEN CANARY",
+                "fencing_token": "FENCING CANARY",
+                "raw_transcript": "TRANSCRIPT CANARY",
+                "candidate_fingerprint": "sk-secret-canary",
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            RunStore(path).append_result(result)
+            payload = RunStore(path).read_records()[0]
+
+        self.assertEqual(
+            payload["stats"],
+            {
+                "schema_version": 1,
+                "phase": "implementation",
+                "usage_source": "native:codex:turn.completed",
+                "usage_version": "codex-jsonl-v1",
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "provider_usage": {
+                    "input_tokens": 12,
+                    "reasoning_output_tokens": 2,
+                },
+            },
+        )
+        encoded = json.dumps(payload)
+        self.assertNotIn("PROMPT CANARY", encoded)
+        self.assertNotIn("sk-secret", encoded)
+        self.assertNotIn("TOKEN CANARY", encoded)
+        self.assertNotIn("FENCING CANARY", encoded)
+        self.assertNotIn("TRANSCRIPT CANARY", encoded)
+
+    def test_run_result_stats_reject_malformed_provenance_values(self) -> None:
+        result = RunResult(
+            run_id="run-malformed-usage",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("/tmp/run.log"),
+            start_main="aaa",
+            end_main="bbb",
+            stats={
+                "phase": {"prompt": "PROMPT CANARY"},
+                "work_kind": ["review", "TRANSCRIPT CANARY"],
+                "provider": {"credential": "sk-secret-canary"},
+                "usage_source": ["native:provider"],
+                "candidate_fingerprint": ["FENCING CANARY"],
+                "provider_usage": {"input_tokens": 7, "secret": "TOKEN CANARY"},
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            RunStore(path).append_result(result)
+            payload = RunStore(path).read_records()[0]
+
+        self.assertEqual(payload["stats"], {"provider_usage": {"input_tokens": 7}})
+        encoded = json.dumps(payload)
+        for canary in (
+            "PROMPT CANARY",
+            "TRANSCRIPT CANARY",
+            "sk-secret-canary",
+            "FENCING CANARY",
+            "TOKEN CANARY",
+        ):
+            self.assertNotIn(canary, encoded)
 
     def test_run_result_json_can_store_native_session_id(self) -> None:
         result = RunResult(
@@ -284,6 +399,53 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["details"]["expected_token"], "<redacted>")
         self.assertEqual(payload["details"]["nested"]["actual_token"], "<redacted>")
         self.assertEqual(payload["details"]["lock_path"], "/safe/lock/path")
+
+    def test_worker_report_redacts_active_token_from_unlabelled_fields(self) -> None:
+        token = "report-generation-7"
+        report = WorkerReport(
+            run_id="run-1",
+            task_id="TASK-01",
+            status="blocked",
+            message=f"backend returned {token}",
+            metadata={
+                "detail": f"VIBE_LOOP_FENCING_TOKEN={token}",
+                "substring": "report-generation-",
+                "unrelated": "report-generation-70",
+            },
+            fencing_token=token,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+
+            RunStore(path).append_report(report)
+
+            raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+
+        self.assertNotIn(f'"{token}"', raw)
+        self.assertEqual(payload["message"], "backend returned <redacted>")
+        self.assertEqual(
+            payload["metadata"]["detail"],
+            "VIBE_LOOP_FENCING_TOKEN=<redacted>",
+        )
+        self.assertEqual(payload["metadata"]["substring"], "report-generation-")
+        self.assertEqual(payload["metadata"]["unrelated"], "report-generation-70")
+
+    def test_worker_report_preserves_legacy_positional_reported_at(self) -> None:
+        reported_at = "2026-05-09T00:00:30+00:00"
+
+        report = WorkerReport(
+            "run-1",
+            "TASK-01",
+            "blocked",
+            "abc123",
+            "waiting",
+            {"reason": "external"},
+            reported_at,
+        )
+
+        self.assertEqual(report.reported_at, reported_at)
+        self.assertEqual(report.fencing_token, "")
 
     def test_run_started_event_writes_trailer_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -386,13 +386,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["session_id_source"], "native:stdout")
         self.assertEqual(payload["agent_command_source"], "auto:codex")
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
-        self.assertEqual(payload["agent_kind"], "auto")
+        self.assertEqual(payload["agent_kind"], "codex")
         self.assertEqual(payload["agent_prompt_dialect"], "codex")
         self.assertEqual(payload["agent_prompt_dialect_source"], "auto:codex")
         self.assertEqual(payload["agent_skill_ref_prefix"], "$")
         self.assertEqual(run_result["session_id"], "codex-native-123")
         self.assertEqual(run_result["session_id_source"], "native:stdout")
         self.assertEqual(run_result["agent_prompt_dialect"], "codex")
+        self.assertEqual(run_result["trailer_context"]["agent_kind"], "codex")
+        self.assertEqual(
+            run_result["trailer_context_sources"]["agent_kind"], "auto:codex"
+        )
         self.assertEqual(run_result["started_at"], run_started["started_at"])
         self.assertEqual(run_result["model_provider"], "openai")
         self.assertEqual(run_result["model_id"], "gpt-5.5")
@@ -442,7 +446,8 @@ class CliTests(unittest.TestCase):
         )
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
-        self.assertIn("$vibe-loop TASK-01", agent_lines[1])
+        self.assertEqual(agent_lines[1], "--json")
+        self.assertIn("$vibe-loop TASK-01", agent_lines[2])
         self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
         self.assertIn("agent prompt dialect source: auto:codex", stderr.getvalue())
@@ -475,6 +480,8 @@ class CliTests(unittest.TestCase):
                 "    'task_id': os.environ['VIBE_LOOP_TASK_ID'],\n"
                 "    'repo': os.environ['VIBE_LOOP_REPO'],\n"
                 "    'log': os.environ['VIBE_LOOP_LOG'],\n"
+                "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
+                "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
                 "}\n"
                 "Path('agent-env.json').write_text(\n"
                 "    json.dumps(env_payload),\n"
@@ -512,6 +519,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(env_payload["task_id"], "TASK-01")
         self.assertEqual(env_payload["repo"], str(repo))
         self.assertEqual(env_payload["log"], payload["log"])
+        self.assertEqual(env_payload["agent_kind"], payload["agent_kind"])
+        self.assertEqual(env_payload["agent_kind"], "codex")
+        self.assertEqual(env_payload["agent_profile"], "")
+        self.assertEqual(payload["trailer_context"]["agent_kind"], "codex")
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
 
     def test_install_skills_are_cli_agnostic(self) -> None:
@@ -574,10 +585,12 @@ class CliTests(unittest.TestCase):
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
 
         task_activation = CLI_WORKER_ADDENDUM.index("### Task Activation")
+        headless_completion = CLI_WORKER_ADDENDUM.index("### Headless Completion")
         workspace_claim = CLI_WORKER_ADDENDUM.index("### Workspace Claim")
         worker_reports = CLI_WORKER_ADDENDUM.index("### Worker Reports")
         integration_locking = CLI_WORKER_ADDENDUM.index("### Integration Locking")
-        self.assertLess(task_activation, workspace_claim)
+        self.assertLess(task_activation, headless_completion)
+        self.assertLess(headless_completion, workspace_claim)
         self.assertLess(workspace_claim, worker_reports)
         self.assertLess(worker_reports, integration_locking)
 
@@ -591,8 +604,14 @@ class CliTests(unittest.TestCase):
             CLI_WORKER_ADDENDUM,
         )
         self.assertIn("vibe-loop worker claim-workspace", CLI_WORKER_ADDENDUM)
-        self.assertIn("--branch <branch-name>", CLI_WORKER_ADDENDUM)
-        self.assertIn("--worktree <absolute-worktree-path>", CLI_WORKER_ADDENDUM)
+        self.assertIn('--branch "$(git branch --show-current)"', CLI_WORKER_ADDENDUM)
+        self.assertIn(
+            '--worktree "$(git rev-parse --show-toplevel)"', CLI_WORKER_ADDENDUM
+        )
+        self.assertIn("single literal\narguments", CLI_WORKER_ADDENDUM)
+        self.assertIn("Agent/Task/Workflow", CLI_WORKER_ADDENDUM)
+        self.assertIn("await or collect every result", CLI_WORKER_ADDENDUM)
+        self.assertIn("returning a progress summary", CLI_WORKER_ADDENDUM)
         self.assertRegex(
             CLI_WORKER_ADDENDUM,
             r"claim fails with an owner mismatch[\s\S]*report the run as blocked",
@@ -624,6 +643,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("vibe-loop main-integration release", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_RUN_ID", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_TASK_ID", CLI_WORKER_ADDENDUM)
+        self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", CLI_WORKER_ADDENDUM)
+        self.assertIn("Never print or echo its value", CLI_WORKER_ADDENDUM)
 
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -638,7 +659,7 @@ class CliTests(unittest.TestCase):
                 bin_dir / "claude",
                 "from pathlib import Path\n"
                 "import sys\n"
-                "if sys.argv[1] != '-p':\n"
+                "if '-p' not in sys.argv[1:]:\n"
                 "    raise SystemExit(64)\n"
                 "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
                 "plan = Path('docs/PLAN.md')\n"
@@ -663,12 +684,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
         agent_lines = agent_args.split("\n")
-        self.assertEqual(agent_lines[0], "-p")
+        self.assertEqual(
+            agent_lines[:3], ["--output-format", "stream-json", "--verbose"]
+        )
         # AUTO-20: a known --session-id is injected before the prompt so the run
         # records the agent's real session id instead of aliasing the run_id.
-        self.assertEqual(agent_lines[1], "--session-id")
-        self.assertRegex(agent_lines[2], r"^[0-9a-fA-F-]{36}$")
-        self.assertEqual(payload["session_id"], agent_lines[2])
+        self.assertEqual(agent_lines[4], "--session-id")
+        self.assertRegex(agent_lines[5], r"^[0-9a-fA-F-]{36}$")
+        self.assertEqual(payload["session_id"], agent_lines[5])
         self.assertEqual(payload["session_id_source"], "observed")
         self.assertIn("/vibe-loop TASK-01", agent_args)
         self.assertIn("vibe-loop CLI Coordination", agent_args)
@@ -696,9 +719,15 @@ class CliTests(unittest.TestCase):
             write_python_executable(
                 bin_dir / "claude",
                 "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
                 "import sys\n"
                 "Path('agent-args.txt').write_text("
                 "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "Path('agent-env.json').write_text(json.dumps({\n"
+                "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
+                "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
+                "}), encoding='utf-8')\n"
                 "print('resumed out')\n",
             )
             task = Task(task_id="TASK-01", title="Task 1", status="Next", order=1)
@@ -720,8 +749,11 @@ class CliTests(unittest.TestCase):
                 config = load_config(repo)
                 runner = VibeRunner(config)
                 runner._source = _StubSource()
-                runner.run_task(task, recovery=recovery)
+                resumed_result = runner.run_task(task, recovery=recovery)
                 resumed = (repo / "agent-args.txt").read_text(encoding="utf-8")
+                resumed_env = json.loads(
+                    (repo / "agent-env.json").read_text(encoding="utf-8")
+                )
 
                 # A second, non-resumable run (resume disabled) must fall back to
                 # a fresh --session-id with the from-scratch recovery brief.
@@ -734,8 +766,11 @@ class CliTests(unittest.TestCase):
                     ),
                 )
                 runner._source = _StubSource()
-                runner.run_task(task, recovery=recovery)
+                fresh_result = runner.run_task(task, recovery=recovery)
                 fresh = (repo / "agent-args.txt").read_text(encoding="utf-8")
+                fresh_env = json.loads(
+                    (repo / "agent-env.json").read_text(encoding="utf-8")
+                )
 
         # Resume path: --resume <prior session id>, no fresh --session-id, and the
         # short continuation nudge (not the from-scratch recovery brief).
@@ -743,12 +778,16 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("--session-id", resumed)
         self.assertIn("Continue this run (resumed session)", resumed)
         self.assertNotIn("Investigate what the previous session did", resumed)
+        self.assertEqual(resumed_env, {"agent_kind": "claude", "agent_profile": ""})
+        self.assertEqual(resumed_result.agent_kind, resumed_env["agent_kind"])
         # Fallback path: fresh --session-id and the from-scratch recovery brief.
         self.assertIn("--session-id", fresh)
         self.assertNotIn("--resume", fresh)
         self.assertIn("Investigate what the previous session did", fresh)
+        self.assertEqual(fresh_env, resumed_env)
+        self.assertEqual(fresh_result.agent_kind, fresh_env["agent_kind"])
 
-    def test_run_task_routes_worker_command_per_task_profile(self) -> None:
+    def test_run_task_exports_routed_profile_to_worker_environment(self) -> None:
         from vibe_loop.config import load_config
         from vibe_loop.runner import VibeRunner
         from vibe_loop.tasks import Task
@@ -762,9 +801,15 @@ class CliTests(unittest.TestCase):
 
         record_and_exit = (
             "from pathlib import Path\n"
+            "import json\n"
+            "import os\n"
             "import sys\n"
             "Path('{name}-args.txt').write_text("
             "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+            "Path('{name}-env.json').write_text(json.dumps({{\n"
+            "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
+            "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
+            "}}), encoding='utf-8')\n"
             "print('{name} out')\n"
         )
 
@@ -803,28 +848,53 @@ class CliTests(unittest.TestCase):
             general_task = Task(
                 task_id="GEN-01", title="General", status="Next", order=1
             )
-            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PATH": str(bin_dir),
+                    "VIBE_LOOP_AGENT_KIND": "ambient-wrong-kind",
+                    "VIBE_LOOP_AGENT_PROFILE": "ambient-wrong-profile",
+                },
+            ):
                 config = load_config(repo)
                 runner = VibeRunner(config)
                 runner._source = _StubSource()
-                runner.run_task(security_task)
+                routed_result = runner.run_task(security_task)
                 routed_run = (repo / "claude-args.txt").exists()
                 routed_args = (repo / "claude-args.txt").read_text(encoding="utf-8")
+                routed_env = json.loads(
+                    (repo / "claude-env.json").read_text(encoding="utf-8")
+                )
                 routed_ran_codex = (repo / "codex-args.txt").exists()
 
                 (repo / "claude-args.txt").unlink()
                 runner._source = _StubSource()
-                runner.run_task(general_task)
+                default_result = runner.run_task(general_task)
                 default_ran_codex = (repo / "codex-args.txt").exists()
+                default_env = json.loads(
+                    (repo / "codex-env.json").read_text(encoding="utf-8")
+                )
                 default_ran_claude = (repo / "claude-args.txt").exists()
 
         # The abi-hazard task is dispatched to the claude profile, not codex.
         self.assertTrue(routed_run)
         self.assertIn("--model\nopus", routed_args)
         self.assertFalse(routed_ran_codex)
+        self.assertEqual(
+            routed_env,
+            {"agent_kind": "claude", "agent_profile": "claude-opus"},
+        )
+        self.assertEqual(routed_result.agent_kind, routed_env["agent_kind"])
+        self.assertEqual(
+            routed_result.trailer_context["agent_profile"],
+            routed_env["agent_profile"],
+        )
         # The unmatched task falls back to the default codex agent.
         self.assertTrue(default_ran_codex)
         self.assertFalse(default_ran_claude)
+        self.assertEqual(default_env, {"agent_kind": "codex", "agent_profile": ""})
+        self.assertEqual(default_result.agent_kind, default_env["agent_kind"])
+        self.assertNotIn("agent_profile", default_result.trailer_context)
 
     def test_run_next_records_observed_claude_session_and_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1064,7 +1134,8 @@ class CliTests(unittest.TestCase):
         )
         agent_lines = agent_args.split("\n")
         self.assertEqual(agent_lines[0], "exec")
-        self.assertIn("$vibe-loop TASK-01", agent_lines[1])
+        self.assertEqual(agent_lines[1], "--json")
+        self.assertIn("$vibe-loop TASK-01", agent_lines[2])
         self.assertIn("vibe-loop CLI Coordination", agent_args)
         self.assertIn("agent command source: auto:codex:codex-first", stderr.getvalue())
         self.assertIn(
@@ -1916,6 +1987,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent"]["skill_ref_prefix"], "$")
         self.assertEqual(payload["agent"]["detected"]["available"], ["codex"])
 
+    def test_doctor_reports_configured_model_and_effort_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(bin_dir / "codex", "raise SystemExit(0)\n")
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nkind = "codex"\nmodel = "gpt-5.4"\neffort = "high"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(["doctor", "--repo", str(repo)])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["agent"]["model"], "gpt-5.4")
+        self.assertEqual(payload["agent"]["model_source"], "explicit")
+        self.assertEqual(payload["agent"]["effort"], "high")
+        self.assertEqual(payload["agent"]["effort_source"], "explicit")
+
     def test_doctor_reports_codex_first_policy_with_both_agents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -2047,6 +2145,40 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["locks"]["acquire_command_configured"])
         self.assertEqual(payload["completion"]["commands_configured"], 1)
         self.assertTrue(payload["completion"]["commands_redacted"])
+
+    def test_doctor_exposes_configured_disk_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot.disk_reserve]\n"
+                "min_free_bytes = 8589934592\n"
+                "min_free_fraction = 0.05\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        reserve = payload["autopilot"]["disk_reserve"]
+        self.assertEqual(reserve["min_free_bytes"], 8589934592)
+        self.assertEqual(reserve["min_free_fraction"], 0.05)
+        self.assertIsNone(reserve["min_free_inodes"])
+        self.assertEqual(
+            sorted(reserve["explicit_keys"]),
+            ["min_free_bytes", "min_free_fraction"],
+        )
+        # Effective floors surface the values actually enforced, including the
+        # native defaults substituted for unset overrides.
+        self.assertEqual(reserve["effective"]["min_free_bytes"], 8589934592)
+        self.assertEqual(reserve["effective"]["min_free_fraction"], 0.05)
+        self.assertEqual(reserve["effective"]["min_free_inodes"], 10000)
+        self.assertEqual(reserve["effective"]["min_free_inode_fraction"], 0.02)
 
     def test_doctor_reports_spec_diagnostics_without_running_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4364,6 +4496,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["metadata"]["owner"], "run-1")
         self.assertNotIn(expected_token, rendered)
         self.assertNotIn(actual_token, rendered)
+
+    def test_report_redacts_active_token_from_message_metadata_and_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            task_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata={
+                    "record_type": "active_run",
+                    "schema_version": 1,
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "pid": os.getpid(),
+                    "worker_pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "started_at": "2026-05-09T00:00:00+00:00",
+                },
+            )
+            token = str(task_lock.metadata["fencing_token"])
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        [
+                            "report",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-1",
+                            "--task-id",
+                            "TASK-01",
+                            "--status",
+                            "blocked",
+                            "--message",
+                            f"worker printed token={token}",
+                            "--metadata-json",
+                            json.dumps(
+                                {
+                                    "ordinary": f"active token {token}",
+                                    "identifier": "TASK-01",
+                                }
+                            ),
+                        ]
+                    )
+
+            stored = (repo / ".vibe-loop" / "runs.jsonl").read_text(encoding="utf-8")
+            payload = json.loads(stdout.getvalue())
+            stored_payload = json.loads(stored)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["message"], "worker printed token=<redacted>")
+        self.assertEqual(payload["metadata"]["ordinary"], "active token <redacted>")
+        self.assertEqual(payload["metadata"]["identifier"], "TASK-01")
+        self.assertEqual(stored_payload["message"], payload["message"])
+        self.assertEqual(stored_payload["metadata"], payload["metadata"])
 
     def test_report_resolves_head_commit_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

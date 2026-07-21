@@ -421,6 +421,7 @@ def configure_generated_task_source(
         command_template,
         prompt=prompt,
         model=config.agent.model,
+        effort=config.agent.effort,
     )
     cmd, use_shell = prepare_shell_command(command_str)
     try:

@@ -15,6 +15,10 @@ from vibe_loop.config import (
     DEFAULT_RUNNABLE_STATUSES,
     TaskSourceConfig,
 )
+from vibe_loop.locks import (
+    fencing_token_value,
+    redact_exact_fencing_token,
+)
 
 
 DONE_STATUS = "Done"
@@ -2276,18 +2280,24 @@ def run_json_command(
     # is handled identically to a nonzero exit by every caller's fail-safe path.
     environment = os.environ.copy()
     environment.update(runtime_context or {})
-    result = subprocess.run(
-        command,
-        cwd=repo,
-        shell=True,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-        env=environment,
-    )
-    return json.loads(result.stdout)
+    fencing_token = fencing_token_value(environment.get("VIBE_LOOP_FENCING_TOKEN"))
+    try:
+        result = subprocess.run(
+            command,
+            cwd=repo,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            env=environment,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        redact_task_source_subprocess_error(exc, fencing_token)
+        raise
+    payload = json.loads(result.stdout)
+    return redact_exact_fencing_token(payload, fencing_token)
 
 
 def run_reset_command(
@@ -2304,17 +2314,31 @@ def run_reset_command(
     # caller's non-fatal handler already covers.
     environment = os.environ.copy()
     environment.update(runtime_context or {})
-    subprocess.run(
-        command,
-        cwd=repo,
-        shell=True,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout,
-        env=environment,
-    )
+    fencing_token = fencing_token_value(environment.get("VIBE_LOOP_FENCING_TOKEN"))
+    try:
+        subprocess.run(
+            command,
+            cwd=repo,
+            shell=True,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            env=environment,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        redact_task_source_subprocess_error(exc, fencing_token)
+        raise
+
+
+def redact_task_source_subprocess_error(
+    error: subprocess.CalledProcessError | subprocess.TimeoutExpired,
+    fencing_token: str,
+) -> None:
+    error.cmd = redact_exact_fencing_token(error.cmd, fencing_token)
+    error.output = redact_exact_fencing_token(error.output, fencing_token)
+    error.stderr = redact_exact_fencing_token(error.stderr, fencing_token)
 
 
 def task_from_mapping(value: object, order: int) -> Task:

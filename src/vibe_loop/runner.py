@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
@@ -21,6 +21,7 @@ from typing import BinaryIO, TextIO
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
+    AgentConfig,
     AgentDetection,
     AgentResolutionError,
     VibeConfig,
@@ -43,11 +44,19 @@ from vibe_loop.generated_discovery import (
     redact_manifest_text,
 )
 from vibe_loop.locks import (
+    LockBackendError,
     LockBusy,
+    LockFencingMismatch,
     LockManager,
+    LockOwnerMismatch,
+    SettledOutcomeNotPersisted,
     TaskLock,
+    FENCING_TOKEN_REDACTION,
     build_lock_manager,
     fencing_token_value,
+    redact_exact_fencing_token,
+    redact_fencing_token_payload,
+    redact_fencing_token_text,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
@@ -61,16 +70,27 @@ from vibe_loop.retry import (
 from vibe_loop.runs import (
     LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
+    LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
+    UNKNOWN_RUN_OUTCOME,
     WorkerReport,
+    settled_run_outcome,
     utc_now_iso,
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
+from vibe_loop.telemetry import (
+    PHASES,
+    WORK_KINDS,
+    ProviderUsage,
+    ProviderUsageObserver,
+    parse_claude_transcript_usage,
+    unavailable_usage,
+)
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
@@ -98,17 +118,47 @@ except ImportError:  # pragma: no cover
 
 
 SESSION_ID_RE = re.compile(
-    r"\bsession(?:[_ -]?id)\s*[:=]\s*"
+    r"\b(?:session|thread)(?:[_ -]?id)[\"']?\s*[:=]\s*[\"']?"
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
 AGENT_CONTEXT_RE = re.compile(
     r"\b(?P<key>model(?:[_ -]?(?:provider|id))?|provider|"
-    r"reasoning[_ -]?effort)\s*[:=]\s*"
+    r"reasoning[_ -]?effort|effort)\s*[:=]\s*"
     r"(?P<value>\"[^\"]+\"|'[^']+'|[^\s,;]+)",
     re.IGNORECASE,
 )
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+# A bare top-level string `model` value is only a model identity inside these
+# structured lifecycle events. Any other JSON object carrying a `model` key
+# (tool payloads, task records, nested agent envelopes) is generic data.
+MODEL_IDENTITY_EVENT_TYPES = frozenset(
+    {
+        "assistant",
+        "init",
+        "result",
+        "session.created",
+        "session.start",
+        "session_configured",
+        "system",
+        "thread.started",
+        "turn.completed",
+        "turn.started",
+    }
+)
+# Higher rank wins when two observations disagree about the same field. Command
+# arguments are explicit operator intent; structured native events outrank both
+# free-text log scraping and executable-name inference.
+AGENT_CONTEXT_SOURCE_RANKS = (
+    ("command_arg:", 40),
+    ("command_config:", 35),
+    ("native:", 30),
+    ("command_executable:", 10),
+)
+# Free-text log scraping (`native:stdout:model`) is weaker than a structured
+# native event (`native:stdout:json.model`) even though both are native.
+AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK = 20
+CLAUDE_MODEL_ALIASES = frozenset({"haiku", "opus", "sonnet"})
 AGENT_CONTEXT_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$")
 SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 REASONING_EFFORT_VALUES = frozenset({"minimal", "low", "medium", "high", "xhigh"})
@@ -137,7 +187,20 @@ SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS = 20
 SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS = 20
 SPEC_WORKER_CONTEXT_LINE_CONTEXT = 3
 
-CLI_WORKER_ADDENDUM = """\
+FENCING_TOKEN_NONDISCLOSURE = """\
+VIBE_LOOP_FENCING_TOKEN is a secret. Never print or echo its value, include it
+in a prompt, report, command argument, tool payload, log, or summary, or expose
+it by any other means. Use it only through the environment for the lock
+protocol commands that require it."""
+
+CURRENT_RUN_WORKSPACE_CLAIM_COMMAND = (
+    'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\\n'
+    '  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\\n'
+    '  --branch "$(git branch --show-current)" \\\n'
+    '  --worktree "$(git rev-parse --show-toplevel)"'
+)
+
+CLI_WORKER_ADDENDUM = f"""\
 
 ## vibe-loop CLI Coordination
 
@@ -149,6 +212,8 @@ environment variables identify this run:
 - VIBE_LOOP_LOG - path to the run log file
 - VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
 
+{FENCING_TOKEN_NONDISCLOSURE}
+
 ### Task Activation
 
 For command-backed task sources, the supervisor acquired this run's exact task
@@ -158,22 +223,32 @@ activation is project task-source state; it is not a worker report and does not
 complete the task. If repository evidence contradicts that confirmed state,
 stop before workspace mutation and report the run as blocked.
 
+### Headless Completion
+
+A headless worker must not end its turn while any asynchronous
+Agent/Task/Workflow subagent, gate, build, test, or other worker-started
+operation remains in flight. Before returning, await or collect every result,
+then finish review, integration, and reporting, or explicitly report the run as
+blocked or failed. Launching background work and returning a progress summary
+is not terminal completion.
+
 ### Workspace Claim
 
 After creating or choosing your task branch/worktree, and before implementation
-edits, attach that workspace to the active task lock:
+edits, verify its real branch and absolute path. Run this command from inside
+that verified worktree to attach it to the active task lock:
 
 ```bash
-vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\
-  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
-  --branch <branch-name> --worktree <absolute-worktree-path>
+{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}
 ```
 
-Use the real branch name and absolute worktree path, not the placeholders. If
-the claim fails with an owner mismatch, missing active task lock, mismatched
-branch/worktree, or unsafe workspace diagnostic, stop mutating repository state
-and report the run as blocked through the worker report protocol. Workspace
-claims are advisory visibility metadata only; they do not permit deleting,
+The quoted Git-derived values keep branch names and paths as single literal
+arguments. If the claim fails with an owner mismatch, missing active task lock,
+mismatched branch/worktree, or unsafe workspace diagnostic, stop mutating
+repository state and report the run as blocked through the worker report
+protocol.
+Workspace claims are advisory visibility metadata only;
+they do not permit deleting,
 resetting, cleaning, merging, or stealing another worker's branch/worktree.
 
 ### Worker Reports
@@ -290,27 +365,64 @@ class AgentRuntimeContext:
             ),
         )
 
-    def missing_delta(self, candidate: AgentRuntimeContext) -> AgentRuntimeContext:
+    def prefer(self, other: AgentRuntimeContext) -> AgentRuntimeContext:
+        """Merge `other` over self, but only where `other` is at least as
+        authoritative. Prevents a weak stream observation from overwriting an
+        explicit command-line or structured model identity."""
+        provider, provider_source = pick_agent_context_field(
+            self.model_provider,
+            self.model_provider_source,
+            other.model_provider,
+            other.model_provider_source,
+        )
+        model_id, model_id_source = pick_agent_model_field(
+            self.model_id,
+            self.model_id_source,
+            other.model_id,
+            other.model_id_source,
+            current_provider=self.model_provider,
+        )
+        effort, effort_source = pick_agent_context_field(
+            self.reasoning_effort,
+            self.reasoning_effort_source,
+            other.reasoning_effort,
+            other.reasoning_effort_source,
+        )
         return AgentRuntimeContext(
-            model_provider=candidate.model_provider if not self.model_provider else "",
+            model_provider=provider,
+            model_provider_source=provider_source,
+            model_id=model_id,
+            model_id_source=model_id_source,
+            reasoning_effort=effort,
+            reasoning_effort_source=effort_source,
+        )
+
+    def missing_delta(self, candidate: AgentRuntimeContext) -> AgentRuntimeContext:
+        """Fields `candidate` contributes that self does not already hold at an
+        equal-or-stronger source rank."""
+        merged = self.prefer(candidate)
+        provider_changed = (
+            merged.model_provider,
+            merged.model_provider_source,
+        ) != (self.model_provider, self.model_provider_source)
+        model_changed = (merged.model_id, merged.model_id_source) != (
+            self.model_id,
+            self.model_id_source,
+        )
+        effort_changed = (
+            merged.reasoning_effort,
+            merged.reasoning_effort_source,
+        ) != (self.reasoning_effort, self.reasoning_effort_source)
+        return AgentRuntimeContext(
+            model_provider=(merged.model_provider if provider_changed else ""),
             model_provider_source=(
-                candidate.model_provider_source
-                if candidate.model_provider and not self.model_provider
-                else ""
+                merged.model_provider_source if provider_changed else ""
             ),
-            model_id=candidate.model_id if not self.model_id else "",
-            model_id_source=(
-                candidate.model_id_source
-                if candidate.model_id and not self.model_id
-                else ""
-            ),
-            reasoning_effort=(
-                candidate.reasoning_effort if not self.reasoning_effort else ""
-            ),
+            model_id=(merged.model_id if model_changed else ""),
+            model_id_source=(merged.model_id_source if model_changed else ""),
+            reasoning_effort=(merged.reasoning_effort if effort_changed else ""),
             reasoning_effort_source=(
-                candidate.reasoning_effort_source
-                if candidate.reasoning_effort and not self.reasoning_effort
-                else ""
+                merged.reasoning_effort_source if effort_changed else ""
             ),
         )
 
@@ -320,12 +432,25 @@ class AgentRuntimeContext:
             payload["model_provider"] = self.model_provider
             payload["model_provider_source"] = self.model_provider_source
         if self.model_id:
+            payload["model"] = self.model_id
+            payload["model_source"] = self.model_id_source
             payload["model_id"] = self.model_id
             payload["model_id_source"] = self.model_id_source
         if self.reasoning_effort:
+            payload["effort"] = self.reasoning_effort
+            payload["effort_source"] = self.reasoning_effort_source
             payload["reasoning_effort"] = self.reasoning_effort
             payload["reasoning_effort_source"] = self.reasoning_effort_source
         return payload
+
+
+def configured_agent_effort_context(agent: AgentConfig) -> AgentRuntimeContext:
+    if agent.effort is None:
+        return AgentRuntimeContext()
+    return AgentRuntimeContext(
+        reasoning_effort=agent.effort,
+        reasoning_effort_source=f"config:agent.effort:{agent.effort_source}",
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -356,6 +481,11 @@ class StreamingCommandResult:
     # True when the worker exceeded its configured wall-clock timeout and its
     # process group was force-killed rather than exiting on its own.
     timed_out: bool = False
+    usage: ProviderUsage = dataclasses.field(
+        default_factory=lambda: unavailable_usage(
+            "unknown", "provider_usage_not_reported"
+        )
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -419,11 +549,16 @@ class AgentLimitWallError(RuntimeError):
 
 
 class AgentOutputObserver:
-    def __init__(self) -> None:
+    def __init__(self, provider: str = "unknown") -> None:
         self._lock = threading.Lock()
         self._session_observation: SessionIdObservation | None = None
         self._runtime_context = AgentRuntimeContext()
         self._line_count = 0
+        self._usage_observer = ProviderUsageObserver(provider)
+
+    @property
+    def usage(self) -> ProviderUsage:
+        return self._usage_observer.usage
 
     @property
     def observation(self) -> AgentRuntimeObservation:
@@ -447,6 +582,7 @@ class AgentOutputObserver:
         line: str,
         stream_name: str,
     ) -> AgentRuntimeObservation | None:
+        self._usage_observer.observe_line(line)
         session_id = parse_worker_session_id(line)
         runtime_context = AgentRuntimeContext()
         with self._lock:
@@ -491,6 +627,14 @@ class VibeRunner:
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
+        self.last_analysis_usage = unavailable_usage(
+            "unknown", "provider_usage_not_reported"
+        )
+        self.last_analysis_runtime_context = AgentRuntimeContext()
+        # Terminal results recorded by an exhausting recovery run before it
+        # released its lock, keyed by run id and consumed by the recovery
+        # driver so the verdict is written exactly once.
+        self._exhausted_recovery_results: dict[str, RunResult] = {}
 
     @property
     def lock_manager(self) -> LockManager:
@@ -636,6 +780,7 @@ class VibeRunner:
             command_template,
             prompt=prompt,
             model=self.config.agent.model,
+            effort=self.config.agent.effort,
         )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
@@ -682,6 +827,13 @@ class VibeRunner:
             command_template,
             prompt=prompt,
             model=self.config.agent.model,
+            effort=self.config.agent.effort,
+        )
+        command_str = inject_structured_usage_output(
+            command_str, self.config.agent.agent_kind
+        )
+        self.last_analysis_runtime_context = parse_agent_runtime_context_from_command(
+            command_str
         )
         cmd, use_shell = prepare_shell_command(command_str)
         walls: list[LimitWallSignal] = []
@@ -704,6 +856,14 @@ class VibeRunner:
         except (OSError, subprocess.TimeoutExpired) as exc:
             report_status(f"analysis agent failed to start: {exc}")
             return None
+        provider = self.last_analysis_runtime_context.model_provider or {
+            "codex": "openai",
+            "claude": "anthropic",
+        }.get(self.config.agent.agent_kind, "unknown")
+        usage_observer = ProviderUsageObserver(provider)
+        for line in (result.stdout or "").splitlines():
+            usage_observer.observe_line(line)
+        self.last_analysis_usage = usage_observer.usage
         if walls:
             raise AgentLimitWallError(
                 walls[0],
@@ -744,6 +904,7 @@ class VibeRunner:
             command_template,
             prompt=prompt,
             model=self.config.agent.model,
+            effort=self.config.agent.effort,
         )
         cmd, use_shell = prepare_shell_command(command_str)
         try:
@@ -863,6 +1024,12 @@ class VibeRunner:
         agent = agent_selection.config
         agent_profile = agent_selection.profile
         command_template = agent.require_command()
+        agent_kind = agent.executable_kind or agent.agent_kind
+        agent_kind_source = (
+            agent.command_source
+            if agent.agent_kind == "auto" and agent.executable_kind
+            else agent.agent_kind_source
+        )
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
@@ -884,7 +1051,7 @@ class VibeRunner:
         resuming = bool(
             resume_session_id
             and self.config.supervision.resume_unknown_runs
-            and command_supports_session_resume(command_template, agent.agent_kind)
+            and command_supports_session_resume(command_template, agent_kind)
         )
         if resuming:
             # Resume the prior run's captured session so the continuation turn
@@ -898,13 +1065,16 @@ class VibeRunner:
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
-        elif command_supports_session_capture(command_template, agent.agent_kind):
+        elif command_supports_session_capture(command_template, agent_kind):
             injected_session_id = str(uuid.uuid4())
             effective_template = inject_claude_session_id(
                 command_template, injected_session_id
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
+        effective_template = inject_structured_usage_output(
+            effective_template, agent_kind
+        )
         skill_prefix = agent.require_skill_ref_prefix()
         worker_prompt = build_run_worker_prompt(
             skill_prefix,
@@ -918,6 +1088,7 @@ class VibeRunner:
             effective_template,
             prompt=worker_prompt,
             model=agent.model,
+            effort=agent.effort,
             task=task,
             profile=agent_profile,
             task_id=task.task_id,
@@ -928,6 +1099,8 @@ class VibeRunner:
             task_id=task.task_id,
             repo=self.config.repo,
             log_path=log_path,
+            agent_kind=agent_kind,
+            agent_profile=agent_profile,
         )
         claude_home = (
             resolve_claude_home(command, command_env, self.config.repo)
@@ -943,15 +1116,27 @@ class VibeRunner:
             if injected_session_id and claude_home is not None
             else ""
         )
-        command_context = parse_agent_runtime_context_from_command(command)
-        agent_kind = agent.agent_kind
-        agent_kind_source = agent.agent_kind_source
+        transcript_start_offset = 0
+        if resuming and transcript_path:
+            try:
+                transcript_start_offset = Path(transcript_path).stat().st_size
+            except OSError:
+                transcript_start_offset = 0
+        command_context = configured_agent_effort_context(agent).prefer(
+            parse_agent_runtime_context_from_command(command)
+        )
         agent_prompt_dialect = agent.prompt_dialect or ""
         agent_prompt_dialect_source = agent.prompt_dialect_source
         agent_skill_ref_prefix = agent.skill_ref_prefix or ""
         agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
         worker_timed_out = False
+        # Defaults hold for any exit that never reaches a durable RunResult - an
+        # interrupted supervisor, a crash, a pre-classification error, a failed
+        # result append - which is an honestly unknown outcome, not a failure
+        # and not a completion.
+        settled_outcome = "unknown"
+        settled_classification = ""
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -1104,6 +1289,49 @@ class VibeRunner:
                 active_state.to_lock_metadata(),
             )
 
+        def settle_outcome_and_release() -> None:
+            # A backend that mirrors run provenance finalizes the run from the
+            # lock row it has already stored and discards release-time payloads,
+            # so writing the settled outcome onto that row is the only operation
+            # that can settle the run. It runs while this supervisor still owns
+            # the lock: deferring to the enclosing run-until-done child's exit
+            # would race the next dispatch.
+            nonlocal active_state
+            # Same guard the observation callbacks use: a reader thread that
+            # outlives the streaming call would otherwise replace active_state
+            # from a pre-publish snapshot and drop the settled outcome.
+            with observation_lock:
+                active_state = active_state.with_settled_outcome(
+                    settled_outcome,
+                    settled_classification,
+                )
+                metadata = active_state.to_lock_metadata()
+            if settled_outcome == UNKNOWN_RUN_OUTCOME:
+                # Unknown is what a backend records for a run it was told
+                # nothing about, so a failed update loses no information and
+                # must not strand the lock of an interrupted or report-less run.
+                try:
+                    self.lock_manager.update(task_lock, metadata)
+                except (
+                    LockBusy,
+                    LockBackendError,
+                    LockOwnerMismatch,
+                    LockFencingMismatch,
+                    OSError,
+                    ValueError,
+                ) as exc:
+                    report_status(
+                        f"could not publish settled outcome {settled_outcome} "
+                        f"for {task.task_id} before lock release: {exc}"
+                    )
+                self.lock_manager.release(task_lock)
+                return
+            self.lock_manager.release_settled(
+                task_lock,
+                metadata,
+                outcome=settled_outcome,
+            )
+
         def record_agent_observation(observation: AgentRuntimeObservation) -> None:
             nonlocal active_state
             nonlocal observed_output_context
@@ -1122,7 +1350,7 @@ class VibeRunner:
                 ):
                     observed_session_id = observation.session_id
                     observed_session_id_source = observation.session_id_source
-                effective_context = command_context.overlay(observed_output_context)
+                effective_context = command_context.prefer(observed_output_context)
                 context_payload = build_run_context_payload(
                     task_id=task.task_id,
                     run_id=run_id,
@@ -1193,11 +1421,12 @@ class VibeRunner:
                     agent.command_source,
                     agent.selection_command_source,
                     agent.detected,
-                    agent.agent_kind,
+                    agent_kind,
                     agent.prompt_dialect,
                     agent.prompt_dialect_source,
                     agent.skill_ref_prefix,
                     agent.skill_ref_prefix_source,
+                    fencing_token=fencing_token,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"run_id={run_id}", log)
@@ -1225,7 +1454,7 @@ class VibeRunner:
                     f"({agent_selection.source})",
                     log,
                 )
-                report_status(f"agent kind: {agent.agent_kind}", log)
+                report_status(f"agent kind: {agent_kind}", log)
                 report_status(
                     f"agent prompt dialect source: {agent.prompt_dialect_source}",
                     log,
@@ -1303,6 +1532,12 @@ class VibeRunner:
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
                     timeout_seconds=self.config.supervision.worker_timeout_seconds,
+                    provider=(
+                        command_context.model_provider
+                        or {"codex": "openai", "claude": "anthropic"}.get(
+                            agent_kind, "unknown"
+                        )
+                    ),
                 )
                 exit_code = stream_result.exit_code
                 worker_timed_out = stream_result.timed_out
@@ -1320,9 +1555,19 @@ class VibeRunner:
                     session_id_source = (
                         stream_result.session_id_source or "fallback:run_id"
                     )
-                final_runtime_context = command_context.overlay(
+                final_runtime_context = command_context.prefer(
                     stream_result.runtime_context
                 )
+                provider_usage = stream_result.usage
+                if (
+                    not provider_usage.available
+                    and agent_kind in {"auto", "claude"}
+                    and transcript_path
+                ):
+                    provider_usage = parse_claude_transcript_usage(
+                        Path(transcript_path),
+                        start_offset=transcript_start_offset,
+                    )
                 final_context_payload = build_run_context_payload(
                     task_id=task.task_id,
                     run_id=run_id,
@@ -1419,6 +1664,7 @@ class VibeRunner:
                 output_tail,
                 timed_out=worker_timed_out,
             )
+            usage_phase, usage_work_kind = worker_usage_provenance(worker_report)
             if classification.status == "limit_wall" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
                 # its dispatch backoff from the recorded result alone.
@@ -1453,7 +1699,7 @@ class VibeRunner:
                 agent_selection_command_source=agent.selection_command_source,
                 agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
                 agent_default_policy=AGENT_DEFAULT_POLICY,
-                agent_kind=agent.agent_kind,
+                agent_kind=agent_kind,
                 agent_prompt_dialect=agent.prompt_dialect or "",
                 agent_prompt_dialect_source=agent.prompt_dialect_source,
                 agent_skill_ref_prefix=agent.skill_ref_prefix or "",
@@ -1483,15 +1729,72 @@ class VibeRunner:
                 ),
                 restart_count=restart_count,
                 max_restarts=max_restarts,
+                stats=provider_usage.to_stats(
+                    phase=usage_phase,
+                    wall_time_seconds=(
+                        datetime.now(UTC)
+                        - datetime.fromisoformat(
+                            active_state.started_at.replace("Z", "+00:00")
+                        )
+                    ).total_seconds(),
+                    candidate_fingerprint=end_main or start_main,
+                    continuation=continuation,
+                    flexible_provider=provider_selection_is_flexible(agent, task),
+                    changed_lines=git_changed_lines(
+                        self.config.repo, start_main, end_main
+                    ),
+                    work_kind=usage_work_kind,
+                ),
             )
             self.record_result(result)
+            # Only a durable local RunResult may be published externally. Until
+            # the append succeeds there is nothing for provenance to agree with,
+            # so an append that raises leaves the run settling as unknown.
+            settled_classification = classification.status
+            settled_outcome = settled_run_outcome(classification.status)
+            if self.recovery_budget_exhausted_by(result, recovery):
+                # This is the last permitted recovery attempt and it still could
+                # not settle the task, so the supervisor will treat this run as
+                # terminally failed. The lock is released below, before it
+                # reaches the exhaustion branch, so the verdict is recorded and
+                # published here - durably first, so external provenance never
+                # claims a failure vibe-loop has not written down.
+                self._exhausted_recovery_results[result.run_id] = (
+                    self.record_recovery_budget_exhausted(result, recovery.attempt)
+                )
+                settled_outcome = "failed"
+                settled_classification = "failed"
             report_status(
                 f"recorded {classification.status} result for {task.task_id}: "
                 f"{log_path}"
             )
             return result
         finally:
-            self.lock_manager.release(task_lock)
+            try:
+                settle_outcome_and_release()
+            except SettledOutcomeNotPersisted as exc:
+                # No release happened, so no lock_released event may be claimed:
+                # the lock is still held under this run id and fencing token and
+                # is recoverable. The RunResult is already durable, so the
+                # failure is surfaced rather than silently reconciled.
+                report_status(str(exc))
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.lock_event(
+                        LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+                        run_id=run_id,
+                        task_id=task.task_id,
+                        lock_kind="task",
+                        lock_path=task_lock.path,
+                        payload={
+                            "started_at": active_state.started_at,
+                            "outcome": settled_outcome,
+                            "classification": settled_classification,
+                            "reason": str(exc.cause),
+                            "released": False,
+                        },
+                    )
+                )
+                raise
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
                     LOCK_RELEASED_RECORD_TYPE,
@@ -1499,7 +1802,11 @@ class VibeRunner:
                     task_id=task.task_id,
                     lock_kind="task",
                     lock_path=task_lock.path,
-                    payload={"started_at": active_state.started_at},
+                    payload={
+                        "started_at": active_state.started_at,
+                        "outcome": settled_outcome,
+                        "classification": settled_classification,
+                    },
                 )
             )
 
@@ -2143,6 +2450,26 @@ class VibeRunner:
         self.record_result(exhausted)
         return exhausted
 
+    def recovery_budget_exhausted_by(
+        self,
+        result: RunResult,
+        recovery: RecoveryContext | None,
+    ) -> bool:
+        """Report whether this run is the one that exhausts the budget.
+
+        The condition mirrors ``drive_unknown_recovery`` exactly: only a run
+        that classifies ``unknown`` re-enters recovery, so any other
+        unknown-settling classification - ``timed_out``, ``limit_wall`` - is
+        terminal as itself and must not be published as failed.
+        """
+
+        if recovery is None or result.classification != "unknown":
+            return False
+        if not self.config.supervision.recover_unknown_runs:
+            return False
+        max_attempts = self.config.supervision.max_restarts
+        return max_attempts > 0 and recovery.attempt >= max_attempts
+
     def record_recovery_budget_exhausted(
         self,
         result: RunResult,
@@ -2194,10 +2521,15 @@ class VibeRunner:
         while current.classification == "unknown":
             attempt = attempts.get(current.task_id, 0) + 1
             if attempt > max_attempts:
-                terminal = self.record_recovery_budget_exhausted(
-                    current,
-                    attempts.get(current.task_id, 0),
-                )
+                # The exhausting run recorded this verdict before releasing its
+                # lock, so external provenance and the run store agree; reuse it
+                # instead of writing a second terminal result for the same run.
+                terminal = self._exhausted_recovery_results.pop(current.run_id, None)
+                if terminal is None:
+                    terminal = self.record_recovery_budget_exhausted(
+                        current,
+                        attempts.get(current.task_id, 0),
+                    )
                 results.append(terminal)
                 report_status(
                     "unknown-run recovery budget exhausted for "
@@ -2512,12 +2844,12 @@ class RecoveryContext:
 def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
     if recovery.workspace_claimed:
         workspace_lines = (
-            f"- Claimed branch: `{recovery.branch}`\n"
-            f"- Claimed worktree: `{recovery.worktree}`\n"
+            f"- Prior run's recorded branch: `{recovery.branch}`\n"
+            f"- Prior run's recorded worktree: `{recovery.worktree}`\n"
         )
         if recovery.head_commit:
             workspace_lines += (
-                f"- Claimed worktree HEAD at claim time: `{recovery.head_commit}`\n"
+                f"- Prior run's recorded HEAD at claim time: `{recovery.head_commit}`\n"
             )
     else:
         workspace_lines = (
@@ -2543,13 +2875,29 @@ def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
         f"{workspace_lines}"
         f"{transcript_line}"
         f"- Prior wrapper log: `{recovery.wrapper_log}`\n\n"
+        "### Current-run workspace claim\n\n"
+        "Any workspace claim shown above belonged to the prior run's released "
+        "lock generation. It is stale evidence only and does not attach that "
+        "workspace to the CURRENT active task lock. Verify the real branch and "
+        "absolute worktree path, then make the current-run claim before any new "
+        "mutation, gate, build, test, review, or integration attempt:\n\n"
+        "```bash\n"
+        f"{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}\n"
+        "```\n\n"
+        "Run this command from inside the verified worktree; its quoted Git "
+        "lookups derive the exact branch and worktree arguments. Do not claim a "
+        "guessed path. If the claim fails or the preserved workspace cannot be "
+        "verified safely, stop before mutation and report `blocked` through the "
+        "worker report protocol.\n\n"
         "### What to do\n\n"
         "1. Investigate what the previous session did and why it ended without "
         "a proper status: read the prior transcript and wrapper log, and "
-        "inspect the claimed branch/worktree for committed-but-unmerged work.\n"
-        "2. Continue on the existing claimed branch/worktree — do not delete, "
-        "reset, steal, or re-create another worker's workspace; build on the "
-        "committed work rather than discarding it.\n"
+        "inspect the prior run's recorded branch/worktree for "
+        "committed-but-unmerged work.\n"
+        "2. After the current-run claim succeeds, continue on the verified "
+        "existing branch/worktree — do not delete, reset, steal, or re-create "
+        "another worker's workspace; build on the committed work rather than "
+        "discarding it.\n"
         "3. Finish the slice through review and integration when permitted, "
         "then emit a proper status (`completed`/`blocked`/`failed`) via the "
         "worker report protocol.\n"
@@ -2568,9 +2916,12 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
     session launched long-running proofs/checks in the background and the
     headless turn ended before they finished.
     """
-    workspace_line = (
-        f"- Your claimed worktree: `{recovery.worktree}`\n" if recovery.worktree else ""
-    )
+    workspace_lines = ""
+    if recovery.workspace_claimed:
+        workspace_lines = (
+            f"- Prior run's recorded branch: `{recovery.branch}`\n"
+            f"- Prior run's recorded worktree: `{recovery.worktree}`\n"
+        )
     return (
         "## Continue this run (resumed session)\n\n"
         f"This is the SAME session for task `{recovery.task_id}`, resumed because "
@@ -2580,11 +2931,24 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
         "The most likely cause: you launched long-running proofs/checks in the "
         "background and this headless turn ended before they finished. Do NOT "
         "restart from scratch.\n\n"
-        f"{workspace_line}"
-        "1. Check the results of any background commands you started (their log "
+        f"{workspace_lines}"
+        "Those prior-run workspace details are stale evidence only. Verify the "
+        "real branch and absolute worktree path, then attach that workspace to "
+        "the CURRENT active task lock before any new mutation, gate, build, "
+        "test, review, or integration attempt:\n\n"
+        "```bash\n"
+        f"{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}\n"
+        "```\n\n"
+        "Run this command from inside the verified worktree; its quoted Git "
+        "lookups derive the exact branch and worktree arguments. Do not claim a "
+        "guessed path. If the claim fails or the workspace cannot be verified "
+        "safely, stop before mutation and report `blocked`.\n\n"
+        "1. Await or collect the results of any asynchronous Agent/Task/Workflow "
+        "subagent or background command you started (including its log "
         "files / exit status); re-run any remaining required gates in the "
         "FOREGROUND so this turn does not end before they complete.\n"
-        "2. Finish the slice through review and integration when permitted, "
+        "2. After the current-run workspace claim succeeds, finish the slice "
+        "through review and integration when permitted, "
         "building on your existing committed work — do not delete, reset, or "
         "re-create the workspace.\n"
         "3. Emit a proper terminal status via the worker report protocol, using "
@@ -2606,7 +2970,8 @@ def build_run_worker_prompt(
 ) -> str:
     if recovery is not None and resuming:
         return append_worker_prompt_extension(
-            build_resume_continuation_prompt(recovery),
+            f"{build_resume_continuation_prompt(recovery)}\n\n"
+            f"{FENCING_TOKEN_NONDISCLOSURE}",
             config,
         )
     if recovery is not None:
@@ -3580,15 +3945,45 @@ def parse_selected_task_ids(output: str) -> list[str] | None:
 
 
 def selection_payload_from_output(output: str) -> object | None:
+    def _candidate(value: object) -> object | None:
+        if not isinstance(value, dict):
+            return None
+        if any(key in value for key in ("task_id", "task_ids", "should_plan")):
+            return value
+        result = value.get("result")
+        if isinstance(result, str):
+            nested = selection_payload_from_output(result)
+            if nested is not None:
+                return nested
+        item = value.get("item")
+        if isinstance(item, Mapping):
+            text = item.get("text")
+            if isinstance(text, str):
+                nested = selection_payload_from_output(text)
+                if nested is not None:
+                    return nested
+        if "type" not in value:
+            return value
+        return None
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        candidate = _candidate(parsed)
+        if candidate is not None:
+            return candidate
     start = output.find("{")
     end = output.rfind("}")
     if start == -1 or end == -1 or end < start:
         return None
     try:
-        payload = json.loads(output[start : end + 1])
+        parsed = json.loads(output[start : end + 1])
     except json.JSONDecodeError:
         return None
-    return payload
+    return _candidate(parsed)
 
 
 def validate_selected_task_batch(
@@ -3870,10 +4265,13 @@ def parse_agent_runtime_context_from_command(command: str) -> AgentRuntimeContex
 
         value = None
         source = ""
-        if token == "--reasoning-effort" and index + 1 < len(argv):
+        if token in {"--effort", "--reasoning-effort"} and index + 1 < len(argv):
             value = argv[index + 1]
-            source = "command_arg:--reasoning-effort"
+            source = f"command_arg:{token}"
             index += 1
+        elif token.startswith("--effort="):
+            value = token.split("=", 1)[1]
+            source = "command_arg:--effort"
         elif token.startswith("--reasoning-effort="):
             value = token.split("=", 1)[1]
             source = "command_arg:--reasoning-effort"
@@ -3936,7 +4334,7 @@ def parse_agent_runtime_context_from_config_arg(value: str) -> AgentRuntimeConte
             model_provider=cleaned,
             model_provider_source=source,
         )
-    if normalized_key in {"model_reasoning_effort", "reasoning_effort"}:
+    if normalized_key in {"effort", "model_reasoning_effort", "reasoning_effort"}:
         cleaned = clean_reasoning_effort_value(raw_value)
         if not cleaned:
             return AgentRuntimeContext()
@@ -3964,11 +4362,8 @@ def command_executable_name(argv: list[str]) -> str:
     return ""
 
 
-# Only Claude commands accept a forced --session-id. Codex `exec` has no
-# equivalent injection flag, and its session id is surfaced only via `--json`
-# (which would replace the streamed human-readable output the wrapper log and
-# selection/analysis text parsing rely on); Codex runs therefore keep the
-# run_id fallback. See README "Agent session transcripts".
+# Only Claude commands accept a forced --session-id. Codex `exec --json`
+# surfaces a native thread id, but it cannot be selected before launch.
 SESSION_CAPTURE_AGENT_KINDS = frozenset({"auto", "claude"})
 SESSION_OBSERVED_SOURCE = "observed"
 
@@ -3990,6 +4385,54 @@ def command_supports_session_capture(command: str, agent_kind: str) -> bool:
     if command_executable_name(argv) != "claude":
         return False
     return not command_specifies_session_id(argv)
+
+
+def inject_structured_usage_output(command: str, agent_kind: str) -> str:
+    """Request native result events only for recognized first-party CLIs."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    executable = command_executable_name(argv)
+    if executable == "codex" and agent_kind in {"auto", "codex"}:
+        if "exec" not in argv or "--json" in argv:
+            return command
+        return re.sub(r"(?<!\S)exec(?=\s|$)", "exec --json", command, count=1)
+    if executable == "claude" and agent_kind in {"auto", "claude"}:
+        if "--output-format" in argv or any(
+            token.startswith("--output-format=") for token in argv
+        ):
+            return command
+        return command.replace(
+            "claude ", "claude --output-format stream-json --verbose ", 1
+        )
+    return command
+
+
+def worker_usage_provenance(worker_report: WorkerReport | None) -> tuple[str, str]:
+    """Return allowlisted phase and work-kind metadata from a worker report."""
+    if worker_report is None:
+        return "implementation", ""
+    phase_value = worker_report.metadata.get("phase")
+    phase = (
+        phase_value if isinstance(phase_value, str) and phase_value in PHASES else ""
+    )
+    work_kind_value = worker_report.metadata.get("work_kind")
+    work_kind = (
+        work_kind_value
+        if isinstance(work_kind_value, str) and work_kind_value in WORK_KINDS
+        else ""
+    )
+    if not phase:
+        phase = "review" if work_kind == "review" else "implementation"
+    if phase == "review" and not work_kind:
+        work_kind = "review"
+    return phase, work_kind
+
+
+def provider_selection_is_flexible(agent: AgentConfig, task: Task) -> bool:
+    """Whether dispatch could choose a provider rather than a pinned model."""
+    return agent.agent_kind == "auto" and not task.model.strip()
 
 
 def inject_claude_session_id(command: str, session_id: str) -> str:
@@ -4122,32 +4565,104 @@ def resolve_claude_transcript(session_id: str, claude_home: Path) -> Path | None
     return matches[0] if matches else None
 
 
+def agent_context_source_rank(source: str) -> int:
+    if not source:
+        return 0
+    for prefix, rank in AGENT_CONTEXT_SOURCE_RANKS:
+        if source.startswith(prefix):
+            if prefix == "native:" and ":json." not in source:
+                return AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK
+            return rank
+    return AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK
+
+
+def pick_agent_context_field(
+    current: str,
+    current_source: str,
+    candidate: str,
+    candidate_source: str,
+) -> tuple[str, str]:
+    if not candidate:
+        return current, current_source
+    if not current:
+        return candidate, candidate_source
+    candidate_rank = agent_context_source_rank(candidate_source)
+    current_rank = agent_context_source_rank(current_source)
+    if candidate == current:
+        if candidate_rank > current_rank:
+            return candidate, candidate_source
+        return current, current_source
+    if candidate_rank >= current_rank:
+        return candidate, candidate_source
+    return current, current_source
+
+
+def pick_agent_model_field(
+    current: str,
+    current_source: str,
+    candidate: str,
+    candidate_source: str,
+    *,
+    current_provider: str,
+) -> tuple[str, str]:
+    if (
+        current_provider == "anthropic"
+        and current.lower() in CLAUDE_MODEL_ALIASES
+        and current_source.startswith(("command_arg:", "command_config:"))
+        and candidate_source.startswith("native:")
+        and ":json." in candidate_source
+    ):
+        return candidate, candidate_source
+    return pick_agent_context_field(
+        current,
+        current_source,
+        candidate,
+        candidate_source,
+    )
+
+
 def parse_agent_runtime_context_from_line(
     line: str,
     stream_name: str,
 ) -> AgentRuntimeContext:
     source_prefix = f"native:{stream_name}"
-    context = parse_agent_runtime_context_from_json_line(line, source_prefix)
-    return context.overlay(
-        parse_agent_runtime_context_from_text_line(line, source_prefix)
-    )
+    json_payload = agent_context_json_payload(line)
+    if json_payload is not None:
+        # A structured line is parsed structurally only; rescanning its raw text
+        # would harvest nested keys the structured reader deliberately rejected.
+        return parse_agent_runtime_context_from_json_payload(
+            json_payload, source_prefix
+        )
+    return parse_agent_runtime_context_from_text_line(line, source_prefix)
+
+
+def agent_context_json_payload(line: str) -> dict[str, object] | None:
+    text = line.strip()
+    if text.startswith("data:"):
+        text = text.removeprefix("data:").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def parse_agent_runtime_context_from_json_line(
     line: str,
     source_prefix: str,
 ) -> AgentRuntimeContext:
-    text = line.strip()
-    if text.startswith("data:"):
-        text = text.removeprefix("data:").strip()
-    if not text.startswith("{"):
+    payload = agent_context_json_payload(line)
+    if payload is None:
         return AgentRuntimeContext()
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return AgentRuntimeContext()
-    if not isinstance(payload, dict):
-        return AgentRuntimeContext()
+    return parse_agent_runtime_context_from_json_payload(payload, source_prefix)
+
+
+def parse_agent_runtime_context_from_json_payload(
+    payload: dict[str, object],
+    source_prefix: str,
+) -> AgentRuntimeContext:
     model_value = payload.get("model")
     model_mapping = model_value if isinstance(model_value, dict) else {}
     model_provider = first_clean_agent_context_value(
@@ -4155,13 +4670,20 @@ def parse_agent_runtime_context_from_json_line(
         model_mapping.get("provider"),
         payload.get("provider"),
     )
+    bare_model = (
+        model_value
+        if isinstance(model_value, str) and payload_declares_model_identity(payload)
+        else None
+    )
     model_id = first_clean_agent_context_value(
         payload.get("model_id"),
         model_mapping.get("id"),
-        model_value if isinstance(model_value, str) else None,
+        bare_model,
     )
     reasoning_effort = first_clean_agent_context_value(
+        payload.get("effort"),
         payload.get("reasoning_effort"),
+        model_mapping.get("effort"),
         model_mapping.get("reasoning_effort"),
         clean_value=clean_reasoning_effort_value,
     )
@@ -4189,21 +4711,7 @@ def parse_agent_runtime_context_from_text_line(
         value = clean_agent_context_value(match.group("value"))
         if not value:
             continue
-        if key in {"model_provider", "provider"}:
-            context = context.overlay(
-                AgentRuntimeContext(
-                    model_provider=value,
-                    model_provider_source=f"{source_prefix}:{key}",
-                )
-            )
-        elif key in {"model", "model_id"}:
-            context = context.overlay(
-                AgentRuntimeContext(
-                    model_id=value,
-                    model_id_source=f"{source_prefix}:{key}",
-                )
-            )
-        elif key == "reasoning_effort":
+        if key in {"effort", "reasoning_effort"}:
             value = clean_reasoning_effort_value(match.group("value"))
             if not value:
                 continue
@@ -4214,6 +4722,13 @@ def parse_agent_runtime_context_from_text_line(
                 )
             )
     return context
+
+
+def payload_declares_model_identity(payload: dict[str, object]) -> bool:
+    event_type = payload.get("type")
+    if not isinstance(event_type, str):
+        return False
+    return event_type.strip().lower() in MODEL_IDENTITY_EVENT_TYPES
 
 
 def normalize_agent_context_key(value: str) -> str:
@@ -4303,9 +4818,13 @@ def build_trailer_context(
         context["model_provider"] = runtime_context.model_provider
         sources["model_provider"] = runtime_context.model_provider_source
     if runtime_context.model_id:
+        context["model"] = runtime_context.model_id
+        sources["model"] = runtime_context.model_id_source
         context["model_id"] = runtime_context.model_id
         sources["model_id"] = runtime_context.model_id_source
     if runtime_context.reasoning_effort:
+        context["effort"] = runtime_context.reasoning_effort
+        sources["effort"] = runtime_context.reasoning_effort_source
         context["reasoning_effort"] = runtime_context.reasoning_effort
         sources["reasoning_effort"] = runtime_context.reasoning_effort_source
     return context, sources
@@ -4384,26 +4903,29 @@ def write_log_header(
     prompt_dialect_source: str,
     skill_ref_prefix: str | None,
     skill_ref_prefix_source: str,
+    *,
+    fencing_token: str = "",
 ) -> None:
-    log.write(f"[vibe-loop] run_id={run_id}\n")
-    log.write(f"[vibe-loop] task_id={task.task_id}\n")
-    log.write(f"[vibe-loop] title={task.title}\n")
-    log.write(f"[vibe-loop] command={command}\n")
-    log.write(f"[vibe-loop] agent_command_source={command_source}\n")
-    log.write(
-        f"[vibe-loop] agent_selection_command_source={selection_command_source}\n"
+    header = (
+        f"[vibe-loop] run_id={run_id}\n"
+        f"[vibe-loop] task_id={task.task_id}\n"
+        f"[vibe-loop] title={task.title}\n"
+        f"[vibe-loop] command={command}\n"
+        f"[vibe-loop] agent_command_source={command_source}\n"
+        "[vibe-loop] agent_selection_command_source="
+        f"{selection_command_source}\n"
+        "[vibe-loop] agent_default_policy_source="
+        f"{AGENT_DEFAULT_POLICY_SOURCE}\n"
+        f"[vibe-loop] agent_default_policy={AGENT_DEFAULT_POLICY}\n"
+        f"[vibe-loop] agent_kind={agent_kind}\n"
+        f"[vibe-loop] agent_prompt_dialect={prompt_dialect or ''}\n"
+        f"[vibe-loop] agent_prompt_dialect_source={prompt_dialect_source}\n"
+        f"[vibe-loop] agent_skill_ref_prefix={skill_ref_prefix or ''}\n"
+        f"[vibe-loop] agent_skill_ref_prefix_source={skill_ref_prefix_source}\n"
+        f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n"
+        f"[vibe-loop] start_main={start_main}\n\n"
     )
-    log.write(
-        f"[vibe-loop] agent_default_policy_source={AGENT_DEFAULT_POLICY_SOURCE}\n"
-    )
-    log.write(f"[vibe-loop] agent_default_policy={AGENT_DEFAULT_POLICY}\n")
-    log.write(f"[vibe-loop] agent_kind={agent_kind}\n")
-    log.write(f"[vibe-loop] agent_prompt_dialect={prompt_dialect or ''}\n")
-    log.write(f"[vibe-loop] agent_prompt_dialect_source={prompt_dialect_source}\n")
-    log.write(f"[vibe-loop] agent_skill_ref_prefix={skill_ref_prefix or ''}\n")
-    log.write(f"[vibe-loop] agent_skill_ref_prefix_source={skill_ref_prefix_source}\n")
-    log.write(f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n")
-    log.write(f"[vibe-loop] start_main={start_main}\n\n")
+    log.write(redact_fencing_token_text(header, fencing_token))
 
 
 def report_status(message: str, log: TextIO | None = None) -> None:
@@ -4559,6 +5081,7 @@ def run_streaming_command(
     reap_grace_seconds: float = 120.0,
     reap_poll_seconds: float = 10.0,
     timeout_seconds: float | None = None,
+    provider: str = "unknown",
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
     popen_kwargs: dict[str, object] = {}
@@ -4617,7 +5140,8 @@ def run_streaming_command(
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()
-    output_observer = AgentOutputObserver()
+    fencing_token = fencing_token_value((env or {}).get("VIBE_LOOP_FENCING_TOKEN"))
+    output_observer = AgentOutputObserver(provider)
     stdout_thread = threading.Thread(
         target=stream_pipe,
         args=(
@@ -4628,6 +5152,7 @@ def run_streaming_command(
             output_observer,
             "stdout",
             on_observation,
+            fencing_token,
         ),
     )
     stderr_thread = threading.Thread(
@@ -4640,6 +5165,7 @@ def run_streaming_command(
             output_observer,
             "stderr",
             on_observation,
+            fencing_token,
         ),
     )
     stdout_thread.start()
@@ -4661,6 +5187,7 @@ def run_streaming_command(
         session_id_source=observation.session_id_source,
         runtime_context=observation.runtime_context,
         timed_out=wait_outcome.timed_out,
+        usage=output_observer.usage,
     )
 
 
@@ -4670,6 +5197,8 @@ def worker_command_env(
     task_id: str,
     repo: Path,
     log_path: Path,
+    agent_kind: str,
+    agent_profile: str,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -4678,6 +5207,8 @@ def worker_command_env(
             "VIBE_LOOP_TASK_ID": task_id,
             "VIBE_LOOP_REPO": str(repo),
             "VIBE_LOOP_LOG": str(log_path),
+            "VIBE_LOOP_AGENT_KIND": agent_kind,
+            "VIBE_LOOP_AGENT_PROFILE": agent_profile,
         }
     )
     return env
@@ -4691,20 +5222,40 @@ def stream_pipe(
     output_observer: AgentOutputObserver,
     stream_name: str,
     on_observation: Callable[[AgentRuntimeObservation], None] | None = None,
+    fencing_token: str = "",
 ) -> None:
     try:
         for line in pipe:
-            observation = output_observer.observe_line(line, stream_name)
+            redacted_line = redact_worker_stream_line(line, fencing_token)
+            observation = output_observer.observe_line(redacted_line, stream_name)
             if observation is not None and on_observation is not None:
                 on_observation(observation)
             if forward:
-                sys.stderr.write(line)
+                sys.stderr.write(redacted_line)
                 sys.stderr.flush()
             with log_lock:
-                log.write(line)
+                log.write(redacted_line)
                 log.flush()
     finally:
         pipe.close()
+
+
+def redact_worker_stream_line(line: str, fencing_token: str) -> str:
+    if not fencing_token:
+        return line
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return redact_fencing_token_text(line, fencing_token)
+    if fencing_token_value(payload) == fencing_token:
+        newline = "\n" if line.endswith("\n") else ""
+        return FENCING_TOKEN_REDACTION + newline
+    field_redacted = redact_fencing_token_payload(payload)
+    redacted = redact_exact_fencing_token(field_redacted, fencing_token)
+    if redacted == payload:
+        return line
+    newline = "\n" if line.endswith("\n") else ""
+    return json.dumps(redacted, separators=(",", ":")) + newline
 
 
 def new_run_id(task_id: str) -> str:
@@ -4820,3 +5371,28 @@ def git_rev_parse(repo: Path, rev: str) -> str:
     if result.returncode != 0:
         return ""
     return result.stdout.strip()
+
+
+def git_changed_lines(repo: Path, start_rev: str, end_rev: str) -> int | None:
+    if not start_rev or not end_rev:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--numstat", start_rev, end_rev],
+            cwd=repo,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    changed = 0
+    for line in result.stdout.splitlines():
+        added, separator, remainder = line.partition("\t")
+        deleted, separator, _path = remainder.partition("\t")
+        if not separator or not added.isdigit() or not deleted.isdigit():
+            continue
+        changed += int(added) + int(deleted)
+    return changed

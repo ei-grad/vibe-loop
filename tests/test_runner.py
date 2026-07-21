@@ -18,6 +18,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
 from vibe_loop.config import (
     AgentConfig,
@@ -31,10 +32,16 @@ from vibe_loop.config import (
     resolve_task_agent,
     shell_quote,
 )
-from vibe_loop.locks import LockBusy, LockManager, LockOwnerMismatch
+from vibe_loop.locks import (
+    LockBusy,
+    LockManager,
+    LockOwnerMismatch,
+    SettledOutcomeNotPersisted,
+)
 from vibe_loop.processes import read_process_node
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
+    CURRENT_RUN_WORKSPACE_CLAIM_COMMAND,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     AgentLimitWallError,
     AgentRuntimeContext,
@@ -57,7 +64,9 @@ from vibe_loop.runner import (
     build_resume_continuation_prompt,
     inject_claude_resume,
     inject_claude_session_id,
+    inject_structured_usage_output,
     parse_agent_runtime_context_from_command,
+    parse_agent_runtime_context_from_line,
     parse_selected_task_id,
     parse_selected_task_ids,
     parse_worker_session_id,
@@ -65,6 +74,7 @@ from vibe_loop.runner import (
     resumable_prior_session_id,
     build_recovery_prompt_section,
     predicted_claude_transcript,
+    provider_selection_is_flexible,
     resolve_claude_home,
     resolve_claude_transcript,
     run_streaming_command,
@@ -72,11 +82,24 @@ from vibe_loop.runner import (
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
     wait_with_reap_watchdog,
+    worker_usage_provenance,
 )
-from vibe_loop.runs import WORKER_REPORT_STATUSES, RunResult, WorkerReport
+from vibe_loop.runs import (
+    LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+    SETTLED_RUN_OUTCOMES,
+    WORKER_REPORT_STATUSES,
+    RunResult,
+    WorkerReport,
+    settled_run_outcome,
+)
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import Task
-from vibe_loop.workers import ActiveRunState
+from vibe_loop.workers import (
+    ActiveRunState,
+    StaleLock,
+    clean_stale_locks,
+    collect_stale_locks,
+)
 
 
 class MutableTaskSource:
@@ -201,6 +224,87 @@ class RunnerTests(unittest.TestCase):
                     prompt.index("### Integration Locking"),
                 )
 
+    def test_initial_worker_prompt_requires_async_work_to_settle(self) -> None:
+        task = Task(task_id="ASYNC-01", title="Finish async work", status="Next")
+
+        for skill_prefix in ("$", "/"):
+            with self.subTest(skill_prefix=skill_prefix):
+                token = "initial-generation-7"
+                with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                    prompt = build_worker_prompt(
+                        skill_prefix,
+                        task,
+                        VibeConfig(repo=Path(".")),
+                    )
+
+                self.assertTrue(prompt.startswith(f"{skill_prefix}vibe-loop ASYNC-01"))
+                self.assertIn("### Headless Completion", prompt)
+                self.assertIn("Agent/Task/Workflow", prompt)
+                self.assertIn("await or collect every result", prompt)
+                self.assertIn("returning a progress summary", prompt)
+                self.assertIn(
+                    'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"', prompt
+                )
+                self.assertIn('--run-id "$VIBE_LOOP_RUN_ID"', prompt)
+                self.assertIn('--task-id "$VIBE_LOOP_TASK_ID"', prompt)
+                self.assertNotIn(token, prompt)
+                self.assertLess(
+                    prompt.index("### Headless Completion"),
+                    prompt.index("### Worker Reports"),
+                )
+
+    def test_workspace_claim_command_preserves_shell_metacharacters(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "work tree"
+            branch = "topic$(touch${IFS}injected)"
+            subprocess.run(
+                ["git", "init", "-b", branch, str(worktree)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            capture = root / "capture.py"
+            capture.write_text(
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            command = CURRENT_RUN_WORKSPACE_CLAIM_COMMAND.replace(
+                "vibe-loop worker claim-workspace",
+                f"{shell_quote(sys.executable)} {shell_quote(str(capture))}",
+            )
+            run = subprocess.run(
+                command,
+                cwd=worktree,
+                env={
+                    **os.environ,
+                    "VIBE_LOOP_REPO": str(worktree),
+                    "VIBE_LOOP_RUN_ID": "run-1",
+                    "VIBE_LOOP_TASK_ID": "task-1",
+                },
+                check=True,
+                capture_output=True,
+                text=True,
+                shell=True,
+            )
+
+            self.assertEqual(
+                json.loads(run.stdout),
+                [
+                    "--repo",
+                    str(worktree),
+                    "--run-id",
+                    "run-1",
+                    "--task-id",
+                    "task-1",
+                    "--branch",
+                    branch,
+                    "--worktree",
+                    str(worktree.resolve()),
+                ],
+            )
+            self.assertFalse((worktree / "injected").exists())
+
     def test_worker_prompt_extension_applies_after_profile_routing(self) -> None:
         extension = "Repository integration policy wins."
         config = VibeConfig(
@@ -258,25 +362,42 @@ class RunnerTests(unittest.TestCase):
             prior_session_id="session-1",
         )
 
-        for resuming, branch_marker in (
-            (False, "## Unknown-Run Recovery"),
-            (True, "## Continue this run (resumed session)"),
-        ):
-            with self.subTest(resuming=resuming):
-                prompt = build_run_worker_prompt(
-                    "$",
-                    task,
-                    config,
-                    recovery=recovery,
-                    resuming=resuming,
-                )
+        for skill_prefix in ("$", "/"):
+            for resuming, branch_marker in (
+                (False, "## Unknown-Run Recovery"),
+                (True, "## Continue this run (resumed session)"),
+            ):
+                with self.subTest(skill_prefix=skill_prefix, resuming=resuming):
+                    token = "recovery-generation-11"
+                    with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                        prompt = build_run_worker_prompt(
+                            skill_prefix,
+                            task,
+                            config,
+                            recovery=recovery,
+                            resuming=resuming,
+                        )
 
-                self.assertIn(branch_marker, prompt)
-                self.assertGreater(
-                    prompt.index("## Repository Worker Prompt Extension"),
-                    prompt.index(branch_marker),
-                )
-                self.assertTrue(prompt.endswith(extension))
+                    self.assertIn(branch_marker, prompt)
+                    if not resuming:
+                        self.assertTrue(
+                            prompt.startswith(f"{skill_prefix}vibe-loop {task.task_id}")
+                        )
+                    self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
+                    self.assertIn("CURRENT active task lock", prompt)
+                    self.assertIn(
+                        'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"',
+                        prompt,
+                    )
+                    self.assertIn('--run-id "$VIBE_LOOP_RUN_ID"', prompt)
+                    self.assertIn('--task-id "$VIBE_LOOP_TASK_ID"', prompt)
+                    self.assertIn("stale evidence only", prompt)
+                    self.assertNotIn(token, prompt)
+                    self.assertGreater(
+                        prompt.index("## Repository Worker Prompt Extension"),
+                        prompt.index(branch_marker),
+                    )
+                    self.assertTrue(prompt.endswith(extension))
 
     def test_worker_prompt_omits_repo_extension_when_unset(self) -> None:
         task = Task(task_id="POLICY-02", title="Default policy", status="Next")
@@ -287,6 +408,18 @@ class RunnerTests(unittest.TestCase):
                 prompt = build_worker_prompt("$", task, config)
 
                 self.assertEqual(prompt, expected)
+
+    def test_worker_prompt_contains_token_rule_without_environment_value(self) -> None:
+        task = Task(task_id="POLICY-04", title="Protect lock token", status="Next")
+        token = "prompt-generation-9"
+
+        with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=Path(".")))
+
+        self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
+        self.assertIn("Never print or echo its value", prompt)
+        self.assertIn("command argument, tool payload, log, or summary", prompt)
+        self.assertNotIn(token, prompt)
 
     def test_worker_prompt_includes_bounded_spec_context_and_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1059,6 +1192,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("/tmp/wt/task-01", prompt)
         self.assertIn("$VIBE_LOOP_RUN_ID", prompt)
         self.assertIn("background", prompt)
+        self.assertIn("Agent/Task/Workflow", prompt)
+        self.assertIn("CURRENT active task lock", prompt)
+        self.assertIn("claim-workspace", prompt)
+        self.assertLess(
+            prompt.index("claim-workspace"),
+            prompt.index("finish the slice"),
+        )
         # Must NOT be the from-scratch recovery brief.
         self.assertNotIn("Investigate what the previous session did", prompt)
 
@@ -2384,6 +2524,103 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("err", stderr.getvalue())
             self.assertIn("err", log_path.read_text(encoding="utf-8"))
 
+    def test_streaming_command_redacts_active_token_for_codex_and_claude(
+        self,
+    ) -> None:
+        token = "stream-generation-3"
+        substring = "stream-generation-"
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as directory:
+                    script = Path(directory) / "cmd.py"
+                    script.write_text(
+                        "import json\n"
+                        "import os\n"
+                        "import sys\n"
+                        "token = os.environ['VIBE_LOOP_FENCING_TOKEN']\n"
+                        "print(token)\n"
+                        "print(json.dumps({'type': 'item.completed', "
+                        "'item': {'output': token}, "
+                        "'substring': token[:-1]}))\n"
+                        "print(f'stderr token={token}', file=sys.stderr)\n",
+                        encoding="utf-8",
+                    )
+                    log_path = Path(directory) / "run.log"
+                    stderr = StringIO()
+                    environment = os.environ.copy()
+                    environment["VIBE_LOOP_FENCING_TOKEN"] = token
+                    with log_path.open("w", encoding="utf-8") as log:
+                        with redirect_stderr(stderr):
+                            result = run_streaming_command(
+                                f"{sys.executable} cmd.py",
+                                Path(directory),
+                                log,
+                                env=environment,
+                                forward_stderr=True,
+                                provider=provider,
+                            )
+
+                    log_text = log_path.read_text(encoding="utf-8")
+                    rendered = log_text + stderr.getvalue()
+                    structured = next(
+                        json.loads(line)
+                        for line in log_text.splitlines()
+                        if line.startswith("{")
+                    )
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertNotIn(token, rendered)
+                self.assertIn("<redacted>", rendered)
+                self.assertEqual(structured["item"]["output"], "<redacted>")
+                self.assertEqual(structured["substring"], substring)
+
+    def test_streaming_command_preserves_numeric_fields_for_short_token(self) -> None:
+        token = "1"
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as directory:
+                    script = Path(directory) / "cmd.py"
+                    script.write_text(
+                        "import json\n"
+                        "import os\n"
+                        "import sys\n"
+                        "token = os.environ['VIBE_LOOP_FENCING_TOKEN']\n"
+                        "print(token)\n"
+                        "print(token, file=sys.stderr)\n"
+                        "print(json.dumps({'fencing_token': int(token), "
+                        "'output': token, 'count': 1, 'task_id': 'TASK-1'}))\n",
+                        encoding="utf-8",
+                    )
+                    log_path = Path(directory) / "run.log"
+                    environment = os.environ.copy()
+                    environment["VIBE_LOOP_FENCING_TOKEN"] = token
+                    stderr = StringIO()
+                    with log_path.open("w", encoding="utf-8") as log:
+                        with redirect_stderr(stderr):
+                            result = run_streaming_command(
+                                f"{sys.executable} cmd.py",
+                                Path(directory),
+                                log,
+                                env=environment,
+                                forward_stderr=True,
+                                provider=provider,
+                            )
+                    lines = log_path.read_text(encoding="utf-8").splitlines()
+                    payload = next(
+                        json.loads(line) for line in lines if line.startswith("{")
+                    )
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(
+                    [line for line in lines if not line.startswith("{")],
+                    ["<redacted>", "<redacted>"],
+                )
+                self.assertNotIn("\n1\n", f"\n{stderr.getvalue()}")
+                self.assertEqual(payload["fencing_token"], "<redacted>")
+                self.assertEqual(payload["output"], "<redacted>")
+                self.assertEqual(payload["count"], 1)
+                self.assertEqual(payload["task_id"], "TASK-1")
+
     def test_streaming_command_captures_stdout_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "cmd.py"
@@ -2476,6 +2713,31 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(context.model_provider_source, "command_executable:codex")
         self.assertEqual(context.model_id, "gpt-5.5")
         self.assertEqual(context.reasoning_effort, "high")
+
+    def test_command_context_accepts_provider_neutral_effort_flag(self) -> None:
+        context = parse_agent_runtime_context_from_command(
+            "claude -p --model opus --effort medium"
+        )
+
+        self.assertEqual(context.model_provider, "anthropic")
+        self.assertEqual(context.model_id, "opus")
+        self.assertEqual(context.reasoning_effort, "medium")
+        self.assertEqual(context.reasoning_effort_source, "command_arg:--effort")
+
+    def test_text_line_parses_bare_effort_alias(self) -> None:
+        # Finding 3 (P2): the public `effort` alias must be recognized in text
+        # observation lines, not only the legacy `reasoning_effort` spelling.
+        bare = parse_agent_runtime_context_from_line("effort: high", "stdout")
+        self.assertEqual(bare.reasoning_effort, "high")
+        self.assertEqual(bare.reasoning_effort_source, "native:stdout:effort")
+
+        legacy = parse_agent_runtime_context_from_line(
+            "reasoning_effort: high", "stdout"
+        )
+        self.assertEqual(legacy.reasoning_effort, "high")
+        self.assertEqual(
+            legacy.reasoning_effort_source, "native:stdout:reasoning_effort"
+        )
 
     def test_streaming_command_reports_started_process_pid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3102,6 +3364,14 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertIn("/tmp/run-1.log", section)
         self.assertIn("attempt 2 of 3", section)
         self.assertIn("do NOT park", section)
+        self.assertIn("stale evidence only", section)
+        self.assertIn("CURRENT active task lock", section)
+        self.assertIn(
+            'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"', section
+        )
+        self.assertLess(
+            section.index("claim-workspace"), section.index("Finish the slice")
+        )
 
     def test_build_recovery_prompt_section_notes_missing_claim(self) -> None:
         recovery = RecoveryContext(
@@ -3122,6 +3392,8 @@ class TransientWorkerFailureTests(unittest.TestCase):
 
         self.assertIn("No `workspace_claim` record", section)
         self.assertIn("transcript: not captured", section)
+        self.assertIn("Verify the real branch", section)
+        self.assertIn("claim-workspace", section)
 
     def test_serial_loop_recovers_unknown_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4400,7 +4672,7 @@ class AnalysisAgentTests(unittest.TestCase):
                     repo=repo,
                     agent=AgentConfig(
                         command="worker",
-                        analysis_command=f"{stub} {{prompt}}",
+                        analysis_command=f"{stub} --model analysis-model {{prompt}}",
                     ),
                 )
             )
@@ -4413,6 +4685,13 @@ class AnalysisAgentTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(output_path.read_text(encoding="utf-8")),
                 {"decision": "keep", "reason": "active WIP"},
+            )
+            self.assertEqual(
+                runner.last_analysis_runtime_context.model_id, "analysis-model"
+            )
+            self.assertEqual(
+                runner.last_analysis_runtime_context.model_id_source,
+                "command_arg:--model",
             )
 
     def test_run_analysis_agent_returns_none_on_nonzero_exit(self) -> None:
@@ -4573,6 +4852,21 @@ class AgentCommandModelTests(unittest.TestCase):
             f"{shell_quote('inspect repo')}",
         )
 
+    def test_format_agent_command_substitutes_shell_quoted_effort(self) -> None:
+        command = format_agent_command(
+            "worker --effort {effort} {prompt}",
+            prompt="inspect repo",
+            model=None,
+            effort="high",
+            task_id="TASK-01",
+            profile="opus",
+        )
+
+        self.assertEqual(
+            command,
+            f"worker --effort high {shell_quote('inspect repo')}",
+        )
+
     def test_format_agent_command_without_model_field_is_unchanged(self) -> None:
         expected = f"worker {shell_quote('inspect repo')}"
         for model in (None, "opus"):
@@ -4623,6 +4917,50 @@ class AgentCommandModelTests(unittest.TestCase):
 
 
 class SessionIdInjectionTests(unittest.TestCase):
+    def test_codex_structured_output_injection_allows_global_options(self) -> None:
+        self.assertEqual(
+            inject_structured_usage_output(
+                "codex --profile reviewer exec {prompt}", "codex"
+            ),
+            "codex --profile reviewer exec --json {prompt}",
+        )
+        self.assertEqual(
+            inject_structured_usage_output(
+                "MODE=review /usr/bin/codex --model gpt-5 exec {prompt}", "auto"
+            ),
+            "MODE=review /usr/bin/codex --model gpt-5 exec --json {prompt}",
+        )
+
+    def test_worker_usage_provenance_is_allowlisted(self) -> None:
+        report = WorkerReport(
+            run_id="run-1",
+            task_id="TASK-01",
+            status="completed",
+            metadata={"phase": "review", "work_kind": "review"},
+        )
+        malformed = dataclasses.replace(
+            report,
+            metadata={"phase": ["review"], "work_kind": "raw transcript"},
+        )
+
+        self.assertEqual(worker_usage_provenance(report), ("review", "review"))
+        self.assertEqual(worker_usage_provenance(malformed), ("implementation", ""))
+
+    def test_flexible_provider_selection_excludes_pinned_dispatches(self) -> None:
+        task = Task(task_id="TASK-01", title="Telemetry", status="Ready")
+
+        self.assertTrue(provider_selection_is_flexible(AgentConfig(), task))
+        self.assertFalse(
+            provider_selection_is_flexible(
+                dataclasses.replace(AgentConfig(), agent_kind="codex"), task
+            )
+        )
+        self.assertFalse(
+            provider_selection_is_flexible(
+                AgentConfig(), dataclasses.replace(task, model="gpt-pinned")
+            )
+        )
+
     def test_supports_capture_for_default_claude_command(self) -> None:
         self.assertTrue(
             command_supports_session_capture("claude -p {prompt}", "claude")
@@ -4759,6 +5097,1379 @@ class SessionIdInjectionTests(unittest.TestCase):
             runtime_context=AgentRuntimeContext(),
         )
         self.assertNotIn("transcript_path", payload)
+
+    def test_run_context_payload_exposes_public_model_and_effort_aliases(self) -> None:
+        payload = build_run_context_payload(
+            task_id="T-1",
+            run_id="r-1",
+            started_at="2026-01-01T00:00:00Z",
+            session_id="r-1",
+            session_id_source="fallback:run_id",
+            agent_kind="codex",
+            agent_kind_source="explicit",
+            agent_prompt_dialect="codex",
+            agent_prompt_dialect_source="explicit",
+            agent_skill_ref_prefix="$",
+            agent_skill_ref_prefix_source="explicit",
+            runtime_context=AgentRuntimeContext(
+                model_id="gpt-5.4",
+                model_id_source="command_arg:-m",
+                reasoning_effort="high",
+                reasoning_effort_source="command_config:model_reasoning_effort",
+            ),
+        )
+
+        self.assertEqual(payload["model"], "gpt-5.4")
+        self.assertEqual(payload["effort"], "high")
+        self.assertEqual(payload["trailer_context"]["effort"], "high")
+
+
+class RecordingLockManager(LockManager):
+    """Captures the lock metadata visible to the backend at each transition.
+
+    A command lock backend finalizes external run provenance from the lock row
+    it holds at release time, so these snapshots are what such a backend would
+    actually observe.
+    """
+
+    def __init__(self, lock_root: Path) -> None:
+        super().__init__(lock_root)
+        self.events: list[tuple[str, dict[str, object]]] = []
+
+    def update(self, task_lock, metadata):
+        self.events.append(("update", dict(metadata)))
+        return super().update(task_lock, metadata)
+
+    def release(self, task_lock) -> None:
+        task_id = str(task_lock.metadata.get("task_id") or "")
+        # What a backend finalizes on is the stored lock row, not anything the
+        # release call carries.
+        self.events.append(("release", dict(self.status(task_id) or {})))
+        super().release(task_lock)
+
+    def outcome_at_release(self, task_id: str) -> str:
+        for kind, metadata in self.events:
+            if kind == "release" and metadata.get("task_id") == task_id:
+                return str(metadata.get("outcome") or "")
+        return ""
+
+
+class SynchronizedHeartbeatLockManager(LockManager):
+    """Runs a real ``LockManager.heartbeat`` across the settling update.
+
+    The heartbeat is the production one: it reads the lock row, then writes
+    that snapshot back with a fresh ``heartbeat_at``. Here its caller-level read
+    is held before the settling update and its write released after, so it
+    carries the genuinely stale pre-settlement pair - a stored
+    ``outcome=unknown`` / ``classification=unknown`` written by an earlier
+    unsettled publication - into a row the backend has already finalized as
+    completed. The write path still merges against a re-read of the row, so
+    stored precedence is what has to keep the outcome terminal.
+    """
+
+    HEARTBEAT_WAIT_SECONDS = 10.0
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._reads = 0
+        self.read_done = threading.Event()
+        self.settled = threading.Event()
+        self.heartbeat_snapshot: dict[str, object] | None = None
+        self.heartbeat_metadata: dict[str, object] | None = None
+        self.heartbeat_error: BaseException | None = None
+        self.injected = False
+        self._heartbeat = threading.local()
+
+    def _on_heartbeat_thread(self) -> bool:
+        return getattr(self._heartbeat, "active", False)
+
+    def _replay_heartbeat(self, task_lock) -> None:
+        self._heartbeat.active = True
+        try:
+            refreshed = self.heartbeat(
+                task_id=task_lock.task_id,
+                run_id=str(task_lock.metadata.get("run_id") or ""),
+                fencing_token=str(task_lock.metadata.get("fencing_token") or "")
+                or None,
+                heartbeat_at="2026-07-20T00:00:00Z",
+            )
+            self.heartbeat_metadata = dict(refreshed.metadata)
+        except BaseException as exc:  # surfaced by the test, never swallowed
+            self.heartbeat_error = exc
+
+    def current_lock(self, task_id):
+        current = super().current_lock(task_id)
+        if self._on_heartbeat_thread():
+            self._reads += 1
+            if self._reads == 1:
+                # Hold this view of the row until the settling update stored a
+                # terminal outcome, so the write back is unambiguously stale.
+                self.heartbeat_snapshot = dict(current.metadata)
+                self.read_done.set()
+                self.settled.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
+        return current
+
+    def update(self, task_lock, metadata):
+        if self._on_heartbeat_thread() or self.injected:
+            return super().update(task_lock, metadata)
+        if (
+            str(metadata.get("outcome") or "")
+            not in locks_module.TERMINAL_LOCK_OUTCOMES
+        ):
+            return super().update(task_lock, metadata)
+        self.injected = True
+        # Model the row an earlier unsettled publication left behind. It is
+        # written straight through the backend: the manager already knows the
+        # outcome it is about to settle and would restore it.
+        stored = self.current_lock(task_lock.task_id)
+        unsettled = dict(stored.metadata)
+        unsettled["outcome"] = "unknown"
+        unsettled["classification"] = "unknown"
+        self.backend.update(stored, unsettled)
+        thread = threading.Thread(target=self._replay_heartbeat, args=(task_lock,))
+        thread.start()
+        try:
+            self.read_done.wait(timeout=self.HEARTBEAT_WAIT_SECONDS)
+            settled = super().update(task_lock, metadata)
+        finally:
+            self.settled.set()
+            thread.join(timeout=self.HEARTBEAT_WAIT_SECONDS)
+        return settled
+
+
+class ParkedWriteBackend:
+    """Lock backend that parks inside ``update`` once the caller has merged.
+
+    Modelling the racing writer at the backend write - not at its read - is the
+    point: by then it has already decided the exact row it intends to store, so
+    nothing downstream of the merge can repair a stale outcome.
+    """
+
+    WAIT_SECONDS = 10.0
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.at_write = threading.Event()
+        self.proceed = threading.Event()
+
+    def acquire(self, task_id, run_id, metadata=None):
+        return self.inner.acquire(task_id, run_id, metadata=metadata)
+
+    def update(self, task_lock, metadata):
+        self.at_write.set()
+        self.proceed.wait(timeout=self.WAIT_SECONDS)
+        return self.inner.update(task_lock, metadata)
+
+    def release(self, task_lock) -> None:
+        self.inner.release(task_lock)
+
+    def status(self, task_id):
+        return self.inner.status(task_id)
+
+    def list_locks(self):
+        return self.inner.list_locks()
+
+    def path_for(self, task_id):
+        return self.inner.path_for(task_id)
+
+
+MUTEX_PROBE_SOURCE = """
+import fcntl
+import sys
+
+with open(sys.argv[1], "a+b") as handle:
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(3)
+sys.exit(0)
+"""
+
+
+def settlement_mutex_is_free(mutex_path: Path) -> bool:
+    """Report whether another process could take the settlement mutex now.
+
+    The probe is a real separate process taking the real advisory lock, so it
+    answers the only question that matters about the boundary - is it held
+    while the racing writer is mid-update - without depending on elapsed time.
+    """
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            MUTEX_PROBE_SOURCE,
+            str(locks_module.metadata_lock_file_path(mutex_path)),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode not in (0, 3):
+        raise AssertionError(
+            f"settlement mutex probe failed: rc={probe.returncode} {probe.stderr}"
+        )
+    return probe.returncode == 0
+
+
+class ForeignHeartbeatLockManager(LockManager):
+    """Settles while a heartbeat from another process is parked mid-update.
+
+    The racing writer is a separate ``LockManager`` over its own backend
+    instance, the way ``vibe-loop worker heartbeat`` runs it: the settling
+    process shares no memory with it and cannot know what it merged. It is
+    parked after reading the pre-settlement row and merging its stale
+    ``unknown`` pair, immediately before the backend write - the window a
+    backend without compare-and-swap cannot close by row precedence alone.
+    """
+
+    WAIT_SECONDS = 10.0
+
+    def __init__(self, *args, writer_backend: ParkedWriteBackend, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.writer_backend = writer_backend
+        self.writer_metadata: dict[str, object] | None = None
+        self.writer_error: BaseException | None = None
+        self.mutex_free_while_parked: bool | None = None
+        self.mutex_free_after_write: bool | None = None
+        self.injected = False
+
+    def _run_writer(self, task_lock) -> None:
+        writer = LockManager(self.lock_root, backend=self.writer_backend)
+        try:
+            refreshed = writer.heartbeat(
+                task_id=task_lock.task_id,
+                run_id=str(task_lock.metadata.get("run_id") or ""),
+                fencing_token=str(task_lock.metadata.get("fencing_token") or "")
+                or None,
+                heartbeat_at="2026-07-20T00:00:00Z",
+            )
+            self.writer_metadata = dict(refreshed.metadata)
+        except BaseException as exc:  # surfaced by the test, never swallowed
+            self.writer_error = exc
+
+    def update(self, task_lock, metadata):
+        if (
+            self.injected
+            or str(metadata.get("outcome") or "")
+            not in locks_module.TERMINAL_LOCK_OUTCOMES
+        ):
+            return super().update(task_lock, metadata)
+        self.injected = True
+        # The row an earlier unsettled publication left behind, written straight
+        # through the backend so the settling manager's own gate does not see it.
+        stored = self.current_lock(task_lock.task_id)
+        unsettled = dict(stored.metadata)
+        unsettled["outcome"] = "unknown"
+        unsettled["classification"] = "unknown"
+        self.backend.update(stored, unsettled)
+        mutex_path = self.settlement_mutex_path(task_lock.task_id)
+        writer = threading.Thread(target=self._run_writer, args=(task_lock,))
+        writer.start()
+        try:
+            if not self.writer_backend.at_write.wait(timeout=self.WAIT_SECONDS):
+                raise AssertionError(
+                    "the foreign writer never reached its backend write"
+                )
+            # The writer has merged its stale pair and is one instruction from
+            # storing it. Whether settlement can interleave is decided entirely
+            # by whether the boundary is held right now, which another process
+            # can answer outright.
+            self.mutex_free_while_parked = settlement_mutex_is_free(mutex_path)
+        finally:
+            self.writer_backend.proceed.set()
+            writer.join(timeout=self.WAIT_SECONDS)
+        if writer.is_alive():
+            raise AssertionError("the foreign writer never finished its update")
+        self.mutex_free_after_write = settlement_mutex_is_free(mutex_path)
+        # Settlement runs only after the stale write landed, which is the order
+        # the boundary forces on the real supervisor.
+        return super().update(task_lock, metadata)
+
+
+class StubTaskSource:
+    def __init__(self, tasks: list[Task], probe_results: dict[str, Task | None]):
+        self._tasks = tasks
+        self._probe_results = probe_results
+        self._dispatched: set[str] = set()
+        self.probe_calls: list[str] = []
+
+    def list_tasks(self) -> list[Task]:
+        # A dispatched task leaves the runnable set the way a real source does
+        # once the worker moves it out of a runnable status.
+        return [task for task in self._tasks if task.task_id not in self._dispatched]
+
+    def probe(self, task_id: str) -> Task | None:
+        self.probe_calls.append(task_id)
+        return self._probe_results.get(task_id)
+
+    def mark_dispatched(self, task_id: str) -> None:
+        self._dispatched.add(task_id)
+
+
+class SettledOutcomeFinalizationTests(unittest.TestCase):
+    """Regression cover for completed runs finalizing as ``unknown``.
+
+    A worker that files a completed report, has its task marked done and its
+    lock released must settle as ``completed`` in the run record *and* in the
+    lock state the backend sees at release, regardless of whether the enclosing
+    run-until-done process immediately dispatches another task or goes idle.
+    """
+
+    def _build_runner(
+        self,
+        directory: str,
+        tasks: list[Task],
+        probe_results: dict[str, Task | None],
+        supervision: SupervisionConfig | None = None,
+    ) -> tuple[VibeRunner, RecordingLockManager, StubTaskSource]:
+        repo = Path(directory)
+        runner = VibeRunner(
+            VibeConfig(
+                repo=repo,
+                agent=AgentConfig(
+                    command="worker {prompt}",
+                    prompt_dialect="codex",
+                    skill_ref_prefix="$",
+                ),
+                agent_profiles={
+                    "worker": AgentConfig(
+                        command="worker {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                },
+                supervision=supervision or SupervisionConfig(),
+            )
+        )
+        lock_manager = RecordingLockManager(runner.config.state_path / "locks")
+        runner._lock_manager = lock_manager
+        source = StubTaskSource(tasks, probe_results)
+        runner._source = source
+        return runner, lock_manager, source
+
+    def _reporting_worker(
+        self,
+        runner: VibeRunner,
+        status: str,
+        *,
+        exit_code: int = 0,
+        report: bool = True,
+    ):
+        def fake_run(command, cwd, log, **kwargs):
+            env = kwargs.get("env") or {}
+            if report:
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status=status,
+                        message=f"{status} via worker report",
+                    )
+                )
+            on_start = kwargs.get("on_start")
+            if on_start is not None:
+                on_start(os.getpid())
+            return runner_module.StreamingCommandResult(exit_code=exit_code)
+
+        return fake_run
+
+    def _run_task(self, runner: VibeRunner, task: Task, fake_run) -> RunResult:
+        with patch.object(runner, "ensure_spec_execution_gate"):
+            with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                    return runner.run_task(task)
+
+    def test_completed_report_settles_before_lock_release(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+
+            result = self._run_task(
+                runner, task, self._reporting_worker(runner, "completed")
+            )
+
+            self.assertEqual(result.classification, "completed")
+            # The backend that finalizes external run provenance at release
+            # must already see the settled outcome, not infer one afterwards.
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_settled_outcome_published_before_next_dispatch(self) -> None:
+        first = Task(task_id="T-1", title="First", status="Next", agent="worker")
+        second = Task(task_id="T-2", title="Second", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="First", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory,
+                [first, second],
+                {
+                    "T-1": done,
+                    "T-2": Task(
+                        task_id="T-2", title="Second", status="Done", agent="worker"
+                    ),
+                },
+            )
+            dispatched: list[str] = []
+            fake_run = self._reporting_worker(runner, "completed")
+
+            def tracking_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                dispatched.append(task_id)
+                source.mark_dispatched(task_id)
+                if task_id == "T-2":
+                    # The second dispatch must not be able to rewrite or defer
+                    # the first run's already-settled outcome.
+                    self.assertEqual(
+                        lock_manager.outcome_at_release("T-1"), "completed"
+                    )
+                return fake_run(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", tracking_run):
+                        results = runner.run_until_done(continue_on_failure=True)
+
+            self.assertEqual(dispatched[:2], ["T-1", "T-2"])
+            self.assertEqual(results[0].classification, "completed")
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_settled_outcome_survives_idle_after_completion(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+            reporting = self._reporting_worker(runner, "completed")
+
+            def fake_run(command, cwd, log, **kwargs):
+                source.mark_dispatched((kwargs.get("env") or {})["VIBE_LOOP_TASK_ID"])
+                return reporting(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        results = runner.run_until_done()
+
+            # The queue drains to idle right after the completed task; the
+            # settled outcome must not be reopened by the cycle ending.
+            self.assertEqual([item.classification for item in results], ["completed"])
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_terminal_report_statuses_map_to_settled_outcomes(self) -> None:
+        for status, expected in (
+            ("completed", "completed"),
+            ("failed", "failed"),
+            ("blocked", "blocked"),
+            ("unknown", "unknown"),
+        ):
+            with self.subTest(status=status):
+                task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+                with tempfile.TemporaryDirectory() as directory:
+                    runner, lock_manager, _ = self._build_runner(
+                        directory, [task], {"T-1": None}
+                    )
+
+                    result = self._run_task(
+                        runner, task, self._reporting_worker(runner, status)
+                    )
+
+                    self.assertEqual(result.classification, status)
+                    self.assertEqual(lock_manager.outcome_at_release("T-1"), expected)
+
+    def test_missing_report_with_indeterminate_probe_stays_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(
+                directory, [task], {"T-1": None}
+            )
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "completed", report=False),
+            )
+
+            self.assertEqual(result.classification, "unknown")
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "unknown")
+
+    def test_interrupted_run_settles_unknown_not_completed(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+
+            def interrupting_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                        message="reported then interrupted",
+                    )
+                )
+                raise KeyboardInterrupt
+
+            with self.assertRaises(KeyboardInterrupt):
+                self._run_task(runner, task, interrupting_run)
+
+            # A report on disk is not a settled run: the supervisor never
+            # classified this one, so its outcome is genuinely unknown even
+            # though the task source would now probe as done.
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "unknown")
+
+    def test_publish_failure_surfaces_without_losing_the_recorded_result(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(
+                directory, [task], {"T-1": done}
+            )
+            original_update = lock_manager.update
+
+            def failing_update(task_lock, metadata):
+                if "outcome" in metadata:
+                    raise LockBusy(task_lock.path, {"reason": "backend unavailable"})
+                return original_update(task_lock, metadata)
+
+            lock_manager.update = failing_update
+
+            with self.assertRaises(SettledOutcomeNotPersisted):
+                self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
+
+            # The classification is durable before finalization is attempted, so
+            # the failure reports an unfinalized lock rather than losing the run.
+            self.assertEqual(
+                [
+                    record.get("classification")
+                    for record in runner.run_store.read_records()
+                    if record.get("record_type") == "run_result"
+                ],
+                ["completed"],
+            )
+            self.assertIsNotNone(lock_manager.status("T-1"))
+
+    def test_lock_released_event_carries_the_settled_outcome(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            released = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "lock_released"
+            ]
+            self.assertEqual(len(released), 1)
+            # vibe-loop's own provenance must settle on the same outcome it
+            # published to the backend, so both views agree after the fact.
+            self.assertEqual(released[0].get("outcome"), "completed")
+            self.assertEqual(released[0].get("classification"), "completed")
+
+    def test_parallel_jobs_settle_each_run_independently(self) -> None:
+        tasks = [
+            Task(task_id=f"T-{index}", title=f"Task {index}", status="Next")
+            for index in range(1, 5)
+        ]
+        statuses = {"T-1": "completed", "T-2": "blocked", "T-3": "failed"}
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, source = self._build_runner(
+                directory,
+                tasks,
+                {
+                    task.task_id: Task(
+                        task_id=task.task_id, title=task.title, status="Done"
+                    )
+                    for task in tasks
+                },
+            )
+
+            def fake_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                source.mark_dispatched(task_id)
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=task_id,
+                        status=statuses.get(task_id, "unknown"),
+                        message="parallel worker report",
+                    )
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        runner.run_until_done(jobs=2, continue_on_failure=True)
+
+            # Concurrent slots share the supervisor but not their settled
+            # outcomes: no run may inherit or overwrite a sibling's.
+            for task_id, expected in {
+                "T-1": "completed",
+                "T-2": "blocked",
+                "T-3": "failed",
+                "T-4": "unknown",
+            }.items():
+                with self.subTest(task_id=task_id):
+                    self.assertEqual(lock_manager.outcome_at_release(task_id), expected)
+
+    def test_command_lock_backend_receives_outcome_on_the_wire(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            wire_log = repo / "wire.jsonl"
+            adapter = repo / "adapter.py"
+            adapter.write_text(
+                "import json, os, pathlib, sys\n"
+                "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
+                "metadata = json.loads(os.environ['VIBE_LOOP_LOCK_METADATA_JSON'])\n"
+                "log = pathlib.Path(sys.argv[1])\n"
+                "store = log.with_suffix('.state')\n"
+                "log.open('a').write(\n"
+                "    json.dumps({'operation': operation, 'metadata': metadata}) + '\\n'\n"
+                ")\n"
+                "held = json.loads(store.read_text()) if store.exists() else None\n"
+                "if operation == 'list':\n"
+                "    print(json.dumps({'locks': [held] if held else []}))\n"
+                "elif operation == 'status':\n"
+                "    print(json.dumps({'locked': bool(held), 'metadata': held or {}}))\n"
+                "elif operation == 'release':\n"
+                "    store.unlink(missing_ok=True)\n"
+                "    print(json.dumps({'released': True}))\n"
+                "else:\n"
+                "    store.write_text(json.dumps(metadata))\n"
+                "    print(json.dumps({'acquired': True, 'metadata': metadata}))\n"
+            )
+            command = f"{sys.executable} {adapter} {wire_log}"
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            runner._lock_manager = LockManager(
+                runner.config.state_path / "locks",
+                backend=locks_module.CommandLockBackend(
+                    repo=repo,
+                    lock_root=runner.config.state_path / "locks",
+                    acquire_command=command,
+                    release_command=command,
+                    status_command=command,
+                    list_command=command,
+                ),
+            )
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            calls = [
+                json.loads(line)
+                for line in wire_log.read_text().splitlines()
+                if line.strip()
+            ]
+            # The defect lived on this wire: the backend that finalizes run
+            # provenance must be handed the outcome by an update it persists,
+            # before the release it finalizes on.
+            operations = [call["operation"] for call in calls]
+            last_update = max(
+                index
+                for index, operation in enumerate(operations)
+                if operation == "update"
+            )
+            release_index = operations.index("release")
+            self.assertLess(last_update, release_index)
+            self.assertEqual(calls[last_update]["metadata"].get("outcome"), "completed")
+
+    def _provenance_adapter(self, root: Path) -> str:
+        """A command lock adapter that mirrors run provenance, as Loopyard does.
+
+        It opens an external run at acquire and finalizes that run at release
+        from the lock row it has already stored. Release-time metadata is
+        deliberately discarded, matching the verified backend constraint that
+        ``lock_wire_release`` persists nothing: only a prior update can settle
+        the run, and an outcome that never reached the stored row stays
+        ``unknown`` - which is exactly the reproduced defect.
+
+        Touching ``fail_update`` under the state directory makes every outcome
+        update fail, standing in for a backend that rejects the settling write.
+        """
+
+        adapter = root / "provenance_adapter.py"
+        adapter.write_text(
+            "import json, os, pathlib, sys\n"
+            "operation = os.environ['VIBE_LOOP_LOCK_OPERATION']\n"
+            "task_id = os.environ['VIBE_LOOP_LOCK_TASK_ID']\n"
+            "run_id = os.environ['VIBE_LOOP_LOCK_RUN_ID']\n"
+            "metadata = json.loads(os.environ['VIBE_LOOP_LOCK_METADATA_JSON'])\n"
+            "root = pathlib.Path(sys.argv[1])\n"
+            "root.mkdir(parents=True, exist_ok=True)\n"
+            "held_path = root / (task_id + '.held.json')\n"
+            "runs_path = root / 'runs.json'\n"
+            "runs = json.loads(runs_path.read_text()) if runs_path.exists() else {}\n"
+            "held = json.loads(held_path.read_text()) if held_path.exists() else None\n"
+            "if operation == 'list':\n"
+            "    locks = [json.loads(p.read_text())\n"
+            "             for p in sorted(root.glob('*.held.json'))]\n"
+            "    print(json.dumps({'locks': locks}))\n"
+            "elif operation == 'status':\n"
+            "    print(json.dumps({'locked': bool(held), 'metadata': held or {}}))\n"
+            "elif operation == 'release':\n"
+            "    outcome = (held or {}).get('outcome') or 'unknown'\n"
+            "    record = runs.get(run_id) or {'task_id': task_id}\n"
+            "    record['outcome'] = outcome\n"
+            "    runs[run_id] = record\n"
+            "    runs_path.write_text(json.dumps(runs))\n"
+            "    held_path.unlink(missing_ok=True)\n"
+            "    print(json.dumps({'released': True}))\n"
+            "elif (operation == 'update' and metadata.get('outcome')\n"
+            "      and (root / 'fail_update').exists()):\n"
+            "    sys.stderr.write('outcome update rejected')\n"
+            "    print(json.dumps({'updated': False}))\n"
+            "else:\n"
+            "    runs.setdefault(run_id, {'task_id': task_id, 'outcome': 'unknown'})\n"
+            "    runs_path.write_text(json.dumps(runs))\n"
+            "    held_path.write_text(json.dumps(metadata))\n"
+            "    print(json.dumps({'acquired': True, 'metadata': metadata}))\n"
+        )
+        return f"{sys.executable} {adapter} {root / 'state'}"
+
+    @staticmethod
+    def _external_outcomes(root: Path) -> dict[str, str]:
+        runs_path = root / "state" / "runs.json"
+        if not runs_path.exists():
+            return {}
+        records = json.loads(runs_path.read_text())
+        return {
+            str(record["task_id"]): str(record["outcome"])
+            for record in records.values()
+        }
+
+    def _attach_provenance_backend(self, runner: VibeRunner, root: Path) -> None:
+        command = self._provenance_adapter(root)
+        runner._lock_manager = LockManager(
+            runner.config.state_path / "locks",
+            backend=locks_module.CommandLockBackend(
+                repo=root,
+                lock_root=runner.config.state_path / "locks",
+                acquire_command=command,
+                release_command=command,
+                status_command=command,
+                list_command=command,
+            ),
+        )
+
+    def test_command_backend_finalizes_completed_across_next_dispatch(self) -> None:
+        first = Task(task_id="T-1", title="First", status="Next", agent="worker")
+        second = Task(task_id="T-2", title="Second", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, source = self._build_runner(
+                directory,
+                [first, second],
+                {
+                    task_id: Task(task_id=task_id, title=task_id, status="Done")
+                    for task_id in ("T-1", "T-2")
+                },
+            )
+            self._attach_provenance_backend(runner, root)
+            reporting = self._reporting_worker(runner, "completed")
+
+            def fake_run(command, cwd, log, **kwargs):
+                source.mark_dispatched((kwargs.get("env") or {})["VIBE_LOOP_TASK_ID"])
+                return reporting(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        results = runner.run_until_done(continue_on_failure=True)
+
+            self.assertEqual(
+                [result.classification for result in results[:2]],
+                ["completed", "completed"],
+            )
+            # The external provenance store - not the command text - is the
+            # evidence: dispatching the next task must not leave the finished
+            # run finalized as unknown.
+            self.assertEqual(
+                self._external_outcomes(root),
+                {"T-1": "completed", "T-2": "completed"},
+            )
+
+    def test_command_backend_finalizes_completed_when_cycle_goes_idle(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, source = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            reporting = self._reporting_worker(runner, "completed")
+
+            def fake_run(command, cwd, log, **kwargs):
+                source.mark_dispatched((kwargs.get("env") or {})["VIBE_LOOP_TASK_ID"])
+                return reporting(command, cwd, log, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                        results = runner.run_until_done(continue_on_failure=True)
+
+            self.assertEqual(results[0].classification, "completed")
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    def test_command_backend_update_failure_blocks_unknown_finalizing_release(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "fail_update").write_text("")
+
+            with self.assertRaises(SettledOutcomeNotPersisted) as raised:
+                self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
+
+            self.assertEqual(raised.exception.outcome, "completed")
+            # Releasing here is what produced completed-locally /
+            # unknown-externally: the backend discards release metadata, so an
+            # unsettled row can only finalize as unknown. No release may happen.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            held = runner.lock_manager.status("T-1")
+            self.assertIsNotNone(held)
+            self.assertNotEqual(held.get("outcome"), "completed")
+            records = runner.run_store.read_records()
+            events = [
+                record
+                for record in records
+                if record.get("record_type")
+                in {"lock_released", "lock_finalization_failed"}
+            ]
+            self.assertEqual(
+                [event["record_type"] for event in events],
+                ["lock_finalization_failed"],
+            )
+            self.assertIs(events[0]["released"], False)
+            self.assertEqual(events[0]["outcome"], "completed")
+            # The run itself still classified correctly; only finalization failed.
+            classifications = [
+                record["classification"]
+                for record in records
+                if record.get("record_type") == "run_result"
+            ]
+            self.assertEqual(classifications, ["completed"])
+
+    def test_stale_cleanup_cannot_finalize_a_retained_lock_as_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "fail_update").write_text("")
+
+            with self.assertRaises(SettledOutcomeNotPersisted):
+                self._run_task(
+                    runner, task, self._reporting_worker(runner, "completed")
+                )
+
+            def collect() -> list[StaleLock]:
+                return collect_stale_locks(
+                    runner.lock_manager,
+                    runner.run_store,
+                    process_exists=lambda pid: False,
+                )
+
+            stale = collect()
+            self.assertEqual([lock.task_id for lock in stale], ["T-1"])
+            # The run is durably completed locally, so the operator recovery path
+            # must carry that verdict rather than releasing the row it collected.
+            self.assertEqual(stale[0].settled_outcome, "completed")
+
+            blocked = clean_stale_locks(stale, runner.lock_manager)
+            self.assertEqual(blocked.cleaned, [])
+            self.assertEqual([lock.task_id for lock, _ in blocked.errors], ["T-1"])
+            # Republication still fails, so refusing the release is the only way
+            # to keep provenance from finalizing this run against its own result.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            self.assertIsNotNone(runner.lock_manager.status("T-1"))
+
+            (root / "state" / "fail_update").unlink()
+            recovered = clean_stale_locks(collect(), runner.lock_manager)
+            self.assertEqual(recovered.errors, [])
+            self.assertEqual([lock.task_id for lock in recovered.cleaned], ["T-1"])
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+            self.assertIsNone(runner.lock_manager.status("T-1"))
+
+    def test_stale_cleanup_falls_back_when_failure_event_append_fails(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            (root / "state").mkdir(parents=True, exist_ok=True)
+            (root / "state" / "fail_update").write_text("")
+            append_event = runner.run_store.append_lifecycle_event
+
+            def append_except_finalization_failure(event) -> None:
+                if event.record_type == LOCK_FINALIZATION_FAILED_RECORD_TYPE:
+                    raise OSError("injected lifecycle append failure")
+                append_event(event)
+
+            with patch.object(
+                runner.run_store,
+                "append_lifecycle_event",
+                side_effect=append_except_finalization_failure,
+            ):
+                with self.assertRaisesRegex(
+                    OSError, "injected lifecycle append failure"
+                ):
+                    self._run_task(
+                        runner, task, self._reporting_worker(runner, "completed")
+                    )
+
+            records = runner.run_store.read_records()
+            self.assertEqual(
+                [
+                    record["classification"]
+                    for record in records
+                    if record.get("record_type") == "run_result"
+                ],
+                ["completed"],
+            )
+            self.assertNotIn(
+                LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+                [record.get("record_type") for record in records],
+            )
+
+            def collect() -> list[StaleLock]:
+                return collect_stale_locks(
+                    runner.lock_manager,
+                    runner.run_store,
+                    process_exists=lambda pid: False,
+                )
+
+            stale = collect()
+            self.assertEqual([lock.settled_outcome for lock in stale], ["completed"])
+
+            blocked = clean_stale_locks(stale, runner.lock_manager)
+            self.assertEqual(blocked.cleaned, [])
+            self.assertEqual([lock.task_id for lock, _ in blocked.errors], ["T-1"])
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            self.assertIsNotNone(runner.lock_manager.status("T-1"))
+
+            (root / "state" / "fail_update").unlink()
+            recovered = clean_stale_locks(collect(), runner.lock_manager)
+            self.assertEqual(recovered.errors, [])
+            self.assertEqual([lock.task_id for lock in recovered.cleaned], ["T-1"])
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+            self.assertIsNone(runner.lock_manager.status("T-1"))
+
+    @staticmethod
+    def _external_run_outcomes(root: Path) -> dict[str, str]:
+        runs_path = root / "state" / "runs.json"
+        if not runs_path.exists():
+            return {}
+        records = json.loads(runs_path.read_text())
+        return {run_id: str(record["outcome"]) for run_id, record in records.items()}
+
+    def test_command_backend_survives_a_stale_heartbeat_before_release(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            command_backend = runner.lock_manager.backend
+            manager = SynchronizedHeartbeatLockManager(
+                runner.config.state_path / "locks",
+                backend=command_backend,
+            )
+            runner._lock_manager = manager
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            self.assertTrue(manager.injected)
+            self.assertIsNone(manager.heartbeat_error)
+            snapshot = manager.heartbeat_snapshot or {}
+            self.assertEqual(snapshot.get("outcome"), "unknown")
+            self.assertEqual(snapshot.get("classification"), "unknown")
+            # The heartbeat really did carry the stale unsettled pair into the
+            # row after settlement; precedence, not absence, is what keeps the
+            # stored outcome terminal for the backend that finalizes on release.
+            self.assertEqual(
+                (manager.heartbeat_metadata or {}).get("outcome"), "completed"
+            )
+            self.assertEqual(
+                (manager.heartbeat_metadata or {}).get("classification"), "completed"
+            )
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    @unittest.skipIf(
+        locks_module.fcntl is None,
+        "the out-of-process mutex probe is written against flock",
+    )
+    def test_command_backend_orders_settlement_after_a_parked_foreign_write(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+            command_backend = runner.lock_manager.backend
+            writer_backend = ParkedWriteBackend(
+                locks_module.CommandLockBackend(
+                    repo=root,
+                    lock_root=runner.config.state_path / "locks",
+                    acquire_command=self._provenance_adapter(root),
+                    release_command=self._provenance_adapter(root),
+                    status_command=self._provenance_adapter(root),
+                    list_command=self._provenance_adapter(root),
+                )
+            )
+            manager = ForeignHeartbeatLockManager(
+                runner.config.state_path / "locks",
+                backend=command_backend,
+                writer_backend=writer_backend,
+            )
+            runner._lock_manager = manager
+
+            self._run_task(runner, task, self._reporting_worker(runner, "completed"))
+
+            self.assertTrue(manager.injected)
+            self.assertIsNone(manager.writer_error)
+            # A separate process could not take the boundary while the foreign
+            # writer was parked with its stale row merged, and could once that
+            # write had landed. No settlement can interleave with that window.
+            self.assertIs(manager.mutex_free_while_parked, False)
+            self.assertIs(manager.mutex_free_after_write, True)
+            # The foreign heartbeat did store its stale pair - it was parked
+            # holding it, so nothing could rewrite it - which is why ordering,
+            # not row precedence, has to be what keeps the run settled.
+            self.assertEqual((manager.writer_metadata or {}).get("outcome"), "unknown")
+            self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
+
+    def test_command_backend_publishes_nothing_without_a_durable_result(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            self._attach_provenance_backend(runner, root)
+
+            with patch.object(
+                runner, "record_result", side_effect=OSError("run store full")
+            ):
+                with self.assertRaises(OSError):
+                    self._run_task(
+                        runner, task, self._reporting_worker(runner, "completed")
+                    )
+
+            # External provenance may never claim a completion vibe-loop itself
+            # failed to record: with no durable RunResult there is nothing for
+            # the two stores to agree on, so the run stays honestly unknown.
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+            classifications = [
+                record["classification"]
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_result"
+            ]
+            self.assertEqual(classifications, [])
+
+    def test_command_backend_settles_exhausted_recovery_as_failed(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The task stays runnable through every attempt, so each run
+            # classifies unknown and recovery burns its single attempt.
+            runner, _, _ = self._build_runner(
+                directory,
+                [task],
+                {"T-1": task},
+                supervision=SupervisionConfig(max_restarts=1, cooldown_seconds=0),
+            )
+            self._attach_provenance_backend(runner, root)
+            worker = self._reporting_worker(runner, "completed", report=False)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch("vibe_loop.runner.run_streaming_command", worker):
+                        first = runner.run_task(task)
+                        results: list[RunResult] = []
+                        terminal = runner.drive_unknown_recovery(
+                            first, attempts={}, results=results
+                        )
+
+            self.assertEqual(first.classification, "unknown")
+            self.assertEqual(terminal.classification, "failed")
+            self.assertEqual(
+                terminal.classification_source, "recovery_budget_exhausted"
+            )
+            self.assertNotEqual(terminal.run_id, first.run_id)
+            external = self._external_run_outcomes(root)
+            # Task runs and worklog must settle together: the supervisor calls
+            # the final run failed, so external provenance may not keep it
+            # unknown just because the exhaustion verdict lands after release.
+            self.assertEqual(external.get(terminal.run_id), "failed")
+            self.assertEqual(external.get(first.run_id), "unknown")
+            recorded = [
+                record["classification"]
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_result"
+                and record.get("run_id") == terminal.run_id
+            ]
+            # The exhausting run recorded the verdict before releasing its lock
+            # and the recovery driver reused it: one durable terminal result.
+            self.assertEqual(recorded, ["unknown", "failed"])
+
+    def test_command_backend_keeps_a_timed_out_final_attempt_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(
+                directory,
+                [task],
+                {"T-1": task},
+                supervision=SupervisionConfig(max_restarts=1, cooldown_seconds=0),
+            )
+            self._attach_provenance_backend(runner, root)
+            recovery = runner_module.RecoveryContext(
+                task_id="T-1",
+                prior_run_id="prior",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log="",
+                attempt=1,
+                max_attempts=1,
+                workspace_claimed=False,
+            )
+
+            def timing_out_worker(command, cwd, log, **kwargs):
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=143, timed_out=True
+                )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                    with patch(
+                        "vibe_loop.runner.run_streaming_command", timing_out_worker
+                    ):
+                        result = runner.run_task(task, recovery=recovery)
+
+            # A timed_out run never re-enters recovery, so no exhaustion verdict
+            # is ever recorded for it. Publishing failed here would leave the
+            # external run terminal while the run store still says timed_out.
+            self.assertEqual(result.classification, "timed_out")
+            self.assertEqual(
+                self._external_run_outcomes(root).get(result.run_id), "unknown"
+            )
+
+    def test_command_backend_keeps_unsettled_runs_unknown(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": None})
+            self._attach_provenance_backend(runner, root)
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "completed", report=False),
+            )
+
+            self.assertNotEqual(result.classification, "completed")
+            self.assertEqual(self._external_outcomes(root), {"T-1": "unknown"})
+
+
+class SettledRunOutcomeTests(unittest.TestCase):
+    def test_settling_classifications_map_through(self) -> None:
+        for classification in ("completed", "failed", "blocked"):
+            with self.subTest(classification=classification):
+                self.assertEqual(settled_run_outcome(classification), classification)
+
+    def test_non_settling_classifications_are_unknown(self) -> None:
+        for classification in ("unknown", "timed_out", "limit_wall", "", "weird"):
+            with self.subTest(classification=classification):
+                self.assertEqual(settled_run_outcome(classification), "unknown")
+
+    def test_every_run_classification_settles_within_the_outcome_family(self) -> None:
+        # A backend that stores one terminal outcome per run rejects anything
+        # outside this family, so no classification may escape the mapping.
+        for classification in (
+            "completed",
+            "failed",
+            "blocked",
+            "unknown",
+            "timed_out",
+            "limit_wall",
+        ):
+            with self.subTest(classification=classification):
+                self.assertIn(settled_run_outcome(classification), SETTLED_RUN_OUTCOMES)
+
+
+class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
+    """Regression cover for run
+    20260720T214201Z-hyphen-adjacent-generation-redaction-3d23bf62, where a
+    generic JSON `model` value was recorded as the run's model identity."""
+
+    def test_generic_json_model_value_is_not_a_model_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model": "task", "status": "queued"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "")
+        self.assertEqual(context.model_id_source, "")
+
+    def test_nested_generic_model_key_is_not_scraped_from_json_text(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "item.completed", "item": {"model": "task"}}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "")
+
+    def test_codex_session_event_still_supplies_model_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "session.created", "model": "gpt-5.6-sol"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "gpt-5.6-sol")
+        self.assertEqual(context.model_id_source, "native:stdout:json.model")
+
+    def test_claude_init_event_still_supplies_model_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {"type": "system", "subtype": "init", "model": "claude-opus-4-8"}
+            ),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "claude-opus-4-8")
+
+    def test_structured_model_mapping_retains_existing_precedence(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model": {"provider": "openai", "id": "gpt-5.5"}}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_provider, "openai")
+        self.assertEqual(context.model_id, "gpt-5.5")
+
+    def test_explicit_model_id_field_retains_existing_precedence(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model_id": "gpt-5.5"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "gpt-5.5")
+
+    def test_malformed_model_value_fails_closed_to_unknown(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "session.created", "model": "gpt 5.6\tsol"}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_id, "")
+        self.assertEqual(context.model_id_source, "")
+
+    def test_generic_text_cannot_establish_codex_or_claude_identity(self) -> None:
+        observed = parse_agent_runtime_context_from_line(
+            "worker note: provider=value model=task",
+            "stdout",
+        )
+
+        self.assertTrue(observed.empty)
+        for command, expected_provider in (
+            ("codex exec --json", "openai"),
+            ("claude --output-format stream-json", "anthropic"),
+        ):
+            with self.subTest(command=command):
+                effective = parse_agent_runtime_context_from_command(command).prefer(
+                    observed
+                )
+                self.assertEqual(effective.model_provider, expected_provider)
+                self.assertEqual(effective.model_id, "")
+
+    def test_claude_init_resolves_command_model_alias(self) -> None:
+        command_context = parse_agent_runtime_context_from_command(
+            "claude --model opus"
+        )
+        init_context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {"type": "system", "subtype": "init", "model": "claude-opus-4-8"}
+            ),
+            "stdout",
+        )
+        assistant_context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": "provider=value model=task"},
+                }
+            ),
+            "stdout",
+        )
+
+        effective = command_context.prefer(init_context).prefer(assistant_context)
+
+        self.assertEqual(effective.model_provider, "anthropic")
+        self.assertEqual(effective.model_id, "claude-opus-4-8")
+        self.assertEqual(effective.model_id_source, "native:stdout:json.model")
+
+    def test_structured_native_provider_refines_executable_inference(self) -> None:
+        command_context = parse_agent_runtime_context_from_command("codex exec")
+        observed = parse_agent_runtime_context_from_line(
+            json.dumps({"model": {"provider": "openai", "id": "gpt-5.6-sol"}}),
+            "stdout",
+        )
+
+        effective = command_context.prefer(observed)
+
+        self.assertEqual(effective.model_id, "gpt-5.6-sol")
+        self.assertEqual(effective.model_id_source, "native:stdout:json.model")
+        self.assertEqual(effective.model_provider, "openai")
+        self.assertEqual(
+            effective.model_provider_source, "native:stdout:json.model_provider"
+        )
+
+    def test_same_value_structured_event_upgrades_weak_source(self) -> None:
+        weak = AgentRuntimeContext(
+            model_id="gpt-5.6-sol",
+            model_id_source="native:stdout:model",
+        )
+        strong = parse_agent_runtime_context_from_line(
+            json.dumps({"type": "session.created", "model": "gpt-5.6-sol"}),
+            "stdout",
+        )
+
+        delta = weak.missing_delta(strong)
+
+        merged = weak.overlay(delta)
+        self.assertEqual(delta.model_id, "gpt-5.6-sol")
+        self.assertEqual(delta.model_id_source, "native:stdout:json.model")
+        self.assertEqual(merged.model_id, "gpt-5.6-sol")
+        self.assertEqual(merged.model_id_source, "native:stdout:json.model")
 
 
 if __name__ == "__main__":

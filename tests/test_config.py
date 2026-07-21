@@ -14,6 +14,8 @@ from vibe_loop.config import (
     SUPERVISION_DEFAULT_MAX_RESTARTS,
     SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
     VibeConfig,
+    agent_command_provider,
+    command_embeds_native_effort,
     detect_agent_clis,
     load_config,
     normalize_registry_runtime_context,
@@ -661,6 +663,141 @@ class ConfigTests(unittest.TestCase):
                         load_config(repo)
                     self.assertIn(expected, str(caught.exception))
 
+    def test_autopilot_disk_reserve_parses_and_exposes_effective_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot.disk_reserve]\n"
+                "min_free_bytes = 8589934592\n"
+                "min_free_fraction = 0.05\n"
+                "min_free_inodes = 50000\n"
+                "min_free_inode_fraction = 0.03\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        reserve = config.autopilot.disk_reserve
+        self.assertEqual(reserve.min_free_bytes, 8589934592)
+        self.assertEqual(reserve.min_free_fraction, 0.05)
+        self.assertEqual(reserve.min_free_inodes, 50000)
+        self.assertEqual(reserve.min_free_inode_fraction, 0.03)
+        payload = config.autopilot.to_json()["disk_reserve"]
+        self.assertEqual(payload["min_free_bytes"], 8589934592)
+        self.assertEqual(payload["min_free_fraction"], 0.05)
+        self.assertEqual(payload["effective"]["min_free_bytes"], 8589934592)
+        self.assertEqual(payload["effective"]["min_free_inodes"], 50000)
+        self.assertEqual(
+            sorted(payload["explicit_keys"]),
+            [
+                "min_free_bytes",
+                "min_free_fraction",
+                "min_free_inode_fraction",
+                "min_free_inodes",
+            ],
+        )
+        # Effective floors resolve overrides for the runtime and doctor output.
+        self.assertEqual(reserve.effective_min_free_bytes, 8589934592)
+        self.assertEqual(reserve.effective_min_free_inode_fraction, 0.03)
+
+    def test_autopilot_disk_reserve_defaults_to_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        reserve = config.autopilot.disk_reserve
+        self.assertIsNone(reserve.min_free_bytes)
+        self.assertIsNone(reserve.min_free_fraction)
+        self.assertIsNone(reserve.min_free_inodes)
+        self.assertIsNone(reserve.min_free_inode_fraction)
+        self.assertEqual(reserve.explicit_keys, frozenset())
+        # Unset overrides resolve to the native AUTO-15 defaults.
+        self.assertEqual(reserve.effective_min_free_bytes, 512 * 1024 * 1024)
+        self.assertEqual(reserve.effective_min_free_fraction, 0.02)
+        self.assertEqual(reserve.effective_min_free_inodes, 10_000)
+        self.assertEqual(reserve.effective_min_free_inode_fraction, 0.02)
+
+    def test_autopilot_disk_reserve_rejects_invalid_values(self) -> None:
+        cases = [
+            (
+                "min_free_bytes = -1\n",
+                "autopilot.disk_reserve.min_free_bytes",
+            ),
+            (
+                'min_free_bytes = "lots"\n',
+                "autopilot.disk_reserve.min_free_bytes",
+            ),
+            (
+                "min_free_fraction = -0.1\n",
+                "autopilot.disk_reserve.min_free_fraction",
+            ),
+            (
+                "min_free_fraction = 1.5\n",
+                "autopilot.disk_reserve.min_free_fraction must be between 0.0 and 1.0",
+            ),
+            (
+                "min_free_fraction = nan\n",
+                "autopilot.disk_reserve.min_free_fraction must be finite",
+            ),
+            (
+                "min_free_inodes = -5\n",
+                "autopilot.disk_reserve.min_free_inodes",
+            ),
+            (
+                "unsupported = 1\n",
+                "autopilot.disk_reserve contains unsupported keys: unsupported",
+            ),
+            (
+                "min_free_bytes = 8589934592\nmin_free_fraction = 0.0\n",
+                "are contradictory",
+            ),
+            (
+                "min_free_inodes = 0\nmin_free_inode_fraction = 0.02\n",
+                "are contradictory",
+            ),
+            # A lone explicit zero silently disables an axis against a positive
+            # native default; the resolved effective pair must be rejected.
+            (
+                "min_free_fraction = 0.0\n",
+                "are contradictory",
+            ),
+            (
+                "min_free_bytes = 0\n",
+                "are contradictory",
+            ),
+            (
+                "min_free_inode_fraction = 0.0\n",
+                "are contradictory",
+            ),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[autopilot.disk_reserve]\n" + toml,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        load_config(repo)
+                    self.assertIn(expected, str(caught.exception))
+
+    def test_autopilot_disk_reserve_allows_fully_disabled_axis(self) -> None:
+        # Both floors of an axis set to zero is a consistent (fully disabled)
+        # configuration, not a contradiction.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot.disk_reserve]\n"
+                "min_free_bytes = 0\n"
+                "min_free_fraction = 0.0\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.autopilot.disk_reserve.min_free_bytes, 0)
+        self.assertEqual(config.autopilot.disk_reserve.min_free_fraction, 0.0)
+
     def test_autopilot_maintenance_keys_are_forbidden_in_generated_profiles(
         self,
     ) -> None:
@@ -803,6 +940,23 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.supervision.explicit_keys, frozenset())
 
+    def test_supervision_config_slice_token_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            default = load_config(repo)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\nslice_token_threshold = 250000\n",
+                encoding="utf-8",
+            )
+            overridden = load_config(repo)
+
+        self.assertEqual(default.supervision.slice_token_threshold, 100000)
+        self.assertEqual(overridden.supervision.slice_token_threshold, 250000)
+        self.assertEqual(
+            overridden.supervision.to_json()["slice_token_threshold"], 250000
+        )
+        self.assertIn("slice_token_threshold", overridden.supervision.explicit_keys)
+
     def test_supervision_config_parses_worker_timeout_override(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -831,6 +985,7 @@ class ConfigTests(unittest.TestCase):
     def test_supervision_config_rejects_invalid_values(self) -> None:
         cases = [
             ("max_restarts = -1\n", "supervision.max_restarts"),
+            ("slice_token_threshold = -1\n", "supervision.slice_token_threshold"),
             (
                 "worker_timeout_seconds = -1\n",
                 "supervision.worker_timeout_seconds",
@@ -1595,6 +1750,114 @@ class AgentProfileRoutingTests(unittest.TestCase):
             "claude -p --model {model} {prompt}",
         )
 
+    def test_kind_defaults_include_configured_effort(self) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\nmodel = "gpt-5.4"\neffort = "xhigh"\n\n'
+            "[agent.profiles.opus]\n"
+            'kind = "claude"\n'
+            'model = "opus"\n'
+            'effort = "high"\n'
+        )
+
+        self.assertEqual(config.agent.effort, "xhigh")
+        self.assertEqual(config.agent.effort_source, "explicit")
+        self.assertEqual(
+            config.agent.command,
+            "codex exec -c model_reasoning_effort={effort} -m {model} {prompt}",
+        )
+        self.assertEqual(config.agent_profiles["opus"].effort, "high")
+        self.assertEqual(config.agent_profiles["opus"].effort_source, "explicit")
+        self.assertEqual(
+            config.agent_profiles["opus"].command,
+            "claude -p --effort {effort} --model {model} {prompt}",
+        )
+
+    def test_effort_rejects_unknown_and_provider_incompatible_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "agent.effort must be one of"):
+            self._load_with_both_clis('[agent]\neffort = "turbo"\n')
+
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "claude"\neffort = "xhigh"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "not supported by claude"):
+            config.agent.require_command()
+
+    def test_explicit_effort_commands_require_placeholder_without_conflict(
+        self,
+    ) -> None:
+        conflict = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\neffort = "high"\n'
+            'command = "codex exec -c model_reasoning_effort=high {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "already embeds"):
+            conflict.agent.require_command()
+
+        missing = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "high"\n'
+            'command = "worker {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "cannot receive"):
+            missing.agent.require_command()
+
+        placeholder = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "high"\n'
+            'command = "worker --effort {effort} {prompt}"\n'
+        )
+        self.assertEqual(
+            placeholder.agent.require_command(), "worker --effort {effort} {prompt}"
+        )
+        self.assertEqual(placeholder.agent.to_json()["effort"], "high")
+
+    def test_recognizable_executable_outranks_kind_for_effort_compat(self) -> None:
+        # Finding 1 (P1): a Codex kind with an explicit Claude command must be
+        # validated against Claude, not the declared kind, so an xhigh value
+        # unsupported by Claude fails closed instead of launching Claude with it.
+        mislabeled = self._load_with_both_clis(
+            '[agent]\nkind = "codex"\neffort = "xhigh"\n'
+            'command = "claude -p --effort {effort} {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "not supported by claude"):
+            mislabeled.agent.require_command()
+
+        # The inverse must not reject a valid Codex command that a Claude kind
+        # mislabels: Codex accepts xhigh, so the recognized executable wins.
+        inverse = self._load_with_both_clis(
+            '[agent]\nkind = "claude"\neffort = "xhigh"\n'
+            "command = "
+            '"codex exec -c model_reasoning_effort={effort} {prompt}"\n'
+        )
+        self.assertEqual(
+            inverse.agent.require_command(),
+            "codex exec -c model_reasoning_effort={effort} {prompt}",
+        )
+
+        # An unrecognized custom executable fails closed: no provider identity is
+        # invented, so provider-specific validation is skipped and the delivered
+        # placeholder command stands.
+        self.assertEqual(
+            agent_command_provider("mywrapper --effort {effort}", "codex"), ""
+        )
+        custom = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "xhigh"\n'
+            'command = "mywrapper --effort {effort} {prompt}"\n'
+        )
+        self.assertEqual(
+            custom.agent.require_command(), "mywrapper --effort {effort} {prompt}"
+        )
+
+    def test_duplicate_effort_flag_after_placeholder_is_rejected(self) -> None:
+        # Finding 2 (P2): a later fixed effort flag must be detected even when a
+        # placeholder flag appears first; the scan must not short-circuit.
+        self.assertTrue(
+            command_embeds_native_effort("worker --effort {effort} --effort low")
+        )
+        conflict = self._load_with_both_clis(
+            '[agent]\nkind = "custom"\nprompt_dialect = "codex"\neffort = "high"\n'
+            'command = "worker --effort {effort} --effort low {prompt}"\n'
+        )
+        with self.assertRaisesRegex(AgentResolutionError, "already embeds"):
+            conflict.agent.require_command()
+
     def test_profile_resolves_command_through_kind_defaults(self) -> None:
         config = self._load_with_both_clis(
             '[agent]\nkind = "codex"\n\n[agent.profiles.opus]\nkind = "claude"\n'
@@ -1715,7 +1978,8 @@ class AgentProfileRoutingTests(unittest.TestCase):
         config = self._load_with_both_clis(
             '[agent]\nkind = "codex"\n\n'
             "[agent.profiles.opus]\n"
-            'kind = "claude"\n\n'
+            'kind = "claude"\n'
+            'effort = "high"\n\n'
             "[[agent.routing]]\n"
             'profile = "opus"\n'
             'match_hazards_any = ["abi"]\n'
@@ -1724,7 +1988,11 @@ class AgentProfileRoutingTests(unittest.TestCase):
         default = Task(task_id="D", title="t", status="Next")
         routed_selection = resolve_task_agent(config, routed)
         self.assertEqual(routed_selection.profile, "opus")
-        self.assertEqual(routed_selection.config.command, "claude -p {prompt}")
+        self.assertEqual(
+            routed_selection.config.command,
+            "claude -p --effort {effort} {prompt}",
+        )
+        self.assertEqual(routed_selection.config.effort, "high")
         default_selection = resolve_task_agent(config, default)
         self.assertEqual(default_selection.profile, "")
         self.assertEqual(default_selection.config.command, "codex exec {prompt}")
@@ -1758,7 +2026,8 @@ class AgentProfileRoutingTests(unittest.TestCase):
     def test_task_only_model_updates_inferred_but_not_explicit_command(self) -> None:
         config = self._load_with_both_clis(
             "[agent.profiles.inferred]\n"
-            'kind = "claude"\n\n'
+            'kind = "claude"\n'
+            'effort = "high"\n\n'
             "[agent.profiles.explicit]\n"
             'kind = "claude"\n'
             'command = "worker {prompt}"\n'
@@ -1787,8 +2056,9 @@ class AgentProfileRoutingTests(unittest.TestCase):
 
         self.assertEqual(
             inferred.config.command,
-            "claude -p --model {model} {prompt}",
+            "claude -p --effort {effort} --model {model} {prompt}",
         )
+        self.assertEqual(inferred.config.effort, "high")
         self.assertEqual(explicit.config.command, "worker {prompt}")
 
     def test_resolve_task_agent_unknown_profile_fails_closed(self) -> None:

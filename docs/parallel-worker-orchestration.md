@@ -1,5 +1,13 @@
 # Parallel Worker Orchestration
 
+> **Target direction.** This document describes the worker-owned operating
+> mode, where the worker agent owns its slice lifecycle end to end. The target
+> architecture moves that lifecycle into the deterministic `vibe-loop run`
+> runtime (`docs/deterministic-run-orchestration.md`,
+> `docs/prd/run-orchestration.md`); worker-owned mode remains a supported
+> compatibility mode during the staged migration, and this document stays
+> authoritative for it.
+
 `vibe-loop` parallel mode should supervise independent finite workers, not take
 over the worker-agent integration flow. Each worker keeps owning the normal
 `$vibe-loop <task_id>` contract: branch/worktree isolation, implementation,

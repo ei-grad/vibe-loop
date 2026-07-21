@@ -10,12 +10,20 @@ taking over the worker-owned branch/worktree, implementation, review, and merge
 workflow.
 
 Acceptance must cover single-task `run-next`, serial `run-until-done`,
-environment variables passed to workers, worker prompt addendum, and the rule
-that workers own their slice lifecycle. For command-backed sources it must also
-cover exact task-lock acquisition followed by project adapter activation and
-non-runnable-state confirmation before `run_started`, worker launch, workspace
-claim, or edit. Missing or unconfirmed activation must fail closed without
-resetting project state or touching another worker's lock or workspace.
+environment variables passed to workers, including the effective routed agent
+kind and profile for repository-owned provenance hooks, worker prompt addendum,
+and the rule that workers own their slice lifecycle. For command-backed sources
+it must also cover exact task-lock acquisition followed by project adapter
+activation and non-runnable-state confirmation before `run_started`, worker
+launch, workspace claim, or edit. Missing or unconfirmed activation must fail
+closed without resetting project state or touching another worker's lock or
+workspace.
+
+The generated prompt must make a headless worker's terminal boundary explicit:
+it cannot return while any worker-started asynchronous Agent/Task/Workflow
+subagent, gate, build, test, or other operation remains in flight. It must await
+or collect those results and finish review, integration, and reporting, or emit
+an explicit `blocked` or `failed` report.
 
 Related implementation IDs: `PAR-01`, `PAR-03`, `PAR-05`.
 
@@ -42,6 +50,71 @@ and fallback classification when no report exists. Fallback classification must
 consider worker exit status, configured completion commands, task probing, and
 main-branch change heuristics while marking the result as less authoritative
 than a matching worker report.
+
+A settled run must also finalize where external provenance lives. Once the run
+is classified, the supervisor publishes a settled outcome — one of `completed`,
+`failed`, `blocked`, `unknown` — into the task lock metadata while it still owns
+the lock, so a command lock backend that mirrors run provenance finalizes the
+run from the supervisor's own conclusion rather than inferring one at release.
+Classifications that do not settle the run, such as `timed_out` and
+`limit_wall`, publish `unknown`; so does any exit that never reached
+classification. Finalization must not depend on the enclosing `run-until-done`
+process, whose next dispatch or idle transition would otherwise race it.
+
+The settled outcome and the lock release form one fail-closed finalization
+boundary. A provenance-mirroring backend finalizes a run from the lock row it has
+already stored and discards whatever the release call carries, so storing the
+outcome is the only operation that can settle the run and it gates the release.
+When the store succeeds the lock is released normally. When it fails for any
+backend, ownership, fencing, or I/O reason, no release is issued, no
+`lock_released` event is recorded, and a typed finalization failure is surfaced
+alongside a `lock_finalization_failed` event; the lock stays held under the same
+run id and fencing token, so it remains recoverable. There is therefore no
+ordering in which the lock is given up while the external run stays `unknown`
+even though the supervisor settled on `completed`. The recorded `run_result` is
+durable before finalization is attempted and is never masked by this failure.
+
+An `unknown` outcome is exempt from the gate: it is what a backend records for a
+run it was told nothing about, so a failed store loses no information, and
+blocking release there would strand the lock of an interrupted or report-less
+run.
+
+Four ordering rules keep the two stores in agreement:
+
+- A settled outcome is only publishable once the local `run_result` append has
+  succeeded. External provenance may never claim a completion vibe-loop itself
+  failed to record, so a failed append leaves the run settling as `unknown`.
+- A settled outcome is monotonic in the lock row: a stored terminal outcome
+  (`completed`, `failed`, `blocked`) may only be replaced by another terminal
+  one. A same-owner update carrying no outcome, or still carrying `unknown` —
+  a heartbeat refreshing from a snapshot read before settlement — keeps the
+  stored outcome and its classification instead of reopening the run.
+- Row precedence only holds if every writer merges against the row its own write
+  lands on, and a command backend offers no compare-and-swap to guarantee that.
+  `LockManager.update` therefore takes read, preserve and write as one critical
+  section, serialized across processes by a per-task file lock under the lock
+  root. This is the same single-host assumption the local fencing-token ledger
+  already makes: the supervisor, `vibe-loop worker heartbeat` and the workspace
+  claim all write a task lock from the host that owns its lock root. A backend
+  whose writers are genuinely distributed would need conditional updates in the
+  backend itself.
+- A recovery attempt that exhausts the unknown-run recovery budget settles as
+  `failed`, not `unknown`. That run records the terminal `failed` result
+  itself, before releasing its lock, and the recovery driver reuses it, so the
+  external outcome is never published ahead of the durable local one. Only a
+  run classified `unknown` re-enters recovery, so a `timed_out` or
+  `limit_wall` run is terminal as itself and stays `unknown` externally.
+
+The gate would be worthless if stale recovery could undo it. A lock retained by
+a failed settlement still stores `unknown` while the run's `run_result` is
+terminal, so `vibe-loop workers clean --force` republishes that durable outcome
+onto the row before releasing it, and refuses the release when republication
+fails. Recovery prefers the matching `lock_finalization_failed` event, but falls
+back to the same run's durable terminal `run_result` if that event append also
+failed or the supervisor exited first. Non-terminal and unrelated results are
+never promoted. Recovery therefore either finalizes the run as it actually
+settled or leaves the lock held and recoverable; it can never finalize it as
+`unknown`.
 
 Related implementation IDs: `PAR-03`, `PAR-05`.
 
@@ -77,6 +150,15 @@ Acceptance must cover claim command inputs, matching active task lock, current
 branch verification, branch/worktree path recording, base commit, current HEAD,
 dirty-at-claim summary, `workspace_claim` run record, and no branch/worktree
 creation, deletion, reset, merge, or cleanup by the claim command.
+
+An unknown-run recovery may use the prior claim to locate a preserved
+branch/worktree, but that record belongs to the released prior lock generation
+and is stale evidence only. Before any new mutation, gate, build, test, review,
+or integration attempt, the recovery worker must verify the actual branch and
+absolute worktree path and claim them explicitly with the current run and task
+identifiers against the current active task lock. The supervisor must not guess
+or auto-claim a path; owner mismatches and unsafe-workspace diagnostics fail
+closed.
 
 Related implementation IDs: `PAR-10`, `PAR-11`, `SKILL-01`.
 

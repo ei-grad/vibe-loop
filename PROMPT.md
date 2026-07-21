@@ -65,8 +65,15 @@ those surfaces to higher-level PRDs, requirements, and task artifacts.
 
 ## Architecture Decisions
 
-- `vibe-loop` is a supervisor, not a branch/worktree manager. Worker agents own
-  branch/worktree setup, implementation, review, and repo-approved integration.
+- `vibe-loop run` owns the complete bounded task lifecycle deterministically:
+  workspace provisioning, implementation launch, gates, review routing,
+  remediation budgets, integration, task provenance, and recovery are runtime
+  transitions, while model sessions propose work and mutate lifecycle state
+  only through explicit fenced runtime commands
+  (`docs/prd/run-orchestration.md`). The legacy worker-owned mode — worker
+  agents owning branch/worktree setup, review, and repo-approved integration
+  with the runtime as a thin supervisor — remains a supported compatibility
+  mode during the staged migration.
 - Task discovery is explicit-first. User-authored config and command adapters
   win over generated parser profiles.
 - Generated task-source profiles are non-executable descriptions over bounded
@@ -100,15 +107,21 @@ those surfaces to higher-level PRDs, requirements, and task artifacts.
 explains the role of each subsystem and guides where new functionality belongs.
 
 - **System 1 — Operations.** Worker agents that execute individual task slices.
-  Each worker owns its branch/worktree, implementation, review, and integration
-  lifecycle. Workers are finite and independent.
+  In the target runtime-owned mode a worker executes the implementation and
+  remediation stages of a lifecycle whose transitions `vibe-loop run` owns
+  deterministically; in the worker-owned compatibility mode the worker owns its
+  branch/worktree, implementation, review, and integration lifecycle end to
+  end. Workers are finite and independent in both modes.
 - **System 2 — Coordination.** Task locks, conflict-domain scheduling,
   integration locks, and workspace claims. These mechanisms prevent interference
   between concurrent S1 workers without centralized control. Coordination is
   advisory and inspectable, not automatic.
 - **System 3 — Control.** The scheduler/dispatcher: task selection, `run-next`,
   `run-until-done`, `--jobs N`, refill, and restart budgets. S3 allocates work
-  to S1 workers and monitors their completion.
+  to S1 workers and monitors their completion. In runtime-owned mode S3 also
+  contains the `vibe-loop run` lifecycle state machine that drives each slice
+  through workspace provisioning, gates, review routing, remediation budgets,
+  integration, and task provenance (`docs/prd/run-orchestration.md`).
 - **System 3\* — Audit.** `doctor`, stale lock detection, workspace diagnostics,
   and worker state visibility. Sporadic read-only checks that surface problems
   without taking corrective action.

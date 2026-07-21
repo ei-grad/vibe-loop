@@ -662,7 +662,11 @@ The native generic cycle must provide repository-agnostic defaults for these
 behaviors while preserving the non-destructive recovery boundary
 (`PRD-AUT-006`): native report-only worktree disposition with an explicit reaping
 opt-in (`PRD-AUT-010`), native disk-health
-checks, a native "what landed" git-log summary, native troubleshoot detection
+checks, a native "what landed" git-log summary that derives the commit span
+from the previous cycle's recorded `main` ref (read from the prior
+`autopilot_cycle` record, since status carries only the current ref) to the
+current `main` ref and journals a bounded, read-only `autopilot_cycle_summary`
+record, native troubleshoot detection
 derived from `runs.jsonl`, and native planning that invokes the configured agent
 rather than requiring a separate `planning_command` script. Native planning is
 split into two stages: the read-only analysis runner decides whether and what to
@@ -680,13 +684,30 @@ Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a
 replacement for explicit configuration.
 
+The native disk-health floors are configuration-free by default but
+project-tunable. A repository may raise or lower any of the four floors
+(absolute free bytes, proportional free fraction, absolute free inodes,
+proportional free-inode fraction) through an `[autopilot.disk_reserve]` table so
+a heavy repository can demand a larger reserve without changing the global
+default, which would create false positives for small or light repositories.
+An unset override keeps the reviewed default, so a configuration-free project's
+behavior is unchanged. Configuration validation rejects invalid, negative,
+non-finite, and out-of-range values, and rejects a positive reserve paired with
+an explicit zero reserve on the same axis as contradictory because the paired
+floors can then never both be exhausted. The effective thresholds are journaled
+in every `autopilot_disk_health` record and surfaced in project status.
+
 Acceptance must cover each native behavior landing as an independently
 reviewable slice, every native action appearing in the append-only journal
 (`PRD-AUT-011`), and no native behavior performing destructive recovery outside
-its declared evidence-gated guardrails.
+its declared evidence-gated guardrails. Configurable disk reserves must preserve
+the reviewed AUTO-15 defaults when unset, block an injected 3.4 GiB/242 GiB
+sample under an 8 GiB reserve, fail validation on invalid or contradictory
+values, and expose the effective thresholds in cycle records and status without
+introducing any cleanup or repository mutation.
 
 Related implementation IDs: `AUTO-12`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
-`AUTO-17`, `AUTO-18`, `AUTO-19`.
+`AUTO-17`, `AUTO-18`, `AUTO-19`, `autopilot-configurable-disk-reserve`.
 
 ## PRD-AUT-013 Observed Agent Session Id And Transcript Linkage
 
@@ -811,3 +832,32 @@ Autopilot acceptance must cover prompt change/message wakes, literal environment
 delivery, schema validation, deadline preservation, adaptive fallback polling,
 bounded error provenance, and unchanged clock/task-source behavior when no wake
 adapter is configured.
+
+## PRD-AUT-016 Provider Usage Run Telemetry
+
+Worker and native-planning results record provider-reported usage without
+estimating tokens from output or transcript size. Recognized Codex and Claude
+commands use their structured result streams; a persisted Claude transcript is
+a numeric-only fallback. Common input/output/cache/total token, duration, turn,
+and reported-cost values live in versioned `stats`, alongside recognized raw
+provider numeric fields and an explicit source/version. Missing and malformed
+usage have a typed reason.
+
+Telemetry records reject prompts, credentials, fencing values, command
+payloads, and transcript content at persistence. Normalized numeric fields stay
+compatible with Loopyard's existing `runs sync` ingestion. Rolling summaries
+group durable provenance by project, provider, model, and phase and report
+launch/productivity ratios plus typed budget diagnostics; diagnostics never
+switch providers.
+
+Worker usage defaults to implementation. An allowlisted `phase` and optional
+`review` or `discovery` `work_kind` from the terminal worker report can refine
+that provenance. Native planning records model/provider provenance from the
+formatted analysis and authoring commands, falls back to the configured model,
+and measures the full planning wall time. Retry ordinals are normalized to
+restart events before aggregation.
+
+Acceptance covers Claude and Codex present/missing/malformed/limit-wall
+fixtures, run-record and Loopyard-compatible stats round trips, phase-aware
+rolling summaries, low-change/high-token detection, same-session continuation,
+redaction, and existing run-result consumers.

@@ -1,0 +1,1 @@
+{"type":"result","subtype":"error_max_turns","is_error":true,"result":"usage limit reached","usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}

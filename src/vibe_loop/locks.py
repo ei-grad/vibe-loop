@@ -40,6 +40,7 @@ COMMAND_LOCK_TIMEOUT_SECONDS = 30.0
 METADATA_REPLACE_TIMEOUT_SECONDS = 5.0
 FENCING_TOKEN_REDACTION = "<redacted>"
 FENCING_TOKEN_FIELDS = frozenset({"fencing_token", "expected_token", "actual_token"})
+FENCING_TOKEN_VALUE_CHARACTERS = r"A-Za-z0-9._+\-"
 MIN_OPAQUE_FENCING_TOKEN_REDACTION_LENGTH = 8
 QUOTED_FENCING_DIAGNOSTIC_PATTERN = re.compile(
     r"(?i)([\"']?(?:fencing_token|expected_token|actual_token)[\"']?"
@@ -163,6 +164,27 @@ def describe_lock_failure(error: BaseException, metadata: Mapping[str, object]) 
     return truncate_diagnostic(detail)
 
 
+class SettledOutcomeNotPersisted(RuntimeError):
+    """A run's settled outcome could not be stored on its task lock row.
+
+    A provenance-mirroring backend finalizes the run from the lock row it has
+    already stored; release-time metadata is discarded. Releasing after a failed
+    outcome update would therefore finalize the run as unknown while the local
+    RunResult says otherwise, so the release is refused and the lock is left
+    held and recoverable by its exact run id and fencing token.
+    """
+
+    def __init__(self, task_id: str, run_id: str, outcome: str, cause: BaseException):
+        self.task_id = task_id
+        self.run_id = run_id
+        self.outcome = outcome
+        self.cause = cause
+        super().__init__(
+            f"could not persist settled outcome {outcome} on the lock for "
+            f"{task_id} (run {run_id}): {cause}; lock left held for recovery"
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TaskLock:
     task_id: str
@@ -277,20 +299,63 @@ class LockManager:
         return task_lock
 
     def update(self, task_lock: TaskLock, metadata: dict[str, object]) -> TaskLock:
-        current = self.current_lock(task_lock.task_id)
-        validate_lock_fencing_token(
-            task_lock.metadata,
-            current.metadata,
-            path=current.path,
-        )
-        validate_lock_run_id(task_lock, current.metadata)
-        return self.backend.update(
-            current,
-            preserve_runtime_lock_fields(metadata, current.metadata),
-        )
+        # Read, preserve and write are one critical section. Row precedence can
+        # only keep a terminal outcome if the row it merges against is the one
+        # the write lands on; a writer that read before settlement and wrote
+        # after would otherwise reopen a settled run, and a command backend has
+        # no compare-and-swap to order the pair. Every writer to a task lock -
+        # supervisor, `worker heartbeat`, workspace claim - runs on the host
+        # that owns this lock root, the same assumption the local fencing-token
+        # ledger already makes.
+        with settlement_update_lock(self.settlement_mutex_path(task_lock.task_id)):
+            current = self.current_lock(task_lock.task_id)
+            validate_lock_fencing_token(
+                task_lock.metadata,
+                current.metadata,
+                path=current.path,
+            )
+            validate_lock_run_id(task_lock, current.metadata)
+            merged = preserve_runtime_lock_fields(metadata, current.metadata)
+            return self.backend.update(current, merged)
+
+    def settlement_mutex_path(self, task_id: str) -> Path:
+        return self.lock_root / f"{safe_name(task_id)}.settlement"
 
     def release(self, task_lock: TaskLock) -> None:
         self.release_with_timeout(task_lock)
+
+    def release_settled(
+        self,
+        task_lock: TaskLock,
+        metadata: dict[str, object],
+        *,
+        outcome: str,
+    ) -> None:
+        """Store the settled outcome on the lock row, then release.
+
+        Backends that mirror run provenance finalize from the stored lock row
+        and discard whatever the release call carries, so the update is the only
+        operation that can settle the run. It is therefore a gate: if it fails,
+        no release is issued and the lock stays held for recovery.
+        """
+
+        try:
+            settled_lock = self.update(task_lock, metadata)
+        except (
+            LockBusy,
+            LockBackendError,
+            LockOwnerMismatch,
+            LockFencingMismatch,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise SettledOutcomeNotPersisted(
+                task_lock.task_id,
+                str(task_lock.metadata.get("run_id") or ""),
+                outcome,
+                exc,
+            ) from exc
+        self.release(settled_lock)
 
     def release_with_timeout(
         self,
@@ -724,6 +789,8 @@ class LockManager:
         path: Path,
         kind: str,
         timeout_seconds: float | None = None,
+        settled_outcome: str = "",
+        settled_classification: str = "",
     ) -> bool:
         deadline = command_deadline(timeout_seconds)
         lock_task_id = MAIN_INTEGRATION_LOCK_NAME if kind == "integration" else task_id
@@ -735,15 +802,59 @@ class LockManager:
         current_path = path_from_metadata(metadata, self.backend.path_for(lock_task_id))
         if current_path != path or string_value(metadata.get("run_id")) != run_id:
             raise LockBackendError("lock metadata changed since collection")
+        current_lock = TaskLock(
+            task_id=lock_task_id,
+            path=current_path,
+            metadata=metadata,
+        )
+        if settled_outcome in TERMINAL_LOCK_OUTCOMES:
+            current_lock = self._republish_settled_outcome(
+                current_lock,
+                settled_outcome,
+                settled_classification,
+            )
         self.release_with_timeout(
-            TaskLock(
-                task_id=lock_task_id,
-                path=current_path,
-                metadata=metadata,
-            ),
+            current_lock,
             timeout_seconds=remaining_command_timeout(deadline),
         )
         return True
+
+    def _republish_settled_outcome(
+        self,
+        current_lock: TaskLock,
+        outcome: str,
+        classification: str,
+    ) -> TaskLock:
+        """Write a run's durable terminal outcome onto its retained lock row.
+
+        A run whose settlement update failed keeps its lock, and the row still
+        says ``unknown`` while the local RunResult is terminal. Stale recovery
+        would otherwise release that row and let a provenance-mirroring backend
+        finalize the run from it, contradicting the durable result. Recovery is
+        therefore the same gate settlement is: republish first, and if that
+        write fails, refuse the release so the lock stays recoverable.
+        """
+
+        if string_value(current_lock.metadata.get("outcome")) == outcome:
+            return current_lock
+        republished = dict(current_lock.metadata)
+        republished["outcome"] = outcome
+        if classification:
+            republished["classification"] = classification
+        try:
+            return self.update(current_lock, republished)
+        except (
+            LockBusy,
+            LockBackendError,
+            LockOwnerMismatch,
+            LockFencingMismatch,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise LockBackendError(
+                f"could not republish settled outcome {outcome} on the lock for "
+                f"{current_lock.task_id}: {exc}; lock left held for recovery"
+            ) from exc
 
 
 class DirectoryLockBackend:
@@ -1309,6 +1420,40 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+# The settled outcomes that are terminal for a run. Mirrors the non-unknown
+# members of runs.SETTLED_RUN_OUTCOMES, duplicated here because runs imports
+# locks.
+TERMINAL_LOCK_OUTCOMES = frozenset({"completed", "failed", "blocked"})
+
+
+def preserve_settled_lock_outcome(
+    updated: dict[str, object],
+    current: dict[str, object],
+) -> None:
+    """Keep a stored terminal outcome from being downgraded in place.
+
+    Backends that mirror run provenance finalize from the stored lock row, so
+    the settled outcome is monotonic: once the supervisor that classified the
+    run writes a terminal outcome, no later same-owner update may replace it
+    with an absent or still-unknown one. A heartbeat refreshing from a snapshot
+    read before settlement carries exactly that stale pair, and it arrives after
+    the settlement update by construction. Outcome and classification move
+    together so provenance never reads a completed outcome beside an unknown
+    classification.
+    """
+
+    stored = current.get("outcome")
+    if not isinstance(stored, str) or stored not in TERMINAL_LOCK_OUTCOMES:
+        return
+    incoming = updated.get("outcome")
+    if isinstance(incoming, str) and incoming in TERMINAL_LOCK_OUTCOMES:
+        return
+    updated["outcome"] = stored
+    stored_classification = current.get("classification")
+    if not runtime_lock_field_empty(stored_classification):
+        updated["classification"] = stored_classification
+
+
 def preserve_runtime_lock_fields(
     metadata: dict[str, object],
     current: dict[str, object],
@@ -1317,6 +1462,7 @@ def preserve_runtime_lock_fields(
     for key in ("fencing_token", "lease_seconds", "heartbeat_at"):
         if key not in updated and key in current:
             updated[key] = current[key]
+    preserve_settled_lock_outcome(updated, current)
     for key in (
         "workspace",
         "worker_pid",
@@ -1661,6 +1807,44 @@ def fencing_token_value(value: object) -> str:
     return ""
 
 
+def redact_exact_fencing_token(value: object, fencing_token: object) -> object:
+    token = fencing_token_value(fencing_token)
+    if not token:
+        return value
+    if isinstance(value, str):
+        pattern = re.compile(
+            rf"(?<![{FENCING_TOKEN_VALUE_CHARACTERS}])"
+            rf"{re.escape(token)}"
+            rf"(?![{FENCING_TOKEN_VALUE_CHARACTERS}])"
+        )
+        return pattern.sub(FENCING_TOKEN_REDACTION, value)
+    if isinstance(value, bytes):
+        pattern = re.compile(
+            rb"(?<![A-Za-z0-9._+\-])"
+            + re.escape(token.encode("utf-8"))
+            + rb"(?![A-Za-z0-9._+\-])"
+        )
+        return pattern.sub(FENCING_TOKEN_REDACTION.encode("utf-8"), value)
+    if isinstance(value, Mapping):
+        return {
+            redact_exact_fencing_token(key, token): redact_exact_fencing_token(
+                item, token
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_exact_fencing_token(item, token) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_exact_fencing_token(item, token) for item in value)
+    return value
+
+
+def redact_fencing_token_text(value: str, fencing_token: object) -> str:
+    redacted = redact_exact_fencing_token(value, fencing_token)
+    assert isinstance(redacted, str)
+    return redacted
+
+
 def redact_fencing_token_payload(value: object) -> object:
     if isinstance(value, Mapping):
         return {
@@ -1782,9 +1966,13 @@ def replace_metadata_file(source: Path, target: Path) -> None:
             delay = min(delay * 2, 0.1)
 
 
+def metadata_lock_file_path(path: Path) -> Path:
+    return path.parent / f".{path.name}.metadata-update"
+
+
 @contextmanager
 def metadata_update_lock(path: Path):
-    lock_path = path.parent / f".{path.name}.metadata-update"
+    lock_path = metadata_lock_file_path(path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+b") as handle:
         ensure_metadata_lock_byte(handle)
@@ -1793,6 +1981,20 @@ def metadata_update_lock(path: Path):
             yield
         finally:
             unlock_metadata_file(handle)
+
+
+@contextmanager
+def settlement_update_lock(path: Path):
+    """Serialize the read-preserve-write boundary of one task lock row.
+
+    This is a different file from the backend's own metadata mutex on purpose:
+    `flock` is held per open file description, so a manager taking this lock and
+    then entering `DirectoryLockBackend.update` would otherwise block on itself.
+    Managers always take this one first, so the nesting order is fixed.
+    """
+
+    with metadata_update_lock(path):
+        yield
 
 
 def ensure_metadata_lock_byte(handle) -> None:

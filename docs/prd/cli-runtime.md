@@ -69,19 +69,25 @@ from a simple command shape, or fall back to the legacy Codex-style prefix, but
 diagnostics must identify that the prompt dialect came from legacy inference or
 legacy defaulting and tell the user how to make it explicit.
 
-Executable command resolution, model resolution, and prompt dialect resolution
+Executable command resolution, model/effort resolution, and prompt dialect resolution
 are independent. `[agent]` and each named agent profile may set an optional
-`model`. Omitted built-in commands include the kind-specific model flag only
-when a model is resolved: Codex uses `-m`, while Claude uses `--model`. A task's
+`model` and `effort`. Omitted built-in commands include the kind-specific model
+and effort flags only when values are resolved: Codex uses `-m` and
+`-c model_reasoning_effort=...`, while Claude uses `--model` and `--effort`.
+Codex accepts `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude accepts
+`low`, `medium`, and `high`. A task's
 optional `model` overrides the selected profile's model without changing how
 that profile is selected.
 
 Explicit user-authored `command` and `selection_command` values remain
 authoritative executable templates. `command` receives `{prompt}`, `{model}`,
+`{effort}`,
 `{task_id}`, and `{run_id}`; `selection_command` receives `{prompt}` and
-`{model}`. `{model}` is shell-quoted and fails closed before launch when the
-template references it but neither task nor profile configuration resolves a
-model. Templates that omit `{model}` remain unchanged. The worker prompt is
+`{model}`/`{effort}`. Both values are shell-quoted and fail closed before launch
+when a template references an unresolved value. When first-class `effort` is
+configured, an explicit command must use `{effort}` and cannot also embed a
+native effort flag; templates that omit `{effort}` remain unchanged only when
+no first-class effort is configured. The worker prompt is
 constructed from the selected skill reference syntax, the normalized task, and
 the runner's worker addendum. An optional top-level
 `agent.worker_prompt_extra` plain-text value is appended to every generated

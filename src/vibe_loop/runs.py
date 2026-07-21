@@ -10,7 +10,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
-from vibe_loop.locks import redact_fencing_token_payload
+from vibe_loop.locks import redact_exact_fencing_token, redact_fencing_token_payload
+from vibe_loop.telemetry import sanitize_run_stats
 
 try:
     import fcntl
@@ -32,6 +33,7 @@ LIFECYCLE_EVENT_SCHEMA_VERSION = 1
 LOCK_ACQUIRED_RECORD_TYPE = "lock_acquired"
 LOCK_RELEASED_RECORD_TYPE = "lock_released"
 LOCK_EXPIRED_RECORD_TYPE = "lock_expired"
+LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
@@ -55,6 +57,8 @@ AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE = "autopilot_planning_launch"
 AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE = "autopilot_planning_outcome"
 AUTOPILOT_IDLE_WAIT_RECORD_TYPE = "autopilot_idle_wait"
 AUTOPILOT_CHILD_STARTED_RECORD_TYPE = "autopilot_child_started"
+AUTOPILOT_DISK_HEALTH_RECORD_TYPE = "autopilot_disk_health"
+AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE = "autopilot_cycle_summary"
 AUTOPILOT_RECORD_TYPES = frozenset(
     {
         AUTOPILOT_CYCLE_RECORD_TYPE,
@@ -63,6 +67,8 @@ AUTOPILOT_RECORD_TYPES = frozenset(
         AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
         AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
         AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
+        AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
+        AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
         AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
         AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
         AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
@@ -76,6 +82,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         LOCK_ACQUIRED_RECORD_TYPE,
         LOCK_RELEASED_RECORD_TYPE,
         LOCK_EXPIRED_RECORD_TYPE,
+        LOCK_FINALIZATION_FAILED_RECORD_TYPE,
         RUN_STARTED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
@@ -108,6 +115,28 @@ LIFECYCLE_STATES = (
 LIFECYCLE_PROTECTED_KEYS = frozenset(
     {"schema_version", "record_type", "occurred_at", "run_id"}
 )
+# The settled outcome family a run finalizes into. It is deliberately coarser
+# than the classification vocabulary: external provenance backends record one
+# terminal outcome per run, while classifications such as "timed_out" and
+# "limit_wall" describe a run that ended without settling the task at all.
+SETTLED_RUN_OUTCOMES = ("completed", "failed", "blocked", "unknown")
+UNKNOWN_RUN_OUTCOME = "unknown"
+
+
+def settled_run_outcome(classification: str) -> str:
+    """Map a run classification onto its settled outcome.
+
+    Only a classification that is itself a settled outcome maps through
+    verbatim. Everything else - an indeterminate probe, a wall-clock kill, a
+    provider limit wall, an interrupted supervisor - is genuinely unknown and
+    must not be promoted to a completion.
+    """
+
+    if classification in SETTLED_RUN_OUTCOMES:
+        return classification
+    return UNKNOWN_RUN_OUTCOME
+
+
 _APPEND_LOCK = threading.Lock()
 LOCK_POLL_SECONDS = 0.05
 LOCK_TIMEOUT_SECONDS = 30.0
@@ -115,6 +144,21 @@ LOCK_TIMEOUT_SECONDS = 30.0
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def redact_run_record(
+    record: Mapping[str, object],
+    *,
+    fencing_token: str = "",
+) -> dict[str, object]:
+    payload = dict(record)
+    if "stats" in payload:
+        payload["stats"] = sanitize_run_stats(payload["stats"])
+    redacted = redact_fencing_token_payload(payload)
+    assert isinstance(redacted, dict)
+    exact_redacted = redact_exact_fencing_token(redacted, fencing_token)
+    assert isinstance(exact_redacted, dict)
+    return exact_redacted
 
 
 def autopilot_child_started_record(
@@ -184,6 +228,7 @@ class RunResult:
     worker_report: dict[str, object] | None = None
     restart_count: int = 0
     max_restarts: int = 0
+    stats: dict[str, object] = dataclasses.field(default_factory=dict)
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
@@ -219,12 +264,16 @@ class RunResult:
         if self.model_provider_source:
             payload["model_provider_source"] = self.model_provider_source
         if self.model_id:
+            payload["model"] = self.model_id
             payload["model_id"] = self.model_id
         if self.model_id_source:
+            payload["model_source"] = self.model_id_source
             payload["model_id_source"] = self.model_id_source
         if self.reasoning_effort:
+            payload["effort"] = self.reasoning_effort
             payload["reasoning_effort"] = self.reasoning_effort
         if self.reasoning_effort_source:
+            payload["effort_source"] = self.reasoning_effort_source
             payload["reasoning_effort_source"] = self.reasoning_effort_source
         if self.trailer_context:
             payload["trailer_context"] = self.trailer_context
@@ -232,6 +281,8 @@ class RunResult:
             payload["trailer_context_sources"] = self.trailer_context_sources
         if self.transcript_path:
             payload["transcript_path"] = self.transcript_path
+        if self.stats:
+            payload["stats"] = sanitize_run_stats(self.stats)
         return payload
 
     def to_record(self) -> dict[str, object]:
@@ -255,6 +306,12 @@ class WorkerReport:
     message: str = ""
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     reported_at: str = dataclasses.field(default_factory=utc_now_iso)
+    fencing_token: str = dataclasses.field(
+        default="",
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         if self.status not in WORKER_REPORT_STATUSES:
@@ -279,7 +336,9 @@ class WorkerReport:
         }
         redacted = redact_fencing_token_payload(payload)
         assert isinstance(redacted, dict)
-        return redacted
+        exact_redacted = redact_exact_fencing_token(redacted, self.fencing_token)
+        assert isinstance(exact_redacted, dict)
+        return exact_redacted
 
     def to_record(self) -> dict[str, object]:
         record = self.to_json()
@@ -633,6 +692,7 @@ class RunHistoryView:
     trailer_context_sources: dict[str, Any]
     classification_source: str
     worker_report: dict[str, Any] | None
+    stats: dict[str, Any]
     restart_count: int
     max_restarts: int
     restart_exhausted: bool
@@ -680,11 +740,15 @@ class RunHistoryView:
             model_provider_source=latest_text(valid_records, "model_provider_source"),
             model_id=latest_text(valid_records, "model_id"),
             model_id_source=latest_text(valid_records, "model_id_source"),
-            reasoning_effort=latest_text(valid_records, "reasoning_effort"),
+            reasoning_effort=(
+                latest_text(valid_records, "reasoning_effort")
+                or latest_text(valid_records, "effort")
+            ),
             reasoning_effort_source=latest_text(
                 valid_records,
                 "reasoning_effort_source",
-            ),
+            )
+            or latest_text(valid_records, "effort_source"),
             trailer_context=latest_mapping(valid_records, "trailer_context"),
             trailer_context_sources=latest_mapping(
                 valid_records,
@@ -692,6 +756,7 @@ class RunHistoryView:
             ),
             classification_source=latest_text(valid_records, "classification_source"),
             worker_report=latest_worker_report_payload(valid_records),
+            stats=latest_mapping(valid_records, "stats"),
             restart_count=latest_int(records, "restart_count") or 0,
             max_restarts=latest_int(records, "max_restarts") or 0,
             restart_exhausted=latest_restart_exhausted(records),
@@ -724,12 +789,17 @@ class RunHistoryView:
             "model_provider_source": self.model_provider_source,
             "model_id": self.model_id,
             "model_id_source": self.model_id_source,
+            "model": self.model_id,
+            "model_source": self.model_id_source,
             "reasoning_effort": self.reasoning_effort,
             "reasoning_effort_source": self.reasoning_effort_source,
+            "effort": self.reasoning_effort,
+            "effort_source": self.reasoning_effort_source,
             "trailer_context": self.trailer_context,
             "trailer_context_sources": self.trailer_context_sources,
             "classification_source": self.classification_source,
             "worker_report": self.worker_report,
+            "stats": self.stats,
             "restart_count": self.restart_count,
             "max_restarts": self.max_restarts,
             "restart_exhausted": self.restart_exhausted,
@@ -760,14 +830,18 @@ class RunStore:
         self.append_record(result.to_record())
 
     def append_report(self, report: WorkerReport) -> None:
-        self.append_record(report.to_record())
+        self.append_record(report.to_record(), fencing_token=report.fencing_token)
 
     def append_lifecycle_event(self, event: RunLifecycleEvent) -> None:
         self.append_record(event.to_record())
 
-    def append_record(self, record: dict[str, object]) -> None:
-        redacted = redact_fencing_token_payload(record)
-        assert isinstance(redacted, dict)
+    def append_record(
+        self,
+        record: dict[str, object],
+        *,
+        fencing_token: str = "",
+    ) -> None:
+        redacted = redact_run_record(record, fencing_token=fencing_token)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
             with append_record_lock(self.path):
@@ -787,8 +861,7 @@ class RunStore:
             except json.JSONDecodeError:
                 continue
             if isinstance(payload, dict) and is_known_record_type(payload):
-                redacted = redact_fencing_token_payload(payload)
-                assert isinstance(redacted, dict)
+                redacted = redact_run_record(payload)
                 records.append(redacted)
         return records
 

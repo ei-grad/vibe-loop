@@ -222,13 +222,48 @@ agent actually did. The path is best-effort: if the agent persists no transcript
 (for example `--no-session-persistence`), the recorded path may not exist.
 Injection is skipped when the command already pins `--session-id`.
 
-Codex `exec` has no equivalent flag to force or print a session id without
-switching stdout to `--json` (which would replace the streamed human-readable
-output the wrapper log and the selection/analysis text parsing rely on), so
-Codex worker runs keep `session_id_source = fallback:run_id` and no
-`transcript_path`. If a worker instead emits a `session id: ...` line on its
-output, that native id is captured with `session_id_source` =
-`native:stdout`/`native:stderr`.
+For recognized Codex and Claude worker commands, the supervisor requests the
+native structured result stream (`codex exec --json` or Claude
+`--output-format stream-json --verbose`). Codex `thread.started` events provide
+the native session id; Codex still has no forced-session flag or resolved local
+transcript path. Custom commands keep their configured output mode. The wrapper
+log retains the provider stream, while run telemetry copies only recognized
+numeric usage fields and fixed provenance labels.
+
+#### Provider usage telemetry
+
+Final `run_result` records include a versioned `stats` object. When exposed by
+the provider, it records input, output, cached-input, cache-read,
+cache-creation, total tokens, turns, native duration, reported cost, and the
+provider's original recognized numeric fields. Missing or malformed usage gets
+an explicit `usage_unavailable_reason`; token counts are never estimated from
+wrapper-log or transcript byte size. Resumed Claude sessions count only records
+appended during the resumed invocation, so one continued session is not charged
+again from its cumulative transcript history.
+
+Telemetry persistence accepts only recognized numeric fields and bounded fixed
+labels. Prompts, credentials, fencing values, command payloads, and transcript
+content are discarded from `stats`. Existing Loopyard installations ingest the
+normalized fields without a schema adapter:
+
+```bash
+loopyard runs sync .vibe-loop/runs.jsonl -p <project>
+```
+
+`vibe-loop runs summary --repo . --hours 24` groups the rolling window by
+project, provider, model, and observed phase. JSON output includes launches,
+completed runs, immediate failures, restarts, worker-minutes, token/cache/cost
+totals, tasks created/landed, per-productive-task ratios, and typed budget
+diagnostics. Only phases with durable provenance are reported; no provider is
+switched automatically.
+
+Ordinary workers default to the `implementation` phase. A workflow that knows a
+more specific phase can report it with allowlisted metadata, for example
+`--metadata-json '{"phase":"review","work_kind":"review"}'`. Valid phases are
+`planning`, `implementation`, `focused_validation`, `full_validation`, `review`,
+`remediation`, and `integration`; repeated-candidate diagnostics accept only the
+`review` and `discovery` work kinds. Arbitrary metadata is not copied into usage
+stats.
 
 #### Unknown-run recovery
 
@@ -247,6 +282,21 @@ log, and the instruction to investigate, finish the work and/or emit a proper
 status, and report `blocked` with a precise reason instead of parking again. It
 builds on the existing claimed branch/worktree and never deletes, resets,
 steals, or merges another worker's committed work.
+
+The prior run's workspace claim is stale evidence after that run releases its
+task lock. Before a recovery worker mutates the preserved workspace or starts a
+gate, build, test, review, or integration attempt, it verifies the real branch
+and absolute worktree path and explicitly claims them against the current run id
+and active task lock. The supervisor does not guess or auto-claim the preserved
+path, so ownership mismatches and unsafe-workspace diagnostics continue to fail
+closed.
+
+Generated worker prompts also treat asynchronous work as part of the finite
+headless turn. A worker must await or collect every Agent/Task/Workflow
+subagent, gate, build, test, or other worker-started operation before returning,
+then finish review, integration, and reporting or explicitly report `blocked`
+or `failed`; a progress summary while background work remains in flight is not
+a terminal outcome.
 
 Recovery is bounded by the same per-task budget as transient restarts
 (`supervision.max_restarts`): each attempt is counted through the `task_restart`
@@ -308,6 +358,7 @@ owner/path context.
 vibe-loop workers --repo . --json
 vibe-loop runs list --repo .
 vibe-loop runs inspect <run-id> --repo .
+vibe-loop runs summary --repo . --hours 24 --json
 vibe-loop doctor --repo . --json
 vibe-loop specs check --repo . --json
 vibe-loop --version
@@ -578,9 +629,59 @@ primary worktree and never dirty or unmerged work-in-progress. Every cycle
 journals the configured policy, candidate evidence, reasons, outcomes, and
 `worktree_disposition_policy:*`, `worktree_disposition_candidates:N`, and
 `reaped_worktrees:N` action tags.
+Each cycle also runs a native, read-only disk-health check even when no
+`health_command` is configured. It probes the repository and state directory for
+free-space and inode pressure against bounded thresholds and journals one
+`autopilot_disk_health` record plus a `disk_health:ok|critical` action tag. A
+target is only a genuine capacity blocker when both an absolute reserve
+(512 MiB free / 10,000 free inodes) and a proportional reserve (2% free) are
+exhausted, so a large disk that is proportionally low but has ample bytes, and a
+small disk low on bytes but proportionally roomy, are not misreported.
+Filesystems that do not expose inode counts skip the inode check. A genuine
+capacity blocker withholds launch (`autopilot_disk_capacity_low`); the check
+never deletes or truncates anything, and an unreadable path is recorded as a
+non-blocking observation rather than a blocker.
+
+Heavy repositories can raise these floors per project without changing the
+global defaults (which would create false positives for small/light repos). An
+`[autopilot.disk_reserve]` table overrides any of the four floors; an unset
+value keeps its native default, and the effective thresholds appear in every
+`autopilot_disk_health` record and in `vibe-loop doctor` output:
+
+```toml
+[autopilot.disk_reserve]
+min_free_bytes = 8589934592        # 8 GiB absolute free-space floor
+min_free_fraction = 0.02           # 2% proportional free-space floor
+min_free_inodes = 10000            # absolute free-inode floor
+min_free_inode_fraction = 0.02     # 2% proportional free-inode floor
+```
+
+Values must be non-negative and finite, and fractions must fall in `[0.0, 1.0]`.
+Validation resolves each axis to its *effective* pair (the override, or the
+native default when unset) and rejects a zero floor paired with a positive one
+as contradictory, because a blocker fires only when both floors of an axis are
+exhausted. To intentionally disable an axis, zero *both* of its floors; a lone
+zero — even against an unset companion that keeps its positive default — is
+refused. With the 8 GiB byte floor above, a sample of 3.4 GiB free on a 242 GiB
+volume blocks launch even though the native 512 MiB floor would record it as
+`ok`.
+
+Each cycle also records a native "what landed" git-log summary even when no
+`summary_command` is configured. It reads the previous cycle's recorded `main`
+ref (the status carries only the current ref, so the span comes from the prior
+`autopilot_cycle` record's `git.main_head`) and journals the commits merged into
+`main` since then as one `autopilot_cycle_summary` record plus a
+`cycle_summary:landed|unchanged|bootstrap|unavailable:<count>` action tag. The
+commit list is bounded (newest first, subjects truncated); a truncated span
+appends `+` to the count. The step is read-only and never mutates the
+repository. The first cycle has no prior recorded ref and records an empty
+`bootstrap` summary rather than walking all of history, and an unresolved
+current ref records an `unavailable` summary; neither fails the cycle. A
+configured `summary_command` still runs alongside this native summary.
+
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
-task source, or an unavailable agent command. `--once` runs one cycle. Without `--interval`, it drains runnable
+task source, an unavailable agent command, or exhausted disk/inode capacity. `--once` runs one cycle. Without `--interval`, it drains runnable
 work and exits when a cycle is idle or blocked; with `--interval N` it stays
 resident until `--max-cycles` or an interrupt. Idle cycles use bounded adaptive
 task-source rechecks: the first listing follows `planning_recheck_seconds`
@@ -713,6 +814,7 @@ state_dir = ".vibe-loop"
 # Optional when kind = "auto" and Codex or Claude is available on PATH.
 kind = "auto"
 # model = "gpt-5.4"  # optional; inferred commands add the kind-specific flag
+# effort = "high"    # optional; inferred commands add the provider-specific flag
 command = "codex exec {prompt}"
 selection_command = "codex exec {prompt}"
 # analysis_command runs a read-only agent for autopilot decisions; the default is
@@ -739,6 +841,7 @@ max_restarts = 3
 cooldown_seconds = 30.0
 recover_unknown_runs = true   # set false to stop on `unknown` instead of launching a continuation worker
 worker_timeout_seconds = 10800.0  # wall-clock cap per worker; its process group is killed and the task returns to runnable. 0 = unbounded
+slice_token_threshold = 100000    # low-change/high-token diagnostic; 0 disables
 
 [locks]
 type = "directory"
@@ -841,14 +944,24 @@ absent, generated prompts are unchanged.
 
 `agent.command` receives `{task_id}`, `{run_id}`, a shell-quoted `{prompt}`
 (skill reference, normalized task context, CLI addendum), and a shell-quoted
-`{model}` when `agent.model` or the task's `model` field resolves one. A template
-that references `{model}` fails before launch when no model is resolved. Workers
-also get
-`VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in
-their environment; `selection_command` receives a `{prompt}` with the candidate
-list and recent run context. Single-task selection prints JSON with `task_id`;
-batch selection prints `task_ids`. If a task has traceability metadata,
-`agent.command` must include `{prompt}` — task-id-only templates fail fast.
+`{model}` when `agent.model` or the task's `model` field resolves one. It also
+receives a shell-quoted `{effort}` when `agent.effort` resolves one. Templates
+that reference either field fail before launch when its value is unresolved.
+Omitted Codex commands receive `-c model_reasoning_effort={effort}`; omitted
+Claude commands receive `--effort {effort}`. Supported values are `minimal`,
+`low`, `medium`, `high`, and `xhigh` for Codex, while Claude accepts `low`,
+`medium`, and `high`; an incompatible value fails before launch. Explicit
+commands stay authoritative: when first-class effort is configured, they must
+use `{effort}` and must not also embed a provider-specific effort flag. Workers
+also get `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`,
+`VIBE_LOOP_LOG`, `VIBE_LOOP_AGENT_KIND`, and `VIBE_LOOP_AGENT_PROFILE` in their
+environment. The agent values come from the effective task profile, so
+repository-owned commit hooks can use the same provenance as run telemetry. The
+profile value is empty for the default `[agent]`. `selection_command` receives a
+`{prompt}` with the candidate list and recent run context. Single-task selection
+prints JSON with `task_id`; batch selection prints `task_ids`. If a task has
+traceability metadata, `agent.command` must include `{prompt}` — task-id-only
+templates fail fast.
 
 `agent.analysis_command` is a third template used by autopilot for read-only
 analysis and decision steps, distinct from the read-write worker. Its `auto`
@@ -879,6 +992,7 @@ kind = "codex"            # default profile: fast, separate quota
 [agent.profiles.claude-opus]
 kind = "claude"
 model = "opus"
+effort = "high"
 
 [[agent.routing]]
 profile = "claude-opus"
@@ -888,14 +1002,20 @@ match_paths_glob = ["kernel/**"]            # optional extra constraint
 
 Each `[agent.profiles.<name>]` table takes the agent-selection fields from
 `[agent]` (`kind`, `model`, `command`, `selection_command`, `analysis_command`,
-and dialect fields) and resolves through the same machinery.
+`effort`, and dialect fields) and resolves through the same machinery.
 `worker_prompt_extra` remains top-level repository policy rather than a
 profile-specific field. A profile with `kind = "claude"` and `model = "opus"`
 gets `claude -p --model {model} {prompt}` without an explicit command; omitting
 `model` preserves the bare `claude -p {prompt}` default. Codex uses
-`codex exec -m {model} {prompt}`. The top-level `[agent]` remains the default
+`codex exec -m {model} {prompt}`. Setting `effort = "high"` adds the matching
+native effort flag to all inferred worker, selection, analysis, and generated
+profile commands. The top-level `[agent]` remains the default
 profile. With no profiles and no routing, behavior is identical to a single
 `[agent]`.
+
+Task selection occurs before a task profile is known, so its command uses the
+default `[agent]` model and effort. Worker execution, recovery, and the
+post-selection provenance use the selected profile's effective values.
 
 `[[agent.routing]]` is an ordered list. Each rule names a `profile` and one or
 more match predicates evaluated against the task; a rule matches when **all** of

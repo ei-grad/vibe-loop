@@ -13,6 +13,7 @@ from typing import Any
 
 from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
+    TERMINAL_LOCK_OUTCOMES,
     LockBackendError,
     LockFencingMismatch,
     LockManager,
@@ -27,6 +28,8 @@ from vibe_loop.locks import (
 from vibe_loop.processes import process_birth_identity
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
+    LOCK_FINALIZATION_FAILED_RECORD_TYPE,
+    LOCK_RELEASED_RECORD_TYPE,
     RUN_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
@@ -166,6 +169,14 @@ class ActiveRunState:
     host: str = dataclasses.field(default_factory=socket.gethostname)
     lock_path: Path | None = None
     workspace: WorkspaceClaim | None = None
+    # Published into the lock metadata just before release so a command lock
+    # backend that mirrors run provenance finalizes this run with the outcome
+    # the supervisor actually settled on, instead of inferring one from the
+    # release event alone. Never treat a parsed value as proof that the run
+    # settled: a backend may materialize a placeholder "unknown" for every live
+    # lock, so only the supervisor that classified the run knows the difference.
+    settled_outcome: str = ""
+    settled_classification: str = ""
 
     @classmethod
     def new(
@@ -285,11 +296,25 @@ class ActiveRunState:
             model_provider_source=(
                 optional_string(metadata.get("model_provider_source")) or ""
             ),
-            model_id=optional_string(metadata.get("model_id")) or "",
-            model_id_source=optional_string(metadata.get("model_id_source")) or "",
-            reasoning_effort=optional_string(metadata.get("reasoning_effort")) or "",
+            model_id=(
+                optional_string(metadata.get("model_id"))
+                or optional_string(metadata.get("model"))
+                or ""
+            ),
+            model_id_source=(
+                optional_string(metadata.get("model_id_source"))
+                or optional_string(metadata.get("model_source"))
+                or ""
+            ),
+            reasoning_effort=(
+                optional_string(metadata.get("reasoning_effort"))
+                or optional_string(metadata.get("effort"))
+                or ""
+            ),
             reasoning_effort_source=(
-                optional_string(metadata.get("reasoning_effort_source")) or ""
+                optional_string(metadata.get("reasoning_effort_source"))
+                or optional_string(metadata.get("effort_source"))
+                or ""
             ),
             trailer_context=optional_mapping(metadata.get("trailer_context")),
             trailer_context_sources=optional_mapping(
@@ -317,6 +342,10 @@ class ActiveRunState:
             host=optional_string(metadata.get("host")) or "",
             lock_path=optional_path(metadata.get("path")),
             workspace=WorkspaceClaim.from_json(metadata.get("workspace")),
+            settled_outcome=optional_string(metadata.get("outcome")) or "",
+            settled_classification=(
+                optional_string(metadata.get("classification")) or ""
+            ),
         )
 
     def with_worker_pid(
@@ -426,8 +455,12 @@ class ActiveRunState:
             "model_provider_source": self.model_provider_source,
             "model_id": self.model_id,
             "model_id_source": self.model_id_source,
+            "model": self.model_id,
+            "model_source": self.model_id_source,
             "reasoning_effort": self.reasoning_effort,
             "reasoning_effort_source": self.reasoning_effort_source,
+            "effort": self.reasoning_effort,
+            "effort_source": self.reasoning_effort_source,
             "trailer_context": self.trailer_context,
             "trailer_context_sources": self.trailer_context_sources,
             "restart_count": self.restart_count,
@@ -441,7 +474,22 @@ class ActiveRunState:
             metadata["fencing_token"] = self.fencing_token
         if self.workspace is not None:
             metadata["workspace"] = self.workspace.to_json()
+        if self.settled_outcome:
+            metadata["outcome"] = self.settled_outcome
+        if self.settled_classification:
+            metadata["classification"] = self.settled_classification
         return metadata
+
+    def with_settled_outcome(
+        self,
+        outcome: str,
+        classification: str,
+    ) -> ActiveRunState:
+        return dataclasses.replace(
+            self,
+            settled_outcome=outcome,
+            settled_classification=classification,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -571,8 +619,12 @@ class WorkerView:
             "model_provider_source": self.active.model_provider_source,
             "model_id": self.active.model_id,
             "model_id_source": self.active.model_id_source,
+            "model": self.active.model_id,
+            "model_source": self.active.model_id_source,
             "reasoning_effort": self.active.reasoning_effort,
             "reasoning_effort_source": self.active.reasoning_effort_source,
+            "effort": self.active.reasoning_effort,
+            "effort_source": self.active.reasoning_effort_source,
             "trailer_context": self.active.trailer_context,
             "trailer_context_sources": self.active.trailer_context_sources,
             "restart_count": self.active.restart_count,
@@ -1583,6 +1635,8 @@ class StaleLock:
     kind: str
     recovery_command: str
     started_at: str = ""
+    settled_outcome: str = ""
+    settled_classification: str = ""
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1607,6 +1661,7 @@ def collect_stale_locks(
     ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[StaleLock]:
     stale: list[StaleLock] = []
+    pending_settlements = pending_settlements_by_run_id(run_store.read_records())
     for view in build_worker_views(
         lock_manager,
         run_store,
@@ -1621,6 +1676,7 @@ def collect_stale_locks(
         lock_path = view.active.lock_path
         if lock_path is None:
             continue
+        settlement = pending_settlements.get(view.active.run_id, ("", ""))
         stale.append(
             StaleLock(
                 task_id=view.active.task_id,
@@ -1633,6 +1689,8 @@ def collect_stale_locks(
                     lock_path,
                 ),
                 started_at=view.active.started_at,
+                settled_outcome=settlement[0],
+                settled_classification=settlement[1],
             )
         )
 
@@ -1666,6 +1724,45 @@ def collect_stale_locks(
     return stale
 
 
+def pending_settlements_by_run_id(
+    records: Sequence[dict[str, Any]],
+) -> dict[str, tuple[str, str]]:
+    """Terminal outcomes that are durable locally but never reached their lock.
+
+    Prefer the explicit ``lock_finalization_failed`` event when it exists. If
+    that append also failed, the same run's terminal ``run_result`` is the
+    fallback source. A later ``lock_released`` for the run clears either source.
+    """
+
+    pending: dict[str, tuple[str, str]] = {}
+    event_derived: set[str] = set()
+    for record in records:
+        run_id = optional_string(record.get("run_id"))
+        if not run_id:
+            continue
+        record_type = record.get("record_type")
+        if record_type == LOCK_RELEASED_RECORD_TYPE:
+            pending.pop(run_id, None)
+            event_derived.discard(run_id)
+            continue
+        if record_type == RUN_RECORD_TYPE:
+            classification = optional_string(record.get("classification")) or ""
+            if classification in TERMINAL_LOCK_OUTCOMES and run_id not in event_derived:
+                pending[run_id] = (classification, classification)
+            continue
+        if record_type != LOCK_FINALIZATION_FAILED_RECORD_TYPE:
+            continue
+        outcome = optional_string(record.get("outcome")) or ""
+        if outcome not in TERMINAL_LOCK_OUTCOMES:
+            continue
+        pending[run_id] = (
+            outcome,
+            optional_string(record.get("classification")) or "",
+        )
+        event_derived.add(run_id)
+    return pending
+
+
 @dataclasses.dataclass(frozen=True)
 class CleanResult:
     cleaned: list[StaleLock]
@@ -1686,6 +1783,8 @@ def clean_stale_locks(
                     run_id=lock.run_id,
                     path=lock.lock_path,
                     kind=lock.kind,
+                    settled_outcome=lock.settled_outcome,
+                    settled_classification=lock.settled_classification,
                 )
             except LockBackendError as exc:
                 errors.append((lock, str(exc)))

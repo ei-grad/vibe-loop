@@ -184,6 +184,7 @@ SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
 # batch/cycle. Only an explicit `worker_timeout_seconds = 0` restores the
 # historical unbounded behavior.
 SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS = 10800.0
+SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD = 100000
 SUPERVISION_CONFIG_KEYS = frozenset(
     {
         "max_restarts",
@@ -194,6 +195,7 @@ SUPERVISION_CONFIG_KEYS = frozenset(
         "limit_wall_backoff_seconds",
         "limit_wall_patterns",
         "worker_timeout_seconds",
+        "slice_token_threshold",
     }
 )
 LOCK_BACKEND_TYPES = ("directory", "command")
@@ -230,10 +232,27 @@ AUTOPILOT_CONFIG_KEYS = (
             "planning_max_launches_per_day",
             "planning_unproductive_threshold",
             "worktree_disposition",
+            "disk_reserve",
         }
     )
     | AUTOPILOT_COMMAND_KEYS
 )
+DISK_RESERVE_CONFIG_KEYS = frozenset(
+    {
+        "min_free_bytes",
+        "min_free_fraction",
+        "min_free_inodes",
+        "min_free_inode_fraction",
+    }
+)
+# Native disk-health floors (the reviewed AUTO-15 defaults). A target is a
+# genuine capacity blocker only when BOTH the absolute and the proportional
+# floor of an axis are exhausted. These are the single source of truth for the
+# defaults; autopilot.DiskHealthThresholds aliases them.
+DISK_RESERVE_DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024
+DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION = 0.02
+DISK_RESERVE_DEFAULT_MIN_FREE_INODES = 10_000
+DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION = 0.02
 # Six hours between planning attempts once planning stops producing actionable
 # work, capped at four launches a rolling day: an analysis plus authoring pass
 # costs real provider spend, and repeating it on the ordinary supervisor
@@ -293,6 +312,11 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
 
 AGENT_KIND_VALUES = ("auto", "codex", "claude", "custom")
 AGENT_PROMPT_DIALECTS = ("codex", "claude")
+AGENT_EFFORT_VALUES = frozenset({"minimal", "low", "medium", "high", "xhigh"})
+AGENT_PROVIDER_EFFORT_VALUES = {
+    "codex": AGENT_EFFORT_VALUES,
+    "claude": frozenset({"low", "medium", "high"}),
+}
 AGENT_ROUTING_PREDICATE_KEYS = frozenset(
     {
         "match_hazards_any",
@@ -386,15 +410,18 @@ class AgentConfig:
     selection_command: str | None = None
     analysis_command: str | None = None
     model: str | None = None
+    effort: str | None = None
     command_source: str = "unresolved:no-supported-cli"
     selection_command_source: str = "unresolved:no-supported-cli"
     analysis_command_source: str = "unresolved:no-supported-cli"
     model_source: str = "default:none"
+    effort_source: str = "default:none"
     detected: AgentDetection = dataclasses.field(default_factory=AgentDetection)
     forward_stderr: bool = False
     agent_kind: str = "auto"
     agent_kind_source: str = "default:auto"
     executable_kind: str | None = None
+    profile_name: str = ""
     prompt_dialect: str | None = "codex"
     prompt_dialect_source: str = "legacy-default:codex"
     skill_ref_prefix: str | None = "$"
@@ -402,6 +429,7 @@ class AgentConfig:
     compatibility_diagnostics: tuple[str, ...] = ()
 
     def require_command(self) -> str:
+        self.require_effort_delivery("command")
         if self.command:
             return self.command
         raise AgentResolutionError(
@@ -412,7 +440,49 @@ class AgentConfig:
             )
         )
 
+    def require_effort_delivery(self, key: str) -> None:
+        diagnostic = self.effort_delivery_diagnostic(key)
+        if diagnostic:
+            raise AgentResolutionError(diagnostic)
+
+    def effort_delivery_diagnostic(self, key: str) -> str:
+        if self.effort is None:
+            return ""
+        command = getattr(self, key)
+        if command is None:
+            return ""
+        command_source = getattr(self, f"{key}_source")
+        provider = agent_command_provider(
+            command,
+            self.executable_kind or self.agent_kind,
+        )
+        if provider in AGENT_PROVIDER_EFFORT_VALUES:
+            allowed = AGENT_PROVIDER_EFFORT_VALUES[provider]
+            if self.effort not in allowed:
+                return (
+                    f"agent.effort {self.effort!r} is not supported by {provider}; "
+                    f"allowed values: {', '.join(sorted(allowed))}"
+                )
+        if command_source != "explicit":
+            return ""
+        setting = (
+            f"agent.profiles.{self.profile_name}." if self.profile_name else "agent."
+        )
+        if command_embeds_native_effort(command):
+            return (
+                f"{setting}{key} already embeds provider-specific effort while "
+                f"{setting}effort is set; remove the embedded flag and use "
+                "{effort}, or unset the first-class setting."
+            )
+        if not command_template_uses_field(command, "effort"):
+            return (
+                f"{setting}{key} is explicit and cannot receive {setting}effort; "
+                "add a validated {effort} placeholder or unset agent.effort."
+            )
+        return ""
+
     def require_selection_command(self) -> str:
+        self.require_effort_delivery("selection_command")
         if self.selection_command:
             return self.selection_command
         raise AgentResolutionError(
@@ -424,6 +494,7 @@ class AgentConfig:
         )
 
     def require_analysis_command(self) -> str:
+        self.require_effort_delivery("analysis_command")
         if self.analysis_command:
             return self.analysis_command
         raise AgentResolutionError(
@@ -446,6 +517,10 @@ class AgentConfig:
 
     def diagnostics(self) -> list[str]:
         messages: list[str] = list(self.compatibility_diagnostics)
+        for key in ("command", "selection_command", "analysis_command"):
+            diagnostic = self.effort_delivery_diagnostic(key)
+            if diagnostic:
+                messages.append(diagnostic)
         if not self.command:
             messages.append(
                 unresolved_agent_command_message(
@@ -481,6 +556,8 @@ class AgentConfig:
             "analysis_command_source": self.analysis_command_source,
             "model": self.model,
             "model_source": self.model_source,
+            "effort": self.effort,
+            "effort_source": self.effort_source,
             "forward_stderr": self.forward_stderr,
             "agent_kind": self.agent_kind,
             "agent_kind_source": self.agent_kind_source,
@@ -656,6 +733,7 @@ class SupervisionConfig:
     # 0.0 means unbounded (historical behavior); a positive value caps a single
     # worker's wall-clock runtime before its process group is force-killed.
     worker_timeout_seconds: float = SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS
+    slice_token_threshold: int = SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -671,6 +749,71 @@ class SupervisionConfig:
             "limit_wall_backoff_seconds": self.limit_wall_backoff_seconds,
             "limit_wall_patterns": list(self.limit_wall_patterns),
             "worker_timeout_seconds": self.worker_timeout_seconds,
+            "slice_token_threshold": self.slice_token_threshold,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskReserveConfig:
+    """Per-project overrides for the native disk-health capacity floors.
+
+    Each field is ``None`` when unset, so the native AUTO-15 default applies and
+    a configuration-free project keeps its reviewed behavior. The disk-health
+    check blocks a target only when *both* the absolute and the proportional
+    floor of an axis are exhausted, so pairing a positive reserve on one axis
+    with a zero reserve on the other can never block; that combination is
+    rejected as contradictory during validation.
+    """
+
+    min_free_bytes: int | None = None
+    min_free_fraction: float | None = None
+    min_free_inodes: int | None = None
+    min_free_inode_fraction: float | None = None
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    @property
+    def effective_min_free_bytes(self) -> int:
+        if self.min_free_bytes is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
+        return self.min_free_bytes
+
+    @property
+    def effective_min_free_fraction(self) -> float:
+        if self.min_free_fraction is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
+        return self.min_free_fraction
+
+    @property
+    def effective_min_free_inodes(self) -> int:
+        if self.min_free_inodes is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_INODES
+        return self.min_free_inodes
+
+    @property
+    def effective_min_free_inode_fraction(self) -> float:
+        if self.min_free_inode_fraction is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION
+        return self.min_free_inode_fraction
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "min_free_bytes": self.min_free_bytes,
+            "min_free_fraction": self.min_free_fraction,
+            "min_free_inodes": self.min_free_inodes,
+            "min_free_inode_fraction": self.min_free_inode_fraction,
+            # Effective floors actually enforced by the cycle: the configured
+            # override, or the native default when unset. Doctor/status show
+            # these so an operator sees the values in force, not just overrides.
+            "effective": {
+                "min_free_bytes": self.effective_min_free_bytes,
+                "min_free_fraction": self.effective_min_free_fraction,
+                "min_free_inodes": self.effective_min_free_inodes,
+                "min_free_inode_fraction": self.effective_min_free_inode_fraction,
+            },
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -694,6 +837,9 @@ class AutopilotConfig:
     troubleshoot_command: str | None = None
     planning_command: str | None = None
     idle_wake_command: str | None = None
+    disk_reserve: DiskReserveConfig = dataclasses.field(
+        default_factory=DiskReserveConfig
+    )
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -724,6 +870,7 @@ class AutopilotConfig:
             "troubleshoot_command": self.troubleshoot_command,
             "planning_command": self.planning_command,
             "idle_wake_command": self.idle_wake_command,
+            "disk_reserve": self.disk_reserve.to_json(),
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1153,6 +1300,8 @@ def parse_agent(data: object) -> AgentConfig:
     detected = detect_agent_clis()
     model = optional_nonempty_string(table.get("model"))
     model_source = "explicit" if model is not None else "default:none"
+    effort = parse_agent_effort(table.get("effort"), "agent.effort")
+    effort_source = "explicit" if effort is not None else "default:none"
     agent_kind = optional_nonempty_string(table.get("kind")) or "auto"
     if agent_kind not in AGENT_KIND_VALUES:
         allowed = ", ".join(AGENT_KIND_VALUES)
@@ -1196,6 +1345,7 @@ def parse_agent(data: object) -> AgentConfig:
         agent_kind,
         detected,
         model,
+        effort,
     )
     selection_command, selection_command_source, _ = resolve_agent_command(
         "selection_command",
@@ -1203,6 +1353,7 @@ def parse_agent(data: object) -> AgentConfig:
         agent_kind,
         detected,
         model,
+        effort,
     )
     analysis_command, analysis_command_source, _ = resolve_agent_command(
         "analysis_command",
@@ -1210,6 +1361,7 @@ def parse_agent(data: object) -> AgentConfig:
         agent_kind,
         detected,
         model,
+        effort,
     )
     prompt_resolution = resolve_agent_prompt_dialect(
         agent_kind,
@@ -1223,10 +1375,12 @@ def parse_agent(data: object) -> AgentConfig:
         selection_command=selection_command,
         analysis_command=analysis_command,
         model=model,
+        effort=effort,
         command_source=command_source,
         selection_command_source=selection_command_source,
         analysis_command_source=analysis_command_source,
         model_source=model_source,
+        effort_source=effort_source,
         detected=detected,
         forward_stderr=optional_bool(
             table.get("forward_stderr"), False, "agent.forward_stderr"
@@ -1257,7 +1411,9 @@ def parse_agent_profiles(table: dict[str, Any]) -> dict[str, AgentConfig]:
         try:
             # Each profile is a full [agent]-shaped table, so it resolves through
             # the same command/kind/prompt-dialect machinery as the default.
-            profiles[name] = parse_agent(profile_table)
+            profiles[name] = dataclasses.replace(
+                parse_agent(profile_table), profile_name=name
+            )
         except ValueError as exc:
             raise ValueError(f"{label}: {exc}") from exc
     return profiles
@@ -1390,7 +1546,9 @@ def apply_model_to_inferred_commands(
     for key in ("command", "selection_command", "analysis_command"):
         source = getattr(config, f"{key}_source")
         if source != "explicit" and getattr(config, key) is not None:
-            replacements[key] = default_agent_command(agent_kind, key, model)
+            replacements[key] = default_agent_command(
+                agent_kind, key, model, config.effort
+            )
     if not replacements:
         return config
     return dataclasses.replace(config, **replacements)
@@ -1409,6 +1567,7 @@ def resolve_agent_command(
     agent_kind: str,
     detected: AgentDetection,
     model: str | None,
+    effort: str | None,
 ) -> tuple[str | None, str, str | None]:
     if configured is not None:
         return configured, "explicit", None
@@ -1417,7 +1576,7 @@ def resolve_agent_command(
     if agent_kind in SUPPORTED_AGENT_CLIS:
         if detected.path_for(agent_kind):
             return (
-                default_agent_command(agent_kind, key, model),
+                default_agent_command(agent_kind, key, model, effort),
                 f"agent.kind:{agent_kind}",
                 agent_kind,
             )
@@ -1428,14 +1587,14 @@ def resolve_agent_command(
         if len(available) > 1:
             source = f"auto:codex:{AGENT_DEFAULT_POLICY_SOURCE}"
         return (
-            default_agent_command(AGENT_PREFERRED_CLI, key, model),
+            default_agent_command(AGENT_PREFERRED_CLI, key, model, effort),
             source,
             AGENT_PREFERRED_CLI,
         )
     if len(available) == 1:
         agent_name = available[0]
         return (
-            default_agent_command(agent_name, key, model),
+            default_agent_command(agent_name, key, model, effort),
             f"auto:{agent_name}",
             agent_name,
         )
@@ -1444,13 +1603,26 @@ def resolve_agent_command(
     return None, "unresolved:multiple-supported-clis", None
 
 
-def default_agent_command(agent_kind: str, key: str, model: str | None) -> str:
+def default_agent_command(
+    agent_kind: str,
+    key: str,
+    model: str | None,
+    effort: str | None = None,
+) -> str:
     command = AGENT_COMMAND_DEFAULTS[agent_kind][key]
     if model is None:
-        return command
+        configured = command
+    elif agent_kind == "codex":
+        configured = command.replace("codex exec", "codex exec -m {model}", 1)
+    else:
+        configured = command.replace("claude -p", "claude -p --model {model}", 1)
+    if effort is None:
+        return configured
     if agent_kind == "codex":
-        return command.replace("codex exec", "codex exec -m {model}", 1)
-    return command.replace("claude -p", "claude -p --model {model}", 1)
+        return configured.replace(
+            "codex exec", "codex exec -c model_reasoning_effort={effort}", 1
+        )
+    return configured.replace("claude -p", "claude -p --effort {effort}", 1)
 
 
 def format_agent_command(
@@ -1458,6 +1630,7 @@ def format_agent_command(
     *,
     prompt: str,
     model: str | None,
+    effort: str | None = None,
     task: Any | None = None,
     profile: str = "",
     **format_fields: str,
@@ -1474,11 +1647,91 @@ def format_agent_command(
             f"references {{model}}, but no model is resolved; set task.model "
             f"or {model_setting}."
         )
+    if not effort and command_template_uses_field(command_template, "effort"):
+        task_context = ""
+        if task is not None:
+            task_id = getattr(task, "task_id", "") or ""
+            task_context = f"task {task_id!r} "
+        profile_name = profile or "default"
+        effort_setting = (
+            f"agent.profiles.{profile}.effort" if profile else "agent.effort"
+        )
+        raise AgentResolutionError(
+            f"{task_context}agent profile {profile_name!r} command template "
+            f"references {{effort}}, but no effort is resolved; set {effort_setting}."
+        )
     return command_template.format(
         prompt=shell_quote(prompt),
         model=shell_quote(model or ""),
+        effort=shell_quote(effort or ""),
         **format_fields,
     )
+
+
+def parse_agent_effort(value: object, setting: str) -> str | None:
+    effort = optional_nonempty_string(value)
+    if effort is None:
+        return None
+    normalized = effort.lower()
+    if normalized not in AGENT_EFFORT_VALUES:
+        allowed = ", ".join(sorted(AGENT_EFFORT_VALUES))
+        raise ValueError(f"{setting} must be one of: {allowed}")
+    return normalized
+
+
+def agent_command_provider(command: str, fallback: str | None) -> str:
+    # A recognizable explicit executable is authoritative: it outranks the
+    # declared kind, so a Codex kind pointing at a Claude command is validated
+    # against Claude. An identifiable-but-unknown executable fails closed to ""
+    # rather than inventing the kind's provider identity. The kind fallback is
+    # used only when the command carries no executable token to inspect.
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    for token in argv:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            continue
+        executable = Path(token).name
+        return executable if executable in AGENT_PROVIDER_EFFORT_VALUES else ""
+    return fallback if fallback in AGENT_PROVIDER_EFFORT_VALUES else ""
+
+
+def command_embeds_native_effort(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    for index, token in enumerate(argv):
+        # A placeholder flag such as `--effort {effort}` does not embed a fixed
+        # effort; keep scanning so a later fixed flag (e.g. `--effort low`) is
+        # still detected instead of short-circuiting on the placeholder.
+        if token in {"--effort", "--reasoning-effort"}:
+            if index + 1 < len(argv) and "{effort}" not in argv[index + 1]:
+                return True
+            continue
+        if token.startswith(("--effort=", "--reasoning-effort=")):
+            if "{effort}" not in token.split("=", 1)[1]:
+                return True
+            continue
+        if token in {"-c", "--config"} and index + 1 < len(argv):
+            token = argv[index + 1]
+        elif token.startswith(("-c=", "--config=")):
+            token = token.split("=", 1)[1]
+        else:
+            continue
+        key, separator, _value = token.partition("=")
+        if (
+            separator
+            and "{effort}" not in _value
+            and key.replace("-", "_")
+            in {
+                "model_reasoning_effort",
+                "reasoning_effort",
+            }
+        ):
+            return True
+    return False
 
 
 def command_template_uses_field(command_template: str, field: str) -> bool:
@@ -1871,6 +2124,11 @@ def parse_supervision(data: object) -> SupervisionConfig:
             SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
             "supervision.worker_timeout_seconds",
         ),
+        slice_token_threshold=nonnegative_int(
+            table.get("slice_token_threshold"),
+            SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD,
+            "supervision.slice_token_threshold",
+        ),
         explicit_keys=explicit_keys,
     )
 
@@ -1952,8 +2210,67 @@ def parse_autopilot(data: object) -> AutopilotConfig:
         ),
         planning_command=optional_nonempty_string(table.get("planning_command")),
         idle_wake_command=optional_nonempty_string(table.get("idle_wake_command")),
+        disk_reserve=parse_disk_reserve(table.get("disk_reserve", {})),
         explicit_keys=explicit_keys,
     )
+
+
+def parse_disk_reserve(data: object) -> DiskReserveConfig:
+    table = expect_table(data, "autopilot.disk_reserve")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - DISK_RESERVE_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            "autopilot.disk_reserve contains unsupported keys: "
+            + ", ".join(unknown_keys)
+        )
+    min_free_bytes = optional_nonnegative_int(
+        table.get("min_free_bytes"), "autopilot.disk_reserve.min_free_bytes"
+    )
+    min_free_fraction = optional_fraction(
+        table.get("min_free_fraction"), "autopilot.disk_reserve.min_free_fraction"
+    )
+    min_free_inodes = optional_nonnegative_int(
+        table.get("min_free_inodes"), "autopilot.disk_reserve.min_free_inodes"
+    )
+    min_free_inode_fraction = optional_fraction(
+        table.get("min_free_inode_fraction"),
+        "autopilot.disk_reserve.min_free_inode_fraction",
+    )
+    reserve = DiskReserveConfig(
+        min_free_bytes=min_free_bytes,
+        min_free_fraction=min_free_fraction,
+        min_free_inodes=min_free_inodes,
+        min_free_inode_fraction=min_free_inode_fraction,
+        explicit_keys=explicit_keys,
+    )
+    reject_contradictory_reserve_pair(
+        ("min_free_bytes", reserve.effective_min_free_bytes),
+        ("min_free_fraction", reserve.effective_min_free_fraction),
+    )
+    reject_contradictory_reserve_pair(
+        ("min_free_inodes", reserve.effective_min_free_inodes),
+        ("min_free_inode_fraction", reserve.effective_min_free_inode_fraction),
+    )
+    return reserve
+
+
+def reject_contradictory_reserve_pair(
+    absolute: tuple[str, int | float],
+    proportional: tuple[str, int | float],
+) -> None:
+    # A blocker fires only when both the absolute and the proportional floor of
+    # an axis are exhausted, so a positive reserve paired with a zero reserve on
+    # the same axis can never block. Validate the *effective* pair (override or
+    # native default), so a lone explicit zero that silently disables an axis is
+    # rejected while a fully zeroed (intentionally disabled) axis stays valid.
+    (name_a, effective_a) = absolute
+    (name_b, effective_b) = proportional
+    if (effective_a == 0) != (effective_b == 0):
+        raise ValueError(
+            f"autopilot.disk_reserve.{name_a} and .{name_b} are contradictory: "
+            "a positive reserve paired with a zero reserve can never block launch"
+        )
 
 
 def parse_locks(data: object) -> LockConfig:
@@ -2281,6 +2598,18 @@ def nonnegative_int(value: object, default: int, name: str) -> int:
     if parsed < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return parsed
+
+
+def optional_nonnegative_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    return nonnegative_int(value, 0, name)
+
+
+def optional_fraction(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    return bounded_float(value, 0.0, name, minimum=0.0, maximum=1.0)
 
 
 def nonnegative_float(value: object, default: float, name: str) -> float:

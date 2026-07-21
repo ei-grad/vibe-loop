@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -20,6 +21,10 @@ from typing import Any, BinaryIO
 
 from vibe_loop.config import (
     AgentResolutionError,
+    DISK_RESERVE_DEFAULT_MIN_FREE_BYTES,
+    DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION,
+    DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION,
+    DISK_RESERVE_DEFAULT_MIN_FREE_INODES,
     REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES,
     REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES,
     RUNTIME_CONTEXT_REDACTION,
@@ -54,11 +59,21 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.retry import parse_limit_wall_reset_delay
-from vibe_loop.runner import AgentLimitWallError, VibeRunner, new_run_id
+from vibe_loop.runner import (
+    AgentLimitWallError,
+    AgentRuntimeContext,
+    ProviderUsageObserver,
+    VibeRunner,
+    inject_structured_usage_output,
+    new_run_id,
+    parse_agent_runtime_context_from_command,
+)
 from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
+    AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_LAUNCH_RECORD_TYPE,
@@ -77,6 +92,7 @@ from vibe_loop.runs import (
     utc_now_iso,
 )
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
+from vibe_loop.telemetry import merge_provider_usage, unavailable_usage
 from vibe_loop.workers import (
     ActiveRunState,
     ProcessExists,
@@ -3395,6 +3411,491 @@ def run_maintenance_command(
     )
 
 
+# Bounded capacity thresholds for the native disk-health check (PRD-AUT-012).
+# A target is a genuine capacity blocker only when BOTH an absolute reserve and
+# a proportional reserve are exhausted, so a large disk with a low percentage
+# but ample bytes, and a small disk low on bytes but proportionally roomy, are
+# not misreported as capacity failures.
+AUTOPILOT_DISK_MIN_FREE_BYTES = DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
+AUTOPILOT_DISK_MIN_FREE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
+AUTOPILOT_DISK_MIN_FREE_INODES = DISK_RESERVE_DEFAULT_MIN_FREE_INODES
+AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION
+DISK_HEALTH_OK = "ok"
+DISK_HEALTH_CRITICAL = "critical"
+AUTOPILOT_DISK_CAPACITY_BLOCKER = "autopilot_disk_capacity_low"
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskHealthThresholds:
+    """Bounded free-space/inode floors the disk-health check compares against."""
+
+    min_free_bytes: int = AUTOPILOT_DISK_MIN_FREE_BYTES
+    min_free_fraction: float = AUTOPILOT_DISK_MIN_FREE_FRACTION
+    min_free_inodes: int = AUTOPILOT_DISK_MIN_FREE_INODES
+    min_free_inode_fraction: float = AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "min_free_bytes": self.min_free_bytes,
+            "min_free_fraction": self.min_free_fraction,
+            "min_free_inodes": self.min_free_inodes,
+            "min_free_inode_fraction": self.min_free_inode_fraction,
+        }
+
+
+DEFAULT_DISK_HEALTH_THRESHOLDS = DiskHealthThresholds()
+
+
+def disk_health_thresholds_for(config: VibeConfig) -> DiskHealthThresholds:
+    """Resolve the effective disk-health floors for a project's cycle.
+
+    Each ``[autopilot.disk_reserve]`` override replaces one native default; an
+    unset override keeps the reviewed AUTO-15 value, so a configuration-free
+    project's thresholds are unchanged.
+    """
+    reserve = config.autopilot.disk_reserve
+    return DiskHealthThresholds(
+        min_free_bytes=reserve.effective_min_free_bytes,
+        min_free_fraction=reserve.effective_min_free_fraction,
+        min_free_inodes=reserve.effective_min_free_inodes,
+        min_free_inode_fraction=reserve.effective_min_free_inode_fraction,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskCapacitySample:
+    """A capacity reading for one filesystem path.
+
+    ``total_inodes == 0`` marks a filesystem that does not expose an inode
+    count (some FUSE/network mounts); inode pressure is treated as not
+    applicable there rather than as exhaustion.
+    """
+
+    path: str
+    total_bytes: int
+    free_bytes: int
+    total_inodes: int
+    free_inodes: int
+
+    @property
+    def free_bytes_fraction(self) -> float:
+        if self.total_bytes <= 0:
+            return 1.0
+        return self.free_bytes / self.total_bytes
+
+    @property
+    def free_inodes_fraction(self) -> float:
+        if self.total_inodes <= 0:
+            return 1.0
+        return self.free_inodes / self.total_inodes
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "total_bytes": self.total_bytes,
+            "free_bytes": self.free_bytes,
+            "free_bytes_fraction": self.free_bytes_fraction,
+            "total_inodes": self.total_inodes,
+            "free_inodes": self.free_inodes,
+            "free_inodes_fraction": self.free_inodes_fraction,
+        }
+
+
+# Reads a filesystem capacity sample for a path. Defaults to ``os.statvfs``;
+# injected in tests so acceptance never depends on real disk state.
+DiskCapacityProbe = Callable[[Path], DiskCapacitySample]
+
+
+def statvfs_capacity_probe(path: Path) -> DiskCapacitySample:
+    # ``os.statvfs`` exposes inode accounting but is POSIX-only. On platforms
+    # without it (Windows), fall back to the portable ``shutil.disk_usage`` for
+    # byte capacity and mark inodes as not accounted (``total_inodes == 0``), so
+    # the OS-independent cycle keeps checking free space instead of aborting.
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is not None:
+        stat = statvfs(path)
+        return DiskCapacitySample(
+            path=str(path),
+            total_bytes=stat.f_frsize * stat.f_blocks,
+            free_bytes=stat.f_frsize * stat.f_bavail,
+            total_inodes=stat.f_files,
+            free_inodes=stat.f_favail,
+        )
+    usage = shutil.disk_usage(path)
+    return DiskCapacitySample(
+        path=str(path),
+        total_bytes=usage.total,
+        free_bytes=usage.free,
+        total_inodes=0,
+        free_inodes=0,
+    )
+
+
+def _evaluate_capacity_pressure(
+    sample: DiskCapacitySample, thresholds: DiskHealthThresholds
+) -> tuple[str, ...]:
+    reasons: list[str] = []
+    if (
+        sample.free_bytes < thresholds.min_free_bytes
+        and sample.free_bytes_fraction < thresholds.min_free_fraction
+    ):
+        reasons.append("free_bytes")
+    if (
+        sample.total_inodes > 0
+        and sample.free_inodes < thresholds.min_free_inodes
+        and sample.free_inodes_fraction < thresholds.min_free_inode_fraction
+    ):
+        reasons.append("free_inodes")
+    return tuple(reasons)
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskCapacityTarget:
+    """One probed path, its reading, and any exhausted-reserve reasons."""
+
+    label: str
+    path: str
+    sample: DiskCapacitySample | None
+    pressure: tuple[str, ...]
+    error: str
+
+    @property
+    def critical(self) -> bool:
+        return bool(self.pressure)
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "label": self.label,
+            "path": self.path,
+            "sample": self.sample.to_json() if self.sample is not None else None,
+            "pressure": list(self.pressure),
+            "error": self.error,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class DiskHealthCycleResult:
+    """Outcome of one cycle's native disk-health check (PRD-AUT-011/012).
+
+    Mirrors the maintenance-command-result record shape: a single typed
+    ``autopilot_disk_health`` record carries the thresholds and per-target
+    evidence. A probe error is a non-blocking observation, not a capacity
+    blocker: an unreadable path can never be a *genuine* exhaustion signal, and
+    the non-destructive boundary (PRD-AUT-006) forbids acting on ambiguity.
+    """
+
+    cycle_id: str
+    thresholds: DiskHealthThresholds
+    targets: tuple[DiskCapacityTarget, ...]
+
+    @property
+    def status(self) -> str:
+        if any(target.critical for target in self.targets):
+            return DISK_HEALTH_CRITICAL
+        return DISK_HEALTH_OK
+
+    @property
+    def blocker(self) -> str:
+        if self.status == DISK_HEALTH_CRITICAL:
+            return AUTOPILOT_DISK_CAPACITY_BLOCKER
+        return ""
+
+    @property
+    def probe_errors(self) -> int:
+        return sum(1 for target in self.targets if target.error)
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "blocker": self.blocker,
+            "thresholds": self.thresholds.to_json(),
+            "targets": [target.to_json() for target in self.targets],
+        }
+
+
+DiskHealthRunner = Callable[..., DiskHealthCycleResult]
+
+
+def run_disk_health(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    probe: DiskCapacityProbe = statvfs_capacity_probe,
+    thresholds: DiskHealthThresholds | None = None,
+) -> DiskHealthCycleResult:
+    """Run the native, read-only disk-health check for the cycle.
+
+    Probes the repository and state directory for free-space/inode pressure
+    against bounded thresholds. The probe is dependency-injected so tests never
+    depend on real disk state. Thresholds default to the project's configured
+    ``[autopilot.disk_reserve]`` floors (native defaults when unset); an
+    explicit ``thresholds`` argument overrides them for focused tests. This step
+    never deletes, truncates, or otherwise mutates anything: it only reports
+    pressure and, on a genuine capacity blocker, signals the cycle to withhold
+    launch (PRD-AUT-006).
+    """
+    if thresholds is None:
+        thresholds = disk_health_thresholds_for(config)
+    targets: list[DiskCapacityTarget] = []
+    for label, path in (("repo", config.repo), ("state", config.state_path)):
+        try:
+            sample = probe(path)
+        except OSError as error:
+            targets.append(
+                DiskCapacityTarget(
+                    label=label,
+                    path=str(path),
+                    sample=None,
+                    pressure=(),
+                    error=str(error),
+                )
+            )
+            continue
+        targets.append(
+            DiskCapacityTarget(
+                label=label,
+                path=str(path),
+                sample=sample,
+                pressure=_evaluate_capacity_pressure(sample, thresholds),
+                error="",
+            )
+        )
+    return DiskHealthCycleResult(
+        cycle_id=cycle_id,
+        thresholds=thresholds,
+        targets=tuple(targets),
+    )
+
+
+# Native "what landed" git-log summary (PRD-AUT-011/012). A configuration-free
+# loop summarizes the commits merged into ``main`` since the previous cycle
+# without requiring a project ``summary_command``. The span is the previous
+# cycle's recorded ``main`` ref (read from the prior ``autopilot_cycle`` record)
+# to the current ``main`` ref from status. The step is read-only: it runs
+# ``git log`` and never mutates the repository.
+LANDED_SUMMARY_MAX_COMMITS = 50
+# Commit subjects are journaled verbatim up to this length; longer subjects are
+# truncated so a single pathological commit message cannot bloat the record.
+LANDED_SUMMARY_SUBJECT_LIMIT = 200
+LANDED_SUMMARY_FIELD_SEP = "\x1f"
+LANDED_SUMMARY_ACTION_PREFIX = "cycle_summary:"
+CYCLE_SUMMARY_BOOTSTRAP = "bootstrap"
+CYCLE_SUMMARY_LANDED = "landed"
+CYCLE_SUMMARY_UNCHANGED = "unchanged"
+CYCLE_SUMMARY_UNAVAILABLE = "unavailable"
+
+
+@dataclasses.dataclass(frozen=True)
+class LandedCommit:
+    """One commit that landed on ``main`` between two cycle refs."""
+
+    commit: str
+    subject: str
+
+    def to_json(self) -> dict[str, object]:
+        return {"commit": self.commit, "subject": self.subject}
+
+
+@dataclasses.dataclass(frozen=True)
+class CycleLandedSummaryResult:
+    """Outcome of one cycle's native "what landed" git-log summary.
+
+    Mirrors the maintenance-command-result record shape: a single typed
+    ``autopilot_cycle_summary`` record carries the derived span and bounded
+    per-commit evidence. The step is non-blocking and never mutates the
+    repository; ``bootstrap`` marks the first cycle (no prior recorded ref) and
+    ``error`` marks an unreadable span, both of which record rather than fail.
+    """
+
+    cycle_id: str
+    since_ref: str
+    until_ref: str
+    commits: tuple[LandedCommit, ...] = ()
+    truncated: bool = False
+    bootstrap: bool = False
+    error: str = ""
+
+    @property
+    def status(self) -> str:
+        if self.error:
+            return CYCLE_SUMMARY_UNAVAILABLE
+        if self.bootstrap:
+            return CYCLE_SUMMARY_BOOTSTRAP
+        if self.commits:
+            return CYCLE_SUMMARY_LANDED
+        return CYCLE_SUMMARY_UNCHANGED
+
+    @property
+    def commit_count(self) -> int:
+        return len(self.commits)
+
+    @property
+    def action(self) -> str:
+        # A trailing ``+`` marks a bounded, truncated span so a reader can tell
+        # "50 commits" from "at least 50 commits".
+        suffix = "+" if self.truncated else ""
+        return (
+            f"{LANDED_SUMMARY_ACTION_PREFIX}{self.status}:{self.commit_count}{suffix}"
+        )
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "since_ref": self.since_ref,
+            "until_ref": self.until_ref,
+            "commit_count": self.commit_count,
+            "truncated": self.truncated,
+            "bootstrap": self.bootstrap,
+            "error": self.error,
+            "commits": [commit.to_json() for commit in self.commits],
+        }
+
+
+# Reads the commits reachable from ``until_ref`` but not ``since_ref``. Defaults
+# to ``git log``; injected in tests so acceptance never depends on real history.
+GitLandedProbe = Callable[..., tuple[tuple[LandedCommit, ...], bool, str]]
+
+
+def git_landed_commits(
+    repo: Path,
+    *,
+    since_ref: str,
+    until_ref: str,
+    max_commits: int,
+) -> tuple[tuple[LandedCommit, ...], bool, str]:
+    """Commits on ``since_ref..until_ref``, newest first, bounded and read-only.
+
+    Requests one commit over ``max_commits`` so truncation is detectable without
+    a second call. Returns ``(commits, truncated, error)``; a git failure (an
+    unknown or rewritten ref) yields an empty tuple and the error text rather
+    than raising, so the cycle records an unavailable span instead of aborting.
+    """
+
+    output, error = git_text(
+        repo,
+        "log",
+        "--no-color",
+        f"--max-count={max_commits + 1}",
+        f"--format=%H{LANDED_SUMMARY_FIELD_SEP}%s",
+        f"{since_ref}..{until_ref}",
+    )
+    if error:
+        return (), False, error
+    commits: list[LandedCommit] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        commit_hash, _sep, subject = line.partition(LANDED_SUMMARY_FIELD_SEP)
+        commits.append(
+            LandedCommit(
+                commit=commit_hash[:12],
+                subject=subject.strip()[:LANDED_SUMMARY_SUBJECT_LIMIT],
+            )
+        )
+    truncated = len(commits) > max_commits
+    return tuple(commits[:max_commits]), truncated, ""
+
+
+CycleSummaryRunner = Callable[..., CycleLandedSummaryResult]
+
+
+def latest_cycle_main_ref(run_store: RunStore) -> str | None:
+    """The ``main`` ref recorded by the most recent ``autopilot_cycle`` record.
+
+    The cycle status carries only the current ref, so the previous cycle's ref
+    is read from its journaled ``git.main_head``. Returns ``None`` when no prior
+    cycle exists (the first cycle); an empty string when a prior cycle exists but
+    its record lacks a resolved main head. The two are deliberately distinct: the
+    first is a bootstrap, the second an unavailable prior endpoint.
+    """
+
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_CYCLE_RECORD_TYPE:
+            continue
+        git = record.get("git")
+        if isinstance(git, dict):
+            return str(git.get("main_head") or "")
+        return ""
+    return None
+
+
+def run_cycle_summary(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    prior_main_ref: str | None,
+    current_main_ref: str,
+    max_commits: int = LANDED_SUMMARY_MAX_COMMITS,
+    git_landed: GitLandedProbe = git_landed_commits,
+) -> CycleLandedSummaryResult:
+    """Summarize commits merged into ``main`` since the previous cycle.
+
+    Read-only: derives the span from the previous cycle's recorded ``main`` ref
+    to the current one and journals a bounded commit summary. The first cycle
+    (``prior_main_ref is None``) records a bootstrap summary regardless of the
+    current ref, since there is no span to derive; an unresolved current ref, or
+    a prior cycle whose recorded endpoint is empty, records an unavailable
+    summary. None of these fail the cycle (PRD-AUT-006/011/012).
+    """
+
+    # The first cycle has no span to derive, so it bootstraps even when the
+    # current ref cannot be resolved: the acceptance ties bootstrap to the
+    # absence of a prior recorded ref, not to current-ref availability.
+    if prior_main_ref is None:
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref="",
+            until_ref=current_main_ref,
+            bootstrap=True,
+        )
+    if not current_main_ref:
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref=prior_main_ref,
+            until_ref=current_main_ref,
+            error="main_ref_unavailable",
+        )
+    if not prior_main_ref:
+        # A prior cycle exists but recorded no resolved endpoint, so no span can
+        # be derived even though the current ref resolved.
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref=prior_main_ref,
+            until_ref=current_main_ref,
+            error="prior_main_ref_unavailable",
+        )
+    if prior_main_ref == current_main_ref:
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref=prior_main_ref,
+            until_ref=current_main_ref,
+        )
+    commits, truncated, error = git_landed(
+        config.repo,
+        since_ref=prior_main_ref,
+        until_ref=current_main_ref,
+        max_commits=max_commits,
+    )
+    return CycleLandedSummaryResult(
+        cycle_id=cycle_id,
+        since_ref=prior_main_ref,
+        until_ref=current_main_ref,
+        commits=commits,
+        truncated=truncated,
+        error=error,
+    )
+
+
 # Returns the parsed JSON decision payload (or ``None``) for a disposition
 # prompt. Defaults to ``VibeRunner.run_analysis_agent`` (PRD-AUT-009); injected
 # in tests so the read-only analysis agent never runs as a real subprocess.
@@ -3716,6 +4217,9 @@ class NativePlanningWorkerResult:
 class NativePlanningCycleResult:
     decision: NativePlanningDecision
     worker: NativePlanningWorkerResult
+    stats: dict[str, object] = dataclasses.field(default_factory=dict)
+    model_provider: str = "unknown"
+    model_id: str = "unknown"
 
 
 PLANNING_OUTCOME_PRODUCTIVE = "productive"
@@ -4015,8 +4519,11 @@ def planning_outcome_record(
     created_count: int | None = None,
     created_task_ids: Sequence[str] = (),
     provider_launched: bool = True,
+    model_provider: str = "unknown",
+    model_id: str = "unknown",
+    stats: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    return {
+    record: dict[str, object] = {
         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
         "record_type": AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
         "occurred_at": utc_now_iso(),
@@ -4029,7 +4536,12 @@ def planning_outcome_record(
         "created_count": created_count,
         "created_task_ids": list(created_task_ids),
         "provider_launched": provider_launched,
+        "model_provider": model_provider,
+        "model_id": model_id,
     }
+    if stats:
+        record["stats"] = dict(stats)
+    return record
 
 
 NativePlanningRunner = Callable[..., NativePlanningCycleResult]
@@ -4224,6 +4736,24 @@ def _native_planning_status(agent_error: str, limit_wall_pause: float | None) ->
     return "analysis_error" if agent_error else "decided"
 
 
+def planning_runtime_identity(
+    contexts: Sequence[AgentRuntimeContext],
+    *,
+    configured_model: str | None,
+) -> tuple[str, str]:
+    providers = {
+        context.model_provider for context in contexts if context.model_provider
+    }
+    models = {context.model_id for context in contexts if context.model_id}
+    provider = next(iter(providers)) if len(providers) == 1 else "mixed"
+    if not providers:
+        provider = "unknown"
+    model = next(iter(models)) if len(models) == 1 else "mixed"
+    if not models:
+        model = configured_model or "unknown"
+    return provider, model
+
+
 def run_native_planning(
     config: VibeConfig,
     *,
@@ -4234,7 +4764,17 @@ def run_native_planning(
     analysis_runner: AnalysisRunner | None = None,
     worker_launcher: PlanningWorkerLauncher = launch_native_planning_worker,
 ) -> NativePlanningCycleResult:
-    runner = analysis_runner or VibeRunner(config).run_analysis_agent
+    planning_started = time_module.monotonic()
+    analysis_vibe_runner = VibeRunner(config) if analysis_runner is None else None
+    runner = (
+        analysis_runner
+        if analysis_runner is not None
+        else analysis_vibe_runner.run_analysis_agent
+    )
+    analysis_usage = unavailable_usage("unknown", "provider_usage_not_reported")
+    worker_usage = unavailable_usage("unknown", "provider_usage_not_reported")
+    analysis_context = AgentRuntimeContext()
+    worker_context = AgentRuntimeContext()
     output_path = config.state_path / "autopilot" / f"{cycle_id}-planning-decision.json"
     agent_error = ""
     agent_error_kind = ""
@@ -4276,6 +4816,9 @@ def run_native_planning(
     if payload is None and not agent_error:
         agent_error = "analysis agent returned no planning decision"
         agent_error_kind = PLANNING_ERROR_INVALID_PLAN
+    if analysis_vibe_runner is not None:
+        analysis_usage = analysis_vibe_runner.last_analysis_usage
+        analysis_context = analysis_vibe_runner.last_analysis_runtime_context
     should_plan = False
     reason = ""
     objective = ""
@@ -4321,7 +4864,23 @@ def run_native_planning(
             error=agent_error,
         )
         run_store.append_record(worker.to_record(config.repo))
-        return NativePlanningCycleResult(decision=decision, worker=worker)
+        model_provider, model_id = planning_runtime_identity(
+            (analysis_context,), configured_model=config.agent.model
+        )
+        return NativePlanningCycleResult(
+            decision=decision,
+            worker=worker,
+            stats=analysis_usage.to_stats(
+                phase="planning",
+                wall_time_seconds=max(0.0, time_module.monotonic() - planning_started),
+            ),
+            model_provider=(
+                model_provider
+                if model_provider != "unknown"
+                else analysis_usage.provider
+            ),
+            model_id=model_id,
+        )
 
     log_path = config.state_path / "autopilot" / f"{cycle_id}-planning-worker.log"
     worker_error = ""
@@ -4363,7 +4922,10 @@ def run_native_planning(
             command_template,
             prompt=build_native_planning_worker_prompt(config, decision),
             model=config.agent.model,
+            effort=config.agent.effort,
         )
+        command = inject_structured_usage_output(command, config.agent.agent_kind)
+        worker_context = parse_agent_runtime_context_from_command(command)
         launch_attempted = True
         process_result = worker_launcher(
             command,
@@ -4385,6 +4947,18 @@ def run_native_planning(
         ValueError,
     ) as exc:
         worker_error = _bounded_planning_text(exc)
+
+    usage_observer = ProviderUsageObserver(
+        {"codex": "openai", "claude": "anthropic"}.get(
+            config.agent.agent_kind, "unknown"
+        )
+    )
+    try:
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            usage_observer.observe_line(line)
+    except OSError:
+        pass
+    worker_usage = usage_observer.usage
 
     task_source_error = ""
     runnable_after: int | None = status.queue.runnable
@@ -4443,7 +5017,22 @@ def run_native_planning(
     run_store.append_record(worker.to_record(config.repo))
     if interruption is not None:
         raise interruption
-    return NativePlanningCycleResult(decision=decision, worker=worker)
+    merged_usage = merge_provider_usage(analysis_usage, worker_usage)
+    model_provider, model_id = planning_runtime_identity(
+        (analysis_context, worker_context), configured_model=config.agent.model
+    )
+    return NativePlanningCycleResult(
+        decision=decision,
+        worker=worker,
+        stats=merged_usage.to_stats(
+            phase="planning",
+            wall_time_seconds=max(0.0, time_module.monotonic() - planning_started),
+        ),
+        model_provider=(
+            model_provider if model_provider != "unknown" else merged_usage.provider
+        ),
+        model_id=model_id,
+    )
 
 
 def execute_autopilot_cycle(
@@ -4463,6 +5052,8 @@ def execute_autopilot_cycle(
     run_store: RunStore,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
+    disk_health_runner: DiskHealthRunner = run_disk_health,
+    cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
@@ -4513,12 +5104,32 @@ def execute_autopilot_cycle(
     if disposition.agent_error:
         actions.append("worktree_disposition_agent_error")
 
+    disk_health = disk_health_runner(config, cycle_id=cycle_id)
+    run_store.append_record(disk_health.to_record(config.repo))
+    actions.append(f"disk_health:{disk_health.status}")
+    if disk_health.probe_errors:
+        actions.append(f"disk_health_probe_errors:{disk_health.probe_errors}")
+
+    # Read-only "what landed" summary: the span is the previous cycle's recorded
+    # main ref to the current one. Runs unconditionally and never blocks; the
+    # prior ref is read before this cycle's record is journaled.
+    cycle_summary = cycle_summary_runner(
+        config,
+        cycle_id=cycle_id,
+        prior_main_ref=latest_cycle_main_ref(run_store),
+        current_main_ref=status.git.main_head,
+    )
+    run_store.append_record(cycle_summary.to_record(config.repo))
+    actions.append(cycle_summary.action)
+
     blocker_list = list(status.blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
         blocker_list.remove("repo_dirty")
         actions.append("repo_dirty_ignored")
     if cleanup_errors:
         blocker_list.append("stale_lock_cleanup_failed")
+    if disk_health.blocker:
+        blocker_list.append(disk_health.blocker)
 
     def run_maintenance(kind: str) -> MaintenanceCommandResult | None:
         command = config.autopilot.maintenance_command(kind)
@@ -4606,6 +5217,9 @@ def execute_autopilot_cycle(
                     created_count=native_planning.worker.created_count,
                     created_task_ids=native_planning.worker.created_task_ids,
                     provider_launched=planning_provider_launched(native_planning),
+                    model_provider=native_planning.model_provider,
+                    model_id=native_planning.model_id,
+                    stats=native_planning.stats,
                 )
             )
             actions.append(f"{PLANNING_OUTCOME_ACTION_PREFIX}{planning_outcome}")
@@ -5261,6 +5875,8 @@ def run_autopilot(
     launcher: RunUntilDoneLauncher | None = None,
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
+    disk_health_runner: DiskHealthRunner = run_disk_health,
+    cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     idle_waiter: Callable[..., IdleWaitResult] = wait_for_idle_change,
     idle_wake_command_runner: Callable[..., dict[str, object] | None] = (
@@ -5426,6 +6042,8 @@ def run_autopilot(
                 run_store=run_store,
                 maintenance_runner=maintenance_runner,
                 worktree_disposition_runner=worktree_disposition_runner,
+                disk_health_runner=disk_health_runner,
+                cycle_summary_runner=cycle_summary_runner,
                 native_planning_runner=native_planning_runner,
             )
             idle_wait_seconds = interval
