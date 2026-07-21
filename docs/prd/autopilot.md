@@ -903,10 +903,15 @@ Native quota evidence is limited to a bounded scope, window label, used
 percentage, window duration, reset time, and observation time. Plan, credit,
 account, command, prompt, credential, fencing, and transcript fields are not
 persisted. Evidence availability is explicit. Forecasting requires two
-increasing observations for the same provider, scope, window duration, and
-reset timestamp; providers and reset windows are never combined. Missing or
-malformed evidence does not produce an inferred quota from transcript bytes or
-token totals.
+increasing observations for the same provider, scope, window label, and window
+duration. Reset timestamps within one second are treated as provider
+serialization jitter and share a deterministic normalized window identity
+equal to the earliest reset second in that bounded cluster. The forecast
+retains the latest observation's raw reset alongside that normalized identity.
+Larger reset changes and decreases in used percentage start a new comparison
+segment; providers, scopes, window labels, window durations, and actual reset
+epochs are never combined. Missing or malformed evidence does not produce an
+inferred quota from transcript bytes or token totals.
 
 Worker usage defaults to implementation. An allowlisted `phase` and optional
 `review` or `discovery` `work_kind` from the terminal worker report can refine

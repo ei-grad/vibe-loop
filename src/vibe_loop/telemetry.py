@@ -106,6 +106,7 @@ QUOTA_UNAVAILABLE_REASONS = frozenset(
         "malformed_quota_snapshot",
     }
 )
+QUOTA_RESET_JITTER_TOLERANCE_SECONDS = 1
 SENSITIVE_METADATA_MARKERS = (
     "credential",
     "fencing",
@@ -988,8 +989,8 @@ def _quota_provider_group(provider: str) -> dict[str, object]:
 
 
 def _quota_forecasts(snapshots: list[dict[str, object]]) -> list[dict[str, object]]:
-    compatible: dict[tuple[str, str, str, int, int], list[dict[str, object]]] = (
-        defaultdict(list)
+    compatible: dict[tuple[str, str, str, int], list[dict[str, object]]] = defaultdict(
+        list
     )
     for snapshot in snapshots:
         key = (
@@ -997,47 +998,91 @@ def _quota_forecasts(snapshots: list[dict[str, object]]) -> list[dict[str, objec
             str(snapshot["scope"]),
             str(snapshot["window"]),
             int(snapshot["window_minutes"]),
-            int(snapshot["resets_at"]),
         )
         compatible[key].append(snapshot)
     forecasts: list[dict[str, object]] = []
-    for key, candidates in sorted(compatible.items()):
-        candidates.sort(key=lambda item: str(item["observed_at"]))
-        distinct: list[dict[str, object]] = []
-        for candidate in candidates:
-            if distinct and candidate["observed_at"] == distinct[-1]["observed_at"]:
-                distinct[-1] = candidate
+    for key, compatible_candidates in sorted(compatible.items()):
+        reset_clusters: list[tuple[int, list[dict[str, object]]]] = []
+        for candidate in sorted(
+            compatible_candidates,
+            key=lambda item: (
+                int(item["resets_at"]),
+                str(item["observed_at"]),
+                float(item["used_percent"]),
+            ),
+        ):
+            reset_at = int(candidate["resets_at"])
+            if (
+                not reset_clusters
+                or reset_at - reset_clusters[-1][0]
+                > QUOTA_RESET_JITTER_TOLERANCE_SECONDS
+            ):
+                reset_clusters.append((reset_at, [candidate]))
             else:
-                distinct.append(candidate)
-        if len(distinct) < 2:
-            continue
-        before, after = distinct[-2:]
-        before_at = parse_timestamp(before["observed_at"])
-        after_at = parse_timestamp(after["observed_at"])
-        if before_at is None or after_at is None or after_at <= before_at:
-            continue
-        delta = float(after["used_percent"]) - float(before["used_percent"])
-        if delta <= 0:
-            continue
-        elapsed_hours = (after_at - before_at).total_seconds() / 3600
-        burn_rate = delta / elapsed_hours
-        remaining_percent = max(0.0, 100 - float(after["used_percent"]))
-        exhaustion_at = after_at + timedelta(hours=remaining_percent / burn_rate)
-        reset_at = datetime.fromtimestamp(key[4], UTC)
-        forecasts.append(
-            {
-                "provider": key[0],
-                "scope": key[1],
-                "window": key[2],
-                "window_minutes": key[3],
-                "resets_at": key[4],
-                "first_observed_at": before_at.isoformat(),
-                "last_observed_at": after_at.isoformat(),
-                "burn_rate_percent_per_hour": round(burn_rate, 6),
-                "exhaustion_at": exhaustion_at.isoformat(),
-                "exhaustion_before_reset": exhaustion_at < reset_at,
-            }
-        )
+                reset_clusters[-1][1].append(candidate)
+
+        for normalized_reset_at, candidates in reset_clusters:
+            # A duplicate provider timestamp has no ordering signal. Prefer the
+            # highest usage, then reset second, so input order cannot alter a forecast.
+            distinct_by_time: dict[str, dict[str, object]] = {}
+            for candidate in candidates:
+                observed_at = str(candidate["observed_at"])
+                prior = distinct_by_time.get(observed_at)
+                if prior is None or (
+                    float(candidate["used_percent"]),
+                    int(candidate["resets_at"]),
+                ) > (
+                    float(prior["used_percent"]),
+                    int(prior["resets_at"]),
+                ):
+                    distinct_by_time[observed_at] = candidate
+            distinct = [distinct_by_time[item] for item in sorted(distinct_by_time)]
+
+            current_window: list[dict[str, object]] = []
+            for candidate in distinct:
+                if current_window and float(candidate["used_percent"]) < float(
+                    current_window[-1]["used_percent"]
+                ):
+                    current_window = []
+                current_window.append(candidate)
+            if len(current_window) < 2:
+                continue
+            after = current_window[-1]
+            before = next(
+                (
+                    candidate
+                    for candidate in reversed(current_window[:-1])
+                    if float(candidate["used_percent"]) < float(after["used_percent"])
+                ),
+                None,
+            )
+            if before is None:
+                continue
+            before_at = parse_timestamp(before["observed_at"])
+            after_at = parse_timestamp(after["observed_at"])
+            if before_at is None or after_at is None or after_at <= before_at:
+                continue
+            delta = float(after["used_percent"]) - float(before["used_percent"])
+            elapsed_hours = (after_at - before_at).total_seconds() / 3600
+            burn_rate = delta / elapsed_hours
+            remaining_percent = max(0.0, 100 - float(after["used_percent"]))
+            exhaustion_at = after_at + timedelta(hours=remaining_percent / burn_rate)
+            reset_at = datetime.fromtimestamp(int(after["resets_at"]), UTC)
+            forecasts.append(
+                {
+                    "provider": key[0],
+                    "scope": key[1],
+                    "window": key[2],
+                    "window_minutes": key[3],
+                    "resets_at": int(after["resets_at"]),
+                    "normalized_resets_at": normalized_reset_at,
+                    "first_observed_at": before_at.isoformat(),
+                    "last_observed_at": after_at.isoformat(),
+                    "burn_rate_percent_per_hour": round(burn_rate, 6),
+                    "exhaustion_at": exhaustion_at.isoformat(),
+                    "exhaustion_before_reset": exhaustion_at < reset_at,
+                }
+            )
     return forecasts
 
 

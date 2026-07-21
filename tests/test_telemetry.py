@@ -797,6 +797,78 @@ def test_quota_summary_forecasts_only_comparable_provider_windows() -> None:
     assert anthropic_group["forecasts"] == []
 
 
+def test_quota_forecast_normalizes_only_bounded_reset_jitter() -> None:
+    cases = fixture("quota-reset-jitter-cases.json")
+    snapshots = [
+        snapshot
+        for case in cases.values()
+        for snapshot in case
+        if isinstance(snapshot, dict)
+    ]
+    records: list[dict[str, object]] = []
+    for index, snapshot in enumerate(snapshots):
+        observed_at = datetime.fromisoformat(str(snapshot["observed_at"]))
+        record = run_record(
+            f"quota-jitter-{index}",
+            f"quota-jitter-task-{index}",
+            observed_at,
+            provider=str(snapshot["provider"]),
+        )
+        stats = record["stats"]
+        assert isinstance(stats, dict)
+        stats["quota_snapshots"] = [snapshot]
+        records.append(record)
+
+    summary = rolling_usage_summary(
+        records,
+        project="demo",
+        now=datetime(2026, 7, 21, 13, 0, tzinfo=UTC),
+    )
+    providers = {
+        item["provider"]: item for item in summary["quota_account_wall"]["providers"]
+    }
+    openai = providers["openai"]
+    forecasts = {
+        (item["scope"], item["normalized_resets_at"]): item
+        for item in openai["forecasts"]
+    }
+
+    latest = forecasts[("codex", 1785156057)]
+    assert latest["resets_at"] == 1785156058
+    assert latest["first_observed_at"] == "2026-07-21T11:00:00+00:00"
+    assert latest["last_observed_at"] == "2026-07-21T12:00:00+00:00"
+    assert latest["burn_rate_percent_per_hour"] == 3
+
+    assert {
+        (item["scope"], item["normalized_resets_at"]) for item in openai["forecasts"]
+    } == {
+        ("codex", 1785156057),
+        ("account-a", 1785156057),
+        ("account-a", 1785760857),
+        ("account-b", 1785156057),
+        ("decrease", 1785156057),
+    }
+    decrease = forecasts[("decrease", 1785156057)]
+    assert decrease["first_observed_at"] == "2026-07-21T11:00:00+00:00"
+    assert decrease["last_observed_at"] == "2026-07-21T12:00:00+00:00"
+    assert decrease["burn_rate_percent_per_hour"] == 3
+    assert all(item["scope"] != "malformed" for item in openai["snapshots"])
+
+    anthropic = providers["anthropic"]
+    assert len(anthropic["forecasts"]) == 1
+    assert anthropic["forecasts"][0]["provider"] == "anthropic"
+    assert anthropic["forecasts"][0]["normalized_resets_at"] == 1785156057
+    assert [
+        item["resets_at"] for item in openai["snapshots"] if item["scope"] == "codex"
+    ] == [
+        1785156057,
+        1785156058,
+        1785156057,
+        1785156058,
+        1785156057,
+    ]
+
+
 def test_review_diagnostics_separate_resume_from_new_session_rereview() -> None:
     now = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
     resume_first = run_record(
