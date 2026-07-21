@@ -56,7 +56,7 @@ uv run python -m unittest tests.test_cli.CliTests.test_install_skills_are_cli_ag
 Installed skill files must remain CLI-agnostic: no worker report commands,
 workspace-claim commands, integration-lock commands, or supervisor environment
 variables belong in the reusable skill text. CLI-launched worker coordination
-belongs in the runner addendum and must include workspace claiming,
+belongs in the runner addendum and must describe the runtime-provisioned claim,
 integration-lock wait behavior, and blocked-report guidance for unsafe
 workspace or integration-lock states.
 

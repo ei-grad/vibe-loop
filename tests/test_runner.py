@@ -41,7 +41,6 @@ from vibe_loop.locks import (
 from vibe_loop.processes import read_process_node
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
-    CURRENT_RUN_WORKSPACE_CLAIM_COMMAND,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     ActivityEvent,
     AgentLimitWallError,
@@ -249,68 +248,15 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("Agent/Task/Workflow", prompt)
                 self.assertIn("await or collect every result", prompt)
                 self.assertIn("returning a progress summary", prompt)
-                self.assertIn(
-                    'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"', prompt
-                )
-                self.assertIn('--run-id "$VIBE_LOOP_RUN_ID"', prompt)
-                self.assertIn('--task-id "$VIBE_LOOP_TASK_ID"', prompt)
+                self.assertIn("VIBE_LOOP_WORKTREE", prompt)
+                self.assertIn("VIBE_LOOP_BRANCH", prompt)
+                self.assertIn("runtime provisioned", prompt)
+                self.assertNotIn("worker claim-workspace", prompt)
                 self.assertNotIn(token, prompt)
                 self.assertLess(
                     prompt.index("### Headless Completion"),
                     prompt.index("### Worker Reports"),
                 )
-
-    def test_workspace_claim_command_preserves_shell_metacharacters(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            worktree = root / "work tree"
-            branch = "topic$(touch${IFS}injected)"
-            subprocess.run(
-                ["git", "init", "-b", branch, str(worktree)],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            capture = root / "capture.py"
-            capture.write_text(
-                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
-                encoding="utf-8",
-            )
-            command = CURRENT_RUN_WORKSPACE_CLAIM_COMMAND.replace(
-                "vibe-loop worker claim-workspace",
-                f"{shell_quote(sys.executable)} {shell_quote(str(capture))}",
-            )
-            run = subprocess.run(
-                command,
-                cwd=worktree,
-                env={
-                    **os.environ,
-                    "VIBE_LOOP_REPO": str(worktree),
-                    "VIBE_LOOP_RUN_ID": "run-1",
-                    "VIBE_LOOP_TASK_ID": "task-1",
-                },
-                check=True,
-                capture_output=True,
-                text=True,
-                shell=True,
-            )
-
-            self.assertEqual(
-                json.loads(run.stdout),
-                [
-                    "--repo",
-                    str(worktree),
-                    "--run-id",
-                    "run-1",
-                    "--task-id",
-                    "task-1",
-                    "--branch",
-                    branch,
-                    "--worktree",
-                    str(worktree.resolve()),
-                ],
-            )
-            self.assertFalse((worktree / "injected").exists())
 
     def test_worker_prompt_extension_applies_after_profile_routing(self) -> None:
         extension = "Repository integration policy wins."
@@ -392,13 +338,9 @@ class RunnerTests(unittest.TestCase):
                         )
                     self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
                     self.assertIn("CURRENT active task lock", prompt)
-                    self.assertIn(
-                        'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"',
-                        prompt,
-                    )
-                    self.assertIn('--run-id "$VIBE_LOOP_RUN_ID"', prompt)
-                    self.assertIn('--task-id "$VIBE_LOOP_TASK_ID"', prompt)
-                    self.assertIn("stale evidence only", prompt)
+                    self.assertIn("VIBE_LOOP_WORKTREE", prompt)
+                    self.assertIn("VIBE_LOOP_BRANCH", prompt)
+                    self.assertNotIn("worker claim-workspace", prompt)
                     self.assertNotIn(token, prompt)
                     self.assertGreater(
                         prompt.index("## Repository Worker Prompt Extension"),
@@ -1226,13 +1168,33 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("background", prompt)
         self.assertIn("Agent/Task/Workflow", prompt)
         self.assertIn("CURRENT active task lock", prompt)
-        self.assertIn("claim-workspace", prompt)
-        self.assertLess(
-            prompt.index("claim-workspace"),
-            prompt.index("finish the slice"),
-        )
+        self.assertIn("VIBE_LOOP_WORKTREE", prompt)
+        self.assertIn("VIBE_LOOP_BRANCH", prompt)
+        self.assertNotIn("worker claim-workspace", prompt)
         # Must NOT be the from-scratch recovery brief.
         self.assertNotIn("Investigate what the previous session did", prompt)
+
+    def test_resume_prompt_without_claim_describes_new_workspace(self) -> None:
+        recovery = RecoveryContext(
+            task_id="TASK-01",
+            prior_run_id="run-1",
+            prior_classification="unknown",
+            branch="",
+            worktree="",
+            head_commit="",
+            transcript_path="/t.jsonl",
+            wrapper_log="/w.log",
+            attempt=1,
+            max_attempts=3,
+            workspace_claimed=False,
+            prior_session_id="sid-123",
+        )
+
+        prompt = build_resume_continuation_prompt(recovery)
+
+        self.assertIn("created and claimed a new dedicated workspace", prompt)
+        self.assertIn("prior uncommitted filesystem changes are not", prompt)
+        self.assertNotIn("adopted the preserved workspace", prompt)
 
     def test_resumable_prior_session_id_requires_observed_and_on_disk(self) -> None:
         base = dict(
@@ -3396,14 +3358,10 @@ class TransientWorkerFailureTests(unittest.TestCase):
         self.assertIn("/tmp/run-1.log", section)
         self.assertIn("attempt 2 of 3", section)
         self.assertIn("do NOT park", section)
-        self.assertIn("stale evidence only", section)
         self.assertIn("CURRENT active task lock", section)
-        self.assertIn(
-            'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO"', section
-        )
-        self.assertLess(
-            section.index("claim-workspace"), section.index("Finish the slice")
-        )
+        self.assertIn("VIBE_LOOP_WORKTREE", section)
+        self.assertIn("VIBE_LOOP_BRANCH", section)
+        self.assertNotIn("worker claim-workspace", section)
 
     def test_build_recovery_prompt_section_notes_missing_claim(self) -> None:
         recovery = RecoveryContext(
@@ -3424,8 +3382,11 @@ class TransientWorkerFailureTests(unittest.TestCase):
 
         self.assertIn("No `workspace_claim` record", section)
         self.assertIn("transcript: not captured", section)
-        self.assertIn("Verify the real branch", section)
-        self.assertIn("claim-workspace", section)
+        self.assertIn("VIBE_LOOP_WORKTREE", section)
+        self.assertIn("created and claimed a new dedicated workspace", section)
+        self.assertIn("uncommitted filesystem changes were not adopted", section)
+        self.assertNotIn("safely adopted the preserved workspace", section)
+        self.assertNotIn("worker claim-workspace", section)
 
     def test_serial_loop_recovers_unknown_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6249,6 +6210,36 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         supervision: SupervisionConfig | None = None,
     ) -> tuple[VibeRunner, RecordingLockManager, StubTaskSource]:
         repo = Path(directory)
+        subprocess.run(
+            ["git", "init", "-b", "main"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Tester"],
+            cwd=repo,
+            check=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.email", "tester@example.com"],
+            cwd=repo,
+            check=True,
+        )
+        (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "baseline"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        (repo / ".git" / "info" / "exclude").write_text(
+            "/adapter.py\n/provenance_adapter.py\n/state/\n/wire.jsonl\n/wire.state\n",
+            encoding="utf-8",
+        )
         runner = VibeRunner(
             VibeConfig(
                 repo=repo,
@@ -6301,9 +6292,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
     def _run_task(self, runner: VibeRunner, task: Task, fake_run) -> RunResult:
         with patch.object(runner, "ensure_spec_execution_gate"):
-            with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                with patch("vibe_loop.runner.run_streaming_command", fake_run):
-                    return runner.run_task(task)
+            with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                return runner.run_task(task)
 
     def test_completed_report_settles_before_lock_release(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
@@ -6403,9 +6393,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 return fake_run(command, cwd, log, **kwargs)
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch("vibe_loop.runner.run_streaming_command", tracking_run):
-                        results = runner.run_until_done(continue_on_failure=True)
+                with patch("vibe_loop.runner.run_streaming_command", tracking_run):
+                    results = runner.run_until_done(continue_on_failure=True)
 
             self.assertEqual(dispatched[:2], ["T-1", "T-2"])
             self.assertEqual(results[0].classification, "completed")
@@ -6425,9 +6414,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 return reporting(command, cwd, log, **kwargs)
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
-                        results = runner.run_until_done()
+                with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                    results = runner.run_until_done()
 
             # The queue drains to idle right after the completed task; the
             # settled outcome must not be reopened by the cycle ending.
@@ -6584,9 +6572,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 return runner_module.StreamingCommandResult(exit_code=0)
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
-                        runner.run_until_done(jobs=2, continue_on_failure=True)
+                with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                    runner.run_until_done(jobs=2, continue_on_failure=True)
 
             # Concurrent slots share the supervisor but not their settled
             # outcomes: no run may inherit or overwrite a sibling's.
@@ -6760,9 +6747,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 return reporting(command, cwd, log, **kwargs)
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
-                        results = runner.run_until_done(continue_on_failure=True)
+                with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                    results = runner.run_until_done(continue_on_failure=True)
 
             self.assertEqual(
                 [result.classification for result in results[:2]],
@@ -6790,9 +6776,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 return reporting(command, cwd, log, **kwargs)
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch("vibe_loop.runner.run_streaming_command", fake_run):
-                        results = runner.run_until_done(continue_on_failure=True)
+                with patch("vibe_loop.runner.run_streaming_command", fake_run):
+                    results = runner.run_until_done(continue_on_failure=True)
 
             self.assertEqual(results[0].classification, "completed")
             self.assertEqual(self._external_outcomes(root), {"T-1": "completed"})
@@ -7080,13 +7065,12 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             worker = self._reporting_worker(runner, "completed", report=False)
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch("vibe_loop.runner.run_streaming_command", worker):
-                        first = runner.run_task(task)
-                        results: list[RunResult] = []
-                        terminal = runner.drive_unknown_recovery(
-                            first, attempts={}, results=results
-                        )
+                with patch("vibe_loop.runner.run_streaming_command", worker):
+                    first = runner.run_task(task)
+                    results: list[RunResult] = []
+                    terminal = runner.drive_unknown_recovery(
+                        first, attempts={}, results=results
+                    )
 
             self.assertEqual(first.classification, "unknown")
             self.assertEqual(terminal.classification, "failed")
@@ -7144,11 +7128,8 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 )
 
             with patch.object(runner, "ensure_spec_execution_gate"):
-                with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                    with patch(
-                        "vibe_loop.runner.run_streaming_command", timing_out_worker
-                    ):
-                        result = runner.run_task(task, recovery=recovery)
+                with patch("vibe_loop.runner.run_streaming_command", timing_out_worker):
+                    result = runner.run_task(task, recovery=recovery)
 
             # A timed_out run never re-enters recovery, so no exhaustion verdict
             # is ever recorded for it. Publishing failed here would leave the

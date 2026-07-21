@@ -61,10 +61,13 @@ from vibe_loop.locks import (
     redact_fencing_token_text,
 )
 from vibe_loop.orchestration import (
+    ProvisionedWorkspace,
     RunContractResolver,
     RunLifecycleStateMachine,
     RunStage,
     StageFailure,
+    WorkspaceProvisionError,
+    WorkspaceProvisioner,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
@@ -206,13 +209,6 @@ in a prompt, report, command argument, tool payload, log, or summary, or expose
 it by any other means. Use it only through the environment for the lock
 protocol commands that require it."""
 
-CURRENT_RUN_WORKSPACE_CLAIM_COMMAND = (
-    'vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \\\n'
-    '  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\\n'
-    '  --branch "$(git branch --show-current)" \\\n'
-    '  --worktree "$(git rev-parse --show-toplevel)"'
-)
-
 CLI_WORKER_ADDENDUM = f"""\
 
 ## vibe-loop CLI Coordination
@@ -223,6 +219,8 @@ environment variables identify this run:
 - VIBE_LOOP_RUN_ID - unique run identifier
 - VIBE_LOOP_TASK_ID - task being worked on
 - VIBE_LOOP_LOG - path to the run log file
+- VIBE_LOOP_WORKTREE - absolute path to the runtime-provisioned worker worktree
+- VIBE_LOOP_BRANCH - branch checked out in the worker worktree
 - VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
 
 {FENCING_TOKEN_NONDISCLOSURE}
@@ -247,22 +245,13 @@ is not terminal completion.
 
 ### Workspace Claim
 
-After creating or choosing your task branch/worktree, and before implementation
-edits, verify its real branch and absolute path. Run this command from inside
-that verified worktree to attach it to the active task lock:
-
-```bash
-{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}
-```
-
-The quoted Git-derived values keep branch names and paths as single literal
-arguments. If the claim fails with an owner mismatch, missing active task lock,
-mismatched branch/worktree, or unsafe workspace diagnostic, stop mutating
-repository state and report the run as blocked through the worker report
-protocol.
-Workspace claims are advisory visibility metadata only;
-they do not permit deleting,
-resetting, cleaning, merging, or stealing another worker's branch/worktree.
+The runtime provisioned or safely adopted the task branch/worktree after
+activation, recorded the workspace claim against this run's lock, and launched
+you with that worktree as the current directory. Before implementation edits,
+verify that `git rev-parse --show-toplevel` and `git branch --show-current`
+match `VIBE_LOOP_WORKTREE` and `VIBE_LOOP_BRANCH`. Do not create, switch, or
+claim another branch/worktree. If they do not match, stop mutating repository
+state and report the run as blocked through the worker report protocol.
 
 ### Worker Reports
 
@@ -1688,31 +1677,10 @@ class VibeRunner:
             agent_kind=agent_kind,
             agent_profile=agent_profile,
         )
-        claude_home = (
-            resolve_claude_home(command, command_env, self.config.repo)
-            if injected_session_id
-            else None
-        )
-        codex_home = (
-            resolve_codex_home(command, command_env, self.config.repo)
-            if agent_kind in {"auto", "codex"}
-            else None
-        )
-        transcript_path = (
-            str(
-                predicted_claude_transcript(
-                    injected_session_id, self.config.repo, claude_home
-                )
-            )
-            if injected_session_id and claude_home is not None
-            else ""
-        )
+        claude_home: Path | None = None
+        codex_home: Path | None = None
+        transcript_path = ""
         transcript_start_offset = 0
-        if resuming and transcript_path:
-            try:
-                transcript_start_offset = Path(transcript_path).stat().st_size
-            except OSError:
-                transcript_start_offset = 0
         command_context = configured_agent_effort_context(agent).prefer(
             parse_agent_runtime_context_from_command(command)
         )
@@ -1727,7 +1695,10 @@ class VibeRunner:
         first_accepted_report: WorkerReport | None = None
         worker_pid_value: int | None = None
         worker_process_group_id: int | None = None
+        worker_process_started = False
         worker_timed_out = False
+        provisioned_workspace: ProvisionedWorkspace | None = None
+        workspace_provisioner: WorkspaceProvisioner | None = None
         # Defaults hold for any exit that never reaches a durable RunResult - an
         # interrupted supervisor, a crash, a pre-classification error, a failed
         # result append - which is an honestly unknown outcome, not a failure
@@ -1909,8 +1880,104 @@ class VibeRunner:
         )
         stage_machine.transition(
             RunStage.WORKSPACE,
-            reason="worker_owned_workspace_handoff",
+            reason="runtime_workspace_provisioning",
         )
+        pre_launch_failure_reason = "workspace_provisioning_failed"
+        workspace_provisioner = WorkspaceProvisioner(
+            repo=self.config.repo,
+            main_branch=self.config.main_branch,
+            lock_manager=self.lock_manager,
+            run_store=self.run_store,
+        )
+
+        def compensate_unstarted_workspace() -> None:
+            if (
+                not worker_process_started
+                and provisioned_workspace is not None
+                and workspace_provisioner is not None
+            ):
+                workspace_provisioner.compensate_created(provisioned_workspace)
+
+        try:
+            provisioned_workspace = workspace_provisioner.provision(
+                task_id=task.task_id,
+                run_id=run_id,
+                base_commit=base_main,
+                fencing_token=fencing_token,
+                recovery_run_id=(recovery.prior_run_id if recovery is not None else ""),
+                recovery_branch=(recovery.branch if recovery is not None else ""),
+                recovery_worktree=(
+                    Path(recovery.worktree)
+                    if recovery is not None and recovery.worktree
+                    else None
+                ),
+            )
+            claimed_state = ActiveRunState.from_lock_metadata(
+                self.lock_manager.status(task.task_id) or {}
+            )
+            if claimed_state is None or claimed_state.workspace is None:
+                raise WorkspaceProvisionError(
+                    "runtime_claim_missing",
+                    "workspace claim was not persisted on the active task lock",
+                )
+            active_state = dataclasses.replace(
+                active_state,
+                workspace=claimed_state.workspace,
+            )
+            task_lock = self.lock_manager.update(
+                task_lock,
+                active_state.to_lock_metadata(),
+            )
+            command_env["VIBE_LOOP_WORKTREE"] = str(provisioned_workspace.worktree)
+            command_env["VIBE_LOOP_BRANCH"] = provisioned_workspace.branch
+            claude_home = (
+                resolve_claude_home(
+                    command,
+                    command_env,
+                    provisioned_workspace.worktree,
+                )
+                if injected_session_id
+                else None
+            )
+            codex_home = (
+                resolve_codex_home(
+                    command,
+                    command_env,
+                    provisioned_workspace.worktree,
+                )
+                if agent_kind in {"auto", "codex"}
+                else None
+            )
+            transcript_path = (
+                str(
+                    predicted_claude_transcript(
+                        injected_session_id,
+                        provisioned_workspace.worktree,
+                        claude_home,
+                    )
+                )
+                if injected_session_id and claude_home is not None
+                else ""
+            )
+            if resuming and transcript_path:
+                try:
+                    transcript_start_offset = Path(transcript_path).stat().st_size
+                except OSError:
+                    transcript_start_offset = 0
+        except KeyboardInterrupt:
+            try:
+                compensate_unstarted_workspace()
+            finally:
+                finalize_pre_launch_failure(StageFailure.CANCELLED)
+            raise
+        except Exception:
+            # Provisioning spans Git, journal, and lock backends; any adapter
+            # failure must release the task lock and compensate owned state.
+            try:
+                compensate_unstarted_workspace()
+            finally:
+                finalize_pre_launch_failure(StageFailure.STAGE_FAILED)
+            raise
         observation_lock = threading.Lock()
         observed_output_context = AgentRuntimeContext()
         observed_session_id = session_id
@@ -2133,12 +2200,14 @@ class VibeRunner:
                 def record_worker_pid(worker_pid: int) -> None:
                     nonlocal active_state
                     nonlocal worker_pid_value, worker_process_group_id
+                    nonlocal worker_process_started
                     # Captured immediately after Popen, while the worker is
                     # still the process this supervisor started: after it
                     # execs its own session leader and reparents, the PID
                     # alone can no longer prove which process is ours.
                     identity = read_process_node(worker_pid)
                     worker_pid_value = worker_pid
+                    worker_process_started = True
                     worker_process_group_id = (
                         identity.process_group_id if identity else None
                     )
@@ -2200,7 +2269,7 @@ class VibeRunner:
                 )
                 stream_result = run_streaming_command(
                     command,
-                    self.config.repo,
+                    provisioned_workspace.worktree,
                     log,
                     env=command_env,
                     forward_stderr=agent.forward_stderr,
@@ -2541,26 +2610,34 @@ class VibeRunner:
             )
             return result
         except KeyboardInterrupt:
-            stage_machine.fail(
-                StageFailure.CANCELLED,
-                reason="worker_interrupted",
-            )
-            if stage_machine.stage is RunStage.CLASSIFICATION:
-                stage_machine.transition(
-                    RunStage.FINALIZATION,
-                    reason="interrupted_finalization",
+            try:
+                compensate_unstarted_workspace()
+            finally:
+                stage_machine.fail(
+                    StageFailure.CANCELLED,
+                    reason="worker_interrupted",
                 )
+                if stage_machine.stage is RunStage.CLASSIFICATION:
+                    stage_machine.transition(
+                        RunStage.FINALIZATION,
+                        reason="interrupted_finalization",
+                    )
             raise
         except Exception:
-            stage_machine.fail(
-                StageFailure.STAGE_FAILED,
-                reason="run_task_exception",
-            )
-            if stage_machine.stage is RunStage.CLASSIFICATION:
-                stage_machine.transition(
-                    RunStage.FINALIZATION,
-                    reason="exception_finalization",
+            # The run body calls configurable process, lock, source, and run
+            # store backends whose exception families are not closed.
+            try:
+                compensate_unstarted_workspace()
+            finally:
+                stage_machine.fail(
+                    StageFailure.STAGE_FAILED,
+                    reason="run_task_exception",
                 )
+                if stage_machine.stage is RunStage.CLASSIFICATION:
+                    stage_machine.transition(
+                        RunStage.FINALIZATION,
+                        reason="exception_finalization",
+                    )
             raise
         finally:
             try:
@@ -3683,6 +3760,35 @@ def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
         if recovery.transcript_path
         else "- Prior agent transcript: not captured for the prior run.\n"
     )
+    if recovery.workspace_claimed:
+        current_workspace = (
+            "The runtime verified the prior ownership evidence, safely adopted the "
+            "preserved workspace, and attached a fresh claim to the CURRENT active "
+            "task lock before launching this continuation."
+        )
+        workspace_action = (
+            "2. Continue on the runtime-claimed existing branch/worktree — do not "
+            "delete, reset, steal, or re-create another worker's workspace; build "
+            "on the committed work rather than discarding it.\n"
+        )
+        investigation_target = (
+            "inspect the prior run's recorded branch/worktree for "
+            "committed-but-unmerged work.\n"
+        )
+    else:
+        current_workspace = (
+            "No prior workspace ownership could be verified, so the runtime created "
+            "and claimed a new dedicated workspace for this continuation. Prior "
+            "uncommitted filesystem changes were not adopted."
+        )
+        workspace_action = (
+            "2. Continue in the newly provisioned current-run workspace. Use the "
+            "prior transcript, wrapper log, and repository refs to recover committed "
+            "work, but do not assume prior uncommitted changes were preserved.\n"
+        )
+        investigation_target = (
+            "inspect repository refs for committed-but-unmerged work.\n"
+        )
     return (
         "## Unknown-Run Recovery\n\n"
         f"You are a continuation worker for task `{recovery.task_id}`. The "
@@ -3696,28 +3802,16 @@ def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
         f"{transcript_line}"
         f"- Prior wrapper log: `{recovery.wrapper_log}`\n\n"
         "### Current-run workspace claim\n\n"
-        "Any workspace claim shown above belonged to the prior run's released "
-        "lock generation. It is stale evidence only and does not attach that "
-        "workspace to the CURRENT active task lock. Verify the real branch and "
-        "absolute worktree path, then make the current-run claim before any new "
-        "mutation, gate, build, test, review, or integration attempt:\n\n"
-        "```bash\n"
-        f"{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}\n"
-        "```\n\n"
-        "Run this command from inside the verified worktree; its quoted Git "
-        "lookups derive the exact branch and worktree arguments. Do not claim a "
-        "guessed path. If the claim fails or the preserved workspace cannot be "
-        "verified safely, stop before mutation and report `blocked` through the "
-        "worker report protocol.\n\n"
+        f"{current_workspace} Verify that the current "
+        "directory and branch match `VIBE_LOOP_WORKTREE` and "
+        "`VIBE_LOOP_BRANCH`. Do not create, switch, or claim another workspace. "
+        "If they do not match, stop before mutation and report `blocked` through "
+        "the worker report protocol.\n\n"
         "### What to do\n\n"
         "1. Investigate what the previous session did and why it ended without "
         "a proper status: read the prior transcript and wrapper log, and "
-        "inspect the prior run's recorded branch/worktree for "
-        "committed-but-unmerged work.\n"
-        "2. After the current-run claim succeeds, continue on the verified "
-        "existing branch/worktree — do not delete, reset, steal, or re-create "
-        "another worker's workspace; build on the committed work rather than "
-        "discarding it.\n"
+        f"{investigation_target}"
+        f"{workspace_action}"
         "3. Finish the slice through review and integration when permitted, "
         "then emit a proper status (`completed`/`blocked`/`failed`) via the "
         "worker report protocol.\n"
@@ -3742,6 +3836,22 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
             f"- Prior run's recorded branch: `{recovery.branch}`\n"
             f"- Prior run's recorded worktree: `{recovery.worktree}`\n"
         )
+        current_workspace = (
+            "The runtime verified those prior-run details, adopted the preserved "
+            "workspace, and attached it to the CURRENT active task lock before "
+            "launching this continuation."
+        )
+        workspace_action = "building on your existing committed work"
+    else:
+        current_workspace = (
+            "No prior workspace ownership could be verified. The runtime created "
+            "and claimed a new dedicated workspace; the resumed conversation is "
+            "preserved, but prior uncommitted filesystem changes are not."
+        )
+        workspace_action = (
+            "recovering committed work from repository refs and not assuming prior "
+            "uncommitted changes survived"
+        )
     return (
         "## Continue this run (resumed session)\n\n"
         f"This is the SAME session for task `{recovery.task_id}`, resumed because "
@@ -3752,24 +3862,17 @@ def build_resume_continuation_prompt(recovery: RecoveryContext) -> str:
         "background and this headless turn ended before they finished. Do NOT "
         "restart from scratch.\n\n"
         f"{workspace_lines}"
-        "Those prior-run workspace details are stale evidence only. Verify the "
-        "real branch and absolute worktree path, then attach that workspace to "
-        "the CURRENT active task lock before any new mutation, gate, build, "
-        "test, review, or integration attempt:\n\n"
-        "```bash\n"
-        f"{CURRENT_RUN_WORKSPACE_CLAIM_COMMAND}\n"
-        "```\n\n"
-        "Run this command from inside the verified worktree; its quoted Git "
-        "lookups derive the exact branch and worktree arguments. Do not claim a "
-        "guessed path. If the claim fails or the workspace cannot be verified "
-        "safely, stop before mutation and report `blocked`.\n\n"
+        f"{current_workspace} Verify the current directory and branch "
+        "against `VIBE_LOOP_WORKTREE` and `VIBE_LOOP_BRANCH`; do not create, "
+        "switch, or claim another workspace. If they do not match, stop before "
+        "mutation and report `blocked`.\n\n"
         "1. Await or collect the results of any asynchronous Agent/Task/Workflow "
         "subagent or background command you started (including its log "
         "files / exit status); re-run any remaining required gates in the "
         "FOREGROUND so this turn does not end before they complete.\n"
-        "2. After the current-run workspace claim succeeds, finish the slice "
+        "2. In the runtime-claimed workspace, finish the slice "
         "through review and integration when permitted, "
-        "building on your existing committed work — do not delete, reset, or "
+        f"{workspace_action} — do not delete, reset, or "
         "re-create the workspace.\n"
         "3. Emit a proper terminal status via the worker report protocol, using "
         "the CURRENT environment run id: `vibe-loop report --repo "
@@ -5369,7 +5472,8 @@ def resolve_claude_home(command: str, env: dict[str, str], cwd: Path) -> Path:
         return candidate if candidate.is_absolute() else Path(cwd) / candidate
     env_home = env.get("CLAUDE_HOME")
     if env_home:
-        return Path(env_home)
+        candidate = Path(env_home)
+        return candidate if candidate.is_absolute() else Path(cwd) / candidate
     return Path.home() / ".claude"
 
 
@@ -5380,7 +5484,8 @@ def resolve_codex_home(command: str, env: dict[str, str], cwd: Path) -> Path:
         return candidate if candidate.is_absolute() else Path(cwd) / candidate
     env_home = env.get("CODEX_HOME")
     if env_home:
-        return Path(env_home)
+        candidate = Path(env_home)
+        return candidate if candidate.is_absolute() else Path(cwd) / candidate
     return Path.home() / ".codex"
 
 

@@ -326,11 +326,13 @@ class CliTests(unittest.TestCase):
                 bin_dir / "codex",
                 "from pathlib import Path\n"
                 "import json\n"
+                "import os\n"
                 "import sys\n"
                 "if sys.argv[1] != 'exec':\n"
                 "    raise SystemExit(64)\n"
-                "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "(repo / '.vibe-loop' / 'agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -350,7 +352,9 @@ class CliTests(unittest.TestCase):
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
-            agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
+            agent_args = (repo / ".vibe-loop" / "agent-args.txt").read_text(
+                encoding="utf-8"
+            )
             run_records = [
                 json.loads(line)
                 for line in (repo / ".vibe-loop" / "runs.jsonl")
@@ -483,7 +487,8 @@ class CliTests(unittest.TestCase):
                 "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
                 "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
                 "}\n"
-                "Path('agent-env.json').write_text(\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "(repo / '.vibe-loop' / 'agent-env.json').write_text(\n"
                 "    json.dumps(env_payload),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
@@ -491,7 +496,7 @@ class CliTests(unittest.TestCase):
                 "raise SystemExit(\n"
                 "    main([\n"
                 "        'report',\n"
-                "        '--repo', '.',\n"
+                "        '--repo', env_payload['repo'],\n"
                 "        '--run-id', env_payload['run_id'],\n"
                 "        '--task-id', env_payload['task_id'],\n"
                 "        '--status', 'completed',\n"
@@ -508,7 +513,7 @@ class CliTests(unittest.TestCase):
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
             env_payload = json.loads(
-                (repo / "agent-env.json").read_text(encoding="utf-8")
+                (repo / ".vibe-loop" / "agent-env.json").read_text(encoding="utf-8")
             )
 
         self.assertEqual(exit_code, 0)
@@ -595,32 +600,20 @@ class CliTests(unittest.TestCase):
         self.assertLess(worker_reports, integration_locking)
 
         self.assertIn(
-            "After creating or choosing your task branch/worktree, and before "
-            "implementation\nedits",
+            "runtime provisioned or safely adopted the task branch/worktree",
             CLI_WORKER_ADDENDUM,
         )
         self.assertIn(
             "confirmed that the task\nis in a non-runnable in-progress state",
             CLI_WORKER_ADDENDUM,
         )
-        self.assertIn("vibe-loop worker claim-workspace", CLI_WORKER_ADDENDUM)
-        self.assertIn('--branch "$(git branch --show-current)"', CLI_WORKER_ADDENDUM)
-        self.assertIn(
-            '--worktree "$(git rev-parse --show-toplevel)"', CLI_WORKER_ADDENDUM
-        )
-        self.assertIn("single literal\narguments", CLI_WORKER_ADDENDUM)
+        self.assertIn("VIBE_LOOP_WORKTREE", CLI_WORKER_ADDENDUM)
+        self.assertIn("VIBE_LOOP_BRANCH", CLI_WORKER_ADDENDUM)
+        self.assertNotIn("vibe-loop worker claim-workspace", CLI_WORKER_ADDENDUM)
         self.assertIn("Agent/Task/Workflow", CLI_WORKER_ADDENDUM)
         self.assertIn("await or collect every result", CLI_WORKER_ADDENDUM)
         self.assertIn("returning a progress summary", CLI_WORKER_ADDENDUM)
-        self.assertRegex(
-            CLI_WORKER_ADDENDUM,
-            r"claim fails with an owner mismatch[\s\S]*report the run as blocked",
-        )
-        self.assertIn("advisory visibility metadata only", CLI_WORKER_ADDENDUM)
-        self.assertIn(
-            "do not permit deleting,\nresetting, cleaning, merging, or stealing",
-            CLI_WORKER_ADDENDUM,
-        )
+        self.assertIn("Do not create, switch, or\nclaim another", CLI_WORKER_ADDENDUM)
         self.assertIn('vibe-loop report --repo "$VIBE_LOOP_REPO"', CLI_WORKER_ADDENDUM)
         self.assertIn("vibe-loop main-integration acquire", CLI_WORKER_ADDENDUM)
         self.assertIn("After final review/re-review has passed", CLI_WORKER_ADDENDUM)
@@ -658,11 +651,13 @@ class CliTests(unittest.TestCase):
             write_python_executable(
                 bin_dir / "claude",
                 "from pathlib import Path\n"
+                "import os\n"
                 "import sys\n"
                 "if '-p' not in sys.argv[1:]:\n"
                 "    raise SystemExit(64)\n"
-                "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "(repo / '.vibe-loop' / 'agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -679,7 +674,9 @@ class CliTests(unittest.TestCase):
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
-            agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
+            agent_args = (repo / ".vibe-loop" / "agent-args.txt").read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -722,9 +719,10 @@ class CliTests(unittest.TestCase):
                 "import json\n"
                 "import os\n"
                 "import sys\n"
-                "Path('agent-args.txt').write_text("
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "Path(repo / '.vibe-loop' / 'agent-args.txt').write_text("
                 "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-                "Path('agent-env.json').write_text(json.dumps({\n"
+                "Path(repo / '.vibe-loop' / 'agent-env.json').write_text(json.dumps({\n"
                 "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
                 "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
                 "}), encoding='utf-8')\n"
@@ -735,14 +733,14 @@ class CliTests(unittest.TestCase):
                 task_id="TASK-01",
                 prior_run_id="run-prior",
                 prior_classification="unknown",
-                branch="task-01",
-                worktree=str(repo),
-                head_commit="abc",
+                branch="",
+                worktree="",
+                head_commit="",
                 transcript_path="",
                 wrapper_log="",
                 attempt=1,
                 max_attempts=3,
-                workspace_claimed=True,
+                workspace_claimed=False,
                 prior_session_id="resume-me-123",
             )
             with patch.dict("os.environ", {"PATH": str(bin_dir)}):
@@ -750,9 +748,11 @@ class CliTests(unittest.TestCase):
                 runner = VibeRunner(config)
                 runner._source = _StubSource()
                 resumed_result = runner.run_task(task, recovery=recovery)
-                resumed = (repo / "agent-args.txt").read_text(encoding="utf-8")
+                resumed = (repo / ".vibe-loop" / "agent-args.txt").read_text(
+                    encoding="utf-8"
+                )
                 resumed_env = json.loads(
-                    (repo / "agent-env.json").read_text(encoding="utf-8")
+                    (repo / ".vibe-loop" / "agent-env.json").read_text(encoding="utf-8")
                 )
 
                 # A second, non-resumable run (resume disabled) must fall back to
@@ -766,10 +766,16 @@ class CliTests(unittest.TestCase):
                     ),
                 )
                 runner._source = _StubSource()
-                fresh_result = runner.run_task(task, recovery=recovery)
-                fresh = (repo / "agent-args.txt").read_text(encoding="utf-8")
+                fresh_recovery = dataclasses.replace(
+                    recovery,
+                    prior_run_id=resumed_result.run_id,
+                )
+                fresh_result = runner.run_task(task, recovery=fresh_recovery)
+                fresh = (repo / ".vibe-loop" / "agent-args.txt").read_text(
+                    encoding="utf-8"
+                )
                 fresh_env = json.loads(
-                    (repo / "agent-env.json").read_text(encoding="utf-8")
+                    (repo / ".vibe-loop" / "agent-env.json").read_text(encoding="utf-8")
                 )
 
         # Resume path: --resume <prior session id>, no fresh --session-id, and the
@@ -804,9 +810,10 @@ class CliTests(unittest.TestCase):
             "import json\n"
             "import os\n"
             "import sys\n"
-            "Path('{name}-args.txt').write_text("
+            "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+            "Path(repo / '.vibe-loop' / '{name}-args.txt').write_text("
             "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-            "Path('{name}-env.json').write_text(json.dumps({{\n"
+            "Path(repo / '.vibe-loop' / '{name}-env.json').write_text(json.dumps({{\n"
             "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
             "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
             "}}), encoding='utf-8')\n"
@@ -838,6 +845,18 @@ class CliTests(unittest.TestCase):
                 'match_hazards_any = ["abi"]\n',
                 encoding="utf-8",
             )
+            subprocess.run(
+                ["git", "add", ".vibe-loop.toml"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "configure routing"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
             security_task = Task(
                 task_id="SEC-01",
                 title="Security",
@@ -860,21 +879,25 @@ class CliTests(unittest.TestCase):
                 runner = VibeRunner(config)
                 runner._source = _StubSource()
                 routed_result = runner.run_task(security_task)
-                routed_run = (repo / "claude-args.txt").exists()
-                routed_args = (repo / "claude-args.txt").read_text(encoding="utf-8")
-                routed_env = json.loads(
-                    (repo / "claude-env.json").read_text(encoding="utf-8")
+                routed_run = (repo / ".vibe-loop" / "claude-args.txt").exists()
+                routed_args = (repo / ".vibe-loop" / "claude-args.txt").read_text(
+                    encoding="utf-8"
                 )
-                routed_ran_codex = (repo / "codex-args.txt").exists()
+                routed_env = json.loads(
+                    (repo / ".vibe-loop" / "claude-env.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                routed_ran_codex = (repo / ".vibe-loop" / "codex-args.txt").exists()
 
-                (repo / "claude-args.txt").unlink()
+                (repo / ".vibe-loop" / "claude-args.txt").unlink()
                 runner._source = _StubSource()
                 default_result = runner.run_task(general_task)
-                default_ran_codex = (repo / "codex-args.txt").exists()
+                default_ran_codex = (repo / ".vibe-loop" / "codex-args.txt").exists()
                 default_env = json.loads(
-                    (repo / "codex-env.json").read_text(encoding="utf-8")
+                    (repo / ".vibe-loop" / "codex-env.json").read_text(encoding="utf-8")
                 )
-                default_ran_claude = (repo / "claude-args.txt").exists()
+                default_ran_claude = (repo / ".vibe-loop" / "claude-args.txt").exists()
 
         # The abi-hazard task is dispatched to the claude profile, not codex.
         self.assertTrue(routed_run)
@@ -918,7 +941,8 @@ class CliTests(unittest.TestCase):
                 "project = Path(os.environ['CLAUDE_HOME']) / 'projects' / 'proj'\n"
                 "project.mkdir(parents=True, exist_ok=True)\n"
                 "(project / f'{session_id}.jsonl').write_text('{}\\n', encoding='utf-8')\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -1097,11 +1121,13 @@ class CliTests(unittest.TestCase):
             write_python_executable(
                 bin_dir / "codex",
                 "from pathlib import Path\n"
+                "import os\n"
                 "import sys\n"
                 "if sys.argv[1] != 'exec':\n"
                 "    raise SystemExit(64)\n"
-                "Path('agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "(repo / '.vibe-loop' / 'agent-args.txt').write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -1118,7 +1144,9 @@ class CliTests(unittest.TestCase):
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
-            agent_args = (repo / "agent-args.txt").read_text(encoding="utf-8")
+            agent_args = (repo / ".vibe-loop" / "agent-args.txt").read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -1171,7 +1199,9 @@ class CliTests(unittest.TestCase):
             write_python_executable(
                 bin_dir / "codex",
                 "from pathlib import Path\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "import os\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -1216,7 +1246,8 @@ class CliTests(unittest.TestCase):
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
                 "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
                 "log_path = os.environ['VIBE_LOOP_LOG']\n"
-                "started = Path('started')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "started = repo / '.vibe-loop' / 'test-started'\n"
                 "started.mkdir(exist_ok=True)\n"
                 "(started / task_id).write_text(run_id, encoding='utf-8')\n"
                 "deadline = time.monotonic() + 15\n"
@@ -1224,14 +1255,14 @@ class CliTests(unittest.TestCase):
                 "    if time.monotonic() > deadline:\n"
                 "        raise SystemExit('parallel barrier timed out')\n"
                 "    time.sleep(0.02)\n"
-                "lock_paths = sorted(str(path) for path in Path('.vibe-loop/locks').glob('*.lock'))\n"
+                "lock_paths = sorted(str(path) for path in (repo / '.vibe-loop' / 'locks').glob('*.lock'))\n"
                 "lock_task_ids = []\n"
-                "for lock_path in Path('.vibe-loop/locks').glob('*.lock'):\n"
+                "for lock_path in (repo / '.vibe-loop' / 'locks').glob('*.lock'):\n"
                 "    metadata_path = lock_path / 'lock.json'\n"
                 "    if metadata_path.exists():\n"
                 "        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))\n"
                 "        lock_task_ids.append(metadata.get('task_id'))\n"
-                "observed = Path('observed')\n"
+                "observed = repo / '.vibe-loop' / 'test-observed'\n"
                 "observed.mkdir(exist_ok=True)\n"
                 "(observed / f'{task_id}.json').write_text(\n"
                 "    json.dumps(\n"
@@ -1256,7 +1287,7 @@ class CliTests(unittest.TestCase):
                 "    main(\n"
                 "        [\n"
                 "            'report',\n"
-                "            '--repo', '.',\n"
+                "            '--repo', str(repo),\n"
                 "            '--run-id', run_id,\n"
                 "            '--task-id', task_id,\n"
                 "            '--status', 'completed',\n"
@@ -1271,6 +1302,7 @@ class CliTests(unittest.TestCase):
                 "[agent]\ncommand = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -1290,7 +1322,9 @@ class CliTests(unittest.TestCase):
             payload = parse_run_result(self, stdout, stderr, exit_code)
             observations = [
                 json.loads(path.read_text(encoding="utf-8"))
-                for path in sorted((repo / "observed").glob("*.json"))
+                for path in sorted(
+                    (repo / ".vibe-loop" / "test-observed").glob("*.json")
+                )
             ]
             log_texts = {
                 str(result["task_id"]): Path(str(result["log"])).read_text(
@@ -1340,11 +1374,12 @@ class CliTests(unittest.TestCase):
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "from vibe_loop.cli import main\n"
+                "repo = os.environ['VIBE_LOOP_REPO']\n"
                 "raise SystemExit(\n"
                 "    main(\n"
                 "        [\n"
                 "            'report',\n"
-                "            '--repo', '.',\n"
+                "            '--repo', repo,\n"
                 "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
                 "            '--task-id', os.environ['VIBE_LOOP_TASK_ID'],\n"
                 "            '--status', 'completed',\n"
@@ -1358,6 +1393,7 @@ class CliTests(unittest.TestCase):
                 "[agent]\ncommand = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -1403,7 +1439,8 @@ class CliTests(unittest.TestCase):
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
-                "started = Path('started')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "started = repo / '.vibe-loop' / 'test-started'\n"
                 "started.mkdir(exist_ok=True)\n"
                 "(started / task_id).write_text('ran', encoding='utf-8')\n"
                 "from vibe_loop.cli import main\n"
@@ -1411,7 +1448,7 @@ class CliTests(unittest.TestCase):
                 "    main(\n"
                 "        [\n"
                 "            'report',\n"
-                "            '--repo', '.',\n"
+                "            '--repo', str(repo),\n"
                 "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
                 "            '--task-id', task_id,\n"
                 "            '--status', 'completed',\n"
@@ -1424,7 +1461,7 @@ class CliTests(unittest.TestCase):
                 "from pathlib import Path\n"
                 "import json\n"
                 "import sys\n"
-                "Path('batch-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
+                "Path('.vibe-loop/batch-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
                 "print(json.dumps({'task_ids': ['TASK-03', 'TASK-01']}))\n",
                 encoding="utf-8",
             )
@@ -1439,6 +1476,7 @@ class CliTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -1457,8 +1495,12 @@ class CliTests(unittest.TestCase):
                 )
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
-            prompt = (repo / "batch-prompt.txt").read_text(encoding="utf-8")
-            started = sorted(path.name for path in (repo / "started").iterdir())
+            prompt = (repo / ".vibe-loop" / "batch-prompt.txt").read_text(
+                encoding="utf-8"
+            )
+            started = sorted(
+                path.name for path in (repo / ".vibe-loop" / "test-started").iterdir()
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -1503,7 +1545,8 @@ class CliTests(unittest.TestCase):
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
-                "started = Path('started')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "started = repo / '.vibe-loop' / 'test-started'\n"
                 "started.mkdir(exist_ok=True)\n"
                 "(started / task_id).write_text('ran', encoding='utf-8')\n"
                 "from vibe_loop.cli import main\n"
@@ -1511,7 +1554,7 @@ class CliTests(unittest.TestCase):
                 "    main(\n"
                 "        [\n"
                 "            'report',\n"
-                "            '--repo', '.',\n"
+                "            '--repo', str(repo),\n"
                 "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
                 "            '--task-id', task_id,\n"
                 "            '--status', 'completed',\n"
@@ -1524,7 +1567,7 @@ class CliTests(unittest.TestCase):
                 "from pathlib import Path\n"
                 "import json\n"
                 "import sys\n"
-                "Path('batch-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
+                "Path('.vibe-loop/batch-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
                 "print(json.dumps({'task_ids': ['TASK-02', 'TASK-02']}))\n",
                 encoding="utf-8",
             )
@@ -1539,6 +1582,7 @@ class CliTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -1557,8 +1601,12 @@ class CliTests(unittest.TestCase):
                 )
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
-            prompt = (repo / "batch-prompt.txt").read_text(encoding="utf-8")
-            started = sorted(path.name for path in (repo / "started").iterdir())
+            prompt = (repo / ".vibe-loop" / "batch-prompt.txt").read_text(
+                encoding="utf-8"
+            )
+            started = sorted(
+                path.name for path in (repo / ".vibe-loop" / "test-started").iterdir()
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(
@@ -1609,19 +1657,22 @@ class CliTests(unittest.TestCase):
                 "from pathlib import Path\n"
                 "import json\n"
                 "import os\n"
+                "import subprocess\n"
                 "import sys\n"
                 "import time\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "from vibe_loop.cli import main\n"
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
                 "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
                 "local_id = task_id.split(':', 1)[-1]\n"
                 "safe_id = task_id.replace(':', '__')\n"
-                "done = Path('done')\n"
-                "done.mkdir(exist_ok=True)\n"
+                "state = repo / '.vibe-loop' / 'spec-wave-test'\n"
+                "done = state / 'done'\n"
+                "done.mkdir(parents=True, exist_ok=True)\n"
                 "done_at_start = sorted(path.name for path in done.iterdir())\n"
                 "wave = 'wave1' if local_id in {'T001', 'T002'} else 'wave2'\n"
-                "started_root = Path('started')\n"
+                "started_root = state / 'started'\n"
                 "started_all = started_root / 'all'\n"
                 "started_all.mkdir(parents=True, exist_ok=True)\n"
                 "(started_all / safe_id).write_text(run_id, encoding='utf-8')\n"
@@ -1643,12 +1694,12 @@ class CliTests(unittest.TestCase):
                 "            raise SystemExit(f'{wave} barrier timed out for {task_id}')\n"
                 "        time.sleep(0.02)\n"
                 "lock_task_ids = []\n"
-                "for lock_path in Path('.vibe-loop/locks').glob('*.lock'):\n"
+                "for lock_path in (repo / '.vibe-loop' / 'locks').glob('*.lock'):\n"
                 "    metadata_path = lock_path / 'lock.json'\n"
                 "    if metadata_path.exists():\n"
                 "        metadata = json.loads(metadata_path.read_text(encoding='utf-8'))\n"
                 "        lock_task_ids.append(metadata.get('task_id'))\n"
-                "observed = Path('observed')\n"
+                "observed = state / 'observed'\n"
                 "observed.mkdir(exist_ok=True)\n"
                 "(observed / f'{safe_id}.json').write_text(\n"
                 "    json.dumps(\n"
@@ -1663,7 +1714,7 @@ class CliTests(unittest.TestCase):
                 "    encoding='utf-8',\n"
                 ")\n"
                 "if wave == 'wave1':\n"
-                "    scanned = Path('scanned') / wave\n"
+                "    scanned = state / 'scanned' / wave\n"
                 "    scanned.mkdir(parents=True, exist_ok=True)\n"
                 "    (scanned / safe_id).write_text(run_id, encoding='utf-8')\n"
                 "    deadline = time.monotonic() + 15\n"
@@ -1671,7 +1722,7 @@ class CliTests(unittest.TestCase):
                 "        if time.monotonic() > deadline:\n"
                 "            raise SystemExit(f'{wave} scan barrier timed out for {task_id}')\n"
                 "        time.sleep(0.02)\n"
-                "lock = Path('.task-update.lock')\n"
+                "lock = state / 'task-update.lock'\n"
                 "deadline = time.monotonic() + 15\n"
                 "while True:\n"
                 "    try:\n"
@@ -1682,10 +1733,15 @@ class CliTests(unittest.TestCase):
                 "            raise SystemExit('task update lock timed out')\n"
                 "        time.sleep(0.02)\n"
                 "try:\n"
-                "    tasks = Path('specs/001-checkout/tasks.md')\n"
+                "    tasks = repo / 'specs' / '001-checkout' / 'tasks.md'\n"
                 "    text = tasks.read_text(encoding='utf-8')\n"
                 "    text = text.replace(f'- [ ] {local_id}', f'- [x] {local_id}', 1)\n"
                 "    tasks.write_text(text, encoding='utf-8')\n"
+                "    subprocess.run(['git', 'add', str(tasks)], cwd=repo, check=True)\n"
+                "    subprocess.run(\n"
+                "        ['git', 'commit', '-m', f'complete {task_id}'],\n"
+                "        cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
+                "    )\n"
                 "finally:\n"
                 "    lock.rmdir()\n"
                 "(done / safe_id).write_text(local_id, encoding='utf-8')\n"
@@ -1693,7 +1749,7 @@ class CliTests(unittest.TestCase):
                 "    main(\n"
                 "        [\n"
                 "            'report',\n"
-                "            '--repo', '.',\n"
+                "            '--repo', str(repo),\n"
                 "            '--run-id', run_id,\n"
                 "            '--task-id', task_id,\n"
                 "            '--status', 'completed',\n"
@@ -1710,6 +1766,7 @@ class CliTests(unittest.TestCase):
                 "command = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -1727,15 +1784,20 @@ class CliTests(unittest.TestCase):
                 )
 
             payload = parse_run_result(self, stdout, stderr, exit_code)
+            self.assertEqual(exit_code, 0, payload)
             observed = {
                 path.stem.replace("__", ":"): json.loads(
                     path.read_text(encoding="utf-8")
                 )
-                for path in (repo / "observed").glob("*.json")
+                for path in (repo / ".vibe-loop" / "spec-wave-test" / "observed").glob(
+                    "*.json"
+                )
             }
             wave1_started = {
                 path.name.replace("__", ":")
-                for path in (repo / "started" / "wave1").iterdir()
+                for path in (
+                    repo / ".vibe-loop" / "spec-wave-test" / "started" / "wave1"
+                ).iterdir()
             }
             final_tasks = tasks_path.read_text(encoding="utf-8")
 
@@ -1776,12 +1838,13 @@ class CliTests(unittest.TestCase):
                 "sys.path.insert(0, sys.argv[1])\n"
                 "from vibe_loop.cli import main\n"
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
+                "repo = os.environ['VIBE_LOOP_REPO']\n"
                 "status = 'failed' if task_id == 'TASK-01' else 'completed'\n"
                 "raise SystemExit(\n"
                 "    main(\n"
                 "        [\n"
                 "            'report',\n"
-                "            '--repo', '.',\n"
+                "            '--repo', repo,\n"
                 "            '--run-id', os.environ['VIBE_LOOP_RUN_ID'],\n"
                 "            '--task-id', task_id,\n"
                 "            '--status', status,\n"
@@ -1795,6 +1858,7 @@ class CliTests(unittest.TestCase):
                 "[agent]\ncommand = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5223,6 +5287,7 @@ class CliTests(unittest.TestCase):
                 '[agent]\ncommand = "python agent.py"\n',
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5265,12 +5330,13 @@ class CliTests(unittest.TestCase):
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             (repo / "agent.py").write_text(
+                "import os\n"
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[3])\n"
                 "from vibe_loop.cli import main\n"
                 "report_exit = main([\n"
                 "        'report',\n"
-                "        '--repo', '.',\n"
+                "        '--repo', os.environ['VIBE_LOOP_REPO'],\n"
                 "        '--run-id', sys.argv[1],\n"
                 "        '--task-id', sys.argv[2],\n"
                 "        '--status', 'completed',\n"
@@ -5286,6 +5352,7 @@ class CliTests(unittest.TestCase):
                 "[agent]\ncommand = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5335,13 +5402,14 @@ class CliTests(unittest.TestCase):
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             (repo / "agent.py").write_text(
+                "import os\n"
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[3])\n"
                 "from vibe_loop.cli import main\n"
                 "raise SystemExit(\n"
                 "    main([\n"
                 "        'report',\n"
-                "        '--repo', '.',\n"
+                "        '--repo', os.environ['VIBE_LOOP_REPO'],\n"
                 "        '--run-id', sys.argv[1],\n"
                 "        '--task-id', sys.argv[2],\n"
                 "        '--status', 'blocked',\n"
@@ -5366,6 +5434,7 @@ class CliTests(unittest.TestCase):
                 + "]\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5388,20 +5457,22 @@ class CliTests(unittest.TestCase):
             (repo / "agent.py").write_text(
                 "from pathlib import Path\n"
                 "import json\n"
+                "import os\n"
                 "import time\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
                 "metadata = {}\n"
                 "for _ in range(100):\n"
-                "    locks = list(Path('.vibe-loop/locks').glob('*.lock/lock.json'))\n"
+                "    locks = list((repo / '.vibe-loop' / 'locks').glob('*.lock/lock.json'))\n"
                 "    if locks:\n"
                 "        metadata = json.loads(locks[0].read_text(encoding='utf-8'))\n"
                 "        if metadata.get('worker_pid'):\n"
                 "            break\n"
                 "    time.sleep(0.01)\n"
-                "Path('active-worker.json').write_text(\n"
+                "Path(repo / '.vibe-loop' / 'active-worker.json').write_text(\n"
                 "    json.dumps(metadata),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -5413,6 +5484,7 @@ class CliTests(unittest.TestCase):
                 '[agent]\ncommand = "python agent.py"\n',
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5421,7 +5493,7 @@ class CliTests(unittest.TestCase):
 
             payload = json.loads(stdout.getvalue())
             metadata = json.loads(
-                (repo / "active-worker.json").read_text(encoding="utf-8")
+                (repo / ".vibe-loop" / "active-worker.json").read_text(encoding="utf-8")
             )
 
         self.assertEqual(exit_code, 0)
@@ -5482,12 +5554,14 @@ class CliTests(unittest.TestCase):
             )
             (repo / "agent.py").write_text(
                 "from pathlib import Path\n"
+                "import os\n"
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[3])\n"
                 "from vibe_loop.cli import main\n"
-                "Path('worker-prompt.txt').write_text(sys.argv[4], encoding='utf-8')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "Path(repo / '.vibe-loop' / 'worker-prompt.txt').write_text(sys.argv[4], encoding='utf-8')\n"
                 "raise SystemExit(main([\n"
-                "    'report', '--repo', '.', '--run-id', sys.argv[1],\n"
+                "    'report', '--repo', str(repo), '--run-id', sys.argv[1],\n"
                 "    '--task-id', sys.argv[2], '--status', 'completed',\n"
                 "    '--commit', 'trace-commit', '--message', 'trace complete',\n"
                 "]))\n",
@@ -5506,6 +5580,7 @@ class CliTests(unittest.TestCase):
                 "command = " + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5513,7 +5588,9 @@ class CliTests(unittest.TestCase):
                 exit_code = main(["run-next", "--repo", str(repo)])
 
             payload = json.loads(stdout.getvalue())
-            prompt = (repo / "worker-prompt.txt").read_text(encoding="utf-8")
+            prompt = (repo / ".vibe-loop" / "worker-prompt.txt").read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -5579,9 +5656,11 @@ class CliTests(unittest.TestCase):
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             (repo / "agent.py").write_text(
                 "from pathlib import Path\n"
+                "import os\n"
                 "import sys\n"
                 "print('session id: explicit-native-456', file=sys.stderr)\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -5593,6 +5672,7 @@ class CliTests(unittest.TestCase):
                 '[agent]\ncommand = "python agent.py"\n',
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5633,12 +5713,14 @@ class CliTests(unittest.TestCase):
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             (repo / "worker.py").write_text(
                 "from pathlib import Path\n"
+                "import os\n"
                 "import sys\n"
                 "prompt = sys.argv[1]\n"
-                "Path('worker-prompt.txt').write_text(prompt, encoding='utf-8')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "Path(repo / '.vibe-loop' / 'worker-prompt.txt').write_text(prompt, encoding='utf-8')\n"
                 "print(f'claude out: {prompt.splitlines()[0]}')\n"
                 "print(f'claude err: {prompt.splitlines()[0]}', file=sys.stderr)\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -5651,6 +5733,7 @@ class CliTests(unittest.TestCase):
                 '[agent]\nkind = "claude"\ncommand = ' + json.dumps(command) + "\n",
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5659,7 +5742,9 @@ class CliTests(unittest.TestCase):
 
             payload = json.loads(stdout.getvalue())
             log_text = Path(str(payload["log"])).read_text(encoding="utf-8")
-            prompt = (repo / "worker-prompt.txt").read_text(encoding="utf-8")
+            prompt = (repo / ".vibe-loop" / "worker-prompt.txt").read_text(
+                encoding="utf-8"
+            )
             run_records = [
                 json.loads(line)
                 for line in (repo / ".vibe-loop" / "runs.jsonl")
@@ -5720,9 +5805,11 @@ class CliTests(unittest.TestCase):
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             (repo / "agent.py").write_text(
                 "from pathlib import Path\n"
+                "import os\n"
                 "import sys\n"
-                "Path('worker-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
-                "plan = Path('docs/PLAN.md')\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "Path(repo / '.vibe-loop' / 'worker-prompt.txt').write_text(sys.argv[1], encoding='utf-8')\n"
+                "plan = repo / 'docs' / 'PLAN.md'\n"
                 "text = plan.read_text(encoding='utf-8')\n"
                 "plan.write_text(\n"
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
@@ -5738,6 +5825,7 @@ class CliTests(unittest.TestCase):
                 'skill_ref_prefix = "/"\n',
                 encoding="utf-8",
             )
+            init_worker_repo(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -5745,7 +5833,9 @@ class CliTests(unittest.TestCase):
                 exit_code = main(["run-next", "--repo", str(repo)])
 
             payload = json.loads(stdout.getvalue())
-            prompt = (repo / "worker-prompt.txt").read_text(encoding="utf-8")
+            prompt = (repo / ".vibe-loop" / "worker-prompt.txt").read_text(
+                encoding="utf-8"
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(payload["classification"], "completed")
@@ -6169,7 +6259,7 @@ class CliTests(unittest.TestCase):
                 "import sys\n"
                 "sys.path.insert(0, sys.argv[1])\n"
                 "from vibe_loop.cli import main\n"
-                "repo = Path.cwd()\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
                 "state_path = Path(sys.argv[2])\n"
                 "state = json.loads(state_path.read_text(encoding='utf-8'))\n"
                 "if state['status'] == 'ready':\n"
@@ -6177,24 +6267,12 @@ class CliTests(unittest.TestCase):
                 "    raise SystemExit(4)\n"
                 "run_id = os.environ['VIBE_LOOP_RUN_ID']\n"
                 "task_id = os.environ['VIBE_LOOP_TASK_ID']\n"
-                "branch = f'worker/{task_id}'\n"
-                "worktree = repo.parent / 'no-commit-worker'\n"
                 "(repo / 'external.txt').write_text('main advanced\\n', encoding='utf-8')\n"
                 "subprocess.run(['git', 'add', 'external.txt'], cwd=repo, check=True)\n"
                 "subprocess.run(\n"
                 "    ['git', 'commit', '-m', 'advance main'],\n"
                 "    cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
                 ")\n"
-                "subprocess.run(\n"
-                "    ['git', 'worktree', 'add', '-b', branch, str(worktree), 'main'],\n"
-                "    cwd=repo, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,\n"
-                ")\n"
-                "steps = [\n"
-                "    ['worker', 'claim-workspace', '--repo', str(repo), '--run-id', run_id, '--task-id', task_id, '--branch', branch, '--worktree', str(worktree)],\n"
-                "]\n"
-                "for step in steps:\n"
-                "    if main(step) != 0:\n"
-                "        raise SystemExit(1)\n"
                 "state_path.write_text(\n"
                 "    json.dumps({'status': 'review', 'history': state['history'] + ['review']}),\n"
                 "    encoding='utf-8',\n"
@@ -6251,6 +6329,18 @@ class CliTests(unittest.TestCase):
                 + '\nrunnable_statuses = ["ready"]\n',
                 encoding="utf-8",
             )
+            subprocess.run(
+                ["git", "add", "task_source.py", "agent.py", ".vibe-loop.toml"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "add lifecycle fixture"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
             stdout = StringIO()
             stderr = StringIO()
 
@@ -6288,7 +6378,12 @@ class CliTests(unittest.TestCase):
             integration_lock_exists = (
                 repo / ".vibe-loop" / "locks" / "main-integration.lock"
             ).exists()
-            retained_worktree_exists = (repo.parent / "no-commit-worker").exists()
+            provisioned_record = next(
+                record
+                for record in records
+                if record["record_type"] == "workspace_provisioned"
+            )
+            retained_worktree_exists = Path(provisioned_record["worktree"]).exists()
             ready_edit_violation = (repo / "ready-edit-violation.txt").exists()
 
         self.assertEqual(exit_code, 0)
@@ -8230,10 +8325,10 @@ class AutopilotCliTests(unittest.TestCase):
             init_planning_repo(repo, PLAN)
             write_python_executable(
                 bin_dir / "codex",
-                "import sys, pathlib\n"
+                "import os, sys, pathlib\n"
                 "if sys.argv[1] != 'exec':\n"
                 "    raise SystemExit(64)\n"
-                "plan = pathlib.Path('PLAN.md')\n"
+                "plan = pathlib.Path(os.environ['VIBE_LOOP_REPO']) / 'PLAN.md'\n"
                 "plan.write_text(\n"
                 "    plan.read_text().replace(\n"
                 "        '| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'\n"
@@ -8528,7 +8623,9 @@ class AutopilotCliTests(unittest.TestCase):
                 "import os\n"
                 "import time\n"
                 "from pathlib import Path\n"
-                "Path('agent-process.json').write_text(\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "process_path = repo / '.vibe-loop' / 'agent-process.json'\n"
+                "process_path.write_text(\n"
                 "    json.dumps({'pid': os.getpid(), 'parent_pid': os.getppid()}),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
@@ -8596,7 +8693,7 @@ class AutopilotCliTests(unittest.TestCase):
                         candidate = json.loads(status.stdout)
                         last_status_payload = candidate
                         workers = candidate.get("workers") or []
-                        agent_path = repo / "agent-process.json"
+                        agent_path = repo / ".vibe-loop" / "agent-process.json"
                         if workers and agent_path.is_file():
                             worker = workers[0]
                             if worker.get("worker_process_birth_id_known") is True:
@@ -9681,11 +9778,7 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    subprocess.run(
-        ["git", "config", "user.name", "Tester"],
-        cwd=repo,
-        check=True,
-    )
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
     subprocess.run(
         ["git", "config", "user.email", "tester@example.com"],
         cwd=repo,
@@ -9693,7 +9786,37 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
     )
     subprocess.run(["git", "add", "PLAN.md"], cwd=repo, check=True)
     subprocess.run(
-        ["git", "commit", "-m", "baseline"],
+        ["git", "commit", "--allow-empty", "-m", "baseline"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def init_worker_repo(repo: Path) -> None:
+    if (repo / ".git").exists():
+        return
+    subprocess.run(
+        ["git", "init", "--initial-branch", "main"],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "tester@example.com"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / ".git" / "info" / "exclude").write_text(
+        "/.vibe-loop/\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "baseline"],
         cwd=repo,
         check=True,
         stdout=subprocess.PIPE,
@@ -9873,13 +9996,15 @@ def generated_profile_cache(source_path: str) -> dict[str, object]:
 
 
 def write_fake_git(bin_dir: Path) -> None:
+    repo = bin_dir.parent / "repo"
+    if repo.is_dir():
+        init_worker_repo(repo)
+    real_git = shutil.which("git")
+    if real_git is None:
+        raise RuntimeError("git is required for CLI tests")
     write_python_executable(
         bin_dir / "git",
-        "import sys\n"
-        "if sys.argv[1:] == ['rev-parse', '--verify', 'HEAD']:\n"
-        "    print('test-head')\n"
-        "    raise SystemExit(0)\n"
-        "raise SystemExit(1)\n",
+        f"import os, sys\nos.execv({real_git!r}, ['git', *sys.argv[1:]])\n",
     )
 
 

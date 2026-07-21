@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -27,11 +28,15 @@ from vibe_loop.orchestration import (
     RunLifecycleStateMachine,
     RunStage,
     StageFailure,
+    WorkspaceProvisionError,
+    WorkspaceProvisioner,
     derive_stage_progress,
 )
 from vibe_loop.runner import VibeRunner
-from vibe_loop.runs import WorkerReport
+from vibe_loop.locks import LockManager
+from vibe_loop.runs import RunStore, WorkerReport
 from vibe_loop.tasks import Task
+from vibe_loop.workers import claim_worker_workspace
 
 
 class OrchestrationConfigTests(unittest.TestCase):
@@ -422,7 +427,8 @@ class RunLifecycleStateMachineTests(unittest.TestCase):
 class RunContractJournalTests(unittest.TestCase):
     def test_contract_is_recorded_after_lock_and_before_activation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
             agent = AgentConfig(
                 command="worker {prompt}",
                 agent_kind="custom",
@@ -442,6 +448,19 @@ class RunContractJournalTests(unittest.TestCase):
 
             def worker(command, cwd, log, **kwargs):
                 env = kwargs["env"]
+                launch_record_types = [
+                    record.get("record_type")
+                    for record in runner.run_store.read_records()
+                ]
+                self.assertIn("workspace_provisioned", launch_record_types)
+                self.assertIn("workspace_claim", launch_record_types)
+                self.assertNotEqual(cwd, repo)
+                self.assertEqual(env["VIBE_LOOP_WORKTREE"], str(cwd))
+                self.assertEqual(
+                    env["VIBE_LOOP_BRANCH"],
+                    git(cwd, "branch", "--show-current").stdout.strip(),
+                )
+                kwargs["on_start"](12345)
                 runner.run_store.append_report(
                     WorkerReport(
                         run_id=env["VIBE_LOOP_RUN_ID"],
@@ -453,9 +472,8 @@ class RunContractJournalTests(unittest.TestCase):
 
             with patch.object(runner, "ensure_spec_execution_gate"):
                 with patch.object(runner, "activate_task_before_launch", activate):
-                    with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
-                        with patch("vibe_loop.runner.run_streaming_command", worker):
-                            runner.run_task(task)
+                    with patch("vibe_loop.runner.run_streaming_command", worker):
+                        runner.run_task(task)
 
             records = runner.run_store.read_records()
 
@@ -533,6 +551,807 @@ class RunContractJournalTests(unittest.TestCase):
         self.assertEqual(stage_records[1]["failure"], "cancelled")
         self.assertEqual(records[-1]["record_type"], "lock_released")
         self.assertEqual(records[-1]["reason"], "task_activation_failed")
+
+    def test_process_start_failure_compensates_workspace_and_releases_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="worker {prompt}",
+                        agent_kind="custom",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    ),
+                )
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch(
+                        "vibe_loop.runner.run_streaming_command",
+                        side_effect=OSError("spawn failed"),
+                    ):
+                        with self.assertRaisesRegex(OSError, "spawn failed"):
+                            runner.run_task(task)
+
+            worktrees = git(repo, "worktree", "list", "--porcelain").stdout
+            branches = git(
+                repo, "branch", "--format=%(refname:short)"
+            ).stdout.splitlines()
+            records = runner.run_store.read_records()
+
+        self.assertEqual(worktrees.count("worktree "), 1)
+        self.assertEqual(branches, ["main"])
+        self.assertFalse(runner.lock_manager.is_locked(task.task_id))
+        self.assertIn(
+            "workspace_provisioned", [record.get("record_type") for record in records]
+        )
+        self.assertEqual(records[-1]["record_type"], "lock_released")
+
+    def test_relative_claude_home_resolves_from_provisioned_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="CLAUDE_HOME=.claude claude -p {prompt}",
+                        agent_kind="claude",
+                    ),
+                )
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch(
+                        "vibe_loop.runner.resolve_claude_home",
+                        wraps=runner_module.resolve_claude_home,
+                    ) as resolve_claude:
+                        with patch(
+                            "vibe_loop.runner.run_streaming_command",
+                            side_effect=OSError("spawn failed"),
+                        ):
+                            with self.assertRaisesRegex(OSError, "spawn failed"):
+                                runner.run_task(task)
+
+            provisioned = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_provisioned"
+            )
+            launch_worktree = Path(str(provisioned["worktree"]))
+
+        self.assertEqual(resolve_claude.call_args.args[2], launch_worktree)
+        self.assertEqual(
+            runner_module.resolve_claude_home(*resolve_claude.call_args.args),
+            launch_worktree / ".claude",
+        )
+
+    def test_relative_codex_home_resolves_from_provisioned_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(
+                        command="CODEX_HOME=.codex codex exec {prompt}",
+                        agent_kind="codex",
+                    ),
+                )
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch(
+                        "vibe_loop.runner.resolve_codex_home",
+                        wraps=runner_module.resolve_codex_home,
+                    ) as resolve_codex:
+                        with patch(
+                            "vibe_loop.runner.run_streaming_command",
+                            side_effect=OSError("spawn failed"),
+                        ):
+                            with self.assertRaisesRegex(OSError, "spawn failed"):
+                                runner.run_task(task)
+
+            provisioned = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_provisioned"
+            )
+            launch_worktree = Path(str(provisioned["worktree"]))
+
+        self.assertEqual(resolve_codex.call_args.args[2], launch_worktree)
+        self.assertEqual(
+            runner_module.resolve_codex_home(*resolve_codex.call_args.args),
+            launch_worktree / ".codex",
+        )
+
+
+class WorkspaceProvisionerTests(unittest.TestCase):
+    def test_creates_claims_and_records_workspace_before_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            primary_before = primary_snapshot(repo)
+
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+
+            records = store.read_records()
+            self.assertEqual(workspace.mode, "created")
+            self.assertNotEqual(workspace.worktree, repo)
+            self.assertEqual(
+                git(workspace.worktree, "branch", "--show-current").stdout.strip(),
+                workspace.branch,
+            )
+            self.assertEqual(
+                [record["record_type"] for record in records],
+                ["workspace_provisioned", "workspace_claim"],
+            )
+            self.assertEqual(primary_snapshot(repo), primary_before)
+            self.assertEqual(
+                manager.status("TASK-01")["workspace"]["worktree"],
+                str(workspace.worktree),
+            )
+
+    def test_adopts_clean_workspace_with_prior_task_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+            first = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            adopted = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=token,
+            )
+
+            self.assertEqual(adopted.mode, "adopted")
+            self.assertEqual(adopted.worktree, first.worktree)
+            self.assertEqual(adopted.owner_run_id, "run-1")
+
+    def test_adopts_legacy_path_with_matching_task_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            worktree = Path(directory) / "legacy-worker"
+            branch = "legacy/task-01"
+            git(repo, "worktree", "add", "-b", branch, str(worktree), base)
+            claim_worker_workspace(
+                manager,
+                store,
+                task_id="TASK-01",
+                run_id="run-1",
+                branch=branch,
+                worktree=worktree,
+                repo=repo,
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            adopted = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=token,
+            )
+
+            self.assertEqual(adopted.mode, "adopted")
+            self.assertEqual(adopted.branch, branch)
+            self.assertEqual(adopted.worktree, worktree)
+
+    def test_dirty_existing_workspace_fails_closed_outside_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+            first = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            (first.worktree / "uncommitted.txt").write_text("keep\n", encoding="utf-8")
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                WorkspaceProvisioner(
+                    repo=repo,
+                    main_branch="main",
+                    lock_manager=manager,
+                    run_store=store,
+                ).provision(
+                    task_id="TASK-01",
+                    run_id="run-2",
+                    base_commit=base,
+                    fencing_token=token,
+                )
+
+            self.assertEqual(raised.exception.code, "dirty_existing_workspace")
+            self.assertTrue((first.worktree / "uncommitted.txt").exists())
+
+    def test_recovery_preserves_exact_dirty_prior_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+            first = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            (first.worktree / "uncommitted.txt").write_text("keep\n", encoding="utf-8")
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            recovered = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=token,
+                recovery_run_id="run-1",
+                recovery_branch=first.branch,
+                recovery_worktree=first.worktree,
+            )
+
+            self.assertEqual(recovered.mode, "preserved")
+            self.assertTrue(recovered.dirty_at_adoption)
+            self.assertTrue((first.worktree / "uncommitted.txt").exists())
+
+    def test_recovery_allows_main_to_advance_from_recorded_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            first_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+            first = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=first_base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            (repo / "main-change.txt").write_text("advanced\n", encoding="utf-8")
+            git(repo, "add", "main-change.txt")
+            git(repo, "commit", "-m", "advance main")
+            current_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            recovered = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=current_base,
+                fencing_token=token,
+                recovery_run_id="run-1",
+                recovery_branch=first.branch,
+                recovery_worktree=first.worktree,
+            )
+
+            self.assertEqual(recovered.mode, "adopted")
+            self.assertEqual(recovered.base_commit, first_base)
+            manager.release(manager.current_lock("TASK-01"))
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-3",
+                store=store,
+            )
+
+            recovered_again = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-3",
+                base_commit=current_base,
+                fencing_token=token,
+                recovery_run_id="run-2",
+                recovery_branch=first.branch,
+                recovery_worktree=first.worktree,
+            )
+
+            self.assertEqual(recovered_again.mode, "adopted")
+            self.assertEqual(recovered_again.base_commit, first_base)
+
+    def test_recovery_rejects_latest_foreign_ownership_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-A", "run-a1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            first = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-A",
+                run_id="run-a1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-A"))
+            manager, _, token = acquire_run(repo, "TASK-B", "run-b1", store=store)
+            claim_worker_workspace(
+                manager,
+                store,
+                task_id="TASK-B",
+                run_id="run-b1",
+                branch=first.branch,
+                worktree=first.worktree,
+                repo=repo,
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-B"))
+            (first.worktree / "foreign.txt").write_text("preserve\n", encoding="utf-8")
+            manager, _, token = acquire_run(repo, "TASK-A", "run-a2", store=store)
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                WorkspaceProvisioner(
+                    repo=repo,
+                    main_branch="main",
+                    lock_manager=manager,
+                    run_store=store,
+                ).provision(
+                    task_id="TASK-A",
+                    run_id="run-a2",
+                    base_commit=base,
+                    fencing_token=token,
+                    recovery_run_id="run-a1",
+                    recovery_branch=first.branch,
+                    recovery_worktree=first.worktree,
+                )
+
+            self.assertEqual(raised.exception.code, "workspace_foreign_owner")
+            self.assertEqual(
+                (first.worktree / "foreign.txt").read_text(encoding="utf-8"),
+                "preserve\n",
+            )
+
+    def test_branch_collision_fails_without_mutating_primary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+            branch, _ = provisioner._workspace_identity(
+                task_id="TASK-01",
+                recovery_branch="",
+                recovery_worktree=None,
+            )
+            git(repo, "branch", branch)
+            before = primary_snapshot(repo)
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                provisioner.provision(
+                    task_id="TASK-01",
+                    run_id="run-1",
+                    base_commit=base,
+                    fencing_token=token,
+                )
+
+            self.assertEqual(raised.exception.code, "workspace_collision")
+            self.assertEqual(primary_snapshot(repo), before)
+
+    def test_dirty_primary_fails_before_workspace_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            (repo / "dirty.txt").write_text("keep\n", encoding="utf-8")
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                WorkspaceProvisioner(
+                    repo=repo,
+                    main_branch="main",
+                    lock_manager=manager,
+                    run_store=store,
+                ).provision(
+                    task_id="TASK-01",
+                    run_id="run-1",
+                    base_commit=base,
+                    fencing_token=token,
+                )
+
+            self.assertEqual(raised.exception.code, "dirty_primary_worktree")
+            self.assertEqual(
+                git(repo, "worktree", "list", "--porcelain").stdout.count("worktree "),
+                1,
+            )
+
+    def test_two_tasks_receive_distinct_workspaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            first_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata=run_lock_metadata(repo, "TASK-01", "run-1"),
+            )
+            second_lock = manager.acquire(
+                "TASK-02",
+                "run-2",
+                metadata=run_lock_metadata(repo, "TASK-02", "run-2"),
+            )
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+
+            first = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=str(first_lock.metadata["fencing_token"]),
+            )
+            second = provisioner.provision(
+                task_id="TASK-02",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=str(second_lock.metadata["fencing_token"]),
+            )
+
+            self.assertNotEqual(first.branch, second.branch)
+            self.assertNotEqual(first.worktree, second.worktree)
+            self.assertNotEqual(first.worktree, repo)
+            self.assertNotEqual(second.worktree, repo)
+
+    def test_compensation_removes_only_unchanged_created_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+            workspace = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+
+            provisioner.compensate_created(workspace)
+
+            self.assertFalse(workspace.worktree.exists())
+            self.assertNotEqual(
+                git(
+                    repo,
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{workspace.branch}",
+                    check=False,
+                ).returncode,
+                0,
+            )
+
+    def test_failed_worktree_add_compensates_partial_git_state(self) -> None:
+        class PartialFailureProvisioner(WorkspaceProvisioner):
+            def _git_result(self, *args: str) -> subprocess.CompletedProcess[str]:
+                result = super()._git_result(*args)
+                if args[:2] == ("worktree", "add"):
+                    return subprocess.CompletedProcess(
+                        result.args,
+                        1,
+                        result.stdout,
+                        "injected post-create failure",
+                    )
+                return result
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = PartialFailureProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                provisioner.provision(
+                    task_id="TASK-01",
+                    run_id="run-1",
+                    base_commit=base,
+                    fencing_token=token,
+                )
+
+            self.assertEqual(raised.exception.code, "workspace_create_failed")
+            self.assertEqual(
+                git(repo, "worktree", "list", "--porcelain").stdout.count("worktree "),
+                1,
+            )
+            self.assertEqual(
+                git(repo, "branch", "--format=%(refname:short)").stdout.splitlines(),
+                ["main"],
+            )
+
+    def test_failed_worktree_add_preserves_unverified_racing_directory(self) -> None:
+        class RacingFailureProvisioner(WorkspaceProvisioner):
+            def _git_result(self, *args: str) -> subprocess.CompletedProcess[str]:
+                if args[:2] == ("worktree", "add"):
+                    worktree = Path(args[4])
+                    worktree.mkdir(parents=True)
+                    (worktree / "foreign.txt").write_text(
+                        "preserve\n",
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(
+                        ["git", *args],
+                        1,
+                        "",
+                        "target appeared during add",
+                    )
+                return super()._git_result(*args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = RacingFailureProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                provisioner.provision(
+                    task_id="TASK-01",
+                    run_id="run-1",
+                    base_commit=base,
+                    fencing_token=token,
+                )
+
+            _, worktree = provisioner._workspace_identity(
+                task_id="TASK-01",
+                recovery_branch="",
+                recovery_worktree=None,
+            )
+            self.assertEqual(raised.exception.code, "workspace_collision")
+            self.assertEqual(
+                (worktree / "foreign.txt").read_text(encoding="utf-8"),
+                "preserve\n",
+            )
+
+    def test_journal_failure_compensates_created_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            provisioner = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            )
+
+            with patch.object(
+                store,
+                "append_lifecycle_event",
+                side_effect=OSError("journal unavailable"),
+            ):
+                with self.assertRaisesRegex(OSError, "journal unavailable"):
+                    provisioner.provision(
+                        task_id="TASK-01",
+                        run_id="run-1",
+                        base_commit=base,
+                        fencing_token=token,
+                    )
+
+            self.assertEqual(
+                git(repo, "worktree", "list", "--porcelain").stdout.count("worktree "),
+                1,
+            )
+            self.assertEqual(
+                git(repo, "branch", "--format=%(refname:short)").stdout.splitlines(),
+                ["main"],
+            )
+
+
+def init_git_repo(repo: Path) -> None:
+    repo.mkdir()
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.name", "Tester")
+    git(repo, "config", "user.email", "tester@example.com")
+    (repo / "README.md").write_text("baseline\n", encoding="utf-8")
+    git(repo, "add", "README.md")
+    git(repo, "commit", "-m", "baseline")
+
+
+def acquire_run(
+    repo: Path,
+    task_id: str,
+    run_id: str,
+    *,
+    store: RunStore | None = None,
+) -> tuple[LockManager, RunStore, str]:
+    manager = LockManager(repo / ".vibe-loop" / "locks")
+    run_store = store or RunStore(repo / ".vibe-loop" / "runs.jsonl")
+    lock = manager.acquire(
+        task_id,
+        run_id,
+        metadata=run_lock_metadata(repo, task_id, run_id),
+    )
+    return manager, run_store, str(lock.metadata["fencing_token"])
+
+
+def run_lock_metadata(repo: Path, task_id: str, run_id: str) -> dict[str, object]:
+    return {
+        "task_id": task_id,
+        "run_id": run_id,
+        "base_main": git(repo, "rev-parse", "HEAD").stdout.strip(),
+        "started_at": "2026-07-21T00:00:00+00:00",
+    }
+
+
+def primary_snapshot(repo: Path) -> tuple[str, str, str]:
+    return (
+        git(repo, "branch", "--show-current").stdout.strip(),
+        git(repo, "rev-parse", "HEAD").stdout.strip(),
+        git(repo, "status", "--short", "--", ".", ":(exclude).vibe-loop").stdout,
+    )
+
+
+def git(
+    repo: Path,
+    *args: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        check=check,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 if __name__ == "__main__":

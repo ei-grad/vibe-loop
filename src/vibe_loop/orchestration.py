@@ -4,7 +4,10 @@ import dataclasses
 import enum
 import hashlib
 import json
+import re
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 from vibe_loop.config import (
@@ -19,6 +22,8 @@ from vibe_loop.config import (
 
 RUN_CONTRACT_VERSION = 1
 RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
+WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
+WORKSPACE_NAME_MAX_LENGTH = 64
 
 
 class RunStage(enum.StrEnum):
@@ -390,6 +395,613 @@ class RunContractResolver:
             "remediation": {"max_rounds": effective.max_remediation_rounds},
         }
         return ResolvedRunContract(payload=payload, digest=sha256_digest(payload))
+
+
+class WorkspaceProvisionError(RuntimeError):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        details: Mapping[str, object] | None = None,
+    ) -> None:
+        self.code = code
+        self.details = dict(details or {})
+        super().__init__(message)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProvisionedWorkspace:
+    mode: str
+    branch: str
+    worktree: Path
+    base_commit: str
+    head_commit: str
+    owner_run_id: str = ""
+    dirty_at_adoption: bool = False
+
+    def to_record_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "mode": self.mode,
+            "branch": self.branch,
+            "worktree": str(self.worktree),
+            "base_commit": self.base_commit,
+            "head_commit": self.head_commit,
+            "dirty_at_adoption": self.dirty_at_adoption,
+        }
+        if self.owner_run_id:
+            payload["owner_run_id"] = self.owner_run_id
+        return payload
+
+
+class WorkspaceProvisioner:
+    def __init__(
+        self,
+        *,
+        repo: Path,
+        main_branch: str,
+        lock_manager: object,
+        run_store: object,
+        ignored_dirty_paths: Sequence[Path] = (),
+    ) -> None:
+        self.repo = repo.resolve()
+        self.main_branch = main_branch
+        self.lock_manager = lock_manager
+        self.run_store = run_store
+        self.ignored_dirty_paths = tuple(ignored_dirty_paths)
+
+    def provision(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        base_commit: str,
+        fencing_token: str | None = None,
+        recovery_run_id: str = "",
+        recovery_branch: str = "",
+        recovery_worktree: Path | None = None,
+    ) -> ProvisionedWorkspace:
+        from vibe_loop.runs import RunLifecycleEvent
+        from vibe_loop.workers import claim_worker_workspace
+
+        self._validate_primary(base_commit)
+        branch, worktree = self._workspace_identity(
+            task_id=task_id,
+            recovery_branch=recovery_branch,
+            recovery_worktree=recovery_worktree,
+        )
+        workspace = self._create_or_adopt(
+            task_id=task_id,
+            run_id=run_id,
+            branch=branch,
+            worktree=worktree,
+            base_commit=base_commit,
+            recovery_run_id=recovery_run_id,
+        )
+        try:
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_provisioned(
+                    run_id=run_id,
+                    task_id=task_id,
+                    payload=workspace.to_record_payload(),
+                )
+            )
+            claim_worker_workspace(
+                self.lock_manager,
+                self.run_store,
+                task_id=task_id,
+                run_id=run_id,
+                branch=workspace.branch,
+                worktree=workspace.worktree,
+                repo=self.repo,
+                base_commit=workspace.base_commit,
+                fencing_token=fencing_token,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+        except KeyboardInterrupt:
+            if workspace.mode == "created":
+                self.compensate_created(workspace)
+            raise
+        except Exception:
+            # Journal and claim backends are extensible local/command adapters;
+            # any failure must compensate a workspace created by this run.
+            if workspace.mode == "created":
+                self.compensate_created(workspace)
+            raise
+        return workspace
+
+    def compensate_created(self, workspace: ProvisionedWorkspace) -> None:
+        if workspace.mode != "created":
+            return
+        from vibe_loop.workers import build_workspace_git_context, git_status_lines
+
+        context = build_workspace_git_context(
+            self.repo,
+            main_branch=self.main_branch,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        entries = [
+            entry
+            for entry in context.worktrees
+            if entry.path == workspace.worktree.resolve()
+        ]
+        if len(entries) != 1 or entries[0].branch != workspace.branch:
+            raise WorkspaceProvisionError(
+                "compensation_identity_mismatch",
+                "refusing to compensate workspace whose git identity changed",
+                details={
+                    "branch": workspace.branch,
+                    "worktree": str(workspace.worktree),
+                },
+            )
+        if git_status_lines(
+            workspace.worktree,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        ):
+            raise WorkspaceProvisionError(
+                "compensation_dirty_workspace",
+                "refusing to remove a created workspace that became dirty",
+                details={"worktree": str(workspace.worktree)},
+            )
+        self._git("worktree", "remove", str(workspace.worktree))
+        self._git("branch", "-d", workspace.branch)
+
+    def _validate_primary(self, base_commit: str) -> None:
+        from vibe_loop.workers import build_workspace_git_context, git_status_lines
+
+        context = build_workspace_git_context(
+            self.repo,
+            main_branch=self.main_branch,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        if context.worktree_list_error:
+            raise WorkspaceProvisionError(
+                "git_state_unavailable",
+                "workspace provisioning requires readable git worktree state",
+                details={"error": context.worktree_list_error},
+            )
+        if not context.worktrees or context.worktrees[0].path != self.repo:
+            raise WorkspaceProvisionError(
+                "primary_worktree_required",
+                "workspace provisioning must run against the primary git worktree",
+                details={"repo": str(self.repo)},
+            )
+        primary = context.worktrees[0]
+        if primary.branch != self.main_branch:
+            raise WorkspaceProvisionError(
+                "primary_branch_mismatch",
+                "primary worktree is not on the configured main branch",
+                details={
+                    "expected_branch": self.main_branch,
+                    "current_branch": primary.branch,
+                },
+            )
+        dirty = git_status_lines(
+            self.repo,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        if dirty:
+            raise WorkspaceProvisionError(
+                "dirty_primary_worktree",
+                "primary worktree must be clean before worker provisioning",
+                details={"dirty_summary": dirty[:20]},
+            )
+        resolved_base = self._git_text("rev-parse", "--verify", base_commit)
+        main_head = self._git_text("rev-parse", "--verify", self.main_branch)
+        if resolved_base != main_head:
+            raise WorkspaceProvisionError(
+                "base_main_mismatch",
+                "workspace base no longer matches the configured main branch",
+                details={"base_commit": resolved_base, "main_head": main_head},
+            )
+
+    def _workspace_identity(
+        self,
+        *,
+        task_id: str,
+        recovery_branch: str,
+        recovery_worktree: Path | None,
+    ) -> tuple[str, Path]:
+        if bool(recovery_branch) != (recovery_worktree is not None):
+            raise WorkspaceProvisionError(
+                "incomplete_recovery_workspace",
+                "recovery requires both a recorded branch and worktree",
+            )
+        if recovery_branch and recovery_worktree is not None:
+            return recovery_branch, recovery_worktree.resolve()
+        owned = self._existing_owned_identity(task_id)
+        if owned is not None:
+            return owned
+        name = workspace_name(task_id)
+        return (
+            f"{WORKSPACE_BRANCH_PREFIX}{name}",
+            self.repo.parent / f"{self.repo.name}-worktrees" / name,
+        )
+
+    def _create_or_adopt(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        branch: str,
+        worktree: Path,
+        base_commit: str,
+        recovery_run_id: str,
+    ) -> ProvisionedWorkspace:
+        from vibe_loop.workers import build_workspace_git_context, git_status_lines
+
+        if branch == self.main_branch or worktree == self.repo:
+            raise WorkspaceProvisionError(
+                "primary_workspace_forbidden",
+                "a worker cannot use the primary worktree or main branch",
+                details={"branch": branch, "worktree": str(worktree)},
+            )
+        context = build_workspace_git_context(
+            self.repo,
+            main_branch=self.main_branch,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        branch_entries = [
+            entry for entry in context.worktrees if entry.branch == branch
+        ]
+        path_entries = [
+            entry for entry in context.worktrees if entry.path == worktree.resolve()
+        ]
+        branch_exists = (
+            self._git_returncode(
+                "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"
+            )
+            == 0
+        )
+        path_exists = worktree.exists()
+        if (
+            not branch_entries
+            and not path_entries
+            and not branch_exists
+            and not path_exists
+        ):
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            result = self._git_result(
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                str(worktree),
+                base_commit,
+            )
+            if result.returncode != 0:
+                self._compensate_partial_creation(
+                    branch=branch,
+                    worktree=worktree,
+                    base_commit=base_commit,
+                )
+                raise WorkspaceProvisionError(
+                    "workspace_create_failed",
+                    "git could not create the task workspace",
+                    details={"stderr": result.stderr.strip()},
+                )
+            workspace = ProvisionedWorkspace(
+                mode="created",
+                branch=branch,
+                worktree=worktree.resolve(),
+                base_commit=base_commit,
+                head_commit=base_commit,
+            )
+            try:
+                head_commit = self._git_text_at(
+                    worktree, "rev-parse", "--verify", "HEAD"
+                )
+            except Exception:
+                # Git state inspection can fail for several OS/repository
+                # reasons after add succeeds; all share the same compensation.
+                self._compensate_partial_creation(
+                    branch=branch,
+                    worktree=worktree,
+                    base_commit=base_commit,
+                )
+                raise
+            return dataclasses.replace(workspace, head_commit=head_commit)
+        if (
+            len(branch_entries) != 1
+            or len(path_entries) != 1
+            or branch_entries[0].path != worktree.resolve()
+            or path_entries[0].branch != branch
+        ):
+            raise WorkspaceProvisionError(
+                "workspace_collision",
+                "existing branch/worktree state is ambiguous or mismatched",
+                details={
+                    "branch": branch,
+                    "worktree": str(worktree),
+                    "branch_worktrees": [str(entry.path) for entry in branch_entries],
+                    "path_branches": [entry.branch for entry in path_entries],
+                    "branch_exists": branch_exists,
+                    "path_exists": path_exists,
+                },
+            )
+        owner = self._ownership_record(
+            task_id=task_id,
+            branch=branch,
+            worktree=worktree,
+            recovery_run_id=recovery_run_id,
+        )
+        if owner is None:
+            raise WorkspaceProvisionError(
+                "workspace_ownership_unverified",
+                "existing workspace has no matching task ownership record",
+                details={"branch": branch, "worktree": str(worktree)},
+            )
+        self._reject_live_foreign_claim(
+            task_id=task_id,
+            run_id=run_id,
+            branch=branch,
+            worktree=worktree,
+        )
+        head = self._git_text_at(worktree, "rev-parse", "--verify", "HEAD")
+        owner_base = owner.get("base_commit")
+        if not isinstance(owner_base, str) or not owner_base:
+            raise WorkspaceProvisionError(
+                "workspace_base_unverified",
+                "existing workspace ownership record has no base commit",
+                details={"owner_run_id": str(owner.get("run_id") or "")},
+            )
+        if (
+            self._git_returncode_at(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                owner_base,
+                head,
+            )
+            != 0
+        ):
+            raise WorkspaceProvisionError(
+                "workspace_base_mismatch",
+                "existing workspace does not descend from its recorded base",
+                details={"base_commit": owner_base, "head_commit": head},
+            )
+        if (
+            self._git_returncode(
+                "merge-base",
+                "--is-ancestor",
+                owner_base,
+                base_commit,
+            )
+            != 0
+        ):
+            raise WorkspaceProvisionError(
+                "workspace_main_history_mismatch",
+                "existing workspace base is not in the selected main history",
+                details={
+                    "workspace_base": owner_base,
+                    "selected_base": base_commit,
+                },
+            )
+        dirty = git_status_lines(
+            worktree,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        if dirty and not recovery_run_id:
+            raise WorkspaceProvisionError(
+                "dirty_existing_workspace",
+                "dirty existing workspace is preserved and cannot be adopted",
+                details={"dirty_summary": dirty[:20]},
+            )
+        return ProvisionedWorkspace(
+            mode="preserved" if dirty else "adopted",
+            branch=branch,
+            worktree=worktree.resolve(),
+            base_commit=owner_base,
+            head_commit=head,
+            owner_run_id=str(owner.get("run_id") or ""),
+            dirty_at_adoption=bool(dirty),
+        )
+
+    def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
+        from vibe_loop.workers import build_workspace_git_context
+
+        context = build_workspace_git_context(
+            self.repo,
+            main_branch=self.main_branch,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        listed = {(entry.branch, entry.path.resolve()) for entry in context.worktrees}
+        candidates: set[tuple[str, Path]] = set()
+        for record in self.run_store.read_records():
+            if record.get("record_type") != "workspace_claim":
+                continue
+            if record.get("task_id") != task_id:
+                continue
+            branch = record.get("branch")
+            raw_worktree = record.get("worktree")
+            if not isinstance(branch, str) or not isinstance(raw_worktree, str):
+                continue
+            identity = (branch, Path(raw_worktree).resolve())
+            if identity in listed:
+                candidates.add(identity)
+        if len(candidates) > 1:
+            raise WorkspaceProvisionError(
+                "ambiguous_owned_workspaces",
+                "multiple existing workspaces have ownership records for the task",
+                details={
+                    "workspaces": [
+                        {"branch": branch, "worktree": str(worktree)}
+                        for branch, worktree in sorted(
+                            candidates,
+                            key=lambda item: (item[0], str(item[1])),
+                        )
+                    ]
+                },
+            )
+        return next(iter(candidates), None)
+
+    def _compensate_partial_creation(
+        self,
+        *,
+        branch: str,
+        worktree: Path,
+        base_commit: str,
+    ) -> None:
+        from vibe_loop.workers import build_workspace_git_context
+
+        context = build_workspace_git_context(
+            self.repo,
+            main_branch=self.main_branch,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        exact = [
+            entry
+            for entry in context.worktrees
+            if entry.path == worktree.resolve() and entry.branch == branch
+        ]
+        if exact:
+            remove = self._git_result("worktree", "remove", "--force", str(worktree))
+            if remove.returncode != 0:
+                raise WorkspaceProvisionError(
+                    "partial_workspace_compensation_failed",
+                    "git could not remove a partially created workspace",
+                    details={"stderr": remove.stderr.strip()},
+                )
+        elif worktree.exists():
+            raise WorkspaceProvisionError(
+                "workspace_collision",
+                "an unverified path appeared while creating the workspace; "
+                "it was preserved",
+                details={"branch": branch, "worktree": str(worktree)},
+            )
+        branch_ref = f"refs/heads/{branch}"
+        if self._git_returncode("show-ref", "--verify", "--quiet", branch_ref) == 0:
+            branch_head = self._git_text("rev-parse", "--verify", branch_ref)
+            if branch_head != base_commit:
+                raise WorkspaceProvisionError(
+                    "partial_branch_changed",
+                    "refusing to remove a partially created branch that changed",
+                    details={"branch": branch},
+                )
+            delete = self._git_result("branch", "-D", branch)
+            if delete.returncode != 0:
+                raise WorkspaceProvisionError(
+                    "partial_branch_compensation_failed",
+                    "git could not remove a partially created branch",
+                    details={"stderr": delete.stderr.strip()},
+                )
+
+    def _ownership_record(
+        self,
+        *,
+        task_id: str,
+        branch: str,
+        worktree: Path,
+        recovery_run_id: str,
+    ) -> Mapping[str, object] | None:
+        for record in reversed(self.run_store.read_records()):
+            if record.get("record_type") != "workspace_claim":
+                continue
+            if record.get("branch") != branch:
+                continue
+            raw_worktree = record.get("worktree")
+            if not isinstance(raw_worktree, str):
+                continue
+            if Path(raw_worktree).resolve() != worktree.resolve():
+                continue
+            owner_task_id = str(record.get("task_id") or "")
+            owner_run_id = str(record.get("run_id") or "")
+            if owner_task_id != task_id or (
+                recovery_run_id and owner_run_id != recovery_run_id
+            ):
+                raise WorkspaceProvisionError(
+                    "workspace_foreign_owner",
+                    "the latest ownership record belongs to another task or run",
+                    details={
+                        "owner_task_id": owner_task_id,
+                        "owner_run_id": owner_run_id,
+                    },
+                )
+            return record
+        return None
+
+    def _reject_live_foreign_claim(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        branch: str,
+        worktree: Path,
+    ) -> None:
+        from vibe_loop.workers import load_active_run_states
+
+        for active in load_active_run_states(self.lock_manager):
+            claim = active.workspace
+            if claim is None or (active.task_id == task_id and active.run_id == run_id):
+                continue
+            if claim.branch == branch or claim.worktree.resolve() == worktree.resolve():
+                raise WorkspaceProvisionError(
+                    "workspace_live_owner",
+                    "existing workspace is claimed by another active run",
+                    details={
+                        "owner_task_id": active.task_id,
+                        "owner_run_id": active.run_id,
+                    },
+                )
+
+    def _git(self, *args: str) -> None:
+        result = self._git_result(*args)
+        if result.returncode != 0:
+            raise WorkspaceProvisionError(
+                "git_command_failed",
+                "git workspace operation failed",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+
+    def _git_text(self, *args: str) -> str:
+        return self._git_text_at(self.repo, *args)
+
+    def _git_text_at(self, cwd: Path, *args: str) -> str:
+        result = self._git_result_at(cwd, *args)
+        if result.returncode != 0:
+            raise WorkspaceProvisionError(
+                "git_state_unavailable",
+                "git workspace state could not be read",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+        return result.stdout.strip()
+
+    def _git_returncode(self, *args: str) -> int:
+        return self._git_returncode_at(self.repo, *args)
+
+    def _git_returncode_at(self, cwd: Path, *args: str) -> int:
+        return self._git_result_at(cwd, *args).returncode
+
+    def _git_result(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self._git_result_at(self.repo, *args)
+
+    @staticmethod
+    def _git_result_at(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except OSError as exc:
+            raise WorkspaceProvisionError(
+                "git_state_unavailable",
+                "git could not be executed for workspace provisioning",
+                details={"error": str(exc)},
+            ) from exc
+
+
+def workspace_name(task_id: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", task_id).strip(".-").lower()
+    if not normalized:
+        normalized = "task"
+    digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:10]
+    prefix_limit = WORKSPACE_NAME_MAX_LENGTH - len(digest) - 1
+    return f"{normalized[:prefix_limit]}-{digest}"
 
 
 def overlay_explicit_orchestration(

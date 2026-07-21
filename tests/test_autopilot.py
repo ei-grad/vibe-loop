@@ -1277,7 +1277,7 @@ class AutopilotRunTests(unittest.TestCase):
                     f"status_command = {json.dumps(command)}\n"
                     f"list_command = {json.dumps(command)}\n"
                     "[autopilot]\n"
-                    f"health_command = {json.dumps(f'{sys.executable} env_probe.py maintenance-env.json')}\n"
+                    f"health_command = {json.dumps(f'{sys.executable} env_probe.py .vibe-loop/maintenance-env.json')}\n"
                 ),
             )
             config_path = repo / ".vibe-loop.toml"
@@ -1336,11 +1336,12 @@ class AutopilotRunTests(unittest.TestCase):
             (repo / "agent.py").write_text(
                 "import json, os\n"
                 "from pathlib import Path\n"
-                "Path('worker-env.json').write_text(json.dumps({\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "(repo / '.vibe-loop' / 'worker-env.json').write_text(json.dumps({\n"
                 "    'selector': 'PROJECT_SELECTOR' in os.environ,\n"
                 "    'transport': 'VIBE_LOOP_AUTOPILOT_RUNTIME_CONTEXT_FD' in os.environ,\n"
                 "}))\n"
-                "plan = Path('PLAN.md')\n"
+                "plan = repo / 'PLAN.md'\n"
                 "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'))\n",
                 encoding="utf-8",
             )
@@ -1363,17 +1364,21 @@ class AutopilotRunTests(unittest.TestCase):
             stop_result = None
             try:
                 deadline = time.monotonic() + 10.0
-                maintenance_probe = repo / "maintenance-env.json"
-                worker_probe = repo / "worker-env.json"
+                maintenance_probe = repo / ".vibe-loop" / "maintenance-env.json"
+                worker_probe = repo / ".vibe-loop" / "worker-env.json"
                 while time.monotonic() < deadline and not (
                     maintenance_probe.exists() and worker_probe.exists()
                 ):
                     time.sleep(0.05)
                 status = collect_project_status(config)
                 payload = json.dumps(status.to_json(), ensure_ascii=False)
+                worker_logs = "\n".join(
+                    path.read_text(encoding="utf-8", errors="replace")
+                    for path in (repo / ".vibe-loop" / "runs").glob("*.log")
+                )
                 self.assertTrue(launch.started, launch.blocker)
                 self.assertTrue(maintenance_probe.is_file())
-                self.assertTrue(worker_probe.is_file())
+                self.assertTrue(worker_probe.is_file(), payload + "\n" + worker_logs)
                 self.assertEqual(
                     json.loads(maintenance_probe.read_text(encoding="utf-8")),
                     {"selector": False, "transport": False},

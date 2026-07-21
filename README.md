@@ -6,11 +6,11 @@ agent command such as `codex exec '$vibe-loop <task_id>'`, captures logs,
 validates completion, records local run metadata, and can repeat until no
 runnable tasks remain.
 
-The CLI is a supervisor, not a branch or worktree manager. It owns task
-discovery, selection, locks, process execution, logs, completion checks, and
-run records. The configured worker agent owns branch/worktree setup,
-implementation, review, and any merge-to-`main` workflow defined by the
-repository instructions.
+The CLI owns task discovery, selection, locks, task workspace provisioning,
+process execution, logs, completion checks, and run records. It creates or
+safely adopts and claims a dedicated branch/worktree before agent launch. The
+configured worker agent owns implementation, review, and any merge-to-`main`
+workflow defined by the repository instructions.
 
 The runtime is built around four bundled skills — see [Skills](#skills) — which
 also work on their own in Codex or Claude without the CLI.
@@ -323,12 +323,11 @@ builds on the existing claimed branch/worktree and never deletes, resets,
 steals, or merges another worker's committed work.
 
 The prior run's workspace claim is stale evidence after that run releases its
-task lock. Before a recovery worker mutates the preserved workspace or starts a
-gate, build, test, review, or integration attempt, it verifies the real branch
-and absolute worktree path and explicitly claims them against the current run id
-and active task lock. The supervisor does not guess or auto-claim the preserved
-path, so ownership mismatches and unsafe-workspace diagnostics continue to fail
-closed.
+task lock. Before launching recovery, the runtime verifies the recorded branch,
+worktree, task ownership, base ancestry, cleanliness/liveness evidence, and then
+attaches a fresh claim to the current task lock. A dirty workspace is eligible
+only for exact recovery of its recorded task/run ownership; ambiguous or
+foreign work remains preserved and fails closed.
 
 Generated worker prompts also treat asynchronous work as part of the finite
 headless turn. A worker must await or collect every Agent/Task/Workflow
@@ -358,8 +357,9 @@ records an operator reset.
 
 ### Worker-side commands
 
-Workers can report status, claim a workspace, and serialize final integration
-while the supervisor run is active.
+Workers can report status and serialize final integration while the supervisor
+run is active. `claim-workspace` remains available for compatibility and manual
+worker flows; normal supervised launches are already claimed by the runtime.
 
 ```bash
 # Report final status (authoritative for classifying that run).
@@ -389,12 +389,12 @@ task probing, and main-branch change heuristics.
 `claim-workspace` requires a matching active task lock and verifies the worktree
 is on the requested branch; it records branch, worktree, base commit, HEAD, and
 dirty state, and never creates, deletes, resets, merges, or cleans up
-branches/worktrees. `main-integration acquire --wait --timeout N` waits for a
-live or unknown holder; stale locks are reported, never stolen. If the active
-task lock has a workspace claim, acquisition is blocked when the claim's
-diagnostics make integration unsafe. Worktree and branch handling stay outside
-the CLI runtime — put that policy in repository instructions or the agent
-command.
+branches/worktrees. Normal `run`/`run-next`/`run-until-done` launches instead
+record `workspace_provisioned` followed by the runtime-authored claim and start
+the agent with that worktree as cwd. `main-integration acquire --wait --timeout
+N` waits for a live or unknown holder; stale locks are reported, never stolen.
+If the active task lock has a workspace claim, acquisition is blocked when the
+claim's diagnostics make integration unsafe.
 
 Fencing tokens remain internal lock capabilities. CLI JSON, worker/status
 views, troubleshooting output, and persisted run diagnostics replace fencing
