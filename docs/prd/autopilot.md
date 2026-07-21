@@ -65,9 +65,9 @@ Autopilot state must be recorded through additive records in the target
 repository's configured runtime journal, such as `.vibe-loop/runs.jsonl`, rather
 than a separate hidden state file.
 
-Records include `autopilot_cycle`, `autopilot_supervisor_started`,
-`autopilot_supervisor_observed`, `autopilot_command_result`, and
-`autopilot_idle_wait`. Each cycle record
+Records include `autopilot_cycle`, `autopilot_cycle_started`,
+`autopilot_supervisor_started`, `autopilot_supervisor_observed`,
+`autopilot_command_result`, and `autopilot_idle_wait`. Each cycle record
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
@@ -610,6 +610,17 @@ supervisor actually honours. Status output must name the recorded outcome, the
 attempt count, and the backoff reason, using outcome names and counts only - no
 prompt text, objectives, or credentials.
 
+Persistent supervisors compute the ordinary post-cycle deadline only after the
+child and post-dispatch queue check finish. The same selected wait duration
+governs the journaled UTC `next_wake` and the monotonic sleep or idle-wait
+budget, so a long child cannot leave status advertising an elapsed pre-cycle
+deadline and wall-clock adjustments cannot change the wait duration. A live
+supervisor reports `active_cycle` from the cycle-start record until the cycle
+record is appended, then `sleeping` while a non-empty `next_wake` is being
+honoured. Bounded and already-stopping paths record no next wake. A drain-mode
+cycle records and honours a positive limit-wall deadline, but records no
+ordinary interval wake.
+
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
 Autopilot cycles must include a native worktree-disposition health step so that
@@ -829,6 +840,39 @@ Acceptance must cover immediate and delayed messages, PID precedence, session
 resolution, literal environment delivery, schema validation, bounded command
 execution, safe errors, and unchanged behavior when no adapter is configured.
 
+`wait-helper` also accepts a separate actionable runtime-event source. Runtime
+events never reuse the direct-message envelope: they contain only a stable
+opaque `id`, an allowlisted `kind`, and bounded opaque `project`, `run_id`, and
+`task_id` metadata. Adapter and journal identifiers are SHA-256-derived before
+return so identifier-shaped sensitive text is never emitted. The initial kinds
+are `operator_action_required`,
+`supervisor_inconsistent`, `recovery_exhausted`, `lock_finalization_failed`,
+`disk_blocked`, `provider_quota_wall`, and `provider_account_wall`. Provider
+wall records must carry explicit verified evidence. Progress, tool activity,
+reviewer chatter or findings, ordinary lifecycle transitions, and successful
+completion are not actionable runtime events.
+
+The source is explicit through either `--runtime-event-command` or the
+reference `--runtime-event-journal` reader. Both require a project scope and a
+durable cursor file. A trusted command receives the prior cursor and scope in
+the literal `VIBE_LOOP_WAIT_EVENT_CURSOR`, `VIBE_LOOP_WAIT_EVENT_PROJECT`,
+`VIBE_LOOP_WAIT_EVENT_RUN_ID`, and `VIBE_LOOP_WAIT_EVENT_TASK_ID` environment
+values, then returns exactly `{"cursor": ..., "event": ...}`. The helper
+atomically checkpoints an advanced cursor before returning a wake. Therefore a
+normally completed invocation cannot wake again on the same durable event. If
+the helper crashes after checkpointing but before printing, the event remains
+consumed; this at-most-once crash rule is deterministic and avoids wake storms.
+
+Adapter output is limited to 64 KiB, individual strings and cursors to 1 KiB,
+and the sanitized event to 4 KiB. Identifier metadata is returned only as
+fixed-size `sha256:` values. Prompts, commands, review text, credentials,
+fencing values, arbitrary adapter fields, and raw stdout/stderr are rejected or
+discarded and never returned or journaled. Invalid, oversized, failed, or
+timed-out runtime adapters fail closed with `wake_reason=adapter_error` and a
+safe `runtime_event_adapter_error` category. PID and deadline checks retain
+their existing precedence, and no runtime adapter is invoked when either is
+already satisfied.
+
 Related implementation IDs: `AUTO-22`.
 
 Autopilot may also use an explicit trusted `[autopilot] idle_wake_command`
@@ -892,10 +936,15 @@ Native quota evidence is limited to a bounded scope, window label, used
 percentage, window duration, reset time, and observation time. Plan, credit,
 account, command, prompt, credential, fencing, and transcript fields are not
 persisted. Evidence availability is explicit. Forecasting requires two
-increasing observations for the same provider, scope, window duration, and
-reset timestamp; providers and reset windows are never combined. Missing or
-malformed evidence does not produce an inferred quota from transcript bytes or
-token totals.
+increasing observations for the same provider, scope, window label, and window
+duration. Reset timestamps within one second are treated as provider
+serialization jitter and share a deterministic normalized window identity
+equal to the earliest reset second in that bounded cluster. The forecast
+retains the latest observation's raw reset alongside that normalized identity.
+Larger reset changes and decreases in used percentage start a new comparison
+segment; providers, scopes, window labels, window durations, and actual reset
+epochs are never combined. Missing or malformed evidence does not produce an
+inferred quota from transcript bytes or token totals.
 
 Worker usage defaults to implementation. An allowlisted `phase` and optional
 `review` or `discovery` `work_kind` from the terminal worker report can refine
@@ -906,6 +955,12 @@ restart events before aggregation.
 
 Quota activity distinguishes implementation, review, resumed review, planning,
 validation, remediation, integration, failed attempts, and restarted attempts.
+Runtime-owned review refines review usage into `initial_review` and
+`targeted_closure`, stamps that phase from lifecycle position, and attributes a
+typed provider wall to the configured reviewer route. Reviewer concurrency is a
+separate contract budget from implementation `jobs`, so a reviewer wall pauses
+that route without consuming the task restart budget or reducing the meaning of
+`jobs = 1` to less than one implementation task.
 Repeated unchanged-candidate review in new sessions and repeated failed
 attempts are avoidable-burn diagnostics. Same-session review continuation is a
 separate informational diagnostic. Telemetry does not switch providers or

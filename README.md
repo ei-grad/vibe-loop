@@ -299,8 +299,9 @@ attempts as avoidable burn, while a same-session review resume stays distinct.
 Ordinary workers default to the `implementation` phase. A workflow that knows a
 more specific phase can report it with allowlisted metadata, for example
 `--metadata-json '{"phase":"review","work_kind":"review"}'`. Valid phases are
-`planning`, `implementation`, `focused_validation`, `full_validation`, `review`,
-`remediation`, and `integration`; repeated-candidate diagnostics accept only the
+`planning`, `implementation`, `initial_review`, `focused_validation`,
+`full_validation`, `review`, `remediation`, `targeted_closure`, and
+`integration`; repeated-candidate diagnostics accept only the
 `review` and `discovery` work kinds. Arbitrary metadata is not copied into usage
 stats.
 
@@ -372,6 +373,11 @@ vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \
   --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
   --branch "$BRANCH" --worktree "$WORKTREE"
 
+# Declare the committed candidate from the claimed workspace.
+vibe-loop worker candidate --repo "$VIBE_LOOP_REPO" \
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \
+  --head "$(git rev-parse HEAD)"
+
 # Serialize the refresh/verify/fast-forward-merge critical section.
 vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
   --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" --wait --timeout 300
@@ -395,6 +401,12 @@ the agent with that worktree as cwd. `main-integration acquire --wait --timeout
 N` waits for a live or unknown holder; stale locks are reported, never stolen.
 If the active task lock has a workspace claim, acquisition is blocked when the
 claim's diagnostics make integration unsafe.
+
+`worker candidate` requires the active fencing capability and a prior workspace
+claim. It derives the recorded base and changed paths from Git, rejects a
+declared HEAD that does not match the clean tracked workspace, and records only
+candidate identity. Runtime-owned gates use that record; worker-owned runs keep
+their existing completion behavior.
 
 Fencing tokens remain internal lock capabilities. CLI JSON, worker/status
 views, troubleshooting output, and persisted run diagnostics replace fencing
@@ -538,7 +550,9 @@ machine-readable boundary consumed by external status surfaces such as the
 loopyard web UI (board, agents, and timeline screens). Supervisor state
 correlates the live supervisor lock with append-only started or observed
 records, preserving its run ID, PID, and log even when newer cycle records are
-idle and PID-less; `last_cycle` independently reports the newest cycle.
+idle and PID-less; `last_cycle` independently reports the newest cycle. A live
+supervisor reports `active_cycle` while a cycle is executing and `sleeping`
+after the completed cycle records the post-cycle deadline it is honouring.
 After a bounded or operator-requested exit, supervisor state is `stopped` while
 `last_cycle` retains the independent child-cycle result such as `completed` or
 `idle`. `stopped` requires both an explicit terminal stop record and a verified
@@ -751,6 +765,11 @@ classified and repeated futility is throttled. Two consecutive `invalid_plan`,
 The backoff extends the idle wait rather than blocking it: a task source that
 reaches `min_ready` still wakes the next cycle early, stop requests are still
 honoured, and `next_wake` reports the deadline the supervisor actually sleeps to.
+A persistent cycle schedules that deadline after the child and post-dispatch
+checks complete, so child duration is not added to the interval and status does
+not retain an already elapsed pre-cycle wake. The wait itself remains duration-
+based and monotonic even though the journal exposes an operator-readable UTC
+deadline.
 A launch that creates tasks, or a materially changed task source, clears the
 outcome gate. Created identities and change detection use the complete task
 source rather than only its runnable subset, so a new task claimed before the
@@ -831,7 +850,9 @@ removed in favor of loopyard.
 
 The top-level **`vibe-loop wait-helper`** blocks until a watched process exits,
 a wall-clock deadline arrives, or an optional message adapter returns a direct
-user instruction, so an unattended steward can sleep between cycles.
+user instruction, or an explicit runtime-event source reports a typed
+operator-action-required condition, so an unattended steward can sleep between
+cycles.
 `--pid` (repeatable) wakes on process exit; `--cycle-schedule [SECONDS]` wakes at
 the next UTC `*/SECONDS` boundary; omitting both `--deadline` and
 `--cycle-schedule` uses the default 1800s boundary. `--deadline` takes an
@@ -852,6 +873,31 @@ vibe-loop wait-helper --pid 12345 --message-command \
 Loopyard messages are consumed atomically and delivered at most once after the
 receive transaction commits. Adapter failures return `wake_reason=adapter_error`
 without including command output in the result.
+
+Actionable runtime events use a separate redacted contract. Configure either a
+trusted command or the reference run-journal reader, plus a project-scoped
+durable cursor:
+
+```bash
+vibe-loop wait-helper --pid 12345 \
+  --runtime-event-journal .vibe-loop/runs.jsonl \
+  --runtime-event-cursor .vibe-loop/wait-runtime.cursor \
+  --runtime-event-project my-project --json
+```
+
+The only returned event fields are `kind`, stable opaque `id`, `project`,
+`run_id`, and `task_id`; unavailable run/task identities are empty. Identifier
+values are SHA-256-derived before return so identifier-shaped prompts,
+commands, review text, or credentials cannot be echoed. The allowlist covers
+operator action, inconsistent
+supervision, exhausted recovery, failed lock finalization, disk blockers, and
+verified provider quota/account walls. Progress, tool and review traffic,
+stage transitions, and successful completion never wake this path. The cursor
+is checkpointed before `wake_reason=runtime_event` is returned, preventing a
+completed rearm from repeating the same durable event. Adapter failures remain
+typed `adapter_error` results; no-adapter behavior and PID/deadline precedence
+are unchanged. The cursor checkpoint fsyncs both its content and containing
+directory before a wake is returned.
 
 ## Configuration
 
@@ -886,6 +932,15 @@ commands = [
   "uv run python scripts/record_worklog.py --validate",
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
+
+# Runtime-owned orchestration is landing in dependency-ordered slices. Keep
+# worker-owned compatibility mode until the migration default flip is released.
+[orchestration]
+mode = "worker-owned"
+# reviewer_profile = "review"
+# max_initial_review_passes = 1
+# max_closure_review_passes = 2
+# reviewer_concurrency_budget = 1
 
 [supervision]
 max_restarts = 3
@@ -1095,6 +1150,67 @@ profile's model; otherwise the profile model is used. The per-task `agent`,
 `model`, and `hazards` fields come from command-backed task sources that emit
 them in task JSON (`"agent": "claude-opus"`, `"model": "sonnet"`, `"hazards":
 ["abi"]`); sources that omit them are unaffected.
+
+### Runtime reviewer route
+
+The resolved run contract can select a reviewer independently from the
+implementation worker by naming an agent profile in
+`orchestration.reviewer_profile`:
+
+```toml
+[agent]
+kind = "claude"
+model = "opus"
+effort = "medium"
+
+[agent.profiles.review]
+kind = "codex"
+model = "gpt-5.6-terra"
+effort = "high"
+command = "codex review {prompt}"
+
+[orchestration]
+mode = "worker-owned"
+reviewer_profile = "review"
+max_initial_review_passes = 1
+max_closure_review_passes = 2
+reviewer_concurrency_budget = 1
+```
+
+The reviewer command must accept `{prompt}` so the runtime can deliver the
+typed candidate, gate evidence, policy references, and prior findings. The
+review route records its profile, provider, model, effort, session identity
+when supplied, duration, native usage when available, and retry/continuation
+ordinals. Initial and closure passes have separate budgets, and reviewer
+concurrency is bounded separately from implementation `--jobs`; `--jobs 1`
+continues to mean one implementation task.
+
+Reviewer output is one schema-validated JSON verdict. Findings are persisted in
+a candidate-scoped ledger, malformed output gets one bounded re-ask, and a
+provider limit wall is attributed to the reviewer route without consuming the
+implementation restart budget. Runtime usage phases are `initial_review` and
+`targeted_closure`; compatibility worker reports may continue using `review`.
+
+Continuation capability is explicit by provider and role. Claude implementer
+and reviewer commands support runtime session injection, resume, structured
+output, and launch-time Agent/Task denial. Codex implementer `exec` supports
+structured output and `exec resume`, but its session is discovered after launch.
+The `codex review` surface supports neither session injection nor resume, so a
+targeted closure records `continuation_fallback = "provider_unsupported"` before
+starting a fresh review with the findings ledger and prior gate evidence.
+Missing and expired sessions similarly record `transcript_missing` or
+`session_expired` before fallback.
+
+The runtime owns session continuation ordinals and review budgets. Each dispatch
+journals one immutable initial/closure budget tied to the first candidate
+fingerprint; later candidate fingerprints consume the remaining closure budget
+instead of resetting it. An unfinished `review_started` record parks as
+`review_wait_incomplete` and is never silently replayed. Reviewer prompts forbid
+nested model delegation, Claude receives launch-time Agent/Task denial, and any
+observable nested structured launch is a typed policy violation with separately
+attributed usage. The runtime-owned mode switch still lands in a subsequent
+orchestration slice. Until then, `mode = "worker-owned"` preserves the existing
+worker-owned lifecycle and `mode = "runtime-owned"` fails closed.
 
 ### Locks
 

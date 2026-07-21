@@ -44,6 +44,14 @@ LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
 RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKSPACE_PROVISIONED_RECORD_TYPE = "workspace_provisioned"
+CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
+GATE_RESULT_RECORD_TYPE = "gate_result"
+REVIEW_STARTED_RECORD_TYPE = "review_started"
+REVIEW_VERDICT_RECORD_TYPE = "review_verdict"
+REVIEW_WAIT_INCOMPLETE_RECORD_TYPE = "review_wait_incomplete"
+REVIEW_BUDGET_RECORD_TYPE = "review_budget"
+CONTINUATION_FALLBACK_RECORD_TYPE = "continuation_fallback"
+FINDING_RECORDED_RECORD_TYPE = "finding_recorded"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
@@ -61,6 +69,7 @@ ATTEMPT_CIRCUIT_RESET_RECORD_TYPE = "attempt_circuit_reset"
 RUN_SUPERVISOR_STARTED_RECORD_TYPE = "run_supervisor_started"
 RUN_SUPERVISOR_EXITED_RECORD_TYPE = "run_supervisor_exited"
 AUTOPILOT_CYCLE_RECORD_TYPE = "autopilot_cycle"
+AUTOPILOT_CYCLE_STARTED_RECORD_TYPE = "autopilot_cycle_started"
 AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE = "autopilot_supervisor_started"
 AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE = "autopilot_supervisor_observed"
 AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE = "autopilot_supervisor_stopped"
@@ -77,6 +86,7 @@ AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE = "autopilot_cycle_summary"
 AUTOPILOT_RECORD_TYPES = frozenset(
     {
         AUTOPILOT_CYCLE_RECORD_TYPE,
+        AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
         AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
         AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
         AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
@@ -101,6 +111,14 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         RUN_STARTED_RECORD_TYPE,
         RUN_CONTRACT_RESOLVED_RECORD_TYPE,
         WORKSPACE_PROVISIONED_RECORD_TYPE,
+        CANDIDATE_RECORDED_RECORD_TYPE,
+        GATE_RESULT_RECORD_TYPE,
+        REVIEW_STARTED_RECORD_TYPE,
+        REVIEW_VERDICT_RECORD_TYPE,
+        REVIEW_WAIT_INCOMPLETE_RECORD_TYPE,
+        REVIEW_BUDGET_RECORD_TYPE,
+        CONTINUATION_FALLBACK_RECORD_TYPE,
+        FINDING_RECORDED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
@@ -323,6 +341,7 @@ class RunResult:
     restart_count: int = 0
     max_restarts: int = 0
     stats: dict[str, object] = dataclasses.field(default_factory=dict)
+    recovery_intent: dict[str, object] | None = None
     finished_at: str = dataclasses.field(default_factory=utc_now_iso)
 
     def to_json(self) -> dict[str, object]:
@@ -394,6 +413,8 @@ class RunResult:
             payload["transcript_path"] = self.transcript_path
         if self.stats:
             payload["stats"] = sanitize_run_stats(self.stats)
+        if self.recovery_intent is not None:
+            payload["recovery_intent"] = self.recovery_intent
         return payload
 
     def to_record(self) -> dict[str, object]:
@@ -645,6 +666,126 @@ class RunLifecycleEvent:
         )
 
     @classmethod
+    def candidate_recorded(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=CANDIDATE_RECORDED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def gate_result(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=GATE_RESULT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_started(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_STARTED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_verdict(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_VERDICT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_wait_incomplete(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_WAIT_INCOMPLETE_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_budget(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_BUDGET_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def continuation_fallback(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=CONTINUATION_FALLBACK_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def finding_recorded(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=FINDING_RECORDED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
     def worker_process_started(
         cls,
         *,
@@ -656,21 +797,25 @@ class RunLifecycleEvent:
         session_id: int | None,
         process_birth_id: str,
         host: str,
+        recovery_payload: Mapping[str, Any] | None = None,
     ) -> RunLifecycleEvent:
+        payload: dict[str, Any] = {
+            "worker_pid": worker_pid,
+            "supervisor_pid": supervisor_pid,
+            "worker_process_group_id": process_group_id,
+            "worker_session_id": session_id,
+            "worker_process_birth_id": process_birth_id,
+            "pid_source": "popen",
+            "pid_scope": "configured_command_process",
+            "host": host,
+        }
+        if recovery_payload is not None:
+            payload["recovery_launch"] = dict(recovery_payload)
         return cls(
             record_type=WORKER_PROCESS_STARTED_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
-            payload={
-                "worker_pid": worker_pid,
-                "supervisor_pid": supervisor_pid,
-                "worker_process_group_id": process_group_id,
-                "worker_session_id": session_id,
-                "worker_process_birth_id": process_birth_id,
-                "pid_source": "popen",
-                "pid_scope": "configured_command_process",
-                "host": host,
-            },
+            payload=payload,
         )
 
     @classmethod
@@ -902,6 +1047,9 @@ class RunHistoryView:
     max_restarts: int
     restart_exhausted: bool
     restart_exhausted_reason: str
+    recovery_pending: bool
+    recovery_attempt: int
+    recovery_max_attempts: int
     record_count: int
     latest_record: dict[str, Any]
     lifecycle_progress: RunLifecycleProgress
@@ -914,6 +1062,7 @@ class RunHistoryView:
     ) -> RunHistoryView:
         valid_records = run_history_view_records(records)
         latest = valid_records[-1]
+        recovery = latest_pending_recovery_record(records)
         return cls(
             run_id=run_id,
             task_id=latest_text(valid_records, "task_id"),
@@ -966,6 +1115,15 @@ class RunHistoryView:
             max_restarts=latest_int(records, "max_restarts") or 0,
             restart_exhausted=latest_restart_exhausted(records),
             restart_exhausted_reason=latest_restart_exhausted_reason(records),
+            recovery_pending=recovery is not None,
+            recovery_attempt=(
+                latest_int([recovery], "attempt") or 0 if recovery is not None else 0
+            ),
+            recovery_max_attempts=(
+                latest_int([recovery], "max_attempts") or 0
+                if recovery is not None
+                else 0
+            ),
             record_count=len(records),
             latest_record=latest,
             lifecycle_progress=derive_run_lifecycle(records),
@@ -1009,6 +1167,9 @@ class RunHistoryView:
             "max_restarts": self.max_restarts,
             "restart_exhausted": self.restart_exhausted,
             "restart_exhausted_reason": self.restart_exhausted_reason,
+            "recovery_pending": self.recovery_pending,
+            "recovery_attempt": self.recovery_attempt,
+            "recovery_max_attempts": self.recovery_max_attempts,
             "record_count": self.record_count,
             "latest_record": self.latest_record,
         }
@@ -1314,6 +1475,122 @@ class RunStore:
     def append_result(self, result: RunResult) -> None:
         self.append_record(result.to_record())
 
+    def claim_review_attempt(
+        self,
+        *,
+        start_record: Mapping[str, object],
+        max_initial_passes: int,
+        max_closure_passes: int,
+        lineage_fingerprint: str,
+        before_start_record: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Atomically initialize the review budget and reserve one launch."""
+
+        run_id = string_value(start_record.get("run_id"))
+        task_id = string_value(start_record.get("task_id"))
+        pass_kind = string_value(start_record.get("pass_kind"))
+        family = "initial" if pass_kind == "initial" else "closure"
+        limit = max_initial_passes if family == "initial" else max_closure_passes
+        if not run_id or not task_id or not pass_kind:
+            raise ValueError("review attempt identity is required")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                initialized = any(
+                    record.get("record_type") == REVIEW_BUDGET_RECORD_TYPE
+                    and string_value(record.get("run_id")) == run_id
+                    and string_value(record.get("task_id")) == task_id
+                    and record.get("action") == "initialized"
+                    for record in records
+                )
+                if not initialized:
+                    self._append_record_unlocked(
+                        RunLifecycleEvent.review_budget(
+                            run_id=run_id,
+                            task_id=task_id,
+                            payload={
+                                "action": "initialized",
+                                "source": "dispatch_contract",
+                                "lineage_fingerprint": lineage_fingerprint,
+                                "max_initial_passes": max_initial_passes,
+                                "max_closure_passes": max_closure_passes,
+                            },
+                        ).to_record()
+                    )
+                    records = self._read_records_unlocked()
+
+                active: dict[tuple[object, ...], dict[str, Any]] = {}
+                successful_ordinals: set[int] = set()
+                for record in records:
+                    if (
+                        string_value(record.get("run_id")) != run_id
+                        or string_value(record.get("task_id")) != task_id
+                    ):
+                        continue
+                    recorded_kind = string_value(record.get("pass_kind"))
+                    recorded_family = (
+                        "initial"
+                        if recorded_kind == "initial"
+                        else "closure"
+                        if recorded_kind.startswith("closure:")
+                        else ""
+                    )
+                    key = (
+                        recorded_kind,
+                        record.get("pass_ordinal"),
+                        record.get("attempt_ordinal"),
+                        record.get("candidate_fingerprint"),
+                    )
+                    if record.get("record_type") == REVIEW_STARTED_RECORD_TYPE:
+                        active[key] = record
+                    elif record.get("record_type") == REVIEW_VERDICT_RECORD_TYPE:
+                        active.pop(key, None)
+                        ordinal = record.get("pass_ordinal")
+                        if (
+                            recorded_family == family
+                            and record.get("verdict") in {"approve", "findings"}
+                            and isinstance(ordinal, int)
+                            and not isinstance(ordinal, bool)
+                            and ordinal > 0
+                        ):
+                            successful_ordinals.add(ordinal)
+                if active:
+                    pending = next(reversed(active.values()))
+                    return {"status": "pending", "record": dict(pending)}
+
+                pass_ordinal = max(successful_ordinals, default=0) + 1
+                if pass_ordinal > limit:
+                    exhausted = RunLifecycleEvent.review_budget(
+                        run_id=run_id,
+                        task_id=task_id,
+                        payload={
+                            "action": "exhausted",
+                            "family": family,
+                            "pass_kind": pass_kind,
+                            "pass_ordinal": pass_ordinal,
+                            "limit": limit,
+                            "candidate_fingerprint": start_record.get(
+                                "candidate_fingerprint", ""
+                            ),
+                        },
+                    ).to_record()
+                    self._append_record_unlocked(exhausted)
+                    return {
+                        "status": "exhausted",
+                        "pass_ordinal": pass_ordinal,
+                        "limit": limit,
+                    }
+
+                claimed = dict(start_record)
+                claimed["pass_ordinal"] = pass_ordinal
+                if before_start_record is not None:
+                    before = dict(before_start_record)
+                    before["pass_ordinal"] = pass_ordinal
+                    self._append_record_unlocked(before)
+                self._append_record_unlocked(claimed)
+                return {"status": "claimed", "pass_ordinal": pass_ordinal}
+
     def append_report(self, report: WorkerReport) -> None:
         self.append_record(report.to_record(), fencing_token=report.fencing_token)
 
@@ -1397,6 +1674,90 @@ class RunStore:
                 continue
             return record
         return None
+
+    def pending_recovery_records(self) -> list[dict[str, Any]]:
+        pending: dict[tuple[str, str], dict[str, Any]] = {}
+        unresolved_launches: dict[str, dict[str, Any]] = {}
+        run_metadata: dict[str, dict[str, Any]] = {}
+        for record in self.read_records():
+            run_id = string_value(record.get("run_id"))
+            if run_id:
+                metadata = run_metadata.setdefault(run_id, {})
+                for field in (
+                    "log",
+                    "session_id",
+                    "session_id_source",
+                    "transcript_path",
+                ):
+                    value = record.get(field)
+                    if value:
+                        metadata[field] = value
+            intent = recovery_intent_record(record)
+            if intent is not None:
+                key = (
+                    string_value(intent.get("task_id")),
+                    string_value(intent.get("prior_run_id")),
+                )
+                if all(key):
+                    pending[key] = intent
+            launch = record.get("recovery_launch")
+            if isinstance(launch, dict):
+                key = (
+                    string_value(launch.get("task_id")),
+                    string_value(launch.get("prior_run_id")),
+                )
+                pending.pop(key, None)
+                if run_id:
+                    unresolved_launches[run_id] = dict(launch)
+            if record.get("record_type") in {None, RUN_RECORD_TYPE} and run_id:
+                unresolved_launches.pop(run_id, None)
+            if record.get("record_type") != TASK_RECOVERY_RECORD_TYPE:
+                continue
+            task_id = string_value(record.get("task_id"))
+            prior_run_id = string_value(record.get("prior_run_id"))
+            if not task_id or not prior_run_id:
+                continue
+            key = (task_id, prior_run_id)
+            phase = string_value(record.get("phase"))
+            if phase in {"pending", "deferred"}:
+                pending[key] = record
+                unresolved_launches.pop(prior_run_id, None)
+            elif phase in {"launched", "outcome", "cancelled"}:
+                pending.pop(key, None)
+            recovery_run_id = string_value(record.get("recovery_run_id"))
+            if phase in {"outcome", "cancelled"} and recovery_run_id:
+                unresolved_launches.pop(recovery_run_id, None)
+        for run_id, launch in unresolved_launches.items():
+            attempt = launch.get("attempt")
+            max_attempts = launch.get("max_attempts")
+            if (
+                isinstance(attempt, bool)
+                or not isinstance(attempt, int)
+                or isinstance(max_attempts, bool)
+                or not isinstance(max_attempts, int)
+            ):
+                continue
+            task_id = string_value(launch.get("task_id"))
+            if not task_id:
+                continue
+            metadata = run_metadata.get(run_id, {})
+            recovered = {
+                **launch,
+                **metadata,
+                "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+                "record_type": TASK_RECOVERY_RECORD_TYPE,
+                "phase": "pending",
+                "task_id": task_id,
+                "prior_run_id": run_id,
+                "prior_classification": "unknown",
+                "owner_task_id": task_id,
+                "owner_run_id": run_id,
+                "attempt": min(attempt + 1, max_attempts),
+                "needs_identity_refresh": attempt < max_attempts,
+                "charged_attempt_exhausted": attempt >= max_attempts,
+            }
+            pending[(task_id, run_id)] = recovered
+        return list(pending.values())
 
     def list_runs(self, limit: int = 20) -> list[RunHistoryView]:
         return build_run_history_views(self.read_records(), limit=limit)
@@ -1624,6 +1985,10 @@ def record_status(record: dict[str, Any]) -> str:
         if record.get("exhausted") is True:
             return string_value(record.get("reason")) or "restart_budget_exhausted"
         return "restart_scheduled"
+    if record_type == TASK_RECOVERY_RECORD_TYPE:
+        phase = string_value(record.get("phase")) or "recovery"
+        outcome = string_value(record.get("outcome"))
+        return f"{phase}:{outcome}" if outcome else phase
     if record_type in {
         LOCK_ACQUIRED_RECORD_TYPE,
         LOCK_RELEASED_RECORD_TYPE,
@@ -1668,6 +2033,50 @@ def latest_worker_report_payload(
         if report is not None:
             return report.to_json()
     return None
+
+
+def latest_pending_recovery_record(
+    records: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    pending: dict[str, dict[str, Any]] = {}
+    for record in records:
+        intent = recovery_intent_record(record)
+        if intent is not None:
+            prior_run_id = string_value(intent.get("prior_run_id"))
+            if prior_run_id:
+                pending[prior_run_id] = intent
+        launch = record.get("recovery_launch")
+        if isinstance(launch, dict):
+            pending.pop(string_value(launch.get("prior_run_id")), None)
+        if record.get("record_type") != TASK_RECOVERY_RECORD_TYPE:
+            continue
+        prior_run_id = string_value(record.get("prior_run_id"))
+        if not prior_run_id:
+            continue
+        phase = string_value(record.get("phase"))
+        if phase in {"pending", "deferred"}:
+            pending[prior_run_id] = record
+        elif phase in {"launched", "outcome", "cancelled"}:
+            pending.pop(prior_run_id, None)
+    return next(reversed(pending.values()), None)
+
+
+def recovery_intent_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    if record.get("record_type") not in {None, RUN_RECORD_TYPE}:
+        return None
+    intent = record.get("recovery_intent")
+    if not isinstance(intent, dict):
+        return None
+    normalized = dict(intent)
+    normalized.update(
+        {
+            "schema_version": LIFECYCLE_EVENT_SCHEMA_VERSION,
+            "record_type": TASK_RECOVERY_RECORD_TYPE,
+            "phase": "pending",
+            "occurred_at": record_updated_at(dict(record)),
+        }
+    )
+    return normalized
 
 
 def latest_text(records: list[dict[str, Any]], key: str) -> str:

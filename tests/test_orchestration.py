@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
+import shlex
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import MappingProxyType
@@ -12,6 +16,7 @@ from unittest.mock import patch
 import vibe_loop.runner as runner_module
 from vibe_loop.config import (
     AgentConfig,
+    AgentResolutionError,
     AgentSelection,
     CompletionConfig,
     OrchestrationConfig,
@@ -20,7 +25,24 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
 )
 from vibe_loop.orchestration import (
+    CandidateRecord,
+    CandidateCollectionError,
+    CandidateCollector,
+    GateExecutionError,
+    GateRemediationExhausted,
+    GateResult,
+    GateRunSummary,
+    GateRunner,
     LEGAL_STAGE_TRANSITIONS,
+    RuntimeGateController,
+    ReviewBudgetExhausted,
+    ReviewConcurrencyBudget,
+    ReviewDelegationPolicyError,
+    ReviewFinding,
+    ReviewLimitWallError,
+    ReviewRouter,
+    ReviewStageResultError,
+    ReviewWaitIncomplete,
     STAGE_FAILURES,
     IllegalStageTransitionError,
     RunContractProposal,
@@ -31,12 +53,15 @@ from vibe_loop.orchestration import (
     WorkspaceProvisionError,
     WorkspaceProvisioner,
     derive_stage_progress,
+    inject_provider_continuation,
+    plan_session_continuation,
+    provider_capabilities,
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.locks import LockManager
-from vibe_loop.runs import RunStore, WorkerReport
+from vibe_loop.runs import RunLifecycleEvent, RunStore, WorkerReport
 from vibe_loop.tasks import Task
-from vibe_loop.workers import claim_worker_workspace
+from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
 class OrchestrationConfigTests(unittest.TestCase):
@@ -422,6 +447,1679 @@ class RunLifecycleStateMachineTests(unittest.TestCase):
         gate_records = [record for record in records if record["to_stage"] == "gates"]
         self.assertEqual([record["ordinal"] for record in candidate_records], [1, 2])
         self.assertEqual([record["ordinal"] for record in gate_records], [1, 2])
+
+
+class RuntimeGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        init_git_repo(self.repo)
+        self.base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "-b", "worker/task-01")
+        (self.repo / "tracked.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "tracked.txt")
+        git(self.repo, "commit", "-m", "candidate")
+        self.head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.store = RunStore(self.repo / ".vibe-loop" / "runs.jsonl")
+        self.collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+
+    def test_candidate_declaration_and_derivation_are_validated_and_recorded(
+        self,
+    ) -> None:
+        declared = self.collector.collect_declared(
+            head_commit=self.head,
+            base_main=self.base,
+            changed_paths=("tracked.txt",),
+        )
+        derived = self.collector.collect_derived()
+
+        self.assertEqual(declared.head_commit, self.head)
+        self.assertEqual(declared.changed_paths, ("tracked.txt",))
+        self.assertEqual(declared.source, "worker_command")
+        self.assertEqual(derived.source, "derived")
+        self.assertEqual(declared.fingerprint, derived.fingerprint)
+        records = self.store.read_records()
+        self.assertEqual(
+            [record["record_type"] for record in records],
+            ["candidate_recorded", "candidate_recorded"],
+        )
+
+        with self.assertRaisesRegex(
+            CandidateCollectionError, "does not match the claimed workspace"
+        ):
+            self.collector.collect_declared(head_commit=self.base)
+
+    def test_candidate_rejects_uncommitted_tracked_changes(self) -> None:
+        (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(
+            CandidateCollectionError, "uncommitted tracked changes"
+        ):
+            self.collector.collect_derived()
+
+    def test_candidate_fingerprint_uses_only_head_and_changed_paths(self) -> None:
+        candidate = self.collector.collect_derived()
+        relocated = dataclasses.replace(
+            candidate,
+            branch="worker/other",
+            worktree=self.repo / "other",
+            base_main="f" * 40,
+        )
+
+        self.assertEqual(candidate.fingerprint, relocated.fingerprint)
+        self.assertNotEqual(
+            candidate.fingerprint,
+            dataclasses.replace(candidate, changed_paths=("other.txt",)).fingerprint,
+        )
+
+    def test_gate_records_redacted_evidence_and_invalidates_mutating_gate(
+        self,
+    ) -> None:
+        command_canary = "printf 'mutated\\n' >> tracked.txt"
+        candidate = self.collector.collect_derived()
+        runner = GateRunner(
+            completion_commands=(command_canary,),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+        )
+
+        summary = runner.run(candidate)
+
+        self.assertFalse(summary.passed)
+        self.assertEqual(summary.results[0].exit_class, "candidate_changed")
+        with self.assertRaises(GateExecutionError):
+            summary.require_review_ready()
+        gate_record = self.store.read_records()[-1]
+        self.assertEqual(gate_record["command_key"], "completion.commands[0]")
+        self.assertNotIn(command_canary, json.dumps(gate_record))
+
+    def test_gate_detects_tracked_mutation_that_is_restored_before_exit(self) -> None:
+        mutation_script = (
+            "from pathlib import Path; import time; "
+            "path = Path('tracked.txt'); original = path.read_bytes(); "
+            "path.write_bytes(b'temporary mutation\\n'); time.sleep(0.08); "
+            "path.write_bytes(original); time.sleep(0.03)"
+        )
+        command = shlex.join([sys.executable, "-c", mutation_script])
+        candidate = self.collector.collect_derived()
+        summary = GateRunner(
+            completion_commands=(command,),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "transient-gates",
+            candidate_poll_seconds=0.005,
+        ).run(candidate)
+
+        self.assertEqual(summary.results[0].exit_code, 0)
+        self.assertEqual(summary.results[0].exit_class, "candidate_changed")
+        self.assertTrue(self.collector.matches(candidate))
+
+    def test_passing_gates_do_not_authorize_unrecorded_candidate(self) -> None:
+        unrecorded_store = RunStore(self.repo / ".vibe-loop" / "unrecorded.jsonl")
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=unrecorded_store,
+            run_id="run-unrecorded",
+            task_id="TASK-01",
+        )
+        candidate = collector.snapshot(source="derived")
+        summary = GateRunner(
+            completion_commands=("true",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=collector,
+            run_store=unrecorded_store,
+            run_id="run-unrecorded",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "unrecorded-gates",
+        ).run(candidate)
+
+        self.assertTrue(summary.passed)
+        self.assertFalse(summary.candidate_recorded)
+        with self.assertRaises(GateExecutionError):
+            summary.require_review_ready()
+
+    def test_gate_resume_skips_recorded_pass_and_preserves_recorded_failure(
+        self,
+    ) -> None:
+        candidate = self.collector.collect_derived()
+        calls: list[str] = []
+
+        def crash_on_second(command, **kwargs):
+            calls.append(command)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(command, 0)
+
+        first = GateRunner(
+            completion_commands=("first", "second"),
+            gate_keys=("completion.commands[0]", "completion.commands[1]"),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=crash_on_second,
+        )
+        with self.assertRaises(KeyboardInterrupt):
+            first.run(candidate)
+
+        resumed_calls: list[str] = []
+
+        def pass_gate(command, **kwargs):
+            resumed_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        resumed = GateRunner(
+            completion_commands=("first", "second"),
+            gate_keys=("completion.commands[0]", "completion.commands[1]"),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(candidate)
+
+        self.assertTrue(resumed.passed)
+        self.assertEqual(resumed_calls, ["second"])
+        self.assertTrue(resumed.results[0].resumed)
+
+        Path(resumed.results[0].log_reference).write_text(
+            "tampered\n", encoding="utf-8"
+        )
+        resumed_calls.clear()
+        after_tamper = GateRunner(
+            completion_commands=("first", "second"),
+            gate_keys=("completion.commands[0]", "completion.commands[1]"),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(candidate)
+        self.assertTrue(after_tamper.passed)
+        self.assertEqual(resumed_calls, ["first"])
+
+        failed_store = RunStore(self.repo / ".vibe-loop" / "failed.jsonl")
+        failed_collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=failed_store,
+            run_id="run-2",
+            task_id="TASK-01",
+        )
+        failed_candidate = failed_collector.collect_derived()
+        failed = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=failed_collector,
+            run_store=failed_store,
+            run_id="run-2",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "failed-gates",
+        )
+        self.assertFalse(failed.run(failed_candidate).passed)
+
+        def unexpected_executor(*args, **kwargs):
+            self.fail("a recorded failed gate must route to remediation")
+
+        replay = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=failed_collector,
+            run_store=failed_store,
+            run_id="run-2",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "failed-gates",
+            executor=unexpected_executor,
+        ).run(failed_candidate)
+        self.assertFalse(replay.passed)
+        self.assertTrue(replay.results[0].resumed)
+
+    def test_remediation_budget_is_journaled_and_exhaustion_is_typed(self) -> None:
+        candidate = self.collector.collect_derived()
+        stage_records: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: stage_records.append(transition.to_payload())
+        )
+        for stage in (RunStage.ACTIVATION, RunStage.WORKSPACE, RunStage.IMPLEMENTING):
+            machine.transition(stage, reason="setup")
+        runner = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "controller-gates",
+        )
+
+        def remediate(round_number, _summary):
+            (self.repo / "tracked.txt").write_text(
+                f"candidate {round_number}\n", encoding="utf-8"
+            )
+            git(self.repo, "add", "tracked.txt")
+            git(self.repo, "commit", "-m", f"remediation {round_number}")
+
+        controller = RuntimeGateController(
+            candidate_collector=self.collector,
+            gate_runner=runner,
+            stage_machine=machine,
+            max_remediation_rounds=1,
+            remediation_launcher=remediate,
+        )
+
+        with self.assertRaises(GateRemediationExhausted) as raised:
+            controller.run(candidate)
+
+        self.assertEqual(raised.exception.max_rounds, 1)
+        self.assertEqual(
+            [record["to_stage"] for record in stage_records],
+            [
+                "activation",
+                "workspace",
+                "implementing",
+                "candidate",
+                "gates",
+                "remediation",
+                "candidate",
+                "gates",
+                "classification",
+            ],
+        )
+        self.assertEqual(stage_records[-1]["failure"], "stage_failed")
+
+    def test_controller_resumes_candidate_and_gate_journal_boundaries(self) -> None:
+        candidate_records: list[dict[str, object]] = []
+
+        def journal(transition) -> None:
+            candidate_records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+
+        candidate_machine = RunLifecycleStateMachine(journal)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+        ):
+            candidate_machine.transition(stage, reason="setup")
+        restored_candidate = RunLifecycleStateMachine.from_records(
+            candidate_records, journal
+        )
+        candidate_summary = RuntimeGateController(
+            candidate_collector=self.collector,
+            gate_runner=GateRunner(
+                completion_commands=("true",),
+                gate_keys=("completion.commands[0]",),
+                candidate_collector=self.collector,
+                run_store=self.store,
+                run_id="run-1",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "candidate-resume",
+            ),
+            stage_machine=restored_candidate,
+            max_remediation_rounds=1,
+            remediation_launcher=lambda _round, _summary: self.fail(
+                "passing candidate recovery must not remediate"
+            ),
+        ).run()
+        self.assertTrue(candidate_summary.passed)
+
+        gate_store = RunStore(self.repo / ".vibe-loop" / "gate-resume.jsonl")
+        gate_collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=gate_store,
+            run_id="run-gates",
+            task_id="TASK-01",
+        )
+        gate_candidate = gate_collector.collect_derived()
+        gate_records: list[dict[str, object]] = []
+
+        def gate_journal(transition) -> None:
+            gate_records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+
+        gate_machine = RunLifecycleStateMachine(gate_journal)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            gate_machine.transition(stage, reason="setup")
+        initial_calls: list[str] = []
+
+        def crash_second(command, **kwargs):
+            initial_calls.append(command)
+            if len(initial_calls) == 2:
+                raise KeyboardInterrupt
+            return subprocess.CompletedProcess(command, 0)
+
+        with self.assertRaises(KeyboardInterrupt):
+            GateRunner(
+                completion_commands=("first", "second"),
+                gate_keys=("completion.commands[0]", "completion.commands[1]"),
+                candidate_collector=gate_collector,
+                run_store=gate_store,
+                run_id="run-gates",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "gate-boundary",
+                executor=crash_second,
+            ).run(gate_candidate)
+        pending_calls: list[str] = []
+
+        def pass_pending(command, **kwargs):
+            pending_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        restored_gates = RunLifecycleStateMachine.from_records(
+            gate_records, gate_journal
+        )
+        gate_summary = RuntimeGateController(
+            candidate_collector=gate_collector,
+            gate_runner=GateRunner(
+                completion_commands=("first", "second"),
+                gate_keys=("completion.commands[0]", "completion.commands[1]"),
+                candidate_collector=gate_collector,
+                run_store=gate_store,
+                run_id="run-gates",
+                task_id="TASK-01",
+                log_dir=self.repo / ".vibe-loop" / "gate-boundary",
+                executor=pass_pending,
+            ),
+            stage_machine=restored_gates,
+            max_remediation_rounds=1,
+            remediation_launcher=lambda _round, _summary: self.fail(
+                "passing gate recovery must not remediate"
+            ),
+        ).run()
+        self.assertTrue(gate_summary.passed)
+        self.assertEqual(pending_calls, ["second"])
+
+    def test_controller_routes_recorded_gate_failure_without_rerunning_it(
+        self,
+    ) -> None:
+        failure_store = RunStore(self.repo / ".vibe-loop" / "failure-resume.jsonl")
+        collector = CandidateCollector(
+            worktree=self.repo,
+            branch="worker/task-01",
+            base_main=self.base,
+            run_store=failure_store,
+            run_id="run-failure",
+            task_id="TASK-01",
+        )
+        candidate = collector.collect_derived()
+        stage_records: list[dict[str, object]] = []
+
+        def journal(transition) -> None:
+            stage_records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+
+        machine = RunLifecycleStateMachine(journal)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        failing_runner = GateRunner(
+            completion_commands=("false",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=collector,
+            run_store=failure_store,
+            run_id="run-failure",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "failure-boundary",
+        )
+        self.assertFalse(failing_runner.run(candidate).passed)
+        executor_calls: list[str] = []
+        remediation_summaries = []
+
+        def unexpected_executor(command, **kwargs):
+            executor_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        def observe_remediation(_round, summary):
+            remediation_summaries.append(summary)
+            raise RuntimeError("remediation relaunched")
+
+        restored = RunLifecycleStateMachine.from_records(stage_records, journal)
+        with self.assertRaisesRegex(RuntimeError, "remediation relaunched"):
+            RuntimeGateController(
+                candidate_collector=collector,
+                gate_runner=GateRunner(
+                    completion_commands=("false",),
+                    gate_keys=("completion.commands[0]",),
+                    candidate_collector=collector,
+                    run_store=failure_store,
+                    run_id="run-failure",
+                    task_id="TASK-01",
+                    log_dir=self.repo / ".vibe-loop" / "failure-boundary",
+                    executor=unexpected_executor,
+                ),
+                stage_machine=restored,
+                max_remediation_rounds=1,
+                remediation_launcher=observe_remediation,
+            ).run()
+
+        self.assertEqual(executor_calls, [])
+        self.assertEqual(len(remediation_summaries), 1)
+        self.assertTrue(remediation_summaries[0].results[0].resumed)
+
+
+class ReviewRouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name)
+        self.store = RunStore(self.repo / "runs.jsonl")
+        self.candidate = CandidateRecord(
+            branch="vibe-loop/TASK-01",
+            worktree=self.repo,
+            base_main="a" * 40,
+            head_commit="b" * 40,
+            changed_paths=("src/example.py",),
+            source="derived",
+        )
+        self.gates = GateRunSummary(
+            candidate=self.candidate,
+            results=(
+                GateResult(
+                    config_key="completion.commands[0]",
+                    exit_class="passed",
+                    exit_code=0,
+                    duration_seconds=0.5,
+                    log_reference=str(self.repo / "gate.log"),
+                    evidence_digest="sha256:" + "c" * 64,
+                    candidate_fingerprint=self.candidate.fingerprint,
+                ),
+            ),
+            candidate_recorded=True,
+        )
+
+    def agent(self, provider: str, *, command: str | None = None) -> AgentConfig:
+        return AgentConfig(
+            command=command
+            or f"{provider} review --model {{model}} --effort {{effort}} {{prompt}}",
+            command_source="explicit",
+            model="review-model",
+            model_source="explicit",
+            effort="high",
+            effort_source="explicit",
+            agent_kind=provider,
+            agent_kind_source="explicit",
+            executable_kind=provider,
+            profile_name="review",
+        )
+
+    def router(
+        self,
+        provider: str,
+        executor,
+        *,
+        initial: int = 1,
+        closure: int = 2,
+    ) -> ReviewRouter:
+        return ReviewRouter(
+            reviewer=self.agent(provider),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=initial,
+            max_closure_passes=closure,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=executor,
+            continuation_availability=lambda _provider, _role, _session: "",
+            session_id_factory=lambda: f"{provider}-session",
+        )
+
+    def gates_for(self, candidate: CandidateRecord) -> GateRunSummary:
+        return dataclasses.replace(
+            self.gates,
+            candidate=candidate,
+            results=tuple(
+                dataclasses.replace(result, candidate_fingerprint=candidate.fingerprint)
+                for result in self.gates.results
+            ),
+        )
+
+    def test_routes_cross_provider_matrices_with_provenance_and_usage(self) -> None:
+        cases = (
+            (
+                "claude",
+                "codex",
+                {"type": "turn.completed", "usage": {"input_tokens": 12}},
+            ),
+            (
+                "codex",
+                "claude",
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 13},
+                    "num_turns": 1,
+                },
+            ),
+        )
+        for implementer, reviewer, usage_event in cases:
+            with self.subTest(implementer=implementer, reviewer=reviewer):
+                commands: list[str] = []
+
+                def execute(command: str, **kwargs):
+                    commands.append(command)
+                    output = "\n".join(
+                        (
+                            json.dumps(usage_event),
+                            json.dumps(
+                                {
+                                    "verdict": "approve",
+                                    "findings": [],
+                                    "session_id": f"{reviewer}-session",
+                                    "session_id_source": "provider",
+                                    "continuation_ordinal": 0,
+                                }
+                            ),
+                        )
+                    )
+                    return subprocess.CompletedProcess(command, 0, stdout=output)
+
+                self.store = RunStore(self.repo / f"{reviewer}.jsonl")
+                result = self.router(reviewer, execute).review(self.gates)
+
+                self.assertTrue(result.approved)
+                self.assertIn("review-model", commands[0])
+                self.assertIn("high", commands[0])
+                records = self.store.read_records()
+                self.assertEqual(
+                    [record["record_type"] for record in records],
+                    [
+                        "review_budget",
+                        "review_started",
+                        "review_verdict",
+                        "review_budget",
+                    ],
+                )
+                verdict = records[-2]
+                self.assertEqual(verdict["route"]["provider"], reviewer)
+                self.assertEqual(verdict["route"]["model"], "review-model")
+                self.assertEqual(verdict["route"]["effort"], "high")
+                self.assertEqual(verdict["stats"]["phase"], "initial_review")
+                self.assertIn("input_tokens", verdict["stats"])
+
+    def test_malformed_reask_findings_ledger_and_budget(self) -> None:
+        outputs = iter(
+            (
+                "not json",
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "candidate can bypass review",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "session-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        result = router.review(self.gates)
+
+        self.assertEqual(result.verdict, "findings")
+        self.assertEqual(result.attempt_ordinal, 2)
+        self.assertEqual(
+            [
+                finding.finding_id
+                for finding in router.ledger.open(self.candidate.fingerprint)
+            ],
+            ["F1"],
+        )
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        router.stage_machine = machine
+        remediated_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="c" * 40)
+        )
+        with self.assertRaises(ReviewBudgetExhausted):
+            router.review(remediated_gates)
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertIn("review_budget_exhausted", transitions[-1]["reason"])
+        self.assertEqual(
+            [record["record_type"] for record in self.store.read_records()],
+            [
+                "review_budget",
+                "review_started",
+                "review_verdict",
+                "continuation_fallback",
+                "review_started",
+                "review_verdict",
+                "finding_recorded",
+                "review_budget",
+                "review_budget",
+            ],
+        )
+
+    def test_targeted_closure_updates_ledger_and_phase(self) -> None:
+        initial = ReviewFinding(
+            finding_id="F1",
+            severity="P1",
+            summary="candidate can bypass review",
+            evidence="reproduction",
+            files=("src/example.py",),
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.finding_recorded(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "finding_id": initial.finding_id,
+                    "severity": initial.severity,
+                    "summary": initial.summary,
+                    "evidence": initial.evidence,
+                    "files": list(initial.files),
+                    "lines": [],
+                    "state": initial.state,
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "pass_kind": "initial",
+                },
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            output = json.dumps(
+                {
+                    "verdict": "approve",
+                    "findings": [
+                        {
+                            "id": "F1",
+                            "severity": "P1",
+                            "summary": "candidate can bypass review",
+                            "evidence": "focused reproduction now passes",
+                            "files": ["src/example.py"],
+                            "lines": ["12"],
+                            "state": "remediated",
+                        }
+                    ],
+                    "session_id": "claude-session",
+                    "session_id_source": "provider",
+                    "continuation_ordinal": 1,
+                }
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        router = self.router("claude", execute)
+        remediated_candidate = dataclasses.replace(
+            self.candidate,
+            head_commit="c" * 40,
+        )
+        remediated_gates = self.gates_for(remediated_candidate)
+        result = router.review(remediated_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertEqual(router.ledger.open(), ())
+        verdict = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ][0]
+        self.assertEqual(verdict["phase"], "targeted_closure")
+        self.assertEqual(verdict["continuation_ordinal"], 1)
+
+    def test_limit_wall_is_typed_to_reviewer_route_without_reask(self) -> None:
+        outputs = iter(
+            (
+                (1, "You've hit your usage limit; resets at 3pm UTC"),
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [],
+                            "session_id": "review-1",
+                            "session_id_source": "provider",
+                            "continuation_ordinal": 0,
+                        }
+                    ),
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            returncode, output = next(outputs)
+            return subprocess.CompletedProcess(command, returncode, stdout=output)
+
+        router = self.router("codex", execute)
+        with self.assertRaises(ReviewLimitWallError) as raised:
+            router.review(self.gates)
+
+        self.assertEqual(raised.exception.phase, "initial_review")
+        result = router.review(self.gates)
+        self.assertEqual(result.pass_ordinal, 1)
+        records = self.store.read_records()
+        wall = next(
+            record
+            for record in records
+            if record.get("record_type") == "review_verdict"
+            and record.get("retry_classification") == "limit_wall"
+        )
+        self.assertEqual(wall["retry_classification"], "limit_wall")
+        self.assertEqual(wall["route"]["provider"], "codex")
+
+    def test_missing_prompt_delivery_fails_before_launch(self) -> None:
+        router = ReviewRouter(
+            reviewer=self.agent(
+                "codex",
+                command="codex review --model {model} --effort {effort}",
+            ),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=(),
+            max_initial_passes=1,
+            max_closure_passes=0,
+            concurrency=ReviewConcurrencyBudget(1),
+        )
+
+        with self.assertRaisesRegex(AgentResolutionError, "must include.*prompt"):
+            router.review(self.gates)
+        self.assertEqual(self.store.read_records(), [])
+
+    def test_open_finding_routes_to_remediation_and_cannot_reach_integration(
+        self,
+    ) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "completion can bypass review",
+                                "evidence": "worker reported completed",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        result = router.review(self.gates)
+
+        self.assertEqual(result.verdict, "findings")
+        self.assertEqual(machine.stage, RunStage.REMEDIATION)
+        self.assertNotIn(
+            RunStage.INTEGRATION.value,
+            [transition["to_stage"] for transition in transitions],
+        )
+
+    def test_reviewer_concurrency_budget_is_independent_and_bounded(self) -> None:
+        budget = ReviewConcurrencyBudget(1)
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+
+        def first() -> None:
+            with budget.slot():
+                first_entered.set()
+                release_first.wait(2)
+
+        def second() -> None:
+            with budget.slot():
+                second_entered.set()
+
+        first_thread = threading.Thread(target=first)
+        second_thread = threading.Thread(target=second)
+        first_thread.start()
+        self.assertTrue(first_entered.wait(1))
+        second_thread.start()
+        self.assertFalse(second_entered.wait(0.05))
+        release_first.set()
+        first_thread.join(1)
+        second_thread.join(1)
+
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(budget.peak, 1)
+        self.assertEqual(budget.active, 0)
+
+    def test_later_approval_cannot_bypass_open_finding(self) -> None:
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "completion can bypass review",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "review-2",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        first = self.router("codex", execute, initial=2)
+        first.review(self.gates)
+        machine = RunLifecycleStateMachine(lambda _transition: None)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        second = self.router("codex", execute, initial=2)
+        second.stage_machine = machine
+
+        second.review(self.gates)
+
+        self.assertEqual(machine.stage, RunStage.REMEDIATION)
+        self.assertEqual(
+            [finding.finding_id for finding in second.ledger.open()], ["F1"]
+        )
+
+    def test_error_verdict_is_typed_failure_not_remediation(self) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "error",
+                        "findings": [],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                        "retry_classification": "fatal",
+                    }
+                ),
+            )
+
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+        with self.assertRaises(ReviewStageResultError):
+            router.review(self.gates)
+
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertNotIn(
+            RunStage.REMEDIATION.value,
+            [transition["to_stage"] for transition in transitions],
+        )
+
+    def test_provider_capabilities_cover_both_roles_and_shared_resume_paths(
+        self,
+    ) -> None:
+        claude_reviewer = provider_capabilities("claude", "reviewer")
+        codex_reviewer = provider_capabilities("codex", "reviewer")
+        codex_implementer = provider_capabilities("codex", "implementer")
+
+        self.assertTrue(claude_reviewer.session_injection)
+        self.assertTrue(claude_reviewer.resume)
+        self.assertTrue(claude_reviewer.structured_output)
+        self.assertFalse(codex_reviewer.resume)
+        self.assertFalse(codex_reviewer.structured_output)
+        self.assertTrue(codex_implementer.resume)
+
+        continuation = plan_session_continuation(
+            provider="codex",
+            role="implementer",
+            continuing=True,
+            prior_session_id="thread-123",
+            prior_ordinal=0,
+        )
+        self.assertEqual(
+            inject_provider_continuation(
+                "codex exec --json {prompt}",
+                provider="codex",
+                role="implementer",
+                continuation=continuation,
+            ),
+            "codex exec resume thread-123 --json {prompt}",
+        )
+
+    def test_review_refuses_gate_evidence_from_an_older_candidate(self) -> None:
+        changed = dataclasses.replace(self.candidate, head_commit="f" * 40)
+        stale_gates = dataclasses.replace(self.gates, candidate=changed)
+
+        with self.assertRaisesRegex(GateExecutionError, "exact candidate"):
+            self.router("codex", lambda *_args, **_kwargs: None).review(stale_gates)
+
+    def test_claude_route_augments_existing_tool_denial_and_parses_stream_result(
+        self,
+    ) -> None:
+        commands: list[str] = []
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            output = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "result": json.dumps(
+                                {
+                                    "verdict": "approve",
+                                    "findings": [],
+                                    "session_id": "claude-session",
+                                    "session_id_source": "provider",
+                                }
+                            ),
+                            "usage": {"input_tokens": 17, "output_tokens": 5},
+                            "num_turns": 1,
+                        }
+                    ),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        router = ReviewRouter(
+            reviewer=self.agent(
+                "claude",
+                command=(
+                    "claude -p --model {model} --effort {effort} "
+                    "--disallowedTools Edit {prompt}"
+                ),
+            ),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=1,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=execute,
+            continuation_availability=lambda _provider, _role, _session: "",
+            session_id_factory=lambda: "claude-session",
+        )
+        result = router.review(self.gates)
+
+        argv = shlex.split(commands[0])
+        denied = argv.index("--disallowedTools")
+        self.assertEqual(argv[denied + 1 : denied + 3], ["Agent,Task", "Edit"])
+        self.assertEqual(argv[-3:], ["--disallowedTools", "Agent,Task", "Edit"])
+        self.assertIn("stream-json", argv)
+        self.assertIn("--verbose", argv)
+        self.assertTrue(result.approved)
+        self.assertEqual(result.usage.values["input_tokens"], 17)
+
+    def test_default_claude_availability_detects_missing_transcript(self) -> None:
+        home = self.repo / "claude-home"
+        initial = ReviewFinding(
+            finding_id="F1",
+            severity="P2",
+            summary="missing guard",
+            evidence="reproduction",
+            files=("src/example.py",),
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.review_verdict(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "pass_kind": "initial",
+                    "pass_ordinal": 1,
+                    "attempt_ordinal": 1,
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "verdict": "findings",
+                    "session_id": "old-session",
+                    "session_id_source": "runtime_injected",
+                    "continuation_ordinal": 0,
+                    "route": {"provider": "claude"},
+                },
+            )
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.finding_recorded(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "finding_id": initial.finding_id,
+                    "severity": initial.severity,
+                    "summary": initial.summary,
+                    "evidence": initial.evidence,
+                    "files": list(initial.files),
+                    "lines": [],
+                    "state": "open",
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "pass_kind": "initial",
+                },
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                **initial.to_payload(),
+                                "evidence": "guard now passes",
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "fresh-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+
+        router = ReviewRouter(
+            reviewer=self.agent(
+                "claude",
+                command=(
+                    f"CLAUDE_HOME={home} claude -p --model {{model}} "
+                    "--effort {effort} {prompt}"
+                ),
+            ),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=1,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=execute,
+            session_id_factory=lambda: "fresh-session",
+        )
+        result = router.review(
+            self.gates_for(dataclasses.replace(self.candidate, head_commit="2" * 40)),
+            pass_kind="closure:1",
+        )
+
+        self.assertTrue(result.approved)
+        fallback = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "continuation_fallback"
+        )
+        self.assertEqual(fallback["reason"], "transcript_missing")
+
+    def test_claude_closure_resumes_runtime_owned_reviewer_session(self) -> None:
+        commands: list[str] = []
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "unsafe completion",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "claude-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "unsafe completion",
+                                "evidence": "reproduction passes",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "claude-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("claude", execute)
+        router.review(self.gates)
+        closure_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="d" * 40)
+        )
+        result = router.review(closure_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertIn("--session-id claude-session", commands[0])
+        self.assertIn("--resume claude-session", commands[1])
+        self.assertIn("--disallowedTools Agent,Task", commands[0])
+        self.assertIn("--output-format stream-json --verbose", commands[0])
+        self.assertEqual(
+            shlex.split(commands[0])[-2:], ["--disallowedTools", "Agent,Task"]
+        )
+        records = self.store.read_records()
+        self.assertFalse(
+            any(record["record_type"] == "continuation_fallback" for record in records)
+        )
+        starts = [
+            record for record in records if record["record_type"] == "review_started"
+        ]
+        self.assertEqual(
+            [
+                (record["session_id"], record["continuation_ordinal"])
+                for record in starts
+            ],
+            [("claude-session", 0), ("claude-session", 1)],
+        )
+
+    def test_codex_closure_records_fallback_before_fresh_launch(self) -> None:
+        commands: list[str] = []
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P2",
+                                "summary": "missing guard",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": [],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "codex-old",
+                        "session_id_source": "provider",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P2",
+                                "summary": "missing guard",
+                                "evidence": "guard now passes",
+                                "files": ["src/example.py"],
+                                "lines": [],
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "codex-new",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        router.review(self.gates)
+        closure_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="e" * 40)
+        )
+        result = router.review(closure_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertNotIn("--resume", shlex.split(commands[1]))
+        self.assertNotIn("exec resume", commands[1])
+        records = self.store.read_records()
+        fallback_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["record_type"] == "continuation_fallback"
+        )
+        closure_start_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["record_type"] == "review_started"
+            and record["pass_kind"] == "closure:1"
+        )
+        fallback = records[fallback_index]
+        self.assertLess(fallback_index, closure_start_index)
+        self.assertEqual(fallback["reason"], "provider_unsupported")
+        self.assertEqual(fallback["prior_session_id"], "codex-old")
+        self.assertEqual(
+            [finding["id"] for finding in fallback["context_artifacts"]["findings"]],
+            ["F1"],
+        )
+        closure_verdict = next(
+            record
+            for record in records
+            if record["record_type"] == "review_verdict"
+            and record["pass_kind"] == "closure:1"
+            and record["verdict"] == "approve"
+        )
+        self.assertFalse(closure_verdict["continuation_resumed"])
+        self.assertFalse(closure_verdict["stats"]["session_continuation"])
+
+    def test_continuation_fallback_reasons_are_runtime_owned(self) -> None:
+        missing = plan_session_continuation(
+            provider="claude",
+            role="reviewer",
+            continuing=True,
+            session_id_factory=lambda: "fresh-session",
+        )
+        expired = plan_session_continuation(
+            provider="claude",
+            role="reviewer",
+            continuing=True,
+            prior_session_id="old-session",
+            availability_reason="session_expired",
+            session_id_factory=lambda: "fresh-session",
+        )
+
+        self.assertEqual(missing.fallback_reason, "transcript_missing")
+        self.assertEqual(expired.fallback_reason, "session_expired")
+        self.assertEqual(expired.prior_session_id, "old-session")
+        self.assertFalse(expired.resumed)
+
+    def test_expired_claude_session_records_fallback_before_retry(self) -> None:
+        commands: list[str] = []
+        session_ids = iter(("old-session", "fresh-session"))
+        outputs = iter(
+            (
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "findings",
+                            "findings": [
+                                {
+                                    "id": "F1",
+                                    "severity": "P2",
+                                    "summary": "missing guard",
+                                    "evidence": "reproduction",
+                                    "files": ["src/example.py"],
+                                    "lines": [],
+                                    "state": "open",
+                                }
+                            ],
+                            "session_id": "old-session",
+                            "session_id_source": "provider",
+                        }
+                    ),
+                ),
+                (1, "No conversation found for session old-session"),
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [
+                                {
+                                    "id": "F1",
+                                    "severity": "P2",
+                                    "summary": "missing guard",
+                                    "evidence": "guard now passes",
+                                    "files": ["src/example.py"],
+                                    "lines": [],
+                                    "state": "remediated",
+                                }
+                            ],
+                            "session_id": "fresh-session",
+                            "session_id_source": "provider",
+                            "continuation_ordinal": 1,
+                        }
+                    ),
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            returncode, output = next(outputs)
+            return subprocess.CompletedProcess(command, returncode, stdout=output)
+
+        router = self.router("claude", execute)
+        router.session_id_factory = lambda: next(session_ids)
+        router.review(self.gates)
+        result = router.review(
+            self.gates_for(dataclasses.replace(self.candidate, head_commit="1" * 40)),
+            pass_kind="closure:1",
+        )
+
+        self.assertTrue(result.approved)
+        self.assertIn("--resume old-session", commands[1])
+        self.assertIn("--session-id fresh-session", commands[2])
+        fallback = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "continuation_fallback"
+        )
+        self.assertEqual(fallback["reason"], "session_expired")
+        self.assertEqual(fallback["prior_session_id"], "old-session")
+
+    def test_unfinished_review_wait_never_relaunches(self) -> None:
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.review_started(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "pass_kind": "initial",
+                    "pass_ordinal": 1,
+                    "attempt_ordinal": 1,
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "session_id": "pending-session",
+                    "session_id_source": "provider",
+                    "continuation_ordinal": 0,
+                },
+            )
+        )
+        launches = 0
+
+        def execute(command: str, **kwargs):
+            nonlocal launches
+            launches += 1
+            raise AssertionError("unfinished review must not relaunch")
+
+        with self.assertRaises(ReviewWaitIncomplete):
+            self.router("codex", execute).review(self.gates)
+
+        self.assertEqual(launches, 0)
+        wait = self.store.read_records()[-1]
+        self.assertEqual(wait["record_type"], "review_wait_incomplete")
+        self.assertEqual(wait["session_id"], "pending-session")
+
+    def test_review_attempt_claim_prevents_concurrent_duplicate_launch(self) -> None:
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        launches = 0
+        first_results: list[object] = []
+
+        def execute(command: str, **kwargs):
+            nonlocal launches
+            launches += 1
+            first_entered.set()
+            release_first.wait(2)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "codex-session",
+                        "session_id_source": "provider",
+                    }
+                ),
+            )
+
+        first = self.router("codex", execute)
+        second = self.router("codex", execute)
+
+        def run_first() -> None:
+            first_results.append(first.review(self.gates))
+
+        thread = threading.Thread(target=run_first)
+        thread.start()
+        self.assertTrue(first_entered.wait(1))
+        with self.assertRaises(ReviewWaitIncomplete):
+            second.review(self.gates)
+        release_first.set()
+        thread.join(2)
+
+        self.assertEqual(launches, 1)
+        self.assertEqual(len(first_results), 1)
+        self.assertFalse(isinstance(first_results[0], Exception))
+
+    def test_review_budget_resets_only_with_a_new_dispatch_contract(self) -> None:
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "codex-session",
+                        "session_id_source": "provider",
+                    }
+                ),
+            )
+
+        first = self.router("codex", execute, initial=1)
+        first.review(self.gates)
+        with self.assertRaises(ReviewBudgetExhausted):
+            first.review(self.gates)
+
+        second = ReviewRouter(
+            reviewer=self.agent("codex"),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-2",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=2,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=execute,
+            session_id_factory=lambda: "codex-session",
+        )
+        result = second.review(self.gates)
+
+        self.assertTrue(result.approved)
+        initialized = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_budget"
+            and record["action"] == "initialized"
+        ]
+        self.assertEqual(
+            [(record["run_id"], record["source"]) for record in initialized],
+            [("run-1", "dispatch_contract"), ("run-2", "dispatch_contract")],
+        )
+
+    def test_nested_reviewer_launch_is_rejected_and_usage_is_separate(self) -> None:
+        def execute(command: str, **kwargs):
+            output = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "subagent.started",
+                            "usage": {"input_tokens": 31_012},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [],
+                            "session_id": "codex-session",
+                            "session_id_source": "provider",
+                        }
+                    ),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        with self.assertRaises(ReviewDelegationPolicyError):
+            self.router("codex", execute).review(self.gates)
+
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["policy_violation"], "nested_reviewer_delegation")
+        self.assertEqual(verdict["nested_launches"], 1)
+        self.assertEqual(verdict["nested_usage"]["input_tokens"], 31_012)
+
+    def test_claude_native_agent_tool_event_is_rejected(self) -> None:
+        def execute(command: str, **kwargs):
+            output = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "name": "Agent",
+                                        "input": {"description": "closure"},
+                                    }
+                                ],
+                                "usage": {"input_tokens": 31_012},
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "result": json.dumps(
+                                {
+                                    "verdict": "approve",
+                                    "findings": [],
+                                    "session_id": "claude-session",
+                                    "session_id_source": "provider",
+                                }
+                            ),
+                        }
+                    ),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        with self.assertRaises(ReviewDelegationPolicyError):
+            self.router("claude", execute).review(self.gates)
+
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["nested_launches"], 1)
+        self.assertEqual(verdict["nested_usage"]["input_tokens"], 31_012)
 
 
 class RunContractJournalTests(unittest.TestCase):
@@ -901,6 +2599,164 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(recovered.mode, "preserved")
             self.assertTrue(recovered.dirty_at_adoption)
             self.assertTrue((first.worktree / "uncommitted.txt").exists())
+
+    def test_recovery_accepts_matching_staged_and_unstaged_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            first = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock("TASK-01"))
+            (first.worktree / "staged.txt").write_text("staged\n", encoding="utf-8")
+            git(first.worktree, "add", "staged.txt")
+            (first.worktree / "unstaged.txt").write_text("unstaged\n", encoding="utf-8")
+            snapshot_lines, dirty_fingerprint = git_dirty_snapshot(first.worktree)
+            snapshot = tuple(snapshot_lines)
+            common_dir = Path(
+                git(first.worktree, "rev-parse", "--git-common-dir").stdout.strip()
+            )
+            if not common_dir.is_absolute():
+                common_dir = first.worktree / common_dir
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            recovered = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=token,
+                recovery_run_id="run-1",
+                recovery_branch=first.branch,
+                recovery_worktree=first.worktree,
+                recovery_git_common_dir=common_dir.resolve(),
+                recovery_base_commit=base,
+                recovery_head_commit=base,
+                recovery_dirty_snapshot=snapshot,
+                recovery_dirty_fingerprint=dirty_fingerprint,
+            )
+
+            self.assertEqual(recovered.mode, "preserved")
+            self.assertTrue((first.worktree / "staged.txt").exists())
+            self.assertTrue((first.worktree / "unstaged.txt").exists())
+
+    def test_recovery_rejects_head_common_dir_and_dirty_snapshot_changes(self) -> None:
+        cases = (
+            ("head", "recovery_head_changed"),
+            ("common_dir", "recovery_git_common_dir_changed"),
+            ("dirty", "recovery_dirty_snapshot_changed"),
+            ("dirty_content", "recovery_dirty_content_changed"),
+        )
+        for mutation, expected_code in cases:
+            with self.subTest(mutation=mutation):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory) / "repo"
+                    init_git_repo(repo)
+                    manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+                    base = git(repo, "rev-parse", "HEAD").stdout.strip()
+                    first = WorkspaceProvisioner(
+                        repo=repo,
+                        main_branch="main",
+                        lock_manager=manager,
+                        run_store=store,
+                    ).provision(
+                        task_id="TASK-01",
+                        run_id="run-1",
+                        base_commit=base,
+                        fencing_token=token,
+                    )
+                    manager.release(manager.current_lock("TASK-01"))
+                    expected_head = base
+                    expected_snapshot: tuple[str, ...] = ()
+                    expected_fingerprint = git_dirty_snapshot(first.worktree)[1]
+                    raw_common = Path(
+                        git(
+                            first.worktree, "rev-parse", "--git-common-dir"
+                        ).stdout.strip()
+                    )
+                    expected_common = (
+                        raw_common
+                        if raw_common.is_absolute()
+                        else first.worktree / raw_common
+                    ).resolve()
+                    if mutation == "head":
+                        (first.worktree / "commit.txt").write_text(
+                            "moved\n", encoding="utf-8"
+                        )
+                        git(first.worktree, "add", "commit.txt")
+                        git(first.worktree, "commit", "-m", "move head")
+                    elif mutation == "common_dir":
+                        expected_common = Path(directory) / "different.git"
+                    elif mutation == "dirty":
+                        (first.worktree / "foreign.txt").write_text(
+                            "foreign\n", encoding="utf-8"
+                        )
+                    else:
+                        (first.worktree / "tracked.txt").write_text(
+                            "first\n", encoding="utf-8"
+                        )
+                        git(first.worktree, "add", "tracked.txt")
+                        (first.worktree / "README.md").write_text(
+                            "first unstaged\n", encoding="utf-8"
+                        )
+                        expected_snapshot, expected_fingerprint = git_dirty_snapshot(
+                            first.worktree
+                        )
+                        (first.worktree / "tracked.txt").write_text(
+                            "second\n", encoding="utf-8"
+                        )
+                        git(first.worktree, "add", "tracked.txt")
+                        (first.worktree / "README.md").write_text(
+                            "second unstaged\n", encoding="utf-8"
+                        )
+                    manager, _, token = acquire_run(
+                        repo,
+                        "TASK-01",
+                        "run-2",
+                        store=store,
+                    )
+
+                    with self.assertRaises(WorkspaceProvisionError) as raised:
+                        WorkspaceProvisioner(
+                            repo=repo,
+                            main_branch="main",
+                            lock_manager=manager,
+                            run_store=store,
+                        ).provision(
+                            task_id="TASK-01",
+                            run_id="run-2",
+                            base_commit=base,
+                            fencing_token=token,
+                            recovery_run_id="run-1",
+                            recovery_branch=first.branch,
+                            recovery_worktree=first.worktree,
+                            recovery_git_common_dir=expected_common,
+                            recovery_base_commit=base,
+                            recovery_head_commit=expected_head,
+                            recovery_dirty_snapshot=expected_snapshot,
+                            recovery_dirty_fingerprint=expected_fingerprint,
+                        )
+
+                    self.assertEqual(raised.exception.code, expected_code)
 
     def test_recovery_allows_main_to_advance_from_recorded_base(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

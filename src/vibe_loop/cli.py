@@ -79,7 +79,15 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
 )
 from vibe_loop.locks import integration_lock_waitable
+from vibe_loop.orchestration import CandidateCollectionError, CandidateCollector
 from vibe_loop.runner import VibeRunner
+from vibe_loop.runtime_events import (
+    RuntimeEventAdapterError,
+    load_runtime_event_cursor,
+    poll_run_journal_event,
+    poll_runtime_event_command,
+    save_runtime_event_cursor,
+)
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
@@ -108,10 +116,12 @@ from vibe_loop.task_views import (
 )
 from vibe_loop.tasks import Task
 from vibe_loop.workers import (
+    ActiveRunState,
     StaleLock,
     WorkerView,
     WorkspaceClaimError,
     build_worker_views,
+    active_task_lock_for_claim,
     claim_worker_workspace,
     clean_stale_locks,
     collect_stale_locks,
@@ -483,6 +493,42 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="SECONDS",
         help="Maximum duration of one message-adapter poll (default: 5)",
     )
+    runtime_event_source = wait_helper.add_mutually_exclusive_group()
+    runtime_event_source.add_argument(
+        "--runtime-event-command",
+        default=None,
+        metavar="COMMAND",
+        help="Poll a trusted typed runtime-event adapter",
+    )
+    runtime_event_source.add_argument(
+        "--runtime-event-journal",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Poll actionable events from a vibe-loop run journal",
+    )
+    wait_helper.add_argument(
+        "--runtime-event-cursor",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Durable runtime-event checkpoint file",
+    )
+    wait_helper.add_argument(
+        "--runtime-event-project",
+        default="",
+        metavar="PROJECT",
+        help="Required project scope for runtime events",
+    )
+    wait_helper.add_argument("--runtime-event-run-id", default="", metavar="RUN_ID")
+    wait_helper.add_argument("--runtime-event-task-id", default="", metavar="TASK_ID")
+    wait_helper.add_argument(
+        "--runtime-event-timeout",
+        type=positive_float,
+        default=5.0,
+        metavar="SECONDS",
+        help="Maximum duration of one runtime-event adapter poll (default: 5)",
+    )
     wait_helper.add_argument("--mode", choices=("any", "all"), default="any")
     wait_helper.add_argument("--json", action="store_true")
 
@@ -504,6 +550,18 @@ def build_parser() -> argparse.ArgumentParser:
     claim_workspace.add_argument("--worktree", type=Path, required=True)
     claim_workspace.add_argument("--base-commit", default="")
     claim_workspace.add_argument("--fencing-token", default="")
+    candidate = worker_subparsers.add_parser(
+        "candidate",
+        help="Record a fenced candidate declaration for the claimed workspace",
+    )
+    add_repo_argument(candidate)
+    candidate.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    candidate.add_argument("--run-id", default="")
+    candidate.add_argument("--task-id", default="")
+    candidate.add_argument("--head", required=True)
+    candidate.add_argument("--base-main", default="")
+    candidate.add_argument("--changed-path", action="append", default=[])
+    candidate.add_argument("--fencing-token", default="")
     heartbeat = worker_subparsers.add_parser(
         "heartbeat",
         help="Refresh the heartbeat timestamp on an active task lock",
@@ -1528,6 +1586,32 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
     if args.session_ref is not None and args.message_command is None:
         print("--session-ref requires --message-command", file=sys.stderr)
         return 2
+    runtime_event_enabled = (
+        args.runtime_event_command is not None or args.runtime_event_journal is not None
+    )
+    if runtime_event_enabled and (
+        args.runtime_event_cursor is None or not args.runtime_event_project
+    ):
+        print(
+            "runtime-event polling requires --runtime-event-cursor and "
+            "--runtime-event-project",
+            file=sys.stderr,
+        )
+        return 2
+    if not runtime_event_enabled and any(
+        (
+            args.runtime_event_cursor is not None,
+            bool(args.runtime_event_project),
+            bool(args.runtime_event_run_id),
+            bool(args.runtime_event_task_id),
+        )
+    ):
+        print(
+            "runtime-event scope options require --runtime-event-command or "
+            "--runtime-event-journal",
+            file=sys.stderr,
+        )
+        return 2
     session_ref = ""
     message_poller = None
     if args.message_command is not None:
@@ -1547,6 +1631,46 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             )
 
         message_poller = poll_message
+    runtime_event_poller = None
+    if runtime_event_enabled:
+        assert args.runtime_event_cursor is not None
+        runtime_cursor: str | None = None
+
+        def poll_runtime_event() -> dict[str, object] | None:
+            nonlocal runtime_cursor
+            if runtime_cursor is None:
+                runtime_cursor = load_runtime_event_cursor(
+                    args.runtime_event_cursor,
+                    project=args.runtime_event_project,
+                )
+            if args.runtime_event_command is not None:
+                next_cursor, event = poll_runtime_event_command(
+                    args.runtime_event_command,
+                    cursor=runtime_cursor,
+                    project=args.runtime_event_project,
+                    run_id=args.runtime_event_run_id,
+                    task_id=args.runtime_event_task_id,
+                    timeout=args.runtime_event_timeout,
+                )
+            else:
+                assert args.runtime_event_journal is not None
+                next_cursor, event = poll_run_journal_event(
+                    args.runtime_event_journal,
+                    cursor=runtime_cursor,
+                    project=args.runtime_event_project,
+                    run_id=args.runtime_event_run_id,
+                    task_id=args.runtime_event_task_id,
+                )
+            if next_cursor != runtime_cursor:
+                save_runtime_event_cursor(
+                    args.runtime_event_cursor,
+                    project=args.runtime_event_project,
+                    cursor=next_cursor,
+                )
+                runtime_cursor = next_cursor
+            return event
+
+        runtime_event_poller = poll_runtime_event
     now = time.time()
     if args.deadline is not None:
         deadline_text = args.deadline
@@ -1570,12 +1694,23 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             mode=args.mode,
             interval=args.interval,
             message_poller=message_poller,
+            runtime_event_poller=runtime_event_poller,
             session_ref=session_ref,
         )
-    except WaitMessageAdapterError as exc:
+    except (WaitMessageAdapterError, RuntimeEventAdapterError) as exc:
+        runtime_error = isinstance(exc, RuntimeEventAdapterError)
         result = WaitResult(
             wake_reason="adapter_error",
-            events=({"kind": "message_adapter_error", "category": exc.category},),
+            events=(
+                {
+                    "kind": (
+                        "runtime_event_adapter_error"
+                        if runtime_error
+                        else "message_adapter_error"
+                    ),
+                    "category": exc.category,
+                },
+            ),
             deadline=deadline_text,
             session_ref=session_ref,
         )
@@ -1876,6 +2011,77 @@ def dispatch_worker(args: argparse.Namespace, config) -> int:
                 "worker workspace claimed "
                 f"task={task_id} run={run_id} branch={claim.branch} "
                 f"worktree={claim.worktree}"
+            )
+        return 0
+
+    if args.worker_command == "candidate":
+        run_id, task_id = worker_identity_from_args(args)
+        if not run_id or not task_id:
+            print(
+                "worker candidate requires --run-id and --task-id "
+                "or VIBE_LOOP_RUN_ID and VIBE_LOOP_TASK_ID",
+                file=sys.stderr,
+            )
+            return 2
+        fencing_token = fencing_token_from_args(args)
+        if not fencing_token:
+            print("worker candidate requires an active fencing token", file=sys.stderr)
+            return 2
+        require_project_binding(config)
+        manager = build_lock_manager(
+            config.repo,
+            config.state_path / "locks",
+            config.locks,
+            runtime_context=config.runtime_environment,
+        )
+        run_store = RunStore(config.state_path / "runs.jsonl")
+        try:
+            lock = active_task_lock_for_claim(
+                manager,
+                task_id=task_id,
+                run_id=run_id,
+                fencing_token=fencing_token,
+            )
+            active = ActiveRunState.from_lock_metadata(lock.metadata)
+            if active is None or active.workspace is None:
+                raise CandidateCollectionError(
+                    "candidate_workspace_missing",
+                    "candidate declaration requires a claimed workspace",
+                )
+            claim = active.workspace
+            collector = CandidateCollector(
+                worktree=claim.worktree,
+                branch=claim.branch,
+                base_main=claim.base_commit,
+                run_store=run_store,
+                run_id=run_id,
+                task_id=task_id,
+            )
+            recorded = collector.collect_declared(
+                head_commit=args.head,
+                base_main=args.base_main,
+                changed_paths=args.changed_path,
+            )
+        except (WorkspaceClaimError, CandidateCollectionError) as exc:
+            code = getattr(exc, "code", "candidate_rejected")
+            payload = {
+                "recorded": False,
+                "error": code,
+                "message": str(exc),
+                "details": getattr(exc, "details", {}),
+            }
+            if json_requested(args):
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"worker candidate refused: {code}: {exc}", file=sys.stderr)
+            return 1
+        payload = {"recorded": True, "candidate": recorded.to_payload()}
+        if json_requested(args):
+            print(json.dumps(payload, indent=2))
+        else:
+            print(
+                "worker candidate recorded "
+                f"task={task_id} run={run_id} head={recorded.head_commit}"
             )
         return 0
 
