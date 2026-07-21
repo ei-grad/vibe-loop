@@ -20,6 +20,7 @@ from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
     LIFECYCLE_STATES,
+    POST_REPORT_ACTIVITY_RECORD_TYPE,
     RUN_RECORD_TYPE,
     RUN_SCHEMA_VERSION,
     RUN_STARTED_RECORD_TYPE,
@@ -594,6 +595,59 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(event["worker_process_birth_id"], "boot-id:500")
         self.assertEqual(event["pid_source"], "popen")
         self.assertIn(WORKER_PROCESS_STARTED_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_post_report_activity_event_records_violation_and_teardown(
+        self,
+    ) -> None:
+        event = RunLifecycleEvent.post_report_activity(
+            run_id="run-1",
+            task_id="TASK-01",
+            activity_kind="tool_call",
+            activity_count=3,
+            post_report_seconds=42.5,
+            worker_pid=4321,
+            process_group_id=4321,
+            identity_verified=True,
+            terminated=True,
+            report_status="completed",
+        ).to_record()
+
+        self.assertEqual(event["record_type"], POST_REPORT_ACTIVITY_RECORD_TYPE)
+        self.assertEqual(event["policy"], "post_report_activity")
+        self.assertEqual(event["activity_kind"], "tool_call")
+        self.assertEqual(event["activity_count"], 3)
+        self.assertEqual(event["post_report_seconds"], 42.5)
+        self.assertEqual(event["worker_pid"], 4321)
+        self.assertEqual(event["worker_process_group_id"], 4321)
+        self.assertTrue(event["identity_verified"])
+        self.assertTrue(event["terminated"])
+        self.assertEqual(event["report_status"], "completed")
+        self.assertIn(POST_REPORT_ACTIVITY_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_post_report_activity_event_round_trips_through_store(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            store = RunStore(path)
+            store.append_lifecycle_event(
+                RunLifecycleEvent.post_report_activity(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    activity_kind="tool_call",
+                    activity_count=1,
+                    post_report_seconds=5.0,
+                    worker_pid=None,
+                    process_group_id=None,
+                    identity_verified=False,
+                    terminated=False,
+                    report_status="completed",
+                )
+            )
+            records = store.read_records()
+
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["record_type"], POST_REPORT_ACTIVITY_RECORD_TYPE)
+        self.assertIsNone(records[0]["worker_pid"])
+        self.assertFalse(records[0]["terminated"])
 
     def test_lifecycle_event_rejects_unknown_type(self) -> None:
         with self.assertRaises(ValueError):

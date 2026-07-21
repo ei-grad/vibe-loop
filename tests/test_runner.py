@@ -45,6 +45,7 @@ from vibe_loop.runner import (
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     AgentLimitWallError,
     AgentRuntimeContext,
+    PostReportActivityMonitor,
     SchedulerLockBusy,
     TaskActivationError,
     VibeRunner,
@@ -62,6 +63,7 @@ from vibe_loop.runner import (
     deterministic_task_batch,
     format_agent_command,
     build_resume_continuation_prompt,
+    classify_post_report_activity,
     inject_claude_resume,
     inject_claude_session_id,
     inject_structured_usage_output,
@@ -987,6 +989,31 @@ class RunnerTests(unittest.TestCase):
                 "TASK-01", 7, "aaa", "aaa", "", None, timed_out=False
             )
             self.assertEqual(result.status, "failed")
+
+    def test_enforced_post_report_teardown_keeps_accepted_report_status(
+        self,
+    ) -> None:
+        # A worker whose process group was stopped for post-report activity
+        # exits on a signal (nonzero exit code) but was not timed out. The
+        # accepted terminal report must stay authoritative so the run finalizes
+        # completed and is never turned into a retry by the teardown.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            result = runner.classify(
+                "TASK-01",
+                -15,
+                "aaa",
+                "aaa",
+                "",
+                WorkerReport(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    status="completed",
+                ),
+                timed_out=False,
+            )
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.source, "worker_report")
 
     def test_classify_falls_through_to_unknown_on_probe_failure(self) -> None:
         # A command-backed probe can fail to shell out, exit nonzero, or hang
@@ -4641,6 +4668,325 @@ class FakeMonotonicClock:
         if self._values:
             self._last = self._values.pop(0)
         return self._last
+
+
+class ClassifyPostReportActivityTests(unittest.TestCase):
+    def test_claude_tool_use_block_is_tool_call(self) -> None:
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "summary"},
+                        {"type": "tool_use", "name": "Bash", "input": {}},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(classify_post_report_activity(line), "tool_call")
+
+    def test_claude_text_only_assistant_is_benign(self) -> None:
+        line = json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "final summary"}]},
+            }
+        )
+        self.assertEqual(classify_post_report_activity(line), "")
+
+    def test_claude_result_event_is_benign(self) -> None:
+        line = json.dumps({"type": "result", "subtype": "success", "usage": {}})
+        self.assertEqual(classify_post_report_activity(line), "")
+
+    def test_claude_tool_result_user_turn_is_tool_result(self) -> None:
+        line = json.dumps(
+            {
+                "type": "user",
+                "message": {"content": [{"type": "tool_result", "tool_use_id": "x"}]},
+            }
+        )
+        self.assertEqual(classify_post_report_activity(line), "tool_result")
+
+    def test_codex_function_call_event_is_tool_call(self) -> None:
+        line = json.dumps({"type": "function_call", "name": "shell"})
+        self.assertEqual(classify_post_report_activity(line), "tool_call")
+
+    def test_codex_item_completed_command_is_tool_call(self) -> None:
+        line = json.dumps(
+            {"type": "item.completed", "item": {"type": "command_execution"}}
+        )
+        self.assertEqual(classify_post_report_activity(line), "tool_call")
+
+    def test_codex_agent_message_and_token_count_are_benign(self) -> None:
+        for payload in (
+            {"type": "item.completed", "item": {"type": "agent_message"}},
+            {"type": "token_count", "info": {}},
+            {"type": "turn.completed", "usage": {}},
+        ):
+            self.assertEqual(classify_post_report_activity(json.dumps(payload)), "")
+
+    def test_non_json_and_prose_are_benign(self) -> None:
+        self.assertEqual(classify_post_report_activity("just some prose\n"), "")
+        self.assertEqual(classify_post_report_activity("{not json"), "")
+
+
+class PostReportActivityMonitorTests(unittest.TestCase):
+    def _tool_line(self) -> str:
+        return json.dumps(
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": "Bash"}]},
+            }
+        )
+
+    def test_monitor_is_inert_before_report(self) -> None:
+        monitor = PostReportActivityMonitor("anthropic")
+        monitor.observe_line(self._tool_line())
+        self.assertFalse(monitor.reported)
+        self.assertFalse(monitor.violation)
+        snapshot = monitor.snapshot()
+        self.assertFalse(snapshot.reported)
+
+    def test_text_summary_after_report_is_not_a_violation(self) -> None:
+        clock = FakeMonotonicClock([10.0, 12.5])
+        monitor = PostReportActivityMonitor("anthropic", monotonic=clock)
+        monitor.mark_report_observed()
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "bye"}]},
+                }
+            )
+        )
+        self.assertTrue(monitor.reported)
+        self.assertFalse(monitor.violation)
+        snapshot = monitor.snapshot()
+        self.assertEqual(snapshot.activity_kind, "")
+        self.assertEqual(snapshot.seconds, 2.5)
+
+    def test_tool_activity_after_report_is_a_violation(self) -> None:
+        monitor = PostReportActivityMonitor("anthropic")
+        monitor.mark_report_observed()
+        monitor.observe_line(self._tool_line())
+        monitor.observe_line(self._tool_line())
+        self.assertTrue(monitor.violation)
+        snapshot = monitor.snapshot(enforced_stop=True, identity_verified=True)
+        self.assertEqual(snapshot.activity_kind, "tool_call")
+        self.assertEqual(snapshot.activity_count, 2)
+        self.assertTrue(snapshot.enforced_stop)
+        self.assertTrue(snapshot.identity_verified)
+
+    def test_post_report_usage_accrues_only_after_report(self) -> None:
+        monitor = PostReportActivityMonitor("anthropic")
+        pre = json.dumps(
+            {"type": "result", "usage": {"input_tokens": 5, "output_tokens": 1}}
+        )
+        monitor.observe_line(pre)
+        self.assertFalse(monitor.snapshot().usage.available)
+        monitor.mark_report_observed()
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 435000, "output_tokens": 900},
+                }
+            )
+        )
+        usage = monitor.snapshot().usage
+        self.assertTrue(usage.available)
+        self.assertEqual(usage.values["input_tokens"], 435000)
+
+
+class FakePostReportMonitor:
+    """Watchdog-facing stand-in whose violation state is deterministic."""
+
+    def __init__(self, *, violates: bool):
+        self._violates = violates
+        self.mark_calls: list[float | None] = []
+
+    def mark_report_observed(self, at: float | None = None) -> None:
+        self.mark_calls.append(at)
+
+    @property
+    def violation(self) -> bool:
+        # Only meaningful once the boundary is marked, mirroring the real
+        # monitor which is inert until then.
+        return bool(self.mark_calls) and self._violates
+
+
+class PostReportWatchdogTests(unittest.TestCase):
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_post_report_activity_stops_verified_group_without_timeout(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        monitor = FakePostReportMonitor(violates=True)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                post_report_monitor=monitor,
+                identity_ok=lambda: True,
+                post_report_activity_grace_seconds=0.0,
+            )
+        self.assertTrue(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(killed)
+        self.assertEqual(killed[0], (proc.pid, signal.SIGTERM))
+        self.assertTrue(monitor.mark_calls)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_post_report_activity_with_identity_mismatch_never_signals(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        monitor = FakePostReportMonitor(violates=True)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                post_report_monitor=monitor,
+                identity_ok=lambda: False,
+                post_report_activity_grace_seconds=0.0,
+            )
+        self.assertEqual(killed, [])
+        self.assertFalse(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_text_only_summary_within_grace_is_not_killed(self):
+        proc = FakeWatchdogProcess(alive_polls=2)
+        monitor = FakePostReportMonitor(violates=False)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                post_report_monitor=monitor,
+                identity_ok=lambda: True,
+                post_report_activity_grace_seconds=0.0,
+            )
+        self.assertEqual(killed, [])
+        self.assertFalse(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_hang_reap_respects_identity_guard(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=0.0,
+                poll_seconds=0.001,
+                identity_ok=lambda: False,
+            )
+        self.assertEqual(killed, [])
+        self.assertFalse(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+
+
+class RunStreamingPostReportTests(unittest.TestCase):
+    def _run(self, body: str, **kwargs):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(body, encoding="utf-8")
+            log_path = Path(directory) / "run.log"
+            stderr = StringIO()
+            with log_path.open("w", encoding="utf-8") as log:
+                with redirect_stderr(stderr):
+                    result = run_streaming_command(
+                        f"{sys.executable} cmd.py",
+                        Path(directory),
+                        log,
+                        **kwargs,
+                    )
+        return result
+
+    def test_worker_that_exits_immediately_after_report_is_unchanged(self):
+        result = self._run(
+            "import json\n"
+            "print(json.dumps({'type': 'result', 'subtype': 'success'}))\n",
+            reap_check=lambda: True,
+            reap_grace_seconds=60.0,
+            reap_poll_seconds=0.02,
+            provider="anthropic",
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.post_report is None or not result.post_report.violation)
+
+    def test_text_only_summary_after_report_finalizes_without_violation(self):
+        result = self._run(
+            "import json, time\n"
+            "print(json.dumps({'type': 'assistant', 'message': {'content': "
+            "[{'type': 'text', 'text': 'done'}]}}), flush=True)\n"
+            "time.sleep(0.2)\n",
+            reap_check=lambda: True,
+            reap_grace_seconds=60.0,
+            reap_poll_seconds=0.02,
+            provider="anthropic",
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+        self.assertIsNotNone(result.post_report)
+        self.assertTrue(result.post_report.reported)
+        self.assertFalse(result.post_report.violation)
+        self.assertFalse(result.post_report.enforced_stop)
+
+    def test_post_report_tool_activity_stops_the_worker(self):
+        pids: list[int] = []
+        result = self._run(
+            "import json, sys, time\n"
+            "line = json.dumps({'type': 'assistant', 'message': {'content': "
+            "[{'type': 'tool_use', 'name': 'Bash'}]}})\n"
+            "for _ in range(100000):\n"
+            "    sys.stdout.write(line + '\\n')\n"
+            "    sys.stdout.flush()\n"
+            "    time.sleep(0.02)\n",
+            on_start=pids.append,
+            reap_check=lambda: True,
+            reap_grace_seconds=60.0,
+            reap_poll_seconds=0.02,
+            post_report_activity_grace_seconds=0.0,
+            provider="anthropic",
+        )
+        self.assertFalse(result.timed_out)
+        self.assertIsNotNone(result.post_report)
+        self.assertTrue(result.post_report.violation)
+        self.assertEqual(result.post_report.activity_kind, "tool_call")
+        self.assertTrue(result.post_report.enforced_stop)
+        self.assertNotEqual(result.exit_code, 0)
+        # The call returns only after the worker is reaped, so no next-task
+        # dispatch can overlap an unfinalized process.
+        self.assertTrue(pids)
+        self.assertIsNone(read_process_node(pids[0]))
 
 
 def write_analysis_stub(path: Path, *, stdout: str = "", exit_code: int = 0) -> None:

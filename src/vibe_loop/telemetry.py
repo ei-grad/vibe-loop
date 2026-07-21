@@ -68,6 +68,9 @@ NATIVE_MODEL_LABEL_RE = re.compile(
     r"|o[1-9](?:-(?:max|mini|pro|[0-9]{8})){0,3})"
 )
 ATTRIBUTION_DIAGNOSTIC_LIMIT = 16
+# Structured activity a worker may perform after its accepted terminal report.
+# A bounded text-only summary is not activity and carries no kind.
+POST_REPORT_ACTIVITY_KINDS = frozenset({"tool_call", "tool_result", "child_process"})
 USAGE_SOURCES = frozenset(
     {
         "unavailable",
@@ -349,6 +352,7 @@ class ProviderUsage:
         flexible_provider: bool = False,
         changed_lines: int | None = None,
         work_kind: str = "",
+        post_report: Mapping[str, object] | None = None,
     ) -> dict[str, object]:
         stats: dict[str, object] = {
             "schema_version": USAGE_SCHEMA_VERSION,
@@ -392,7 +396,37 @@ class ProviderUsage:
             stats["changed_lines"] = changed_lines
         if work_kind in WORK_KINDS:
             stats["work_kind"] = work_kind
+        post_report_stats = _sanitize_post_report_stats(post_report)
+        if post_report_stats:
+            stats["post_report"] = post_report_stats
         return stats
+
+
+def _sanitize_post_report_stats(value: object) -> dict[str, object]:
+    """Whitelist the post-report teardown breakdown attached to run stats.
+
+    Kept separate from the primary usage so quota diagnostics can subtract the
+    teardown burn a worker accrued after its accepted terminal report from the
+    useful implementation/review spend.
+    """
+    if not isinstance(value, Mapping):
+        return {}
+    result: dict[str, object] = {}
+    duration = _number(value.get("duration_seconds"))
+    if duration is not None and duration >= 0:
+        result["duration_seconds"] = duration
+    if isinstance(value.get("enforced_stop"), bool):
+        result["enforced_stop"] = value["enforced_stop"]
+    activity_kind = value.get("activity_kind")
+    if isinstance(activity_kind, str) and activity_kind in POST_REPORT_ACTIVITY_KINDS:
+        result["activity_kind"] = activity_kind
+    activity_count = _integer(value.get("activity_count"))
+    if activity_count is not None and activity_count >= 0:
+        result["activity_count"] = activity_count
+    usage = _numeric_mapping(value.get("usage"))
+    if usage:
+        result["usage"] = usage
+    return result
 
 
 def unavailable_usage(provider: str, reason: str) -> ProviderUsage:
@@ -446,6 +480,9 @@ def sanitize_run_stats(value: object) -> dict[str, object]:
     provider_usage = _numeric_mapping(value.get("provider_usage"))
     if provider_usage:
         result["provider_usage"] = provider_usage
+    post_report = _sanitize_post_report_stats(value.get("post_report"))
+    if post_report:
+        result["post_report"] = post_report
     quota_reason = value.get("quota_unavailable_reason")
     snapshots = _sanitize_quota_snapshots(value.get("quota_snapshots"))
     if snapshots:

@@ -537,6 +537,9 @@ class StreamingCommandResult:
             "unknown", "provider_usage_not_reported"
         )
     )
+    # Post-report teardown accounting, present only when a terminal report was
+    # observed during the stream. None means the worker never reported.
+    post_report: PostReportActivity | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -665,6 +668,222 @@ class AgentOutputObserver:
                 session_id=delta_session_id,
                 session_id_source=delta_session_id_source,
                 runtime_context=delta_context,
+            )
+
+
+# Claude stream-json content blocks that represent structured tool activity
+# rather than a text summary.
+CLAUDE_TOOL_CONTENT_TYPES = frozenset({"tool_use", "server_tool_use"})
+CLAUDE_TOOL_RESULT_CONTENT_TYPES = frozenset({"tool_result", "web_search_tool_result"})
+# Codex JSON top-level events that carry a tool/command/file-mutation call.
+CODEX_TOOL_EVENT_TYPES = frozenset(
+    {
+        "function_call",
+        "local_shell_call",
+        "custom_tool_call",
+        "mcp_tool_call",
+        "exec_command_begin",
+        "exec_command_end",
+        "exec_command_output_delta",
+        "command_execution",
+        "patch_apply_begin",
+        "patch_apply_end",
+        "apply_patch",
+        "web_search_call",
+        "file_change",
+    }
+)
+# Codex ``item.*`` envelope item types that wrap a tool/command/file mutation.
+CODEX_TOOL_ITEM_TYPES = frozenset(
+    {
+        "function_call",
+        "local_shell_call",
+        "custom_tool_call",
+        "mcp_tool_call",
+        "command_execution",
+        "file_change",
+        "patch_apply",
+        "web_search",
+    }
+)
+CODEX_ITEM_ENVELOPE_TYPES = frozenset(
+    {
+        "item.started",
+        "item.updated",
+        "item.completed",
+        "response.output_item.added",
+        "response.output_item.done",
+    }
+)
+
+
+def _content_blocks_have_type(content: object, kinds: frozenset[str]) -> bool:
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, Mapping) and block.get("type") in kinds for block in content
+    )
+
+
+def _classify_claude_post_report_activity(payload: Mapping[str, object]) -> str:
+    event_type = payload.get("type")
+    message = payload.get("message")
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if event_type == "assistant" and _content_blocks_have_type(
+        content, CLAUDE_TOOL_CONTENT_TYPES
+    ):
+        return "tool_call"
+    if event_type == "user" and _content_blocks_have_type(
+        content, CLAUDE_TOOL_RESULT_CONTENT_TYPES
+    ):
+        return "tool_result"
+    return ""
+
+
+def _classify_codex_post_report_activity(payload: Mapping[str, object]) -> str:
+    event = payload
+    nested = payload.get("payload")
+    if isinstance(nested, Mapping):
+        event = nested
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return ""
+    if event_type in CODEX_TOOL_EVENT_TYPES:
+        return "tool_call"
+    if event_type in CODEX_ITEM_ENVELOPE_TYPES:
+        item = event.get("item")
+        item_type = item.get("type") if isinstance(item, Mapping) else None
+        if isinstance(item_type, str) and item_type in CODEX_TOOL_ITEM_TYPES:
+            return "tool_call"
+    return ""
+
+
+def classify_post_report_activity(line: str) -> str:
+    """Classify a worker stream line emitted after its terminal report.
+
+    Returns a non-empty activity kind (``tool_call``/``tool_result``) when the
+    line is structured tool/command/file activity in either the Claude
+    stream-json or Codex JSON dialect, and ``""`` for a bounded text-only
+    summary, usage/session events, or anything unparseable. Detection is by
+    event shape, not substring, so a summary that merely mentions a tool name is
+    not flagged.
+    """
+    text = line.strip()
+    if text.startswith("data:"):
+        text = text.removeprefix("data:").strip()
+    if not text.startswith("{"):
+        return ""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    return _classify_claude_post_report_activity(
+        payload
+    ) or _classify_codex_post_report_activity(payload)
+
+
+@dataclasses.dataclass(frozen=True)
+class PostReportActivity:
+    """Post-report teardown accounting for a single worker run.
+
+    ``reported`` is False when the worker never filed a terminal report, in
+    which case the boundary never applied. ``activity_kind`` is empty for a
+    clean text-only summary; a non-empty kind is a ``post_report_activity``
+    policy violation.
+    """
+
+    reported: bool
+    seconds: float
+    activity_kind: str
+    activity_count: int
+    enforced_stop: bool
+    identity_verified: bool
+    usage: ProviderUsage
+
+    @property
+    def violation(self) -> bool:
+        return bool(self.activity_kind)
+
+
+class PostReportActivityMonitor:
+    """Attributes a worker's post-terminal-report stream output.
+
+    The monitor is inert until ``mark_report_observed`` fires. From that point
+    every stream line is post-report teardown: its provider usage accrues
+    separately so quota diagnostics can distinguish teardown burn from useful
+    implementation/review, and any structured tool/child activity is recorded as
+    a policy violation. Thread-safe: stream threads call ``observe_line`` while
+    the supervision watchdog marks the boundary and reads ``violation``.
+    """
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._provider = provider
+        self._monotonic = monotonic
+        self._lock = threading.Lock()
+        self._reported_at: float | None = None
+        self._usage_observer = ProviderUsageObserver(provider)
+        self._activity_kind = ""
+        self._activity_count = 0
+
+    def mark_report_observed(self, at: float | None = None) -> None:
+        with self._lock:
+            if self._reported_at is None:
+                self._reported_at = at if at is not None else self._monotonic()
+
+    @property
+    def reported(self) -> bool:
+        with self._lock:
+            return self._reported_at is not None
+
+    def observe_line(self, line: str) -> None:
+        with self._lock:
+            active = self._reported_at is not None
+        if not active:
+            return
+        # The usage observer holds its own lock; call it outside the monitor
+        # lock to keep a single, consistent lock order.
+        self._usage_observer.observe_line(line)
+        kind = classify_post_report_activity(line)
+        if not kind:
+            return
+        with self._lock:
+            self._activity_count += 1
+            if not self._activity_kind:
+                self._activity_kind = kind
+
+    @property
+    def violation(self) -> bool:
+        with self._lock:
+            return bool(self._activity_kind)
+
+    def snapshot(
+        self,
+        *,
+        enforced_stop: bool = False,
+        identity_verified: bool = False,
+        until: float | None = None,
+    ) -> PostReportActivity:
+        with self._lock:
+            reported = self._reported_at is not None
+            seconds = 0.0
+            if reported:
+                end = until if until is not None else self._monotonic()
+                seconds = max(0.0, end - self._reported_at)
+            return PostReportActivity(
+                reported=reported,
+                seconds=seconds,
+                activity_kind=self._activity_kind,
+                activity_count=self._activity_count,
+                enforced_stop=enforced_stop,
+                identity_verified=identity_verified,
+                usage=self._usage_observer.usage,
             )
 
 
@@ -1186,6 +1405,8 @@ class VibeRunner:
         agent_skill_ref_prefix = agent.skill_ref_prefix or ""
         agent_skill_ref_prefix_source = agent.skill_ref_prefix_source
         worker_report: WorkerReport | None = None
+        worker_pid_value: int | None = None
+        worker_process_group_id: int | None = None
         worker_timed_out = False
         # Defaults hold for any exit that never reaches a durable RunResult - an
         # interrupted supervisor, a crash, a pre-classification error, a failed
@@ -1575,11 +1796,16 @@ class VibeRunner:
 
                 def record_worker_pid(worker_pid: int) -> None:
                     nonlocal active_state
+                    nonlocal worker_pid_value, worker_process_group_id
                     # Captured immediately after Popen, while the worker is
                     # still the process this supervisor started: after it
                     # execs its own session leader and reparents, the PID
                     # alone can no longer prove which process is ours.
                     identity = read_process_node(worker_pid)
+                    worker_pid_value = worker_pid
+                    worker_process_group_id = (
+                        identity.process_group_id if identity else None
+                    )
                     active_state = active_state.with_worker_pid(
                         worker_pid,
                         process_group_id=(
@@ -1772,6 +1998,37 @@ class VibeRunner:
                         )
                 elif exit_code == 0:
                     message = self.run_completion_checks(log)
+                post_report_activity = stream_result.post_report
+                if post_report_activity is not None and post_report_activity.violation:
+                    report_status(
+                        f"post-report policy violation for {task.task_id}: "
+                        f"worker emitted {post_report_activity.activity_kind} "
+                        f"{post_report_activity.activity_count}x over "
+                        f"{post_report_activity.seconds:.1f}s after its terminal "
+                        "report; process-group teardown "
+                        + (
+                            "enforced"
+                            if post_report_activity.enforced_stop
+                            else "skipped (worker already exited)"
+                        ),
+                        log,
+                    )
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.post_report_activity(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            activity_kind=post_report_activity.activity_kind,
+                            activity_count=post_report_activity.activity_count,
+                            post_report_seconds=post_report_activity.seconds,
+                            worker_pid=worker_pid_value,
+                            process_group_id=worker_process_group_id,
+                            identity_verified=post_report_activity.identity_verified,
+                            terminated=post_report_activity.enforced_stop,
+                            report_status=(
+                                worker_report.status if worker_report else ""
+                            ),
+                        )
+                    )
             end_main = git_rev_parse(self.config.repo, "HEAD")
             try:
                 output_tail = _read_log_tail(
@@ -1828,6 +2085,21 @@ class VibeRunner:
                 RunStage.FINALIZATION,
                 reason="run_result_recording",
             )
+            post_report_stats: dict[str, object] | None = None
+            if (
+                stream_result.post_report is not None
+                and stream_result.post_report.reported
+            ):
+                pr = stream_result.post_report
+                post_report_stats = {
+                    "duration_seconds": pr.seconds,
+                    "enforced_stop": pr.enforced_stop,
+                    "activity_count": pr.activity_count,
+                }
+                if pr.activity_kind:
+                    post_report_stats["activity_kind"] = pr.activity_kind
+                if pr.usage.available:
+                    post_report_stats["usage"] = dict(pr.usage.raw)
             result = RunResult(
                 run_id=run_id,
                 task_id=task.task_id,
@@ -1891,6 +2163,7 @@ class VibeRunner:
                         self.config.repo, start_main, end_main
                     ),
                     work_kind=usage_work_kind,
+                    post_report=post_report_stats,
                 ),
             )
             self.record_result(result)
@@ -5230,6 +5503,11 @@ class WaitOutcome:
     exit_code: int
     # True when the wall-clock deadline fired and the process group was killed.
     timed_out: bool = False
+    # True when the worker's verified process group was stopped because it kept
+    # performing structured activity after filing its terminal report. Distinct
+    # from timed_out so the accepted report stays authoritative for
+    # classification and the run is never turned into a retry.
+    post_report_enforced: bool = False
 
 
 def wait_with_reap_watchdog(
@@ -5241,10 +5519,13 @@ def wait_with_reap_watchdog(
     poll_seconds: float,
     timeout_seconds: float | None = None,
     monotonic: Callable[[], float] = time.monotonic,
+    post_report_monitor: PostReportActivityMonitor | None = None,
+    identity_ok: Callable[[], bool] | None = None,
+    post_report_activity_grace_seconds: float = 0.0,
 ) -> WaitOutcome:
-    """Wait for a worker, reaping it if it hangs.
+    """Wait for a worker, reaping it if it hangs or overruns its report.
 
-    Two independent reap conditions apply:
+    Three independent reap conditions apply:
 
     * Wall-clock deadline (``timeout_seconds``): an absolute upper bound on the
       run regardless of whether the worker ever filed a report. When it fires
@@ -5256,7 +5537,19 @@ def wait_with_reap_watchdog(
       True (e.g. the worker filed a terminal report, so it intends to exit) a
       grace timer starts; if the process is still alive ``grace_seconds`` later
       its process group is terminated. A worker that exits on its own within
-      grace is never force-killed.
+      grace, including one that emits a bounded text-only summary, is never
+      force-killed.
+    * Post-report activity (``post_report_monitor``): once the report is
+      observed, the monitor watches the stream for structured tool/child
+      activity. If any appears, the worker's verified process group is stopped
+      after ``post_report_activity_grace_seconds`` with ``post_report_enforced``
+      set. This bounds the quota a worker burns by continuing to act past its
+      accepted terminal report while leaving that report authoritative.
+
+    ``identity_ok`` gates every signal: it must confirm the live PID is still the
+    worker this supervisor launched (by process-birth ID) before the group is
+    touched, so a recycled PID's unrelated group is never signalled. When it is
+    ``None`` the historical unconditional reap is preserved.
 
     ``monotonic`` is injectable so tests can drive the deadline with a fake
     clock instead of a real wall-clock sleep.
@@ -5267,6 +5560,16 @@ def wait_with_reap_watchdog(
     if reap_check is None and deadline is None:
         return WaitOutcome(process.wait())
 
+    def _identity_permits_signal() -> bool:
+        if identity_ok is None:
+            return True
+        try:
+            return identity_ok()
+        # An unreadable identity is not proof the group is ours: fail closed and
+        # do not signal rather than risk an unrelated process group.
+        except Exception:
+            return False
+
     def _reap_for_timeout() -> WaitOutcome:
         report_status(
             f"worker pid={process.pid} exceeded its "
@@ -5274,10 +5577,13 @@ def wait_with_reap_watchdog(
             "group so the task returns to runnable and the batch proceeds",
             log,
         )
-        terminate_worker_process_group(process, log)
+        if _identity_permits_signal():
+            terminate_worker_process_group(process, log)
         return WaitOutcome(process.wait(), timed_out=True)
 
     reap_eligible_since: float | None = None
+    activity_eligible_since: float | None = None
+    report_marked = False
     while True:
         wait_for = poll_seconds
         if deadline is not None:
@@ -5291,14 +5597,44 @@ def wait_with_reap_watchdog(
             pass
         if deadline is not None and monotonic() - deadline >= 0:
             return _reap_for_timeout()
-        if reap_check is None:
-            continue
-        try:
-            eligible = reap_check()
-        # The watchdog must never crash the wait: a flaky report read should
-        # leave the worker running, not abort supervision.
-        except Exception:
-            eligible = False
+        eligible = False
+        if reap_check is not None:
+            try:
+                eligible = reap_check()
+            # The watchdog must never crash the wait: a flaky report read should
+            # leave the worker running, not abort supervision.
+            except Exception:
+                eligible = False
+        if eligible and not report_marked:
+            report_marked = True
+            if post_report_monitor is not None:
+                post_report_monitor.mark_report_observed(monotonic())
+        if (
+            post_report_monitor is not None
+            and report_marked
+            and post_report_monitor.violation
+        ):
+            now = monotonic()
+            if activity_eligible_since is None:
+                activity_eligible_since = now
+            if now - activity_eligible_since >= post_report_activity_grace_seconds:
+                report_status(
+                    f"worker pid={process.pid} performed structured activity "
+                    "after filing its terminal report; stopping its verified "
+                    "process group to bound post-report quota burn",
+                    log,
+                )
+                if _identity_permits_signal():
+                    terminate_worker_process_group(process, log)
+                    return WaitOutcome(process.wait(), post_report_enforced=True)
+                # The live PID is no longer our worker (it exited on its own);
+                # the accepted report stands and no group is signalled.
+                report_status(
+                    f"worker pid={process.pid} no longer matches its recorded "
+                    "process identity; not signalling",
+                    log,
+                )
+                return WaitOutcome(process.wait())
         if not eligible:
             continue
         now = monotonic()
@@ -5312,7 +5648,8 @@ def wait_with_reap_watchdog(
                 "reaping process group to release its slot",
                 log,
             )
-            terminate_worker_process_group(process, log)
+            if _identity_permits_signal():
+                terminate_worker_process_group(process, log)
             return WaitOutcome(process.wait())
 
 
@@ -5328,6 +5665,7 @@ def run_streaming_command(
     reap_check: Callable[[], bool] | None = None,
     reap_grace_seconds: float = 120.0,
     reap_poll_seconds: float = 10.0,
+    post_report_activity_grace_seconds: float = 0.0,
     timeout_seconds: float | None = None,
     provider: str = "unknown",
 ) -> StreamingCommandResult:
@@ -5387,9 +5725,24 @@ def run_streaming_command(
         raise
     assert process.stdout is not None
     assert process.stderr is not None
+    # Captured immediately after Popen while the PID is still ours, so a later
+    # signal can confirm the live PID is the same process by its birth ID rather
+    # than trusting a possibly-recycled PID.
+    expected_node = read_process_node(process.pid)
+    expected_birth_id = expected_node.process_birth_id if expected_node else ""
+
+    def identity_ok() -> bool:
+        # Non-Linux (or an unreadable birth ID) cannot prove a mismatch, so
+        # preserve the historical unconditional reap.
+        if not expected_birth_id:
+            return True
+        node = read_process_node(process.pid)
+        return node is not None and node.process_birth_id == expected_birth_id
+
     log_lock = threading.Lock()
     fencing_token = fencing_token_value((env or {}).get("VIBE_LOOP_FENCING_TOKEN"))
     output_observer = AgentOutputObserver(provider)
+    post_report_monitor = PostReportActivityMonitor(provider)
     stdout_thread = threading.Thread(
         target=stream_pipe,
         args=(
@@ -5401,6 +5754,7 @@ def run_streaming_command(
             "stdout",
             on_observation,
             fencing_token,
+            post_report_monitor,
         ),
     )
     stderr_thread = threading.Thread(
@@ -5414,6 +5768,7 @@ def run_streaming_command(
             "stderr",
             on_observation,
             fencing_token,
+            post_report_monitor,
         ),
     )
     stdout_thread.start()
@@ -5425,10 +5780,17 @@ def run_streaming_command(
         grace_seconds=reap_grace_seconds,
         poll_seconds=reap_poll_seconds,
         timeout_seconds=timeout_seconds,
+        post_report_monitor=post_report_monitor,
+        identity_ok=identity_ok,
+        post_report_activity_grace_seconds=post_report_activity_grace_seconds,
     )
     stdout_thread.join()
     stderr_thread.join()
     observation = output_observer.observation
+    post_report = post_report_monitor.snapshot(
+        enforced_stop=wait_outcome.post_report_enforced,
+        identity_verified=wait_outcome.post_report_enforced and bool(expected_birth_id),
+    )
     return StreamingCommandResult(
         exit_code=wait_outcome.exit_code,
         session_id=observation.session_id,
@@ -5436,6 +5798,7 @@ def run_streaming_command(
         runtime_context=observation.runtime_context,
         timed_out=wait_outcome.timed_out,
         usage=output_observer.usage,
+        post_report=post_report if post_report.reported else None,
     )
 
 
@@ -5471,6 +5834,7 @@ def stream_pipe(
     stream_name: str,
     on_observation: Callable[[AgentRuntimeObservation], None] | None = None,
     fencing_token: str = "",
+    post_report_monitor: PostReportActivityMonitor | None = None,
 ) -> None:
     try:
         for line in pipe:
@@ -5478,6 +5842,8 @@ def stream_pipe(
             observation = output_observer.observe_line(redacted_line, stream_name)
             if observation is not None and on_observation is not None:
                 on_observation(observation)
+            if post_report_monitor is not None:
+                post_report_monitor.observe_line(redacted_line)
             if forward:
                 sys.stderr.write(redacted_line)
                 sys.stderr.flush()

@@ -43,6 +43,7 @@ LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
 RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
+POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
@@ -94,6 +95,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         RUN_STARTED_RECORD_TYPE,
         RUN_CONTRACT_RESOLVED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
+        POST_REPORT_ACTIVITY_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
         WORKSPACE_CLAIM_RECORD_TYPE,
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
@@ -572,6 +574,43 @@ class RunLifecycleEvent:
                 "pid_source": "popen",
                 "pid_scope": "configured_command_process",
                 "host": host,
+            },
+        )
+
+    @classmethod
+    def post_report_activity(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        activity_kind: str,
+        activity_count: int,
+        post_report_seconds: float,
+        worker_pid: int | None,
+        process_group_id: int | None,
+        identity_verified: bool,
+        terminated: bool,
+        report_status: str,
+    ) -> RunLifecycleEvent:
+        # A worker that keeps mutating state after its accepted terminal report
+        # violates the finite-worker boundary and burns quota; this record makes
+        # that violation and the conservative process-group teardown auditable
+        # while leaving the already accepted report authoritative.
+        return cls(
+            record_type=POST_REPORT_ACTIVITY_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "task_id": task_id,
+                "policy": "post_report_activity",
+                "activity_kind": activity_kind,
+                "activity_count": activity_count,
+                "post_report_seconds": post_report_seconds,
+                "worker_pid": worker_pid,
+                "worker_process_group_id": process_group_id,
+                "identity_verified": identity_verified,
+                "terminated": terminated,
+                "report_status": report_status,
             },
         )
 

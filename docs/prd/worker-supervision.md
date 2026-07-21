@@ -25,6 +25,23 @@ subagent, gate, build, test, or other operation remains in flight. It must await
 or collect those results and finish review, integration, and reporting, or emit
 an explicit `blocked` or `failed` report.
 
+An accepted terminal worker report is also the end of mutable worker activity.
+After the supervisor observes the report the worker may only emit a bounded
+text-only final summary and tear down; structured tool calls, child-process
+launches, filesystem or task mutations, review launches, and unbounded reasoning
+past that boundary are a policy violation. On observing such activity the
+supervisor records a `post_report_activity` lifecycle event and conservatively
+stops the exact worker process group after verifying, by process-birth ID, that
+the live PID is still the worker it launched — never by broad process killing,
+and never touching a recycled or unrelated group. The already accepted report
+stays authoritative: enforced teardown neither downgrades a completed result to
+unknown nor creates a retry, and finalization/next-task dispatch still waits for
+the worker process to exit. Post-report elapsed time and attributable provider
+usage are recorded separately from the useful implementation/review spend so
+quota diagnostics can isolate teardown burn. The wrapper stays compatible with
+Codex JSON and Claude stream-json, including a worker that exits immediately
+after reporting and one that emits a short final text summary.
+
 Related implementation IDs: `PAR-01`, `PAR-03`, `PAR-05`.
 
 ## PRD-WRK-002 Task Locks And Run Records
@@ -192,7 +209,10 @@ Related implementation IDs: `PAR-09`, `PAR-11`, `EVAL-09`.
 `runs.jsonl` should support additional record types beyond `run_result` and
 `worker_report`. New types include lock events (acquired, released, expired),
 run start snapshots, observed agent runtime context, workspace events (claimed,
-mismatch detected), and run state transitions (session observed, classified).
+mismatch detected), run state transitions (session observed, classified), and
+`post_report_activity` policy violations (structured worker activity observed
+after an accepted terminal report, with the verified process-group teardown and
+its post-report duration).
 
 Records must be additive — unknown types are ignored on read, consistent with
 the existing invalid JSON line tolerance. Each record carries `schema_version`,

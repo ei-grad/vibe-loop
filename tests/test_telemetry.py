@@ -15,6 +15,7 @@ from vibe_loop.cli import main
 from vibe_loop.retry import detect_limit_wall
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.telemetry import (
+    ProviderUsage,
     ProviderUsageObserver,
     normalize_model_label,
     normalize_provider_label,
@@ -23,6 +24,7 @@ from vibe_loop.telemetry import (
     parse_codex_event,
     parse_codex_rollout_usage,
     rolling_usage_summary,
+    sanitize_run_stats,
 )
 
 
@@ -193,6 +195,50 @@ def test_usage_stats_never_persist_sensitive_payload_text() -> None:
     assert "credential" not in encoded
     assert "fencing_token" not in encoded
     assert "raw_transcript" not in encoded
+
+
+def test_stats_expose_post_report_teardown_breakdown() -> None:
+    usage = ProviderUsage(
+        "anthropic",
+        "native:claude:result",
+        "claude-result-v1",
+        {"input_tokens": 100, "output_tokens": 20},
+    )
+
+    stats = usage.to_stats(
+        phase="implementation",
+        post_report={
+            "duration_seconds": 63.5,
+            "enforced_stop": True,
+            "activity_kind": "tool_call",
+            "activity_count": 4,
+            "usage": {"input_tokens": 435000, "output_tokens": 900},
+        },
+    )
+
+    assert stats["post_report"] == {
+        "duration_seconds": 63.5,
+        "enforced_stop": True,
+        "activity_kind": "tool_call",
+        "activity_count": 4,
+        "usage": {"input_tokens": 435000, "output_tokens": 900},
+    }
+    # The teardown breakdown survives the read-side sanitizer intact.
+    assert sanitize_run_stats(stats)["post_report"] == stats["post_report"]
+
+
+def test_stats_drop_unknown_post_report_activity_kind() -> None:
+    stats = sanitize_run_stats(
+        {
+            "post_report": {
+                "duration_seconds": 1.0,
+                "activity_kind": "mystery",
+                "activity_count": -5,
+            }
+        }
+    )
+
+    assert stats["post_report"] == {"duration_seconds": 1.0}
 
 
 def test_codex_quota_snapshot_keeps_only_bounded_window_evidence() -> None:
@@ -873,6 +919,10 @@ class TelemetryUnittestCoverage(unittest.TestCase):
         for name in ("claude-limit-wall.json", "codex-limit-wall.json"):
             with self.subTest(fixture=name):
                 test_provider_limit_wall_fixtures_remain_typed(name)
+
+    def test_post_report_teardown_stats(self) -> None:
+        test_stats_expose_post_report_teardown_breakdown()
+        test_stats_drop_unknown_post_report_activity_kind()
 
     def test_usage_stats_redact_sensitive_payloads(self) -> None:
         test_usage_stats_never_persist_sensitive_payload_text()
