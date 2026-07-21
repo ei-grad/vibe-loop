@@ -59,6 +59,15 @@ PROVIDER_NUMERIC_FIELDS = frozenset(
     }
 )
 SAFE_METADATA_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._+/-]{0,159}$")
+CANONICAL_USAGE_PROVIDERS = frozenset({"anthropic", "openai", "unknown"})
+NATIVE_MODEL_LABEL_RE = re.compile(
+    r"(?:claude-(?:(?:haiku|opus|sonnet)(?:-[0-9]+){1,3}"
+    r"|[0-9]+(?:-[0-9]+){0,2}-(?:haiku|opus|sonnet)(?:-[0-9]{8})?)"
+    r"|gpt-[0-9]+(?:\.[0-9]+)?[a-z]?"
+    r"(?:-(?:chat|codex|latest|max|mini|nano|pro|sol|terra|[0-9]{8})){0,4}"
+    r"|o[1-9](?:-(?:max|mini|pro|[0-9]{8})){0,3})"
+)
+ATTRIBUTION_DIAGNOSTIC_LIMIT = 16
 USAGE_SOURCES = frozenset(
     {
         "unavailable",
@@ -103,6 +112,30 @@ SENSITIVE_METADATA_MARKERS = (
     "token",
     "transcript",
 )
+
+
+def normalize_provider_label(value: object) -> tuple[str, bool]:
+    """Return a canonical usage-group provider and whether input was rejected."""
+    if not isinstance(value, str):
+        return "unknown", value is not None
+    normalized = value.casefold()
+    if value != value.strip() or normalized not in CANONICAL_USAGE_PROVIDERS:
+        return "unknown", True
+    return normalized, False
+
+
+def normalize_model_label(value: object) -> tuple[str, bool]:
+    """Return a bounded native model identifier or the safe fallback."""
+    if not isinstance(value, str):
+        return "unknown", value is not None
+    normalized = value.casefold()
+    if value != value.strip():
+        return "unknown", True
+    if normalized == "unknown":
+        return normalized, False
+    if NATIVE_MODEL_LABEL_RE.fullmatch(normalized):
+        return normalized, False
+    return "unknown", True
 
 
 def _number(value: object) -> int | float | None:
@@ -188,7 +221,7 @@ def _sanitize_quota_snapshots(value: object) -> list[dict[str, object]]:
         resets_at = _integer(candidate.get("resets_at"))
         if (
             not isinstance(provider, str)
-            or provider not in USAGE_PROVIDERS
+            or provider not in CANONICAL_USAGE_PROVIDERS
             or not isinstance(scope, str)
             or _safe_quota_label(scope, "") != scope
             or not isinstance(window, str)
@@ -782,21 +815,53 @@ def _metric(stats: object, key: str) -> float:
     return float(value) if value is not None else 0.0
 
 
-def _group_identity(record: Mapping[str, object]) -> tuple[str, str, str]:
+def _raw_provider_label(record: Mapping[str, object]) -> object:
     stats = record.get("stats")
     stats_map = stats if isinstance(stats, Mapping) else {}
-    provider = str(
+    return (
         record.get("model_provider")
         or stats_map.get("provider")
         or {"codex": "openai", "claude": "anthropic"}.get(
             record.get("agent_kind"), "unknown"
         )
     )
-    model = str(record.get("model_id") or "unknown")
+
+
+def _group_identity(
+    record: Mapping[str, object],
+) -> tuple[str, str, str, frozenset[str]]:
+    provider, provider_rejected = normalize_provider_label(_raw_provider_label(record))
+    model, model_rejected = normalize_model_label(record.get("model_id") or "unknown")
+    rejected = frozenset(
+        field
+        for field, invalid in (
+            ("provider", provider_rejected),
+            ("model", model_rejected),
+        )
+        if invalid
+    )
+    stats = record.get("stats")
+    stats_map = stats if isinstance(stats, Mapping) else {}
     phase = str(stats_map.get("phase") or "implementation")
     if phase not in PHASES:
         phase = "implementation"
-    return provider, model, phase
+    return provider, model, phase, rejected
+
+
+def _stored_attribution_rejections(record: Mapping[str, object]) -> frozenset[str]:
+    value = record.get("attribution_diagnostics")
+    if not isinstance(value, list | tuple):
+        return frozenset()
+    fields: set[str] = set()
+    for diagnostic in value[:ATTRIBUTION_DIAGNOSTIC_LIMIT]:
+        if not isinstance(diagnostic, Mapping):
+            continue
+        if diagnostic.get("type") != "invalid_attribution_label":
+            continue
+        field = diagnostic.get("field")
+        if field in {"provider", "model"}:
+            fields.add(str(field))
+    return frozenset(fields)
 
 
 def _new_usage_group(
@@ -950,13 +1015,7 @@ def _quota_account_wall_summary(
             continue
         stats = record.get("stats")
         stats_map = stats if isinstance(stats, Mapping) else {}
-        provider = str(
-            record.get("model_provider")
-            or stats_map.get("provider")
-            or {"codex": "openai", "claude": "anthropic"}.get(
-                record.get("agent_kind"), "unknown"
-            )
-        )
+        provider, _ = normalize_provider_label(_raw_provider_label(record))
         group = providers.setdefault(provider, _quota_provider_group(provider))
         launched = not (
             record_type == "autopilot_planning_outcome"
@@ -1091,6 +1150,7 @@ def rolling_usage_summary(
     ]
     groups: dict[tuple[str, str, str], dict[str, object]] = {}
     diagnostics: list[dict[str, object]] = []
+    attribution_rejections: dict[str, int] = defaultdict(int)
     task_attempts: dict[str, list[tuple[datetime, Mapping[str, object]]]] = defaultdict(
         list
     )
@@ -1105,14 +1165,22 @@ def rolling_usage_summary(
     landed_tasks: dict[tuple[str, str, str], set[str]] = defaultdict(set)
 
     for record in recent:
+        if record.get("record_type") not in {
+            None,
+            "run_result",
+            "autopilot_planning_outcome",
+        }:
+            continue
+        _, _, _, projected_rejections = _group_identity(record)
+        for field in projected_rejections | _stored_attribution_rejections(record):
+            attribution_rejections[field] += 1
+
+    for record in recent:
         if record.get("record_type") != "autopilot_planning_outcome":
             continue
         stats = record.get("stats")
         stats_map = stats if isinstance(stats, Mapping) else {}
-        provider = str(
-            record.get("model_provider") or stats_map.get("provider") or "unknown"
-        )
-        model = str(record.get("model_id") or "unknown")
+        provider, model, _, _ = _group_identity(record)
         key = (provider, model, "planning")
         group = groups.setdefault(
             key,
@@ -1142,7 +1210,7 @@ def rolling_usage_summary(
     for record in recent:
         if record.get("record_type") not in {None, "run_result"}:
             continue
-        provider, model, phase = _group_identity(record)
+        provider, model, phase, _ = _group_identity(record)
         key = (provider, model, phase)
         group = groups.setdefault(
             key,
@@ -1362,6 +1430,16 @@ def rolling_usage_summary(
                         "expected_range": [0.4, 0.6],
                     }
                 )
+    for field in sorted(attribution_rejections):
+        diagnostics.append(
+            {
+                "type": "invalid_attribution_label",
+                "severity": "warning",
+                "field": field,
+                "count": attribution_rejections[field],
+                "normalized": "unknown",
+            }
+        )
     return {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "project": project,

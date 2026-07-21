@@ -857,6 +857,15 @@ group durable provenance by project, provider, model, and phase and report
 launch/productivity ratios plus typed budget diagnostics; diagnostics never
 switch providers.
 
+Provider group labels are limited to `openai`, `anthropic`, and `unknown`.
+Model labels must be bounded, versioned native Codex/OpenAI (`gpt-*` or `oN-*`)
+or Claude (`claude-*`) families with supported suffixes. Selector aliases,
+key-name values, command fragments, paths, whitespace/control-bearing strings,
+and arbitrary JSON values normalize to `unknown`. Runtime ingestion emits a
+bounded attribution diagnostic containing only the rejected dimension. Summary
+projection applies the same rules to legacy records without rewriting
+append-only history and retains their numeric usage under the safe group.
+
 Rolling summaries preserve those raw groups and add a separate provider quota
 and account-wall view. Provider dimensions remain distinct: fresh input, cache
 read, cache creation, output/reasoning output, reported cost, launches,

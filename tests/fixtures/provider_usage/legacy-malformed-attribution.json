@@ -1,0 +1,20 @@
+{
+  "record_type": "run_result",
+  "run_id": "legacy-provider-value-model-task",
+  "task_id": "provider-usage-label-validation",
+  "classification": "completed",
+  "started_at": "2026-07-21T11:58:00+00:00",
+  "finished_at": "2026-07-21T12:00:00+00:00",
+  "model_provider": "value",
+  "model_id": "task",
+  "stats": {
+    "phase": "implementation",
+    "provider": "anthropic",
+    "input_tokens": 1200,
+    "output_tokens": 300,
+    "cache_read_input_tokens": 4000,
+    "cache_creation_input_tokens": 500,
+    "total_tokens": 1500,
+    "cost_usd": 0.42
+  }
+}

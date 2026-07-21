@@ -65,6 +65,42 @@ class RunStoreTests(unittest.TestCase):
             payload["effort_source"], "command_config:model_reasoning_effort"
         )
 
+    def test_run_result_normalizes_invalid_attribution_at_ingestion(self) -> None:
+        result = RunResult(
+            run_id="run-invalid-attribution",
+            task_id="TASK-01",
+            classification="completed",
+            exit_code=0,
+            log_path=Path("run.log"),
+            start_main="abc",
+            end_main="def",
+            model_provider="value",
+            model_provider_source="native:stdout:json.model_provider",
+            model_id="task",
+            model_id_source="native:stdout:json.model",
+        )
+
+        payload = result.to_json()
+
+        self.assertEqual(payload["model_provider"], "unknown")
+        self.assertEqual(payload["model_id"], "unknown")
+        self.assertEqual(payload["model"], "unknown")
+        self.assertEqual(
+            payload["attribution_diagnostics"],
+            [
+                {
+                    "type": "invalid_attribution_label",
+                    "field": "provider",
+                    "normalized": "unknown",
+                },
+                {
+                    "type": "invalid_attribution_label",
+                    "field": "model",
+                    "normalized": "unknown",
+                },
+            ],
+        )
+
     def test_run_result_json_uses_stable_finished_at(self) -> None:
         result = RunResult(
             run_id="run-1",

@@ -2722,7 +2722,7 @@ class RunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(context.model_provider, "anthropic")
-        self.assertEqual(context.model_id, "opus")
+        self.assertEqual(context.model_id, "")
         self.assertEqual(context.reasoning_effort, "medium")
         self.assertEqual(context.reasoning_effort_source, "command_arg:--effort")
 
@@ -4688,12 +4688,11 @@ class AnalysisAgentTests(unittest.TestCase):
                 json.loads(output_path.read_text(encoding="utf-8")),
                 {"decision": "keep", "reason": "active WIP"},
             )
+            self.assertEqual(runner.last_analysis_runtime_context.model_id, "")
+            self.assertEqual(runner.last_analysis_runtime_context.model_id_source, "")
             self.assertEqual(
-                runner.last_analysis_runtime_context.model_id, "analysis-model"
-            )
-            self.assertEqual(
-                runner.last_analysis_runtime_context.model_id_source,
-                "command_arg:--model",
+                runner.last_analysis_runtime_context.attribution_diagnostics,
+                ("model",),
             )
 
     def test_run_analysis_agent_returns_none_on_nonzero_exit(self) -> None:
@@ -6416,6 +6415,61 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         )
 
         self.assertEqual(context.model_id, "gpt-5.5")
+
+    def test_structured_placeholder_attribution_is_rejected_with_diagnostics(
+        self,
+    ) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps({"model": {"provider": "value", "id": "task"}}),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_provider, "")
+        self.assertEqual(context.model_id, "")
+        self.assertEqual(
+            context.attribution_diagnostics,
+            ("provider", "model"),
+        )
+
+    def test_rejected_aliases_do_not_hide_later_native_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {
+                    "model_provider": "value",
+                    "model_id": "task",
+                    "model": {"provider": "openai", "id": "gpt-5.6-sol"},
+                }
+            ),
+            "stdout",
+        )
+
+        self.assertEqual(context.model_provider, "openai")
+        self.assertEqual(context.model_id, "gpt-5.6-sol")
+        self.assertEqual(
+            context.attribution_diagnostics,
+            ("provider", "model"),
+        )
+
+    def test_command_fragments_and_paths_are_not_model_attribution(self) -> None:
+        for model in ("task", "codex exec --json", "/tmp/gpt-5.6-sol"):
+            with self.subTest(model=model):
+                context = parse_agent_runtime_context_from_command(
+                    f"codex exec --model {shell_quote(model)}"
+                )
+                self.assertEqual(context.model_provider, "openai")
+                self.assertEqual(context.model_id, "")
+                self.assertEqual(context.attribution_diagnostics, ("model",))
+
+    def test_noncanonical_explicit_provider_falls_back_to_executable_identity(
+        self,
+    ) -> None:
+        context = parse_agent_runtime_context_from_command(
+            "codex exec --provider value --model gpt-5.6-sol"
+        )
+
+        self.assertEqual(context.model_provider, "openai")
+        self.assertEqual(context.model_id, "gpt-5.6-sol")
+        self.assertEqual(context.attribution_diagnostics, ("provider",))
 
     def test_malformed_model_value_fails_closed_to_unknown(self) -> None:
         context = parse_agent_runtime_context_from_line(

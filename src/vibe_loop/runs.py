@@ -12,7 +12,12 @@ from typing import Any, BinaryIO, Mapping
 
 from vibe_loop.locks import redact_exact_fencing_token, redact_fencing_token_payload
 from vibe_loop.orchestration import StageTransition, derive_stage_progress
-from vibe_loop.telemetry import sanitize_run_stats
+from vibe_loop.telemetry import (
+    ATTRIBUTION_DIAGNOSTIC_LIMIT,
+    normalize_model_label,
+    normalize_provider_label,
+    sanitize_run_stats,
+)
 
 try:
     import fcntl
@@ -225,6 +230,7 @@ class RunResult:
     model_provider_source: str = ""
     model_id: str = ""
     model_id_source: str = ""
+    attribution_diagnostics: tuple[str, ...] = ()
     reasoning_effort: str = ""
     reasoning_effort_source: str = ""
     trailer_context: dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -264,13 +270,20 @@ class RunResult:
             "max_restarts": self.max_restarts,
             "finished_at": self.finished_at,
         }
+        rejected_fields = list(self.attribution_diagnostics)
         if self.model_provider:
-            payload["model_provider"] = self.model_provider
+            provider, rejected = normalize_provider_label(self.model_provider)
+            payload["model_provider"] = provider
+            if rejected and "provider" not in rejected_fields:
+                rejected_fields.append("provider")
         if self.model_provider_source:
             payload["model_provider_source"] = self.model_provider_source
         if self.model_id:
-            payload["model"] = self.model_id
-            payload["model_id"] = self.model_id
+            model_id, rejected = normalize_model_label(self.model_id)
+            payload["model"] = model_id
+            payload["model_id"] = model_id
+            if rejected and "model" not in rejected_fields:
+                rejected_fields.append("model")
         if self.model_id_source:
             payload["model_source"] = self.model_id_source
             payload["model_id_source"] = self.model_id_source
@@ -280,6 +293,16 @@ class RunResult:
         if self.reasoning_effort_source:
             payload["effort_source"] = self.reasoning_effort_source
             payload["reasoning_effort_source"] = self.reasoning_effort_source
+        if rejected_fields:
+            payload["attribution_diagnostics"] = [
+                {
+                    "type": "invalid_attribution_label",
+                    "field": field,
+                    "normalized": "unknown",
+                }
+                for field in rejected_fields[:ATTRIBUTION_DIAGNOSTIC_LIMIT]
+                if field in {"provider", "model"}
+            ]
         if self.trailer_context:
             payload["trailer_context"] = self.trailer_context
         if self.trailer_context_sources:

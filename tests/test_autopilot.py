@@ -4746,22 +4746,28 @@ class NativePlanningTests(unittest.TestCase):
                     runnable_after=result.worker.runnable_after,
                     model_provider=result.model_provider,
                     model_id=result.model_id,
+                    attribution_diagnostics=result.attribution_diagnostics,
                     stats=result.stats,
                 )
             )
             persisted = run_store.read_records()[-1]
 
         self.assertEqual(result.model_provider, "mixed")
-        self.assertEqual(result.model_id, "mixed")
-        self.assertEqual(persisted["model_provider"], "mixed")
-        self.assertEqual(persisted["model_id"], "mixed")
+        self.assertEqual(result.model_id, "unknown")
+        self.assertEqual(result.attribution_diagnostics, ("model",))
+        self.assertEqual(persisted["model_provider"], "unknown")
+        self.assertEqual(persisted["model_id"], "unknown")
+        self.assertEqual(
+            {item["field"] for item in persisted["attribution_diagnostics"]},
+            {"provider", "model"},
+        )
 
     def test_explicit_worker_model_persists_in_planning_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
             (repo / ".vibe-loop.toml").write_text(
-                '[agent]\ncommand = "codex exec -m gpt-explicit {prompt}"\n',
+                '[agent]\ncommand = "codex exec -m gpt-5-codex {prompt}"\n',
                 encoding="utf-8",
             )
             config = load_config(repo)
@@ -4769,7 +4775,7 @@ class NativePlanningTests(unittest.TestCase):
             run_store = RunStore(config.state_path / "runs.jsonl")
 
             def worker_launcher(command, *, cwd, log_path, timeout_seconds, on_start):
-                self.assertIn("-m gpt-explicit", command)
+                self.assertIn("-m gpt-5-codex", command)
                 on_start(4242)
                 return NativePlanningProcessResult(exit_code=0, pid=4242)
 
@@ -4796,15 +4802,16 @@ class NativePlanningTests(unittest.TestCase):
                     runnable_after=result.worker.runnable_after,
                     model_provider=result.model_provider,
                     model_id=result.model_id,
+                    attribution_diagnostics=result.attribution_diagnostics,
                     stats=result.stats,
                 )
             )
             persisted = run_store.read_records()[-1]
 
         self.assertEqual(result.model_provider, "openai")
-        self.assertEqual(result.model_id, "gpt-explicit")
+        self.assertEqual(result.model_id, "gpt-5-codex")
         self.assertEqual(persisted["model_provider"], "openai")
-        self.assertEqual(persisted["model_id"], "gpt-explicit")
+        self.assertEqual(persisted["model_id"], "gpt-5-codex")
 
     def test_read_only_no_plan_decision_journals_skipped_worker_stage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

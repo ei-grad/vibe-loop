@@ -92,7 +92,12 @@ from vibe_loop.runs import (
     utc_now_iso,
 )
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
-from vibe_loop.telemetry import merge_provider_usage, unavailable_usage
+from vibe_loop.telemetry import (
+    normalize_model_label,
+    normalize_provider_label,
+    merge_provider_usage,
+    unavailable_usage,
+)
 from vibe_loop.workers import (
     ActiveRunState,
     ProcessExists,
@@ -4220,6 +4225,7 @@ class NativePlanningCycleResult:
     stats: dict[str, object] = dataclasses.field(default_factory=dict)
     model_provider: str = "unknown"
     model_id: str = "unknown"
+    attribution_diagnostics: tuple[str, ...] = ()
 
 
 PLANNING_OUTCOME_PRODUCTIVE = "productive"
@@ -4521,8 +4527,11 @@ def planning_outcome_record(
     provider_launched: bool = True,
     model_provider: str = "unknown",
     model_id: str = "unknown",
+    attribution_diagnostics: Sequence[str] = (),
     stats: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
+    normalized_provider, provider_rejected = normalize_provider_label(model_provider)
+    normalized_model, model_rejected = normalize_model_label(model_id)
     record: dict[str, object] = {
         "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
         "record_type": AUTOPILOT_PLANNING_OUTCOME_RECORD_TYPE,
@@ -4536,9 +4545,31 @@ def planning_outcome_record(
         "created_count": created_count,
         "created_task_ids": list(created_task_ids),
         "provider_launched": provider_launched,
-        "model_provider": model_provider,
-        "model_id": model_id,
+        "model_provider": normalized_provider,
+        "model_id": normalized_model,
     }
+    rejected_fields = list(
+        dict.fromkeys(
+            field for field in attribution_diagnostics if field in {"provider", "model"}
+        )
+    )
+    rejected_fields.extend(
+        field
+        for field, rejected in (
+            ("provider", provider_rejected),
+            ("model", model_rejected),
+        )
+        if rejected and field not in rejected_fields
+    )
+    if rejected_fields:
+        record["attribution_diagnostics"] = [
+            {
+                "type": "invalid_attribution_label",
+                "field": field,
+                "normalized": "unknown",
+            }
+            for field in rejected_fields
+        ]
     if stats:
         record["stats"] = dict(stats)
     return record
@@ -4740,7 +4771,7 @@ def planning_runtime_identity(
     contexts: Sequence[AgentRuntimeContext],
     *,
     configured_model: str | None,
-) -> tuple[str, str]:
+) -> tuple[str, str, tuple[str, ...]]:
     providers = {
         context.model_provider for context in contexts if context.model_provider
     }
@@ -4751,7 +4782,15 @@ def planning_runtime_identity(
     model = next(iter(models)) if len(models) == 1 else "mixed"
     if not models:
         model = configured_model or "unknown"
-    return provider, model
+    diagnostics = tuple(
+        dict.fromkeys(
+            field
+            for context in contexts
+            for field in context.attribution_diagnostics
+            if field in {"provider", "model"}
+        )
+    )
+    return provider, model, diagnostics
 
 
 def run_native_planning(
@@ -4864,7 +4903,7 @@ def run_native_planning(
             error=agent_error,
         )
         run_store.append_record(worker.to_record(config.repo))
-        model_provider, model_id = planning_runtime_identity(
+        model_provider, model_id, attribution_diagnostics = planning_runtime_identity(
             (analysis_context,), configured_model=config.agent.model
         )
         return NativePlanningCycleResult(
@@ -4880,6 +4919,7 @@ def run_native_planning(
                 else analysis_usage.provider
             ),
             model_id=model_id,
+            attribution_diagnostics=attribution_diagnostics,
         )
 
     log_path = config.state_path / "autopilot" / f"{cycle_id}-planning-worker.log"
@@ -5018,7 +5058,7 @@ def run_native_planning(
     if interruption is not None:
         raise interruption
     merged_usage = merge_provider_usage(analysis_usage, worker_usage)
-    model_provider, model_id = planning_runtime_identity(
+    model_provider, model_id, attribution_diagnostics = planning_runtime_identity(
         (analysis_context, worker_context), configured_model=config.agent.model
     )
     return NativePlanningCycleResult(
@@ -5032,6 +5072,7 @@ def run_native_planning(
             model_provider if model_provider != "unknown" else merged_usage.provider
         ),
         model_id=model_id,
+        attribution_diagnostics=attribution_diagnostics,
     )
 
 
@@ -5219,6 +5260,7 @@ def execute_autopilot_cycle(
                     provider_launched=planning_provider_launched(native_planning),
                     model_provider=native_planning.model_provider,
                     model_id=native_planning.model_id,
+                    attribution_diagnostics=(native_planning.attribution_diagnostics),
                     stats=native_planning.stats,
                 )
             )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -15,6 +16,8 @@ from vibe_loop.retry import detect_limit_wall
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.telemetry import (
     ProviderUsageObserver,
+    normalize_model_label,
+    normalize_provider_label,
     parse_claude_result,
     parse_claude_transcript_usage,
     parse_codex_event,
@@ -30,6 +33,49 @@ def fixture(name: str) -> dict[str, object]:
     value = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
     assert isinstance(value, dict)
     return value
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "rejected"),
+    [
+        ("openai", "openai", False),
+        ("anthropic", "anthropic", False),
+        ("unknown", "unknown", False),
+        ("value", "unknown", True),
+        ("mixed", "unknown", True),
+        (" openai", "unknown", True),
+        ("openai\n", "unknown", True),
+    ],
+)
+def test_provider_labels_use_only_canonical_groups(
+    value: str, expected: str, rejected: bool
+) -> None:
+    assert normalize_provider_label(value) == (expected, rejected)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "rejected"),
+    [
+        ("gpt-5.6-sol", "gpt-5.6-sol", False),
+        ("o4-mini", "o4-mini", False),
+        ("claude-opus-4-8", "claude-opus-4-8", False),
+        ("unknown", "unknown", False),
+        ("task", "unknown", True),
+        ("value", "unknown", True),
+        ("gpt-task", "unknown", True),
+        ("claude-model", "unknown", True),
+        ("gpt-5-ignore-all-previous-instructions", "unknown", True),
+        ("claude-opus-4-read-task", "unknown", True),
+        ("codex exec --json", "unknown", True),
+        ("/tmp/model", "unknown", True),
+        ("gpt 5.6", "unknown", True),
+        ("gpt-5.6\nsol", "unknown", True),
+    ],
+)
+def test_model_labels_require_bounded_native_identifiers(
+    value: str, expected: str, rejected: bool
+) -> None:
+    assert normalize_model_label(value) == (expected, rejected)
 
 
 @pytest.mark.parametrize(
@@ -499,7 +545,7 @@ def test_persisted_phase_and_work_kind_drive_summary(tmp_path: Path) -> None:
                 started_at=(now - timedelta(seconds=60)).isoformat(),
                 finished_at=now.isoformat(),
                 model_provider="openai",
-                model_id="gpt-test",
+                model_id="gpt-5-codex",
                 stats={
                     "schema_version": 1,
                     "phase": phase,
@@ -537,7 +583,7 @@ def test_planning_summary_preserves_model_and_worker_minutes() -> None:
         "provider_launched": True,
         "created_count": 2,
         "model_provider": "anthropic",
-        "model_id": "claude-test",
+        "model_id": "claude-opus-4-8",
         "stats": {
             "phase": "planning",
             "wall_time_seconds": 120,
@@ -550,8 +596,91 @@ def test_planning_summary_preserves_model_and_worker_minutes() -> None:
     group = summary["groups"][0]
 
     assert group["provider"] == "anthropic"
-    assert group["model"] == "claude-test"
+    assert group["model"] == "claude-opus-4-8"
     assert group["worker_minutes"] == 2
+
+
+def test_legacy_malformed_attribution_projects_safely_without_rewrite() -> None:
+    record = fixture("legacy-malformed-attribution.json")
+    original = copy.deepcopy(record)
+    now = datetime(2026, 7, 21, 12, 5, tzinfo=UTC)
+
+    summary = rolling_usage_summary([record], project="vibe-loop", now=now)
+
+    assert record == original
+    assert len(summary["groups"]) == 1
+    group = summary["groups"][0]
+    assert (group["provider"], group["model"]) == ("unknown", "unknown")
+    assert group["input_tokens"] == 1200
+    assert group["cache_read_input_tokens"] == 4000
+    assert group["total_tokens"] == 1500
+    quota = summary["quota_account_wall"]
+    assert [item["provider"] for item in quota["providers"]] == ["unknown"]
+    assert quota["providers"][0]["gross_tokens"] == 6000
+    attribution = {
+        item["field"]: item
+        for item in summary["diagnostics"]
+        if item["type"] == "invalid_attribution_label"
+    }
+    assert attribution == {
+        "model": {
+            "type": "invalid_attribution_label",
+            "severity": "warning",
+            "field": "model",
+            "count": 1,
+            "normalized": "unknown",
+        },
+        "provider": {
+            "type": "invalid_attribution_label",
+            "severity": "warning",
+            "field": "provider",
+            "count": 1,
+            "normalized": "unknown",
+        },
+    }
+    assert "value" not in json.dumps(attribution)
+    assert "task" not in json.dumps(attribution)
+
+
+def test_invalid_providers_cannot_create_usage_or_quota_groups() -> None:
+    now = datetime(2026, 7, 21, 12, 5, tzinfo=UTC)
+    records = []
+    for index, provider in enumerate(("value", "mixed", "/tmp/provider")):
+        record = fixture("legacy-malformed-attribution.json")
+        record["run_id"] = f"invalid-{index}"
+        record["model_provider"] = provider
+        record["model_id"] = "gpt-5.6-sol"
+        record["finished_at"] = (now - timedelta(minutes=index + 1)).isoformat()
+        if index == 0:
+            stats = record["stats"]
+            assert isinstance(stats, dict)
+            stats["quota_snapshots"] = [
+                {
+                    "provider": "mixed",
+                    "scope": "account",
+                    "window": "primary",
+                    "observed_at": record["finished_at"],
+                    "used_percent": 50,
+                    "window_minutes": 300,
+                    "resets_at": 1784642400,
+                }
+            ]
+        records.append(record)
+
+    summary = rolling_usage_summary(records, project="vibe-loop", now=now)
+
+    assert {group["provider"] for group in summary["groups"]} == {"unknown"}
+    assert {
+        provider["provider"] for provider in summary["quota_account_wall"]["providers"]
+    } == {"unknown"}
+    assert summary["quota_account_wall"]["providers"][0]["snapshots"] == []
+    diagnostic = next(
+        item
+        for item in summary["diagnostics"]
+        if item.get("type") == "invalid_attribution_label"
+        and item.get("field") == "provider"
+    )
+    assert diagnostic["count"] == 3
 
 
 def test_quota_summary_forecasts_only_comparable_provider_windows() -> None:

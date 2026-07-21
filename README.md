@@ -250,6 +250,14 @@ labels. Prompts, credentials, fencing values, command payloads, and transcript
 content are discarded from `stats`. Existing Loopyard installations ingest the
 normalized fields without a schema adapter:
 
+Provider attribution is restricted to `openai`, `anthropic`, and `unknown`.
+Model attribution accepts only bounded, versioned native Codex/OpenAI (`gpt-*`
+and `oN-*`) or Claude (`claude-*`) families with supported suffixes; command
+fragments, paths, selector aliases, placeholder values, and arbitrary JSON
+strings become `unknown`. Rejections add only a bounded
+`invalid_attribution_label` diagnostic naming the rejected dimension, never the
+rejected text.
+
 ```bash
 loopyard runs sync .vibe-loop/runs.jsonl -p <project>
 ```
@@ -260,6 +268,10 @@ completed runs, immediate failures, restarts, worker-minutes, token/cache/cost
 totals, tasks created/landed, per-productive-task ratios, and typed budget
 diagnostics. Only phases with durable provenance are reported; no provider is
 switched automatically.
+
+The same validation is applied while projecting historical run records. Legacy
+labels cannot create arbitrary usage or quota groups, while their numeric usage
+is retained under `unknown`; the append-only source records are not rewritten.
 
 The summary also has a separate `quota_account_wall` section. It does not apply
 a universal token price across providers. For each provider it reports fresh

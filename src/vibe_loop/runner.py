@@ -90,10 +90,13 @@ from vibe_loop.runs import (
 )
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.telemetry import (
+    ATTRIBUTION_DIAGNOSTIC_LIMIT,
     PHASES,
     WORK_KINDS,
     ProviderUsage,
     ProviderUsageObserver,
+    normalize_model_label,
+    normalize_provider_label,
     parse_claude_transcript_usage,
     parse_codex_rollout_usage,
     unavailable_usage,
@@ -353,10 +356,16 @@ class AgentRuntimeContext:
     model_id_source: str = ""
     reasoning_effort: str = ""
     reasoning_effort_source: str = ""
+    attribution_diagnostics: tuple[str, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not (self.model_provider or self.model_id or self.reasoning_effort)
+        return not (
+            self.model_provider
+            or self.model_id
+            or self.reasoning_effort
+            or self.attribution_diagnostics
+        )
 
     def overlay(self, other: AgentRuntimeContext) -> AgentRuntimeContext:
         return AgentRuntimeContext(
@@ -369,6 +378,10 @@ class AgentRuntimeContext:
             reasoning_effort=other.reasoning_effort or self.reasoning_effort,
             reasoning_effort_source=(
                 other.reasoning_effort_source or self.reasoning_effort_source
+            ),
+            attribution_diagnostics=merge_attribution_diagnostics(
+                self.attribution_diagnostics,
+                other.attribution_diagnostics,
             ),
         )
 
@@ -402,6 +415,10 @@ class AgentRuntimeContext:
             model_id_source=model_id_source,
             reasoning_effort=effort,
             reasoning_effort_source=effort_source,
+            attribution_diagnostics=merge_attribution_diagnostics(
+                self.attribution_diagnostics,
+                other.attribution_diagnostics,
+            ),
         )
 
     def missing_delta(self, candidate: AgentRuntimeContext) -> AgentRuntimeContext:
@@ -431,6 +448,11 @@ class AgentRuntimeContext:
             reasoning_effort_source=(
                 merged.reasoning_effort_source if effort_changed else ""
             ),
+            attribution_diagnostics=tuple(
+                diagnostic
+                for diagnostic in merged.attribution_diagnostics
+                if diagnostic not in self.attribution_diagnostics
+            ),
         )
 
     def to_record_fields(self) -> dict[str, object]:
@@ -448,7 +470,29 @@ class AgentRuntimeContext:
             payload["effort_source"] = self.reasoning_effort_source
             payload["reasoning_effort"] = self.reasoning_effort
             payload["reasoning_effort_source"] = self.reasoning_effort_source
+        if self.attribution_diagnostics:
+            payload["attribution_diagnostics"] = [
+                {
+                    "type": "invalid_attribution_label",
+                    "field": field,
+                    "normalized": "unknown",
+                }
+                for field in self.attribution_diagnostics
+            ]
         return payload
+
+
+def merge_attribution_diagnostics(
+    *items: tuple[str, ...],
+) -> tuple[str, ...]:
+    merged: list[str] = []
+    for item in items:
+        for field in item:
+            if field not in merged:
+                merged.append(field)
+            if len(merged) >= ATTRIBUTION_DIAGNOSTIC_LIMIT:
+                return tuple(merged)
+    return tuple(merged)
 
 
 def configured_agent_effort_context(agent: AgentConfig) -> AgentRuntimeContext:
@@ -1810,6 +1854,7 @@ class VibeRunner:
                 model_provider_source=final_runtime_context.model_provider_source,
                 model_id=final_runtime_context.model_id,
                 model_id_source=final_runtime_context.model_id_source,
+                attribution_diagnostics=(final_runtime_context.attribution_diagnostics),
                 reasoning_effort=final_runtime_context.reasoning_effort,
                 reasoning_effort_source=final_runtime_context.reasoning_effort_source,
                 trailer_context=(
@@ -4348,8 +4393,12 @@ def parse_agent_runtime_context_from_command(command: str) -> AgentRuntimeContex
             value = token.split("=", 1)[1]
             source = "command_arg:--model"
         if value is not None:
-            cleaned = clean_agent_context_value(value)
+            cleaned, rejected = clean_command_model_attribution_value(value)
             if not cleaned:
+                if rejected:
+                    context = context.overlay(
+                        AgentRuntimeContext(attribution_diagnostics=("model",))
+                    )
                 index += 1
                 continue
             context = context.overlay(
@@ -4374,8 +4423,12 @@ def parse_agent_runtime_context_from_command(command: str) -> AgentRuntimeContex
             value = token.split("=", 1)[1]
             source = "command_arg:--provider"
         if value is not None:
-            cleaned = clean_agent_context_value(value)
+            cleaned, rejected = clean_provider_attribution_value(value)
             if not cleaned:
+                if rejected:
+                    context = context.overlay(
+                        AgentRuntimeContext(attribution_diagnostics=("provider",))
+                    )
                 index += 1
                 continue
             context = context.overlay(
@@ -4446,14 +4499,18 @@ def parse_agent_runtime_context_from_config_arg(value: str) -> AgentRuntimeConte
     normalized_key = normalize_agent_context_key(key)
     source = f"command_config:{normalized_key}"
     if normalized_key in {"model", "model_id"}:
-        cleaned = clean_agent_context_value(raw_value)
+        cleaned, rejected = clean_command_model_attribution_value(raw_value)
         if not cleaned:
-            return AgentRuntimeContext()
+            return AgentRuntimeContext(
+                attribution_diagnostics=(("model",) if rejected else ())
+            )
         return AgentRuntimeContext(model_id=cleaned, model_id_source=source)
     if normalized_key in {"model_provider", "provider"}:
-        cleaned = clean_agent_context_value(raw_value)
+        cleaned, rejected = clean_provider_attribution_value(raw_value)
         if not cleaned:
-            return AgentRuntimeContext()
+            return AgentRuntimeContext(
+                attribution_diagnostics=(("provider",) if rejected else ())
+            )
         return AgentRuntimeContext(
             model_provider=cleaned,
             model_provider_source=source,
@@ -4815,20 +4872,22 @@ def parse_agent_runtime_context_from_json_payload(
 ) -> AgentRuntimeContext:
     model_value = payload.get("model")
     model_mapping = model_value if isinstance(model_value, dict) else {}
-    model_provider = first_clean_agent_context_value(
-        payload.get("model_provider"),
-        model_mapping.get("provider"),
-        payload.get("provider"),
+    model_provider, provider_rejected = first_attribution_context_value(
+        (
+            payload.get("model_provider"),
+            model_mapping.get("provider"),
+            payload.get("provider"),
+        ),
+        clean_provider_attribution_value,
     )
     bare_model = (
         model_value
         if isinstance(model_value, str) and payload_declares_model_identity(payload)
         else None
     )
-    model_id = first_clean_agent_context_value(
-        payload.get("model_id"),
-        model_mapping.get("id"),
-        bare_model,
+    model_id, model_rejected = first_attribution_context_value(
+        (payload.get("model_id"), model_mapping.get("id"), bare_model),
+        clean_model_attribution_value,
     )
     reasoning_effort = first_clean_agent_context_value(
         payload.get("effort"),
@@ -4847,6 +4906,14 @@ def parse_agent_runtime_context_from_json_payload(
         reasoning_effort=reasoning_effort,
         reasoning_effort_source=(
             f"{source_prefix}:json.reasoning_effort" if reasoning_effort else ""
+        ),
+        attribution_diagnostics=tuple(
+            field
+            for field, rejected in (
+                ("provider", provider_rejected),
+                ("model", model_rejected),
+            )
+            if rejected
         ),
     )
 
@@ -4897,6 +4964,21 @@ def first_clean_agent_context_value(
     return ""
 
 
+def first_attribution_context_value(
+    values: tuple[object, ...],
+    cleaner: Callable[[object], tuple[str, bool]],
+) -> tuple[str, bool]:
+    rejected = False
+    for value in values:
+        if value is None:
+            continue
+        cleaned, candidate_rejected = cleaner(value)
+        rejected = rejected or candidate_rejected
+        if cleaned:
+            return cleaned, rejected
+    return "", rejected
+
+
 def clean_agent_context_value(value: object) -> str:
     if not isinstance(value, str):
         return ""
@@ -4910,6 +4992,22 @@ def clean_agent_context_value(value: object) -> str:
     if agent_context_value_is_secret_like(cleaned):
         return ""
     return cleaned
+
+
+def clean_provider_attribution_value(value: object) -> tuple[str, bool]:
+    normalized, rejected = normalize_provider_label(value)
+    return ("" if normalized == "unknown" else normalized), rejected
+
+
+def clean_model_attribution_value(value: object) -> tuple[str, bool]:
+    normalized, rejected = normalize_model_label(value)
+    return ("" if normalized == "unknown" else normalized), rejected
+
+
+def clean_command_model_attribution_value(value: object) -> tuple[str, bool]:
+    if isinstance(value, str) and value.casefold() in CLAUDE_MODEL_ALIASES:
+        return "", False
+    return clean_model_attribution_value(value)
 
 
 def clean_reasoning_effort_value(value: object) -> str:
