@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import threading
@@ -52,6 +53,10 @@ RUN_STATE_TRANSITION_RECORD_TYPE = "run_state_transition"
 STAGE_TRANSITION_RECORD_TYPE = "stage_transition"
 TASK_RESTART_RECORD_TYPE = "task_restart"
 TASK_RECOVERY_RECORD_TYPE = "task_recovery"
+ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE = "attempt_circuit_attempt"
+ATTEMPT_CIRCUIT_OPENED_RECORD_TYPE = "attempt_circuit_opened"
+ATTEMPT_CIRCUIT_AVOIDED_RECORD_TYPE = "attempt_circuit_avoided"
+ATTEMPT_CIRCUIT_RESET_RECORD_TYPE = "attempt_circuit_reset"
 RUN_SUPERVISOR_STARTED_RECORD_TYPE = "run_supervisor_started"
 RUN_SUPERVISOR_EXITED_RECORD_TYPE = "run_supervisor_exited"
 AUTOPILOT_CYCLE_RECORD_TYPE = "autopilot_cycle"
@@ -107,12 +112,21 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     }
 )
+CIRCUIT_BREAKER_RECORD_TYPES = frozenset(
+    {
+        ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE,
+        ATTEMPT_CIRCUIT_OPENED_RECORD_TYPE,
+        ATTEMPT_CIRCUIT_AVOIDED_RECORD_TYPE,
+        ATTEMPT_CIRCUIT_RESET_RECORD_TYPE,
+    }
+)
 KNOWN_RECORD_TYPES = frozenset(
     {
         RUN_RECORD_TYPE,
         WORKER_REPORT_RECORD_TYPE,
         *LIFECYCLE_RECORD_TYPES,
         *AUTOPILOT_RECORD_TYPES,
+        *CIRCUIT_BREAKER_RECORD_TYPES,
     }
 )
 LIFECYCLE_STATES = (
@@ -133,6 +147,71 @@ LIFECYCLE_PROTECTED_KEYS = frozenset(
 # "limit_wall" describe a run that ended without settling the task at all.
 SETTLED_RUN_OUTCOMES = ("completed", "failed", "blocked", "unknown")
 UNKNOWN_RUN_OUTCOME = "unknown"
+
+
+@dataclasses.dataclass(frozen=True)
+class AttemptCircuitInputs:
+    """Safe, revision-scoped identity for one dispatchable task attempt."""
+
+    task_id: str
+    task_revision: str
+    configuration_revision: str
+    base: str
+    candidate: str
+    route: str = ""
+
+    @property
+    def fingerprint(self) -> str:
+        encoded = json.dumps(
+            self.to_json(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        return hashlib.sha256(encoded.encode("utf-8", "replace")).hexdigest()[:24]
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "task_revision": self.task_revision,
+            "configuration_revision": self.configuration_revision,
+            "base": self.base,
+            "candidate": self.candidate,
+            "route": self.route,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class AttemptCircuitState:
+    task_id: str
+    inputs: AttemptCircuitInputs
+    threshold: int
+    blocker_class: str = ""
+    attempt_count: int = 0
+    pending_count: int = 0
+    avoided_launches: int = 0
+    opened_at: str = ""
+    opening_reason: str = ""
+    reset_at: str = ""
+    reset_provenance: str = ""
+    withheld: bool = False
+
+    @property
+    def open(self) -> bool:
+        return self.attempt_count >= self.threshold or self.withheld
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "task_id": self.task_id,
+            "open": self.open,
+            "threshold": self.threshold,
+            "attempt_count": self.attempt_count,
+            "pending_count": self.pending_count,
+            "blocker_class": self.blocker_class,
+            "fingerprint": self.inputs.fingerprint,
+            "fingerprint_inputs": self.inputs.to_json(),
+            "opening_reason": self.opening_reason,
+            "opened_at": self.opened_at,
+            "reset_at": self.reset_at,
+            "reset_provenance": self.reset_provenance,
+            "avoided_launches": self.avoided_launches,
+        }
 
 
 def settled_run_outcome(classification: str) -> str:
@@ -931,9 +1010,289 @@ class RunInspection:
         return payload
 
 
+def attempt_circuit_blocker_class(record: Mapping[str, object]) -> str:
+    """Return a stable failure class, excluding provider-wall outcomes.
+
+    The circuit breaker is an implementation-attempt budget. Provider/account
+    walls already have a timed backoff path and must not become evidence that a
+    task implementation is stuck.
+    """
+
+    classification = string_value(record.get("classification") or record.get("status"))
+    if not classification or classification == "completed":
+        return ""
+    if classification == "limit_wall":
+        return ""
+    source = string_value(record.get("classification_source"))
+    if source in {"limit_wall", "provider_wall", "account_limit"}:
+        return ""
+    return f"{classification}:{source or 'unspecified'}"
+
+
+def attempt_circuit_state(
+    records: list[dict[str, Any]],
+    *,
+    inputs: AttemptCircuitInputs,
+    threshold: int,
+) -> AttemptCircuitState:
+    """Derive one task's durable breaker state from append-only records."""
+
+    task_records = [
+        record
+        for record in records
+        if string_value(record.get("task_id")) == inputs.task_id
+    ]
+    reset_index = max(
+        (
+            index
+            for index, record in enumerate(task_records)
+            if record.get("record_type") == ATTEMPT_CIRCUIT_RESET_RECORD_TYPE
+        ),
+        default=-1,
+    )
+    current = task_records[reset_index + 1 :]
+    reset_record = task_records[reset_index] if reset_index >= 0 else {}
+    relevant_attempts = {
+        string_value(record.get("run_id")): record
+        for record in current
+        if record.get("record_type") == ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE
+        and _attempt_inputs_match(record, inputs)
+        and string_value(record.get("run_id"))
+    }
+    terminal_by_run: dict[str, dict[str, Any]] = {}
+    for record in current:
+        if record.get("record_type") not in {None, RUN_RECORD_TYPE}:
+            continue
+        run_id = string_value(record.get("run_id"))
+        if run_id in relevant_attempts:
+            terminal_by_run[run_id] = record
+
+    counts: dict[str, int] = {}
+    pending = 0
+    for run_id in relevant_attempts:
+        terminal = terminal_by_run.get(run_id)
+        if terminal is None:
+            pending += 1
+            continue
+        blocker_class = attempt_circuit_blocker_class(terminal)
+        if blocker_class:
+            counts[blocker_class] = counts.get(blocker_class, 0) + 1
+    blocker_class, attempt_count = max(
+        counts.items(), key=lambda item: (item[1], item[0]), default=("", 0)
+    )
+    opened = next(
+        (
+            record
+            for record in reversed(current)
+            if record.get("record_type") == ATTEMPT_CIRCUIT_OPENED_RECORD_TYPE
+            and _attempt_inputs_match(record, inputs)
+            and string_value(record.get("blocker_class")) == blocker_class
+        ),
+        {},
+    )
+    avoided_launches = sum(
+        1
+        for record in current
+        if record.get("record_type") == ATTEMPT_CIRCUIT_AVOIDED_RECORD_TYPE
+        and _attempt_inputs_match(record, inputs)
+    )
+    return AttemptCircuitState(
+        task_id=inputs.task_id,
+        inputs=inputs,
+        threshold=threshold,
+        blocker_class=blocker_class,
+        attempt_count=attempt_count,
+        pending_count=pending,
+        avoided_launches=avoided_launches,
+        opened_at=string_value(opened.get("occurred_at")),
+        opening_reason=string_value(opened.get("reason")),
+        reset_at=string_value(reset_record.get("occurred_at")),
+        reset_provenance=string_value(reset_record.get("provenance")),
+    )
+
+
+def _attempt_inputs_match(
+    record: Mapping[str, object], inputs: AttemptCircuitInputs
+) -> bool:
+    return (
+        string_value(record.get("task_revision")) == inputs.task_revision
+        and string_value(record.get("configuration_revision"))
+        == inputs.configuration_revision
+        and string_value(record.get("base")) == inputs.base
+        and string_value(record.get("candidate")) == inputs.candidate
+        and string_value(record.get("route")) == inputs.route
+    )
+
+
 class RunStore:
     def __init__(self, path: Path):
         self.path = path
+
+    def reserve_attempt_circuit(
+        self,
+        *,
+        run_id: str,
+        inputs: AttemptCircuitInputs,
+        threshold: int,
+    ) -> AttemptCircuitState:
+        """Atomically reserve a provider-launch attempt or record its avoidance."""
+
+        if threshold < 1:
+            raise ValueError("attempt circuit threshold must be positive")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                state = attempt_circuit_state(
+                    records, inputs=inputs, threshold=threshold
+                )
+                # Pending reservations are charged conservatively against the
+                # established failure class so concurrent supervisors cannot
+                # both claim the final permitted launch.
+                reserved = state.attempt_count + state.pending_count
+                if state.open or (state.blocker_class and reserved >= threshold):
+                    avoided = {
+                        "schema_version": RUN_SCHEMA_VERSION,
+                        "record_type": ATTEMPT_CIRCUIT_AVOIDED_RECORD_TYPE,
+                        "occurred_at": utc_now_iso(),
+                        "run_id": run_id,
+                        "task_id": inputs.task_id,
+                        **inputs.to_json(),
+                        "fingerprint": inputs.fingerprint,
+                        "blocker_class": state.blocker_class,
+                        "attempt_count": state.attempt_count,
+                        "pending_count": state.pending_count,
+                        "threshold": threshold,
+                        "reason": "unchanged_noncompleted_attempt_threshold",
+                    }
+                    self._append_record_unlocked(avoided)
+                    return dataclasses.replace(
+                        state,
+                        avoided_launches=state.avoided_launches + 1,
+                        withheld=True,
+                    )
+                attempt = {
+                    "schema_version": RUN_SCHEMA_VERSION,
+                    "record_type": ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE,
+                    "occurred_at": utc_now_iso(),
+                    "run_id": run_id,
+                    "task_id": inputs.task_id,
+                    **inputs.to_json(),
+                    "fingerprint": inputs.fingerprint,
+                    "threshold": threshold,
+                }
+                self._append_record_unlocked(attempt)
+                return dataclasses.replace(state, pending_count=state.pending_count + 1)
+
+    def record_attempt_circuit_outcome(
+        self, result: RunResult, *, threshold: int
+    ) -> None:
+        """Open a breaker once a reserved attempt reaches its failure threshold."""
+
+        if threshold < 1:
+            raise ValueError("attempt circuit threshold must be positive")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                attempt = next(
+                    (
+                        record
+                        for record in reversed(records)
+                        if record.get("record_type")
+                        == ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE
+                        and string_value(record.get("run_id")) == result.run_id
+                    ),
+                    None,
+                )
+                if attempt is None:
+                    return
+                inputs = AttemptCircuitInputs(
+                    task_id=string_value(attempt.get("task_id")),
+                    task_revision=string_value(attempt.get("task_revision")),
+                    configuration_revision=string_value(
+                        attempt.get("configuration_revision")
+                    ),
+                    base=string_value(attempt.get("base")),
+                    candidate=string_value(attempt.get("candidate")),
+                    route=string_value(attempt.get("route")),
+                )
+                state = attempt_circuit_state(
+                    records, inputs=inputs, threshold=threshold
+                )
+                if not state.open or not state.blocker_class:
+                    return
+                already_opened = any(
+                    record.get("record_type") == ATTEMPT_CIRCUIT_OPENED_RECORD_TYPE
+                    and _attempt_inputs_match(record, inputs)
+                    and string_value(record.get("blocker_class")) == state.blocker_class
+                    for record in records
+                )
+                if already_opened:
+                    return
+                self._append_record_unlocked(
+                    {
+                        "schema_version": RUN_SCHEMA_VERSION,
+                        "record_type": ATTEMPT_CIRCUIT_OPENED_RECORD_TYPE,
+                        "occurred_at": utc_now_iso(),
+                        "run_id": result.run_id,
+                        "task_id": inputs.task_id,
+                        **inputs.to_json(),
+                        "fingerprint": inputs.fingerprint,
+                        "blocker_class": state.blocker_class,
+                        "attempt_count": state.attempt_count,
+                        "threshold": threshold,
+                        "reason": "unchanged_noncompleted_attempt_threshold",
+                    }
+                )
+
+    def reset_attempt_circuit(
+        self, task_id: str, *, provenance: str = "operator_cli"
+    ) -> None:
+        """Audit an explicit operator reset; no runner path invokes this method."""
+
+        if not task_id:
+            raise ValueError("task id is required for attempt circuit reset")
+        self.append_record(
+            {
+                "schema_version": RUN_SCHEMA_VERSION,
+                "record_type": ATTEMPT_CIRCUIT_RESET_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "task_id": task_id,
+                "provenance": provenance,
+            }
+        )
+
+    def attempt_circuit_states(self, *, threshold: int) -> list[AttemptCircuitState]:
+        """Return currently open durable breakers from compatible journals."""
+
+        records = self.read_records()
+        latest_inputs: dict[str, AttemptCircuitInputs] = {}
+        for record in records:
+            if record.get("record_type") != ATTEMPT_CIRCUIT_ATTEMPT_RECORD_TYPE:
+                continue
+            task_id = string_value(record.get("task_id"))
+            if not task_id:
+                continue
+            latest_inputs[task_id] = AttemptCircuitInputs(
+                task_id=task_id,
+                task_revision=string_value(record.get("task_revision")),
+                configuration_revision=string_value(
+                    record.get("configuration_revision")
+                ),
+                base=string_value(record.get("base")),
+                candidate=string_value(record.get("candidate")),
+                route=string_value(record.get("route")),
+            )
+        return [
+            state
+            for inputs in latest_inputs.values()
+            if (
+                state := attempt_circuit_state(
+                    records, inputs=inputs, threshold=threshold
+                )
+            ).open
+        ]
 
     def append_result(self, result: RunResult) -> None:
         self.append_record(result.to_record())
@@ -954,11 +1313,18 @@ class RunStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
             with append_record_lock(self.path):
-                with self.path.open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps(redacted, separators=(",", ":")) + "\n")
-                    handle.flush()
+                self._append_record_unlocked(redacted)
 
     def read_records(self) -> list[dict[str, Any]]:
+        return self._read_records_unlocked()
+
+    def _append_record_unlocked(self, record: Mapping[str, object]) -> None:
+        redacted = redact_run_record(record)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(redacted, separators=(",", ":")) + "\n")
+            handle.flush()
+
+    def _read_records_unlocked(self) -> list[dict[str, Any]]:
         if not self.path.exists():
             return []
         records: list[dict[str, Any]] = []

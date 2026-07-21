@@ -346,6 +346,16 @@ outcome are journaled append-only as `task_recovery` records in
 `.vibe-loop/runs.jsonl`. Set `supervision.recover_unknown_runs = false` to
 disable recovery and have the supervisor stop on `unknown` as before.
 
+Independent supervisor runs also share a durable per-task attempt circuit. By
+default, three unchanged non-completed implementation attempts with the same
+task revision, selected base/candidate, relevant routing configuration, and
+blocker class open the circuit. Autopilot then records avoided launches instead
+of starting another worker. A changed task/config/candidate starts a new
+evidence epoch; provider and account walls stay on their existing backoff path
+and do not consume this budget. `vibe-loop attempt-circuit status --repo .`
+shows open circuits, and only `vibe-loop attempt-circuit reset TASK-ID --repo .`
+records an operator reset.
+
 ### Worker-side commands
 
 Workers can report status, claim a workspace, and serialize final integration
@@ -881,6 +891,7 @@ cooldown_seconds = 30.0
 recover_unknown_runs = true   # set false to stop on `unknown` instead of launching a continuation worker
 worker_timeout_seconds = 10800.0  # wall-clock cap per worker; its process group is killed and the task returns to runnable. 0 = unbounded
 slice_token_threshold = 100000    # low-change/high-token diagnostic; 0 disables
+cross_run_attempt_threshold = 3   # unchanged non-completed attempts before autopilot withholds launches
 
 [locks]
 type = "directory"

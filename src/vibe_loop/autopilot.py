@@ -299,6 +299,7 @@ class ProjectStatus:
     observations: tuple[str, ...] = ()
     last_cycle: CycleSummary | None = None
     next_wake: str = ""
+    attempt_circuit_breakers: tuple[dict[str, object], ...] = ()
     runtime_context: tuple[tuple[str, str], ...] = ()
     project_binding: ResolvedProjectBinding = dataclasses.field(
         default_factory=ResolvedProjectBinding
@@ -328,6 +329,9 @@ class ProjectStatus:
                 self.last_cycle.to_json() if self.last_cycle is not None else None
             ),
             "next_wake": self.next_wake,
+            "attempt_circuit_breakers": [
+                dict(breaker) for breaker in self.attempt_circuit_breakers
+            ],
         }
         redacted = redact_runtime_context_payload(payload, self.runtime_context)
         assert isinstance(redacted, dict)
@@ -458,6 +462,12 @@ def collect_project_status(
     agent = config.agent.to_json()
     agent_blockers = agent_blocking_diagnostics(config)
     last_cycle = latest_cycle_summary(run_store)
+    attempt_circuit_breakers = tuple(
+        breaker.to_json()
+        for breaker in run_store.attempt_circuit_states(
+            threshold=config.supervision.cross_run_attempt_threshold
+        )
+    )
     supervisor_lock = lock_manager.autopilot_status(process_exists=process_exists)
     supervisor = collect_supervisor_status(
         run_store,
@@ -503,6 +513,7 @@ def collect_project_status(
         observations=observations,
         last_cycle=last_cycle,
         next_wake=last_cycle.next_wake if last_cycle is not None else "",
+        attempt_circuit_breakers=attempt_circuit_breakers,
         runtime_context=config.runtime_context,
         project_binding=project_binding,
     )

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from vibe_loop.orchestration import RunStage, StageTransition
 from vibe_loop.runs import (
     AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
+    ATTEMPT_CIRCUIT_RESET_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
@@ -35,6 +38,7 @@ from vibe_loop.runs import (
     WORKER_REPORT_SCHEMA_VERSION,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
+    AttemptCircuitInputs,
     RunResult,
     RunStore,
     WorkerReport,
@@ -43,6 +47,156 @@ from vibe_loop.runs import (
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_cross_run_attempt_circuit_opens_and_records_avoided_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            inputs = AttemptCircuitInputs(
+                task_id="TASK-01",
+                task_revision="task-a",
+                configuration_revision="config-a",
+                base="base-a",
+                candidate="candidate-a",
+                route="codex:gpt-5",
+            )
+            for index in range(3):
+                run_id = f"run-{index}"
+                self.assertFalse(
+                    store.reserve_attempt_circuit(
+                        run_id=run_id, inputs=inputs, threshold=3
+                    ).open
+                )
+                result = RunResult(
+                    run_id=run_id,
+                    task_id="TASK-01",
+                    classification="failed",
+                    classification_source="worker_exit",
+                    exit_code=1,
+                    log_path=Path("run.log"),
+                    start_main="base-a",
+                    end_main="base-a",
+                )
+                store.append_result(result)
+                store.record_attempt_circuit_outcome(result, threshold=3)
+
+            blocked = store.reserve_attempt_circuit(
+                run_id="run-3", inputs=inputs, threshold=3
+            )
+
+            self.assertTrue(blocked.open)
+            self.assertEqual(blocked.attempt_count, 3)
+            self.assertEqual(blocked.avoided_launches, 1)
+            self.assertEqual(blocked.blocker_class, "failed:worker_exit")
+            self.assertEqual(len(store.attempt_circuit_states(threshold=3)), 1)
+
+    def test_changed_candidate_and_operator_reset_start_new_attempt_epochs(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            old = AttemptCircuitInputs("TASK-01", "task-a", "config-a", "base", "old")
+            for index in range(3):
+                run_id = f"old-{index}"
+                store.reserve_attempt_circuit(run_id=run_id, inputs=old, threshold=3)
+                result = RunResult(
+                    run_id=run_id,
+                    task_id="TASK-01",
+                    classification="blocked",
+                    classification_source="reviewer_verdict",
+                    exit_code=1,
+                    log_path=Path("run.log"),
+                    start_main="base",
+                    end_main="base",
+                )
+                store.append_result(result)
+                store.record_attempt_circuit_outcome(result, threshold=3)
+            self.assertTrue(
+                store.reserve_attempt_circuit(
+                    run_id="old-blocked", inputs=old, threshold=3
+                ).open
+            )
+            changed = dataclasses.replace(old, candidate="new")
+            self.assertFalse(
+                store.reserve_attempt_circuit(
+                    run_id="new-0", inputs=changed, threshold=3
+                ).open
+            )
+
+            store.reset_attempt_circuit("TASK-01")
+
+            self.assertEqual(store.attempt_circuit_states(threshold=3), [])
+            self.assertIn(
+                ATTEMPT_CIRCUIT_RESET_RECORD_TYPE,
+                [record["record_type"] for record in store.read_records()],
+            )
+
+    def test_provider_walls_and_concurrent_observers_do_not_bypass_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            inputs = AttemptCircuitInputs(
+                "TASK-01", "task", "config", "base", "candidate"
+            )
+            for index in range(3):
+                run_id = f"wall-{index}"
+                store.reserve_attempt_circuit(run_id=run_id, inputs=inputs, threshold=3)
+                result = RunResult(
+                    run_id=run_id,
+                    task_id="TASK-01",
+                    classification="limit_wall",
+                    classification_source="limit_wall",
+                    exit_code=1,
+                    log_path=Path("run.log"),
+                    start_main="base",
+                    end_main="base",
+                )
+                store.append_result(result)
+                store.record_attempt_circuit_outcome(result, threshold=3)
+            self.assertFalse(
+                store.reserve_attempt_circuit(
+                    run_id="after-wall", inputs=inputs, threshold=3
+                ).open
+            )
+            after_wall = RunResult(
+                run_id="after-wall",
+                task_id="TASK-01",
+                classification="limit_wall",
+                classification_source="limit_wall",
+                exit_code=1,
+                log_path=Path("run.log"),
+                start_main="base",
+                end_main="base",
+            )
+            store.append_result(after_wall)
+            store.record_attempt_circuit_outcome(after_wall, threshold=3)
+
+            for index in range(2):
+                run_id = f"failure-{index}"
+                store.reserve_attempt_circuit(run_id=run_id, inputs=inputs, threshold=3)
+                result = RunResult(
+                    run_id=run_id,
+                    task_id="TASK-01",
+                    classification="failed",
+                    classification_source="worker_exit",
+                    exit_code=1,
+                    log_path=Path("run.log"),
+                    start_main="base",
+                    end_main="base",
+                )
+                store.append_result(result)
+                store.record_attempt_circuit_outcome(result, threshold=3)
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                states = list(
+                    executor.map(
+                        lambda run_id: store.reserve_attempt_circuit(
+                            run_id=run_id, inputs=inputs, threshold=3
+                        ),
+                        ("concurrent-a", "concurrent-b"),
+                    )
+                )
+
+            self.assertEqual(sum(not state.open for state in states), 1)
+            self.assertEqual(sum(state.open for state in states), 1)
+
     def test_run_result_exposes_public_model_and_effort_aliases(self) -> None:
         result = RunResult(
             run_id="run-effort",

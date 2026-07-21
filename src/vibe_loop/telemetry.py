@@ -1165,6 +1165,72 @@ def _quota_account_wall_summary(
     }
 
 
+def attempt_circuit_breaker_summary(
+    records: Iterable[Mapping[str, object]],
+) -> dict[str, object]:
+    """Summarize durable breaker records without exposing task text or commands."""
+
+    latest_attempt: dict[str, Mapping[str, object]] = {}
+    latest_reset: dict[str, int] = {}
+    opened: list[tuple[int, Mapping[str, object]]] = []
+    avoided: dict[tuple[str, str], int] = defaultdict(int)
+    materialized = list(records)
+    for index, record in enumerate(materialized):
+        task_id = str(record.get("task_id") or "")
+        if not task_id:
+            continue
+        record_type = record.get("record_type")
+        if record_type == "attempt_circuit_reset":
+            latest_reset[task_id] = index
+        elif record_type == "attempt_circuit_attempt":
+            latest_attempt[task_id] = record
+        elif record_type == "attempt_circuit_opened":
+            opened.append((index, record))
+    for index, record in enumerate(materialized):
+        if record.get("record_type") != "attempt_circuit_avoided":
+            continue
+        task_id = str(record.get("task_id") or "")
+        fingerprint = str(record.get("fingerprint") or "")
+        if task_id and index > latest_reset.get(task_id, -1):
+            avoided[(task_id, fingerprint)] += 1
+    open_breakers: list[dict[str, object]] = []
+    for index, record in opened:
+        task_id = str(record.get("task_id") or "")
+        fingerprint = str(record.get("fingerprint") or "")
+        if not task_id or index <= latest_reset.get(task_id, -1):
+            continue
+        current = latest_attempt.get(task_id)
+        if current is None or str(current.get("fingerprint") or "") != fingerprint:
+            continue
+        open_breakers.append(
+            {
+                "task_id": task_id,
+                "fingerprint": fingerprint,
+                "fingerprint_inputs": {
+                    key: record.get(key, "")
+                    for key in (
+                        "task_revision",
+                        "configuration_revision",
+                        "base",
+                        "candidate",
+                        "route",
+                    )
+                },
+                "attempt_count": int(record.get("attempt_count") or 0),
+                "threshold": int(record.get("threshold") or 0),
+                "blocker_class": str(record.get("blocker_class") or ""),
+                "opening_reason": str(record.get("reason") or ""),
+                "opened_at": str(record.get("occurred_at") or ""),
+                "avoided_launches": avoided[(task_id, fingerprint)],
+            }
+        )
+    return {
+        "open": sorted(open_breakers, key=lambda item: str(item["task_id"])),
+        "open_count": len(open_breakers),
+        "avoided_launches": sum(item["avoided_launches"] for item in open_breakers),
+    }
+
+
 def rolling_usage_summary(
     records: Iterable[Mapping[str, object]],
     *,
@@ -1175,9 +1241,10 @@ def rolling_usage_summary(
 ) -> dict[str, object]:
     current = now or datetime.now(UTC)
     since = current - timedelta(hours=hours)
+    all_records = list(records)
     recent = [
         record
-        for record in records
+        for record in all_records
         if (
             timestamp := parse_timestamp(
                 record.get("finished_at") or record.get("occurred_at")
@@ -1486,5 +1553,6 @@ def rolling_usage_summary(
         "until": current.isoformat(),
         "groups": [groups[key] for key in sorted(groups)],
         "quota_account_wall": _quota_account_wall_summary(recent),
+        "attempt_circuit_breakers": attempt_circuit_breaker_summary(all_records),
         "diagnostics": diagnostics,
     }

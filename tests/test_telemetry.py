@@ -895,6 +895,48 @@ def test_runs_summary_text_separates_quota_account_wall(tmp_path: Path, capsys) 
     assert "quota_unavailable_reason=quota_snapshot_not_reported" in output.out
 
 
+def test_rolling_summary_exposes_open_attempt_breakers_without_task_text() -> None:
+    now = datetime.now(UTC)
+    records = [
+        {
+            "record_type": "attempt_circuit_attempt",
+            "occurred_at": now.isoformat(),
+            "task_id": "TASK-01",
+            "fingerprint": "fingerprint-a",
+        },
+        {
+            "record_type": "attempt_circuit_opened",
+            "occurred_at": now.isoformat(),
+            "task_id": "TASK-01",
+            "fingerprint": "fingerprint-a",
+            "task_revision": "task-revision",
+            "configuration_revision": "config-revision",
+            "base": "base",
+            "candidate": "candidate",
+            "route": "codex:gpt-5",
+            "blocker_class": "failed:worker_exit",
+            "attempt_count": 3,
+            "threshold": 3,
+            "reason": "unchanged_noncompleted_attempt_threshold",
+            "prompt": "must not be surfaced",
+        },
+        {
+            "record_type": "attempt_circuit_avoided",
+            "occurred_at": now.isoformat(),
+            "task_id": "TASK-01",
+            "fingerprint": "fingerprint-a",
+        },
+    ]
+
+    summary = rolling_usage_summary(records, project="demo", now=now)
+
+    breaker = summary["attempt_circuit_breakers"]["open"][0]
+    assert summary["attempt_circuit_breakers"]["open_count"] == 1
+    assert breaker["avoided_launches"] == 1
+    assert breaker["blocker_class"] == "failed:worker_exit"
+    assert "prompt" not in breaker
+
+
 class TelemetryUnittestCoverage(unittest.TestCase):
     def test_provider_usage_fixture_matrix(self) -> None:
         cases = (

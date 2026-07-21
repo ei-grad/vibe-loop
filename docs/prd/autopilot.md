@@ -29,6 +29,20 @@ safe to ship and to surface in a future shared dashboard.
 
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-05`.
 
+## PRD-AUT-002a Cross-Run Attempt Circuit Breaker
+
+Autopilot must not let fresh run IDs, supervisor recovery, or task-source
+resets repeatedly spend implementation capacity on unchanged evidence. It
+records an append-only attempt identity containing only revision digests and
+safe base/candidate/routing labels. After the configurable threshold (default
+three) of non-completed attempts with the same task revision, candidate/base,
+relevant configuration, and blocker class, it withholds further launches until
+that fingerprint changes or an explicit operator reset is journaled. Provider
+or account walls use their existing backoff and never consume the attempt
+budget. Status and `runs summary` expose breaker state, safe fingerprint
+inputs, opening reason, reset provenance, and avoided-launch counts without
+task prompts, commands, credentials, or fencing values.
+
 ## PRD-AUT-002 Command Surface
 
 The CLI must expose autopilot through a subcommand group:

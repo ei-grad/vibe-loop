@@ -547,6 +547,26 @@ def build_parser() -> argparse.ArgumentParser:
     runs_summary.add_argument("--json", action="store_true")
     runs_summary.add_argument("--hours", type=float, default=24.0)
 
+    attempt_circuit = subparsers.add_parser(
+        "attempt-circuit", help="Inspect or explicitly reset task attempt breakers"
+    )
+    add_repo_argument(attempt_circuit)
+    attempt_circuit.add_argument("--json", action="store_true")
+    attempt_circuit_subparsers = attempt_circuit.add_subparsers(
+        dest="attempt_circuit_command", required=True
+    )
+    attempt_circuit_status = attempt_circuit_subparsers.add_parser(
+        "status", help="Show open cross-run attempt breakers"
+    )
+    add_repo_argument(attempt_circuit_status)
+    attempt_circuit_status.add_argument("--json", action="store_true")
+    attempt_circuit_reset = attempt_circuit_subparsers.add_parser(
+        "reset", help="Record an explicit operator reset for one task breaker"
+    )
+    add_repo_argument(attempt_circuit_reset)
+    attempt_circuit_reset.add_argument("task_id")
+    attempt_circuit_reset.add_argument("--json", action="store_true")
+
     integration = subparsers.add_parser(
         "main-integration",
         help="Manage the advisory main integration lock",
@@ -930,6 +950,9 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "runs":
         return dispatch_runs(args, config)
 
+    if args.command == "attempt-circuit":
+        return dispatch_attempt_circuit(args, config)
+
     if args.command == "main-integration":
         return dispatch_main_integration(args, config)
 
@@ -1085,6 +1108,33 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
         return 0
 
     raise AssertionError(args.runs_command)
+
+
+def dispatch_attempt_circuit(args: argparse.Namespace, config) -> int:
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    if args.attempt_circuit_command == "reset":
+        run_store.reset_attempt_circuit(args.task_id)
+    breakers = [
+        breaker.to_json()
+        for breaker in run_store.attempt_circuit_states(
+            threshold=config.supervision.cross_run_attempt_threshold
+        )
+    ]
+    payload = {"open": breakers, "open_count": len(breakers)}
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    elif breakers:
+        for breaker in breakers:
+            print(
+                f"{breaker['task_id']}\t{breaker['attempt_count']}/"
+                f"{breaker['threshold']}\t{breaker['blocker_class']}\t"
+                f"avoided={breaker['avoided_launches']}"
+            )
+    elif args.attempt_circuit_command == "reset":
+        print(f"attempt circuit reset recorded for {args.task_id}")
+    else:
+        print("No open attempt circuits.")
+    return 0
 
 
 def redacted_task_source_report(report: dict[str, object]) -> dict[str, object]:
@@ -1462,6 +1512,15 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             lines.append(f"planning backoff: {cycle.planning_backoff_action}")
     if status.next_wake:
         lines.append(f"next wake: {status.next_wake}")
+    if status.attempt_circuit_breakers:
+        lines.append("attempt circuit breakers:")
+        for breaker in status.attempt_circuit_breakers:
+            lines.append(
+                "  - "
+                f"{breaker['task_id']} {breaker['attempt_count']}/"
+                f"{breaker['threshold']} blocker={breaker['blocker_class']} "
+                f"avoided={breaker['avoided_launches']}"
+            )
     return "\n".join(lines)
 
 
@@ -2518,6 +2577,13 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
         f"project: {summary['project']}",
         f"window: {summary['window_hours']}h",
     ]
+    breaker_summary = summary.get("attempt_circuit_breakers")
+    if isinstance(breaker_summary, Mapping):
+        lines.append(
+            "attempt-circuit-breakers: "
+            f"open={breaker_summary.get('open_count', 0)} "
+            f"avoided_launches={breaker_summary.get('avoided_launches', 0)}"
+        )
     groups = summary.get("groups")
     if isinstance(groups, list):
         for group in groups:

@@ -76,6 +76,7 @@ from vibe_loop.retry import (
     retry_subprocess_run,
 )
 from vibe_loop.runs import (
+    AttemptCircuitInputs,
     LIFECYCLE_EVENT_SCHEMA_VERSION,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
@@ -580,6 +581,18 @@ class SchedulerLockBusy(RuntimeError):
     def __init__(self, path: Path):
         self.path = path
         super().__init__(f"resource scheduler lock is busy: {path}")
+
+
+class AttemptCircuitOpen(RuntimeError):
+    """A task has exhausted unchanged cross-run implementation attempts."""
+
+    def __init__(self, state) -> None:
+        self.state = state
+        super().__init__(
+            "attempt circuit open for "
+            f"{state.task_id}: {state.attempt_count}/{state.threshold} "
+            f"{state.blocker_class or 'noncompleted'} attempts"
+        )
 
 
 class TaskActivationError(RuntimeError):
@@ -2041,6 +2054,22 @@ class VibeRunner:
                     )
 
         try:
+            circuit_inputs = attempt_circuit_inputs(
+                task,
+                self.config,
+                base=base_main,
+                candidate=start_main,
+                agent=agent,
+                profile=agent_profile,
+            )
+            circuit_state = self.run_store.reserve_attempt_circuit(
+                run_id=run_id,
+                inputs=circuit_inputs,
+                threshold=self.config.supervision.cross_run_attempt_threshold,
+            )
+            if circuit_state.open:
+                self._reset_task_source_status(task.task_id)
+                raise AttemptCircuitOpen(circuit_state)
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(
                     log,
@@ -2729,6 +2758,15 @@ class VibeRunner:
                 task,
                 restart_count=restart_count,
             )
+        except AttemptCircuitOpen as exc:
+            report_status(str(exc))
+            excluded = set(exclude or set())
+            excluded.add(task.task_id)
+            return self.run_next(
+                ask_agent=ask_agent,
+                exclude=excluded,
+                restart_counts=restart_counts,
+            )
         except LockBusy:
             report_status(f"task locked during acquire, retrying: {task.task_id}")
             excluded = set(exclude or set())
@@ -3044,6 +3082,10 @@ class VibeRunner:
                             "scheduler lock busy during acquire, skipping: "
                             f"{task_id} path={exc.path}"
                         )
+                        skipped.add(task_id)
+                        continue
+                    except AttemptCircuitOpen as exc:
+                        report_status(str(exc))
                         skipped.add(task_id)
                         continue
                     except LockBusy:
@@ -3379,6 +3421,9 @@ class VibeRunner:
         )
         try:
             result = self.run_task(task, recovery=recovery)
+        except AttemptCircuitOpen as exc:
+            report_status(str(exc))
+            return None
         except LockBusy:
             report_status(
                 "unknown-run recovery deferred: task locked during acquire: "
@@ -3484,6 +3529,10 @@ class VibeRunner:
     def record_result(self, result: RunResult) -> None:
         with self._record_lock:
             self.run_store.append_result(result)
+            self.run_store.record_attempt_circuit_outcome(
+                result,
+                threshold=self.config.supervision.cross_run_attempt_threshold,
+            )
 
     def _report_limit_wall_pause(self, result: RunResult) -> None:
         detail = (result.message or "").strip()
@@ -3516,8 +3565,15 @@ class VibeRunner:
         self._reset_task_source_status(result.task_id)
 
     def _reset_task_source_status(self, task_id: str) -> None:
+        reset_hook = getattr(self.source, "reset", None)
+        if reset_hook is None:
+            report_status(
+                f"task-source reset hook unavailable for {task_id}; "
+                "leaving backend status unchanged"
+            )
+            return
         try:
-            reset = self.source.reset(task_id)
+            reset = reset_hook(task_id)
         except (subprocess.SubprocessError, OSError) as exc:
             report_status(
                 f"task-source reset hook failed for {task_id}: {exc}; "
@@ -6246,6 +6302,61 @@ def redact_worker_stream_line(line: str, fencing_token: str) -> str:
         return line
     newline = "\n" if line.endswith("\n") else ""
     return json.dumps(redacted, separators=(",", ":")) + newline
+
+
+def attempt_circuit_inputs(
+    task: Task,
+    config: VibeConfig,
+    *,
+    base: str,
+    candidate: str,
+    agent: AgentConfig,
+    profile: str,
+) -> AttemptCircuitInputs:
+    """Build a redaction-safe identity for cross-run attempt accounting."""
+
+    task_payload = task.to_json()
+    task_payload.pop("status", None)
+    task_payload.pop("order", None)
+    task_revision = _circuit_digest(task_payload)
+    configuration_revision = _circuit_digest(
+        {
+            "supervision": config.supervision.to_json(),
+            "agent": {
+                "kind": agent.agent_kind,
+                "executable_kind": agent.executable_kind,
+                "model": agent.model,
+                "effort": agent.effort,
+                "prompt_dialect": agent.prompt_dialect,
+                "skill_ref_prefix": agent.skill_ref_prefix,
+            },
+            "profile": profile,
+            "task_source": {
+                "type": config.task_source.type,
+                "runnable_statuses": list(config.task_source.runnable_statuses),
+            },
+        }
+    )
+    route = ":".join(
+        value
+        for value in (profile, agent.agent_kind, agent.executable_kind, agent.model)
+        if value
+    )
+    return AttemptCircuitInputs(
+        task_id=task.task_id,
+        task_revision=task_revision,
+        configuration_revision=configuration_revision,
+        base=base,
+        candidate=candidate,
+        route=route,
+    )
+
+
+def _circuit_digest(value: Mapping[str, object]) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(encoded.encode("utf-8", "replace")).hexdigest()[:24]
 
 
 def new_run_id(task_id: str) -> str:
