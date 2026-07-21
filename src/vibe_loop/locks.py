@@ -260,7 +260,7 @@ class LockManager:
             # best effort: when it also fails the lock stays held with no local
             # witness, and that outcome is surfaced rather than swallowed.
             try:
-                self.backend.release(task_lock)
+                self.release(task_lock)
             except (
                 LockBackendError,
                 LockOwnerMismatch,

@@ -470,38 +470,28 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
             )
 
     def test_compensation_mismatch_cannot_replace_the_witness_failure(self) -> None:
-        def owner_mismatch(path: Path) -> BaseException:
-            return locks.LockOwnerMismatch(
-                path,
-                {"run_id": "other-run"},
-                run_id="run-1",
-                task_id="TASK-1",
-            )
-
-        def fencing_mismatch(path: Path) -> BaseException:
-            return locks.LockFencingMismatch(
-                path,
-                {"fencing_token": "9"},
-                expected_token="1",
-                actual_token="9",
-            )
-
-        for name, build_error in (
-            ("owner", owner_mismatch),
-            ("fencing", fencing_mismatch),
+        for name, field, replacement, expected_error in (
+            ("owner", "run_id", "other-run", locks.LockOwnerMismatch),
+            ("fencing", "fencing_token", "9", locks.LockFencingMismatch),
         ):
             with self.subTest(mismatch=name):
-
-                class MismatchingReleaseBackend(locks.DirectoryLockBackend):
-                    def release(self, task_lock: locks.TaskLock) -> None:
-                        raise build_error(self.path_for(task_lock.task_id))
-
                 with tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
-                    backend = MismatchingReleaseBackend(root)
+                    backend = locks.DirectoryLockBackend(root)
                     manager = locks.LockManager(root, backend=backend)
 
-                    with self._witness_failure():
+                    def replace_lock_owner(*_args: object) -> None:
+                        path = backend.path_for("TASK-1")
+                        current = locks.read_metadata(path)
+                        current[field] = replacement
+                        locks.write_metadata(path, current)
+                        raise OSError("witness volume offline")
+
+                    with patch.object(
+                        locks,
+                        "record_acquired_fencing_token",
+                        side_effect=replace_lock_owner,
+                    ):
                         with self.assertRaises(
                             locks.LockWitnessCompensationError
                         ) as caught:
@@ -510,12 +500,13 @@ class AcquireWitnessCompensationTests(unittest.TestCase):
                     error = caught.exception
                     self.assertIs(error.witness_error, error.__cause__)
                     self.assertIn("witness volume offline", error.witness_detail)
-                    self.assertIn(
-                        type(build_error(root)).__name__,
-                        error.release_detail,
-                    )
+                    self.assertIsInstance(error.release_error, expected_error)
+                    self.assertIn(expected_error.__name__, error.release_detail)
                     self.assertIn("may remain held", str(error))
-                    self.assertIsNotNone(backend.status("TASK-1"))
+                    self.assertTrue(backend.path_for("TASK-1").exists())
+                    self.assertEqual(
+                        (backend.status("TASK-1") or {}).get(field), replacement
+                    )
 
     def test_unlabelled_low_entropy_generation_is_redacted(self) -> None:
         class BareGenerationReleaseBackend(locks.DirectoryLockBackend):
