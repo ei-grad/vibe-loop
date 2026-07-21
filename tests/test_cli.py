@@ -2146,6 +2146,12 @@ class CliTests(unittest.TestCase):
             sorted(reserve["explicit_keys"]),
             ["min_free_bytes", "min_free_fraction"],
         )
+        # Effective floors surface the values actually enforced, including the
+        # native defaults substituted for unset overrides.
+        self.assertEqual(reserve["effective"]["min_free_bytes"], 8589934592)
+        self.assertEqual(reserve["effective"]["min_free_fraction"], 0.05)
+        self.assertEqual(reserve["effective"]["min_free_inodes"], 10000)
+        self.assertEqual(reserve["effective"]["min_free_inode_fraction"], 0.02)
 
     def test_doctor_reports_spec_diagnostics_without_running_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

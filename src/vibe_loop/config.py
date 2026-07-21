@@ -245,6 +245,14 @@ DISK_RESERVE_CONFIG_KEYS = frozenset(
         "min_free_inode_fraction",
     }
 )
+# Native disk-health floors (the reviewed AUTO-15 defaults). A target is a
+# genuine capacity blocker only when BOTH the absolute and the proportional
+# floor of an axis are exhausted. These are the single source of truth for the
+# defaults; autopilot.DiskHealthThresholds aliases them.
+DISK_RESERVE_DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024
+DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION = 0.02
+DISK_RESERVE_DEFAULT_MIN_FREE_INODES = 10_000
+DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION = 0.02
 # Six hours between planning attempts once planning stops producing actionable
 # work, capped at four launches a rolling day: an analysis plus authoring pass
 # costs real provider spend, and repeating it on the ordinary supervisor
@@ -709,12 +717,45 @@ class DiskReserveConfig:
     def is_explicit(self, key: str) -> bool:
         return key in self.explicit_keys
 
+    @property
+    def effective_min_free_bytes(self) -> int:
+        if self.min_free_bytes is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
+        return self.min_free_bytes
+
+    @property
+    def effective_min_free_fraction(self) -> float:
+        if self.min_free_fraction is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
+        return self.min_free_fraction
+
+    @property
+    def effective_min_free_inodes(self) -> int:
+        if self.min_free_inodes is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_INODES
+        return self.min_free_inodes
+
+    @property
+    def effective_min_free_inode_fraction(self) -> float:
+        if self.min_free_inode_fraction is None:
+            return DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION
+        return self.min_free_inode_fraction
+
     def to_json(self) -> dict[str, object]:
         return {
             "min_free_bytes": self.min_free_bytes,
             "min_free_fraction": self.min_free_fraction,
             "min_free_inodes": self.min_free_inodes,
             "min_free_inode_fraction": self.min_free_inode_fraction,
+            # Effective floors actually enforced by the cycle: the configured
+            # override, or the native default when unset. Doctor/status show
+            # these so an operator sees the values in force, not just overrides.
+            "effective": {
+                "min_free_bytes": self.effective_min_free_bytes,
+                "min_free_fraction": self.effective_min_free_fraction,
+                "min_free_inodes": self.effective_min_free_inodes,
+                "min_free_inode_fraction": self.effective_min_free_inode_fraction,
+            },
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -2032,40 +2073,36 @@ def parse_disk_reserve(data: object) -> DiskReserveConfig:
         table.get("min_free_inode_fraction"),
         "autopilot.disk_reserve.min_free_inode_fraction",
     )
-    reject_contradictory_reserve_pair(
-        ("min_free_bytes", min_free_bytes),
-        ("min_free_fraction", min_free_fraction),
-        explicit_keys,
-    )
-    reject_contradictory_reserve_pair(
-        ("min_free_inodes", min_free_inodes),
-        ("min_free_inode_fraction", min_free_inode_fraction),
-        explicit_keys,
-    )
-    return DiskReserveConfig(
+    reserve = DiskReserveConfig(
         min_free_bytes=min_free_bytes,
         min_free_fraction=min_free_fraction,
         min_free_inodes=min_free_inodes,
         min_free_inode_fraction=min_free_inode_fraction,
         explicit_keys=explicit_keys,
     )
+    reject_contradictory_reserve_pair(
+        ("min_free_bytes", reserve.effective_min_free_bytes),
+        ("min_free_fraction", reserve.effective_min_free_fraction),
+    )
+    reject_contradictory_reserve_pair(
+        ("min_free_inodes", reserve.effective_min_free_inodes),
+        ("min_free_inode_fraction", reserve.effective_min_free_inode_fraction),
+    )
+    return reserve
 
 
 def reject_contradictory_reserve_pair(
-    absolute: tuple[str, int | None],
-    proportional: tuple[str, float | None],
-    explicit_keys: frozenset[str],
+    absolute: tuple[str, int | float],
+    proportional: tuple[str, int | float],
 ) -> None:
     # A blocker fires only when both the absolute and the proportional floor of
-    # an axis are exhausted, so a positive reserve paired with an explicit zero
-    # reserve on the same axis can never block. Flag that only when the operator
-    # explicitly configured both values; an omitted companion keeps its native
-    # positive default and is not a contradiction.
-    (name_a, value_a) = absolute
-    (name_b, value_b) = proportional
-    if name_a not in explicit_keys or name_b not in explicit_keys:
-        return
-    if (value_a == 0) != (value_b == 0):
+    # an axis are exhausted, so a positive reserve paired with a zero reserve on
+    # the same axis can never block. Validate the *effective* pair (override or
+    # native default), so a lone explicit zero that silently disables an axis is
+    # rejected while a fully zeroed (intentionally disabled) axis stays valid.
+    (name_a, effective_a) = absolute
+    (name_b, effective_b) = proportional
+    if (effective_a == 0) != (effective_b == 0):
         raise ValueError(
             f"autopilot.disk_reserve.{name_a} and .{name_b} are contradictory: "
             "a positive reserve paired with a zero reserve can never block launch"

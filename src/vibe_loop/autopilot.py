@@ -21,6 +21,10 @@ from typing import Any, BinaryIO
 
 from vibe_loop.config import (
     AgentResolutionError,
+    DISK_RESERVE_DEFAULT_MIN_FREE_BYTES,
+    DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION,
+    DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION,
+    DISK_RESERVE_DEFAULT_MIN_FREE_INODES,
     REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES,
     REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES,
     RUNTIME_CONTEXT_REDACTION,
@@ -3411,10 +3415,10 @@ def run_maintenance_command(
 # a proportional reserve are exhausted, so a large disk with a low percentage
 # but ample bytes, and a small disk low on bytes but proportionally roomy, are
 # not misreported as capacity failures.
-AUTOPILOT_DISK_MIN_FREE_BYTES = 512 * 1024 * 1024
-AUTOPILOT_DISK_MIN_FREE_FRACTION = 0.02
-AUTOPILOT_DISK_MIN_FREE_INODES = 10_000
-AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION = 0.02
+AUTOPILOT_DISK_MIN_FREE_BYTES = DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
+AUTOPILOT_DISK_MIN_FREE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
+AUTOPILOT_DISK_MIN_FREE_INODES = DISK_RESERVE_DEFAULT_MIN_FREE_INODES
+AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION
 DISK_HEALTH_OK = "ok"
 DISK_HEALTH_CRITICAL = "critical"
 AUTOPILOT_DISK_CAPACITY_BLOCKER = "autopilot_disk_capacity_low"
@@ -3450,26 +3454,10 @@ def disk_health_thresholds_for(config: VibeConfig) -> DiskHealthThresholds:
     """
     reserve = config.autopilot.disk_reserve
     return DiskHealthThresholds(
-        min_free_bytes=(
-            AUTOPILOT_DISK_MIN_FREE_BYTES
-            if reserve.min_free_bytes is None
-            else reserve.min_free_bytes
-        ),
-        min_free_fraction=(
-            AUTOPILOT_DISK_MIN_FREE_FRACTION
-            if reserve.min_free_fraction is None
-            else reserve.min_free_fraction
-        ),
-        min_free_inodes=(
-            AUTOPILOT_DISK_MIN_FREE_INODES
-            if reserve.min_free_inodes is None
-            else reserve.min_free_inodes
-        ),
-        min_free_inode_fraction=(
-            AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION
-            if reserve.min_free_inode_fraction is None
-            else reserve.min_free_inode_fraction
-        ),
+        min_free_bytes=reserve.effective_min_free_bytes,
+        min_free_fraction=reserve.effective_min_free_fraction,
+        min_free_inodes=reserve.effective_min_free_inodes,
+        min_free_inode_fraction=reserve.effective_min_free_inode_fraction,
     )
 
 

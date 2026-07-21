@@ -656,12 +656,15 @@ min_free_inodes = 10000            # absolute free-inode floor
 min_free_inode_fraction = 0.02     # 2% proportional free-inode floor
 ```
 
-Values must be non-negative and finite, fractions must fall in `[0.0, 1.0]`, and
-a positive absolute reserve paired with an explicit zero proportional reserve on
-the same axis (or the reverse) is rejected as contradictory because the paired
-floors can then never both be exhausted. With the 8 GiB byte floor above, a
-sample of 3.4 GiB free on a 242 GiB volume blocks launch even though the native
-512 MiB floor would record it as `ok`.
+Values must be non-negative and finite, and fractions must fall in `[0.0, 1.0]`.
+Validation resolves each axis to its *effective* pair (the override, or the
+native default when unset) and rejects a zero floor paired with a positive one
+as contradictory, because a blocker fires only when both floors of an axis are
+exhausted. To intentionally disable an axis, zero *both* of its floors; a lone
+zero — even against an unset companion that keeps its positive default — is
+refused. With the 8 GiB byte floor above, a sample of 3.4 GiB free on a 242 GiB
+volume blocks launch even though the native 512 MiB floor would record it as
+`ok`.
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, an unavailable agent command, or exhausted disk/inode capacity. `--once` runs one cycle. Without `--interval`, it drains runnable

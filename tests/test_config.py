@@ -683,6 +683,8 @@ class ConfigTests(unittest.TestCase):
         payload = config.autopilot.to_json()["disk_reserve"]
         self.assertEqual(payload["min_free_bytes"], 8589934592)
         self.assertEqual(payload["min_free_fraction"], 0.05)
+        self.assertEqual(payload["effective"]["min_free_bytes"], 8589934592)
+        self.assertEqual(payload["effective"]["min_free_inodes"], 50000)
         self.assertEqual(
             sorted(payload["explicit_keys"]),
             [
@@ -692,6 +694,9 @@ class ConfigTests(unittest.TestCase):
                 "min_free_inodes",
             ],
         )
+        # Effective floors resolve overrides for the runtime and doctor output.
+        self.assertEqual(reserve.effective_min_free_bytes, 8589934592)
+        self.assertEqual(reserve.effective_min_free_inode_fraction, 0.03)
 
     def test_autopilot_disk_reserve_defaults_to_unset(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -703,6 +708,11 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(reserve.min_free_inodes)
         self.assertIsNone(reserve.min_free_inode_fraction)
         self.assertEqual(reserve.explicit_keys, frozenset())
+        # Unset overrides resolve to the native AUTO-15 defaults.
+        self.assertEqual(reserve.effective_min_free_bytes, 512 * 1024 * 1024)
+        self.assertEqual(reserve.effective_min_free_fraction, 0.02)
+        self.assertEqual(reserve.effective_min_free_inodes, 10_000)
+        self.assertEqual(reserve.effective_min_free_inode_fraction, 0.02)
 
     def test_autopilot_disk_reserve_rejects_invalid_values(self) -> None:
         cases = [
@@ -740,6 +750,20 @@ class ConfigTests(unittest.TestCase):
             ),
             (
                 "min_free_inodes = 0\nmin_free_inode_fraction = 0.02\n",
+                "are contradictory",
+            ),
+            # A lone explicit zero silently disables an axis against a positive
+            # native default; the resolved effective pair must be rejected.
+            (
+                "min_free_fraction = 0.0\n",
+                "are contradictory",
+            ),
+            (
+                "min_free_bytes = 0\n",
+                "are contradictory",
+            ),
+            (
+                "min_free_inode_fraction = 0.0\n",
                 "are contradictory",
             ),
         ]
