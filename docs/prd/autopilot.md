@@ -843,12 +843,35 @@ and reported-cost values live in versioned `stats`, alongside recognized raw
 provider numeric fields and an explicit source/version. Missing and malformed
 usage have a typed reason.
 
+Codex quota windows are emitted in the local rollout `token_count` events, not
+the ordinary `codex exec --json` stdout stream. Once stdout supplies the native
+session id, collection resolves that rollout locally, prefers cumulative
+`total_token_usage` over last-call usage, and retains a bounded history of
+quota observations. Neither the rollout path nor raw rollout records enter
+telemetry.
+
 Telemetry records reject prompts, credentials, fencing values, command
 payloads, and transcript content at persistence. Normalized numeric fields stay
 compatible with Loopyard's existing `runs sync` ingestion. Rolling summaries
 group durable provenance by project, provider, model, and phase and report
 launch/productivity ratios plus typed budget diagnostics; diagnostics never
 switch providers.
+
+Rolling summaries preserve those raw groups and add a separate provider quota
+and account-wall view. Provider dimensions remain distinct: fresh input, cache
+read, cache creation, output/reasoning output, reported cost, launches,
+attempts, productive completions, and worker-minutes are not converted to a
+universal token price. Gross and fresh-input usage per landed task are reported
+separately.
+
+Native quota evidence is limited to a bounded scope, window label, used
+percentage, window duration, reset time, and observation time. Plan, credit,
+account, command, prompt, credential, fencing, and transcript fields are not
+persisted. Evidence availability is explicit. Forecasting requires two
+increasing observations for the same provider, scope, window duration, and
+reset timestamp; providers and reset windows are never combined. Missing or
+malformed evidence does not produce an inferred quota from transcript bytes or
+token totals.
 
 Worker usage defaults to implementation. An allowlisted `phase` and optional
 `review` or `discovery` `work_kind` from the terminal worker report can refine
@@ -857,7 +880,17 @@ formatted analysis and authoring commands, falls back to the configured model,
 and measures the full planning wall time. Retry ordinals are normalized to
 restart events before aggregation.
 
+Quota activity distinguishes implementation, review, resumed review, planning,
+validation, remediation, integration, failed attempts, and restarted attempts.
+Repeated unchanged-candidate review in new sessions and repeated failed
+attempts are avoidable-burn diagnostics. Same-session review continuation is a
+separate informational diagnostic. Telemetry does not switch providers or
+reset quota in response.
+
 Acceptance covers Claude and Codex present/missing/malformed/limit-wall
-fixtures, run-record and Loopyard-compatible stats round trips, phase-aware
-rolling summaries, low-change/high-token detection, same-session continuation,
-redaction, and existing run-result consumers.
+fixtures, cache-present/cache-absent and reported-cost cases, bounded quota
+snapshots, malformed snapshots, reset-window changes, unavailable account-wall
+evidence, run-record and Loopyard-compatible stats round trips, phase-aware
+rolling summaries, forecast arithmetic, low-change/high-token detection,
+same-session continuation versus new-session re-review, redaction, and existing
+run-result consumers.

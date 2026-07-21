@@ -104,6 +104,19 @@ class RunStoreTests(unittest.TestCase):
                     "reasoning_output_tokens": 2,
                     "prompt": "PROMPT CANARY",
                 },
+                "quota_evidence_available": True,
+                "quota_snapshots": [
+                    {
+                        "provider": "openai",
+                        "scope": "codex",
+                        "window": "primary",
+                        "observed_at": "2026-05-09T00:00:00Z",
+                        "used_percent": 25,
+                        "window_minutes": 300,
+                        "resets_at": 1778292000,
+                        "command": "PRIVATE COMMAND",
+                    }
+                ],
                 "prompt": "PROMPT CANARY",
                 "credential": "sk-secret-canary",
                 "token": "TOKEN CANARY",
@@ -131,6 +144,18 @@ class RunStoreTests(unittest.TestCase):
                     "input_tokens": 12,
                     "reasoning_output_tokens": 2,
                 },
+                "quota_evidence_available": True,
+                "quota_snapshots": [
+                    {
+                        "provider": "openai",
+                        "scope": "codex",
+                        "window": "primary",
+                        "observed_at": "2026-05-09T00:00:00+00:00",
+                        "used_percent": 25.0,
+                        "window_minutes": 300,
+                        "resets_at": 1778292000,
+                    }
+                ],
             },
         )
         encoded = json.dumps(payload)
@@ -139,6 +164,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertNotIn("TOKEN CANARY", encoded)
         self.assertNotIn("FENCING CANARY", encoded)
         self.assertNotIn("TRANSCRIPT CANARY", encoded)
+        self.assertNotIn("PRIVATE COMMAND", encoded)
 
     def test_run_result_stats_reject_malformed_provenance_values(self) -> None:
         result = RunResult(
@@ -156,6 +182,19 @@ class RunStoreTests(unittest.TestCase):
                 "usage_source": ["native:provider"],
                 "candidate_fingerprint": ["FENCING CANARY"],
                 "provider_usage": {"input_tokens": 7, "secret": "TOKEN CANARY"},
+                "quota_evidence_available": True,
+                "quota_unavailable_reason": "malformed_quota_snapshot",
+                "quota_snapshots": [
+                    {
+                        "provider": "openai",
+                        "scope": "sk-secret-canary",
+                        "window": "primary",
+                        "observed_at": "PROMPT CANARY",
+                        "used_percent": 10,
+                        "window_minutes": 300,
+                        "resets_at": 1778292000,
+                    }
+                ],
             },
         )
 
@@ -164,7 +203,14 @@ class RunStoreTests(unittest.TestCase):
             RunStore(path).append_result(result)
             payload = RunStore(path).read_records()[0]
 
-        self.assertEqual(payload["stats"], {"provider_usage": {"input_tokens": 7}})
+        self.assertEqual(
+            payload["stats"],
+            {
+                "provider_usage": {"input_tokens": 7},
+                "quota_evidence_available": False,
+                "quota_unavailable_reason": "malformed_quota_snapshot",
+            },
+        )
         encoded = json.dumps(payload)
         for canary in (
             "PROMPT CANARY",

@@ -226,9 +226,13 @@ For recognized Codex and Claude worker commands, the supervisor requests the
 native structured result stream (`codex exec --json` or Claude
 `--output-format stream-json --verbose`). Codex `thread.started` events provide
 the native session id; Codex still has no forced-session flag or resolved local
-transcript path. Custom commands keep their configured output mode. The wrapper
-log retains the provider stream, while run telemetry copies only recognized
-numeric usage fields and fixed provenance labels.
+transcript path in run provenance. After observing that id, the supervisor may
+read its local Codex rollout JSONL for cumulative numeric token counts and
+bounded quota-window snapshots that are not present in `codex exec --json`
+stdout. The rollout path and raw records are not persisted. Custom commands keep
+their configured output mode. The wrapper log retains the provider stream,
+while run telemetry copies only recognized numeric usage fields and fixed
+provenance labels.
 
 #### Provider usage telemetry
 
@@ -256,6 +260,29 @@ completed runs, immediate failures, restarts, worker-minutes, token/cache/cost
 totals, tasks created/landed, per-productive-task ratios, and typed budget
 diagnostics. Only phases with durable provenance are reported; no provider is
 switched automatically.
+
+The summary also has a separate `quota_account_wall` section. It does not apply
+a universal token price across providers. For each provider it reports fresh
+input, cache reads, cache creation, output/reasoning output, reported cost,
+launches, attempts, productive completions, worker-minutes, gross usage per
+landed task, and fresh input per landed task. OpenAI fresh input subtracts its
+cached-input subset; Anthropic input is already separate from cache reads and
+cache creation. The original raw counters remain in the phase groups.
+
+When a native event exposes a quota snapshot, telemetry retains only the quota
+scope, primary/secondary window label, used percentage, window duration, reset
+time, and observation time. It excludes plan details, credits, account
+identifiers, provider messages, and raw payloads. Each provider reports
+`quota_evidence_available` and `account_wall_evidence_available` explicitly.
+Missing or malformed evidence is unavailable; transcript bytes and token totals
+are never used to infer remaining quota. A rolling burn rate and exhaustion
+time require two observations with the same provider, quota scope, window
+duration, and reset time. A reset change starts a new comparison window.
+
+Quota activity separates implementation, review, resumed review, planning,
+validation, remediation, integration, failed attempts, and restarted attempts.
+Diagnostics mark unchanged-candidate new-session re-review and repeated failed
+attempts as avoidable burn, while a same-session review resume stays distinct.
 
 Ordinary workers default to the `implementation` phase. A workflow that knows a
 more specific phase can report it with allowlisted metadata, for example

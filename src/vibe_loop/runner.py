@@ -89,6 +89,7 @@ from vibe_loop.telemetry import (
     ProviderUsage,
     ProviderUsageObserver,
     parse_claude_transcript_usage,
+    parse_codex_rollout_usage,
     unavailable_usage,
 )
 from vibe_loop.tasks import (
@@ -1107,6 +1108,11 @@ class VibeRunner:
             if injected_session_id
             else None
         )
+        codex_home = (
+            resolve_codex_home(command, command_env, self.config.repo)
+            if agent_kind in {"auto", "codex"}
+            else None
+        )
         transcript_path = (
             str(
                 predicted_claude_transcript(
@@ -1559,6 +1565,25 @@ class VibeRunner:
                     stream_result.runtime_context
                 )
                 provider_usage = stream_result.usage
+                if codex_home is not None and session_id != run_id:
+                    rollout = resolve_codex_rollout(session_id, codex_home)
+                    if rollout is not None:
+                        rollout_usage = parse_codex_rollout_usage(rollout)
+                        if rollout_usage.available:
+                            provider_usage = dataclasses.replace(
+                                rollout_usage,
+                                values={
+                                    **provider_usage.values,
+                                    **rollout_usage.values,
+                                },
+                                raw={**provider_usage.raw, **rollout_usage.raw},
+                            )
+                        if rollout_usage.quota_snapshots:
+                            provider_usage = dataclasses.replace(
+                                provider_usage,
+                                quota_snapshots=rollout_usage.quota_snapshots,
+                                quota_unavailable_reason="",
+                            )
                 if (
                     not provider_usage.available
                     and agent_kind in {"auto", "claude"}
@@ -4539,6 +4564,32 @@ def resolve_claude_home(command: str, env: dict[str, str], cwd: Path) -> Path:
     if env_home:
         return Path(env_home)
     return Path.home() / ".claude"
+
+
+def resolve_codex_home(command: str, env: dict[str, str], cwd: Path) -> Path:
+    inline = leading_env_assignment(command, "CODEX_HOME")
+    if inline:
+        candidate = Path(inline)
+        return candidate if candidate.is_absolute() else Path(cwd) / candidate
+    env_home = env.get("CODEX_HOME")
+    if env_home:
+        return Path(env_home)
+    return Path.home() / ".codex"
+
+
+def resolve_codex_rollout(session_id: str, codex_home: Path) -> Path | None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,159}", session_id):
+        return None
+    sessions = Path(codex_home) / "sessions"
+    try:
+        matches = sorted(
+            candidate
+            for candidate in sessions.glob("*/*/*/*.jsonl")
+            if candidate.stem.endswith(f"-{session_id}")
+        )
+    except OSError:
+        return None
+    return matches[-1] if matches else None
 
 
 def predicted_claude_transcript(

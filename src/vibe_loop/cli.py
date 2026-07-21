@@ -2519,6 +2519,47 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
                 f"reasoning_output={group.get('reasoning_output_tokens', 0)} "
                 f"cost_usd={group['reported_cost_usd']}"
             )
+    quota = summary.get("quota_account_wall")
+    if isinstance(quota, Mapping):
+        lines.append(
+            "quota/account-wall: "
+            f"evidence_available={str(bool(quota.get('evidence_available'))).lower()}"
+        )
+        providers = quota.get("providers")
+        if isinstance(providers, list):
+            for provider in providers:
+                if not isinstance(provider, Mapping):
+                    continue
+                lines.append(
+                    f"- {provider['provider']}: "
+                    f"quota_evidence_available={str(bool(provider.get('quota_evidence_available'))).lower()} "
+                    f"account_wall_evidence_available={str(bool(provider.get('account_wall_evidence_available'))).lower()} "
+                    f"fresh_input={provider.get('fresh_input_tokens', 0)} "
+                    f"cache_read={provider.get('cache_read_tokens', 0)} "
+                    f"cache_create={provider.get('cache_create_tokens', 0)} "
+                    f"output={provider.get('output_tokens', 0)} "
+                    f"reasoning_output={provider.get('reasoning_output_tokens', 0)} "
+                    f"cost_usd={provider.get('reported_cost_usd', 0)} "
+                    f"launches={provider.get('launches', 0)} "
+                    f"attempts={provider.get('attempts', 0)} "
+                    f"productive={provider.get('productive_completions', 0)} "
+                    f"worker_minutes={provider.get('worker_minutes', 0)} "
+                    f"gross_per_landed={provider.get('gross_usage_per_landed_task')} "
+                    f"fresh_per_landed={provider.get('fresh_input_per_landed_task')}"
+                )
+                reason = provider.get("quota_unavailable_reason")
+                if reason:
+                    lines.append(f"  quota_unavailable_reason={reason}")
+                activity = provider.get("activity")
+                if isinstance(activity, Mapping):
+                    lines.append("  activity=" + json.dumps(activity, sort_keys=True))
+                forecasts = provider.get("forecasts")
+                if isinstance(forecasts, list):
+                    for forecast in forecasts:
+                        if isinstance(forecast, Mapping):
+                            lines.append(
+                                "  forecast=" + json.dumps(forecast, sort_keys=True)
+                            )
     diagnostics = summary.get("diagnostics")
     if isinstance(diagnostics, list):
         lines.append(f"diagnostics: {len(diagnostics)}")

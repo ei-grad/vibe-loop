@@ -18,6 +18,7 @@ from vibe_loop.telemetry import (
     parse_claude_result,
     parse_claude_transcript_usage,
     parse_codex_event,
+    parse_codex_rollout_usage,
     rolling_usage_summary,
 )
 
@@ -38,10 +39,13 @@ def fixture(name: str) -> dict[str, object]:
         ("claude-missing.json", parse_claude_result, False, True),
         ("claude-malformed.json", parse_claude_result, False, True),
         ("claude-limit-wall.json", parse_claude_result, True, False),
+        ("claude-no-cache.json", parse_claude_result, True, False),
         ("codex-present.json", parse_codex_event, True, False),
         ("codex-missing.json", parse_codex_event, False, True),
         ("codex-malformed.json", parse_codex_event, False, True),
         ("codex-limit-wall.json", parse_codex_event, False, False),
+        ("codex-quota-first.json", parse_codex_event, True, False),
+        ("codex-quota-malformed.json", parse_codex_event, True, False),
     ],
 )
 def test_provider_usage_fixtures(name, parser, available, malformed) -> None:
@@ -64,7 +68,7 @@ def test_normalizes_claude_and_codex_native_fields() -> None:
     codex_stats = codex.to_stats(phase="implementation")
 
     assert claude_stats == {
-        "schema_version": 1,
+        "schema_version": 2,
         "phase": "review",
         "usage_source": "native:claude:result",
         "usage_version": "claude-result-v1",
@@ -89,6 +93,8 @@ def test_normalizes_claude_and_codex_native_fields() -> None:
             "duration_api_ms": 11750,
             "total_cost_usd": 0.42,
         },
+        "quota_evidence_available": False,
+        "quota_unavailable_reason": "quota_snapshot_not_reported",
     }
     assert codex_stats["input_tokens"] == 24763
     assert codex_stats["cached_input_tokens"] == 24448
@@ -141,6 +147,106 @@ def test_usage_stats_never_persist_sensitive_payload_text() -> None:
     assert "credential" not in encoded
     assert "fencing_token" not in encoded
     assert "raw_transcript" not in encoded
+
+
+def test_codex_quota_snapshot_keeps_only_bounded_window_evidence() -> None:
+    usage = parse_codex_event(fixture("codex-quota-first.json"))
+    assert usage is not None
+
+    stats = usage.to_stats(phase="implementation")
+
+    assert stats["input_tokens"] == 1500
+    assert stats["cached_input_tokens"] == 1200
+    assert stats["output_tokens"] == 80
+    assert stats["quota_evidence_available"] is True
+    assert stats["quota_snapshots"] == [
+        {
+            "provider": "openai",
+            "scope": "codex",
+            "window": "primary",
+            "observed_at": "2026-07-21T10:00:00+00:00",
+            "used_percent": 20.0,
+            "window_minutes": 300,
+            "resets_at": 1784642400,
+        },
+        {
+            "provider": "openai",
+            "scope": "codex",
+            "window": "secondary",
+            "observed_at": "2026-07-21T10:00:00+00:00",
+            "used_percent": 40.0,
+            "window_minutes": 10080,
+            "resets_at": 1785247200,
+        },
+    ]
+    encoded = json.dumps(stats)
+    assert "plan_type" not in encoded
+    assert "credits" not in encoded
+    assert "SECRET CREDIT" not in encoded
+
+
+def test_malformed_quota_snapshot_is_unavailable_and_redacted() -> None:
+    usage = parse_codex_event(fixture("codex-quota-malformed.json"))
+    assert usage is not None
+
+    encoded = json.dumps(usage.to_stats(phase="review"))
+
+    assert '"quota_evidence_available": false' in encoded
+    assert "malformed_quota_snapshot" in encoded
+    for canary in (
+        "PROMPT CANARY",
+        "sk-secret-canary",
+        "FENCING CANARY",
+        "PRIVATE COMMAND",
+        "RAW TRANSCRIPT",
+    ):
+        assert canary not in encoded
+
+
+def test_provider_usage_without_cache_fields_keeps_fresh_input() -> None:
+    usage = parse_claude_result(fixture("claude-no-cache.json"))
+    assert usage is not None
+
+    stats = usage.to_stats(phase="implementation")
+
+    assert stats["input_tokens"] == 125
+    assert "cache_read_input_tokens" not in stats
+    assert "cache_creation_input_tokens" not in stats
+
+
+def test_codex_rollout_retains_same_run_snapshots_and_cumulative_usage(
+    tmp_path: Path,
+) -> None:
+    rollout = tmp_path / "rollout.jsonl"
+    rollout.write_text(
+        "\n".join(
+            json.dumps(fixture(name))
+            for name in ("codex-quota-first.json", "codex-quota-second.json")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    usage = parse_codex_rollout_usage(rollout)
+    stats = usage.to_stats(phase="implementation")
+
+    assert stats["input_tokens"] == 1700
+    assert stats["cached_input_tokens"] == 1400
+    assert stats["output_tokens"] == 100
+    assert len(stats["quota_snapshots"]) == 4
+    record = run_record(
+        "rollout-run",
+        "rollout-task",
+        datetime(2026, 7, 21, 11, 0, tzinfo=UTC),
+    )
+    record["stats"] = stats
+    summary = rolling_usage_summary(
+        [record],
+        project="demo",
+        now=datetime(2026, 7, 21, 12, 0, tzinfo=UTC),
+    )
+    forecasts = summary["quota_account_wall"]["providers"][0]["forecasts"]
+    assert {item["window"] for item in forecasts} == {"primary", "secondary"}
 
 
 def test_claude_resume_counts_only_records_appended_after_exact_offset(
@@ -320,9 +426,18 @@ def test_rolling_summary_groups_productivity_and_budget_diagnostics() -> None:
         "planning_spend",
         "daily_output_tokens",
         "low_change_high_token",
-        "same_session_continuation",
+        "same_session_review_resume",
+        "repeated_failed_attempts",
         "flexible_provider_share",
     } <= diagnostic_types
+    quota_providers = {
+        item["provider"]: item for item in summary["quota_account_wall"]["providers"]
+    }
+    assert quota_providers["openai"]["account_wall_evidence_available"] is True
+    assert (
+        quota_providers["openai"]["account_wall_last_observed_at"]
+        == (now - timedelta(minutes=5)).isoformat()
+    )
 
 
 def test_summary_counts_restart_events_not_cumulative_ordinals() -> None:
@@ -439,6 +554,126 @@ def test_planning_summary_preserves_model_and_worker_minutes() -> None:
     assert group["worker_minutes"] == 2
 
 
+def test_quota_summary_forecasts_only_comparable_provider_windows() -> None:
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    records: list[dict[str, object]] = []
+    for index, name in enumerate(
+        (
+            "codex-quota-first.json",
+            "codex-quota-second.json",
+            "codex-quota-reset-change.json",
+        )
+    ):
+        usage = parse_codex_event(fixture(name))
+        assert usage is not None
+        finished = datetime.fromisoformat(
+            str(fixture(name)["timestamp"]).replace("Z", "+00:00")
+        )
+        record = run_record(
+            f"openai-{index}",
+            "task-openai",
+            finished,
+            classification="completed" if index < 2 else "failed",
+        )
+        record["stats"] = usage.to_stats(phase="implementation")
+        records.append(record)
+
+    claude = parse_claude_result(fixture("claude-present.json"))
+    assert claude is not None
+    anthropic = run_record(
+        "anthropic-1",
+        "task-anthropic",
+        now - timedelta(minutes=5),
+        provider="anthropic",
+    )
+    anthropic["stats"] = claude.to_stats(phase="planning")
+    records.append(anthropic)
+
+    summary = rolling_usage_summary(records, project="demo", now=now)
+    quota = summary["quota_account_wall"]
+    assert quota["evidence_available"] is True
+    providers = {item["provider"]: item for item in quota["providers"]}
+
+    openai = providers["openai"]
+    assert openai["fresh_input_tokens"] == 700
+    assert openai["cache_read_tokens"] == 3200
+    assert openai["cache_create_tokens"] == 0
+    assert openai["gross_tokens"] == 4110
+    assert openai["landed_tasks"] == 1
+    assert openai["gross_usage_per_landed_task"] == 4110
+    assert openai["fresh_input_per_landed_task"] == 700
+    assert openai["activity"] == {"implementation": 3, "failed_attempt": 1}
+    assert {
+        (forecast["window"], forecast["resets_at"]) for forecast in openai["forecasts"]
+    } == {("primary", 1784642400), ("secondary", 1785247200)}
+    primary = next(item for item in openai["forecasts"] if item["window"] == "primary")
+    assert primary["burn_rate_percent_per_hour"] == 10
+    assert primary["exhaustion_before_reset"] is False
+
+    anthropic_group = providers["anthropic"]
+    assert anthropic_group["fresh_input_tokens"] == 1200
+    assert anthropic_group["cache_read_tokens"] == 4000
+    assert anthropic_group["cache_create_tokens"] == 500
+    assert anthropic_group["gross_tokens"] == 6000
+    assert anthropic_group["quota_evidence_available"] is False
+    assert anthropic_group["quota_unavailable_reason"] == (
+        "quota_snapshot_not_reported"
+    )
+    assert anthropic_group["forecasts"] == []
+
+
+def test_review_diagnostics_separate_resume_from_new_session_rereview() -> None:
+    now = datetime(2026, 7, 21, 12, 0, tzinfo=UTC)
+    resume_first = run_record(
+        "resume-1",
+        "task-resume",
+        now - timedelta(minutes=4),
+        phase="review",
+        session_id="review-session",
+        fingerprint="candidate-resume",
+    )
+    resume_second = run_record(
+        "resume-2",
+        "task-resume",
+        now - timedelta(minutes=3),
+        phase="review",
+        session_id="review-session",
+        fingerprint="candidate-resume",
+    )
+    resume_stats = resume_second["stats"]
+    assert isinstance(resume_stats, dict)
+    resume_stats["session_continuation"] = True
+    rereview_first = run_record(
+        "rereview-1",
+        "task-rereview",
+        now - timedelta(minutes=2),
+        phase="review",
+        session_id="review-session-a",
+        fingerprint="candidate-rereview",
+    )
+    rereview_second = run_record(
+        "rereview-2",
+        "task-rereview",
+        now - timedelta(minutes=1),
+        phase="review",
+        session_id="review-session-b",
+        fingerprint="candidate-rereview",
+    )
+
+    summary = rolling_usage_summary(
+        [resume_first, resume_second, rereview_first, rereview_second],
+        project="demo",
+        now=now,
+    )
+
+    diagnostics = {item["type"]: item for item in summary["diagnostics"]}
+    assert diagnostics["same_session_review_resume"]["avoidable_burn"] is False
+    assert diagnostics["new_session_rereview"]["avoidable_burn"] is True
+    provider = summary["quota_account_wall"]["providers"][0]
+    assert provider["activity"]["review"] == 3
+    assert provider["activity"]["resumed_review"] == 1
+
+
 def test_runs_summary_cli_exposes_json(tmp_path: Path, capsys) -> None:
     repo = tmp_path / "demo"
     runs_path = repo / ".vibe-loop" / "runs.jsonl"
@@ -459,6 +694,30 @@ def test_runs_summary_cli_exposes_json(tmp_path: Path, capsys) -> None:
     payload = json.loads(output.out)
     assert payload["project"] == "demo"
     assert payload["groups"][0]["total_tokens"] == 120
+    assert (
+        payload["quota_account_wall"]["providers"][0]["quota_evidence_available"]
+        is False
+    )
+
+
+def test_runs_summary_text_separates_quota_account_wall(tmp_path: Path, capsys) -> None:
+    repo = tmp_path / "demo"
+    runs_path = repo / ".vibe-loop" / "runs.jsonl"
+    runs_path.parent.mkdir(parents=True)
+    record = run_record(
+        "run-1",
+        "task-1",
+        datetime.now(UTC) - timedelta(minutes=1),
+    )
+    runs_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    exit_code = main(["runs", "summary", "--repo", str(repo)])
+    output = capsys.readouterr()
+
+    assert exit_code == 0
+    assert output.err == ""
+    assert "quota/account-wall: evidence_available=false" in output.out
+    assert "quota_unavailable_reason=quota_snapshot_not_reported" in output.out
 
 
 class TelemetryUnittestCoverage(unittest.TestCase):
@@ -468,10 +727,13 @@ class TelemetryUnittestCoverage(unittest.TestCase):
             ("claude-missing.json", parse_claude_result, False, True),
             ("claude-malformed.json", parse_claude_result, False, True),
             ("claude-limit-wall.json", parse_claude_result, True, False),
+            ("claude-no-cache.json", parse_claude_result, True, False),
             ("codex-present.json", parse_codex_event, True, False),
             ("codex-missing.json", parse_codex_event, False, True),
             ("codex-malformed.json", parse_codex_event, False, True),
             ("codex-limit-wall.json", parse_codex_event, False, False),
+            ("codex-quota-first.json", parse_codex_event, True, False),
+            ("codex-quota-malformed.json", parse_codex_event, True, False),
         )
         for case in cases:
             with self.subTest(fixture=case[0]):
@@ -485,6 +747,13 @@ class TelemetryUnittestCoverage(unittest.TestCase):
 
     def test_usage_stats_redact_sensitive_payloads(self) -> None:
         test_usage_stats_never_persist_sensitive_payload_text()
+        test_codex_quota_snapshot_keeps_only_bounded_window_evidence()
+        test_malformed_quota_snapshot_is_unavailable_and_redacted()
+        test_provider_usage_without_cache_fields_keeps_fresh_input()
+        with tempfile.TemporaryDirectory() as directory:
+            test_codex_rollout_retains_same_run_snapshots_and_cumulative_usage(
+                Path(directory)
+            )
 
     def test_resume_usage_uses_appended_records_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -503,6 +772,8 @@ class TelemetryUnittestCoverage(unittest.TestCase):
         test_summary_counts_restart_events_not_cumulative_ordinals()
         test_repeated_discovery_distinguishes_independent_sessions()
         test_planning_summary_preserves_model_and_worker_minutes()
+        test_quota_summary_forecasts_only_comparable_provider_windows()
+        test_review_diagnostics_separate_resume_from_new_session_rereview()
 
     def test_persisted_phase_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -77,6 +77,8 @@ from vibe_loop.runner import (
     provider_selection_is_flexible,
     resolve_claude_home,
     resolve_claude_transcript,
+    resolve_codex_home,
+    resolve_codex_rollout,
     run_streaming_command,
     terminate_worker_process_group,
     validate_analysis_prompt_delivery,
@@ -5035,6 +5037,25 @@ class SessionIdInjectionTests(unittest.TestCase):
             Path.home() / ".claude",
         )
 
+    def test_resolve_codex_home_prefers_inline_then_env_then_default(self) -> None:
+        cwd = Path("/repo")
+        self.assertEqual(
+            resolve_codex_home("CODEX_HOME=/abs codex exec {prompt}", {}, cwd),
+            Path("/abs"),
+        )
+        self.assertEqual(
+            resolve_codex_home("CODEX_HOME=rel codex exec {prompt}", {}, cwd),
+            Path("/repo/rel"),
+        )
+        self.assertEqual(
+            resolve_codex_home("codex exec {prompt}", {"CODEX_HOME": "/env"}, cwd),
+            Path("/env"),
+        )
+        self.assertEqual(
+            resolve_codex_home("codex exec {prompt}", {}, cwd),
+            Path.home() / ".codex",
+        )
+
     def test_resolve_transcript_globs_by_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
@@ -5048,6 +5069,18 @@ class SessionIdInjectionTests(unittest.TestCase):
                 transcript,
             )
             self.assertIsNone(resolve_claude_transcript("missing", home))
+
+    def test_resolve_codex_rollout_by_native_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            day = home / "sessions" / "2026" / "07" / "21"
+            day.mkdir(parents=True)
+            rollout = day / "rollout-2026-07-21T10-00-00-abc-123.jsonl"
+            rollout.write_text("{}\n", encoding="utf-8")
+
+            self.assertEqual(resolve_codex_rollout("abc-123", home), rollout)
+            self.assertIsNone(resolve_codex_rollout("missing", home))
+            self.assertIsNone(resolve_codex_rollout("../abc-123", home))
 
     def test_predicted_transcript_uses_encoded_cwd(self) -> None:
         predicted = predicted_claude_transcript(

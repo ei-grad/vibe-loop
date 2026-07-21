@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 
-USAGE_SCHEMA_VERSION = 1
-SUMMARY_SCHEMA_VERSION = 1
+USAGE_SCHEMA_VERSION = 2
+SUMMARY_SCHEMA_VERSION = 2
 PHASES = frozenset(
     {
         "planning",
@@ -66,6 +66,7 @@ USAGE_SOURCES = frozenset(
         "native:claude:result",
         "native:claude:transcript",
         "native:codex:turn.completed",
+        "native:codex:token_count",
         "native:combined",
     }
 )
@@ -75,6 +76,7 @@ USAGE_VERSIONS = frozenset(
         "claude-result-v1",
         "claude-transcript-v1",
         "codex-jsonl-v1",
+        "codex-rollout-v1",
         "provider-usage-v1",
     }
 )
@@ -84,6 +86,12 @@ USAGE_UNAVAILABLE_REASONS = frozenset(
         "provider_usage_not_reported",
         "malformed_provider_usage",
         "provider_transcript_unavailable",
+    }
+)
+QUOTA_UNAVAILABLE_REASONS = frozenset(
+    {
+        "quota_snapshot_not_reported",
+        "malformed_quota_snapshot",
     }
 )
 SENSITIVE_METADATA_MARKERS = (
@@ -125,6 +133,163 @@ def _numeric_mapping(value: object) -> dict[str, int | float]:
     return result
 
 
+def _safe_quota_label(value: object, fallback: str) -> str:
+    if (
+        isinstance(value, str)
+        and SAFE_METADATA_RE.fullmatch(value)
+        and not any(marker in value.casefold() for marker in SENSITIVE_METADATA_MARKERS)
+    ):
+        return value
+    return fallback
+
+
+def _canonical_observed_at(value: object, fallback: datetime | None = None) -> str:
+    observed = parse_timestamp(value)
+    if observed is None:
+        observed = fallback or datetime.now(UTC)
+    return observed.isoformat()
+
+
+@dataclasses.dataclass(frozen=True)
+class QuotaSnapshot:
+    provider: str
+    scope: str
+    window: str
+    observed_at: str
+    used_percent: float
+    window_minutes: int
+    resets_at: int
+
+    def to_stats(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "scope": self.scope,
+            "window": self.window,
+            "observed_at": self.observed_at,
+            "used_percent": self.used_percent,
+            "window_minutes": self.window_minutes,
+            "resets_at": self.resets_at,
+        }
+
+
+def _sanitize_quota_snapshots(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list | tuple):
+        return []
+    snapshots: list[dict[str, object]] = []
+    for candidate in value[:8]:
+        if not isinstance(candidate, Mapping):
+            continue
+        provider = candidate.get("provider")
+        scope = candidate.get("scope")
+        window = candidate.get("window")
+        observed_at = parse_timestamp(candidate.get("observed_at"))
+        used_percent = _number(candidate.get("used_percent"))
+        window_minutes = _integer(candidate.get("window_minutes"))
+        resets_at = _integer(candidate.get("resets_at"))
+        if (
+            not isinstance(provider, str)
+            or provider not in USAGE_PROVIDERS
+            or not isinstance(scope, str)
+            or _safe_quota_label(scope, "") != scope
+            or not isinstance(window, str)
+            or _safe_quota_label(window, "") != window
+            or observed_at is None
+            or used_percent is None
+            or used_percent > 100
+            or window_minutes is None
+            or not 0 < window_minutes <= 10 * 366 * 24 * 60
+            or resets_at is None
+            or resets_at > 253402300799
+        ):
+            continue
+        snapshots.append(
+            {
+                "provider": provider,
+                "scope": scope,
+                "window": window,
+                "observed_at": observed_at.isoformat(),
+                "used_percent": float(used_percent),
+                "window_minutes": window_minutes,
+                "resets_at": resets_at,
+            }
+        )
+    return snapshots
+
+
+def _quota_snapshots(
+    provider: str,
+    payload: Mapping[str, object],
+    *,
+    observed_at: datetime | None = None,
+) -> tuple[tuple[QuotaSnapshot, ...], str]:
+    event = payload
+    nested = payload.get("payload")
+    if isinstance(nested, Mapping):
+        event = nested
+    raw_limits = event.get("rate_limits")
+    if raw_limits is None:
+        raw_limits = event.get("quota")
+    if raw_limits is None:
+        return (), "quota_snapshot_not_reported"
+    if not isinstance(raw_limits, Mapping):
+        return (), "malformed_quota_snapshot"
+
+    scope = _safe_quota_label(raw_limits.get("limit_id"), provider)
+    observed_value = payload.get("timestamp") or event.get("observed_at")
+    observation = _canonical_observed_at(observed_value, observed_at)
+    snapshots: list[QuotaSnapshot] = []
+    malformed = False
+    windows = (
+        ("primary", raw_limits.get("primary") or raw_limits.get("primary_window")),
+        (
+            "secondary",
+            raw_limits.get("secondary") or raw_limits.get("secondary_window"),
+        ),
+    )
+    for window_name, raw_window in windows:
+        if raw_window is None:
+            continue
+        if not isinstance(raw_window, Mapping):
+            malformed = True
+            continue
+        used_percent = _number(raw_window.get("used_percent"))
+        window_minutes = _integer(raw_window.get("window_minutes"))
+        if window_minutes is None:
+            window_seconds = _integer(raw_window.get("limit_window_seconds"))
+            if window_seconds is not None and window_seconds % 60 == 0:
+                window_minutes = window_seconds // 60
+        resets_at = _integer(raw_window.get("resets_at"))
+        if (
+            used_percent is None
+            or used_percent > 100
+            or window_minutes is None
+            or not 0 < window_minutes <= 10 * 366 * 24 * 60
+            or resets_at is None
+            or resets_at > 253402300799
+        ):
+            malformed = True
+            continue
+        snapshots.append(
+            QuotaSnapshot(
+                provider=provider,
+                scope=scope,
+                window=window_name,
+                observed_at=observation,
+                used_percent=float(used_percent),
+                window_minutes=window_minutes,
+                resets_at=resets_at,
+            )
+        )
+    if snapshots:
+        return tuple(snapshots), ""
+    return (
+        (),
+        "malformed_quota_snapshot"
+        if malformed or raw_limits
+        else "quota_snapshot_not_reported",
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class ProviderUsage:
     provider: str
@@ -134,6 +299,8 @@ class ProviderUsage:
     raw: Mapping[str, int | float] = dataclasses.field(default_factory=dict)
     unavailable_reason: str = ""
     malformed: bool = False
+    quota_snapshots: tuple[QuotaSnapshot, ...] = ()
+    quota_unavailable_reason: str = "quota_snapshot_not_reported"
 
     @property
     def available(self) -> bool:
@@ -177,6 +344,15 @@ class ProviderUsage:
             )
         if reason:
             stats["usage_unavailable_reason"] = reason
+        stats["quota_evidence_available"] = bool(self.quota_snapshots)
+        if self.quota_snapshots:
+            stats["quota_snapshots"] = [
+                snapshot.to_stats() for snapshot in self.quota_snapshots
+            ]
+        else:
+            stats["quota_unavailable_reason"] = (
+                self.quota_unavailable_reason or "quota_snapshot_not_reported"
+            )
         if candidate_fingerprint:
             stats["candidate_fingerprint"] = candidate_fingerprint[:160]
         if changed_lines is not None and changed_lines >= 0:
@@ -237,16 +413,41 @@ def sanitize_run_stats(value: object) -> dict[str, object]:
     provider_usage = _numeric_mapping(value.get("provider_usage"))
     if provider_usage:
         result["provider_usage"] = provider_usage
+    quota_reason = value.get("quota_unavailable_reason")
+    snapshots = _sanitize_quota_snapshots(value.get("quota_snapshots"))
+    if snapshots:
+        result["quota_evidence_available"] = True
+        result["quota_snapshots"] = snapshots
+    elif any(
+        key in value
+        for key in (
+            "quota_evidence_available",
+            "quota_unavailable_reason",
+            "quota_snapshots",
+        )
+    ):
+        result["quota_evidence_available"] = False
+        result["quota_unavailable_reason"] = (
+            quota_reason
+            if isinstance(quota_reason, str)
+            and quota_reason in QUOTA_UNAVAILABLE_REASONS
+            else "malformed_quota_snapshot"
+        )
     return result
 
 
 def merge_provider_usage(*items: ProviderUsage) -> ProviderUsage:
     available = [item for item in items if item.available]
+    quota_snapshots = _merge_quota_snapshots(*(item.quota_snapshots for item in items))
     if not available:
-        return (
-            items[0]
-            if items
-            else unavailable_usage("unknown", "provider_usage_not_reported")
+        if not items:
+            return unavailable_usage("unknown", "provider_usage_not_reported")
+        return dataclasses.replace(
+            items[0],
+            quota_snapshots=quota_snapshots,
+            quota_unavailable_reason=(
+                "" if quota_snapshots else items[0].quota_unavailable_reason
+            ),
         )
     providers = {item.provider for item in available}
     provider = available[0].provider if len(providers) == 1 else "mixed"
@@ -264,6 +465,10 @@ def merge_provider_usage(*items: ProviderUsage) -> ProviderUsage:
         values=dict(values),
         raw=dict(raw),
         malformed=any(item.malformed for item in items),
+        quota_snapshots=quota_snapshots,
+        quota_unavailable_reason=(
+            "" if quota_snapshots else "quota_snapshot_not_reported"
+        ),
     )
 
 
@@ -325,10 +530,12 @@ def _normalized_usage(
     )
 
 
-def parse_claude_result(payload: Mapping[str, object]) -> ProviderUsage | None:
+def parse_claude_result(
+    payload: Mapping[str, object], *, observed_at: datetime | None = None
+) -> ProviderUsage | None:
     if payload.get("type") != "result":
         return None
-    return _normalized_usage(
+    usage = _normalized_usage(
         "anthropic",
         "native:claude:result",
         "claude-result-v1",
@@ -340,22 +547,51 @@ def parse_claude_result(payload: Mapping[str, object]) -> ProviderUsage | None:
             "total_cost_usd": payload.get("total_cost_usd"),
         },
     )
+    snapshots, reason = _quota_snapshots("anthropic", payload, observed_at=observed_at)
+    return dataclasses.replace(
+        usage, quota_snapshots=snapshots, quota_unavailable_reason=reason
+    )
 
 
-def parse_codex_event(payload: Mapping[str, object]) -> ProviderUsage | None:
-    event_type = payload.get("type")
-    if event_type not in {"turn.completed", "turn_complete", "turn.completed.v1"}:
+def parse_codex_event(
+    payload: Mapping[str, object], *, observed_at: datetime | None = None
+) -> ProviderUsage | None:
+    event = payload
+    nested = payload.get("payload")
+    if isinstance(nested, Mapping):
+        event = nested
+    event_type = event.get("type")
+    snapshots, reason = _quota_snapshots("openai", payload, observed_at=observed_at)
+    if event_type not in {
+        "turn.completed",
+        "turn_complete",
+        "turn.completed.v1",
+        "token_count",
+    }:
         return None
-    usage = payload.get("usage")
+    usage = event.get("usage")
     if not isinstance(usage, Mapping):
-        turn = payload.get("turn")
+        turn = event.get("turn")
         usage = turn.get("usage") if isinstance(turn, Mapping) else usage
-    return _normalized_usage(
+    if not isinstance(usage, Mapping) and event_type == "token_count":
+        info = event.get("info")
+        if isinstance(info, Mapping):
+            usage = info.get("total_token_usage")
+            if not isinstance(usage, Mapping):
+                usage = info.get("last_token_usage")
+    normalized = _normalized_usage(
         "openai",
-        "native:codex:turn.completed",
-        "codex-jsonl-v1",
+        (
+            "native:codex:token_count"
+            if event_type == "token_count"
+            else "native:codex:turn.completed"
+        ),
+        "codex-rollout-v1" if event_type == "token_count" else "codex-jsonl-v1",
         usage,
         extra={"turns": 1},
+    )
+    return dataclasses.replace(
+        normalized, quota_snapshots=snapshots, quota_unavailable_reason=reason
     )
 
 
@@ -392,13 +628,58 @@ class ProviderUsageObserver:
             return
         if not isinstance(payload, dict):
             return
-        parsed = parse_claude_result(payload) or parse_codex_event(payload)
+        observed_at = datetime.now(UTC)
+        parsed = parse_claude_result(
+            payload, observed_at=observed_at
+        ) or parse_codex_event(payload, observed_at=observed_at)
         if parsed is None:
             return
         with self._lock:
             self._saw_malformed_usage = self._saw_malformed_usage or parsed.malformed
-            if parsed.available or self._usage is None:
+            if self._usage is None:
                 self._usage = parsed
+                return
+            current = self._usage
+            usage = parsed if parsed.available else current
+            snapshots = _merge_quota_snapshots(
+                current.quota_snapshots, parsed.quota_snapshots
+            )
+            quota_reason = "" if snapshots else parsed.quota_unavailable_reason
+            self._usage = dataclasses.replace(
+                usage,
+                quota_snapshots=snapshots,
+                quota_unavailable_reason=quota_reason,
+                malformed=current.malformed or parsed.malformed,
+            )
+
+
+def _merge_quota_snapshots(
+    *items: Iterable[QuotaSnapshot],
+) -> tuple[QuotaSnapshot, ...]:
+    snapshots: dict[tuple[object, ...], QuotaSnapshot] = {}
+    for item in items:
+        for snapshot in item:
+            key = (
+                snapshot.provider,
+                snapshot.scope,
+                snapshot.window,
+                snapshot.observed_at,
+                snapshot.window_minutes,
+                snapshot.resets_at,
+            )
+            snapshots[key] = snapshot
+    return tuple(list(snapshots.values())[-8:])
+
+
+def parse_codex_rollout_usage(path: Path) -> ProviderUsage:
+    observer = ProviderUsageObserver("openai")
+    try:
+        with path.open(encoding="utf-8") as rollout:
+            for line in rollout:
+                observer.observe_line(line)
+    except (OSError, UnicodeError):
+        return unavailable_usage("openai", "provider_transcript_unavailable")
+    return observer.usage
 
 
 def parse_claude_transcript_usage(
@@ -550,6 +831,241 @@ def non_cached_input_tokens(stats: object) -> int:
         int(_metric(stats, "input_tokens"))
         - int(_metric(stats, "cached_input_tokens")),
     )
+
+
+def fresh_input_tokens(stats: object, provider: str) -> int:
+    if provider == "openai":
+        return non_cached_input_tokens(stats)
+    return int(_metric(stats, "input_tokens"))
+
+
+def _quota_role(record: Mapping[str, object]) -> str:
+    stats = record.get("stats")
+    stats_map = stats if isinstance(stats, Mapping) else {}
+    phase = str(stats_map.get("phase") or "implementation")
+    if phase == "review":
+        return (
+            "resumed_review"
+            if stats_map.get("session_continuation") is True
+            else "review"
+        )
+    if phase in {"focused_validation", "full_validation"}:
+        return "validation"
+    if phase in {"planning", "remediation", "integration"}:
+        return phase
+    return "implementation"
+
+
+def _quota_provider_group(provider: str) -> dict[str, object]:
+    return {
+        "provider": provider,
+        "launches": 0,
+        "attempts": 0,
+        "productive_completions": 0,
+        "landed_tasks": 0,
+        "worker_minutes": 0.0,
+        "fresh_input_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_create_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "gross_tokens": 0,
+        "reported_cost_usd": 0.0,
+        "gross_usage_per_landed_task": None,
+        "fresh_input_per_landed_task": None,
+        "activity": {},
+        "quota_evidence_available": False,
+        "quota_unavailable_reason": "quota_snapshot_not_reported",
+        "account_wall_evidence_available": False,
+        "account_wall_observations": 0,
+        "account_wall_last_observed_at": None,
+        "snapshots": [],
+        "forecasts": [],
+    }
+
+
+def _quota_forecasts(snapshots: list[dict[str, object]]) -> list[dict[str, object]]:
+    compatible: dict[tuple[str, str, str, int, int], list[dict[str, object]]] = (
+        defaultdict(list)
+    )
+    for snapshot in snapshots:
+        key = (
+            str(snapshot["provider"]),
+            str(snapshot["scope"]),
+            str(snapshot["window"]),
+            int(snapshot["window_minutes"]),
+            int(snapshot["resets_at"]),
+        )
+        compatible[key].append(snapshot)
+    forecasts: list[dict[str, object]] = []
+    for key, candidates in sorted(compatible.items()):
+        candidates.sort(key=lambda item: str(item["observed_at"]))
+        distinct: list[dict[str, object]] = []
+        for candidate in candidates:
+            if distinct and candidate["observed_at"] == distinct[-1]["observed_at"]:
+                distinct[-1] = candidate
+            else:
+                distinct.append(candidate)
+        if len(distinct) < 2:
+            continue
+        before, after = distinct[-2:]
+        before_at = parse_timestamp(before["observed_at"])
+        after_at = parse_timestamp(after["observed_at"])
+        if before_at is None or after_at is None or after_at <= before_at:
+            continue
+        delta = float(after["used_percent"]) - float(before["used_percent"])
+        if delta <= 0:
+            continue
+        elapsed_hours = (after_at - before_at).total_seconds() / 3600
+        burn_rate = delta / elapsed_hours
+        remaining_percent = max(0.0, 100 - float(after["used_percent"]))
+        exhaustion_at = after_at + timedelta(hours=remaining_percent / burn_rate)
+        reset_at = datetime.fromtimestamp(key[4], UTC)
+        forecasts.append(
+            {
+                "provider": key[0],
+                "scope": key[1],
+                "window": key[2],
+                "window_minutes": key[3],
+                "resets_at": key[4],
+                "first_observed_at": before_at.isoformat(),
+                "last_observed_at": after_at.isoformat(),
+                "burn_rate_percent_per_hour": round(burn_rate, 6),
+                "exhaustion_at": exhaustion_at.isoformat(),
+                "exhaustion_before_reset": exhaustion_at < reset_at,
+            }
+        )
+    return forecasts
+
+
+def _quota_account_wall_summary(
+    recent: Iterable[Mapping[str, object]],
+) -> dict[str, object]:
+    providers: dict[str, dict[str, object]] = {}
+    landed: dict[str, set[str]] = defaultdict(set)
+    malformed_evidence: set[str] = set()
+    for record in recent:
+        record_type = record.get("record_type")
+        if record_type not in {None, "run_result", "autopilot_planning_outcome"}:
+            continue
+        stats = record.get("stats")
+        stats_map = stats if isinstance(stats, Mapping) else {}
+        provider = str(
+            record.get("model_provider")
+            or stats_map.get("provider")
+            or {"codex": "openai", "claude": "anthropic"}.get(
+                record.get("agent_kind"), "unknown"
+            )
+        )
+        group = providers.setdefault(provider, _quota_provider_group(provider))
+        launched = not (
+            record_type == "autopilot_planning_outcome"
+            and record.get("provider_launched") is False
+        )
+        if launched:
+            group["launches"] = int(group["launches"]) + 1
+            group["attempts"] = int(group["attempts"]) + 1
+        productive = (
+            record.get("outcome") == "productive"
+            if record_type == "autopilot_planning_outcome"
+            else record.get("classification", record.get("status")) == "completed"
+        )
+        if productive:
+            group["productive_completions"] = int(group["productive_completions"]) + 1
+            task_id = str(record.get("task_id") or "")
+            if task_id:
+                landed[provider].add(task_id)
+        group["worker_minutes"] = float(group["worker_minutes"]) + (
+            record_duration_seconds(record) / 60
+        )
+        fresh = fresh_input_tokens(stats, provider)
+        cache_read = int(
+            _metric(
+                stats,
+                "cached_input_tokens"
+                if provider == "openai"
+                else "cache_read_input_tokens",
+            )
+        )
+        cache_create = int(_metric(stats, "cache_creation_input_tokens"))
+        output = int(_metric(stats, "output_tokens"))
+        reasoning = int(_metric(stats, "reasoning_output_tokens"))
+        gross = fresh + cache_read + cache_create + output
+        group["fresh_input_tokens"] = int(group["fresh_input_tokens"]) + fresh
+        group["cache_read_tokens"] = int(group["cache_read_tokens"]) + cache_read
+        group["cache_create_tokens"] = int(group["cache_create_tokens"]) + cache_create
+        group["output_tokens"] = int(group["output_tokens"]) + output
+        group["reasoning_output_tokens"] = (
+            int(group["reasoning_output_tokens"]) + reasoning
+        )
+        group["gross_tokens"] = int(group["gross_tokens"]) + gross
+        group["reported_cost_usd"] = float(group["reported_cost_usd"]) + _metric(
+            stats, "cost_usd"
+        )
+        activity = group["activity"]
+        assert isinstance(activity, dict)
+        role = _quota_role(record)
+        activity[role] = int(activity.get(role, 0)) + 1
+        if not productive:
+            activity["failed_attempt"] = int(activity.get("failed_attempt", 0)) + 1
+        if (_integer(record.get("restart_count")) or 0) > 0:
+            activity["restarted_attempt"] = (
+                int(activity.get("restarted_attempt", 0)) + 1
+            )
+        snapshots = _sanitize_quota_snapshots(stats_map.get("quota_snapshots"))
+        if snapshots:
+            group["quota_evidence_available"] = True
+            group["quota_unavailable_reason"] = ""
+            stored = group["snapshots"]
+            assert isinstance(stored, list)
+            stored.extend(snapshots)
+        elif stats_map.get("quota_unavailable_reason") == "malformed_quota_snapshot":
+            malformed_evidence.add(provider)
+        if record.get("classification") == "limit_wall":
+            group["account_wall_evidence_available"] = True
+            group["account_wall_observations"] = (
+                int(group["account_wall_observations"]) + 1
+            )
+            observed_at = parse_timestamp(
+                record.get("finished_at") or record.get("occurred_at")
+            )
+            if observed_at is not None:
+                prior = parse_timestamp(group["account_wall_last_observed_at"])
+                if prior is None or observed_at > prior:
+                    group["account_wall_last_observed_at"] = observed_at.isoformat()
+
+    for provider, group in providers.items():
+        group["landed_tasks"] = len(landed[provider])
+        tasks = int(group["landed_tasks"])
+        group["worker_minutes"] = round(float(group["worker_minutes"]), 3)
+        group["reported_cost_usd"] = round(float(group["reported_cost_usd"]), 6)
+        if tasks:
+            group["gross_usage_per_landed_task"] = round(
+                int(group["gross_tokens"]) / tasks, 3
+            )
+            group["fresh_input_per_landed_task"] = round(
+                int(group["fresh_input_tokens"]) / tasks, 3
+            )
+        if provider in malformed_evidence and not group["quota_evidence_available"]:
+            group["quota_unavailable_reason"] = "malformed_quota_snapshot"
+        stored = group["snapshots"]
+        assert isinstance(stored, list)
+        stored.sort(
+            key=lambda item: (
+                str(item["scope"]),
+                str(item["window"]),
+                str(item["observed_at"]),
+            )
+        )
+        group["forecasts"] = _quota_forecasts(stored)
+    return {
+        "evidence_available": any(
+            bool(group["quota_evidence_available"])
+            or bool(group["account_wall_evidence_available"])
+            for group in providers.values()
+        ),
+        "providers": [providers[key] for key in sorted(providers)],
+    }
 
 
 def rolling_usage_summary(
@@ -718,6 +1234,11 @@ def rolling_usage_summary(
             if productive_tasks
             else None
         )
+        group["fresh_input_tokens_per_completed_task"] = (
+            round(int(group["non_cached_input_tokens"]) / productive_tasks, 3)
+            if productive_tasks
+            else None
+        )
         group["cost_per_completed_task_usd"] = (
             round(float(group["reported_cost_usd"]) / productive_tasks, 6)
             if productive_tasks
@@ -734,6 +1255,21 @@ def rolling_usage_summary(
                     "task_id": task_id,
                     "attempts": count,
                     "threshold": 4 if count >= 4 else 3,
+                }
+            )
+        failed = [
+            record
+            for _, record in attempts
+            if record.get("classification", record.get("status")) != "completed"
+        ]
+        if len(failed) >= 2:
+            diagnostics.append(
+                {
+                    "type": "repeated_failed_attempts",
+                    "severity": "warning",
+                    "task_id": task_id,
+                    "attempts": len(failed),
+                    "avoidable_burn": True,
                 }
             )
     for provider, failures in quick_failures.items():
@@ -759,11 +1295,18 @@ def rolling_usage_summary(
             if candidate.get("session_id")
         }
         independent_sessions = len(sessions) if sessions else len(candidates)
-        diagnostic_type = (
-            "same_session_continuation"
-            if independent_sessions == 1
-            else "repeated_candidate_work"
-        )
+        if work_kind == "review":
+            diagnostic_type = (
+                "same_session_review_resume"
+                if independent_sessions == 1
+                else "new_session_rereview"
+            )
+        else:
+            diagnostic_type = (
+                "same_session_continuation"
+                if independent_sessions == 1
+                else "repeated_candidate_work"
+            )
         diagnostics.append(
             {
                 "type": diagnostic_type,
@@ -773,6 +1316,7 @@ def rolling_usage_summary(
                 "candidate_fingerprint": fingerprint,
                 "launches": len(candidates),
                 "independent_sessions": independent_sessions,
+                "avoidable_burn": independent_sessions > 1,
             }
         )
     planning_cost = sum(
@@ -825,5 +1369,6 @@ def rolling_usage_summary(
         "since": since.isoformat(),
         "until": current.isoformat(),
         "groups": [groups[key] for key in sorted(groups)],
+        "quota_account_wall": _quota_account_wall_summary(recent),
         "diagnostics": diagnostics,
     }

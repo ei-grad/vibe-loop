@@ -1,0 +1,1 @@
+{"timestamp":"PROMPT CANARY","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":2}},"rate_limits":{"limit_id":"sk-secret-canary","primary":{"used_percent":"FENCING CANARY","window_minutes":300,"resets_at":1784642400},"command":"PRIVATE COMMAND","transcript":"RAW TRANSCRIPT"}}}
