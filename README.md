@@ -880,12 +880,15 @@ absent, generated prompts are unchanged.
 (skill reference, normalized task context, CLI addendum), and a shell-quoted
 `{model}` when `agent.model` or the task's `model` field resolves one. A template
 that references `{model}` fails before launch when no model is resolved. Workers
-also get
-`VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`, and `VIBE_LOOP_LOG` in
-their environment; `selection_command` receives a `{prompt}` with the candidate
-list and recent run context. Single-task selection prints JSON with `task_id`;
-batch selection prints `task_ids`. If a task has traceability metadata,
-`agent.command` must include `{prompt}` — task-id-only templates fail fast.
+also get `VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`,
+`VIBE_LOOP_LOG`, `VIBE_LOOP_AGENT_KIND`, and `VIBE_LOOP_AGENT_PROFILE` in their
+environment. The agent values come from the effective task profile, so
+repository-owned commit hooks can use the same provenance as run telemetry. The
+profile value is empty for the default `[agent]`. `selection_command` receives a
+`{prompt}` with the candidate list and recent run context. Single-task selection
+prints JSON with `task_id`; batch selection prints `task_ids`. If a task has
+traceability metadata, `agent.command` must include `{prompt}` — task-id-only
+templates fail fast.
 
 `agent.analysis_command` is a third template used by autopilot for read-only
 analysis and decision steps, distinct from the read-write worker. Its `auto`

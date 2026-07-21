@@ -991,6 +991,12 @@ class VibeRunner:
         agent = agent_selection.config
         agent_profile = agent_selection.profile
         command_template = agent.require_command()
+        agent_kind = agent.executable_kind or agent.agent_kind
+        agent_kind_source = (
+            agent.command_source
+            if agent.agent_kind == "auto" and agent.executable_kind
+            else agent.agent_kind_source
+        )
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
@@ -1012,7 +1018,7 @@ class VibeRunner:
         resuming = bool(
             resume_session_id
             and self.config.supervision.resume_unknown_runs
-            and command_supports_session_resume(command_template, agent.agent_kind)
+            and command_supports_session_resume(command_template, agent_kind)
         )
         if resuming:
             # Resume the prior run's captured session so the continuation turn
@@ -1026,7 +1032,7 @@ class VibeRunner:
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
-        elif command_supports_session_capture(command_template, agent.agent_kind):
+        elif command_supports_session_capture(command_template, agent_kind):
             injected_session_id = str(uuid.uuid4())
             effective_template = inject_claude_session_id(
                 command_template, injected_session_id
@@ -1034,7 +1040,7 @@ class VibeRunner:
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
         effective_template = inject_structured_usage_output(
-            effective_template, agent.agent_kind
+            effective_template, agent_kind
         )
         skill_prefix = agent.require_skill_ref_prefix()
         worker_prompt = build_run_worker_prompt(
@@ -1059,6 +1065,8 @@ class VibeRunner:
             task_id=task.task_id,
             repo=self.config.repo,
             log_path=log_path,
+            agent_kind=agent_kind,
+            agent_profile=agent_profile,
         )
         claude_home = (
             resolve_claude_home(command, command_env, self.config.repo)
@@ -1081,8 +1089,6 @@ class VibeRunner:
             except OSError:
                 transcript_start_offset = 0
         command_context = parse_agent_runtime_context_from_command(command)
-        agent_kind = agent.agent_kind
-        agent_kind_source = agent.agent_kind_source
         agent_prompt_dialect = agent.prompt_dialect or ""
         agent_prompt_dialect_source = agent.prompt_dialect_source
         agent_skill_ref_prefix = agent.skill_ref_prefix or ""
@@ -1379,7 +1385,7 @@ class VibeRunner:
                     agent.command_source,
                     agent.selection_command_source,
                     agent.detected,
-                    agent.agent_kind,
+                    agent_kind,
                     agent.prompt_dialect,
                     agent.prompt_dialect_source,
                     agent.skill_ref_prefix,
@@ -1412,7 +1418,7 @@ class VibeRunner:
                     f"({agent_selection.source})",
                     log,
                 )
-                report_status(f"agent kind: {agent.agent_kind}", log)
+                report_status(f"agent kind: {agent_kind}", log)
                 report_status(
                     f"agent prompt dialect source: {agent.prompt_dialect_source}",
                     log,
@@ -1493,7 +1499,7 @@ class VibeRunner:
                     provider=(
                         command_context.model_provider
                         or {"codex": "openai", "claude": "anthropic"}.get(
-                            agent.agent_kind, "unknown"
+                            agent_kind, "unknown"
                         )
                     ),
                 )
@@ -1519,7 +1525,7 @@ class VibeRunner:
                 provider_usage = stream_result.usage
                 if (
                     not provider_usage.available
-                    and agent.agent_kind in {"auto", "claude"}
+                    and agent_kind in {"auto", "claude"}
                     and transcript_path
                 ):
                     provider_usage = parse_claude_transcript_usage(
@@ -1657,7 +1663,7 @@ class VibeRunner:
                 agent_selection_command_source=agent.selection_command_source,
                 agent_default_policy_source=AGENT_DEFAULT_POLICY_SOURCE,
                 agent_default_policy=AGENT_DEFAULT_POLICY,
-                agent_kind=agent.agent_kind,
+                agent_kind=agent_kind,
                 agent_prompt_dialect=agent.prompt_dialect or "",
                 agent_prompt_dialect_source=agent.prompt_dialect_source,
                 agent_skill_ref_prefix=agent.skill_ref_prefix or "",
@@ -5114,6 +5120,8 @@ def worker_command_env(
     task_id: str,
     repo: Path,
     log_path: Path,
+    agent_kind: str,
+    agent_profile: str,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.update(
@@ -5122,6 +5130,8 @@ def worker_command_env(
             "VIBE_LOOP_TASK_ID": task_id,
             "VIBE_LOOP_REPO": str(repo),
             "VIBE_LOOP_LOG": str(log_path),
+            "VIBE_LOOP_AGENT_KIND": agent_kind,
+            "VIBE_LOOP_AGENT_PROFILE": agent_profile,
         }
     )
     return env

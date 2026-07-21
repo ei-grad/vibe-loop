@@ -386,13 +386,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["session_id_source"], "native:stdout")
         self.assertEqual(payload["agent_command_source"], "auto:codex")
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
-        self.assertEqual(payload["agent_kind"], "auto")
+        self.assertEqual(payload["agent_kind"], "codex")
         self.assertEqual(payload["agent_prompt_dialect"], "codex")
         self.assertEqual(payload["agent_prompt_dialect_source"], "auto:codex")
         self.assertEqual(payload["agent_skill_ref_prefix"], "$")
         self.assertEqual(run_result["session_id"], "codex-native-123")
         self.assertEqual(run_result["session_id_source"], "native:stdout")
         self.assertEqual(run_result["agent_prompt_dialect"], "codex")
+        self.assertEqual(run_result["trailer_context"]["agent_kind"], "codex")
+        self.assertEqual(
+            run_result["trailer_context_sources"]["agent_kind"], "auto:codex"
+        )
         self.assertEqual(run_result["started_at"], run_started["started_at"])
         self.assertEqual(run_result["model_provider"], "openai")
         self.assertEqual(run_result["model_id"], "gpt-5.5")
@@ -476,6 +480,8 @@ class CliTests(unittest.TestCase):
                 "    'task_id': os.environ['VIBE_LOOP_TASK_ID'],\n"
                 "    'repo': os.environ['VIBE_LOOP_REPO'],\n"
                 "    'log': os.environ['VIBE_LOOP_LOG'],\n"
+                "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
+                "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
                 "}\n"
                 "Path('agent-env.json').write_text(\n"
                 "    json.dumps(env_payload),\n"
@@ -513,6 +519,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(env_payload["task_id"], "TASK-01")
         self.assertEqual(env_payload["repo"], str(repo))
         self.assertEqual(env_payload["log"], payload["log"])
+        self.assertEqual(env_payload["agent_kind"], payload["agent_kind"])
+        self.assertEqual(env_payload["agent_kind"], "codex")
+        self.assertEqual(env_payload["agent_profile"], "")
+        self.assertEqual(payload["trailer_context"]["agent_kind"], "codex")
         self.assertIn("agent command source: auto:codex", stderr.getvalue())
 
     def test_install_skills_are_cli_agnostic(self) -> None:
@@ -701,9 +711,15 @@ class CliTests(unittest.TestCase):
             write_python_executable(
                 bin_dir / "claude",
                 "from pathlib import Path\n"
+                "import json\n"
+                "import os\n"
                 "import sys\n"
                 "Path('agent-args.txt').write_text("
                 "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "Path('agent-env.json').write_text(json.dumps({\n"
+                "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
+                "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
+                "}), encoding='utf-8')\n"
                 "print('resumed out')\n",
             )
             task = Task(task_id="TASK-01", title="Task 1", status="Next", order=1)
@@ -725,8 +741,11 @@ class CliTests(unittest.TestCase):
                 config = load_config(repo)
                 runner = VibeRunner(config)
                 runner._source = _StubSource()
-                runner.run_task(task, recovery=recovery)
+                resumed_result = runner.run_task(task, recovery=recovery)
                 resumed = (repo / "agent-args.txt").read_text(encoding="utf-8")
+                resumed_env = json.loads(
+                    (repo / "agent-env.json").read_text(encoding="utf-8")
+                )
 
                 # A second, non-resumable run (resume disabled) must fall back to
                 # a fresh --session-id with the from-scratch recovery brief.
@@ -739,8 +758,11 @@ class CliTests(unittest.TestCase):
                     ),
                 )
                 runner._source = _StubSource()
-                runner.run_task(task, recovery=recovery)
+                fresh_result = runner.run_task(task, recovery=recovery)
                 fresh = (repo / "agent-args.txt").read_text(encoding="utf-8")
+                fresh_env = json.loads(
+                    (repo / "agent-env.json").read_text(encoding="utf-8")
+                )
 
         # Resume path: --resume <prior session id>, no fresh --session-id, and the
         # short continuation nudge (not the from-scratch recovery brief).
@@ -748,12 +770,16 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("--session-id", resumed)
         self.assertIn("Continue this run (resumed session)", resumed)
         self.assertNotIn("Investigate what the previous session did", resumed)
+        self.assertEqual(resumed_env, {"agent_kind": "claude", "agent_profile": ""})
+        self.assertEqual(resumed_result.agent_kind, resumed_env["agent_kind"])
         # Fallback path: fresh --session-id and the from-scratch recovery brief.
         self.assertIn("--session-id", fresh)
         self.assertNotIn("--resume", fresh)
         self.assertIn("Investigate what the previous session did", fresh)
+        self.assertEqual(fresh_env, resumed_env)
+        self.assertEqual(fresh_result.agent_kind, fresh_env["agent_kind"])
 
-    def test_run_task_routes_worker_command_per_task_profile(self) -> None:
+    def test_run_task_exports_routed_profile_to_worker_environment(self) -> None:
         from vibe_loop.config import load_config
         from vibe_loop.runner import VibeRunner
         from vibe_loop.tasks import Task
@@ -767,9 +793,15 @@ class CliTests(unittest.TestCase):
 
         record_and_exit = (
             "from pathlib import Path\n"
+            "import json\n"
+            "import os\n"
             "import sys\n"
             "Path('{name}-args.txt').write_text("
             "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+            "Path('{name}-env.json').write_text(json.dumps({{\n"
+            "    'agent_kind': os.environ['VIBE_LOOP_AGENT_KIND'],\n"
+            "    'agent_profile': os.environ['VIBE_LOOP_AGENT_PROFILE'],\n"
+            "}}), encoding='utf-8')\n"
             "print('{name} out')\n"
         )
 
@@ -808,28 +840,53 @@ class CliTests(unittest.TestCase):
             general_task = Task(
                 task_id="GEN-01", title="General", status="Next", order=1
             )
-            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+            with patch.dict(
+                "os.environ",
+                {
+                    "PATH": str(bin_dir),
+                    "VIBE_LOOP_AGENT_KIND": "ambient-wrong-kind",
+                    "VIBE_LOOP_AGENT_PROFILE": "ambient-wrong-profile",
+                },
+            ):
                 config = load_config(repo)
                 runner = VibeRunner(config)
                 runner._source = _StubSource()
-                runner.run_task(security_task)
+                routed_result = runner.run_task(security_task)
                 routed_run = (repo / "claude-args.txt").exists()
                 routed_args = (repo / "claude-args.txt").read_text(encoding="utf-8")
+                routed_env = json.loads(
+                    (repo / "claude-env.json").read_text(encoding="utf-8")
+                )
                 routed_ran_codex = (repo / "codex-args.txt").exists()
 
                 (repo / "claude-args.txt").unlink()
                 runner._source = _StubSource()
-                runner.run_task(general_task)
+                default_result = runner.run_task(general_task)
                 default_ran_codex = (repo / "codex-args.txt").exists()
+                default_env = json.loads(
+                    (repo / "codex-env.json").read_text(encoding="utf-8")
+                )
                 default_ran_claude = (repo / "claude-args.txt").exists()
 
         # The abi-hazard task is dispatched to the claude profile, not codex.
         self.assertTrue(routed_run)
         self.assertIn("--model\nopus", routed_args)
         self.assertFalse(routed_ran_codex)
+        self.assertEqual(
+            routed_env,
+            {"agent_kind": "claude", "agent_profile": "claude-opus"},
+        )
+        self.assertEqual(routed_result.agent_kind, routed_env["agent_kind"])
+        self.assertEqual(
+            routed_result.trailer_context["agent_profile"],
+            routed_env["agent_profile"],
+        )
         # The unmatched task falls back to the default codex agent.
         self.assertTrue(default_ran_codex)
         self.assertFalse(default_ran_claude)
+        self.assertEqual(default_env, {"agent_kind": "codex", "agent_profile": ""})
+        self.assertEqual(default_result.agent_kind, default_env["agent_kind"])
+        self.assertNotIn("agent_profile", default_result.trailer_context)
 
     def test_run_next_records_observed_claude_session_and_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
