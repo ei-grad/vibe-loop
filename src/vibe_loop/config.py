@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
+import hashlib
 import math
 import os
 import re
@@ -307,8 +308,36 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "planning_command",
         "idle_wake_command",
         "analysis_command",
+        "orchestration",
+        "reviewer_profile",
+        "gates",
+        "verify_on_main",
+        "max_initial_review_passes",
+        "max_closure_review_passes",
+        "reviewer_concurrency_budget",
+        "max_remediation_rounds",
+        "integration_enabled",
+        "task_provenance_mode",
     }
 )
+
+ORCHESTRATION_MODES = ("worker-owned", "runtime-owned")
+ORCHESTRATION_TASK_PROVENANCE_MODES = ("external-confirmed", "adapter")
+ORCHESTRATION_CONFIG_KEYS = frozenset(
+    {
+        "mode",
+        "reviewer_profile",
+        "gates",
+        "verify_on_main",
+        "max_initial_review_passes",
+        "max_closure_review_passes",
+        "reviewer_concurrency_budget",
+        "max_remediation_rounds",
+        "integration_enabled",
+        "task_provenance_mode",
+    }
+)
+ORCHESTRATION_COMMAND_REF_RE = re.compile(r"^completion\.commands\[(\d+)]$")
 
 AGENT_KIND_VALUES = ("auto", "codex", "claude", "custom")
 AGENT_PROMPT_DIALECTS = ("codex", "claude")
@@ -720,6 +749,39 @@ class CompletionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class OrchestrationConfig:
+    mode: str = "worker-owned"
+    reviewer_profile: str | None = None
+    gates: tuple[str, ...] = ()
+    verify_on_main: tuple[str, ...] = ()
+    max_initial_review_passes: int = 1
+    max_closure_review_passes: int = 2
+    reviewer_concurrency_budget: int = 1
+    max_remediation_rounds: int = 2
+    integration_enabled: bool = True
+    task_provenance_mode: str = "external-confirmed"
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "reviewer_profile": self.reviewer_profile,
+            "gates": list(self.gates),
+            "verify_on_main": list(self.verify_on_main),
+            "max_initial_review_passes": self.max_initial_review_passes,
+            "max_closure_review_passes": self.max_closure_review_passes,
+            "reviewer_concurrency_budget": self.reviewer_concurrency_budget,
+            "max_remediation_rounds": self.max_remediation_rounds,
+            "integration_enabled": self.integration_enabled,
+            "task_provenance_mode": self.task_provenance_mode,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class SupervisionConfig:
     max_restarts: int = SUPERVISION_DEFAULT_MAX_RESTARTS
     cooldown_seconds: float = SUPERVISION_DEFAULT_COOLDOWN_SECONDS
@@ -1038,6 +1100,9 @@ class VibeConfig:
     agent_routing: tuple[AgentRoutingRule, ...] = ()
     task_source: TaskSourceConfig = dataclasses.field(default_factory=TaskSourceConfig)
     completion: CompletionConfig = dataclasses.field(default_factory=CompletionConfig)
+    orchestration: OrchestrationConfig = dataclasses.field(
+        default_factory=OrchestrationConfig
+    )
     supervision: SupervisionConfig = dataclasses.field(
         default_factory=SupervisionConfig
     )
@@ -1051,6 +1116,7 @@ class VibeConfig:
     )
     config_path: Path | None = None
     config_source: str = "default"
+    config_digest: str = ""
     worker_prompt_extra: str | None = None
     runtime_context: tuple[tuple[str, str], ...] = ()
 
@@ -1084,13 +1150,22 @@ def load_config(
 ) -> VibeConfig:
     repo = repo.resolve()
     config_path, config_source = resolve_config_file(repo)
-    data = read_config_file(config_path) if config_path is not None else {}
+    if config_path is not None:
+        data, config_digest = read_config_file_snapshot(config_path)
+    else:
+        data = {}
+        config_digest = ""
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
     agent_table = expect_table(data.get("agent", {}), "agent")
     agent = parse_agent(agent_table)
     agent_profiles = parse_agent_profiles(agent_table)
     agent_routing = parse_agent_routing(agent_table, agent_profiles)
+    orchestration = parse_orchestration(
+        data.get("orchestration", {}),
+        completion=completion,
+        agent_profiles=agent_profiles,
+    )
     supervision = parse_supervision(data.get("supervision", {}))
     locks = parse_locks(data.get("locks", {}))
     project_binding = parse_project_binding(data.get("project_binding", {}))
@@ -1106,6 +1181,7 @@ def load_config(
         repo=repo,
         config_path=config_path,
         config_source=config_source,
+        config_digest=config_digest,
         main_branch=str(data.get("main_branch") or "main"),
         state_dir=str(data.get("state_dir") or ".vibe-loop"),
         worker_prompt_extra=optional_text(
@@ -1117,6 +1193,7 @@ def load_config(
         agent_routing=agent_routing,
         task_source=task_source,
         completion=completion,
+        orchestration=orchestration,
         supervision=supervision,
         locks=locks,
         project_binding=project_binding,
@@ -1286,13 +1363,18 @@ def parse_main_worktree_path(porcelain: str) -> Path | None:
 
 
 def read_config_file(path: Path) -> dict[str, Any]:
+    return read_config_file_snapshot(path)[0]
+
+
+def read_config_file_snapshot(path: Path) -> tuple[dict[str, Any], str]:
     if not path.exists():
-        return {}
-    with path.open("rb") as handle:
-        payload = tomllib.load(handle)
+        return {}, ""
+    content = path.read_bytes()
+    payload = tomllib.loads(content.decode("utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: expected TOML table")
-    return payload
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    return payload, digest
 
 
 def parse_agent(data: object) -> AgentConfig:
@@ -2066,6 +2148,145 @@ def parse_completion(data: object, repo: Path) -> CompletionConfig:
     if isinstance(commands, list) and all(isinstance(item, str) for item in commands):
         return CompletionConfig(commands=tuple(commands))
     raise ValueError("completion.commands must be an array of strings")
+
+
+def parse_orchestration(
+    data: object,
+    *,
+    completion: CompletionConfig,
+    agent_profiles: Mapping[str, AgentConfig],
+) -> OrchestrationConfig:
+    table = expect_table(data, "orchestration")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - ORCHESTRATION_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            "orchestration contains unsupported keys: " + ", ".join(unknown_keys)
+        )
+
+    mode = orchestration_enum_value(
+        table,
+        "mode",
+        default="worker-owned",
+        allowed=ORCHESTRATION_MODES,
+    )
+    if mode == "runtime-owned":
+        raise ValueError(
+            'orchestration.mode = "runtime-owned" is not yet available; '
+            'use "worker-owned" until orc-scheduler-separation is complete'
+        )
+
+    reviewer_profile = optional_nonempty_string(table.get("reviewer_profile"))
+    if reviewer_profile is not None and reviewer_profile not in agent_profiles:
+        raise ValueError(
+            "orchestration.reviewer_profile must reference a configured "
+            f"agent.profiles entry: {reviewer_profile}"
+        )
+
+    default_command_refs = tuple(
+        f"completion.commands[{index}]" for index, _ in enumerate(completion.commands)
+    )
+    gates = nonempty_string_tuple(
+        table.get("gates"),
+        default_command_refs,
+        "orchestration.gates",
+        allow_empty=True,
+    )
+    verify_on_main = nonempty_string_tuple(
+        table.get("verify_on_main"),
+        default_command_refs,
+        "orchestration.verify_on_main",
+        allow_empty=True,
+    )
+    validate_orchestration_command_refs(
+        gates,
+        completion=completion,
+        setting="orchestration.gates",
+    )
+    validate_orchestration_command_refs(
+        verify_on_main,
+        completion=completion,
+        setting="orchestration.verify_on_main",
+    )
+
+    task_provenance_mode = orchestration_enum_value(
+        table,
+        "task_provenance_mode",
+        default="external-confirmed",
+        allowed=ORCHESTRATION_TASK_PROVENANCE_MODES,
+    )
+
+    return OrchestrationConfig(
+        mode=mode,
+        reviewer_profile=reviewer_profile,
+        gates=gates,
+        verify_on_main=verify_on_main,
+        max_initial_review_passes=positive_int(
+            table.get("max_initial_review_passes"),
+            1,
+            "orchestration.max_initial_review_passes",
+        ),
+        max_closure_review_passes=nonnegative_int(
+            table.get("max_closure_review_passes"),
+            2,
+            "orchestration.max_closure_review_passes",
+        ),
+        reviewer_concurrency_budget=positive_int(
+            table.get("reviewer_concurrency_budget"),
+            1,
+            "orchestration.reviewer_concurrency_budget",
+        ),
+        max_remediation_rounds=nonnegative_int(
+            table.get("max_remediation_rounds"),
+            2,
+            "orchestration.max_remediation_rounds",
+        ),
+        integration_enabled=optional_bool(
+            table.get("integration_enabled"),
+            True,
+            "orchestration.integration_enabled",
+        ),
+        task_provenance_mode=task_provenance_mode,
+        explicit_keys=explicit_keys,
+    )
+
+
+def validate_orchestration_command_refs(
+    refs: Sequence[str],
+    *,
+    completion: CompletionConfig,
+    setting: str,
+) -> None:
+    for ref in refs:
+        match = ORCHESTRATION_COMMAND_REF_RE.fullmatch(ref)
+        if match is None:
+            raise ValueError(
+                f"{setting} entries must be allowlisted completion.commands[N] "
+                f"references, not executable values: {ref!r}"
+            )
+        index = int(match.group(1))
+        if index >= len(completion.commands):
+            raise ValueError(
+                f"{setting} references unconfigured command key {ref}; "
+                f"completion.commands has {len(completion.commands)} entries"
+            )
+
+
+def orchestration_enum_value(
+    table: Mapping[str, object],
+    key: str,
+    *,
+    default: str,
+    allowed: Sequence[str],
+) -> str:
+    value = table.get(key)
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"orchestration.{key} must be one of: " + ", ".join(allowed))
+    if value not in allowed:
+        raise ValueError(f"orchestration.{key} must be one of: " + ", ".join(allowed))
+    return value
 
 
 def default_completion_commands(repo: Path) -> tuple[str, ...]:

@@ -58,6 +58,7 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
     redact_fencing_token_text,
 )
+from vibe_loop.orchestration import RunContractResolver
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
     LimitWallSignal,
@@ -1223,7 +1224,17 @@ class VibeRunner:
             )
         )
         continuation = recovery is not None or restart_count > 0
+        pre_launch_failure_reason = "run_contract_resolution_failed"
         try:
+            run_contract = RunContractResolver(self.config).resolve(agent_selection)
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    contract=run_contract.to_record_payload(),
+                )
+            )
+            pre_launch_failure_reason = "task_activation_failed"
             activated_task = self.activate_task_before_launch(
                 task,
                 run_id,
@@ -1244,7 +1255,7 @@ class VibeRunner:
                     lock_path=task_lock.path,
                     payload={
                         "started_at": active_state.started_at,
-                        "reason": "task_activation_failed",
+                        "reason": pre_launch_failure_reason,
                     },
                 )
             )
@@ -1263,6 +1274,9 @@ class VibeRunner:
                     "conflict_domains_known": task.conflict_domains_known,
                     "restart_count": restart_count,
                     "max_restarts": max_restarts,
+                    "run_contract_digest": run_contract.digest,
+                    "run_contract_version": run_contract.payload["contract_version"],
+                    "orchestration_mode": run_contract.payload["mode"],
                     "reason": (
                         "task_activation_confirmed"
                         if activated_task is not None

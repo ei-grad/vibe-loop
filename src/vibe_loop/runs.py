@@ -35,6 +35,7 @@ LOCK_RELEASED_RECORD_TYPE = "lock_released"
 LOCK_EXPIRED_RECORD_TYPE = "lock_expired"
 LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
+RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
@@ -84,6 +85,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         LOCK_EXPIRED_RECORD_TYPE,
         LOCK_FINALIZATION_FAILED_RECORD_TYPE,
         RUN_STARTED_RECORD_TYPE,
+        RUN_CONTRACT_RESOLVED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
         WORKSPACE_CLAIM_RECORD_TYPE,
@@ -486,6 +488,21 @@ class RunLifecycleEvent:
             run_id=run_id,
             task_id=task_id,
             payload=event_payload,
+        )
+
+    @classmethod
+    def run_contract_resolved(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        contract: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=RUN_CONTRACT_RESOLVED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=contract,
         )
 
     @classmethod
@@ -1105,6 +1122,8 @@ def record_status(record: dict[str, Any]) -> str:
         return string_value(record.get("to_state"))
     if record_type == RUN_STARTED_RECORD_TYPE:
         return "started"
+    if record_type == RUN_CONTRACT_RESOLVED_RECORD_TYPE:
+        return "resolved"
     if record_type == WORKER_PROCESS_STARTED_RECORD_TYPE:
         return "started"
     if record_type == AGENT_CONTEXT_OBSERVED_RECORD_TYPE:

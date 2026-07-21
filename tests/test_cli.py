@@ -6375,7 +6375,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("requires task_source.activate", stderr.getvalue())
         self.assertFalse(agent_started)
         self.assertFalse(task_lock_exists)
-        self.assertEqual(record_types, ["lock_acquired", "lock_released"])
+        self.assertEqual(
+            record_types,
+            ["lock_acquired", "run_contract_resolved", "lock_released"],
+        )
         self.assertEqual(records[-1]["reason"], "task_activation_failed")
 
     def test_command_prelaunch_failures_release_lock_without_starting_worker(
@@ -6474,7 +6477,10 @@ class CliTests(unittest.TestCase):
 
                 self.assertFalse(agent_started)
                 self.assertFalse(task_lock_exists)
-                self.assertEqual(record_types, ["lock_acquired", "lock_released"])
+                self.assertEqual(
+                    record_types,
+                    ["lock_acquired", "run_contract_resolved", "lock_released"],
+                )
                 self.assertEqual(records[-1]["reason"], "task_activation_failed")
 
     def test_main_integration_rejects_merged_branch_behind_main(self) -> None:
