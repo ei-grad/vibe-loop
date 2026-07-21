@@ -48,6 +48,9 @@ CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 REVIEW_STARTED_RECORD_TYPE = "review_started"
 REVIEW_VERDICT_RECORD_TYPE = "review_verdict"
+REVIEW_WAIT_INCOMPLETE_RECORD_TYPE = "review_wait_incomplete"
+REVIEW_BUDGET_RECORD_TYPE = "review_budget"
+CONTINUATION_FALLBACK_RECORD_TYPE = "continuation_fallback"
 FINDING_RECORDED_RECORD_TYPE = "finding_recorded"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
@@ -112,6 +115,9 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         GATE_RESULT_RECORD_TYPE,
         REVIEW_STARTED_RECORD_TYPE,
         REVIEW_VERDICT_RECORD_TYPE,
+        REVIEW_WAIT_INCOMPLETE_RECORD_TYPE,
+        REVIEW_BUDGET_RECORD_TYPE,
+        CONTINUATION_FALLBACK_RECORD_TYPE,
         FINDING_RECORDED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
@@ -711,6 +717,51 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=REVIEW_VERDICT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_wait_incomplete(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_WAIT_INCOMPLETE_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def review_budget(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=REVIEW_BUDGET_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def continuation_fallback(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=CONTINUATION_FALLBACK_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,
@@ -1400,6 +1451,122 @@ class RunStore:
 
     def append_result(self, result: RunResult) -> None:
         self.append_record(result.to_record())
+
+    def claim_review_attempt(
+        self,
+        *,
+        start_record: Mapping[str, object],
+        max_initial_passes: int,
+        max_closure_passes: int,
+        lineage_fingerprint: str,
+        before_start_record: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        """Atomically initialize the review budget and reserve one launch."""
+
+        run_id = string_value(start_record.get("run_id"))
+        task_id = string_value(start_record.get("task_id"))
+        pass_kind = string_value(start_record.get("pass_kind"))
+        family = "initial" if pass_kind == "initial" else "closure"
+        limit = max_initial_passes if family == "initial" else max_closure_passes
+        if not run_id or not task_id or not pass_kind:
+            raise ValueError("review attempt identity is required")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                initialized = any(
+                    record.get("record_type") == REVIEW_BUDGET_RECORD_TYPE
+                    and string_value(record.get("run_id")) == run_id
+                    and string_value(record.get("task_id")) == task_id
+                    and record.get("action") == "initialized"
+                    for record in records
+                )
+                if not initialized:
+                    self._append_record_unlocked(
+                        RunLifecycleEvent.review_budget(
+                            run_id=run_id,
+                            task_id=task_id,
+                            payload={
+                                "action": "initialized",
+                                "source": "dispatch_contract",
+                                "lineage_fingerprint": lineage_fingerprint,
+                                "max_initial_passes": max_initial_passes,
+                                "max_closure_passes": max_closure_passes,
+                            },
+                        ).to_record()
+                    )
+                    records = self._read_records_unlocked()
+
+                active: dict[tuple[object, ...], dict[str, Any]] = {}
+                successful_ordinals: set[int] = set()
+                for record in records:
+                    if (
+                        string_value(record.get("run_id")) != run_id
+                        or string_value(record.get("task_id")) != task_id
+                    ):
+                        continue
+                    recorded_kind = string_value(record.get("pass_kind"))
+                    recorded_family = (
+                        "initial"
+                        if recorded_kind == "initial"
+                        else "closure"
+                        if recorded_kind.startswith("closure:")
+                        else ""
+                    )
+                    key = (
+                        recorded_kind,
+                        record.get("pass_ordinal"),
+                        record.get("attempt_ordinal"),
+                        record.get("candidate_fingerprint"),
+                    )
+                    if record.get("record_type") == REVIEW_STARTED_RECORD_TYPE:
+                        active[key] = record
+                    elif record.get("record_type") == REVIEW_VERDICT_RECORD_TYPE:
+                        active.pop(key, None)
+                        ordinal = record.get("pass_ordinal")
+                        if (
+                            recorded_family == family
+                            and record.get("verdict") in {"approve", "findings"}
+                            and isinstance(ordinal, int)
+                            and not isinstance(ordinal, bool)
+                            and ordinal > 0
+                        ):
+                            successful_ordinals.add(ordinal)
+                if active:
+                    pending = next(reversed(active.values()))
+                    return {"status": "pending", "record": dict(pending)}
+
+                pass_ordinal = max(successful_ordinals, default=0) + 1
+                if pass_ordinal > limit:
+                    exhausted = RunLifecycleEvent.review_budget(
+                        run_id=run_id,
+                        task_id=task_id,
+                        payload={
+                            "action": "exhausted",
+                            "family": family,
+                            "pass_kind": pass_kind,
+                            "pass_ordinal": pass_ordinal,
+                            "limit": limit,
+                            "candidate_fingerprint": start_record.get(
+                                "candidate_fingerprint", ""
+                            ),
+                        },
+                    ).to_record()
+                    self._append_record_unlocked(exhausted)
+                    return {
+                        "status": "exhausted",
+                        "pass_ordinal": pass_ordinal,
+                        "limit": limit,
+                    }
+
+                claimed = dict(start_record)
+                claimed["pass_ordinal"] = pass_ordinal
+                if before_start_record is not None:
+                    before = dict(before_start_record)
+                    before["pass_ordinal"] = pass_ordinal
+                    self._append_record_unlocked(before)
+                self._append_record_unlocked(claimed)
+                return {"status": "claimed", "pass_ordinal": pass_ordinal}
 
     def append_report(self, report: WorkerReport) -> None:
         self.append_record(report.to_record(), fencing_token=report.fencing_token)

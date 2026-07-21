@@ -68,6 +68,7 @@ from vibe_loop.orchestration import (
     StageFailure,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
+    inject_claude_session,
     run_configured_command,
 )
 from vibe_loop.processes import read_process_node
@@ -5373,9 +5374,7 @@ def inject_claude_session_id(command: str, session_id: str) -> str:
     streamed stdout format and leaves the {prompt} placeholder intact for the
     later .format() call.
     """
-    if "{prompt}" in command:
-        return command.replace("{prompt}", f"--session-id {session_id} {{prompt}}", 1)
-    return f"{command.rstrip()} --session-id {session_id}"
+    return inject_claude_session(command, session_id, resume=False)
 
 
 def command_specifies_resume(argv: list[str]) -> bool:
@@ -5418,9 +5417,7 @@ def inject_claude_resume(command: str, session_id: str) -> str:
     session); if a future claude version forks on resume this assumption, and
     the stable-transcript resolution below, would need revisiting.
     """
-    if "{prompt}" in command:
-        return command.replace("{prompt}", f"--resume {session_id} {{prompt}}", 1)
-    return f"{command.rstrip()} --resume {session_id}"
+    return inject_claude_session(command, session_id, resume=True)
 
 
 def resumable_prior_session_id(prior_result: RunResult) -> str:

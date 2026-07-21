@@ -1163,9 +1163,27 @@ a candidate-scoped ledger, malformed output gets one bounded re-ask, and a
 provider limit wall is attributed to the reviewer route without consuming the
 implementation restart budget. Runtime usage phases are `initial_review` and
 `targeted_closure`; compatibility worker reports may continue using `review`.
-Same-session continuation and the runtime-owned mode switch land in subsequent
-orchestration slices. Until then, `mode = "worker-owned"` preserves the existing
-worker-owned review lifecycle and `mode = "runtime-owned"` fails closed.
+
+Continuation capability is explicit by provider and role. Claude implementer
+and reviewer commands support runtime session injection, resume, structured
+output, and launch-time Agent/Task denial. Codex implementer `exec` supports
+structured output and `exec resume`, but its session is discovered after launch.
+The `codex review` surface supports neither session injection nor resume, so a
+targeted closure records `continuation_fallback = "provider_unsupported"` before
+starting a fresh review with the findings ledger and prior gate evidence.
+Missing and expired sessions similarly record `transcript_missing` or
+`session_expired` before fallback.
+
+The runtime owns session continuation ordinals and review budgets. Each dispatch
+journals one immutable initial/closure budget tied to the first candidate
+fingerprint; later candidate fingerprints consume the remaining closure budget
+instead of resetting it. An unfinished `review_started` record parks as
+`review_wait_incomplete` and is never silently replayed. Reviewer prompts forbid
+nested model delegation, Claude receives launch-time Agent/Task denial, and any
+observable nested structured launch is a typed policy violation with separately
+attributed usage. The runtime-owned mode switch still lands in a subsequent
+orchestration slice. Until then, `mode = "worker-owned"` preserves the existing
+worker-owned lifecycle and `mode = "runtime-owned"` fails closed.
 
 ### Locks
 

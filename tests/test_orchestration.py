@@ -37,10 +37,12 @@ from vibe_loop.orchestration import (
     RuntimeGateController,
     ReviewBudgetExhausted,
     ReviewConcurrencyBudget,
+    ReviewDelegationPolicyError,
     ReviewFinding,
     ReviewLimitWallError,
     ReviewRouter,
     ReviewStageResultError,
+    ReviewWaitIncomplete,
     STAGE_FAILURES,
     IllegalStageTransitionError,
     RunContractProposal,
@@ -51,6 +53,9 @@ from vibe_loop.orchestration import (
     WorkspaceProvisionError,
     WorkspaceProvisioner,
     derive_stage_progress,
+    inject_provider_continuation,
+    plan_session_continuation,
+    provider_capabilities,
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.locks import LockManager
@@ -499,6 +504,21 @@ class RuntimeGateTests(unittest.TestCase):
             CandidateCollectionError, "uncommitted tracked changes"
         ):
             self.collector.collect_derived()
+
+    def test_candidate_fingerprint_uses_only_head_and_changed_paths(self) -> None:
+        candidate = self.collector.collect_derived()
+        relocated = dataclasses.replace(
+            candidate,
+            branch="worker/other",
+            worktree=self.repo / "other",
+            base_main="f" * 40,
+        )
+
+        self.assertEqual(candidate.fingerprint, relocated.fingerprint)
+        self.assertNotEqual(
+            candidate.fingerprint,
+            dataclasses.replace(candidate, changed_paths=("other.txt",)).fingerprint,
+        )
 
     def test_gate_records_redacted_evidence_and_invalidates_mutating_gate(
         self,
@@ -980,6 +1000,18 @@ class ReviewRouterTests(unittest.TestCase):
             max_closure_passes=closure,
             concurrency=ReviewConcurrencyBudget(1),
             executor=executor,
+            continuation_availability=lambda _provider, _role, _session: "",
+            session_id_factory=lambda: f"{provider}-session",
+        )
+
+    def gates_for(self, candidate: CandidateRecord) -> GateRunSummary:
+        return dataclasses.replace(
+            self.gates,
+            candidate=candidate,
+            results=tuple(
+                dataclasses.replace(result, candidate_fingerprint=candidate.fingerprint)
+                for result in self.gates.results
+            ),
         )
 
     def test_routes_cross_provider_matrices_with_provenance_and_usage(self) -> None:
@@ -1030,9 +1062,14 @@ class ReviewRouterTests(unittest.TestCase):
                 records = self.store.read_records()
                 self.assertEqual(
                     [record["record_type"] for record in records],
-                    ["review_started", "review_verdict"],
+                    [
+                        "review_budget",
+                        "review_started",
+                        "review_verdict",
+                        "review_budget",
+                    ],
                 )
-                verdict = records[-1]
+                verdict = records[-2]
                 self.assertEqual(verdict["route"]["provider"], reviewer)
                 self.assertEqual(verdict["route"]["model"], "review-model")
                 self.assertEqual(verdict["route"]["effort"], "high")
@@ -1093,9 +1130,8 @@ class ReviewRouterTests(unittest.TestCase):
         ):
             machine.transition(stage, reason="setup")
         router.stage_machine = machine
-        remediated_gates = dataclasses.replace(
-            self.gates,
-            candidate=dataclasses.replace(self.candidate, head_commit="c" * 40),
+        remediated_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="c" * 40)
         )
         with self.assertRaises(ReviewBudgetExhausted):
             router.review(remediated_gates)
@@ -1104,11 +1140,15 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertEqual(
             [record["record_type"] for record in self.store.read_records()],
             [
+                "review_budget",
                 "review_started",
                 "review_verdict",
+                "continuation_fallback",
                 "review_started",
                 "review_verdict",
                 "finding_recorded",
+                "review_budget",
+                "review_budget",
             ],
         )
 
@@ -1153,7 +1193,7 @@ class ReviewRouterTests(unittest.TestCase):
                             "state": "remediated",
                         }
                     ],
-                    "session_id": "session-1",
+                    "session_id": "claude-session",
                     "session_id_source": "provider",
                     "continuation_ordinal": 1,
                 }
@@ -1165,10 +1205,7 @@ class ReviewRouterTests(unittest.TestCase):
             self.candidate,
             head_commit="c" * 40,
         )
-        remediated_gates = dataclasses.replace(
-            self.gates,
-            candidate=remediated_candidate,
-        )
+        remediated_gates = self.gates_for(remediated_candidate)
         result = router.review(remediated_gates, pass_kind="closure:1")
 
         self.assertTrue(result.approved)
@@ -1212,7 +1249,12 @@ class ReviewRouterTests(unittest.TestCase):
         result = router.review(self.gates)
         self.assertEqual(result.pass_ordinal, 1)
         records = self.store.read_records()
-        wall = records[1]
+        wall = next(
+            record
+            for record in records
+            if record.get("record_type") == "review_verdict"
+            and record.get("retry_classification") == "limit_wall"
+        )
         self.assertEqual(wall["retry_classification"], "limit_wall")
         self.assertEqual(wall["route"]["provider"], "codex")
 
@@ -1416,6 +1458,668 @@ class ReviewRouterTests(unittest.TestCase):
             RunStage.REMEDIATION.value,
             [transition["to_stage"] for transition in transitions],
         )
+
+    def test_provider_capabilities_cover_both_roles_and_shared_resume_paths(
+        self,
+    ) -> None:
+        claude_reviewer = provider_capabilities("claude", "reviewer")
+        codex_reviewer = provider_capabilities("codex", "reviewer")
+        codex_implementer = provider_capabilities("codex", "implementer")
+
+        self.assertTrue(claude_reviewer.session_injection)
+        self.assertTrue(claude_reviewer.resume)
+        self.assertTrue(claude_reviewer.structured_output)
+        self.assertFalse(codex_reviewer.resume)
+        self.assertFalse(codex_reviewer.structured_output)
+        self.assertTrue(codex_implementer.resume)
+
+        continuation = plan_session_continuation(
+            provider="codex",
+            role="implementer",
+            continuing=True,
+            prior_session_id="thread-123",
+            prior_ordinal=0,
+        )
+        self.assertEqual(
+            inject_provider_continuation(
+                "codex exec --json {prompt}",
+                provider="codex",
+                role="implementer",
+                continuation=continuation,
+            ),
+            "codex exec resume thread-123 --json {prompt}",
+        )
+
+    def test_review_refuses_gate_evidence_from_an_older_candidate(self) -> None:
+        changed = dataclasses.replace(self.candidate, head_commit="f" * 40)
+        stale_gates = dataclasses.replace(self.gates, candidate=changed)
+
+        with self.assertRaisesRegex(GateExecutionError, "exact candidate"):
+            self.router("codex", lambda *_args, **_kwargs: None).review(stale_gates)
+
+    def test_claude_route_augments_existing_tool_denial_and_parses_stream_result(
+        self,
+    ) -> None:
+        commands: list[str] = []
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            output = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "result": json.dumps(
+                                {
+                                    "verdict": "approve",
+                                    "findings": [],
+                                    "session_id": "claude-session",
+                                    "session_id_source": "provider",
+                                }
+                            ),
+                            "usage": {"input_tokens": 17, "output_tokens": 5},
+                            "num_turns": 1,
+                        }
+                    ),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        router = ReviewRouter(
+            reviewer=self.agent(
+                "claude",
+                command=(
+                    "claude -p --model {model} --effort {effort} "
+                    "--disallowedTools Edit {prompt}"
+                ),
+            ),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=1,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=execute,
+            continuation_availability=lambda _provider, _role, _session: "",
+            session_id_factory=lambda: "claude-session",
+        )
+        result = router.review(self.gates)
+
+        argv = shlex.split(commands[0])
+        denied = argv.index("--disallowedTools")
+        self.assertEqual(argv[denied + 1 : denied + 3], ["Agent,Task", "Edit"])
+        self.assertEqual(argv[-3:], ["--disallowedTools", "Agent,Task", "Edit"])
+        self.assertIn("stream-json", argv)
+        self.assertIn("--verbose", argv)
+        self.assertTrue(result.approved)
+        self.assertEqual(result.usage.values["input_tokens"], 17)
+
+    def test_default_claude_availability_detects_missing_transcript(self) -> None:
+        home = self.repo / "claude-home"
+        initial = ReviewFinding(
+            finding_id="F1",
+            severity="P2",
+            summary="missing guard",
+            evidence="reproduction",
+            files=("src/example.py",),
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.review_verdict(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "pass_kind": "initial",
+                    "pass_ordinal": 1,
+                    "attempt_ordinal": 1,
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "verdict": "findings",
+                    "session_id": "old-session",
+                    "session_id_source": "runtime_injected",
+                    "continuation_ordinal": 0,
+                    "route": {"provider": "claude"},
+                },
+            )
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.finding_recorded(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "finding_id": initial.finding_id,
+                    "severity": initial.severity,
+                    "summary": initial.summary,
+                    "evidence": initial.evidence,
+                    "files": list(initial.files),
+                    "lines": [],
+                    "state": "open",
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "pass_kind": "initial",
+                },
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                **initial.to_payload(),
+                                "evidence": "guard now passes",
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "fresh-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+
+        router = ReviewRouter(
+            reviewer=self.agent(
+                "claude",
+                command=(
+                    f"CLAUDE_HOME={home} claude -p --model {{model}} "
+                    "--effort {effort} {prompt}"
+                ),
+            ),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=1,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=execute,
+            session_id_factory=lambda: "fresh-session",
+        )
+        result = router.review(
+            self.gates_for(dataclasses.replace(self.candidate, head_commit="2" * 40)),
+            pass_kind="closure:1",
+        )
+
+        self.assertTrue(result.approved)
+        fallback = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "continuation_fallback"
+        )
+        self.assertEqual(fallback["reason"], "transcript_missing")
+
+    def test_claude_closure_resumes_runtime_owned_reviewer_session(self) -> None:
+        commands: list[str] = []
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "unsafe completion",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "claude-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "unsafe completion",
+                                "evidence": "reproduction passes",
+                                "files": ["src/example.py"],
+                                "lines": ["12"],
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "claude-session",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("claude", execute)
+        router.review(self.gates)
+        closure_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="d" * 40)
+        )
+        result = router.review(closure_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertIn("--session-id claude-session", commands[0])
+        self.assertIn("--resume claude-session", commands[1])
+        self.assertIn("--disallowedTools Agent,Task", commands[0])
+        self.assertIn("--output-format stream-json --verbose", commands[0])
+        self.assertEqual(
+            shlex.split(commands[0])[-2:], ["--disallowedTools", "Agent,Task"]
+        )
+        records = self.store.read_records()
+        self.assertFalse(
+            any(record["record_type"] == "continuation_fallback" for record in records)
+        )
+        starts = [
+            record for record in records if record["record_type"] == "review_started"
+        ]
+        self.assertEqual(
+            [
+                (record["session_id"], record["continuation_ordinal"])
+                for record in starts
+            ],
+            [("claude-session", 0), ("claude-session", 1)],
+        )
+
+    def test_codex_closure_records_fallback_before_fresh_launch(self) -> None:
+        commands: list[str] = []
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P2",
+                                "summary": "missing guard",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": [],
+                                "state": "open",
+                            }
+                        ],
+                        "session_id": "codex-old",
+                        "session_id_source": "provider",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P2",
+                                "summary": "missing guard",
+                                "evidence": "guard now passes",
+                                "files": ["src/example.py"],
+                                "lines": [],
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "codex-new",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 1,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        router.review(self.gates)
+        closure_gates = self.gates_for(
+            dataclasses.replace(self.candidate, head_commit="e" * 40)
+        )
+        result = router.review(closure_gates, pass_kind="closure:1")
+
+        self.assertTrue(result.approved)
+        self.assertNotIn("--resume", shlex.split(commands[1]))
+        self.assertNotIn("exec resume", commands[1])
+        records = self.store.read_records()
+        fallback_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["record_type"] == "continuation_fallback"
+        )
+        closure_start_index = next(
+            index
+            for index, record in enumerate(records)
+            if record["record_type"] == "review_started"
+            and record["pass_kind"] == "closure:1"
+        )
+        fallback = records[fallback_index]
+        self.assertLess(fallback_index, closure_start_index)
+        self.assertEqual(fallback["reason"], "provider_unsupported")
+        self.assertEqual(fallback["prior_session_id"], "codex-old")
+        self.assertEqual(
+            [finding["id"] for finding in fallback["context_artifacts"]["findings"]],
+            ["F1"],
+        )
+        closure_verdict = next(
+            record
+            for record in records
+            if record["record_type"] == "review_verdict"
+            and record["pass_kind"] == "closure:1"
+            and record["verdict"] == "approve"
+        )
+        self.assertFalse(closure_verdict["continuation_resumed"])
+        self.assertFalse(closure_verdict["stats"]["session_continuation"])
+
+    def test_continuation_fallback_reasons_are_runtime_owned(self) -> None:
+        missing = plan_session_continuation(
+            provider="claude",
+            role="reviewer",
+            continuing=True,
+            session_id_factory=lambda: "fresh-session",
+        )
+        expired = plan_session_continuation(
+            provider="claude",
+            role="reviewer",
+            continuing=True,
+            prior_session_id="old-session",
+            availability_reason="session_expired",
+            session_id_factory=lambda: "fresh-session",
+        )
+
+        self.assertEqual(missing.fallback_reason, "transcript_missing")
+        self.assertEqual(expired.fallback_reason, "session_expired")
+        self.assertEqual(expired.prior_session_id, "old-session")
+        self.assertFalse(expired.resumed)
+
+    def test_expired_claude_session_records_fallback_before_retry(self) -> None:
+        commands: list[str] = []
+        session_ids = iter(("old-session", "fresh-session"))
+        outputs = iter(
+            (
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "findings",
+                            "findings": [
+                                {
+                                    "id": "F1",
+                                    "severity": "P2",
+                                    "summary": "missing guard",
+                                    "evidence": "reproduction",
+                                    "files": ["src/example.py"],
+                                    "lines": [],
+                                    "state": "open",
+                                }
+                            ],
+                            "session_id": "old-session",
+                            "session_id_source": "provider",
+                        }
+                    ),
+                ),
+                (1, "No conversation found for session old-session"),
+                (
+                    0,
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [
+                                {
+                                    "id": "F1",
+                                    "severity": "P2",
+                                    "summary": "missing guard",
+                                    "evidence": "guard now passes",
+                                    "files": ["src/example.py"],
+                                    "lines": [],
+                                    "state": "remediated",
+                                }
+                            ],
+                            "session_id": "fresh-session",
+                            "session_id_source": "provider",
+                            "continuation_ordinal": 1,
+                        }
+                    ),
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            returncode, output = next(outputs)
+            return subprocess.CompletedProcess(command, returncode, stdout=output)
+
+        router = self.router("claude", execute)
+        router.session_id_factory = lambda: next(session_ids)
+        router.review(self.gates)
+        result = router.review(
+            self.gates_for(dataclasses.replace(self.candidate, head_commit="1" * 40)),
+            pass_kind="closure:1",
+        )
+
+        self.assertTrue(result.approved)
+        self.assertIn("--resume old-session", commands[1])
+        self.assertIn("--session-id fresh-session", commands[2])
+        fallback = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "continuation_fallback"
+        )
+        self.assertEqual(fallback["reason"], "session_expired")
+        self.assertEqual(fallback["prior_session_id"], "old-session")
+
+    def test_unfinished_review_wait_never_relaunches(self) -> None:
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.review_started(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "pass_kind": "initial",
+                    "pass_ordinal": 1,
+                    "attempt_ordinal": 1,
+                    "candidate_fingerprint": self.candidate.fingerprint,
+                    "session_id": "pending-session",
+                    "session_id_source": "provider",
+                    "continuation_ordinal": 0,
+                },
+            )
+        )
+        launches = 0
+
+        def execute(command: str, **kwargs):
+            nonlocal launches
+            launches += 1
+            raise AssertionError("unfinished review must not relaunch")
+
+        with self.assertRaises(ReviewWaitIncomplete):
+            self.router("codex", execute).review(self.gates)
+
+        self.assertEqual(launches, 0)
+        wait = self.store.read_records()[-1]
+        self.assertEqual(wait["record_type"], "review_wait_incomplete")
+        self.assertEqual(wait["session_id"], "pending-session")
+
+    def test_review_attempt_claim_prevents_concurrent_duplicate_launch(self) -> None:
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        launches = 0
+        first_results: list[object] = []
+
+        def execute(command: str, **kwargs):
+            nonlocal launches
+            launches += 1
+            first_entered.set()
+            release_first.wait(2)
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "codex-session",
+                        "session_id_source": "provider",
+                    }
+                ),
+            )
+
+        first = self.router("codex", execute)
+        second = self.router("codex", execute)
+
+        def run_first() -> None:
+            first_results.append(first.review(self.gates))
+
+        thread = threading.Thread(target=run_first)
+        thread.start()
+        self.assertTrue(first_entered.wait(1))
+        with self.assertRaises(ReviewWaitIncomplete):
+            second.review(self.gates)
+        release_first.set()
+        thread.join(2)
+
+        self.assertEqual(launches, 1)
+        self.assertEqual(len(first_results), 1)
+        self.assertFalse(isinstance(first_results[0], Exception))
+
+    def test_review_budget_resets_only_with_a_new_dispatch_contract(self) -> None:
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "codex-session",
+                        "session_id_source": "provider",
+                    }
+                ),
+            )
+
+        first = self.router("codex", execute, initial=1)
+        first.review(self.gates)
+        with self.assertRaises(ReviewBudgetExhausted):
+            first.review(self.gates)
+
+        second = ReviewRouter(
+            reviewer=self.agent("codex"),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-2",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=2,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=execute,
+            session_id_factory=lambda: "codex-session",
+        )
+        result = second.review(self.gates)
+
+        self.assertTrue(result.approved)
+        initialized = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_budget"
+            and record["action"] == "initialized"
+        ]
+        self.assertEqual(
+            [(record["run_id"], record["source"]) for record in initialized],
+            [("run-1", "dispatch_contract"), ("run-2", "dispatch_contract")],
+        )
+
+    def test_nested_reviewer_launch_is_rejected_and_usage_is_separate(self) -> None:
+        def execute(command: str, **kwargs):
+            output = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "subagent.started",
+                            "usage": {"input_tokens": 31_012},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "verdict": "approve",
+                            "findings": [],
+                            "session_id": "codex-session",
+                            "session_id_source": "provider",
+                        }
+                    ),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        with self.assertRaises(ReviewDelegationPolicyError):
+            self.router("codex", execute).review(self.gates)
+
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["policy_violation"], "nested_reviewer_delegation")
+        self.assertEqual(verdict["nested_launches"], 1)
+        self.assertEqual(verdict["nested_usage"]["input_tokens"], 31_012)
+
+    def test_claude_native_agent_tool_event_is_rejected(self) -> None:
+        def execute(command: str, **kwargs):
+            output = "\n".join(
+                (
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "name": "Agent",
+                                        "input": {"description": "closure"},
+                                    }
+                                ],
+                                "usage": {"input_tokens": 31_012},
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "result": json.dumps(
+                                {
+                                    "verdict": "approve",
+                                    "findings": [],
+                                    "session_id": "claude-session",
+                                    "session_id_source": "provider",
+                                }
+                            ),
+                        }
+                    ),
+                )
+            )
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        with self.assertRaises(ReviewDelegationPolicyError):
+            self.router("claude", execute).review(self.gates)
+
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["nested_launches"], 1)
+        self.assertEqual(verdict["nested_usage"]["input_tokens"], 31_012)
 
 
 class RunContractJournalTests(unittest.TestCase):

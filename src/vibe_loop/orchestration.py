@@ -4,10 +4,13 @@ import dataclasses
 import enum
 import hashlib
 import json
+import os
 import re
+import shlex
 import subprocess
 import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,6 +41,86 @@ REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
 FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
 FINDING_STATES = ("open", "remediated", "accepted", "rejected")
+CONTINUATION_FALLBACK_REASONS = (
+    "provider_unsupported",
+    "transcript_missing",
+    "session_expired",
+)
+REVIEW_ROLES = ("implementer", "reviewer")
+NESTED_REVIEW_EVENT_TYPES = frozenset(
+    {
+        "agent.spawned",
+        "subagent.started",
+        "subagent.spawned",
+        "task.delegated",
+        "workflow.started",
+    }
+)
+NESTED_REVIEW_TOOL_NAMES = frozenset(
+    {"agent", "task", "workflow", "spawn_agent", "delegate_agent"}
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ProviderCapabilities:
+    provider: str
+    role: str
+    session_injection: bool
+    resume: bool
+    structured_output: bool
+    nested_delegation_disable: bool
+
+
+PROVIDER_CAPABILITY_TABLE: Mapping[tuple[str, str], ProviderCapabilities] = {
+    ("claude", "implementer"): ProviderCapabilities(
+        provider="claude",
+        role="implementer",
+        session_injection=True,
+        resume=True,
+        structured_output=True,
+        nested_delegation_disable=True,
+    ),
+    ("claude", "reviewer"): ProviderCapabilities(
+        provider="claude",
+        role="reviewer",
+        session_injection=True,
+        resume=True,
+        structured_output=True,
+        nested_delegation_disable=True,
+    ),
+    ("codex", "implementer"): ProviderCapabilities(
+        provider="codex",
+        role="implementer",
+        session_injection=False,
+        resume=True,
+        structured_output=True,
+        nested_delegation_disable=False,
+    ),
+    ("codex", "reviewer"): ProviderCapabilities(
+        provider="codex",
+        role="reviewer",
+        session_injection=False,
+        resume=False,
+        structured_output=False,
+        nested_delegation_disable=False,
+    ),
+}
+
+
+def provider_capabilities(provider: str, role: str) -> ProviderCapabilities:
+    if role not in REVIEW_ROLES:
+        raise ValueError(f"unsupported continuation role: {role}")
+    try:
+        return PROVIDER_CAPABILITY_TABLE[(provider, role)]
+    except KeyError:
+        return ProviderCapabilities(
+            provider=provider or "unknown",
+            role=role,
+            session_injection=False,
+            resume=False,
+            structured_output=False,
+            nested_delegation_disable=False,
+        )
 
 
 class RunStage(enum.StrEnum):
@@ -118,6 +201,30 @@ class ReviewBudgetExhausted(ReviewExecutionError):
         self.pass_kind = pass_kind
         self.limit = limit
         super().__init__(f"review budget exhausted for {pass_kind}: limit={limit}")
+
+
+class ReviewWaitIncomplete(ReviewExecutionError):
+    def __init__(self, pass_kind: str, pass_ordinal: int, attempt_ordinal: int) -> None:
+        self.pass_kind = pass_kind
+        self.pass_ordinal = pass_ordinal
+        self.attempt_ordinal = attempt_ordinal
+        super().__init__(
+            "review wait is incomplete for "
+            f"{pass_kind} pass {pass_ordinal} attempt {attempt_ordinal}"
+        )
+
+
+class ReviewDelegationPolicyError(ReviewExecutionError):
+    def __init__(self, nested_launches: int) -> None:
+        self.nested_launches = nested_launches
+        super().__init__(
+            "reviewer violated the no-delegation policy: "
+            f"nested_launches={nested_launches}"
+        )
+
+
+class ReviewSessionExpired(ReviewExecutionError):
+    pass
 
 
 class ReviewLimitWallError(ReviewExecutionError):
@@ -359,8 +466,6 @@ class CandidateRecord:
     def fingerprint(self) -> str:
         return sha256_digest(
             {
-                "branch": self.branch,
-                "base_main": self.base_main,
                 "head_commit": self.head_commit,
                 "changed_paths": list(self.changed_paths),
             }
@@ -750,9 +855,17 @@ class GateRunSummary:
         return tuple(result.config_key for result in self.results if not result.passed)
 
     def require_review_ready(self) -> None:
-        if not self.candidate_recorded or not self.passed:
+        if (
+            not self.candidate_recorded
+            or not self.passed
+            or any(
+                result.candidate_fingerprint != self.candidate.fingerprint
+                for result in self.results
+            )
+        ):
             raise GateExecutionError(
-                "review requires a recorded candidate and passing gate evidence"
+                "review requires a recorded candidate and passing gate evidence "
+                "for the exact candidate fingerprint"
             )
 
 
@@ -873,6 +986,206 @@ class ReviewRequest:
 
 
 @dataclasses.dataclass(frozen=True)
+class ContinuationContext:
+    session_id: str = ""
+    session_id_source: str = ""
+    prior_session_id: str = ""
+    continuation_ordinal: int = 0
+    fallback_reason: str = ""
+    resumed: bool = False
+
+    def __post_init__(self) -> None:
+        if (
+            self.fallback_reason
+            and self.fallback_reason not in CONTINUATION_FALLBACK_REASONS
+        ):
+            raise ValueError("invalid continuation fallback reason")
+        if self.continuation_ordinal < 0:
+            raise ValueError("continuation ordinal must be non-negative")
+
+
+def inject_claude_session(command: str, session_id: str, *, resume: bool) -> str:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id) is None:
+        raise ReviewExecutionError("runtime continuation session id is invalid")
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ReviewExecutionError("reviewer command cannot be parsed") from exc
+    executable = next(
+        (
+            Path(token).name
+            for token in argv
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token) is None
+        ),
+        "",
+    )
+    if executable != "claude":
+        raise ReviewExecutionError("Claude session injection requires a claude command")
+    if any(
+        token in {"--resume", "-r", "--continue", "-c", "--session-id"}
+        or token.startswith(("--resume=", "--session-id="))
+        for token in argv
+    ):
+        raise ReviewExecutionError("reviewer command already controls session identity")
+    option = "--resume" if resume else "--session-id"
+    insertion = f"{option} {session_id}"
+    if "{prompt}" in command:
+        return command.replace("{prompt}", f"{insertion} {{prompt}}", 1)
+    return f"{command.rstrip()} {insertion}"
+
+
+def plan_session_continuation(
+    *,
+    provider: str,
+    role: str,
+    continuing: bool,
+    prior_session_id: str = "",
+    prior_ordinal: int = 0,
+    availability_reason: str = "",
+    session_id_factory: Callable[[], str] | None = None,
+) -> ContinuationContext:
+    capabilities = provider_capabilities(provider, role)
+    factory = session_id_factory or (lambda: str(uuid.uuid4()))
+    if not continuing:
+        if capabilities.session_injection:
+            return ContinuationContext(
+                session_id=factory(), session_id_source="runtime_injected"
+            )
+        return ContinuationContext(
+            session_id=factory(), session_id_source="runtime_launch"
+        )
+    if availability_reason and availability_reason not in CONTINUATION_FALLBACK_REASONS:
+        raise ValueError("invalid continuation availability reason")
+    reason = availability_reason
+    if not prior_session_id:
+        reason = "transcript_missing"
+    elif not capabilities.resume:
+        reason = "provider_unsupported"
+    if reason:
+        fresh_session = factory()
+        return ContinuationContext(
+            session_id=fresh_session,
+            session_id_source=(
+                "runtime_injected"
+                if capabilities.session_injection
+                else "runtime_launch"
+            ),
+            prior_session_id=prior_session_id,
+            continuation_ordinal=prior_ordinal + 1,
+            fallback_reason=reason,
+        )
+    return ContinuationContext(
+        session_id=prior_session_id,
+        session_id_source="runtime_resumed",
+        prior_session_id=prior_session_id,
+        continuation_ordinal=prior_ordinal + 1,
+        resumed=True,
+    )
+
+
+def inject_provider_continuation(
+    command: str,
+    *,
+    provider: str,
+    role: str,
+    continuation: ContinuationContext,
+) -> str:
+    capabilities = provider_capabilities(provider, role)
+    if (
+        not continuation.session_id
+        or not capabilities.session_injection
+        and not continuation.resumed
+    ):
+        return command
+    if provider == "claude":
+        return inject_claude_session(
+            command, continuation.session_id, resume=continuation.resumed
+        )
+    if provider == "codex" and role == "implementer" and continuation.resumed:
+        if (
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", continuation.session_id)
+            is None
+        ):
+            raise ReviewExecutionError("runtime continuation session id is invalid")
+        if "{prompt}" not in command:
+            raise ReviewExecutionError("Codex continuation requires {prompt}")
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            raise ReviewExecutionError("implementer command cannot be parsed") from exc
+        if "exec" not in argv or "resume" in argv:
+            raise ReviewExecutionError(
+                "Codex implementer continuation requires an unresumed exec command"
+            )
+        return re.sub(
+            r"(?<!\S)exec(?=\s|$)",
+            f"exec resume {continuation.session_id}",
+            command,
+            count=1,
+        )
+    return command
+
+
+def prepare_claude_review_command(command: str) -> str:
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ReviewExecutionError("reviewer command cannot be parsed") from exc
+    prompt_index = next(
+        (index for index, token in enumerate(argv) if token == "{prompt}"), len(argv)
+    )
+
+    output_format = ""
+    for index, token in enumerate(argv):
+        if token.startswith("--output-format="):
+            output_format = token.partition("=")[2]
+            break
+        if token == "--output-format" and index + 1 < len(argv):
+            output_format = argv[index + 1]
+            break
+    if output_format and output_format != "stream-json":
+        raise ReviewExecutionError(
+            "Claude reviewer structured output requires stream-json"
+        )
+    additions: list[str] = []
+    if not output_format:
+        additions.extend(("--output-format", "stream-json"))
+    if "--verbose" not in argv:
+        additions.append("--verbose")
+    if additions:
+        argv[prompt_index:prompt_index] = additions
+
+    disallowed = [
+        index
+        for index, token in enumerate(argv)
+        if token in {"--disallowedTools", "--disallowed-tools"}
+        or token.startswith(("--disallowedTools=", "--disallowed-tools="))
+    ]
+    if len(disallowed) > 1:
+        raise ReviewExecutionError(
+            "Claude reviewer command may specify disallowed tools only once"
+        )
+    existing_denials: list[str] = []
+    if disallowed:
+        index = disallowed[0]
+        token = argv.pop(index)
+        if "=" in token:
+            _, _, values = token.partition("=")
+            if values:
+                existing_denials.append(values)
+        else:
+            while index < len(argv):
+                value = argv[index]
+                if value == "{prompt}" or value.startswith("-"):
+                    break
+                existing_denials.append(argv.pop(index))
+    argv.extend(("--disallowedTools", "Agent,Task", *existing_denials))
+
+    prepared = shlex.join(argv)
+    return prepared.replace(shlex.quote("{prompt}"), "{prompt}")
+
+
+@dataclasses.dataclass(frozen=True)
 class ReviewResult:
     verdict: str
     findings: tuple[ReviewFinding, ...]
@@ -885,6 +1198,8 @@ class ReviewResult:
     pass_kind: str
     pass_ordinal: int
     attempt_ordinal: int
+    continuation_resumed: bool = False
+    nested_launches: int = 0
 
     @property
     def approved(self) -> bool:
@@ -969,6 +1284,7 @@ class FindingsLedger:
 
 
 ReviewExecutor = Callable[..., subprocess.CompletedProcess[str]]
+ContinuationAvailability = Callable[[str, str, str], str]
 
 
 class ReviewRouter:
@@ -988,6 +1304,8 @@ class ReviewRouter:
         stage_machine: RunLifecycleStateMachine | None = None,
         limit_wall_patterns: Sequence[str] | None = None,
         executor: ReviewExecutor = subprocess.run,
+        continuation_availability: ContinuationAvailability | None = None,
+        session_id_factory: Callable[[], str] | None = None,
     ) -> None:
         if max_initial_passes <= 0:
             raise ValueError("max_initial_passes must be positive")
@@ -1006,6 +1324,8 @@ class ReviewRouter:
         self.stage_machine = stage_machine
         self.limit_wall_patterns = limit_wall_patterns
         self.executor = executor
+        self.continuation_availability = continuation_availability
+        self.session_id_factory = session_id_factory or (lambda: str(uuid.uuid4()))
         self.ledger = FindingsLedger(run_store, run_id, task_id)
 
     def review(
@@ -1030,37 +1350,68 @@ class ReviewRouter:
             pass_kind=pass_kind,
             prior_findings=prior,
         )
+        command_template = self.reviewer.require_command()
+        if not command_template_uses_field(command_template, "prompt"):
+            raise AgentResolutionError(
+                "reviewer command must include {prompt}; otherwise the typed "
+                "review request cannot be delivered"
+            )
         pass_ordinal = self._next_pass_ordinal(request)
         limit = (
             self.max_initial_passes
             if request.family == "initial"
             else self.max_closure_passes
         )
-        if pass_ordinal > limit:
-            if self.stage_machine is not None:
-                self.stage_machine.fail(
-                    StageFailure.STAGE_FAILED,
-                    reason=f"review_budget_exhausted:{request.family}:limit={limit}",
-                )
-            raise ReviewBudgetExhausted(request.family, limit)
         self._transition_to_review(request)
         malformed: ReviewExecutionError | None = None
+        continuation = self._continuation_context(request)
         for attempt_ordinal in (1, 2):
             try:
-                result = self._launch(
-                    request,
-                    pass_ordinal=pass_ordinal,
-                    attempt_ordinal=attempt_ordinal,
-                    reask=attempt_ordinal == 2,
-                )
+                try:
+                    result = self._launch(
+                        request,
+                        pass_ordinal=pass_ordinal,
+                        attempt_ordinal=attempt_ordinal,
+                        reask=attempt_ordinal == 2,
+                        continuation=continuation,
+                    )
+                except ReviewSessionExpired:
+                    continuation = plan_session_continuation(
+                        provider=str(self._route_payload()["provider"]),
+                        role="reviewer",
+                        continuing=True,
+                        prior_session_id=(
+                            continuation.prior_session_id or continuation.session_id
+                        ),
+                        prior_ordinal=max(0, continuation.continuation_ordinal - 1),
+                        availability_reason="session_expired",
+                        session_id_factory=self.session_id_factory,
+                    )
+                    result = self._launch(
+                        request,
+                        pass_ordinal=pass_ordinal,
+                        attempt_ordinal=attempt_ordinal,
+                        reask=attempt_ordinal == 2,
+                        continuation=continuation,
+                    )
             except ReviewExecutionError as exc:
                 malformed = exc
                 if attempt_ordinal == 1 and str(exc).startswith("malformed review"):
+                    continuation = self._continuation_context(
+                        request, previous=continuation
+                    )
                     continue
                 if str(exc).startswith("malformed review"):
                     self._fail_stage_for_result("fatal")
                 raise
+            pass_ordinal = result.pass_ordinal
             self._record_findings(request, result.findings)
+            self._record_budget(
+                request,
+                action="consumed",
+                pass_ordinal=pass_ordinal,
+                limit=limit,
+            )
             self._transition_from_review(result)
             return result
         assert malformed is not None
@@ -1073,6 +1424,7 @@ class ReviewRouter:
         pass_ordinal: int,
         attempt_ordinal: int,
         reask: bool,
+        continuation: ContinuationContext,
     ) -> ReviewResult:
         command_template = self.reviewer.require_command()
         if not command_template_uses_field(command_template, "prompt"):
@@ -1080,25 +1432,22 @@ class ReviewRouter:
                 "reviewer command must include {prompt}; otherwise the typed "
                 "review request cannot be delivered"
             )
-        prompt = self._prompt(request, reask=reask)
+        effective_template = self._continuation_command(command_template, continuation)
+        prompt = self._prompt(request, reask=reask, continuation=continuation)
         command = format_agent_command(
-            command_template,
+            effective_template,
             prompt=prompt,
             model=self.reviewer.model,
             effort=self.reviewer.effort,
             profile=self.reviewer_profile,
         )
         route = self._route_payload()
-        self._append_event(
-            "review_started",
-            {
-                "pass_kind": request.pass_kind,
-                "pass_ordinal": pass_ordinal,
-                "attempt_ordinal": attempt_ordinal,
-                "candidate_fingerprint": request.candidate.fingerprint,
-                "phase": request.phase,
-                "route": route,
-            },
+        pass_ordinal = self._claim_review_attempt(
+            request,
+            pass_ordinal=pass_ordinal,
+            attempt_ordinal=attempt_ordinal,
+            route=route,
+            continuation=continuation,
         )
         started = time.monotonic()
         with self.concurrency.slot():
@@ -1125,10 +1474,19 @@ class ReviewRouter:
                     unavailable_usage(
                         self._usage_provider(), "provider_usage_not_reported"
                     ),
+                    continuation=continuation,
                 )
                 self._fail_stage_for_result("fatal")
                 raise ReviewExecutionError(
                     f"reviewer command could not be executed: {type(exc).__name__}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                self._record_wait_incomplete(
+                    request, pass_ordinal, attempt_ordinal, continuation
+                )
+                self._fail_stage_for_result("timeout")
+                raise ReviewWaitIncomplete(
+                    request.pass_kind, pass_ordinal, attempt_ordinal
                 ) from exc
         duration = max(0.0, time.monotonic() - started)
         output = completed.stdout or ""
@@ -1136,6 +1494,23 @@ class ReviewRouter:
         for line in output.splitlines():
             observer.observe_line(line)
         usage = observer.usage
+        nested_launches, nested_usage = self._nested_launch_evidence(output)
+        if nested_launches:
+            self._record_error(
+                request,
+                route,
+                pass_ordinal,
+                attempt_ordinal,
+                "fatal",
+                duration,
+                usage,
+                continuation=continuation,
+                nested_launches=nested_launches,
+                nested_usage=nested_usage,
+                policy_violation="nested_reviewer_delegation",
+            )
+            self._fail_stage_for_result("fatal")
+            raise ReviewDelegationPolicyError(nested_launches)
         wall = detect_limit_wall(output, self.limit_wall_patterns)
         if wall is not None:
             self._record_error(
@@ -1146,6 +1521,7 @@ class ReviewRouter:
                 "limit_wall",
                 duration,
                 usage,
+                continuation=continuation,
             )
             self._fail_stage_for_result("limit_wall")
             raise ReviewLimitWallError(
@@ -1154,6 +1530,14 @@ class ReviewRouter:
                 phase=request.phase,
             )
         if completed.returncode != 0:
+            session_expired = continuation.resumed and any(
+                marker in output.casefold()
+                for marker in (
+                    "no conversation found",
+                    "conversation not found",
+                    "session expired",
+                )
+            )
             self._record_error(
                 request,
                 route,
@@ -1162,7 +1546,10 @@ class ReviewRouter:
                 "fatal",
                 duration,
                 usage,
+                continuation=continuation,
             )
+            if session_expired:
+                raise ReviewSessionExpired("reviewer session expired")
             self._fail_stage_for_result("fatal")
             raise ReviewExecutionError(
                 f"reviewer command failed with exit code {completed.returncode}"
@@ -1175,6 +1562,7 @@ class ReviewRouter:
                 attempt_ordinal=attempt_ordinal,
                 usage=usage,
                 duration=duration,
+                continuation=continuation,
             )
         except ReviewExecutionError:
             self._record_error(
@@ -1185,6 +1573,7 @@ class ReviewRouter:
                 "transient" if not reask else "fatal",
                 duration,
                 usage,
+                continuation=continuation,
             )
             raise
         self._append_event(
@@ -1211,6 +1600,7 @@ class ReviewRouter:
         attempt_ordinal: int,
         usage: ProviderUsage,
         duration: float,
+        continuation: ContinuationContext,
     ) -> ReviewResult:
         payload: object | None = None
         for line in reversed(output.splitlines()):
@@ -1221,6 +1611,19 @@ class ReviewRouter:
             if isinstance(candidate, Mapping) and "verdict" in candidate:
                 payload = candidate
                 break
+            if isinstance(candidate, Mapping) and candidate.get("type") == "result":
+                result_text = candidate.get("result")
+                if isinstance(result_text, str):
+                    try:
+                        result_payload = json.loads(result_text)
+                    except json.JSONDecodeError:
+                        continue
+                    if (
+                        isinstance(result_payload, Mapping)
+                        and "verdict" in result_payload
+                    ):
+                        payload = result_payload
+                        break
         if not isinstance(payload, Mapping):
             raise ReviewExecutionError("malformed review output: missing JSON verdict")
         verdict = payload.get("verdict")
@@ -1261,20 +1664,22 @@ class ReviewRouter:
                 raise ReviewExecutionError(
                     "malformed review output: closure verdict must match finding states"
                 )
-        session_id = payload.get("session_id", "")
-        session_id_source = payload.get("session_id_source", "")
-        continuation_ordinal = payload.get("continuation_ordinal", 0)
+        reported_session_id = payload.get("session_id", "")
+        reported_session_id_source = payload.get("session_id_source", "")
+        reported_continuation_ordinal = payload.get("continuation_ordinal", 0)
         retry_classification = payload.get(
             "retry_classification", "fatal" if verdict == "error" else "ok"
         )
-        if not isinstance(session_id, str) or not isinstance(session_id_source, str):
+        if not isinstance(reported_session_id, str) or not isinstance(
+            reported_session_id_source, str
+        ):
             raise ReviewExecutionError(
                 "malformed review output: invalid session identity"
             )
         if (
-            isinstance(continuation_ordinal, bool)
-            or not isinstance(continuation_ordinal, int)
-            or continuation_ordinal < 0
+            isinstance(reported_continuation_ordinal, bool)
+            or not isinstance(reported_continuation_ordinal, int)
+            or reported_continuation_ordinal < 0
         ):
             raise ReviewExecutionError(
                 "malformed review output: invalid continuation ordinal"
@@ -1287,21 +1692,56 @@ class ReviewRouter:
             raise ReviewExecutionError(
                 "malformed review output: non-error verdict must classify as ok"
             )
+        if (
+            continuation.session_id_source in {"runtime_injected", "runtime_resumed"}
+            and continuation.session_id
+            and reported_session_id
+            and reported_session_id != continuation.session_id
+        ):
+            raise ReviewExecutionError(
+                "malformed review output: session identity differs from runtime launch"
+            )
+        if (
+            reported_continuation_ordinal
+            and reported_continuation_ordinal != continuation.continuation_ordinal
+        ):
+            raise ReviewExecutionError(
+                "malformed review output: continuation ordinal differs from runtime journal"
+            )
+        session_id = (
+            reported_session_id
+            if continuation.session_id_source == "runtime_launch"
+            and reported_session_id
+            else continuation.session_id or reported_session_id
+        )
+        session_id_source = (
+            reported_session_id_source
+            if continuation.session_id_source == "runtime_launch"
+            and reported_session_id_source
+            else continuation.session_id_source or reported_session_id_source
+        )
         return ReviewResult(
             verdict=str(verdict),
             findings=findings,
             session_id=session_id,
             session_id_source=session_id_source,
-            continuation_ordinal=continuation_ordinal,
+            continuation_ordinal=continuation.continuation_ordinal,
             retry_classification=str(retry_classification),
             usage=usage,
             duration_seconds=duration,
             pass_kind=request.pass_kind,
             pass_ordinal=pass_ordinal,
             attempt_ordinal=attempt_ordinal,
+            continuation_resumed=continuation.resumed,
         )
 
-    def _prompt(self, request: ReviewRequest, *, reask: bool) -> str:
+    def _prompt(
+        self,
+        request: ReviewRequest,
+        *,
+        reask: bool,
+        continuation: ContinuationContext,
+    ) -> str:
         instruction = (
             "The previous response was malformed. Return only one JSON object. "
             if reask
@@ -1309,11 +1749,394 @@ class ReviewRouter:
         )
         return (
             instruction
-            + "Review the candidate described by this request. Return exactly one "
+            + "Review this candidate directly. Do not launch, delegate to, or "
+            "invoke any subagent, nested model, Task, Agent, or Workflow. Return "
+            "exactly one "
             "JSON object with verdict (approve|findings|error), findings, session_id, "
-            "session_id_source, and continuation_ordinal. Each finding requires id, "
+            "and session_id_source. The runtime owns continuation ordinals and "
+            "review budgets; do not propose or reset either. Each finding requires id, "
             "severity (P0-P3), summary, evidence, files, lines, and state.\n"
-            + json.dumps(request.to_payload(), sort_keys=True, ensure_ascii=False)
+            + json.dumps(
+                {
+                    **request.to_payload(),
+                    "continuation": {
+                        "session_id": continuation.session_id,
+                        "session_id_source": continuation.session_id_source,
+                        "prior_session_id": continuation.prior_session_id,
+                        "ordinal": continuation.continuation_ordinal,
+                        "resumed": continuation.resumed,
+                        "fallback_reason": continuation.fallback_reason,
+                    },
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+        )
+
+    def _continuation_context(
+        self,
+        request: ReviewRequest,
+        *,
+        previous: ContinuationContext | None = None,
+    ) -> ContinuationContext:
+        route = self._route_payload()
+        provider = str(route["provider"])
+        if request.family == "initial" and previous is None:
+            return plan_session_continuation(
+                provider=provider,
+                role="reviewer",
+                continuing=False,
+                session_id_factory=self.session_id_factory,
+            )
+
+        prior_session_id = ""
+        prior_ordinal = 0
+        if previous is not None:
+            prior_session_id = previous.session_id
+            prior_ordinal = previous.continuation_ordinal
+        else:
+            prior = self._latest_review_session(provider)
+            if prior is not None:
+                prior_session_id, prior_ordinal = prior
+        fallback_reason = ""
+        if prior_session_id:
+            availability = (
+                self.continuation_availability
+                or self._default_continuation_availability
+            )
+            fallback_reason = availability(provider, "reviewer", prior_session_id)
+            if fallback_reason not in ("", *CONTINUATION_FALLBACK_REASONS):
+                raise ReviewExecutionError(
+                    "continuation availability returned an invalid reason"
+                )
+        return plan_session_continuation(
+            provider=provider,
+            role="reviewer",
+            continuing=True,
+            prior_session_id=prior_session_id,
+            prior_ordinal=prior_ordinal,
+            availability_reason=fallback_reason,
+            session_id_factory=self.session_id_factory,
+        )
+
+    def _default_continuation_availability(
+        self, provider: str, role: str, session_id: str
+    ) -> str:
+        if provider != "claude" or role != "reviewer":
+            return ""
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id) is None:
+            return "transcript_missing"
+        try:
+            argv = shlex.split(self.reviewer.require_command())
+        except ValueError:
+            return "transcript_missing"
+        configured_home = ""
+        for token in argv:
+            if token.startswith("CLAUDE_HOME="):
+                configured_home = token.partition("=")[2]
+                break
+            if "=" not in token:
+                break
+        if not configured_home:
+            configured_home = os.environ.get("CLAUDE_HOME", "")
+        claude_home = (
+            Path(configured_home).expanduser()
+            if configured_home
+            else Path.home() / ".claude"
+        )
+        if not claude_home.is_absolute():
+            claude_home = self.worktree / claude_home
+        try:
+            return (
+                ""
+                if any(
+                    candidate.is_file()
+                    for candidate in (claude_home / "projects").glob(
+                        f"*/{session_id}.jsonl"
+                    )
+                )
+                else "transcript_missing"
+            )
+        except OSError:
+            return "transcript_missing"
+
+    def _latest_review_session(self, provider: str) -> tuple[str, int] | None:
+        for record in reversed(self.run_store.read_records()):
+            route = record.get("route")
+            if (
+                record.get("record_type") != "review_verdict"
+                or record.get("run_id") != self.run_id
+                or record.get("task_id") != self.task_id
+                or record.get("verdict") not in {"approve", "findings"}
+                or not isinstance(route, Mapping)
+                or route.get("provider") != provider
+            ):
+                continue
+            session_id = record.get("session_id")
+            ordinal = record.get("continuation_ordinal", 0)
+            if (
+                isinstance(session_id, str)
+                and session_id
+                and isinstance(ordinal, int)
+                and not isinstance(ordinal, bool)
+                and ordinal >= 0
+            ):
+                return session_id, ordinal
+        return None
+
+    def _continuation_command(
+        self, command_template: str, continuation: ContinuationContext
+    ) -> str:
+        route = self._route_payload()
+        provider = str(route["provider"])
+        capabilities = provider_capabilities(provider, "reviewer")
+        effective = inject_provider_continuation(
+            command_template,
+            provider=provider,
+            role="reviewer",
+            continuation=continuation,
+        )
+        if capabilities.nested_delegation_disable:
+            effective = prepare_claude_review_command(effective)
+        return effective
+
+    def _claim_review_attempt(
+        self,
+        request: ReviewRequest,
+        *,
+        pass_ordinal: int,
+        attempt_ordinal: int,
+        route: Mapping[str, object],
+        continuation: ContinuationContext,
+    ) -> int:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        claim = self.run_store.claim_review_attempt(
+            start_record=RunLifecycleEvent.review_started(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload={
+                    "pass_kind": request.pass_kind,
+                    "pass_ordinal": pass_ordinal,
+                    "attempt_ordinal": attempt_ordinal,
+                    "candidate_fingerprint": request.candidate.fingerprint,
+                    "phase": request.phase,
+                    "route": dict(route),
+                    "session_id": continuation.session_id,
+                    "session_id_source": continuation.session_id_source,
+                    "continuation_ordinal": continuation.continuation_ordinal,
+                    "continuation_resumed": continuation.resumed,
+                },
+            ).to_record(),
+            max_initial_passes=self.max_initial_passes,
+            max_closure_passes=self.max_closure_passes,
+            lineage_fingerprint=request.candidate.fingerprint,
+            before_start_record=(
+                RunLifecycleEvent.continuation_fallback(
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    payload=self._continuation_fallback_payload(request, continuation),
+                ).to_record()
+                if continuation.fallback_reason
+                else None
+            ),
+        )
+        status = claim.get("status")
+        if status == "claimed":
+            claimed_ordinal = claim.get("pass_ordinal")
+            if isinstance(claimed_ordinal, int) and not isinstance(
+                claimed_ordinal, bool
+            ):
+                return claimed_ordinal
+            raise ReviewExecutionError("review attempt claim returned no ordinal")
+        if status == "pending":
+            pending = claim.get("record")
+            record = pending if isinstance(pending, Mapping) else {}
+            pending_ordinal = record.get("pass_ordinal")
+            pending_attempt = record.get("attempt_ordinal")
+            resolved_ordinal = (
+                pending_ordinal
+                if isinstance(pending_ordinal, int)
+                and not isinstance(pending_ordinal, bool)
+                else pass_ordinal
+            )
+            resolved_attempt = (
+                pending_attempt
+                if isinstance(pending_attempt, int)
+                and not isinstance(pending_attempt, bool)
+                else attempt_ordinal
+            )
+            self._record_wait_incomplete(
+                request,
+                resolved_ordinal,
+                resolved_attempt,
+                self._continuation_from_start_record(record),
+            )
+            raise ReviewWaitIncomplete(
+                request.pass_kind, resolved_ordinal, resolved_attempt
+            )
+        if status == "exhausted":
+            limit = claim.get("limit")
+            exhausted_limit = limit if isinstance(limit, int) else 0
+            if self.stage_machine is not None:
+                self.stage_machine.fail(
+                    StageFailure.STAGE_FAILED,
+                    reason=(
+                        f"review_budget_exhausted:{request.family}:"
+                        f"limit={exhausted_limit}"
+                    ),
+                )
+            raise ReviewBudgetExhausted(request.family, exhausted_limit)
+        raise ReviewExecutionError("review attempt claim returned invalid status")
+
+    def _continuation_from_start_record(
+        self, record: Mapping[str, object]
+    ) -> ContinuationContext:
+        session_id = record.get("session_id")
+        session_id_source = record.get("session_id_source")
+        continuation_ordinal = record.get("continuation_ordinal")
+        resumed = record.get("continuation_resumed", False)
+        return ContinuationContext(
+            session_id=session_id if isinstance(session_id, str) else "",
+            session_id_source=(
+                session_id_source
+                if isinstance(session_id_source, str)
+                else "unavailable"
+            ),
+            continuation_ordinal=(
+                continuation_ordinal
+                if isinstance(continuation_ordinal, int)
+                and not isinstance(continuation_ordinal, bool)
+                and continuation_ordinal >= 0
+                else 0
+            ),
+            resumed=resumed if isinstance(resumed, bool) else False,
+        )
+
+    def _record_budget(
+        self,
+        request: ReviewRequest,
+        *,
+        action: str,
+        pass_ordinal: int,
+        limit: int,
+    ) -> None:
+        self._append_event(
+            "review_budget",
+            {
+                "action": action,
+                "family": request.family,
+                "pass_kind": request.pass_kind,
+                "pass_ordinal": pass_ordinal,
+                "limit": limit,
+                "candidate_fingerprint": request.candidate.fingerprint,
+            },
+        )
+
+    def _record_wait_incomplete(
+        self,
+        request: ReviewRequest,
+        pass_ordinal: int,
+        attempt_ordinal: int,
+        continuation: ContinuationContext,
+    ) -> None:
+        self._append_event(
+            "review_wait_incomplete",
+            {
+                "pass_kind": request.pass_kind,
+                "pass_ordinal": pass_ordinal,
+                "attempt_ordinal": attempt_ordinal,
+                "candidate_fingerprint": request.candidate.fingerprint,
+                "session_id": continuation.session_id,
+                "session_id_source": continuation.session_id_source,
+                "continuation_ordinal": continuation.continuation_ordinal,
+                "reason": "verdict_not_recorded",
+            },
+        )
+
+    def _continuation_fallback_payload(
+        self, request: ReviewRequest, continuation: ContinuationContext
+    ) -> dict[str, object]:
+        return {
+            "role": "reviewer",
+            "pass_kind": request.pass_kind,
+            "candidate_fingerprint": request.candidate.fingerprint,
+            "reason": continuation.fallback_reason,
+            "prior_session_id": continuation.prior_session_id,
+            "session_id": continuation.session_id,
+            "session_id_source": continuation.session_id_source,
+            "continuation_ordinal": continuation.continuation_ordinal,
+            "context_artifacts": {
+                "findings": [
+                    finding.to_payload() for finding in request.prior_findings
+                ],
+                "gate_evidence": [
+                    result.to_payload() for result in request.gate_results
+                ],
+            },
+        }
+
+    def _nested_launch_evidence(
+        self, output: str
+    ) -> tuple[int, dict[str, int | float]]:
+        count = 0
+        usage: dict[str, int | float] = {}
+        for line in output.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, Mapping):
+                continue
+            event_type = event.get("type")
+            nested = event.get("item")
+            nested_type = nested.get("type") if isinstance(nested, Mapping) else None
+            tool_names: list[str] = []
+            if isinstance(nested, Mapping):
+                for key in ("name", "tool_name", "server", "method"):
+                    value = nested.get(key)
+                    if isinstance(value, str):
+                        tool_names.append(value)
+            message = event.get("message")
+            if isinstance(message, Mapping):
+                content = message.get("content")
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, Mapping):
+                            continue
+                        if block.get("type") != "tool_use":
+                            continue
+                        name = block.get("name")
+                        if isinstance(name, str):
+                            tool_names.append(name)
+            nested_tool = any(self._is_nested_review_tool(name) for name in tool_names)
+            if (
+                event_type not in NESTED_REVIEW_EVENT_TYPES
+                and nested_type not in {"agent", "subagent", "task", "workflow"}
+                and not nested_tool
+            ):
+                continue
+            count += 1
+            raw_usage = event.get("usage")
+            if not isinstance(raw_usage, Mapping) and isinstance(message, Mapping):
+                raw_usage = message.get("usage")
+            if isinstance(raw_usage, Mapping):
+                for key, value in raw_usage.items():
+                    if (
+                        isinstance(key, str)
+                        and isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and value >= 0
+                    ):
+                        usage[key] = usage.get(key, 0) + value
+        return count, usage
+
+    def _is_nested_review_tool(self, name: str) -> bool:
+        normalized = name.casefold().replace("-", "_")
+        parts = {part for part in re.split(r"[.:/]", normalized) if part}
+        return bool(parts & NESTED_REVIEW_TOOL_NAMES) or any(
+            marker in normalized
+            for marker in ("spawn_agent", "delegate_agent", "delegate_to_agent")
         )
 
     def _next_pass_ordinal(self, request: ReviewRequest) -> int:
@@ -1368,23 +2191,36 @@ class ReviewRouter:
         retry_classification: str,
         duration: float,
         usage: ProviderUsage,
+        *,
+        continuation: ContinuationContext | None = None,
+        nested_launches: int = 0,
+        nested_usage: Mapping[str, int | float] | None = None,
+        policy_violation: str = "",
     ) -> None:
+        context = continuation or ContinuationContext()
         result = ReviewResult(
             verdict="error",
             findings=(),
-            session_id="",
-            session_id_source="",
-            continuation_ordinal=0,
+            session_id=context.session_id,
+            session_id_source=context.session_id_source,
+            continuation_ordinal=context.continuation_ordinal,
             retry_classification=retry_classification,
             usage=usage,
             duration_seconds=duration,
             pass_kind=request.pass_kind,
             pass_ordinal=pass_ordinal,
             attempt_ordinal=attempt_ordinal,
+            continuation_resumed=context.resumed,
+            nested_launches=nested_launches,
         )
+        payload = self._result_payload(result, request, route)
+        if nested_usage:
+            payload["nested_usage"] = dict(nested_usage)
+        if policy_violation:
+            payload["policy_violation"] = policy_violation
         self._append_event(
             "review_verdict",
-            self._result_payload(result, request, route),
+            payload,
         )
 
     def _result_payload(
@@ -1403,7 +2239,9 @@ class ReviewRouter:
             "session_id": result.session_id,
             "session_id_source": result.session_id_source,
             "continuation_ordinal": result.continuation_ordinal,
+            "continuation_resumed": result.continuation_resumed,
             "retry_classification": result.retry_classification,
+            "nested_launches": result.nested_launches,
             "duration_seconds": result.duration_seconds,
             "phase": request.phase,
             "route": dict(route),
@@ -1411,6 +2249,7 @@ class ReviewRouter:
                 phase=request.phase,
                 wall_time_seconds=result.duration_seconds,
                 candidate_fingerprint=request.candidate.fingerprint,
+                continuation=result.continuation_resumed,
                 work_kind="review",
             ),
         }
@@ -1440,6 +2279,8 @@ class ReviewRouter:
         if self.stage_machine is None:
             return
         stage = RunStage.REVIEW if request.family == "initial" else RunStage.CLOSURE
+        if self.stage_machine.stage is stage:
+            return
         self.stage_machine.transition(
             stage, reason=f"review_started:{request.pass_kind}"
         )

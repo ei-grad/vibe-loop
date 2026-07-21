@@ -123,6 +123,14 @@ Codex-implementer/Claude-reviewer matrices, missing reviewer command
 diagnostics, continuation on resume-capable providers, recorded fallback on
 non-resumable providers, and malformed-output handling.
 
+The continuation contract also forbids unbudgeted nested reviewer/model
+delegation. Provider launch policy disables nested Agent/Task use when the
+surface supports it; observable structured nested-launch events invalidate the
+verdict, journal a typed policy violation, and attribute nested usage
+separately. A `review_started` record without a matching verdict is an
+incomplete durable wait, not authority to replay a fresh full review after
+worker or supervisor recovery.
+
 Related implementation IDs: `ORC-06`
 (`run-until-done-supervisor-review-routing`), `ORC-07`
 (`orc-reviewer-continuation`).
@@ -147,6 +155,11 @@ remediating, or integrating.
 Acceptance must cover ledger persistence and state transitions, budget
 enforcement and exhaustion behavior, explicit budget-reset journaling,
 separate reviewer concurrency, and stage-visible status output.
+
+Budget initialization is a dispatch-contract event. Candidate changes never
+create a reset event; they retain the lineage budget and consume its remaining
+targeted-closure allowance. A new dispatch is the only runtime-recognized fresh
+budget boundary.
 
 Related implementation IDs: `ORC-06`
 (`run-until-done-supervisor-review-routing`), `ORC-07`
