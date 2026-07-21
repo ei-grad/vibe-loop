@@ -850,7 +850,9 @@ removed in favor of loopyard.
 
 The top-level **`vibe-loop wait-helper`** blocks until a watched process exits,
 a wall-clock deadline arrives, or an optional message adapter returns a direct
-user instruction, so an unattended steward can sleep between cycles.
+user instruction, or an explicit runtime-event source reports a typed
+operator-action-required condition, so an unattended steward can sleep between
+cycles.
 `--pid` (repeatable) wakes on process exit; `--cycle-schedule [SECONDS]` wakes at
 the next UTC `*/SECONDS` boundary; omitting both `--deadline` and
 `--cycle-schedule` uses the default 1800s boundary. `--deadline` takes an
@@ -871,6 +873,31 @@ vibe-loop wait-helper --pid 12345 --message-command \
 Loopyard messages are consumed atomically and delivered at most once after the
 receive transaction commits. Adapter failures return `wake_reason=adapter_error`
 without including command output in the result.
+
+Actionable runtime events use a separate redacted contract. Configure either a
+trusted command or the reference run-journal reader, plus a project-scoped
+durable cursor:
+
+```bash
+vibe-loop wait-helper --pid 12345 \
+  --runtime-event-journal .vibe-loop/runs.jsonl \
+  --runtime-event-cursor .vibe-loop/wait-runtime.cursor \
+  --runtime-event-project my-project --json
+```
+
+The only returned event fields are `kind`, stable opaque `id`, `project`,
+`run_id`, and `task_id`; unavailable run/task identities are empty. Identifier
+values are SHA-256-derived before return so identifier-shaped prompts,
+commands, review text, or credentials cannot be echoed. The allowlist covers
+operator action, inconsistent
+supervision, exhausted recovery, failed lock finalization, disk blockers, and
+verified provider quota/account walls. Progress, tool and review traffic,
+stage transitions, and successful completion never wake this path. The cursor
+is checkpointed before `wake_reason=runtime_event` is returned, preventing a
+completed rearm from repeating the same durable event. Adapter failures remain
+typed `adapter_error` results; no-adapter behavior and PID/deadline precedence
+are unchanged. The cursor checkpoint fsyncs both its content and containing
+directory before a wake is returned.
 
 ## Configuration
 

@@ -6156,6 +6156,38 @@ class AutopilotWaitTests(unittest.TestCase):
         self.assertEqual(result.wake_reason, "pid")
         self.assertEqual(polls, [])
 
+    def test_wakes_on_actionable_runtime_event(self) -> None:
+        event = {
+            "kind": "operator_action_required",
+            "id": "event-1",
+            "project": "alpha",
+            "run_id": "run-1",
+        }
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=10_000.0,
+            process_exists=lambda _pid: True,
+            wallclock=lambda: 0.0,
+            sleep=lambda _seconds: None,
+            runtime_event_poller=lambda: event,
+        )
+        self.assertEqual(result.wake_reason, "runtime_event")
+        self.assertEqual(result.wake_summary, "runtime_event:operator_action_required")
+        self.assertEqual(result.events, (event,))
+
+    def test_dead_pid_wins_without_polling_runtime_events(self) -> None:
+        polls: list[bool] = []
+        result = wait_for_processes(
+            pids=[123],
+            deadline_epoch=10_000.0,
+            process_exists=lambda _pid: False,
+            wallclock=lambda: 0.0,
+            sleep=lambda _seconds: None,
+            runtime_event_poller=lambda: polls.append(True),
+        )
+        self.assertEqual(result.wake_reason, "pid")
+        self.assertEqual(polls, [])
+
     def test_message_command_maps_valid_envelope_and_session_environment(self) -> None:
         completed = subprocess.CompletedProcess(
             args="adapter",

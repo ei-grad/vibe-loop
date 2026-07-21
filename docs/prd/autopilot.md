@@ -840,6 +840,39 @@ Acceptance must cover immediate and delayed messages, PID precedence, session
 resolution, literal environment delivery, schema validation, bounded command
 execution, safe errors, and unchanged behavior when no adapter is configured.
 
+`wait-helper` also accepts a separate actionable runtime-event source. Runtime
+events never reuse the direct-message envelope: they contain only a stable
+opaque `id`, an allowlisted `kind`, and bounded opaque `project`, `run_id`, and
+`task_id` metadata. Adapter and journal identifiers are SHA-256-derived before
+return so identifier-shaped sensitive text is never emitted. The initial kinds
+are `operator_action_required`,
+`supervisor_inconsistent`, `recovery_exhausted`, `lock_finalization_failed`,
+`disk_blocked`, `provider_quota_wall`, and `provider_account_wall`. Provider
+wall records must carry explicit verified evidence. Progress, tool activity,
+reviewer chatter or findings, ordinary lifecycle transitions, and successful
+completion are not actionable runtime events.
+
+The source is explicit through either `--runtime-event-command` or the
+reference `--runtime-event-journal` reader. Both require a project scope and a
+durable cursor file. A trusted command receives the prior cursor and scope in
+the literal `VIBE_LOOP_WAIT_EVENT_CURSOR`, `VIBE_LOOP_WAIT_EVENT_PROJECT`,
+`VIBE_LOOP_WAIT_EVENT_RUN_ID`, and `VIBE_LOOP_WAIT_EVENT_TASK_ID` environment
+values, then returns exactly `{"cursor": ..., "event": ...}`. The helper
+atomically checkpoints an advanced cursor before returning a wake. Therefore a
+normally completed invocation cannot wake again on the same durable event. If
+the helper crashes after checkpointing but before printing, the event remains
+consumed; this at-most-once crash rule is deterministic and avoids wake storms.
+
+Adapter output is limited to 64 KiB, individual strings and cursors to 1 KiB,
+and the sanitized event to 4 KiB. Identifier metadata is returned only as
+fixed-size `sha256:` values. Prompts, commands, review text, credentials,
+fencing values, arbitrary adapter fields, and raw stdout/stderr are rejected or
+discarded and never returned or journaled. Invalid, oversized, failed, or
+timed-out runtime adapters fail closed with `wake_reason=adapter_error` and a
+safe `runtime_event_adapter_error` category. PID and deadline checks retain
+their existing precedence, and no runtime adapter is invoked when either is
+already satisfied.
+
 Related implementation IDs: `AUTO-22`.
 
 Autopilot may also use an explicit trusted `[autopilot] idle_wake_command`

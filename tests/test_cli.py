@@ -9756,6 +9756,93 @@ class AutopilotCliTests(unittest.TestCase):
         )
         self.assertNotIn("secret-bearing-command", out)
 
+    def test_wait_helper_journal_runtime_events_checkpoint_rearms(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "runs.jsonl"
+            cursor = root / "cursor.json"
+            journal.write_text(
+                json.dumps(
+                    {
+                        "record_type": "operator_action_required",
+                        "event_id": "event-1",
+                        "run_id": "run-1",
+                        "task_id": "task-1",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            arguments = (
+                "--deadline",
+                "2030-01-01T00:00:00Z",
+                "--runtime-event-journal",
+                str(journal),
+                "--runtime-event-cursor",
+                str(cursor),
+                "--runtime-event-project",
+                "alpha",
+                "--json",
+            )
+            first_code, first_out = self._wait_helper(*arguments)
+            with journal.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "record_type": "lock_finalization_failed",
+                            "event_id": "event-2",
+                            "run_id": "run-2",
+                            "task_id": "task-2",
+                        }
+                    )
+                    + "\n"
+                )
+            second_code, second_out = self._wait_helper(*arguments)
+
+        first = json.loads(first_out)
+        second = json.loads(second_out)
+        self.assertEqual(first_code, 0)
+        self.assertEqual(first["wake_reason"], "runtime_event")
+        self.assertNotEqual(first["events"][0]["id"], "event-1")
+        self.assertTrue(first["events"][0]["id"].startswith("sha256:"))
+        self.assertEqual(second_code, 0)
+        self.assertNotEqual(second["events"][0]["id"], "event-2")
+        self.assertNotEqual(first["events"][0]["id"], second["events"][0]["id"])
+
+    def test_wait_helper_runtime_adapter_error_is_safe_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cursor = Path(directory) / "cursor.json"
+            with patch.object(
+                cli_module,
+                "poll_runtime_event_command",
+                side_effect=cli_module.RuntimeEventAdapterError("output_too_large"),
+            ):
+                code, out = self._wait_helper(
+                    "--deadline",
+                    "2030-01-01T00:00:00Z",
+                    "--runtime-event-command",
+                    "secret-bearing-command",
+                    "--runtime-event-cursor",
+                    str(cursor),
+                    "--runtime-event-project",
+                    "alpha",
+                    "--json",
+                )
+        payload = json.loads(out)
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["wake_reason"], "adapter_error")
+        self.assertEqual(payload["wake_summary"], "runtime_event_adapter_error")
+        self.assertEqual(
+            payload["events"],
+            [
+                {
+                    "kind": "runtime_event_adapter_error",
+                    "category": "output_too_large",
+                }
+            ],
+        )
+        self.assertNotIn("secret-bearing-command", out)
+
     def _wait_helper(self, *args: str) -> tuple[int, str]:
         stdout = StringIO()
         stderr = StringIO()

@@ -163,15 +163,24 @@ Wake results report `wake_reason`:
 - `deadline`: the cycle boundary arrived — run the full cycle.
 - `message`: a user instruction arrived — read the structured `user_message`
   event and apply it as a redirect before continuing the cycle.
+- `runtime_event`: an authoritative, allowlisted operator-action condition was
+  recorded — inspect the event kind and scoped project/run/task identity, then
+  run the health cycle before deciding whether recovery or escalation is safe.
 - `adapter_error`: message polling failed — inspect the adapter directly before
-  waiting again; do not silently disable it.
+  waiting again; `runtime_event_adapter_error` identifies the separate runtime
+  source. Do not silently disable either adapter.
 
 After every wake, state the exact `wake_reason`/`wake_summary`, run the health
 checks, then decide whether to recover, summarize, troubleshoot, plan, or keep
-waiting. When the repository exposes a trusted direct-message adapter, add
+waiting. A direct `message` is a user redirect and may change the task; a
+`runtime_event` contains no message content and only signals that the scoped
+runtime needs operator action. Run the same full health cycle after either
+wake. When the repository exposes a trusted direct-message adapter, add
 `--message-command` and identify the recipient with `--session-ref` (or
-`VIBE_LOOP_RUN_ID`). Keep harness-specific wake signals, such as completion of
-one of your own subagents, in the agent environment.
+`VIBE_LOOP_RUN_ID`). When it exposes typed lifecycle events, add a trusted
+`--runtime-event-command` or `--runtime-event-journal` with a project-scoped
+durable cursor. Keep harness-specific wake signals, such as completion of one
+of your own subagents, in the agent environment.
 
 ## Investigate Loop Termination
 

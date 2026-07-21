@@ -59,6 +59,7 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.retry import parse_limit_wall_reset_delay
+from vibe_loop.runtime_events import ACTIONABLE_RUNTIME_EVENT_KINDS
 from vibe_loop.runner import (
     AgentLimitWallError,
     AgentRuntimeContext,
@@ -6603,6 +6604,7 @@ DEFAULT_WAIT_CYCLE_SECONDS = 1800.0
 DEFAULT_WAIT_POLL_SECONDS = 5.0
 WallClock = Callable[[], float]
 WaitMessagePoller = Callable[[], dict[str, object] | None]
+WaitRuntimeEventPoller = Callable[[], dict[str, object] | None]
 
 
 class WaitMessageAdapterError(RuntimeError):
@@ -6627,6 +6629,8 @@ class WaitResult:
                 parts.append(f"pid_exit:{event.get('pid')}")
             elif kind == "user_message":
                 continue
+            elif kind in ACTIONABLE_RUNTIME_EVENT_KINDS:
+                parts.append(f"runtime_event:{kind}")
             else:
                 parts.append(str(kind or "event"))
         message_count = sum(
@@ -6639,6 +6643,11 @@ class WaitResult:
         if self.wake_reason == "deadline":
             return f"deadline:{self.deadline}"
         if self.wake_reason == "adapter_error":
+            if any(
+                event.get("kind") == "runtime_event_adapter_error"
+                for event in self.events
+            ):
+                return "runtime_event_adapter_error"
             return "message_adapter_error"
         return self.wake_reason
 
@@ -6767,9 +6776,10 @@ def wait_for_processes(
     wallclock: WallClock | None = None,
     sleep: Sleep | None = None,
     message_poller: WaitMessagePoller | None = None,
+    runtime_event_poller: WaitRuntimeEventPoller | None = None,
     session_ref: str = "",
 ) -> WaitResult:
-    """Block until a watched PID exits, deadline, or external message."""
+    """Block until a watched PID exits, deadline, or trusted external event."""
 
     watched_pids = list(dict.fromkeys(pids))
     if not watched_pids and deadline_epoch is None:
@@ -6802,6 +6812,15 @@ def wait_for_processes(
                 return WaitResult(
                     wake_reason="message",
                     events=tuple([*all_events, message_event]),
+                    deadline=deadline_text,
+                    session_ref=session_ref,
+                )
+        if runtime_event_poller is not None:
+            runtime_event = runtime_event_poller()
+            if runtime_event is not None:
+                return WaitResult(
+                    wake_reason="runtime_event",
+                    events=tuple([*all_events, runtime_event]),
                     deadline=deadline_text,
                     session_ref=session_ref,
                 )
