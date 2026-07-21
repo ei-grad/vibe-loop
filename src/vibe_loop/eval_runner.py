@@ -2466,7 +2466,6 @@ def run_configured_fixture_hooks(
         max_slices=1,
         max_tasks=1,
         min_ready=2,
-        next_wake="",
         process_exists=lambda _pid: True,
         launcher=refuse_worker_launch,
         run_store=RunStore(config.state_path / "runs.jsonl"),

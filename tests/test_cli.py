@@ -8559,7 +8559,7 @@ class AutopilotCliTests(unittest.TestCase):
                     text=True,
                 )
                 supervisor = json.loads(status.stdout)["supervisor"]
-                self.assertEqual(supervisor["state"], "running")
+                self.assertIn(supervisor["state"], {"active_cycle", "sleeping"})
                 self.assertEqual(supervisor["pid"], pid)
                 self.assertEqual(supervisor["run_id"], launch["run_id"])
                 self.assertEqual(supervisor["log"], launch["log"])

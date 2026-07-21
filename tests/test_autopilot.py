@@ -238,7 +238,10 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(len(payload["workers"]), 1)
         self.assertEqual(payload["workers"][0]["state"], "running")
         self.assertEqual(payload["last_cycle"]["cycle_id"], "cycle-1")
-        self.assertEqual(payload["next_wake"], "2026-05-09T00:05:00+00:00")
+        self.assertEqual(
+            payload["last_cycle"]["next_wake"], "2026-05-09T00:05:00+00:00"
+        )
+        self.assertEqual(payload["next_wake"], "")
         self.assertEqual(records[-1]["record_type"], AUTOPILOT_CYCLE_RECORD_TYPE)
 
     def test_collect_project_status_excludes_configured_state_dir_from_dirty(
@@ -657,6 +660,16 @@ class AutopilotStatusTests(unittest.TestCase):
                     "occurred_at": "2026-05-09T00:00:00+00:00",
                 }
             )
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                    "run_id": "autopilot-stale",
+                    "cycle_id": "autopilot-stale-c1",
+                    "status": "completed",
+                    "next_wake": "2026-05-09T01:00:00+00:00",
+                    "occurred_at": "2026-05-09T00:00:01+00:00",
+                }
+            )
 
             payload = collect_project_status(
                 config,
@@ -665,6 +678,70 @@ class AutopilotStatusTests(unittest.TestCase):
 
         self.assertNotEqual(payload["supervisor"]["state"], "running")
         self.assertEqual(payload["supervisor"]["run_id"], "autopilot-stale")
+        self.assertEqual(payload["supervisor"]["state"], "stale")
+        self.assertEqual(payload["next_wake"], "")
+        self.assertEqual(
+            payload["last_cycle"]["next_wake"], "2026-05-09T01:00:00+00:00"
+        )
+
+    def test_project_status_does_not_expose_another_runs_wake(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            holder = manager.acquire_autopilot(
+                run_id="autopilot-live",
+                metadata={"pid": 999},
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
+                    "run_id": "autopilot-live",
+                    "pid": 999,
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                }
+            )
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                    "run_id": "autopilot-live",
+                    "cycle_id": "autopilot-live-c1",
+                    "status": "completed",
+                    "next_wake": "2026-05-09T01:00:00+00:00",
+                    "occurred_at": "2026-05-09T00:00:01+00:00",
+                }
+            )
+            run_store.append_record(
+                {
+                    "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                    "run_id": "autopilot-other",
+                    "cycle_id": "autopilot-other-c1",
+                    "status": "completed",
+                    "next_wake": "2026-05-09T02:00:00+00:00",
+                    "occurred_at": "2026-05-09T00:00:02+00:00",
+                }
+            )
+            try:
+                payload = collect_project_status(
+                    config,
+                    process_exists=lambda pid: pid == 999,
+                ).to_json()
+            finally:
+                manager.release_autopilot(
+                    run_id="autopilot-live",
+                    fencing_token=str(holder.metadata.get("fencing_token") or ""),
+                )
+
+        self.assertEqual(payload["supervisor"]["state"], "sleeping")
+        self.assertEqual(payload["supervisor"]["cycle_id"], "autopilot-live-c1")
+        self.assertEqual(payload["last_cycle"]["cycle_id"], "autopilot-other-c1")
+        self.assertEqual(payload["next_wake"], "")
 
     def test_project_status_separates_stopped_supervisor_from_last_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1387,7 +1464,7 @@ class AutopilotRunTests(unittest.TestCase):
                     json.loads(worker_probe.read_text(encoding="utf-8")),
                     {"selector": False, "transport": False},
                 )
-                self.assertEqual(status.supervisor.state, "running")
+                self.assertEqual(status.supervisor.state, "active_cycle")
                 self.assertEqual(status.supervisor.pid, launch.pid)
                 self.assertEqual(status.supervisor.run_id, launch.run_id)
                 self.assertNotIn(selector, payload)
@@ -3535,16 +3612,18 @@ class LimitWallPauseTests(unittest.TestCase):
             summary = run_autopilot(
                 config,
                 max_cycles=2,
-                interval=5.0,
+                interval=0.0,
                 launcher=launcher,
                 sleep=sleeps.append,
             )
 
         self.assertTrue(summary.started)
-        # The limit-wall backoff replaces the normal interval between cycles.
         self.assertEqual(sleeps, [42.0])
         self.assertEqual(summary.cycles[0].limit_wall_pause_seconds, 42.0)
         self.assertIn("limit_wall_pause:42s", summary.cycles[0].actions)
+        wake = datetime.datetime.fromisoformat(summary.cycles[0].next_wake)
+        occurred = datetime.datetime.fromisoformat(summary.cycles[0].occurred_at)
+        self.assertGreater((wake - occurred).total_seconds(), 40.0)
 
 
 class AutopilotRecheckTests(unittest.TestCase):
@@ -3967,6 +4046,75 @@ class AutopilotRecheckTests(unittest.TestCase):
         # keeps the single full-interval sleep.
         self.assertEqual(sleeps, [100.0])
         self.assertEqual(len(launcher_calls), 2)
+
+    def test_long_cycle_schedules_wake_after_completion_and_reports_phase(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+            config = load_config(repo)
+            active_statuses = []
+            sleeping_statuses = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                if on_start is not None:
+                    on_start(4242)
+                active_statuses.append(collect_project_status(config))
+                time.sleep(0.05)
+                return 0
+
+            def sleeper(seconds: float) -> None:
+                sleeping_statuses.append(
+                    (
+                        seconds,
+                        collect_project_status(config),
+                        datetime.datetime.now(datetime.UTC),
+                    )
+                )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=0.02,
+                launcher=launcher,
+                sleep=sleeper,
+            )
+
+        first = summary.cycles[0]
+        self.assertEqual(active_statuses[0].supervisor.state, "active_cycle")
+        self.assertEqual(active_statuses[0].next_wake, "")
+        self.assertEqual(sleeping_statuses[0][0], 0.02)
+        sleeping_status = sleeping_statuses[0][1]
+        self.assertEqual(sleeping_status.supervisor.state, "sleeping")
+        self.assertEqual(sleeping_status.next_wake, first.next_wake)
+        self.assertGreater(
+            datetime.datetime.fromisoformat(first.next_wake),
+            sleeping_statuses[0][2],
+        )
+
+    def test_cooperative_stop_after_cycle_does_not_advertise_or_enter_wait(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+            config = load_config(repo)
+            launcher, _calls = self._recording_launcher()
+            sleeps: list[float] = []
+            stop_checks = iter((False, True))
+
+            summary = run_autopilot(
+                config,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+                should_stop=lambda: next(stop_checks),
+            )
+
+        self.assertEqual(len(summary.cycles), 1)
+        self.assertEqual(summary.cycles[0].next_wake, "")
+        self.assertEqual(sleeps, [])
 
     def test_drained_dispatched_cycle_reaches_planning_after_one_recheck(self) -> None:
         for exit_code, expected_status in (

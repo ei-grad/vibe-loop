@@ -72,6 +72,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
     AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
     AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
@@ -359,12 +360,14 @@ class AutopilotCycleResult:
     next_wake: str = ""
     limit_wall_pause_seconds: float | None = None
     planning_backoff_seconds: float | None = None
+    autopilot_run_id: str = ""
 
     def to_json(self) -> dict[str, object]:
         return {
             "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
             "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
             "cycle_id": self.cycle_id,
+            "run_id": self.autopilot_run_id,
             "repo": str(self.repo),
             "status": self.status,
             "occurred_at": self.occurred_at,
@@ -494,6 +497,14 @@ def collect_project_status(
     observations = tuple(
         project_observations(queue_status=queue_status, workers=workers)
     )
+    next_wake = (
+        last_cycle.next_wake
+        if supervisor.state == "sleeping"
+        and last_cycle is not None
+        and last_cycle.cycle_id == supervisor.cycle_id
+        and str(last_cycle.record.get("run_id") or "") == supervisor.run_id
+        else ""
+    )
     return ProjectStatus(
         repo=config.repo,
         display_name=config.repo.name,
@@ -512,7 +523,7 @@ def collect_project_status(
         blockers=blockers,
         observations=observations,
         last_cycle=last_cycle,
-        next_wake=last_cycle.next_wake if last_cycle is not None else "",
+        next_wake=next_wake,
         attempt_circuit_breakers=attempt_circuit_breakers,
         runtime_context=config.runtime_context,
         project_binding=project_binding,
@@ -752,6 +763,18 @@ def collect_supervisor_status(
         None,
     )
 
+    def live_phase(run_id: str) -> dict[str, Any] | None:
+        for record in reversed(records):
+            record_type = record.get("record_type")
+            if record_type not in {
+                AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
+                AUTOPILOT_CYCLE_RECORD_TYPE,
+            }:
+                continue
+            if str(record.get("run_id") or "") == run_id:
+                return record
+        return None
+
     if supervisor_lock is not None:
         if supervisor_lock.locked and supervisor_lock.state in {"held", "unknown"}:
             lock_run_id = str(supervisor_lock.metadata.get("run_id") or "")
@@ -774,18 +797,32 @@ def collect_supervisor_status(
                 ),
                 None,
             )
+            phase_record = live_phase(lock_run_id)
+            state = "running" if supervisor_lock.state == "held" else "observed"
+            if supervisor_lock.state == "held" and phase_record is not None:
+                if (
+                    phase_record.get("record_type")
+                    == AUTOPILOT_CYCLE_STARTED_RECORD_TYPE
+                ):
+                    state = "active_cycle"
+                elif phase_record.get("next_wake"):
+                    state = "sleeping"
             return SupervisorStatus(
-                state=("running" if supervisor_lock.state == "held" else "observed"),
+                state=state,
                 pid=lock_pid,
                 log=log,
                 run_id=lock_run_id,
                 cycle_id=(
-                    str(newest_record.get("cycle_id") or "")
+                    str(phase_record.get("cycle_id") or "")
+                    if phase_record is not None
+                    else str(newest_record.get("cycle_id") or "")
                     if newest_record is not None
                     else ""
                 ),
                 observed_at=(
-                    str(newest_record.get("occurred_at") or "")
+                    str(phase_record.get("occurred_at") or "")
+                    if phase_record is not None
+                    else str(newest_record.get("occurred_at") or "")
                     if newest_record is not None
                     else str(supervisor_lock.metadata.get("heartbeat_at") or "")
                 ),
@@ -5099,7 +5136,6 @@ def execute_autopilot_cycle(
     max_slices: int,
     max_tasks: int,
     min_ready: int,
-    next_wake: str,
     process_exists: ProcessExists | None,
     launcher: RunUntilDoneLauncher,
     run_store: RunStore,
@@ -5394,9 +5430,9 @@ def execute_autopilot_cycle(
         blockers=blockers,
         child_pid=child_pid,
         child_log=child_log,
-        next_wake=next_wake,
         limit_wall_pause_seconds=pause_seconds,
         planning_backoff_seconds=planning_backoff_pause,
+        autopilot_run_id=autopilot_run_id,
     )
 
 
@@ -6079,10 +6115,20 @@ def run_autopilot(
                 break
             cycle_number += 1
             bounded_last = once or (max_cycles > 0 and cycle_number >= max_cycles)
-            next_wake = "" if bounded_last else iso_after(interval)
+            cycle_id = f"{supervisor_run_id}-c{cycle_number}"
+            run_store.append_record(
+                {
+                    "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                    "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
+                    "occurred_at": utc_now_iso(),
+                    "repo": str(config.repo),
+                    "run_id": supervisor_run_id,
+                    "cycle_id": cycle_id,
+                }
+            )
             result = execute_autopilot_cycle(
                 config,
-                cycle_id=f"{supervisor_run_id}-c{cycle_number}",
+                cycle_id=cycle_id,
                 autopilot_run_id=supervisor_run_id,
                 jobs=jobs,
                 ask_agent=ask_agent,
@@ -6090,7 +6136,6 @@ def run_autopilot(
                 max_slices=max_slices,
                 max_tasks=max_tasks,
                 min_ready=min_ready,
-                next_wake=next_wake,
                 process_exists=process_exists,
                 launcher=launch,
                 run_store=run_store,
@@ -6118,9 +6163,6 @@ def run_autopilot(
                     and planning_backoff_seconds > interval
                 ):
                     idle_wait_seconds = planning_backoff_seconds
-                result = dataclasses.replace(
-                    result, next_wake=iso_after(idle_wait_seconds)
-                )
             post_cycle_planning_delay: float | None = None
             if (
                 not bounded_last
@@ -6141,36 +6183,43 @@ def run_autopilot(
                     result = dataclasses.replace(
                         result,
                         actions=(*result.actions, post_cycle_action),
-                        next_wake=iso_after(post_cycle_planning_delay),
                     )
                 else:
                     result = dataclasses.replace(
                         result,
                         actions=(*result.actions, post_cycle_action),
                     )
+            stop_pending = should_stop is not None and should_stop()
+            scheduled_wait_seconds: float | None = None
             limit_wall_pause = result.limit_wall_pause_seconds
-            # Restamping and waiting must share one predicate. A configured
-            # zero backoff makes an elapsed or reset-less wall pause for zero
-            # seconds, which is not a pause at all: stamping next_wake to now
-            # and then sleeping the ordinary interval would report a wake the
-            # supervisor never honours.
-            if (
-                not bounded_last
-                and limit_wall_pause is not None
-                and limit_wall_pause > 0
-            ):
-                # The interval-based wake stamped before the cycle is a lie once
-                # a limit wall pauses dispatch: report the reset the supervisor
-                # actually sleeps to.
-                result = dataclasses.replace(
-                    result,
-                    next_wake=iso_after(limit_wall_pause),
-                )
+            if not bounded_last and not stop_pending:
+                if limit_wall_pause is not None and limit_wall_pause > 0:
+                    scheduled_wait_seconds = limit_wall_pause
+                elif interval > 0:
+                    if cycle_should_recheck(result):
+                        scheduled_wait_seconds = idle_wait_seconds
+                    elif post_cycle_planning_delay is not None:
+                        scheduled_wait_seconds = post_cycle_planning_delay
+                    else:
+                        scheduled_wait_seconds = interval
+            result = dataclasses.replace(
+                result,
+                next_wake=(
+                    iso_after(scheduled_wait_seconds)
+                    if scheduled_wait_seconds is not None
+                    else ""
+                ),
+            )
             result.append_to(run_store)
             cycles.append(result)
-            if bounded_last:
+            if bounded_last or stop_pending:
                 break
-            pause_seconds = result.limit_wall_pause_seconds
+            pause_seconds = (
+                scheduled_wait_seconds
+                if result.limit_wall_pause_seconds is not None
+                and result.limit_wall_pause_seconds > 0
+                else None
+            )
             # A non-positive pause would skip the interval sleep entirely and
             # spin the cycle; treat it as no pause at all.
             if pause_seconds is not None and pause_seconds > 0:
@@ -6192,6 +6241,7 @@ def run_autopilot(
                     break
                 continue
             if interval > 0:
+                assert scheduled_wait_seconds is not None
                 # Persistent watch: keep cycling and sleeping until a bound or
                 # signal stops the loop, even across idle or blocked cycles.
                 if cycle_should_recheck(result):
@@ -6225,7 +6275,7 @@ def run_autopilot(
                         config,
                         cycle_id=result.cycle_id,
                         deadline=result.next_wake,
-                        interval=idle_wait_seconds,
+                        interval=scheduled_wait_seconds,
                         initial_poll_seconds=(
                             config.autopilot.planning_recheck_seconds
                         ),
@@ -6263,9 +6313,9 @@ def run_autopilot(
                         f"{post_cycle_planning_delay:.0f}s",
                         flush=True,
                     )
-                    sleeper(post_cycle_planning_delay)
+                    sleeper(scheduled_wait_seconds)
                 else:
-                    sleeper(interval)
+                    sleeper(scheduled_wait_seconds)
                 continue
             # Drain mode (no interval): continue only while cycles can still make
             # progress; an idle or blocked cycle cannot advance without waiting or

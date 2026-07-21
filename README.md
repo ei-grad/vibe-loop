@@ -549,7 +549,9 @@ machine-readable boundary consumed by external status surfaces such as the
 loopyard web UI (board, agents, and timeline screens). Supervisor state
 correlates the live supervisor lock with append-only started or observed
 records, preserving its run ID, PID, and log even when newer cycle records are
-idle and PID-less; `last_cycle` independently reports the newest cycle.
+idle and PID-less; `last_cycle` independently reports the newest cycle. A live
+supervisor reports `active_cycle` while a cycle is executing and `sleeping`
+after the completed cycle records the post-cycle deadline it is honouring.
 After a bounded or operator-requested exit, supervisor state is `stopped` while
 `last_cycle` retains the independent child-cycle result such as `completed` or
 `idle`. `stopped` requires both an explicit terminal stop record and a verified
@@ -762,6 +764,11 @@ classified and repeated futility is throttled. Two consecutive `invalid_plan`,
 The backoff extends the idle wait rather than blocking it: a task source that
 reaches `min_ready` still wakes the next cycle early, stop requests are still
 honoured, and `next_wake` reports the deadline the supervisor actually sleeps to.
+A persistent cycle schedules that deadline after the child and post-dispatch
+checks complete, so child duration is not added to the interval and status does
+not retain an already elapsed pre-cycle wake. The wait itself remains duration-
+based and monotonic even though the journal exposes an operator-readable UTC
+deadline.
 A launch that creates tasks, or a materially changed task source, clears the
 outcome gate. Created identities and change detection use the complete task
 source rather than only its runnable subset, so a new task claimed before the

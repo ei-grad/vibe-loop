@@ -65,9 +65,9 @@ Autopilot state must be recorded through additive records in the target
 repository's configured runtime journal, such as `.vibe-loop/runs.jsonl`, rather
 than a separate hidden state file.
 
-Records include `autopilot_cycle`, `autopilot_supervisor_started`,
-`autopilot_supervisor_observed`, `autopilot_command_result`, and
-`autopilot_idle_wait`. Each cycle record
+Records include `autopilot_cycle`, `autopilot_cycle_started`,
+`autopilot_supervisor_started`, `autopilot_supervisor_observed`,
+`autopilot_command_result`, and `autopilot_idle_wait`. Each cycle record
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
@@ -609,6 +609,17 @@ still prevents a busy loop, and the journaled `next_wake` is the deadline the
 supervisor actually honours. Status output must name the recorded outcome, the
 attempt count, and the backoff reason, using outcome names and counts only - no
 prompt text, objectives, or credentials.
+
+Persistent supervisors compute the ordinary post-cycle deadline only after the
+child and post-dispatch queue check finish. The same selected wait duration
+governs the journaled UTC `next_wake` and the monotonic sleep or idle-wait
+budget, so a long child cannot leave status advertising an elapsed pre-cycle
+deadline and wall-clock adjustments cannot change the wait duration. A live
+supervisor reports `active_cycle` from the cycle-start record until the cycle
+record is appended, then `sleeping` while a non-empty `next_wake` is being
+honoured. Bounded and already-stopping paths record no next wake. A drain-mode
+cycle records and honours a positive limit-wall deadline, but records no
+ordinary interval wake.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
