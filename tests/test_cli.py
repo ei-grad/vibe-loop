@@ -6377,8 +6377,23 @@ class CliTests(unittest.TestCase):
         self.assertFalse(task_lock_exists)
         self.assertEqual(
             record_types,
-            ["lock_acquired", "run_contract_resolved", "lock_released"],
+            [
+                "lock_acquired",
+                "run_contract_resolved",
+                "stage_transition",
+                "stage_transition",
+                "stage_transition",
+                "lock_released",
+            ],
         )
+        stage_records = [
+            record for record in records if record["record_type"] == "stage_transition"
+        ]
+        self.assertEqual(
+            [record["to_stage"] for record in stage_records],
+            ["activation", "classification", "finalization"],
+        )
+        self.assertEqual(stage_records[1]["failure"], "stage_failed")
         self.assertEqual(records[-1]["reason"], "task_activation_failed")
 
     def test_command_prelaunch_failures_release_lock_without_starting_worker(
@@ -6479,7 +6494,14 @@ class CliTests(unittest.TestCase):
                 self.assertFalse(task_lock_exists)
                 self.assertEqual(
                     record_types,
-                    ["lock_acquired", "run_contract_resolved", "lock_released"],
+                    [
+                        "lock_acquired",
+                        "run_contract_resolved",
+                        "stage_transition",
+                        "stage_transition",
+                        "stage_transition",
+                        "lock_released",
+                    ],
                 )
                 self.assertEqual(records[-1]["reason"], "task_activation_failed")
 
@@ -7764,6 +7786,18 @@ class CliTests(unittest.TestCase):
                 },
                 {
                     "schema_version": 3,
+                    "record_type": "stage_transition",
+                    "run_id": "run-1",
+                    "task_id": "TASK-01",
+                    "occurred_at": "2026-05-09T00:00:45+00:00",
+                    "from_stage": "classification",
+                    "to_stage": "finalization",
+                    "reason": "run_result_recording",
+                    "ordinal": 1,
+                    "accepted": True,
+                },
+                {
+                    "schema_version": 3,
                     "record_type": "run_result",
                     "run_id": "run-1",
                     "session_id": "native-1",
@@ -7856,6 +7890,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(list_payload[1]["lifecycle_state"], "finalized")
         self.assertEqual(list_payload[1]["log"], str(runs_dir / "run-1.log"))
         self.assertEqual(inspect_payload["lifecycle_state"], "finalized")
+        self.assertEqual(inspect_payload["stage"], "finalization")
+        self.assertEqual(inspect_payload["stage_ordinal"], 1)
         self.assertIn(
             "started",
             inspect_payload["missing_lifecycle_transitions"],
@@ -7893,7 +7929,9 @@ class CliTests(unittest.TestCase):
             "message: -\n"
             "lifecycle: finalized\n"
             "missing_lifecycle: started, session_observed, workspace_claimed\n"
-            "records: 4\n"
+            "stage: finalization (ordinal 1, started "
+            "2026-05-09T00:00:45+00:00)\n"
+            "records: 5\n"
             'worker_report: {"commit": "abc123", "message": "", '
             '"metadata": {"source": "worker"}, '
             '"reported_at": "2026-05-09T00:00:00+00:00", '
@@ -7906,6 +7944,8 @@ class CliTests(unittest.TestCase):
             "\tupdated=2026-05-09T00:00:00+00:00\n"
             "- run_state_transition\tstatus=classified"
             "\tupdated=2026-05-09T00:00:30+00:00\n"
+            "- stage_transition\tstatus=finalization"
+            "\tupdated=2026-05-09T00:00:45+00:00\n"
             "- run_result\tstatus=completed"
             "\tupdated=2026-05-09T00:01:00+00:00\n",
         )

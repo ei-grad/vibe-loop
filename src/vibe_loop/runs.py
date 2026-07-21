@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
 from vibe_loop.locks import redact_exact_fencing_token, redact_fencing_token_payload
+from vibe_loop.orchestration import StageTransition, derive_stage_progress
 from vibe_loop.telemetry import sanitize_run_stats
 
 try:
@@ -42,6 +43,7 @@ WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
 WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE = "workspace_claim_mismatch"
 RUN_STATE_TRANSITION_RECORD_TYPE = "run_state_transition"
+STAGE_TRANSITION_RECORD_TYPE = "stage_transition"
 TASK_RESTART_RECORD_TYPE = "task_restart"
 TASK_RECOVERY_RECORD_TYPE = "task_recovery"
 RUN_SUPERVISOR_STARTED_RECORD_TYPE = "run_supervisor_started"
@@ -91,6 +93,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         WORKSPACE_CLAIM_RECORD_TYPE,
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
         RUN_STATE_TRANSITION_RECORD_TYPE,
+        STAGE_TRANSITION_RECORD_TYPE,
         TASK_RESTART_RECORD_TYPE,
         TASK_RECOVERY_RECORD_TYPE,
         RUN_SUPERVISOR_STARTED_RECORD_TYPE,
@@ -473,6 +476,21 @@ class RunLifecycleEvent:
         )
 
     @classmethod
+    def stage_transition(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        transition: StageTransition,
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=STAGE_TRANSITION_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={"task_id": task_id, **transition.to_payload()},
+        )
+
+    @classmethod
     def run_started(
         cls,
         *,
@@ -661,6 +679,9 @@ class RunLifecycleTransition:
 class RunLifecycleProgress:
     state: str
     transitions: tuple[RunLifecycleTransition, ...]
+    stage: str = ""
+    stage_ordinal: int = 0
+    stage_started_at: str = ""
 
     @property
     def missing_states(self) -> tuple[str, ...]:
@@ -671,13 +692,22 @@ class RunLifecycleProgress:
         )
 
     def to_json(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "lifecycle_state": self.state,
             "lifecycle_transitions": [
                 transition.to_json() for transition in self.transitions
             ],
             "missing_lifecycle_transitions": list(self.missing_states),
         }
+        if self.stage:
+            payload.update(
+                {
+                    "stage": self.stage,
+                    "stage_ordinal": self.stage_ordinal,
+                    "stage_started_at": self.stage_started_at,
+                }
+            )
+        return payload
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1023,7 +1053,14 @@ def derive_run_lifecycle(records: list[dict[str, Any]]) -> RunLifecycleProgress:
     for transition in transitions:
         if transition.observed:
             current_state = transition.state
-    return RunLifecycleProgress(state=current_state, transitions=transitions)
+    stage = derive_stage_progress(records)
+    return RunLifecycleProgress(
+        state=current_state,
+        transitions=transitions,
+        stage=stage.stage.value if stage is not None else "",
+        stage_ordinal=stage.ordinal if stage is not None else 0,
+        stage_started_at=stage.occurred_at if stage is not None else "",
+    )
 
 
 def observed_lifecycle_states(record: dict[str, Any]) -> tuple[str, ...]:
@@ -1120,6 +1157,12 @@ def record_status(record: dict[str, Any]) -> str:
     record_type = record.get("record_type")
     if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
         return string_value(record.get("to_state"))
+    if record_type == STAGE_TRANSITION_RECORD_TYPE:
+        if record.get("accepted") is False:
+            return "rejected"
+        return string_value(record.get("failure")) or string_value(
+            record.get("to_stage")
+        )
     if record_type == RUN_STARTED_RECORD_TYPE:
         return "started"
     if record_type == RUN_CONTRACT_RESOLVED_RECORD_TYPE:

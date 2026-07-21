@@ -58,7 +58,12 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
     redact_fencing_token_text,
 )
-from vibe_loop.orchestration import RunContractResolver
+from vibe_loop.orchestration import (
+    RunContractResolver,
+    RunLifecycleStateMachine,
+    RunStage,
+    StageFailure,
+)
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
     LimitWallSignal,
@@ -1223,28 +1228,28 @@ class VibeRunner:
                 },
             )
         )
-        continuation = recovery is not None or restart_count > 0
-        pre_launch_failure_reason = "run_contract_resolution_failed"
-        try:
-            run_contract = RunContractResolver(self.config).resolve(agent_selection)
-            self.run_store.append_lifecycle_event(
-                RunLifecycleEvent.run_contract_resolved(
+        stage_machine = RunLifecycleStateMachine(
+            lambda transition: self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
                     run_id=run_id,
                     task_id=task.task_id,
-                    contract=run_contract.to_record_payload(),
+                    transition=transition,
                 )
             )
-            pre_launch_failure_reason = "task_activation_failed"
-            activated_task = self.activate_task_before_launch(
-                task,
-                run_id,
-                command_env,
-                continuation=continuation,
-            )
-        except Exception:
-            # Any ordinary pre-launch failure after acquisition must release
-            # this run's exact task lock. Activation adapters are external and
-            # can fail outside the enumerated subprocess/config exceptions.
+        )
+        continuation = recovery is not None or restart_count > 0
+        pre_launch_failure_reason = "run_contract_resolution_failed"
+
+        def finalize_pre_launch_failure(failure: StageFailure) -> None:
+            if stage_machine.stage is not None:
+                stage_machine.fail(
+                    failure,
+                    reason=pre_launch_failure_reason,
+                )
+                stage_machine.transition(
+                    RunStage.FINALIZATION,
+                    reason="pre_launch_failure",
+                )
             self.lock_manager.release(task_lock)
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
@@ -1259,6 +1264,35 @@ class VibeRunner:
                     },
                 )
             )
+
+        try:
+            run_contract = RunContractResolver(self.config).resolve(agent_selection)
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    contract=run_contract.to_record_payload(),
+                )
+            )
+            stage_machine.transition(
+                RunStage.ACTIVATION,
+                reason="run_contract_resolved",
+            )
+            pre_launch_failure_reason = "task_activation_failed"
+            activated_task = self.activate_task_before_launch(
+                task,
+                run_id,
+                command_env,
+                continuation=continuation,
+            )
+        except KeyboardInterrupt:
+            finalize_pre_launch_failure(StageFailure.CANCELLED)
+            raise
+        except Exception:
+            # Any ordinary pre-launch failure after acquisition must release
+            # this run's exact task lock. Activation adapters are external and
+            # can fail outside the enumerated subprocess/config exceptions.
+            finalize_pre_launch_failure(StageFailure.STAGE_FAILED)
             raise
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.run_started(
@@ -1287,6 +1321,10 @@ class VibeRunner:
                     ),
                 },
             )
+        )
+        stage_machine.transition(
+            RunStage.WORKSPACE,
+            reason="worker_owned_workspace_handoff",
         )
         observation_lock = threading.Lock()
         observed_output_context = AgentRuntimeContext()
@@ -1542,6 +1580,10 @@ class VibeRunner:
                         is not None
                     )
 
+                stage_machine.transition(
+                    RunStage.IMPLEMENTING,
+                    reason="worker_process_launch",
+                )
                 stream_result = run_streaming_command(
                     command,
                     self.config.repo,
@@ -1708,6 +1750,23 @@ class VibeRunner:
                 # Persist the advertised reset phrase so the supervisor can size
                 # its dispatch backoff from the recorded result alone.
                 message = classification.detail
+            failure_by_classification = {
+                "limit_wall": StageFailure.LIMIT_WALL,
+                "timed_out": StageFailure.TIMED_OUT,
+                "failed": StageFailure.STAGE_FAILED,
+                "blocked": StageFailure.BLOCKED,
+            }
+            stage_failure = failure_by_classification.get(classification.status)
+            if stage_failure is None:
+                stage_machine.transition(
+                    RunStage.CLASSIFICATION,
+                    reason=classification.source,
+                )
+            else:
+                stage_machine.fail(
+                    stage_failure,
+                    reason=classification.source,
+                )
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.run_state_transition(
                     run_id=run_id,
@@ -1720,6 +1779,10 @@ class VibeRunner:
                         "started_at": active_state.started_at,
                     },
                 )
+            )
+            stage_machine.transition(
+                RunStage.FINALIZATION,
+                reason="run_result_recording",
             )
             result = RunResult(
                 run_id=run_id,
@@ -1808,6 +1871,28 @@ class VibeRunner:
                 f"{log_path}"
             )
             return result
+        except KeyboardInterrupt:
+            stage_machine.fail(
+                StageFailure.CANCELLED,
+                reason="worker_interrupted",
+            )
+            if stage_machine.stage is RunStage.CLASSIFICATION:
+                stage_machine.transition(
+                    RunStage.FINALIZATION,
+                    reason="interrupted_finalization",
+                )
+            raise
+        except Exception:
+            stage_machine.fail(
+                StageFailure.STAGE_FAILED,
+                reason="run_task_exception",
+            )
+            if stage_machine.stage is RunStage.CLASSIFICATION:
+                stage_machine.transition(
+                    RunStage.FINALIZATION,
+                    reason="exception_finalization",
+                )
+            raise
         finally:
             try:
                 settle_outcome_and_release()

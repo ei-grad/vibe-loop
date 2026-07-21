@@ -2250,6 +2250,9 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tresult={payload['result_status']}" if payload["result_status"] else ""
         )
         lifecycle = f"\tlifecycle={payload['lifecycle_state'] or '-'}"
+        stage = ""
+        if payload.get("stage"):
+            stage = f"\tstage={payload['stage']}:{payload['stage_ordinal']}"
         restart_count = payload.get("restart_count")
         restarts = ""
         if isinstance(restart_count, int) and restart_count > 0:
@@ -2271,7 +2274,7 @@ def render_workers(workers: list[WorkerView]) -> str:
             f"\tprocess={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
             f"\tcommand={payload['command']}{workspace}{lifecycle}{result}"
-            f"{restarts}{diagnostics}{stale}"
+            f"{stage}{restarts}{diagnostics}{stale}"
         )
     return "\n".join(lines)
 
@@ -2446,6 +2449,12 @@ def render_run_inspection(inspection) -> str:
         ),
         f"records: {payload['record_count']}",
     ]
+    if payload.get("stage"):
+        lines.insert(
+            -1,
+            f"stage: {payload['stage']} (ordinal {payload['stage_ordinal']}, "
+            f"started {payload['stage_started_at'] or '-'})",
+        )
     if payload["restart_count"] or payload["restart_exhausted"]:
         lines.insert(
             -1,
@@ -2467,6 +2476,12 @@ def render_run_inspection(inspection) -> str:
         if status == "-":
             if record_type == "run_state_transition":
                 status = record.get("to_state") or "-"
+            elif record_type == "stage_transition":
+                status = (
+                    "rejected"
+                    if record.get("accepted") is False
+                    else record.get("failure") or record.get("to_stage") or "-"
+                )
             elif record_type == "workspace_claim":
                 status = record.get("event_type") or "workspace_claimed"
             elif record_type == "workspace_claim_mismatch":

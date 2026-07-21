@@ -18,7 +18,17 @@ from vibe_loop.config import (
     load_config,
     reject_generated_command_adapters,
 )
-from vibe_loop.orchestration import RunContractProposal, RunContractResolver
+from vibe_loop.orchestration import (
+    LEGAL_STAGE_TRANSITIONS,
+    STAGE_FAILURES,
+    IllegalStageTransitionError,
+    RunContractProposal,
+    RunContractResolver,
+    RunLifecycleStateMachine,
+    RunStage,
+    StageFailure,
+    derive_stage_progress,
+)
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runs import WorkerReport
 from vibe_loop.tasks import Task
@@ -249,6 +259,166 @@ class RunContractResolverTests(unittest.TestCase):
         self.assertTrue(str(source["digest"]).startswith("sha256:"))
 
 
+class RunLifecycleStateMachineTests(unittest.TestCase):
+    @staticmethod
+    def restored(stage: RunStage, records: list[dict[str, object]]):
+        return RunLifecycleStateMachine.from_records(
+            [
+                {
+                    "record_type": "stage_transition",
+                    "from_stage": "",
+                    "to_stage": stage.value,
+                    "reason": "restore",
+                    "ordinal": 1,
+                    "accepted": True,
+                }
+            ],
+            lambda transition: records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            ),
+        )
+
+    def test_every_legal_transition_is_accepted(self) -> None:
+        initial_records: list[dict[str, object]] = []
+        initial = RunLifecycleStateMachine(
+            lambda transition: initial_records.append(transition.to_payload())
+        )
+        initial.transition(RunStage.ACTIVATION, reason="start")
+        self.assertEqual(initial.stage, RunStage.ACTIVATION)
+
+        for source, destinations in LEGAL_STAGE_TRANSITIONS.items():
+            for destination in destinations:
+                with self.subTest(source=source, destination=destination):
+                    records: list[dict[str, object]] = []
+                    machine = self.restored(source, records)
+                    transition = machine.transition(destination, reason="test")
+                    self.assertTrue(transition.accepted)
+                    self.assertEqual(machine.stage, destination)
+
+    def test_every_typed_failure_is_accepted_from_every_stage(self) -> None:
+        self.assertEqual(
+            set(STAGE_FAILURES),
+            {"limit_wall", "timed_out", "stage_failed", "blocked", "cancelled"},
+        )
+        for stage in RunStage:
+            for failure in StageFailure:
+                with self.subTest(stage=stage, failure=failure):
+                    records: list[dict[str, object]] = []
+                    machine = self.restored(stage, records)
+                    transition = machine.fail(failure, reason="test failure")
+                    self.assertTrue(transition.accepted)
+                    self.assertEqual(transition.failure, failure)
+                    expected = (
+                        RunStage.FINALIZATION
+                        if stage in {RunStage.CLASSIFICATION, RunStage.FINALIZATION}
+                        else RunStage.CLASSIFICATION
+                    )
+                    self.assertEqual(machine.stage, expected)
+
+    def test_gate_failure_can_remediate_and_repeat_candidate_gates(self) -> None:
+        records: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: records.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REMEDIATION,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.CLOSURE,
+        ):
+            machine.transition(stage, reason="gate remediation")
+
+        self.assertEqual(machine.stage, RunStage.CLOSURE)
+        self.assertEqual(
+            [record["ordinal"] for record in records if record["to_stage"] == "gates"],
+            [1, 2],
+        )
+
+    def test_illegal_transition_is_journaled_before_typed_error(self) -> None:
+        records: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: records.append(
+                {"record_type": "stage_transition", **transition.to_payload()}
+            )
+        )
+        machine.transition(RunStage.ACTIVATION, reason="start")
+
+        with self.assertRaises(IllegalStageTransitionError) as raised:
+            machine.transition(RunStage.REVIEW, reason="skip owners")
+
+        self.assertEqual(raised.exception.from_stage, RunStage.ACTIVATION)
+        self.assertEqual(raised.exception.to_stage, RunStage.REVIEW)
+        self.assertFalse(records[-1]["accepted"])
+        self.assertEqual(records[-1]["to_stage"], "review")
+        self.assertEqual(machine.stage, RunStage.ACTIVATION)
+
+    def test_journal_append_precedes_in_memory_transition(self) -> None:
+        observed_stages: list[RunStage | None] = []
+        machine: RunLifecycleStateMachine
+
+        def journal(_transition) -> None:
+            observed_stages.append(machine.stage)
+
+        machine = RunLifecycleStateMachine(journal)
+        machine.transition(RunStage.ACTIVATION, reason="start")
+        machine.transition(RunStage.WORKSPACE, reason="activated")
+
+        self.assertEqual(observed_stages, [None, RunStage.ACTIVATION])
+
+    def test_state_reconstructs_after_each_recorded_boundary(self) -> None:
+        records: list[dict[str, object]] = []
+
+        def journal(transition) -> None:
+            records.append(
+                {
+                    "record_type": "stage_transition",
+                    "occurred_at": f"boundary-{len(records) + 1}",
+                    **transition.to_payload(),
+                }
+            )
+
+        machine = RunLifecycleStateMachine(journal)
+        path = (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REVIEW,
+            RunStage.REMEDIATION,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.CLOSURE,
+            RunStage.INTEGRATION,
+            RunStage.PROVENANCE,
+            RunStage.CLASSIFICATION,
+            RunStage.FINALIZATION,
+        )
+
+        for expected in path:
+            machine.transition(expected, reason="boundary")
+            recovered = RunLifecycleStateMachine.from_records(records, lambda _: None)
+            progress = derive_stage_progress(records)
+            self.assertEqual(recovered.stage, expected)
+            self.assertIsNotNone(progress)
+            assert progress is not None
+            self.assertEqual(progress.stage, expected)
+            self.assertEqual(progress.ordinal, recovered.ordinal)
+            self.assertEqual(progress.occurred_at, f"boundary-{len(records)}")
+
+        candidate_records = [
+            record for record in records if record["to_stage"] == "candidate"
+        ]
+        gate_records = [record for record in records if record["to_stage"] == "gates"]
+        self.assertEqual([record["ordinal"] for record in candidate_records], [1, 2])
+        self.assertEqual([record["ordinal"] for record in gate_records], [1, 2])
+
+
 class RunContractJournalTests(unittest.TestCase):
     def test_contract_is_recorded_after_lock_and_before_activation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -292,7 +462,7 @@ class RunContractJournalTests(unittest.TestCase):
         record_types = [record.get("record_type") for record in records]
         self.assertEqual(
             activation_record_types,
-            ["lock_acquired", "run_contract_resolved"],
+            ["lock_acquired", "run_contract_resolved", "stage_transition"],
         )
         self.assertLess(
             record_types.index("run_contract_resolved"),
@@ -308,6 +478,61 @@ class RunContractJournalTests(unittest.TestCase):
         )
         self.assertEqual(started["run_contract_digest"], contract["contract_digest"])
         self.assertEqual(started["orchestration_mode"], "worker-owned")
+        stage_records = [
+            record
+            for record in records
+            if record.get("record_type") == "stage_transition"
+        ]
+        self.assertEqual(
+            [record["to_stage"] for record in stage_records],
+            [
+                "activation",
+                "workspace",
+                "implementing",
+                "classification",
+                "finalization",
+            ],
+        )
+        self.assertEqual(stage_records[-2]["failure"], "stage_failed")
+
+    def test_activation_cancellation_is_journaled_and_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(VibeConfig(repo=repo, agent=agent))
+            task = Task(task_id="T-1", title="Task", status="Next")
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    side_effect=KeyboardInterrupt,
+                ):
+                    with patch("vibe_loop.runner.git_rev_parse", return_value="abc123"):
+                        with self.assertRaises(KeyboardInterrupt):
+                            runner.run_task(task)
+
+            records = runner.run_store.read_records()
+            task_lock_exists = (repo / ".vibe-loop" / "locks" / "T-1.lock").exists()
+
+        self.assertFalse(task_lock_exists)
+        stage_records = [
+            record
+            for record in records
+            if record.get("record_type") == "stage_transition"
+        ]
+        self.assertEqual(
+            [record["to_stage"] for record in stage_records],
+            ["activation", "classification", "finalization"],
+        )
+        self.assertEqual(stage_records[1]["failure"], "cancelled")
+        self.assertEqual(records[-1]["record_type"], "lock_released")
+        self.assertEqual(records[-1]["reason"], "task_activation_failed")
 
 
 if __name__ == "__main__":

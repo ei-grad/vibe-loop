@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from vibe_loop.orchestration import RunStage, StageTransition
 from vibe_loop.runs import (
     AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
@@ -23,6 +24,7 @@ from vibe_loop.runs import (
     RUN_SCHEMA_VERSION,
     RUN_STARTED_RECORD_TYPE,
     RUN_STATE_TRANSITION_RECORD_TYPE,
+    STAGE_TRANSITION_RECORD_TYPE,
     TASK_RECOVERY_RECORD_TYPE,
     TASK_RESTART_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
@@ -687,6 +689,52 @@ class RunStoreTests(unittest.TestCase):
         self.assertFalse(by_state["finalized"]["observed"])
         self.assertIn("scheduled", payload["missing_lifecycle_transitions"])
         self.assertIn("finalized", payload["missing_lifecycle_transitions"])
+        self.assertNotIn("stage", payload)
+
+    def test_derive_run_lifecycle_exposes_only_accepted_recorded_stage(self) -> None:
+        records = [
+            RunLifecycleEvent.stage_transition(
+                run_id="run-1",
+                task_id="TASK-01",
+                transition=StageTransition(
+                    from_stage=None,
+                    to_stage=RunStage.ACTIVATION,
+                    reason="contract_resolved",
+                    ordinal=1,
+                    accepted=True,
+                ),
+            ).to_record(),
+            RunLifecycleEvent.stage_transition(
+                run_id="run-1",
+                task_id="TASK-01",
+                transition=StageTransition(
+                    from_stage=RunStage.ACTIVATION,
+                    to_stage=RunStage.REVIEW,
+                    reason="illegal_skip",
+                    ordinal=1,
+                    accepted=False,
+                ),
+            ).to_record(),
+            RunLifecycleEvent.stage_transition(
+                run_id="run-1",
+                task_id="TASK-01",
+                transition=StageTransition(
+                    from_stage=RunStage.ACTIVATION,
+                    to_stage=RunStage.WORKSPACE,
+                    reason="activated",
+                    ordinal=1,
+                    accepted=True,
+                ),
+            ).to_record(),
+        ]
+        records[-1]["occurred_at"] = "2026-05-09T00:00:20+00:00"
+
+        payload = derive_run_lifecycle(records).to_json()
+
+        self.assertEqual(records[0]["record_type"], STAGE_TRANSITION_RECORD_TYPE)
+        self.assertEqual(payload["stage"], "workspace")
+        self.assertEqual(payload["stage_ordinal"], 1)
+        self.assertEqual(payload["stage_started_at"], "2026-05-09T00:00:20+00:00")
 
     def test_latest_worker_report_uses_latest_matching_valid_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

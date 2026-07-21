@@ -17,6 +17,7 @@ from vibe_loop.locks import (
     LockManager,
     build_lock_manager,
 )
+from vibe_loop.orchestration import RunStage, StageTransition
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     RunLifecycleEvent,
@@ -1069,6 +1070,19 @@ class WorkerStateTests(unittest.TestCase):
                     reason="task_lock_acquired",
                 )
             )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-1",
+                    task_id="PAR-03",
+                    transition=StageTransition(
+                        from_stage=RunStage.WORKSPACE,
+                        to_stage=RunStage.IMPLEMENTING,
+                        reason="worker_process_launch",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
 
             views = build_worker_views(
                 manager,
@@ -1086,6 +1100,8 @@ class WorkerStateTests(unittest.TestCase):
         self.assertTrue(by_state["scheduled"]["observed"])
         self.assertTrue(by_state["started"]["observed"])
         self.assertFalse(by_state["reported"]["observed"])
+        self.assertEqual(payload["stage"], "implementing")
+        self.assertEqual(payload["stage_ordinal"], 1)
 
     def test_worker_views_include_restart_count_from_active_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
