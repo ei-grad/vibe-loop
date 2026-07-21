@@ -686,29 +686,29 @@ class ProviderUsageObserver:
                 )
             return unavailable_usage(self.provider, "provider_usage_not_reported")
 
-    def observe_line(self, line: str) -> None:
+    def observe_line(self, line: str) -> ProviderUsage | None:
         text = line.strip()
         if text.startswith("data:"):
             text = text.removeprefix("data:").strip()
         if not text.startswith("{"):
-            return
+            return None
         try:
             payload = json.loads(text)
         except json.JSONDecodeError:
-            return
+            return None
         if not isinstance(payload, dict):
-            return
+            return None
         observed_at = datetime.now(UTC)
         parsed = parse_claude_result(
             payload, observed_at=observed_at
         ) or parse_codex_event(payload, observed_at=observed_at)
         if parsed is None:
-            return
+            return None
         with self._lock:
             self._saw_malformed_usage = self._saw_malformed_usage or parsed.malformed
             if self._usage is None:
                 self._usage = parsed
-                return
+                return parsed
             current = self._usage
             usage = parsed if parsed.available else current
             snapshots = _merge_quota_snapshots(
@@ -721,6 +721,7 @@ class ProviderUsageObserver:
                 quota_unavailable_reason=quota_reason,
                 malformed=current.malformed or parsed.malformed,
             )
+        return parsed
 
 
 def _merge_quota_snapshots(

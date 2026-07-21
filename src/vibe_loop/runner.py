@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -743,6 +744,7 @@ class ActivityEvent:
     kind: str
     tool_id: str
     is_completion: bool
+    emitted_at: float | None = None
 
 
 def _string_id(value: object) -> str:
@@ -799,6 +801,48 @@ def _codex_activity_event(payload: Mapping[str, object]) -> ActivityEvent | None
     return None
 
 
+def _provider_stream_epoch(payload: Mapping[str, object]) -> float | None:
+    """Return a validated provider event timestamp when the stream supplies one."""
+    nested = payload.get("payload")
+    candidates = (payload, nested) if isinstance(nested, Mapping) else (payload,)
+    for event in candidates:
+        timestamp = event.get("timestamp")
+        if isinstance(timestamp, bool):
+            continue
+        if isinstance(timestamp, (int, float)):
+            value = float(timestamp)
+            if math.isfinite(value):
+                return value
+            continue
+        if not isinstance(timestamp, str):
+            continue
+        try:
+            parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                continue
+            value = parsed.timestamp()
+        except (OverflowError, OSError, ValueError):
+            continue
+        if math.isfinite(value):
+            return value
+    return None
+
+
+def _provider_stream_epoch_from_line(line: str) -> float | None:
+    text = line.strip()
+    if text.startswith("data:"):
+        text = text.removeprefix("data:").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _provider_stream_epoch(payload)
+
+
 def classify_post_report_event(line: str) -> ActivityEvent | None:
     """Parse a worker stream line into a structured tool/command event.
 
@@ -819,7 +863,10 @@ def classify_post_report_event(line: str) -> ActivityEvent | None:
         return None
     if not isinstance(payload, dict):
         return None
-    return _claude_activity_event(payload) or _codex_activity_event(payload)
+    event = _claude_activity_event(payload) or _codex_activity_event(payload)
+    if event is None:
+        return None
+    return dataclasses.replace(event, emitted_at=_provider_stream_epoch(payload))
 
 
 def classify_post_report_activity(line: str) -> str:
@@ -908,19 +955,40 @@ def worker_report_persistence_epoch(report: WorkerReport | None) -> float | None
 # persistence and the next watchdog poll, so a few thousand recent events is
 # ample; the cap bounds memory on a pathological pre-report burst.
 POST_REPORT_PENDING_BUFFER = 4096
+POST_REPORT_USAGE_HISTORY_BUFFER = 4096
+
+
+@dataclasses.dataclass(frozen=True)
+class _CumulativeUsageObservation:
+    epoch: float
+    order: int
+    usage: ProviderUsage
+
+
+def _usage_compatibility_key(
+    usage: ProviderUsage,
+) -> tuple[str, str, str, tuple[str, ...]]:
+    """Identify cumulative totals that can safely be subtracted from each other."""
+    return (
+        usage.provider,
+        usage.source,
+        usage.version,
+        tuple(sorted(usage.values)),
+    )
 
 
 class PostReportActivityMonitor:
     """Attributes a worker's post-terminal-report stream output.
 
-    Usage is observed across the whole stream so a cumulative snapshot is
-    available at the boundary. The report boundary is a wall-clock instant -- the
+    Usage is observed across the whole stream so a cumulative snapshot can be
+    selected at the boundary. The report boundary is a wall-clock instant -- the
     report's own persistence time -- not the moment the watchdog happens to
     notice it, so structured activity emitted after persistence but before the
-    watchdog polls is still attributed rather than lost (F1). Because the monitor
-    cannot know the boundary until ``mark_report_observed`` fires, it buffers
-    pre-mark structured events and reconciles them against the boundary at mark
-    time; activity that arrives after the mark is attributed live.
+    watchdog polls is still attributed rather than lost (F1). Provider timestamps
+    order delayed Claude/Codex stream delivery when available; malformed or
+    missing timestamps fall back to reader order. Because the monitor cannot know
+    the boundary until ``mark_report_observed`` fires, it buffers recent activity
+    and cumulative usage observations, then reconciles both against the boundary.
 
     A tool call that started before the boundary but only completes after it
     (including the worker's own ``vibe-loop report`` invocation and its result)
@@ -947,7 +1015,6 @@ class PostReportActivityMonitor:
         self._reported_at: float | None = None
         self._boundary_wall: float | None = None
         self._usage_observer = ProviderUsageObserver(provider)
-        self._baseline_usage_values: dict[str, int | float] = {}
         self._activity_kind = ""
         self._activity_count = 0
         # Wall time of the first observed start for each correlation id, used to
@@ -958,6 +1025,10 @@ class PostReportActivityMonitor:
         self._pending: deque[tuple[float, ActivityEvent]] = deque(
             maxlen=POST_REPORT_PENDING_BUFFER
         )
+        self._usage_history: deque[_CumulativeUsageObservation] = deque(
+            maxlen=POST_REPORT_USAGE_HISTORY_BUFFER
+        )
+        self._usage_observation_order = 0
 
     def mark_report_observed(
         self,
@@ -965,12 +1036,6 @@ class PostReportActivityMonitor:
         *,
         boundary_wall: float | None = None,
     ) -> None:
-        # Snapshot cumulative usage-so-far outside the monitor lock (the usage
-        # observer holds its own) so the post-report delta excludes the useful
-        # pre-report spend. ``boundary_wall`` is the report's persistence time;
-        # without it (unit callers, or an unparseable report timestamp) the mark
-        # instant is used, which only attributes activity seen after the mark.
-        baseline = dict(self._usage_observer.usage.values)
         with self._lock:
             if self._reported_at is not None:
                 return
@@ -978,7 +1043,6 @@ class PostReportActivityMonitor:
             self._boundary_wall = (
                 boundary_wall if boundary_wall is not None else self._wallclock()
             )
-            self._baseline_usage_values = baseline
             for wall, event in self._pending:
                 self._attribute_locked(wall, event)
             self._pending.clear()
@@ -989,15 +1053,42 @@ class PostReportActivityMonitor:
             return self._reported_at is not None
 
     def observe_line(self, line: str) -> None:
-        # Usage accrues over the whole run so the boundary snapshot is accurate;
-        # the observer holds its own lock, so call it outside the monitor lock to
-        # keep a single, consistent lock order.
-        self._usage_observer.observe_line(line)
+        # Usage accrues over the whole run. Retain each cumulative observation so
+        # a delayed boundary can select the last compatible total at or before
+        # persistence rather than copying a later total as a false zero baseline.
+        usage = self._usage_observer.observe_line(line)
         event = classify_post_report_event(line)
-        if event is None:
+        source_epoch = (
+            event.emitted_at
+            if event is not None
+            else _provider_stream_epoch_from_line(line)
+        )
+        observed_epoch: float | None = None
+        if usage is not None and usage.available:
+            observed_epoch = (
+                source_epoch if source_epoch is not None else self._wallclock()
+            )
+        if event is None and observed_epoch is None:
             return
-        wall = self._wallclock()
+        wall = (
+            event.emitted_at
+            if event is not None and event.emitted_at is not None
+            else observed_epoch
+            if observed_epoch is not None
+            else self._wallclock()
+        )
         with self._lock:
+            if usage is not None and usage.available:
+                self._usage_observation_order += 1
+                self._usage_history.append(
+                    _CumulativeUsageObservation(
+                        observed_epoch if observed_epoch is not None else wall,
+                        self._usage_observation_order,
+                        usage,
+                    )
+                )
+            if event is None:
+                return
             if event.tool_id and not event.is_completion:
                 self._start_wall.setdefault(event.tool_id, wall)
             if self._boundary_wall is None:
@@ -1028,22 +1119,40 @@ class PostReportActivityMonitor:
     def _post_report_usage(
         self,
         reported: bool,
-        baseline: Mapping[str, int | float],
+        boundary_wall: float | None,
+        history: tuple[_CumulativeUsageObservation, ...],
         final: ProviderUsage,
     ) -> ProviderUsage:
         if not reported:
             return unavailable_usage(self._provider, "post_report_boundary_not_reached")
         if not final.available:
             return final
-        if not baseline:
-            # No usage was observed before the boundary, so the only signal is an
-            # end-of-run cumulative total that covers the whole run rather than
-            # just teardown. Attributing it all to the post-report window would
-            # overstate teardown burn, so decline to attribute (F5).
+        if boundary_wall is None:
+            return unavailable_usage(self._provider, "post_report_boundary_not_reached")
+        before_boundary = tuple(
+            observation for observation in history if observation.epoch <= boundary_wall
+        )
+        if not before_boundary:
+            # The only comparable signal is an end-of-run cumulative total that
+            # covers the whole run. Attributing it all to teardown would overstate
+            # post-report spend, so decline to attribute (F5).
             return unavailable_usage(
                 self._provider, "post_report_usage_end_only_cumulative"
             )
-        return _post_report_usage_delta(baseline, final)
+        compatible = tuple(
+            observation
+            for observation in before_boundary
+            if _usage_compatibility_key(observation.usage)
+            == _usage_compatibility_key(final)
+        )
+        if not compatible:
+            return unavailable_usage(
+                self._provider, "post_report_usage_incompatible_cumulative"
+            )
+        baseline = max(
+            compatible, key=lambda observation: (observation.epoch, observation.order)
+        )
+        return _post_report_usage_delta(baseline.usage.values, final)
 
     def snapshot(
         self,
@@ -1052,17 +1161,24 @@ class PostReportActivityMonitor:
         identity_verified: bool = False,
         until: float | None = None,
     ) -> PostReportActivity:
-        final_usage = self._usage_observer.usage
         with self._lock:
             reported = self._reported_at is not None
-            baseline = dict(self._baseline_usage_values)
+            boundary_wall = self._boundary_wall
+            history = tuple(self._usage_history)
             activity_kind = self._activity_kind
             activity_count = self._activity_count
             seconds = 0.0
             if reported:
                 end = until if until is not None else self._monotonic()
                 seconds = max(0.0, end - self._reported_at)
-        usage = self._post_report_usage(reported, baseline, final_usage)
+        final_usage = (
+            max(
+                history, key=lambda observation: (observation.epoch, observation.order)
+            ).usage
+            if history
+            else self._usage_observer.usage
+        )
+        usage = self._post_report_usage(reported, boundary_wall, history, final_usage)
         return PostReportActivity(
             reported=reported,
             seconds=seconds,

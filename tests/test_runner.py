@@ -4926,6 +4926,57 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.violation)
         self.assertEqual(monitor.snapshot().activity_count, 0)
 
+    def test_delayed_claude_report_tool_start_uses_provider_timestamp(self) -> None:
+        # The report command started before persistence but the reader did not
+        # consume its Claude stream-json line until after the watchdog boundary.
+        # Its provider timestamp, rather than reader delay, keeps it benign.
+        monitor = PostReportActivityMonitor("anthropic", wallclock=lambda: 150.0)
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": 90.0,
+                    "message": {
+                        "content": [
+                            {"type": "tool_use", "id": "report", "name": "Bash"}
+                        ]
+                    },
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        self.assertFalse(monitor.violation)
+
+    def test_delayed_codex_report_item_uses_provider_timestamp(self) -> None:
+        monitor = PostReportActivityMonitor("openai", wallclock=lambda: 150.0)
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "timestamp": "1970-01-01T00:01:30+00:00",
+                    "type": "item.started",
+                    "item": {"type": "command_execution", "id": "report"},
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        self.assertFalse(monitor.violation)
+
+    def test_malformed_provider_timestamp_falls_back_to_reader_order(self) -> None:
+        monitor = PostReportActivityMonitor("anthropic", wallclock=lambda: 150.0)
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "timestamp": "not-a-timestamp",
+                    "message": {
+                        "content": [{"type": "tool_use", "id": "fresh", "name": "Bash"}]
+                    },
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        self.assertTrue(monitor.violation)
+
     def test_fresh_post_boundary_tool_start_is_a_violation(self) -> None:
         wall = FakeMonotonicClock([150.0])
         monitor = PostReportActivityMonitor("anthropic", wallclock=wall)
@@ -4952,6 +5003,115 @@ class PostReportActivityMonitorTests(unittest.TestCase):
         self.assertFalse(usage.available)
         self.assertEqual(
             usage.unavailable_reason, "post_report_usage_end_only_cumulative"
+        )
+
+    def test_delayed_claude_usage_uses_pre_boundary_cumulative_baseline(self) -> None:
+        # Both lines reach the reader after persistence. The later cumulative
+        # total must subtract the timestamped pre-boundary total, not itself.
+        monitor = PostReportActivityMonitor("anthropic")
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "timestamp": 90.0,
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                }
+            )
+        )
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "timestamp": 110.0,
+                    "usage": {"input_tokens": 140, "output_tokens": 15},
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        usage = monitor.snapshot().usage
+        self.assertTrue(usage.available)
+        self.assertEqual(usage.values["input_tokens"], 40)
+        self.assertEqual(usage.values["output_tokens"], 5)
+
+    def test_delayed_codex_usage_uses_pre_boundary_cumulative_baseline(self) -> None:
+        monitor = PostReportActivityMonitor("openai")
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "timestamp": "1970-01-01T00:01:30+00:00",
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                }
+            )
+        )
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "timestamp": "1970-01-01T00:01:50+00:00",
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 130, "output_tokens": 20},
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        usage = monitor.snapshot().usage
+        self.assertTrue(usage.available)
+        self.assertEqual(usage.values["input_tokens"], 30)
+        self.assertEqual(usage.values["output_tokens"], 10)
+
+    def test_usage_order_uses_provider_timestamp_not_reader_consumption(self) -> None:
+        # A delayed pre-report line can arrive after a post-report cumulative
+        # total. The logical final total is still the later provider timestamp.
+        monitor = PostReportActivityMonitor("anthropic")
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "timestamp": 110.0,
+                    "usage": {"input_tokens": 140, "output_tokens": 15},
+                }
+            )
+        )
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "timestamp": 90.0,
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        usage = monitor.snapshot().usage
+        self.assertTrue(usage.available)
+        self.assertEqual(usage.values["input_tokens"], 40)
+        self.assertEqual(usage.values["output_tokens"], 5)
+
+    def test_incompatible_usage_history_is_not_subtracted(self) -> None:
+        monitor = PostReportActivityMonitor("anthropic")
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "type": "result",
+                    "timestamp": 90.0,
+                    "usage": {"input_tokens": 100, "output_tokens": 10},
+                }
+            )
+        )
+        monitor.observe_line(
+            json.dumps(
+                {
+                    "timestamp": 110.0,
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 130, "output_tokens": 20},
+                }
+            )
+        )
+        monitor.mark_report_observed(boundary_wall=100.0)
+        usage = monitor.snapshot().usage
+        self.assertFalse(usage.available)
+        self.assertEqual(
+            usage.unavailable_reason, "post_report_usage_incompatible_cumulative"
         )
 
     def test_report_persistence_epoch_parses_reported_at(self) -> None:

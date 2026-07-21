@@ -45,20 +45,24 @@ finalization/next-task dispatch still waits for the worker process to exit.
 The boundary is the report's own persistence instant, not the moment the
 supervisor's poll notices it, so structured activity emitted after persistence
 but before that poll — including a worker that reports, acts, and exits inside a
-single poll window — is buffered and attributed rather than lost. A tool call
-that started before the boundary and only completes after it (the worker's own
-`vibe-loop report` invocation and its result included) is correlated by call id
-and not counted as fresh post-report activity; only genuinely new post-report
-tool starts, and completions with no observed start, are violations.
+single poll window — is buffered and attributed rather than lost. Valid provider
+timestamps order delayed Claude stream-json and Codex JSON delivery against that
+instant; malformed or missing timestamps conservatively fall back to reader
+order. A tool call that started before the boundary and only completes after it
+(the worker's own `vibe-loop report` invocation and its result included) is
+correlated by call id and not counted as fresh post-report activity; only
+genuinely new post-report tool starts, and completions with no observed start,
+are violations.
 
 Post-report elapsed time and attributable provider usage are recorded separately
 from the useful implementation/review spend so quota diagnostics can isolate
 teardown burn; because provider usage events carry cumulative totals, the
-attributable post-report usage is the delta from the cumulative snapshot taken at
-the boundary, not the raw event. When the only usage signal is an end-of-run
-cumulative total emitted after the report — with no boundary snapshot to subtract
-— the post-report usage is left unavailable rather than mislabeling the whole
-run as teardown burn. The wrapper stays compatible with Codex JSON and
+attributable post-report usage is the delta from the last compatible cumulative
+total ordered at or before the boundary, not the raw event. Provider and usage
+shape must match; incompatible totals are never combined. When the only usage
+signal is an end-of-run cumulative total emitted after the report — with no
+comparable boundary total to subtract — the post-report usage is left unavailable
+rather than mislabeling the whole run as teardown burn. The wrapper stays compatible with Codex JSON and
 Claude stream-json, including a worker that exits immediately after reporting and
 one that emits a short final text summary.
 
