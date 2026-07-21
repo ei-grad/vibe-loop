@@ -665,6 +665,20 @@ zero — even against an unset companion that keeps its positive default — is
 refused. With the 8 GiB byte floor above, a sample of 3.4 GiB free on a 242 GiB
 volume blocks launch even though the native 512 MiB floor would record it as
 `ok`.
+
+Each cycle also records a native "what landed" git-log summary even when no
+`summary_command` is configured. It reads the previous cycle's recorded `main`
+ref (the status carries only the current ref, so the span comes from the prior
+`autopilot_cycle` record's `git.main_head`) and journals the commits merged into
+`main` since then as one `autopilot_cycle_summary` record plus a
+`cycle_summary:landed|unchanged|bootstrap|unavailable:<count>` action tag. The
+commit list is bounded (newest first, subjects truncated); a truncated span
+appends `+` to the count. The step is read-only and never mutates the
+repository. The first cycle has no prior recorded ref and records an empty
+`bootstrap` summary rather than walking all of history, and an unresolved
+current ref records an `unavailable` summary; neither fails the cycle. A
+configured `summary_command` still runs alongside this native summary.
+
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, an unavailable agent command, or exhausted disk/inode capacity. `--once` runs one cycle. Without `--interval`, it drains runnable

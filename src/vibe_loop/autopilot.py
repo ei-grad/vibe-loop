@@ -72,6 +72,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
     AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
@@ -3671,6 +3672,230 @@ def run_disk_health(
     )
 
 
+# Native "what landed" git-log summary (PRD-AUT-011/012). A configuration-free
+# loop summarizes the commits merged into ``main`` since the previous cycle
+# without requiring a project ``summary_command``. The span is the previous
+# cycle's recorded ``main`` ref (read from the prior ``autopilot_cycle`` record)
+# to the current ``main`` ref from status. The step is read-only: it runs
+# ``git log`` and never mutates the repository.
+LANDED_SUMMARY_MAX_COMMITS = 50
+# Commit subjects are journaled verbatim up to this length; longer subjects are
+# truncated so a single pathological commit message cannot bloat the record.
+LANDED_SUMMARY_SUBJECT_LIMIT = 200
+LANDED_SUMMARY_FIELD_SEP = "\x1f"
+LANDED_SUMMARY_ACTION_PREFIX = "cycle_summary:"
+CYCLE_SUMMARY_BOOTSTRAP = "bootstrap"
+CYCLE_SUMMARY_LANDED = "landed"
+CYCLE_SUMMARY_UNCHANGED = "unchanged"
+CYCLE_SUMMARY_UNAVAILABLE = "unavailable"
+
+
+@dataclasses.dataclass(frozen=True)
+class LandedCommit:
+    """One commit that landed on ``main`` between two cycle refs."""
+
+    commit: str
+    subject: str
+
+    def to_json(self) -> dict[str, object]:
+        return {"commit": self.commit, "subject": self.subject}
+
+
+@dataclasses.dataclass(frozen=True)
+class CycleLandedSummaryResult:
+    """Outcome of one cycle's native "what landed" git-log summary.
+
+    Mirrors the maintenance-command-result record shape: a single typed
+    ``autopilot_cycle_summary`` record carries the derived span and bounded
+    per-commit evidence. The step is non-blocking and never mutates the
+    repository; ``bootstrap`` marks the first cycle (no prior recorded ref) and
+    ``error`` marks an unreadable span, both of which record rather than fail.
+    """
+
+    cycle_id: str
+    since_ref: str
+    until_ref: str
+    commits: tuple[LandedCommit, ...] = ()
+    truncated: bool = False
+    bootstrap: bool = False
+    error: str = ""
+
+    @property
+    def status(self) -> str:
+        if self.error:
+            return CYCLE_SUMMARY_UNAVAILABLE
+        if self.bootstrap:
+            return CYCLE_SUMMARY_BOOTSTRAP
+        if self.commits:
+            return CYCLE_SUMMARY_LANDED
+        return CYCLE_SUMMARY_UNCHANGED
+
+    @property
+    def commit_count(self) -> int:
+        return len(self.commits)
+
+    @property
+    def action(self) -> str:
+        # A trailing ``+`` marks a bounded, truncated span so a reader can tell
+        # "50 commits" from "at least 50 commits".
+        suffix = "+" if self.truncated else ""
+        return (
+            f"{LANDED_SUMMARY_ACTION_PREFIX}{self.status}:{self.commit_count}{suffix}"
+        )
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "since_ref": self.since_ref,
+            "until_ref": self.until_ref,
+            "commit_count": self.commit_count,
+            "truncated": self.truncated,
+            "bootstrap": self.bootstrap,
+            "error": self.error,
+            "commits": [commit.to_json() for commit in self.commits],
+        }
+
+
+# Reads the commits reachable from ``until_ref`` but not ``since_ref``. Defaults
+# to ``git log``; injected in tests so acceptance never depends on real history.
+GitLandedProbe = Callable[..., tuple[tuple[LandedCommit, ...], bool, str]]
+
+
+def git_landed_commits(
+    repo: Path,
+    *,
+    since_ref: str,
+    until_ref: str,
+    max_commits: int,
+) -> tuple[tuple[LandedCommit, ...], bool, str]:
+    """Commits on ``since_ref..until_ref``, newest first, bounded and read-only.
+
+    Requests one commit over ``max_commits`` so truncation is detectable without
+    a second call. Returns ``(commits, truncated, error)``; a git failure (an
+    unknown or rewritten ref) yields an empty tuple and the error text rather
+    than raising, so the cycle records an unavailable span instead of aborting.
+    """
+
+    output, error = git_text(
+        repo,
+        "log",
+        "--no-color",
+        f"--max-count={max_commits + 1}",
+        f"--format=%H{LANDED_SUMMARY_FIELD_SEP}%s",
+        f"{since_ref}..{until_ref}",
+    )
+    if error:
+        return (), False, error
+    commits: list[LandedCommit] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        commit_hash, _sep, subject = line.partition(LANDED_SUMMARY_FIELD_SEP)
+        commits.append(
+            LandedCommit(
+                commit=commit_hash[:12],
+                subject=subject.strip()[:LANDED_SUMMARY_SUBJECT_LIMIT],
+            )
+        )
+    truncated = len(commits) > max_commits
+    return tuple(commits[:max_commits]), truncated, ""
+
+
+CycleSummaryRunner = Callable[..., CycleLandedSummaryResult]
+
+
+def latest_cycle_main_ref(run_store: RunStore) -> str | None:
+    """The ``main`` ref recorded by the most recent ``autopilot_cycle`` record.
+
+    The cycle status carries only the current ref, so the previous cycle's ref
+    is read from its journaled ``git.main_head``. Returns ``None`` when no prior
+    cycle exists (the first cycle); an empty string when a prior cycle exists but
+    its record lacks a resolved main head. The two are deliberately distinct: the
+    first is a bootstrap, the second an unavailable prior endpoint.
+    """
+
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_CYCLE_RECORD_TYPE:
+            continue
+        git = record.get("git")
+        if isinstance(git, dict):
+            return str(git.get("main_head") or "")
+        return ""
+    return None
+
+
+def run_cycle_summary(
+    config: VibeConfig,
+    *,
+    cycle_id: str,
+    prior_main_ref: str | None,
+    current_main_ref: str,
+    max_commits: int = LANDED_SUMMARY_MAX_COMMITS,
+    git_landed: GitLandedProbe = git_landed_commits,
+) -> CycleLandedSummaryResult:
+    """Summarize commits merged into ``main`` since the previous cycle.
+
+    Read-only: derives the span from the previous cycle's recorded ``main`` ref
+    to the current one and journals a bounded commit summary. The first cycle
+    (``prior_main_ref is None``) records a bootstrap summary regardless of the
+    current ref, since there is no span to derive; an unresolved current ref, or
+    a prior cycle whose recorded endpoint is empty, records an unavailable
+    summary. None of these fail the cycle (PRD-AUT-006/011/012).
+    """
+
+    # The first cycle has no span to derive, so it bootstraps even when the
+    # current ref cannot be resolved: the acceptance ties bootstrap to the
+    # absence of a prior recorded ref, not to current-ref availability.
+    if prior_main_ref is None:
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref="",
+            until_ref=current_main_ref,
+            bootstrap=True,
+        )
+    if not current_main_ref:
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref=prior_main_ref,
+            until_ref=current_main_ref,
+            error="main_ref_unavailable",
+        )
+    if not prior_main_ref:
+        # A prior cycle exists but recorded no resolved endpoint, so no span can
+        # be derived even though the current ref resolved.
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref=prior_main_ref,
+            until_ref=current_main_ref,
+            error="prior_main_ref_unavailable",
+        )
+    if prior_main_ref == current_main_ref:
+        return CycleLandedSummaryResult(
+            cycle_id=cycle_id,
+            since_ref=prior_main_ref,
+            until_ref=current_main_ref,
+        )
+    commits, truncated, error = git_landed(
+        config.repo,
+        since_ref=prior_main_ref,
+        until_ref=current_main_ref,
+        max_commits=max_commits,
+    )
+    return CycleLandedSummaryResult(
+        cycle_id=cycle_id,
+        since_ref=prior_main_ref,
+        until_ref=current_main_ref,
+        commits=commits,
+        truncated=truncated,
+        error=error,
+    )
+
+
 # Returns the parsed JSON decision payload (or ``None``) for a disposition
 # prompt. Defaults to ``VibeRunner.run_analysis_agent`` (PRD-AUT-009); injected
 # in tests so the read-only analysis agent never runs as a real subprocess.
@@ -4827,6 +5052,7 @@ def execute_autopilot_cycle(
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     disk_health_runner: DiskHealthRunner = run_disk_health,
+    cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
@@ -4882,6 +5108,18 @@ def execute_autopilot_cycle(
     actions.append(f"disk_health:{disk_health.status}")
     if disk_health.probe_errors:
         actions.append(f"disk_health_probe_errors:{disk_health.probe_errors}")
+
+    # Read-only "what landed" summary: the span is the previous cycle's recorded
+    # main ref to the current one. Runs unconditionally and never blocks; the
+    # prior ref is read before this cycle's record is journaled.
+    cycle_summary = cycle_summary_runner(
+        config,
+        cycle_id=cycle_id,
+        prior_main_ref=latest_cycle_main_ref(run_store),
+        current_main_ref=status.git.main_head,
+    )
+    run_store.append_record(cycle_summary.to_record(config.repo))
+    actions.append(cycle_summary.action)
 
     blocker_list = list(status.blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
@@ -5637,6 +5875,7 @@ def run_autopilot(
     maintenance_runner: MaintenanceRunner = run_maintenance_command,
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     disk_health_runner: DiskHealthRunner = run_disk_health,
+    cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     idle_waiter: Callable[..., IdleWaitResult] = wait_for_idle_change,
     idle_wake_command_runner: Callable[..., dict[str, object] | None] = (
@@ -5803,6 +6042,7 @@ def run_autopilot(
                 maintenance_runner=maintenance_runner,
                 worktree_disposition_runner=worktree_disposition_runner,
                 disk_health_runner=disk_health_runner,
+                cycle_summary_runner=cycle_summary_runner,
                 native_planning_runner=native_planning_runner,
             )
             idle_wait_seconds = interval

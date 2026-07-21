@@ -20,9 +20,18 @@ from vibe_loop.autopilot import (
     DISK_HEALTH_CRITICAL,
     DISK_HEALTH_OK,
     AutopilotCycleResult,
+    CYCLE_SUMMARY_BOOTSTRAP,
+    CYCLE_SUMMARY_LANDED,
+    CYCLE_SUMMARY_UNAVAILABLE,
+    CYCLE_SUMMARY_UNCHANGED,
     DiskCapacitySample,
     DiskHealthCycleResult,
+    LANDED_SUMMARY_MAX_COMMITS,
+    LandedCommit,
     disk_health_thresholds_for,
+    git_landed_commits,
+    latest_cycle_main_ref,
+    run_cycle_summary,
     run_disk_health,
     statvfs_capacity_probe,
     AutopilotTerminationRequested,
@@ -105,6 +114,7 @@ from vibe_loop.locks import (
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
     AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
@@ -6595,6 +6605,262 @@ class DiskHealthCycleTests(unittest.TestCase):
         self.assertEqual(len(launched), 1)
         self.assertEqual(len(disk_records), 1)
         self.assertEqual(disk_records[0]["status"], DISK_HEALTH_OK)
+
+
+class CycleSummaryUnitTests(unittest.TestCase):
+    def _config(self, repo: Path):
+        configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+        return load_config(repo)
+
+    def test_bootstrap_when_no_prior_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+
+            def git_landed(*a, **k):  # pragma: no cover - must not be called
+                raise AssertionError("bootstrap must not walk history")
+
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref=None,
+                current_main_ref="deadbeef",
+                git_landed=git_landed,
+            )
+
+        self.assertTrue(result.bootstrap)
+        self.assertEqual(result.status, CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertEqual(result.commit_count, 0)
+        self.assertEqual(result.action, "cycle_summary:bootstrap:0")
+
+    def test_bootstrap_wins_over_unresolvable_current_ref_on_first_cycle(self) -> None:
+        # First cycle (no prior recorded ref) where the current main ref also
+        # cannot be resolved: the acceptance ties bootstrap to the absence of a
+        # prior ref, so it must record bootstrap rather than unavailable.
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref=None,
+                current_main_ref="",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertTrue(result.bootstrap)
+        self.assertEqual(result.error, "")
+
+    def test_prior_cycle_with_empty_ref_is_unavailable_not_bootstrap(self) -> None:
+        # A prior cycle exists but recorded no resolved endpoint (git was
+        # unavailable then). With the current ref now resolved, the span cannot
+        # be derived, so this is unavailable, not a mislabeled bootstrap.
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c2",
+                prior_main_ref="",
+                current_main_ref="new",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNAVAILABLE)
+        self.assertFalse(result.bootstrap)
+        self.assertEqual(result.error, "prior_main_ref_unavailable")
+
+    def test_unavailable_when_current_ref_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="cafe",
+                current_main_ref="",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNAVAILABLE)
+        self.assertEqual(result.error, "main_ref_unavailable")
+
+    def test_unchanged_when_refs_equal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="samesha",
+                current_main_ref="samesha",
+                git_landed=lambda *a, **k: (_ for _ in ()).throw(AssertionError),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNCHANGED)
+        self.assertEqual(result.commit_count, 0)
+
+    def test_landed_records_bounded_commit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            captured: dict[str, object] = {}
+
+            def git_landed(repo, *, since_ref, until_ref, max_commits):
+                captured.update(
+                    since_ref=since_ref, until_ref=until_ref, max_commits=max_commits
+                )
+                return (
+                    (LandedCommit("abc123", "add thing"),),
+                    False,
+                    "",
+                )
+
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="old",
+                current_main_ref="new",
+                git_landed=git_landed,
+            )
+
+        self.assertEqual(captured["since_ref"], "old")
+        self.assertEqual(captured["until_ref"], "new")
+        self.assertEqual(captured["max_commits"], LANDED_SUMMARY_MAX_COMMITS)
+        self.assertEqual(result.status, CYCLE_SUMMARY_LANDED)
+        self.assertEqual(result.action, "cycle_summary:landed:1")
+        record = result.to_record(config.repo)
+        self.assertEqual(record["record_type"], AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE)
+        self.assertEqual(record["since_ref"], "old")
+        self.assertEqual(record["until_ref"], "new")
+        self.assertEqual(
+            record["commits"], [{"commit": "abc123", "subject": "add thing"}]
+        )
+
+    def test_truncation_marks_action_and_bounds_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="old",
+                current_main_ref="new",
+                git_landed=lambda *a, **k: (
+                    (LandedCommit("a", "x"), LandedCommit("b", "y")),
+                    True,
+                    "",
+                ),
+            )
+
+        self.assertTrue(result.truncated)
+        self.assertEqual(result.action, "cycle_summary:landed:2+")
+
+    def test_git_error_records_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = self._config(Path(directory))
+            result = run_cycle_summary(
+                config,
+                cycle_id="c1",
+                prior_main_ref="rewritten",
+                current_main_ref="new",
+                git_landed=lambda *a, **k: ((), False, "fatal: bad revision"),
+            )
+
+        self.assertEqual(result.status, CYCLE_SUMMARY_UNAVAILABLE)
+        self.assertEqual(result.error, "fatal: bad revision")
+
+    def test_default_probe_reads_real_commits_and_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            (repo / "f.txt").write_text("0\n", encoding="utf-8")
+            run(repo, "git", "add", "f.txt")
+            run(repo, "git", "commit", "-m", "base")
+            base = git_text(repo, "rev-parse", "HEAD")
+            for index in range(3):
+                (repo / "f.txt").write_text(f"line {index}\n", encoding="utf-8")
+                run(repo, "git", "commit", "-am", f"change {index}")
+            head = git_text(repo, "rev-parse", "HEAD")
+
+            commits, truncated, error = git_landed_commits(
+                repo, since_ref=base, until_ref=head, max_commits=2
+            )
+
+        self.assertEqual(error, "")
+        self.assertTrue(truncated)
+        self.assertEqual(len(commits), 2)
+        # Newest first.
+        self.assertEqual(commits[0].subject, "change 2")
+
+
+class CycleSummaryCycleTests(unittest.TestCase):
+    def _summary_records(self, config) -> list[dict[str, object]]:
+        return [
+            record
+            for record in RunStore(config.state_path / "runs.jsonl").read_records()
+            if record["record_type"] == AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE
+        ]
+
+    def test_first_cycle_records_bootstrap_without_config(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 0,
+            )
+            records = self._summary_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertIn("cycle_summary:bootstrap:0", cycle.actions)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["status"], CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertTrue(records[0]["bootstrap"])
+
+    def test_second_cycle_summarizes_commits_landed_since_first(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            calls: list[int] = []
+
+            def launcher(*a, **k):
+                # Land a distinct commit on main only on the first dispatch, so
+                # the second cycle sees exactly one commit landed since cycle 1.
+                calls.append(1)
+                if len(calls) == 1:
+                    (repo / "landed.txt").write_text("done\n", encoding="utf-8")
+                    run(repo, "git", "add", "landed.txt")
+                    run(repo, "git", "commit", "-m", "land the slice")
+                return 0
+
+            summary = run_autopilot(
+                config,
+                once=False,
+                max_cycles=2,
+                interval=0,
+                launcher=launcher,
+            )
+            records = self._summary_records(config)
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["status"], CYCLE_SUMMARY_BOOTSTRAP)
+        self.assertEqual(records[1]["status"], CYCLE_SUMMARY_LANDED)
+        self.assertEqual(records[1]["commit_count"], 1)
+        self.assertEqual(records[1]["commits"][0]["subject"], "land the slice")
+        self.assertIn("cycle_summary:landed:1", summary.cycles[1].actions)
+
+    def test_latest_cycle_main_ref_reads_prior_record(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self.assertIsNone(latest_cycle_main_ref(run_store))
+
+            run_autopilot(config, once=True, launcher=lambda *a, **k: 0)
+            head = git_text(repo, "rev-parse", "--verify", "refs/heads/main")
+
+            self.assertEqual(latest_cycle_main_ref(run_store), head)
 
 
 class PlanningSourceFingerprintTests(unittest.TestCase):

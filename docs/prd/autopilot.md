@@ -648,7 +648,11 @@ The native generic cycle must provide repository-agnostic defaults for these
 behaviors while preserving the non-destructive recovery boundary
 (`PRD-AUT-006`): native report-only worktree disposition with an explicit reaping
 opt-in (`PRD-AUT-010`), native disk-health
-checks, a native "what landed" git-log summary, native troubleshoot detection
+checks, a native "what landed" git-log summary that derives the commit span
+from the previous cycle's recorded `main` ref (read from the prior
+`autopilot_cycle` record, since status carries only the current ref) to the
+current `main` ref and journals a bounded, read-only `autopilot_cycle_summary`
+record, native troubleshoot detection
 derived from `runs.jsonl`, and native planning that invokes the configured agent
 rather than requiring a separate `planning_command` script. Native planning is
 split into two stages: the read-only analysis runner decides whether and what to
