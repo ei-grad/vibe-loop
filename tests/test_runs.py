@@ -377,6 +377,53 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(payload["details"]["nested"]["actual_token"], "<redacted>")
         self.assertEqual(payload["details"]["lock_path"], "/safe/lock/path")
 
+    def test_worker_report_redacts_active_token_from_unlabelled_fields(self) -> None:
+        token = "report-generation-7"
+        report = WorkerReport(
+            run_id="run-1",
+            task_id="TASK-01",
+            status="blocked",
+            message=f"backend returned {token}",
+            metadata={
+                "detail": f"VIBE_LOOP_FENCING_TOKEN={token}",
+                "substring": "report-generation-",
+                "unrelated": "report-generation-70",
+            },
+            fencing_token=token,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+
+            RunStore(path).append_report(report)
+
+            raw = path.read_text(encoding="utf-8")
+            payload = json.loads(raw)
+
+        self.assertNotIn(f'"{token}"', raw)
+        self.assertEqual(payload["message"], "backend returned <redacted>")
+        self.assertEqual(
+            payload["metadata"]["detail"],
+            "VIBE_LOOP_FENCING_TOKEN=<redacted>",
+        )
+        self.assertEqual(payload["metadata"]["substring"], "report-generation-")
+        self.assertEqual(payload["metadata"]["unrelated"], "report-generation-70")
+
+    def test_worker_report_preserves_legacy_positional_reported_at(self) -> None:
+        reported_at = "2026-05-09T00:00:30+00:00"
+
+        report = WorkerReport(
+            "run-1",
+            "TASK-01",
+            "blocked",
+            "abc123",
+            "waiting",
+            {"reason": "external"},
+            reported_at,
+        )
+
+        self.assertEqual(report.reported_at, reported_at)
+        self.assertEqual(report.fencing_token, "")
+
     def test_run_started_event_writes_trailer_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "runs.jsonl"

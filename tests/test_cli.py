@@ -625,6 +625,8 @@ class CliTests(unittest.TestCase):
         self.assertIn("vibe-loop main-integration release", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_RUN_ID", CLI_WORKER_ADDENDUM)
         self.assertIn("VIBE_LOOP_TASK_ID", CLI_WORKER_ADDENDUM)
+        self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", CLI_WORKER_ADDENDUM)
+        self.assertIn("Never print or echo its value", CLI_WORKER_ADDENDUM)
 
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4368,6 +4370,65 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["metadata"]["owner"], "run-1")
         self.assertNotIn(expected_token, rendered)
         self.assertNotIn(actual_token, rendered)
+
+    def test_report_redacts_active_token_from_message_metadata_and_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            task_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata={
+                    "record_type": "active_run",
+                    "schema_version": 1,
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "pid": os.getpid(),
+                    "worker_pid": os.getpid(),
+                    "host": socket.gethostname(),
+                    "started_at": "2026-05-09T00:00:00+00:00",
+                },
+            )
+            token = str(task_lock.metadata["fencing_token"])
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(
+                        [
+                            "report",
+                            "--repo",
+                            str(repo),
+                            "--run-id",
+                            "run-1",
+                            "--task-id",
+                            "TASK-01",
+                            "--status",
+                            "blocked",
+                            "--message",
+                            f"worker printed token={token}",
+                            "--metadata-json",
+                            json.dumps(
+                                {
+                                    "ordinary": f"active token {token}",
+                                    "identifier": "TASK-01",
+                                }
+                            ),
+                        ]
+                    )
+
+            stored = (repo / ".vibe-loop" / "runs.jsonl").read_text(encoding="utf-8")
+            payload = json.loads(stdout.getvalue())
+            stored_payload = json.loads(stored)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(payload["message"], "worker printed token=<redacted>")
+        self.assertEqual(payload["metadata"]["ordinary"], "active token <redacted>")
+        self.assertEqual(payload["metadata"]["identifier"], "TASK-01")
+        self.assertEqual(stored_payload["message"], payload["message"])
+        self.assertEqual(stored_payload["metadata"], payload["metadata"])
 
     def test_report_resolves_head_commit_ref(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -1256,6 +1257,67 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertEqual(
             len({identity for _command, _environment, identity in calls}), 3
         )
+
+    def test_command_task_source_redacts_active_token_from_json_output(self) -> None:
+        token = "1"
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "id": "TASK-1",
+                            "status": "Next",
+                            "title": f"leaked {token}",
+                            "acceptance": "source-generation-",
+                            "priority": 1,
+                        }
+                    ]
+                ),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(type="command", list_command="list-tasks"),
+                runtime_context={"VIBE_LOOP_FENCING_TOKEN": token},
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                task = source.list_tasks()[0]
+
+        self.assertEqual(task.title, "leaked <redacted>")
+        self.assertEqual(task.acceptance, "source-generation-")
+        self.assertEqual(task.task_id, "TASK-1")
+        self.assertEqual(task.priority, "1")
+
+    def test_command_task_source_redacts_active_token_from_errors(self) -> None:
+        token = "source-generation-5"
+
+        def fail_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            raise subprocess.CalledProcessError(
+                7,
+                f"backend --generation {token}",
+                output=f"stdout token={token}",
+                stderr=f"stderr token={token}".encode(),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(type="command", list_command="list-tasks"),
+                runtime_context={"VIBE_LOOP_FENCING_TOKEN": token},
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fail_run):
+                with self.assertRaises(subprocess.CalledProcessError) as caught:
+                    source.list_tasks()
+
+        error = caught.exception
+        self.assertNotIn(token, str(error))
+        self.assertEqual(error.output, "stdout token=<redacted>")
+        self.assertEqual(error.stderr, b"stderr token=<redacted>")
 
     def test_command_task_source_surfaces_timeout_as_subprocess_error(self) -> None:
         # A hung backend command expires as TimeoutExpired — a SubprocessError

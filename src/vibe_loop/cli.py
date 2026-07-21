@@ -944,6 +944,7 @@ def dispatch(args: argparse.Namespace) -> int:
             commit=resolve_report_commit(config.repo, args.commit),
             message=args.message,
             metadata=parse_metadata_json(args.metadata_json),
+            fencing_token=fencing_token_from_args(args),
         )
         RunStore(config.state_path / "runs.jsonl").append_report(report)
         print(json.dumps(report.to_json(), indent=2))

@@ -14,6 +14,50 @@ from unittest.mock import Mock, patch
 from vibe_loop import locks
 
 
+class FencingTokenRedactionTests(unittest.TestCase):
+    def test_exact_token_redaction_preserves_substrings_and_identifiers(self) -> None:
+        token = "generation-3"
+        payload = {
+            "standalone": token,
+            "labelled": f"VIBE_LOOP_FENCING_TOKEN={token}",
+            "substring": "generation-",
+            "longer_identifier": "generation-30",
+            "short_generation_identifier": "TASK-03",
+            token: [token.encode("utf-8")],
+        }
+
+        redacted = locks.redact_exact_fencing_token(payload, token)
+
+        self.assertEqual(redacted["standalone"], "<redacted>")
+        self.assertEqual(redacted["labelled"], "VIBE_LOOP_FENCING_TOKEN=<redacted>")
+        self.assertEqual(redacted["substring"], "generation-")
+        self.assertEqual(redacted["longer_identifier"], "generation-30")
+        self.assertEqual(redacted["short_generation_identifier"], "TASK-03")
+        self.assertEqual(redacted["<redacted>"], [b"<redacted>"])
+
+    def test_single_digit_token_does_not_redact_digits_inside_identifiers(self) -> None:
+        self.assertEqual(
+            locks.redact_fencing_token_text("token=1 TASK-01 run-1", "1"),
+            "token=<redacted> TASK-01 run-1",
+        )
+
+    def test_exact_token_redaction_accepts_colon_and_slash_delimiters(self) -> None:
+        self.assertEqual(
+            locks.redact_fencing_token_text(
+                "token:generation-3 path/generation-3",
+                "generation-3",
+            ),
+            "token:<redacted> path/<redacted>",
+        )
+        self.assertEqual(
+            locks.redact_exact_fencing_token(
+                b"token:generation-3 path/generation-3",
+                "generation-3",
+            ),
+            b"token:<redacted> path/<redacted>",
+        )
+
+
 class ReplaceMetadataFileTests(unittest.TestCase):
     def test_retries_transient_windows_permission_error(self) -> None:
         real_replace = Path.replace

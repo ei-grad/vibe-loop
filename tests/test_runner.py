@@ -285,15 +285,19 @@ class RunnerTests(unittest.TestCase):
             (True, "## Continue this run (resumed session)"),
         ):
             with self.subTest(resuming=resuming):
-                prompt = build_run_worker_prompt(
-                    "$",
-                    task,
-                    config,
-                    recovery=recovery,
-                    resuming=resuming,
-                )
+                token = "recovery-generation-11"
+                with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+                    prompt = build_run_worker_prompt(
+                        "$",
+                        task,
+                        config,
+                        recovery=recovery,
+                        resuming=resuming,
+                    )
 
                 self.assertIn(branch_marker, prompt)
+                self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
+                self.assertNotIn(token, prompt)
                 self.assertGreater(
                     prompt.index("## Repository Worker Prompt Extension"),
                     prompt.index(branch_marker),
@@ -309,6 +313,18 @@ class RunnerTests(unittest.TestCase):
                 prompt = build_worker_prompt("$", task, config)
 
                 self.assertEqual(prompt, expected)
+
+    def test_worker_prompt_contains_token_rule_without_environment_value(self) -> None:
+        task = Task(task_id="POLICY-04", title="Protect lock token", status="Next")
+        token = "prompt-generation-9"
+
+        with patch.dict(os.environ, {"VIBE_LOOP_FENCING_TOKEN": token}):
+            prompt = build_worker_prompt("$", task, VibeConfig(repo=Path(".")))
+
+        self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", prompt)
+        self.assertIn("Never print or echo its value", prompt)
+        self.assertIn("command argument, tool payload, log, or summary", prompt)
+        self.assertNotIn(token, prompt)
 
     def test_worker_prompt_includes_bounded_spec_context_and_gates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2405,6 +2421,103 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertIn("err", stderr.getvalue())
             self.assertIn("err", log_path.read_text(encoding="utf-8"))
+
+    def test_streaming_command_redacts_active_token_for_codex_and_claude(
+        self,
+    ) -> None:
+        token = "stream-generation-3"
+        substring = "stream-generation-"
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as directory:
+                    script = Path(directory) / "cmd.py"
+                    script.write_text(
+                        "import json\n"
+                        "import os\n"
+                        "import sys\n"
+                        "token = os.environ['VIBE_LOOP_FENCING_TOKEN']\n"
+                        "print(token)\n"
+                        "print(json.dumps({'type': 'item.completed', "
+                        "'item': {'output': token}, "
+                        "'substring': token[:-1]}))\n"
+                        "print(f'stderr token={token}', file=sys.stderr)\n",
+                        encoding="utf-8",
+                    )
+                    log_path = Path(directory) / "run.log"
+                    stderr = StringIO()
+                    environment = os.environ.copy()
+                    environment["VIBE_LOOP_FENCING_TOKEN"] = token
+                    with log_path.open("w", encoding="utf-8") as log:
+                        with redirect_stderr(stderr):
+                            result = run_streaming_command(
+                                f"{sys.executable} cmd.py",
+                                Path(directory),
+                                log,
+                                env=environment,
+                                forward_stderr=True,
+                                provider=provider,
+                            )
+
+                    log_text = log_path.read_text(encoding="utf-8")
+                    rendered = log_text + stderr.getvalue()
+                    structured = next(
+                        json.loads(line)
+                        for line in log_text.splitlines()
+                        if line.startswith("{")
+                    )
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertNotIn(token, rendered)
+                self.assertIn("<redacted>", rendered)
+                self.assertEqual(structured["item"]["output"], "<redacted>")
+                self.assertEqual(structured["substring"], substring)
+
+    def test_streaming_command_preserves_numeric_fields_for_short_token(self) -> None:
+        token = "1"
+        for provider in ("openai", "anthropic"):
+            with self.subTest(provider=provider):
+                with tempfile.TemporaryDirectory() as directory:
+                    script = Path(directory) / "cmd.py"
+                    script.write_text(
+                        "import json\n"
+                        "import os\n"
+                        "import sys\n"
+                        "token = os.environ['VIBE_LOOP_FENCING_TOKEN']\n"
+                        "print(token)\n"
+                        "print(token, file=sys.stderr)\n"
+                        "print(json.dumps({'fencing_token': int(token), "
+                        "'output': token, 'count': 1, 'task_id': 'TASK-1'}))\n",
+                        encoding="utf-8",
+                    )
+                    log_path = Path(directory) / "run.log"
+                    environment = os.environ.copy()
+                    environment["VIBE_LOOP_FENCING_TOKEN"] = token
+                    stderr = StringIO()
+                    with log_path.open("w", encoding="utf-8") as log:
+                        with redirect_stderr(stderr):
+                            result = run_streaming_command(
+                                f"{sys.executable} cmd.py",
+                                Path(directory),
+                                log,
+                                env=environment,
+                                forward_stderr=True,
+                                provider=provider,
+                            )
+                    lines = log_path.read_text(encoding="utf-8").splitlines()
+                    payload = next(
+                        json.loads(line) for line in lines if line.startswith("{")
+                    )
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(
+                    [line for line in lines if not line.startswith("{")],
+                    ["<redacted>", "<redacted>"],
+                )
+                self.assertNotIn("\n1\n", f"\n{stderr.getvalue()}")
+                self.assertEqual(payload["fencing_token"], "<redacted>")
+                self.assertEqual(payload["output"], "<redacted>")
+                self.assertEqual(payload["count"], 1)
+                self.assertEqual(payload["task_id"], "TASK-1")
 
     def test_streaming_command_captures_stdout_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

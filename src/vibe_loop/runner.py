@@ -51,8 +51,12 @@ from vibe_loop.locks import (
     LockOwnerMismatch,
     SettledOutcomeNotPersisted,
     TaskLock,
+    FENCING_TOKEN_REDACTION,
     build_lock_manager,
     fencing_token_value,
+    redact_exact_fencing_token,
+    redact_fencing_token_payload,
+    redact_fencing_token_text,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
@@ -183,7 +187,13 @@ SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS = 20
 SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS = 20
 SPEC_WORKER_CONTEXT_LINE_CONTEXT = 3
 
-CLI_WORKER_ADDENDUM = """\
+FENCING_TOKEN_NONDISCLOSURE = """\
+VIBE_LOOP_FENCING_TOKEN is a secret. Never print or echo its value, include it
+in a prompt, report, command argument, tool payload, log, or summary, or expose
+it by any other means. Use it only through the environment for the lock
+protocol commands that require it."""
+
+CLI_WORKER_ADDENDUM = f"""\
 
 ## vibe-loop CLI Coordination
 
@@ -194,6 +204,8 @@ environment variables identify this run:
 - VIBE_LOOP_TASK_ID - task being worked on
 - VIBE_LOOP_LOG - path to the run log file
 - VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
+
+{FENCING_TOKEN_NONDISCLOSURE}
 
 ### Task Activation
 
@@ -1372,6 +1384,7 @@ class VibeRunner:
                     agent.prompt_dialect_source,
                     agent.skill_ref_prefix,
                     agent.skill_ref_prefix_source,
+                    fencing_token=fencing_token,
                 )
                 report_status(f"running {task.task_id}: {task.title}", log)
                 report_status(f"run_id={run_id}", log)
@@ -2883,7 +2896,8 @@ def build_run_worker_prompt(
 ) -> str:
     if recovery is not None and resuming:
         return append_worker_prompt_extension(
-            build_resume_continuation_prompt(recovery),
+            f"{build_resume_continuation_prompt(recovery)}\n\n"
+            f"{FENCING_TOKEN_NONDISCLOSURE}",
             config,
         )
     if recovery is not None:
@@ -4806,26 +4820,29 @@ def write_log_header(
     prompt_dialect_source: str,
     skill_ref_prefix: str | None,
     skill_ref_prefix_source: str,
+    *,
+    fencing_token: str = "",
 ) -> None:
-    log.write(f"[vibe-loop] run_id={run_id}\n")
-    log.write(f"[vibe-loop] task_id={task.task_id}\n")
-    log.write(f"[vibe-loop] title={task.title}\n")
-    log.write(f"[vibe-loop] command={command}\n")
-    log.write(f"[vibe-loop] agent_command_source={command_source}\n")
-    log.write(
-        f"[vibe-loop] agent_selection_command_source={selection_command_source}\n"
+    header = (
+        f"[vibe-loop] run_id={run_id}\n"
+        f"[vibe-loop] task_id={task.task_id}\n"
+        f"[vibe-loop] title={task.title}\n"
+        f"[vibe-loop] command={command}\n"
+        f"[vibe-loop] agent_command_source={command_source}\n"
+        "[vibe-loop] agent_selection_command_source="
+        f"{selection_command_source}\n"
+        "[vibe-loop] agent_default_policy_source="
+        f"{AGENT_DEFAULT_POLICY_SOURCE}\n"
+        f"[vibe-loop] agent_default_policy={AGENT_DEFAULT_POLICY}\n"
+        f"[vibe-loop] agent_kind={agent_kind}\n"
+        f"[vibe-loop] agent_prompt_dialect={prompt_dialect or ''}\n"
+        f"[vibe-loop] agent_prompt_dialect_source={prompt_dialect_source}\n"
+        f"[vibe-loop] agent_skill_ref_prefix={skill_ref_prefix or ''}\n"
+        f"[vibe-loop] agent_skill_ref_prefix_source={skill_ref_prefix_source}\n"
+        f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n"
+        f"[vibe-loop] start_main={start_main}\n\n"
     )
-    log.write(
-        f"[vibe-loop] agent_default_policy_source={AGENT_DEFAULT_POLICY_SOURCE}\n"
-    )
-    log.write(f"[vibe-loop] agent_default_policy={AGENT_DEFAULT_POLICY}\n")
-    log.write(f"[vibe-loop] agent_kind={agent_kind}\n")
-    log.write(f"[vibe-loop] agent_prompt_dialect={prompt_dialect or ''}\n")
-    log.write(f"[vibe-loop] agent_prompt_dialect_source={prompt_dialect_source}\n")
-    log.write(f"[vibe-loop] agent_skill_ref_prefix={skill_ref_prefix or ''}\n")
-    log.write(f"[vibe-loop] agent_skill_ref_prefix_source={skill_ref_prefix_source}\n")
-    log.write(f"[vibe-loop] detected_agents={format_detected_agents(detected)}\n")
-    log.write(f"[vibe-loop] start_main={start_main}\n\n")
+    log.write(redact_fencing_token_text(header, fencing_token))
 
 
 def report_status(message: str, log: TextIO | None = None) -> None:
@@ -5040,6 +5057,7 @@ def run_streaming_command(
     assert process.stdout is not None
     assert process.stderr is not None
     log_lock = threading.Lock()
+    fencing_token = fencing_token_value((env or {}).get("VIBE_LOOP_FENCING_TOKEN"))
     output_observer = AgentOutputObserver(provider)
     stdout_thread = threading.Thread(
         target=stream_pipe,
@@ -5051,6 +5069,7 @@ def run_streaming_command(
             output_observer,
             "stdout",
             on_observation,
+            fencing_token,
         ),
     )
     stderr_thread = threading.Thread(
@@ -5063,6 +5082,7 @@ def run_streaming_command(
             output_observer,
             "stderr",
             on_observation,
+            fencing_token,
         ),
     )
     stdout_thread.start()
@@ -5115,20 +5135,40 @@ def stream_pipe(
     output_observer: AgentOutputObserver,
     stream_name: str,
     on_observation: Callable[[AgentRuntimeObservation], None] | None = None,
+    fencing_token: str = "",
 ) -> None:
     try:
         for line in pipe:
-            observation = output_observer.observe_line(line, stream_name)
+            redacted_line = redact_worker_stream_line(line, fencing_token)
+            observation = output_observer.observe_line(redacted_line, stream_name)
             if observation is not None and on_observation is not None:
                 on_observation(observation)
             if forward:
-                sys.stderr.write(line)
+                sys.stderr.write(redacted_line)
                 sys.stderr.flush()
             with log_lock:
-                log.write(line)
+                log.write(redacted_line)
                 log.flush()
     finally:
         pipe.close()
+
+
+def redact_worker_stream_line(line: str, fencing_token: str) -> str:
+    if not fencing_token:
+        return line
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return redact_fencing_token_text(line, fencing_token)
+    if fencing_token_value(payload) == fencing_token:
+        newline = "\n" if line.endswith("\n") else ""
+        return FENCING_TOKEN_REDACTION + newline
+    field_redacted = redact_fencing_token_payload(payload)
+    redacted = redact_exact_fencing_token(field_redacted, fencing_token)
+    if redacted == payload:
+        return line
+    newline = "\n" if line.endswith("\n") else ""
+    return json.dumps(redacted, separators=(",", ":")) + newline
 
 
 def new_run_id(task_id: str) -> str:

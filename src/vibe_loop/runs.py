@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
-from vibe_loop.locks import redact_fencing_token_payload
+from vibe_loop.locks import redact_exact_fencing_token, redact_fencing_token_payload
 from vibe_loop.telemetry import sanitize_run_stats
 
 try:
@@ -142,13 +142,19 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def redact_run_record(record: Mapping[str, object]) -> dict[str, object]:
+def redact_run_record(
+    record: Mapping[str, object],
+    *,
+    fencing_token: str = "",
+) -> dict[str, object]:
     payload = dict(record)
     if "stats" in payload:
         payload["stats"] = sanitize_run_stats(payload["stats"])
     redacted = redact_fencing_token_payload(payload)
     assert isinstance(redacted, dict)
-    return redacted
+    exact_redacted = redact_exact_fencing_token(redacted, fencing_token)
+    assert isinstance(exact_redacted, dict)
+    return exact_redacted
 
 
 def autopilot_child_started_record(
@@ -292,6 +298,12 @@ class WorkerReport:
     message: str = ""
     metadata: dict[str, Any] = dataclasses.field(default_factory=dict)
     reported_at: str = dataclasses.field(default_factory=utc_now_iso)
+    fencing_token: str = dataclasses.field(
+        default="",
+        repr=False,
+        compare=False,
+        kw_only=True,
+    )
 
     def __post_init__(self) -> None:
         if self.status not in WORKER_REPORT_STATUSES:
@@ -316,7 +328,9 @@ class WorkerReport:
         }
         redacted = redact_fencing_token_payload(payload)
         assert isinstance(redacted, dict)
-        return redacted
+        exact_redacted = redact_exact_fencing_token(redacted, self.fencing_token)
+        assert isinstance(exact_redacted, dict)
+        return exact_redacted
 
     def to_record(self) -> dict[str, object]:
         record = self.to_json()
@@ -800,13 +814,18 @@ class RunStore:
         self.append_record(result.to_record())
 
     def append_report(self, report: WorkerReport) -> None:
-        self.append_record(report.to_record())
+        self.append_record(report.to_record(), fencing_token=report.fencing_token)
 
     def append_lifecycle_event(self, event: RunLifecycleEvent) -> None:
         self.append_record(event.to_record())
 
-    def append_record(self, record: dict[str, object]) -> None:
-        redacted = redact_run_record(record)
+    def append_record(
+        self,
+        record: dict[str, object],
+        *,
+        fencing_token: str = "",
+    ) -> None:
+        redacted = redact_run_record(record, fencing_token=fencing_token)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
             with append_record_lock(self.path):

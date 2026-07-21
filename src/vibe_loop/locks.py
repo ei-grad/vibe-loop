@@ -40,6 +40,7 @@ COMMAND_LOCK_TIMEOUT_SECONDS = 30.0
 METADATA_REPLACE_TIMEOUT_SECONDS = 5.0
 FENCING_TOKEN_REDACTION = "<redacted>"
 FENCING_TOKEN_FIELDS = frozenset({"fencing_token", "expected_token", "actual_token"})
+FENCING_TOKEN_VALUE_CHARACTERS = r"A-Za-z0-9._+\-"
 MIN_OPAQUE_FENCING_TOKEN_REDACTION_LENGTH = 8
 QUOTED_FENCING_DIAGNOSTIC_PATTERN = re.compile(
     r"(?i)([\"']?(?:fencing_token|expected_token|actual_token)[\"']?"
@@ -1721,6 +1722,44 @@ def fencing_token_value(value: object) -> str:
     if isinstance(value, (int, str)):
         return str(value)
     return ""
+
+
+def redact_exact_fencing_token(value: object, fencing_token: object) -> object:
+    token = fencing_token_value(fencing_token)
+    if not token:
+        return value
+    if isinstance(value, str):
+        pattern = re.compile(
+            rf"(?<![{FENCING_TOKEN_VALUE_CHARACTERS}])"
+            rf"{re.escape(token)}"
+            rf"(?![{FENCING_TOKEN_VALUE_CHARACTERS}])"
+        )
+        return pattern.sub(FENCING_TOKEN_REDACTION, value)
+    if isinstance(value, bytes):
+        pattern = re.compile(
+            rb"(?<![A-Za-z0-9._+\-])"
+            + re.escape(token.encode("utf-8"))
+            + rb"(?![A-Za-z0-9._+\-])"
+        )
+        return pattern.sub(FENCING_TOKEN_REDACTION.encode("utf-8"), value)
+    if isinstance(value, Mapping):
+        return {
+            redact_exact_fencing_token(key, token): redact_exact_fencing_token(
+                item, token
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_exact_fencing_token(item, token) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_exact_fencing_token(item, token) for item in value)
+    return value
+
+
+def redact_fencing_token_text(value: str, fencing_token: object) -> str:
+    redacted = redact_exact_fencing_token(value, fencing_token)
+    assert isinstance(redacted, str)
+    return redacted
 
 
 def redact_fencing_token_payload(value: object) -> object:
