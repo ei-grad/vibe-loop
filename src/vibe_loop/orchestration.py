@@ -2623,6 +2623,804 @@ class RuntimeGateController:
         return candidate
 
 
+INTEGRATION_OUTCOMES = ("merged", "branch_already_merged", "failed")
+INTEGRATION_FAILURE_REASONS = (
+    "lock_timeout",
+    "lock_unavailable",
+    "workspace_preflight_failed",
+    "merge_conflict",
+    "merge_failed",
+    "integration_verification_failed",
+    "main_worktree_unavailable",
+    "main_fast_forward_failed",
+    "main_verification_failed",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class IntegrationCheckResult:
+    phase: str
+    command_key: str
+    exit_class: str
+    exit_code: int | None
+    duration_seconds: float
+    log_reference: str
+    evidence_digest: str
+
+    @property
+    def passed(self) -> bool:
+        return self.exit_class == "passed"
+
+    def to_payload(self) -> dict[str, object]:
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_payload(cls, value: object) -> IntegrationCheckResult | None:
+        if not isinstance(value, Mapping):
+            return None
+        try:
+            return cls(
+                phase=str(value["phase"]),
+                command_key=str(value["command_key"]),
+                exit_class=str(value["exit_class"]),
+                exit_code=(
+                    int(value["exit_code"])
+                    if value.get("exit_code") is not None
+                    else None
+                ),
+                duration_seconds=float(value["duration_seconds"]),
+                log_reference=str(value["log_reference"]),
+                evidence_digest=str(value["evidence_digest"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+
+@dataclasses.dataclass(frozen=True)
+class IntegrationResult:
+    outcome: str
+    status: str
+    reason: str
+    branch: str
+    candidate_head: str
+    refreshed_head: str
+    main_before: str
+    main_after: str
+    verification: tuple[IntegrationCheckResult, ...] = ()
+    recovered: bool = False
+    diagnostics: Mapping[str, object] = dataclasses.field(default_factory=dict)
+
+    @property
+    def completed(self) -> bool:
+        return self.status == "completed"
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "outcome": self.outcome,
+            "status": self.status,
+            "reason": self.reason,
+            "branch": self.branch,
+            "candidate_head": self.candidate_head,
+            "refreshed_head": self.refreshed_head,
+            "main_before": self.main_before,
+            "main_after": self.main_after,
+            "verification": [item.to_payload() for item in self.verification],
+            "recovered": self.recovered,
+            "diagnostics": dict(self.diagnostics),
+        }
+
+    @classmethod
+    def from_record(cls, value: object) -> IntegrationResult | None:
+        if (
+            not isinstance(value, Mapping)
+            or value.get("record_type") != "integration_result"
+        ):
+            return None
+        outcome = value.get("outcome")
+        status = value.get("status")
+        reason = value.get("reason")
+        verification = value.get("verification", [])
+        if (
+            outcome not in INTEGRATION_OUTCOMES
+            or status not in {"completed", "blocked", "failed"}
+            or not isinstance(reason, str)
+            or not isinstance(verification, list)
+        ):
+            return None
+        checks = tuple(
+            check
+            for item in verification
+            if (check := IntegrationCheckResult.from_payload(item)) is not None
+        )
+        if len(checks) != len(verification):
+            return None
+        diagnostics = value.get("diagnostics")
+        return cls(
+            outcome=str(outcome),
+            status=str(status),
+            reason=reason,
+            branch=str(value.get("branch") or ""),
+            candidate_head=str(value.get("candidate_head") or ""),
+            refreshed_head=str(value.get("refreshed_head") or ""),
+            main_before=str(value.get("main_before") or ""),
+            main_after=str(value.get("main_after") or ""),
+            verification=checks,
+            recovered=bool(value.get("recovered")),
+            diagnostics=dict(diagnostics) if isinstance(diagnostics, Mapping) else {},
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class _RecoveredIntegrationLock:
+    status: object
+    timed_out: bool = False
+
+
+class Integrator:
+    def __init__(
+        self,
+        *,
+        repo: Path,
+        main_branch: str,
+        candidate: CandidateRecord,
+        completion_commands: Sequence[str],
+        integration_keys: Sequence[str],
+        verify_on_main_keys: Sequence[str],
+        lock_manager: object,
+        run_store: object,
+        run_id: str,
+        task_id: str,
+        log_dir: Path,
+        wait: bool = True,
+        timeout_seconds: float | None = 300,
+        poll_interval_seconds: float = 1,
+        executor: GateExecutor = subprocess.run,
+        stage_machine: RunLifecycleStateMachine | None = None,
+    ) -> None:
+        self.repo = repo.resolve()
+        self.main_branch = main_branch
+        self.candidate = candidate
+        self.completion_commands = tuple(completion_commands)
+        self.integration_keys = tuple(integration_keys)
+        self.verify_on_main_keys = tuple(verify_on_main_keys)
+        self.lock_manager = lock_manager
+        self.run_store = run_store
+        self.run_id = run_id
+        self.task_id = task_id
+        self.log_dir = log_dir
+        self.wait = wait
+        self.timeout_seconds = timeout_seconds
+        self.poll_interval_seconds = poll_interval_seconds
+        self.executor = executor
+        self.stage_machine = stage_machine
+
+    def run(self) -> IntegrationResult:
+        prior = self._prior_result()
+        if prior is not None and self._prior_result_is_consistent(prior):
+            self._release_recovered_lock()
+            return prior
+
+        preflight = self._workspace_preflight()
+        if preflight is not None:
+            return self._record_preflight_failure(preflight)
+
+        acquired, recovered_lock, lock_status = self._acquire_lock()
+        if not acquired:
+            reason = "lock_timeout" if lock_status.timed_out else "lock_unavailable"
+            return self._record_failure(
+                reason,
+                status="blocked",
+                diagnostics={"lock_state": lock_status.status.state},
+            )
+
+        self._record_lock_event("lock_acquired", lock_status.status.path)
+        if (
+            self.stage_machine is not None
+            and self.stage_machine.stage is not RunStage.INTEGRATION
+        ):
+            self.stage_machine.transition(
+                RunStage.INTEGRATION,
+                reason="main_integration_lock_acquired",
+            )
+        try:
+            concurrent_result = self._prior_result()
+            if concurrent_result is not None and self._prior_result_is_consistent(
+                concurrent_result
+            ):
+                return concurrent_result
+            post_acquire_preflight = self._workspace_preflight()
+            if post_acquire_preflight is not None:
+                return self._record_preflight_failure(post_acquire_preflight)
+            return self._run_locked(recovered_lock=recovered_lock)
+        finally:
+            fencing_token = lock_status.status.metadata.get("fencing_token")
+            released = self.lock_manager.release_main_integration(
+                task_id=self.task_id,
+                run_id=self.run_id,
+                fencing_token=(
+                    fencing_token if isinstance(fencing_token, str) else None
+                ),
+            )
+            if released:
+                self._record_lock_event(
+                    "lock_released",
+                    lock_status.status.path,
+                )
+
+    def _run_locked(self, *, recovered_lock: bool) -> IntegrationResult:
+        main_before = self._rev_parse(self.repo, self.main_branch)
+        branch_head = self._rev_parse(self.candidate.worktree, "HEAD")
+        current_main_checkout = self._current_branch(self.repo)
+        if current_main_checkout != self.main_branch:
+            return self._record_failure(
+                "main_worktree_unavailable",
+                status="blocked",
+                main_before=main_before,
+                refreshed_head=branch_head,
+                diagnostics={
+                    "expected_branch": self.main_branch,
+                    "current_branch": current_main_checkout,
+                },
+                recovered=recovered_lock,
+            )
+        if not self._is_ancestor(self.candidate.head_commit, branch_head):
+            return self._record_failure(
+                "workspace_preflight_failed",
+                status="blocked",
+                main_before=main_before,
+                refreshed_head=branch_head,
+                diagnostics={"code": "candidate_not_ancestor_of_branch"},
+                recovered=recovered_lock,
+            )
+        if branch_head == main_before:
+            integration_checks = self._run_checks(
+                phase="integration",
+                keys=self.integration_keys,
+                worktree=self.candidate.worktree,
+            )
+            if not all(check.passed for check in integration_checks):
+                return self._record_failure(
+                    "integration_verification_failed",
+                    status="failed",
+                    main_before=main_before,
+                    main_after=main_before,
+                    refreshed_head=branch_head,
+                    verification=integration_checks,
+                    recovered=recovered_lock,
+                )
+            main_checks = self._run_checks(
+                phase="main",
+                keys=self.verify_on_main_keys,
+                worktree=self.repo,
+            )
+            checks = (*integration_checks, *main_checks)
+            if not all(check.passed for check in main_checks):
+                return self._record_failure(
+                    "main_verification_failed",
+                    status="failed",
+                    main_before=main_before,
+                    main_after=main_before,
+                    refreshed_head=branch_head,
+                    verification=checks,
+                    recovered=recovered_lock,
+                )
+            return self._record_result(
+                IntegrationResult(
+                    outcome="branch_already_merged",
+                    status="completed",
+                    reason="branch_already_merged",
+                    branch=self.candidate.branch,
+                    candidate_head=self.candidate.head_commit,
+                    refreshed_head=branch_head,
+                    main_before=main_before,
+                    main_after=main_before,
+                    verification=checks,
+                    recovered=recovered_lock,
+                )
+            )
+
+        if branch_head == self.candidate.head_commit:
+            merge = self._git(
+                self.candidate.worktree, "merge", "--no-edit", self.main_branch
+            )
+            if merge.returncode != 0:
+                conflicts = self._unmerged_paths()
+                reason = "merge_conflict" if conflicts else "merge_failed"
+                return self._record_failure(
+                    reason,
+                    status="blocked",
+                    main_before=main_before,
+                    refreshed_head=self._rev_parse(self.candidate.worktree, "HEAD"),
+                    diagnostics={
+                        "conflicted_paths": conflicts,
+                        "git_output": self._bounded_git_output(merge),
+                    },
+                    recovered=recovered_lock,
+                )
+            branch_head = self._rev_parse(self.candidate.worktree, "HEAD")
+            if not self._refresh_is_valid(branch_head):
+                return self._record_failure(
+                    "workspace_preflight_failed",
+                    status="blocked",
+                    main_before=main_before,
+                    refreshed_head=branch_head,
+                    diagnostics={"code": "refresh_result_not_reviewed_candidate"},
+                    recovered=recovered_lock,
+                )
+        elif not self._is_recoverable_refresh(branch_head):
+            return self._record_failure(
+                "workspace_preflight_failed",
+                status="blocked",
+                main_before=main_before,
+                refreshed_head=branch_head,
+                diagnostics={"code": "unrecognized_refreshed_candidate"},
+                recovered=recovered_lock,
+            )
+
+        integration_checks = self._run_checks(
+            phase="integration",
+            keys=self.integration_keys,
+            worktree=self.candidate.worktree,
+        )
+        if not all(check.passed for check in integration_checks):
+            return self._record_failure(
+                "integration_verification_failed",
+                status="failed",
+                main_before=main_before,
+                refreshed_head=branch_head,
+                verification=integration_checks,
+                recovered=recovered_lock,
+            )
+
+        main_head = self._rev_parse(self.repo, self.main_branch)
+        if not self._is_ancestor(branch_head, main_head):
+            merge_main = self._git(
+                self.repo,
+                "merge",
+                "--ff-only",
+                branch_head,
+            )
+            if merge_main.returncode != 0:
+                return self._record_failure(
+                    "main_fast_forward_failed",
+                    status="blocked",
+                    main_before=main_before,
+                    main_after=self._rev_parse(self.repo, self.main_branch),
+                    refreshed_head=branch_head,
+                    verification=integration_checks,
+                    diagnostics={"git_output": self._bounded_git_output(merge_main)},
+                    recovered=recovered_lock,
+                )
+        main_after = self._rev_parse(self.repo, self.main_branch)
+        main_checks = self._run_checks(
+            phase="main",
+            keys=self.verify_on_main_keys,
+            worktree=self.repo,
+        )
+        checks = (*integration_checks, *main_checks)
+        if not all(check.passed for check in main_checks):
+            return self._record_failure(
+                "main_verification_failed",
+                status="failed",
+                main_before=main_before,
+                main_after=main_after,
+                refreshed_head=branch_head,
+                verification=checks,
+                recovered=recovered_lock,
+            )
+        return self._record_result(
+            IntegrationResult(
+                outcome="merged",
+                status="completed",
+                reason="",
+                branch=self.candidate.branch,
+                candidate_head=self.candidate.head_commit,
+                refreshed_head=branch_head,
+                main_before=main_before,
+                main_after=main_after,
+                verification=checks,
+                recovered=recovered_lock,
+            )
+        )
+
+    def _workspace_preflight(self) -> dict[str, object] | None:
+        from vibe_loop.workers import build_worker_views
+
+        views = build_worker_views(
+            self.lock_manager,
+            self.run_store,
+            repo=self.repo,
+            main_branch=self.main_branch,
+            ignored_dirty_paths=(self.repo / ".vibe-loop",),
+        )
+        view = next(
+            (
+                item
+                for item in views
+                if item.active.task_id == self.task_id
+                and item.active.run_id == self.run_id
+            ),
+            None,
+        )
+        if view is None or view.active.workspace is None:
+            return {"code": "workspace_claim_missing", "diagnostics": []}
+        claim = view.active.workspace
+        if (
+            claim.branch != self.candidate.branch
+            or claim.worktree.resolve() != self.candidate.worktree.resolve()
+        ):
+            return {"code": "workspace_claim_mismatch", "diagnostics": []}
+        if not view.workspace_diagnostics:
+            return None
+        if self._is_exact_merged_noop(view):
+            return None
+        conflicts = self._unmerged_paths()
+        return {
+            "code": "merge_conflict" if conflicts else "workspace_preflight_failed",
+            "diagnostics": [
+                diagnostic.to_json() for diagnostic in view.workspace_diagnostics
+            ],
+            "conflicted_paths": conflicts,
+        }
+
+    def _is_exact_merged_noop(self, view: object) -> bool:
+        diagnostics = view.workspace_diagnostics
+        state = view.workspace_git_state
+        claim = view.active.workspace
+        return bool(
+            len(diagnostics) == 1
+            and diagnostics[0].code == "branch_already_merged"
+            and state is not None
+            and claim is not None
+            and state.worktree_exists
+            and state.worktree_listed
+            and not state.dirty
+            and state.current_branch == claim.branch
+            and state.head_commit
+            and state.head_commit == self._rev_parse(self.repo, self.main_branch)
+        )
+
+    def _acquire_lock(self) -> tuple[bool, bool, object]:
+        from vibe_loop.locks import LockBusy
+
+        status = self.lock_manager.main_integration_status()
+        if (
+            status.locked
+            and status.state == "stale"
+            and status.metadata.get("owner_task_id") == self.task_id
+            and status.metadata.get("run_id") == self.run_id
+        ):
+            try:
+                self.lock_manager.recover_stale_main_integration(
+                    task_id=self.task_id,
+                    run_id=self.run_id,
+                    metadata={
+                        "pid": os.getpid(),
+                        "pid_source": "runtime_integrator_recovery",
+                    },
+                )
+            except LockBusy:
+                pass
+            else:
+                return (
+                    True,
+                    True,
+                    _RecoveredIntegrationLock(
+                        self.lock_manager.main_integration_status()
+                    ),
+                )
+        result = self.lock_manager.acquire_main_integration_with_wait(
+            task_id=self.task_id,
+            run_id=self.run_id,
+            metadata={"pid": os.getpid(), "pid_source": "runtime_integrator"},
+            wait=self.wait,
+            timeout_seconds=self.timeout_seconds,
+            poll_interval_seconds=self.poll_interval_seconds,
+        )
+        return result.acquired, False, result
+
+    def _run_checks(
+        self,
+        *,
+        phase: str,
+        keys: Sequence[str],
+        worktree: Path,
+    ) -> tuple[IntegrationCheckResult, ...]:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        results: list[IntegrationCheckResult] = []
+        for index, command_key in enumerate(keys):
+            command = resolve_completion_command(
+                self.completion_commands,
+                command_key,
+            )
+            log_path = self.log_dir / f"{phase}-{index + 1}.log"
+            started = time.monotonic()
+            exit_code: int | None = None
+            tracked_before = self._tracked_state(worktree)
+            try:
+                with log_path.open("w", encoding="utf-8") as log:
+                    completed = run_configured_command(
+                        command,
+                        worktree=worktree,
+                        log=log,
+                        executor=self.executor,
+                    )
+                exit_code = completed.returncode
+                exit_class = "passed" if exit_code == 0 else "failed"
+            except OSError:
+                log_path.write_text(
+                    "integration verification command could not be executed\n",
+                    encoding="utf-8",
+                )
+                exit_class = "execution_error"
+            if self._tracked_state(worktree) != tracked_before:
+                exit_class = "candidate_changed"
+            result = IntegrationCheckResult(
+                phase=phase,
+                command_key=command_key,
+                exit_class=exit_class,
+                exit_code=exit_code,
+                duration_seconds=max(0.0, time.monotonic() - started),
+                log_reference=str(log_path),
+                evidence_digest=(
+                    "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
+                ),
+            )
+            results.append(result)
+            if not result.passed:
+                break
+        return tuple(results)
+
+    def _tracked_state(self, worktree: Path) -> tuple[str, str]:
+        return (
+            self._rev_parse(worktree, "HEAD"),
+            self._git(
+                worktree,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            ).stdout,
+        )
+
+    def _prior_result(self) -> IntegrationResult | None:
+        result = None
+        for record in self.run_store.read_records():
+            if (
+                record.get("run_id") == self.run_id
+                and record.get("task_id") == self.task_id
+            ):
+                result = IntegrationResult.from_record(record) or result
+        return result
+
+    def _prior_result_is_consistent(self, result: IntegrationResult) -> bool:
+        if not result.completed:
+            return True
+        if not result.refreshed_head:
+            return False
+        return self._is_ancestor(
+            result.refreshed_head,
+            self._rev_parse(self.repo, self.main_branch),
+        )
+
+    def _release_recovered_lock(self) -> None:
+        status = self.lock_manager.main_integration_status()
+        if (
+            status.locked
+            and status.state == "stale"
+            and status.metadata.get("owner_task_id") == self.task_id
+            and status.metadata.get("run_id") == self.run_id
+        ):
+            fencing_token = status.metadata.get("fencing_token")
+            if self.lock_manager.release_main_integration(
+                task_id=self.task_id,
+                run_id=self.run_id,
+                fencing_token=(
+                    fencing_token if isinstance(fencing_token, str) else None
+                ),
+            ):
+                self._record_lock_event("lock_released", status.path)
+
+    def _record_preflight_failure(
+        self, preflight: Mapping[str, object]
+    ) -> IntegrationResult:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.workspace_claim_mismatch(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                reason="workspace_preflight_failed",
+                message="claimed workspace is not safe for runtime integration",
+                details=preflight,
+            )
+        )
+        reason = str(preflight.get("code") or "workspace_preflight_failed")
+        if reason not in INTEGRATION_FAILURE_REASONS:
+            reason = "workspace_preflight_failed"
+        result = self._record_failure(
+            reason,
+            status="blocked",
+            diagnostics=preflight,
+        )
+        self._release_recovered_lock()
+        return result
+
+    def _record_failure(
+        self,
+        reason: str,
+        *,
+        status: str,
+        main_before: str = "",
+        main_after: str = "",
+        refreshed_head: str = "",
+        verification: Sequence[IntegrationCheckResult] = (),
+        recovered: bool = False,
+        diagnostics: Mapping[str, object] | None = None,
+    ) -> IntegrationResult:
+        result = self._record_result(
+            IntegrationResult(
+                outcome="failed",
+                status=status,
+                reason=reason,
+                branch=self.candidate.branch,
+                candidate_head=self.candidate.head_commit,
+                refreshed_head=refreshed_head,
+                main_before=main_before,
+                main_after=main_after,
+                verification=tuple(verification),
+                recovered=recovered,
+                diagnostics=dict(diagnostics or {}),
+            )
+        )
+        if self.stage_machine is not None:
+            self.stage_machine.fail(
+                StageFailure.BLOCKED
+                if status == "blocked"
+                else StageFailure.STAGE_FAILED,
+                reason=reason,
+            )
+        return result
+
+    def _record_result(self, result: IntegrationResult) -> IntegrationResult:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.integration_result(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=result.to_payload(),
+            )
+        )
+        return result
+
+    def _record_lock_event(self, record_type: str, path: Path) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.lock_event(
+                record_type,
+                run_id=self.run_id,
+                task_id=self.task_id,
+                lock_kind="integration",
+                lock_path=path,
+                payload={"resource": "main-integration"},
+            )
+        )
+
+    def _is_recoverable_refresh(self, head: str) -> bool:
+        parents = self._git(
+            self.candidate.worktree,
+            "show",
+            "-s",
+            "--format=%P",
+            head,
+        )
+        if parents.returncode != 0:
+            return False
+        parent_ids = parents.stdout.strip().split()
+        if (
+            len(parent_ids) != 2
+            or parent_ids[0] != self.candidate.head_commit
+            or not self._is_ancestor(parent_ids[1], self.main_branch)
+        ):
+            return False
+        expected_tree = self._git(
+            self.candidate.worktree,
+            "merge-tree",
+            "--write-tree",
+            parent_ids[0],
+            parent_ids[1],
+        )
+        if expected_tree.returncode != 0:
+            return False
+        actual_tree = self._git(
+            self.candidate.worktree,
+            "rev-parse",
+            "--verify",
+            f"{head}^{{tree}}",
+        )
+        return bool(
+            actual_tree.returncode == 0
+            and expected_tree.stdout.splitlines()[0].strip()
+            == actual_tree.stdout.strip()
+        )
+
+    def _refresh_is_valid(self, head: str) -> bool:
+        return bool(
+            head == self.candidate.head_commit
+            or (
+                head == self._rev_parse(self.repo, self.main_branch)
+                and self._is_ancestor(self.candidate.head_commit, head)
+            )
+            or self._is_recoverable_refresh(head)
+        )
+
+    def _unmerged_paths(self) -> list[str]:
+        result = self._git(
+            self.candidate.worktree,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        )
+        if result.returncode != 0:
+            return []
+        return [line for line in result.stdout.splitlines() if line]
+
+    def _is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        return (
+            self._git(
+                self.repo,
+                "merge-base",
+                "--is-ancestor",
+                ancestor,
+                descendant,
+            ).returncode
+            == 0
+        )
+
+    def _rev_parse(self, worktree: Path, ref: str) -> str:
+        result = self._git(worktree, "rev-parse", "--verify", f"{ref}^{{commit}}")
+        if result.returncode != 0:
+            raise RuntimeError(f"git ref is unavailable for integration: {ref}")
+        return result.stdout.strip()
+
+    def _current_branch(self, worktree: Path) -> str:
+        result = self._git(worktree, "branch", "--show-current")
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    @staticmethod
+    def _bounded_git_output(result: subprocess.CompletedProcess[str]) -> str:
+        return (result.stdout + result.stderr).strip()[:2000]
+
+    @staticmethod
+    def _git(worktree: Path, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(worktree), *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+
+
+def resolve_completion_command(
+    completion_commands: Sequence[str], command_key: str
+) -> str:
+    match = re.fullmatch(r"completion\.commands\[(\d+)]", command_key)
+    if match is None:
+        raise GateExecutionError(
+            "command key is not an allowlisted completion command reference: "
+            f"{command_key}"
+        )
+    index = int(match.group(1))
+    if index >= len(completion_commands):
+        raise GateExecutionError(
+            f"command key references an unavailable command: {command_key}"
+        )
+    return completion_commands[index]
+
+
 @dataclasses.dataclass(frozen=True)
 class RunContractProposal:
     kind: str

@@ -541,6 +541,52 @@ class LockManager:
                 status=self.main_integration_status(),
             )
 
+    def recover_stale_main_integration(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        metadata: dict[str, object] | None = None,
+        current_host: str | None = None,
+        process_exists: ProcessExists | None = None,
+    ) -> TaskLock:
+        with settlement_update_lock(
+            self.settlement_mutex_path(MAIN_INTEGRATION_LOCK_NAME)
+        ):
+            current = self.current_lock(MAIN_INTEGRATION_LOCK_NAME)
+            status = classify_integration_lock(
+                current.path,
+                current.metadata,
+                current_host=current_host,
+                process_exists=process_exists,
+            )
+            if (
+                string_value(current.metadata.get("owner_task_id")) != task_id
+                or string_value(current.metadata.get("run_id")) != run_id
+            ):
+                raise LockOwnerMismatch(
+                    current.path,
+                    current.metadata,
+                    run_id=run_id,
+                    task_id=task_id,
+                )
+            if status.state != "stale":
+                raise LockBusy(current.path, current.metadata)
+            recovered = dict(current.metadata)
+            recovered.update(metadata or {})
+            recovered.update(
+                {
+                    "schema_version": MAIN_INTEGRATION_LOCK_SCHEMA_VERSION,
+                    "record_type": MAIN_INTEGRATION_LOCK_RECORD_TYPE,
+                    "task_id": MAIN_INTEGRATION_LOCK_NAME,
+                    "owner_task_id": task_id,
+                    "resource": MAIN_INTEGRATION_LOCK_NAME,
+                    "run_id": run_id,
+                    "heartbeat_at": utc_now_iso(),
+                }
+            )
+            return self.backend.update(current, recovered)
+
     def release_main_integration(
         self,
         *,

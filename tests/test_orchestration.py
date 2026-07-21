@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from vibe_loop.orchestration import (
     GateResult,
     GateRunSummary,
     GateRunner,
+    Integrator,
     LEGAL_STAGE_TRANSITIONS,
     RuntimeGateController,
     ReviewBudgetExhausted,
@@ -58,7 +60,11 @@ from vibe_loop.orchestration import (
     provider_capabilities,
 )
 from vibe_loop.runner import VibeRunner
-from vibe_loop.locks import LockManager
+from vibe_loop.locks import (
+    MAIN_INTEGRATION_LOCK_NAME,
+    LockFencingMismatch,
+    LockManager,
+)
 from vibe_loop.runs import RunLifecycleEvent, RunStore, WorkerReport
 from vibe_loop.tasks import Task
 from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
@@ -933,6 +939,652 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(executor_calls, [])
         self.assertEqual(len(remediation_summaries), 1)
         self.assertTrue(remediation_summaries[0].results[0].resumed)
+
+
+class RuntimeIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        init_git_repo(self.repo)
+        self.base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.worktree = Path(self.directory.name) / "task-worktree"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/TASK-01",
+            str(self.worktree),
+        )
+        (self.worktree / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.worktree, "add", "candidate.txt")
+        git(self.worktree, "commit", "-m", "candidate")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        self.manager, self.store, token = acquire_run(self.repo, "TASK-01", "run-1")
+        claim_worker_workspace(
+            self.manager,
+            self.store,
+            task_id="TASK-01",
+            run_id="run-1",
+            branch="worker/TASK-01",
+            worktree=self.worktree,
+            repo=self.repo,
+            base_commit=self.base,
+            fencing_token=token,
+        )
+
+    def integrator(
+        self,
+        *,
+        commands: tuple[str, ...] = ("true", "true"),
+        integration_keys: tuple[str, ...] = ("completion.commands[0]",),
+        main_keys: tuple[str, ...] = ("completion.commands[1]",),
+        executor=subprocess.run,
+        timeout_seconds: float = 0,
+        stage_machine: RunLifecycleStateMachine | None = None,
+    ) -> Integrator:
+        return Integrator(
+            repo=self.repo,
+            main_branch="main",
+            candidate=CandidateRecord(
+                head_commit=self.candidate_head,
+                base_main=self.base,
+                changed_paths=("candidate.txt",),
+                source="derived",
+                branch="worker/TASK-01",
+                worktree=self.worktree,
+            ),
+            completion_commands=commands,
+            integration_keys=integration_keys,
+            verify_on_main_keys=main_keys,
+            lock_manager=self.manager,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "integration",
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=0.01,
+            executor=executor,
+            stage_machine=stage_machine,
+        )
+
+    def advance_main(self, *, content: str = "main\n") -> str:
+        (self.repo / "main.txt").write_text(content, encoding="utf-8")
+        git(self.repo, "add", "main.txt")
+        git(self.repo, "commit", "-m", "advance main")
+        return git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_success_refreshes_verifies_fast_forwards_and_records_evidence(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+
+        result = self.integrator().run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.outcome, "merged")
+        self.assertEqual(result.main_before, main_before)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(),
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+        )
+        self.assertEqual(
+            [check.phase for check in result.verification],
+            ["integration", "main"],
+        )
+        self.assertTrue(
+            all(
+                check.evidence_digest.startswith("sha256:")
+                for check in result.verification
+            )
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+        record_types = [record["record_type"] for record in self.store.read_records()]
+        self.assertLess(
+            record_types.index("lock_acquired"),
+            record_types.index("integration_result"),
+        )
+        self.assertLess(
+            record_types.index("integration_result"),
+            record_types.index("lock_released"),
+        )
+
+    def test_exact_already_merged_branch_is_no_commit_noop(self) -> None:
+        git(self.repo, "merge", "--ff-only", "worker/TASK-01")
+        main_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.integrator(integration_keys=()).run()
+
+        self.assertEqual(result.outcome, "branch_already_merged")
+        self.assertEqual(result.main_before, main_head)
+        self.assertEqual(result.main_after, main_head)
+        self.assertEqual(
+            git(self.repo, "rev-list", "--count", self.base + "..main").stdout.strip(),
+            "1",
+        )
+
+    def test_merge_conflict_parks_workspace_and_releases_lock(self) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate conflict\n", encoding="utf-8"
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate conflict")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        (self.repo / "README.md").write_text("main conflict\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main conflict")
+        main_before = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.integrator().run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "merge_conflict")
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), main_before
+        )
+        self.assertIn("README.md", result.diagnostics["conflicted_paths"])
+        self.assertTrue(
+            git(
+                self.worktree,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+            ).stdout.strip()
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_recovery_classifies_preserved_conflict_and_releases_stale_lock(
+        self,
+    ) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate conflict\n", encoding="utf-8"
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate conflict")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        (self.repo / "README.md").write_text("main conflict\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main conflict")
+        conflict = git(self.worktree, "merge", "--no-edit", "main", check=False)
+        self.assertNotEqual(conflict.returncode, 0)
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+
+        result = self.integrator().run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "merge_conflict")
+        self.assertIn("README.md", result.diagnostics["conflicted_paths"])
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_verification_failure_preserves_candidate_before_main_move(self) -> None:
+        main_before = self.advance_main()
+
+        result = self.integrator(
+            commands=("false",),
+            integration_keys=("completion.commands[0]",),
+            main_keys=(),
+        ).run()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "integration_verification_failed")
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), main_before
+        )
+        self.assertTrue(self.worktree.exists())
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_verification_cannot_mutate_reviewed_candidate(self) -> None:
+        main_before = self.advance_main()
+        command = "printf 'mutated\\n' >> candidate.txt"
+
+        result = self.integrator(
+            commands=(command,),
+            integration_keys=("completion.commands[0]",),
+            main_keys=(),
+        ).run()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "integration_verification_failed")
+        self.assertEqual(result.verification[0].exit_class, "candidate_changed")
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), main_before
+        )
+        self.assertIn("candidate.txt", git(self.worktree, "status", "--short").stdout)
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_lock_timeout_is_journaled_without_releasing_other_owner(self) -> None:
+        holder = self.manager.acquire_main_integration(
+            task_id="TASK-OTHER",
+            run_id="run-other",
+            metadata={"pid": os.getpid()},
+        )
+        self.addCleanup(self.manager.release, holder)
+
+        result = self.integrator().run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "lock_timeout")
+        status = self.manager.main_integration_status()
+        self.assertTrue(status.locked)
+        self.assertEqual(status.metadata["owner_task_id"], "TASK-OTHER")
+
+    def test_lock_timeout_emits_typed_blocked_stage_transition(self) -> None:
+        transitions = []
+        machine = RunLifecycleStateMachine(transitions.append)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REVIEW,
+        ):
+            machine.transition(stage, reason="setup")
+        holder = self.manager.acquire_main_integration(
+            task_id="TASK-OTHER",
+            run_id="run-other",
+            metadata={"pid": os.getpid()},
+        )
+        self.addCleanup(self.manager.release, holder)
+
+        result = self.integrator(stage_machine=machine).run()
+
+        self.assertEqual(result.reason, "lock_timeout")
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertEqual(transitions[-1].failure, StageFailure.BLOCKED)
+
+    def test_two_same_run_recoveries_atomically_claim_one_stale_window(self) -> None:
+        self.advance_main()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+        active = 0
+        maximum = 0
+        calls = 0
+        guard = threading.Lock()
+
+        def slow_success(command, **kwargs):
+            nonlocal active, maximum, calls
+            with guard:
+                active += 1
+                calls += 1
+                maximum = max(maximum, active)
+            try:
+                threading.Event().wait(0.05)
+                return subprocess.CompletedProcess(command, 0)
+            finally:
+                with guard:
+                    active -= 1
+
+        integrators = [
+            self.integrator(
+                commands=("check",),
+                integration_keys=("completion.commands[0]",),
+                main_keys=(),
+                executor=slow_success,
+                timeout_seconds=2,
+            )
+            for _ in range(2)
+        ]
+        results: list[object] = []
+        threads = [
+            threading.Thread(target=lambda item=item: results.append(item.run()))
+            for item in integrators
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(maximum, 1)
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.completed for result in results))
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_two_same_run_recoveries_refresh_expired_lease_atomically(self) -> None:
+        self.advance_main()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={
+                "pid": os.getpid(),
+                "lease_seconds": 60,
+                "heartbeat_at": "2000-01-01T00:00:00+00:00",
+            },
+        )
+        active = 0
+        maximum = 0
+        calls = 0
+        guard = threading.Lock()
+
+        def slow_success(command, **kwargs):
+            nonlocal active, maximum, calls
+            with guard:
+                active += 1
+                calls += 1
+                maximum = max(maximum, active)
+            try:
+                threading.Event().wait(0.05)
+                return subprocess.CompletedProcess(command, 0)
+            finally:
+                with guard:
+                    active -= 1
+
+        integrators = [
+            self.integrator(
+                commands=("check",),
+                integration_keys=("completion.commands[0]",),
+                main_keys=(),
+                executor=slow_success,
+                timeout_seconds=2,
+            )
+            for _ in range(2)
+        ]
+        results: list[object] = []
+        threads = [
+            threading.Thread(target=lambda item=item: results.append(item.run()))
+            for item in integrators
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(maximum, 1)
+        self.assertEqual(calls, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.completed for result in results))
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_release_is_fenced_to_acquired_lock_generation(self) -> None:
+        self.advance_main()
+        replacement_token = ""
+
+        def replace_lock(command, **kwargs):
+            nonlocal replacement_token
+            acquired = self.manager.main_integration_status()
+            old_token = str(acquired.metadata["fencing_token"])
+            self.manager.release_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                fencing_token=old_token,
+            )
+            replacement = self.manager.acquire_main_integration(
+                task_id="TASK-01",
+                run_id="run-1",
+                metadata={"pid": os.getpid()},
+            )
+            replacement_token = str(replacement.metadata["fencing_token"])
+            self.assertNotEqual(replacement_token, old_token)
+            return subprocess.CompletedProcess(command, 1)
+
+        try:
+            with self.assertRaises(LockFencingMismatch):
+                self.integrator(
+                    commands=("replace-lock",),
+                    integration_keys=("completion.commands[0]",),
+                    main_keys=(),
+                    executor=replace_lock,
+                ).run()
+            status = self.manager.main_integration_status()
+            self.assertTrue(status.locked)
+            self.assertEqual(status.metadata["fencing_token"], replacement_token)
+        finally:
+            if self.manager.main_integration_status().locked:
+                self.manager.release(
+                    self.manager.current_lock(MAIN_INTEGRATION_LOCK_NAME)
+                )
+
+    def test_stale_owned_lock_recovers_after_main_ref_moved_without_duplicate_merge(
+        self,
+    ) -> None:
+        self.advance_main()
+        git(self.worktree, "merge", "--no-edit", "main")
+        git(self.repo, "merge", "--ff-only", "worker/TASK-01")
+        main_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        commit_count = git(self.repo, "rev-list", "--count", "main").stdout.strip()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+
+        result = self.integrator(integration_keys=()).run()
+
+        self.assertTrue(result.completed)
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.outcome, "branch_already_merged")
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD").stdout.strip(), main_head)
+        self.assertEqual(
+            git(self.repo, "rev-list", "--count", "main").stdout.strip(),
+            commit_count,
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_stale_owned_lock_recovers_refreshed_branch_before_main_move(self) -> None:
+        self.advance_main()
+        git(self.worktree, "merge", "--no-edit", "main")
+        refreshed_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+
+        result = self.integrator().run()
+
+        self.assertTrue(result.completed)
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.outcome, "merged")
+        self.assertEqual(result.refreshed_head, refreshed_head)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), refreshed_head
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_main_verification_failure_records_moved_ref_for_recovery(self) -> None:
+        main_before = self.advance_main()
+
+        result = self.integrator(
+            commands=("true", "false"),
+        ).run()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertNotEqual(result.main_after, main_before)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), result.main_after
+        )
+        self.assertTrue(
+            git(
+                self.repo,
+                "merge-base",
+                "--is-ancestor",
+                result.refreshed_head,
+                "main",
+            ).returncode
+            == 0
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_non_main_checkout_is_blocked_without_moving_configured_ref(self) -> None:
+        main_head = self.advance_main()
+        git(self.repo, "checkout", "-b", "side")
+        side_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.integrator().run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "main_worktree_unavailable")
+        self.assertEqual(git(self.repo, "rev-parse", "main").stdout.strip(), main_head)
+        self.assertEqual(git(self.repo, "rev-parse", "side").stdout.strip(), side_head)
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_fast_forward_uses_verified_sha_if_candidate_ref_moves(self) -> None:
+        self.advance_main()
+        attacker_worktree = Path(self.directory.name) / "attacker-worktree"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "attacker",
+            str(attacker_worktree),
+            self.candidate_head,
+        )
+        (attacker_worktree / "unverified.txt").write_text(
+            "unverified\n", encoding="utf-8"
+        )
+        git(attacker_worktree, "add", "unverified.txt")
+        git(attacker_worktree, "commit", "-m", "unverified")
+        unverified_head = git(attacker_worktree, "rev-parse", "HEAD").stdout.strip()
+        integrator = self.integrator()
+        original_git = integrator._git
+        moved = False
+
+        def move_candidate_before_fast_forward(worktree, *args):
+            nonlocal moved
+            if (
+                not moved
+                and worktree == self.repo
+                and args[:2] == ("merge", "--ff-only")
+            ):
+                moved = True
+                git(
+                    self.repo,
+                    "update-ref",
+                    "refs/heads/worker/TASK-01",
+                    unverified_head,
+                )
+            return original_git(worktree, *args)
+
+        with patch.object(
+            integrator,
+            "_git",
+            side_effect=move_candidate_before_fast_forward,
+        ):
+            result = integrator.run()
+
+        self.assertTrue(result.completed)
+        self.assertTrue(moved)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "main").stdout.strip(), result.refreshed_head
+        )
+        self.assertNotEqual(result.refreshed_head, unverified_head)
+        self.assertNotEqual(
+            git(
+                self.repo,
+                "merge-base",
+                "--is-ancestor",
+                unverified_head,
+                "main",
+                check=False,
+            ).returncode,
+            0,
+        )
+
+    def test_jobs_two_integration_windows_are_serialized(self) -> None:
+        second_worktree = Path(self.directory.name) / "second-worktree"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/TASK-02",
+            str(second_worktree),
+            self.base,
+        )
+        (second_worktree / "second.txt").write_text("second\n", encoding="utf-8")
+        git(second_worktree, "add", "second.txt")
+        git(second_worktree, "commit", "-m", "second candidate")
+        second_head = git(second_worktree, "rev-parse", "HEAD").stdout.strip()
+        second_lock = self.manager.acquire(
+            "TASK-02",
+            "run-2",
+            metadata=run_lock_metadata(self.repo, "TASK-02", "run-2"),
+        )
+        claim_worker_workspace(
+            self.manager,
+            self.store,
+            task_id="TASK-02",
+            run_id="run-2",
+            branch="worker/TASK-02",
+            worktree=second_worktree,
+            repo=self.repo,
+            base_commit=self.base,
+            fencing_token=str(second_lock.metadata["fencing_token"]),
+        )
+        active = 0
+        maximum = 0
+        guard = threading.Lock()
+
+        def slow_success(command, **kwargs):
+            nonlocal active, maximum
+            with guard:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                threading.Event().wait(0.05)
+                return subprocess.CompletedProcess(command, 0)
+            finally:
+                with guard:
+                    active -= 1
+
+        first = self.integrator(
+            commands=("check",),
+            integration_keys=("completion.commands[0]",),
+            main_keys=(),
+            executor=slow_success,
+            timeout_seconds=2,
+        )
+        second = Integrator(
+            repo=self.repo,
+            main_branch="main",
+            candidate=CandidateRecord(
+                head_commit=second_head,
+                base_main=self.base,
+                changed_paths=("second.txt",),
+                source="derived",
+                branch="worker/TASK-02",
+                worktree=second_worktree,
+            ),
+            completion_commands=("check",),
+            integration_keys=("completion.commands[0]",),
+            verify_on_main_keys=(),
+            lock_manager=self.manager,
+            run_store=self.store,
+            run_id="run-2",
+            task_id="TASK-02",
+            log_dir=self.repo / ".vibe-loop" / "integration-2",
+            timeout_seconds=2,
+            poll_interval_seconds=0.01,
+            executor=slow_success,
+        )
+        results: list[object] = []
+
+        threads = [
+            threading.Thread(target=lambda item=item: results.append(item.run()))
+            for item in (first, second)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(maximum, 1)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.completed for result in results))
+        self.assertFalse(self.manager.main_integration_status().locked)
 
 
 class ReviewRouterTests(unittest.TestCase):
