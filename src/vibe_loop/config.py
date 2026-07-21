@@ -232,9 +232,18 @@ AUTOPILOT_CONFIG_KEYS = (
             "planning_max_launches_per_day",
             "planning_unproductive_threshold",
             "worktree_disposition",
+            "disk_reserve",
         }
     )
     | AUTOPILOT_COMMAND_KEYS
+)
+DISK_RESERVE_CONFIG_KEYS = frozenset(
+    {
+        "min_free_bytes",
+        "min_free_fraction",
+        "min_free_inodes",
+        "min_free_inode_fraction",
+    }
 )
 # Six hours between planning attempts once planning stops producing actionable
 # work, capped at four launches a rolling day: an analysis plus authoring pass
@@ -680,6 +689,37 @@ class SupervisionConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class DiskReserveConfig:
+    """Per-project overrides for the native disk-health capacity floors.
+
+    Each field is ``None`` when unset, so the native AUTO-15 default applies and
+    a configuration-free project keeps its reviewed behavior. The disk-health
+    check blocks a target only when *both* the absolute and the proportional
+    floor of an axis are exhausted, so pairing a positive reserve on one axis
+    with a zero reserve on the other can never block; that combination is
+    rejected as contradictory during validation.
+    """
+
+    min_free_bytes: int | None = None
+    min_free_fraction: float | None = None
+    min_free_inodes: int | None = None
+    min_free_inode_fraction: float | None = None
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "min_free_bytes": self.min_free_bytes,
+            "min_free_fraction": self.min_free_fraction,
+            "min_free_inodes": self.min_free_inodes,
+            "min_free_inode_fraction": self.min_free_inode_fraction,
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class AutopilotConfig:
     jobs: int | None = None
     interval_seconds: float | None = None
@@ -698,6 +738,9 @@ class AutopilotConfig:
     troubleshoot_command: str | None = None
     planning_command: str | None = None
     idle_wake_command: str | None = None
+    disk_reserve: DiskReserveConfig = dataclasses.field(
+        default_factory=DiskReserveConfig
+    )
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -728,6 +771,7 @@ class AutopilotConfig:
             "troubleshoot_command": self.troubleshoot_command,
             "planning_command": self.planning_command,
             "idle_wake_command": self.idle_wake_command,
+            "disk_reserve": self.disk_reserve.to_json(),
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -1961,8 +2005,71 @@ def parse_autopilot(data: object) -> AutopilotConfig:
         ),
         planning_command=optional_nonempty_string(table.get("planning_command")),
         idle_wake_command=optional_nonempty_string(table.get("idle_wake_command")),
+        disk_reserve=parse_disk_reserve(table.get("disk_reserve", {})),
         explicit_keys=explicit_keys,
     )
+
+
+def parse_disk_reserve(data: object) -> DiskReserveConfig:
+    table = expect_table(data, "autopilot.disk_reserve")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - DISK_RESERVE_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(
+            "autopilot.disk_reserve contains unsupported keys: "
+            + ", ".join(unknown_keys)
+        )
+    min_free_bytes = optional_nonnegative_int(
+        table.get("min_free_bytes"), "autopilot.disk_reserve.min_free_bytes"
+    )
+    min_free_fraction = optional_fraction(
+        table.get("min_free_fraction"), "autopilot.disk_reserve.min_free_fraction"
+    )
+    min_free_inodes = optional_nonnegative_int(
+        table.get("min_free_inodes"), "autopilot.disk_reserve.min_free_inodes"
+    )
+    min_free_inode_fraction = optional_fraction(
+        table.get("min_free_inode_fraction"),
+        "autopilot.disk_reserve.min_free_inode_fraction",
+    )
+    reject_contradictory_reserve_pair(
+        ("min_free_bytes", min_free_bytes),
+        ("min_free_fraction", min_free_fraction),
+        explicit_keys,
+    )
+    reject_contradictory_reserve_pair(
+        ("min_free_inodes", min_free_inodes),
+        ("min_free_inode_fraction", min_free_inode_fraction),
+        explicit_keys,
+    )
+    return DiskReserveConfig(
+        min_free_bytes=min_free_bytes,
+        min_free_fraction=min_free_fraction,
+        min_free_inodes=min_free_inodes,
+        min_free_inode_fraction=min_free_inode_fraction,
+        explicit_keys=explicit_keys,
+    )
+
+
+def reject_contradictory_reserve_pair(
+    absolute: tuple[str, int | None],
+    proportional: tuple[str, float | None],
+    explicit_keys: frozenset[str],
+) -> None:
+    # A blocker fires only when both the absolute and the proportional floor of
+    # an axis are exhausted, so a positive reserve paired with an explicit zero
+    # reserve on the same axis can never block. Flag that only when the operator
+    # explicitly configured both values; an omitted companion keeps its native
+    # positive default and is not a contradiction.
+    (name_a, value_a) = absolute
+    (name_b, value_b) = proportional
+    if name_a not in explicit_keys or name_b not in explicit_keys:
+        return
+    if (value_a == 0) != (value_b == 0):
+        raise ValueError(
+            f"autopilot.disk_reserve.{name_a} and .{name_b} are contradictory: "
+            "a positive reserve paired with a zero reserve can never block launch"
+        )
 
 
 def parse_locks(data: object) -> LockConfig:
@@ -2290,6 +2397,18 @@ def nonnegative_int(value: object, default: int, name: str) -> int:
     if parsed < 0:
         raise ValueError(f"{name} must be a non-negative integer")
     return parsed
+
+
+def optional_nonnegative_int(value: object, name: str) -> int | None:
+    if value is None:
+        return None
+    return nonnegative_int(value, 0, name)
+
+
+def optional_fraction(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    return bounded_float(value, 0.0, name, minimum=0.0, maximum=1.0)
 
 
 def nonnegative_float(value: object, default: float, name: str) -> float:

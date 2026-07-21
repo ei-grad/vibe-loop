@@ -661,6 +661,117 @@ class ConfigTests(unittest.TestCase):
                         load_config(repo)
                     self.assertIn(expected, str(caught.exception))
 
+    def test_autopilot_disk_reserve_parses_and_exposes_effective_values(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot.disk_reserve]\n"
+                "min_free_bytes = 8589934592\n"
+                "min_free_fraction = 0.05\n"
+                "min_free_inodes = 50000\n"
+                "min_free_inode_fraction = 0.03\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        reserve = config.autopilot.disk_reserve
+        self.assertEqual(reserve.min_free_bytes, 8589934592)
+        self.assertEqual(reserve.min_free_fraction, 0.05)
+        self.assertEqual(reserve.min_free_inodes, 50000)
+        self.assertEqual(reserve.min_free_inode_fraction, 0.03)
+        payload = config.autopilot.to_json()["disk_reserve"]
+        self.assertEqual(payload["min_free_bytes"], 8589934592)
+        self.assertEqual(payload["min_free_fraction"], 0.05)
+        self.assertEqual(
+            sorted(payload["explicit_keys"]),
+            [
+                "min_free_bytes",
+                "min_free_fraction",
+                "min_free_inode_fraction",
+                "min_free_inodes",
+            ],
+        )
+
+    def test_autopilot_disk_reserve_defaults_to_unset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+
+        reserve = config.autopilot.disk_reserve
+        self.assertIsNone(reserve.min_free_bytes)
+        self.assertIsNone(reserve.min_free_fraction)
+        self.assertIsNone(reserve.min_free_inodes)
+        self.assertIsNone(reserve.min_free_inode_fraction)
+        self.assertEqual(reserve.explicit_keys, frozenset())
+
+    def test_autopilot_disk_reserve_rejects_invalid_values(self) -> None:
+        cases = [
+            (
+                "min_free_bytes = -1\n",
+                "autopilot.disk_reserve.min_free_bytes",
+            ),
+            (
+                'min_free_bytes = "lots"\n',
+                "autopilot.disk_reserve.min_free_bytes",
+            ),
+            (
+                "min_free_fraction = -0.1\n",
+                "autopilot.disk_reserve.min_free_fraction",
+            ),
+            (
+                "min_free_fraction = 1.5\n",
+                "autopilot.disk_reserve.min_free_fraction must be between 0.0 and 1.0",
+            ),
+            (
+                "min_free_fraction = nan\n",
+                "autopilot.disk_reserve.min_free_fraction must be finite",
+            ),
+            (
+                "min_free_inodes = -5\n",
+                "autopilot.disk_reserve.min_free_inodes",
+            ),
+            (
+                "unsupported = 1\n",
+                "autopilot.disk_reserve contains unsupported keys: unsupported",
+            ),
+            (
+                "min_free_bytes = 8589934592\nmin_free_fraction = 0.0\n",
+                "are contradictory",
+            ),
+            (
+                "min_free_inodes = 0\nmin_free_inode_fraction = 0.02\n",
+                "are contradictory",
+            ),
+        ]
+        for toml, expected in cases:
+            with self.subTest(toml=toml):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[autopilot.disk_reserve]\n" + toml,
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(ValueError) as caught:
+                        load_config(repo)
+                    self.assertIn(expected, str(caught.exception))
+
+    def test_autopilot_disk_reserve_allows_fully_disabled_axis(self) -> None:
+        # Both floors of an axis set to zero is a consistent (fully disabled)
+        # configuration, not a contradiction.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot.disk_reserve]\n"
+                "min_free_bytes = 0\n"
+                "min_free_fraction = 0.0\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.autopilot.disk_reserve.min_free_bytes, 0)
+        self.assertEqual(config.autopilot.disk_reserve.min_free_fraction, 0.0)
+
     def test_autopilot_maintenance_keys_are_forbidden_in_generated_profiles(
         self,
     ) -> None:

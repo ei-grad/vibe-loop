@@ -3441,6 +3441,38 @@ class DiskHealthThresholds:
 DEFAULT_DISK_HEALTH_THRESHOLDS = DiskHealthThresholds()
 
 
+def disk_health_thresholds_for(config: VibeConfig) -> DiskHealthThresholds:
+    """Resolve the effective disk-health floors for a project's cycle.
+
+    Each ``[autopilot.disk_reserve]`` override replaces one native default; an
+    unset override keeps the reviewed AUTO-15 value, so a configuration-free
+    project's thresholds are unchanged.
+    """
+    reserve = config.autopilot.disk_reserve
+    return DiskHealthThresholds(
+        min_free_bytes=(
+            AUTOPILOT_DISK_MIN_FREE_BYTES
+            if reserve.min_free_bytes is None
+            else reserve.min_free_bytes
+        ),
+        min_free_fraction=(
+            AUTOPILOT_DISK_MIN_FREE_FRACTION
+            if reserve.min_free_fraction is None
+            else reserve.min_free_fraction
+        ),
+        min_free_inodes=(
+            AUTOPILOT_DISK_MIN_FREE_INODES
+            if reserve.min_free_inodes is None
+            else reserve.min_free_inodes
+        ),
+        min_free_inode_fraction=(
+            AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION
+            if reserve.min_free_inode_fraction is None
+            else reserve.min_free_inode_fraction
+        ),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class DiskCapacitySample:
     """A capacity reading for one filesystem path.
@@ -3605,16 +3637,21 @@ def run_disk_health(
     *,
     cycle_id: str,
     probe: DiskCapacityProbe = statvfs_capacity_probe,
-    thresholds: DiskHealthThresholds = DEFAULT_DISK_HEALTH_THRESHOLDS,
+    thresholds: DiskHealthThresholds | None = None,
 ) -> DiskHealthCycleResult:
     """Run the native, read-only disk-health check for the cycle.
 
     Probes the repository and state directory for free-space/inode pressure
     against bounded thresholds. The probe is dependency-injected so tests never
-    depend on real disk state. This step never deletes, truncates, or otherwise
-    mutates anything: it only reports pressure and, on a genuine capacity
-    blocker, signals the cycle to withhold launch (PRD-AUT-006).
+    depend on real disk state. Thresholds default to the project's configured
+    ``[autopilot.disk_reserve]`` floors (native defaults when unset); an
+    explicit ``thresholds`` argument overrides them for focused tests. This step
+    never deletes, truncates, or otherwise mutates anything: it only reports
+    pressure and, on a genuine capacity blocker, signals the cycle to withhold
+    launch (PRD-AUT-006).
     """
+    if thresholds is None:
+        thresholds = disk_health_thresholds_for(config)
     targets: list[DiskCapacityTarget] = []
     for label, path in (("repo", config.repo), ("state", config.state_path)):
         try:

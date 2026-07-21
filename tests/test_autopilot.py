@@ -22,6 +22,7 @@ from vibe_loop.autopilot import (
     AutopilotCycleResult,
     DiskCapacitySample,
     DiskHealthCycleResult,
+    disk_health_thresholds_for,
     run_disk_health,
     statvfs_capacity_probe,
     AutopilotTerminationRequested,
@@ -6458,6 +6459,52 @@ class DiskHealthCheckTests(unittest.TestCase):
         self.assertEqual(record["cycle_id"], "c1")
         self.assertIn("thresholds", record)
         self.assertEqual(len(record["targets"]), 2)
+
+    def _run_with_toml(self, probe, extra_toml: str) -> DiskHealthCycleResult:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=extra_toml,
+            )
+            config = load_config(repo)
+            return run_disk_health(config, cycle_id="c1", probe=probe)
+
+    def test_configured_reserve_blocks_sample_that_default_allows(self) -> None:
+        # 3.4 GiB free on a 242 GiB volume clears the native 512 MiB floor, so
+        # the default cycle records ok. An 8 GiB project reserve turns the same
+        # sample into a genuine capacity blocker (matches the task evidence).
+        sample = _capacity_probe(total_bytes=242 * GIB, free_bytes=int(3.4 * GIB))
+
+        default_result = self._run(sample)
+        self.assertEqual(default_result.status, DISK_HEALTH_OK)
+
+        configured_result = self._run_with_toml(
+            sample,
+            "[autopilot.disk_reserve]\nmin_free_bytes = 8589934592\n",
+        )
+        self.assertEqual(configured_result.status, DISK_HEALTH_CRITICAL)
+        self.assertEqual(configured_result.blocker, AUTOPILOT_DISK_CAPACITY_BLOCKER)
+        self.assertIn("free_bytes", configured_result.targets[0].pressure)
+        record = configured_result.to_record(Path("/repo"))
+        self.assertEqual(record["thresholds"]["min_free_bytes"], 8589934592)
+
+    def test_configured_thresholds_resolve_defaults_for_unset_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[autopilot.disk_reserve]\nmin_free_bytes = 8589934592\n",
+            )
+            thresholds = disk_health_thresholds_for(load_config(repo))
+
+        self.assertEqual(thresholds.min_free_bytes, 8589934592)
+        # Unset axes keep the reviewed AUTO-15 defaults.
+        self.assertEqual(thresholds.min_free_fraction, 0.02)
+        self.assertEqual(thresholds.min_free_inodes, 10_000)
+        self.assertEqual(thresholds.min_free_inode_fraction, 0.02)
 
     def test_default_probe_reads_real_paths(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

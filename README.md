@@ -641,6 +641,27 @@ Filesystems that do not expose inode counts skip the inode check. A genuine
 capacity blocker withholds launch (`autopilot_disk_capacity_low`); the check
 never deletes or truncates anything, and an unreadable path is recorded as a
 non-blocking observation rather than a blocker.
+
+Heavy repositories can raise these floors per project without changing the
+global defaults (which would create false positives for small/light repos). An
+`[autopilot.disk_reserve]` table overrides any of the four floors; an unset
+value keeps its native default, and the effective thresholds appear in every
+`autopilot_disk_health` record and in `vibe-loop doctor` output:
+
+```toml
+[autopilot.disk_reserve]
+min_free_bytes = 8589934592        # 8 GiB absolute free-space floor
+min_free_fraction = 0.02           # 2% proportional free-space floor
+min_free_inodes = 10000            # absolute free-inode floor
+min_free_inode_fraction = 0.02     # 2% proportional free-inode floor
+```
+
+Values must be non-negative and finite, fractions must fall in `[0.0, 1.0]`, and
+a positive absolute reserve paired with an explicit zero proportional reserve on
+the same axis (or the reverse) is rejected as contradictory because the paired
+floors can then never both be exhausted. With the 8 GiB byte floor above, a
+sample of 3.4 GiB free on a 242 GiB volume blocks launch even though the native
+512 MiB floor would record it as `ok`.
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, an unavailable agent command, or exhausted disk/inode capacity. `--once` runs one cycle. Without `--interval`, it drains runnable

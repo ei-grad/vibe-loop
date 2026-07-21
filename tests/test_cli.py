@@ -2119,6 +2119,34 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["completion"]["commands_configured"], 1)
         self.assertTrue(payload["completion"]["commands_redacted"])
 
+    def test_doctor_exposes_configured_disk_reserve(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot.disk_reserve]\n"
+                "min_free_bytes = 8589934592\n"
+                "min_free_fraction = 0.05\n",
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr.getvalue(), "")
+        reserve = payload["autopilot"]["disk_reserve"]
+        self.assertEqual(reserve["min_free_bytes"], 8589934592)
+        self.assertEqual(reserve["min_free_fraction"], 0.05)
+        self.assertIsNone(reserve["min_free_inodes"])
+        self.assertEqual(
+            sorted(reserve["explicit_keys"]),
+            ["min_free_bytes", "min_free_fraction"],
+        )
+
     def test_doctor_reports_spec_diagnostics_without_running_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
