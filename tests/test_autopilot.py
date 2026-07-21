@@ -6474,7 +6474,7 @@ class DiskHealthCheckTests(unittest.TestCase):
         # stubbed here to stand in for the Windows byte-capacity backend.
         usage = mock.Mock(total=100 * GIB, free=50 * GIB)
         with (
-            mock.patch.object(os, "statvfs", None),
+            mock.patch.object(os, "statvfs", None, create=True),
             mock.patch("vibe_loop.autopilot.shutil.disk_usage", return_value=usage),
         ):
             sample = statvfs_capacity_probe(Path("/whatever"))
