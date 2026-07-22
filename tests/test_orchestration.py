@@ -4362,6 +4362,81 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 [record.get("record_type") for record in records],
             )
 
+    def test_runner_rejects_head_change_between_preflight_and_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(
+                RunContractJournalTests.worker_owned_config(repo, agent)
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+            manager, store, token = acquire_run(
+                repo,
+                task.task_id,
+                "prior-run",
+                store=runner.run_store,
+            )
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock(task.task_id))
+            original_claim = claim_worker_workspace
+
+            def mutate_then_claim(*args, **kwargs):
+                (workspace.worktree / "raced.txt").write_text(
+                    "preserve raced commit\n", encoding="utf-8"
+                )
+                git(workspace.worktree, "add", "raced.txt")
+                git(workspace.worktree, "commit", "-m", "race workspace claim")
+                return original_claim(*args, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch(
+                        "vibe_loop.workers.claim_worker_workspace",
+                        side_effect=mutate_then_claim,
+                    ):
+                        with patch("vibe_loop.runner.run_streaming_command") as launch:
+                            with self.assertRaises(WorkspaceProvisionError) as raised:
+                                runner.run_task(task)
+
+            self.assertEqual(raised.exception.code, "workspace_changed_during_claim")
+            launch.assert_not_called()
+            self.assertTrue((workspace.worktree / "raced.txt").exists())
+            claims = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_claim"
+            ]
+            self.assertEqual([record["run_id"] for record in claims], ["prior-run"])
+            rejected = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("decision") == "rejected"
+            ]
+            self.assertEqual(rejected[-1]["reason"], "workspace_changed_during_claim")
+            self.assertFalse(rejected[-1]["worker_launch_allowed"])
+
     def test_recovery_rejects_latest_foreign_ownership_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

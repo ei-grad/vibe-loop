@@ -77,6 +77,7 @@ class WorkspaceClaim:
     current_branch: str
     dirty: bool
     dirty_summary: tuple[str, ...]
+    dirty_fingerprint: str = ""
     started_at: str = ""
     claimed_at: str = dataclasses.field(default_factory=utc_now_iso)
 
@@ -100,6 +101,7 @@ class WorkspaceClaim:
             current_branch=optional_string(payload.get("current_branch")) or "",
             dirty=optional_bool(payload.get("dirty")),
             dirty_summary=optional_string_tuple(payload.get("dirty_summary")),
+            dirty_fingerprint=(optional_string(payload.get("dirty_fingerprint")) or ""),
             started_at=optional_string(payload.get("started_at")) or "",
             claimed_at=(
                 optional_string(payload.get("claimed_at"))
@@ -123,6 +125,7 @@ class WorkspaceClaim:
             "current_branch": self.current_branch,
             "dirty": self.dirty,
             "dirty_summary": list(self.dirty_summary),
+            "dirty_fingerprint": self.dirty_fingerprint,
             "started_at": self.started_at,
             "claimed_at": self.claimed_at,
         }
@@ -682,6 +685,9 @@ def claim_worker_workspace(
     base_commit: str = "",
     fencing_token: str | None = None,
     ignored_dirty_paths: Iterable[Path] = (),
+    expected_head_commit: str = "",
+    expected_dirty_fingerprint: str | None = None,
+    required_ancestor_base: str = "",
 ) -> WorkspaceClaim:
     if not branch:
         raise WorkspaceClaimError(
@@ -706,6 +712,40 @@ def claim_worker_workspace(
         started_at=optional_string(lock.metadata.get("started_at")) or "",
         ignored_dirty_paths=ignored_dirty_paths,
     )
+    if expected_head_commit and claim.head_commit != expected_head_commit:
+        raise WorkspaceClaimError(
+            "workspace_snapshot_changed",
+            "workspace claim refused: HEAD changed after workspace preflight",
+            details={
+                "expected_head_commit": expected_head_commit,
+                "actual_head_commit": claim.head_commit,
+            },
+        )
+    if (
+        expected_dirty_fingerprint is not None
+        and claim.dirty_fingerprint != expected_dirty_fingerprint
+    ):
+        raise WorkspaceClaimError(
+            "workspace_snapshot_changed",
+            "workspace claim refused: dirty state changed after workspace preflight",
+        )
+    if required_ancestor_base:
+        ancestry = run_git(
+            claim.worktree,
+            "merge-base",
+            "--is-ancestor",
+            required_ancestor_base,
+            claim.head_commit,
+        )
+        if ancestry.returncode != 0:
+            raise WorkspaceClaimError(
+                "workspace_snapshot_changed",
+                "workspace claim refused: HEAD does not contain the selected base",
+                details={
+                    "selected_base": required_ancestor_base,
+                    "head_commit": claim.head_commit,
+                },
+            )
     updated_metadata = dict(lock.metadata)
     updated_metadata["workspace"] = claim.to_json()
     lock_manager.update(lock, updated_metadata)
@@ -794,7 +834,10 @@ def inspect_workspace_claim(
             },
         )
     head_commit = git_text(worktree, "rev-parse", "--verify", "HEAD")
-    status_lines = git_status_lines(worktree, ignored_dirty_paths=ignored_dirty_paths)
+    status_lines, dirty_fingerprint = git_dirty_snapshot(
+        worktree,
+        ignored_dirty_paths=ignored_dirty_paths,
+    )
     return WorkspaceClaim(
         task_id=task_id,
         run_id=run_id,
@@ -805,6 +848,7 @@ def inspect_workspace_claim(
         current_branch=current_branch,
         dirty=bool(status_lines),
         dirty_summary=tuple(status_lines[:DIRTY_SUMMARY_LIMIT]),
+        dirty_fingerprint=dirty_fingerprint,
         started_at=started_at,
     )
 

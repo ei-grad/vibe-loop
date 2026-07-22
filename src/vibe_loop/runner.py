@@ -145,6 +145,7 @@ from vibe_loop.workers import (
     ActiveRunState,
     WorkerView,
     WorkspaceClaim,
+    WorkspaceClaimError,
     active_run_is_live,
     build_worker_views,
     git_dirty_snapshot,
@@ -1321,6 +1322,7 @@ class VibeRunner:
         # driver so the verdict is written exactly once.
         self._exhausted_recovery_results: dict[str, RunResult] = {}
         self._durably_exhausted_recovery_tasks: set[str] = set()
+        self._workspace_deferred_recovery_tasks: set[str] = set()
         self._review_concurrency = ReviewConcurrencyBudget(
             config.orchestration.reviewer_concurrency_budget
         )
@@ -3717,6 +3719,7 @@ class VibeRunner:
 
     def pending_recovery_contexts(self) -> list[RecoveryContext]:
         contexts: list[RecoveryContext] = []
+        self._workspace_deferred_recovery_tasks.clear()
         for record in self.run_store.pending_recovery_records():
             if record.get("charged_attempt_exhausted") is True:
                 task_id = str(record.get("task_id") or "")
@@ -3787,6 +3790,15 @@ class VibeRunner:
                     "is required"
                 )
                 continue
+            if context.workspace_state_fingerprint:
+                current_fingerprint = workspace_retry_state_fingerprint(
+                    repo=self.config.repo,
+                    main_branch=self.config.main_branch,
+                    recovery=context,
+                )
+                if current_fingerprint == context.workspace_state_fingerprint:
+                    self._workspace_deferred_recovery_tasks.add(context.task_id)
+                    continue
             contexts.append(context)
         return contexts
 
@@ -3811,6 +3823,7 @@ class VibeRunner:
         while max_slices <= 0 or len(results) < max_slices:
             pending_contexts = self.pending_recovery_contexts()
             skipped.update(self._durably_exhausted_recovery_tasks)
+            skipped.update(self._workspace_deferred_recovery_tasks)
             pending = next(
                 (
                     recovery
@@ -3945,6 +3958,7 @@ class VibeRunner:
 
         pending_contexts = self.pending_recovery_contexts()
         skipped.update(self._durably_exhausted_recovery_tasks)
+        skipped.update(self._workspace_deferred_recovery_tasks)
         for recovery in pending_contexts:
             if max_slices > 0 and len(results) >= max_slices:
                 break
@@ -4378,6 +4392,7 @@ class VibeRunner:
         outcome: str = "",
         blocker: str = "",
         retry_disposition: str = "",
+        workspace_state_fingerprint: str = "",
     ) -> None:
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_recovery(
@@ -4397,6 +4412,7 @@ class VibeRunner:
                     "recovery_run_id": recovery_run_id,
                     "blocker": blocker,
                     "retry_disposition": retry_disposition,
+                    "workspace_state_fingerprint": workspace_state_fingerprint,
                 },
             )
         )
@@ -4559,11 +4575,19 @@ class VibeRunner:
                 "unknown-run recovery deferred before worker launch: "
                 f"{recovery.task_id}: {exc.code}"
             )
+            workspace_state_fingerprint = ""
+            if exc.retry_disposition == "defer_until_workspace_changes":
+                workspace_state_fingerprint = workspace_retry_state_fingerprint(
+                    repo=self.config.repo,
+                    main_branch=self.config.main_branch,
+                    recovery=recovery,
+                )
             self.record_recovery_phase(
                 recovery,
                 phase="deferred",
                 blocker=exc.code,
                 retry_disposition=exc.retry_disposition,
+                workspace_state_fingerprint=workspace_state_fingerprint,
             )
             return None
         except (OSError, subprocess.SubprocessError) as exc:
@@ -4847,6 +4871,7 @@ class RecoveryContext:
     git_common_dir: str = ""
     dirty_snapshot: tuple[str, ...] = ()
     dirty_fingerprint: str = ""
+    workspace_state_fingerprint: str = ""
 
 
 def capture_recovery_workspace_snapshot(
@@ -4895,6 +4920,63 @@ def capture_recovery_workspace_snapshot(
     )
 
 
+def workspace_retry_state_fingerprint(
+    *,
+    repo: Path,
+    main_branch: str,
+    recovery: RecoveryContext,
+) -> str:
+    worktree = Path(recovery.worktree).resolve() if recovery.worktree else None
+
+    def git_observation(cwd: Path, *args: str) -> str:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd), *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError:
+            return "unavailable"
+        if result.returncode != 0:
+            return "unavailable"
+        return result.stdout.strip()
+
+    selected_base = git_observation(repo, "rev-parse", "--verify", main_branch)
+    state: dict[str, object] = {
+        "schema_version": 1,
+        "selected_base": selected_base,
+        "expected_branch": recovery.branch,
+        "expected_base": recovery.base_commit,
+        "worktree": str(worktree) if worktree is not None else "",
+    }
+    if worktree is None or not worktree.is_dir():
+        state["workspace_state"] = "missing"
+    else:
+        state.update(
+            {
+                "workspace_state": "present",
+                "branch": git_observation(worktree, "branch", "--show-current"),
+                "head": git_observation(worktree, "rev-parse", "--verify", "HEAD"),
+                "git_common_dir": git_observation(
+                    worktree, "rev-parse", "--git-common-dir"
+                ),
+            }
+        )
+        try:
+            _dirty, dirty_fingerprint = git_dirty_snapshot(worktree)
+        except WorkspaceClaimError:
+            dirty_fingerprint = "unavailable"
+        state["dirty_fingerprint"] = dirty_fingerprint
+    encoded = json.dumps(
+        state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def recovery_context_payload(recovery: RecoveryContext) -> dict[str, object]:
     return {
         "task_id": recovery.task_id,
@@ -4911,6 +4993,7 @@ def recovery_context_payload(recovery: RecoveryContext) -> dict[str, object]:
         "git_common_dir": recovery.git_common_dir,
         "dirty_snapshot": list(recovery.dirty_snapshot),
         "dirty_fingerprint": recovery.dirty_fingerprint,
+        "workspace_state_fingerprint": recovery.workspace_state_fingerprint,
         "transcript_path": recovery.transcript_path,
         "wrapper_log": recovery.wrapper_log,
         "attempt": recovery.attempt,
@@ -4946,6 +5029,11 @@ def recovery_context_from_record(
         value = record.get(key)
         return value if isinstance(value, str) else ""
 
+    workspace_state_fingerprint = text_value("workspace_state_fingerprint")
+    if workspace_state_fingerprint and not SHA256_HEX_RE.fullmatch(
+        workspace_state_fingerprint
+    ):
+        return None
     return RecoveryContext(
         task_id=str(required_strings["task_id"]),
         prior_run_id=str(required_strings["prior_run_id"]),
@@ -4963,6 +5051,7 @@ def recovery_context_from_record(
         git_common_dir=text_value("git_common_dir"),
         dirty_snapshot=tuple(dirty),
         dirty_fingerprint=text_value("dirty_fingerprint"),
+        workspace_state_fingerprint=workspace_state_fingerprint,
     )
 
 

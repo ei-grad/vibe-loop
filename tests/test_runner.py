@@ -3246,6 +3246,140 @@ class LimitWallLoopTests(unittest.TestCase):
 
 
 class TransientWorkerFailureTests(unittest.TestCase):
+    def test_deferred_workspace_recovery_waits_for_state_change(self) -> None:
+        for mode in ("serial", "parallel"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory) / "repo"
+                repo.mkdir()
+                subprocess.run(
+                    ["git", "init", "-b", "main"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "test@example.com"],
+                    cwd=repo,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Test"],
+                    cwd=repo,
+                    check=True,
+                )
+                (repo / "README.md").write_text("base\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "base"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                base = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                dirty, dirty_fingerprint = runner_module.git_dirty_snapshot(repo)
+                recovery = RecoveryContext(
+                    task_id="TASK-01",
+                    prior_run_id="run-1",
+                    prior_classification="unknown",
+                    branch="main",
+                    worktree=str(repo),
+                    head_commit=base,
+                    transcript_path="",
+                    wrapper_log="",
+                    attempt=1,
+                    max_attempts=3,
+                    workspace_claimed=True,
+                    base_commit=base,
+                    git_common_dir=str((repo / ".git").resolve()),
+                    dirty_snapshot=tuple(dirty),
+                    dirty_fingerprint=dirty_fingerprint,
+                )
+                runner = VibeRunner(
+                    VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                )
+                source = MutableTaskSource(
+                    [Task(task_id="TASK-01", title="Task", status="Next", order=1)]
+                )
+                runner._source = source
+                fingerprint = runner_module.workspace_retry_state_fingerprint(
+                    repo=repo,
+                    main_branch="main",
+                    recovery=recovery,
+                )
+                runner.record_recovery_phase(
+                    recovery,
+                    phase="deferred",
+                    blocker="workspace_stale_current_base",
+                    retry_disposition="defer_until_workspace_changes",
+                    workspace_state_fingerprint=fingerprint,
+                )
+                launches: list[RecoveryContext] = []
+
+                def complete_after_wake(
+                    task: Task,
+                    *,
+                    recovery: RecoveryContext | None = None,
+                ) -> RunResult:
+                    assert recovery is not None
+                    launches.append(recovery)
+                    source.mark_done(task.task_id)
+                    return RunResult(
+                        run_id="run-2",
+                        task_id=task.task_id,
+                        classification="completed",
+                        exit_code=0,
+                        log_path=repo / "run-2.log",
+                        start_main=base,
+                        end_main=base,
+                    )
+
+                runner.run_task = complete_after_wake
+                if mode == "serial":
+                    unchanged = runner.run_until_done_serial(max_slices=1)
+                else:
+                    unchanged = runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    )
+
+                self.assertEqual(unchanged, [])
+                self.assertEqual(launches, [])
+                records = runner.run_store.read_records()
+                self.assertFalse(
+                    any(
+                        record.get("record_type") == "task_restart"
+                        for record in records
+                    )
+                )
+                deferred = runner.run_store.pending_recovery_records()[0]
+                self.assertEqual(deferred["attempt"], 1)
+                self.assertEqual(deferred["workspace_state_fingerprint"], fingerprint)
+
+                (repo / "changed.txt").write_text("wake\n", encoding="utf-8")
+                if mode == "serial":
+                    changed = runner.run_until_done_serial(max_slices=1)
+                else:
+                    changed = runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    )
+
+                self.assertEqual(
+                    [result.classification for result in changed], ["completed"]
+                )
+                self.assertEqual(len(launches), 1)
+                self.assertEqual(launches[0].attempt, 1)
+
     def test_is_transient_worker_failure_detects_quota_in_log(self) -> None:
         from vibe_loop.runner import is_transient_worker_failure
 

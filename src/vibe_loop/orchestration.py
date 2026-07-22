@@ -4155,6 +4155,8 @@ WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
         "recovery_head_changed",
         "workspace_base_mismatch",
         "workspace_base_unverified",
+        "workspace_changed_during_claim",
+        "workspace_claim_snapshot_mismatch",
         "workspace_collision",
         "workspace_foreign_owner",
         "workspace_live_owner",
@@ -4180,6 +4182,8 @@ class ProvisionedWorkspace:
     head_commit: str
     owner_run_id: str = ""
     dirty_at_adoption: bool = False
+    dirty_snapshot: tuple[str, ...] = ()
+    dirty_fingerprint: str = ""
 
     def to_record_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -4228,7 +4232,7 @@ class WorkspaceProvisioner:
         recovery_dirty_fingerprint: str = "",
     ) -> ProvisionedWorkspace:
         from vibe_loop.runs import RunLifecycleEvent
-        from vibe_loop.workers import claim_worker_workspace
+        from vibe_loop.workers import WorkspaceClaimError, claim_worker_workspace
 
         branch = ""
         worktree: Path | None = None
@@ -4296,18 +4300,70 @@ class WorkspaceProvisioner:
                     payload=workspace.to_record_payload(),
                 )
             )
-            claim_worker_workspace(
-                self.lock_manager,
-                self.run_store,
-                task_id=task_id,
-                run_id=run_id,
-                branch=workspace.branch,
-                worktree=workspace.worktree,
-                repo=self.repo,
-                base_commit=workspace.base_commit,
-                fencing_token=fencing_token,
-                ignored_dirty_paths=self.ignored_dirty_paths,
-            )
+            try:
+                claim = claim_worker_workspace(
+                    self.lock_manager,
+                    self.run_store,
+                    task_id=task_id,
+                    run_id=run_id,
+                    branch=workspace.branch,
+                    worktree=workspace.worktree,
+                    repo=self.repo,
+                    base_commit=workspace.base_commit,
+                    fencing_token=fencing_token,
+                    ignored_dirty_paths=self.ignored_dirty_paths,
+                    expected_head_commit=workspace.head_commit,
+                    expected_dirty_fingerprint=workspace.dirty_fingerprint,
+                    required_ancestor_base=base_commit,
+                )
+            except WorkspaceClaimError as exc:
+                if exc.code != "workspace_snapshot_changed":
+                    raise
+                failure = WorkspaceProvisionError(
+                    "workspace_changed_during_claim",
+                    "workspace changed after preflight and before durable claim",
+                    details=exc.details,
+                )
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.workspace_preflight(
+                        run_id=run_id,
+                        task_id=task_id,
+                        decision="rejected",
+                        reason=failure.code,
+                        retry_disposition=failure.retry_disposition,
+                        worker_launch_allowed=False,
+                        branch=workspace.branch,
+                        worktree=workspace.worktree,
+                        selected_base=base_commit,
+                        workspace_base=workspace.base_commit,
+                        head_commit=workspace_commit_evidence(
+                            exc.details.get("actual_head_commit")
+                            or exc.details.get("head_commit")
+                        ),
+                    )
+                )
+                raise failure from exc
+            try:
+                self._validate_durable_claim(
+                    claim=claim,
+                    workspace=workspace,
+                    selected_base=base_commit,
+                )
+            except WorkspaceProvisionError as failure:
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.workspace_preflight(
+                        run_id=run_id,
+                        task_id=task_id,
+                        decision="rejected",
+                        reason=failure.code,
+                        retry_disposition=failure.retry_disposition,
+                        worker_launch_allowed=False,
+                        branch=workspace.branch,
+                        worktree=workspace.worktree,
+                        selected_base=base_commit,
+                    )
+                )
+                raise
         except KeyboardInterrupt:
             if workspace.mode == "created":
                 self.compensate_created(workspace)
@@ -4515,7 +4571,17 @@ class WorkspaceProvisioner:
                     base_commit=base_commit,
                 )
                 raise
-            return dataclasses.replace(workspace, head_commit=head_commit)
+            dirty, dirty_fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+            return dataclasses.replace(
+                workspace,
+                head_commit=head_commit,
+                dirty_at_adoption=bool(dirty),
+                dirty_snapshot=tuple(dirty),
+                dirty_fingerprint=dirty_fingerprint,
+            )
         if (
             len(branch_entries) != 1
             or len(path_entries) != 1
@@ -4683,7 +4749,31 @@ class WorkspaceProvisioner:
             head_commit=head,
             owner_run_id=str(owner.get("run_id") or ""),
             dirty_at_adoption=bool(dirty),
+            dirty_snapshot=tuple(dirty),
+            dirty_fingerprint=dirty_fingerprint,
         )
+
+    def _validate_durable_claim(
+        self,
+        *,
+        claim: object,
+        workspace: ProvisionedWorkspace,
+        selected_base: str,
+    ) -> None:
+        from vibe_loop.workers import DIRTY_SUMMARY_LIMIT, WorkspaceClaim
+
+        if not isinstance(claim, WorkspaceClaim) or (
+            claim.branch != workspace.branch
+            or claim.worktree.resolve() != workspace.worktree.resolve()
+            or claim.base_commit != selected_base
+            or claim.head_commit != workspace.head_commit
+            or claim.dirty_fingerprint != workspace.dirty_fingerprint
+            or claim.dirty_summary != workspace.dirty_snapshot[:DIRTY_SUMMARY_LIMIT]
+        ):
+            raise WorkspaceProvisionError(
+                "workspace_claim_snapshot_mismatch",
+                "durable workspace claim does not match validated preflight state",
+            )
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context
