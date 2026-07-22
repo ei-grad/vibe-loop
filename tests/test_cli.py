@@ -10284,9 +10284,7 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
         cwd=repo,
         check=True,
     )
-    subprocess.run(
-        ["git", "add", "PLAN.md", ".vibe-loop.toml"], cwd=repo, check=True
-    )
+    subprocess.run(["git", "add", "PLAN.md", ".vibe-loop.toml"], cwd=repo, check=True)
     subprocess.run(
         ["git", "commit", "--allow-empty", "-m", "baseline"],
         cwd=repo,
@@ -10334,9 +10332,7 @@ def configure_worker_owned_mode(repo: Path) -> None:
         return
     separator = "" if not content or content.endswith("\n\n") else "\n"
     config_path.write_text(
-        content
-        + separator
-        + '[orchestration]\nmode = "worker-owned"\n',
+        content + separator + '[orchestration]\nmode = "worker-owned"\n',
         encoding="utf-8",
     )
 

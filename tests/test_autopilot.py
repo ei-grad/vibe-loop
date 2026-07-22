@@ -8241,8 +8241,7 @@ def configured_repo(
     init_repo(repo)
     (repo / ".vibe-loop.toml").write_text(
         '[agent]\ncommand = "codex exec {prompt}"\n'
-        '[orchestration]\nmode = "worker-owned"\n'
-        + extra_toml,
+        '[orchestration]\nmode = "worker-owned"\n' + extra_toml,
         encoding="utf-8",
     )
     write_plan(repo, rows)

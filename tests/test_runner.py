@@ -6973,9 +6973,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 "review_verdict",
                 "integration_result",
                 "task_provenance_committed",
-            }.isdisjoint(
-                record.get("record_type") for record in records
-            )
+            }.isdisjoint(record.get("record_type") for record in records)
         )
 
     def test_legacy_journal_without_contract_or_stages_remains_worker_owned(
@@ -6996,9 +6994,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 }
             )
 
-            runtime_owned = runner._run_uses_runtime_owned_orchestration(
-                "legacy-run"
-            )
+            runtime_owned = runner._run_uses_runtime_owned_orchestration("legacy-run")
             records = runner.run_store.read_records()
 
         self.assertFalse(runtime_owned)
@@ -7325,7 +7321,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             reviewer.write_text(
                 "import json\n"
                 "import sys\n"
-                "if '\"exit_class\": \"passed\"' not in sys.argv[-1]:\n"
+                'if \'"exit_class": "passed"\' not in sys.argv[-1]:\n'
                 "    raise SystemExit('review launched before gate terminal evidence')\n"
                 "print(json.dumps({\n"
                 "    'verdict': 'approve', 'findings': [],\n"
@@ -7335,9 +7331,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             gate = runner.config.repo / "gate.py"
             gate.write_text(
-                "import time\n"
-                "time.sleep(0.15)\n"
-                "print('slow gate passed')\n",
+                "import time\ntime.sleep(0.15)\nprint('slow gate passed')\n",
                 encoding="utf-8",
             )
             subprocess.run(
@@ -7361,9 +7355,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             runner.config = dataclasses.replace(
                 runner.config,
-                completion=CompletionConfig(
-                    commands=(f"{sys.executable} {gate}",)
-                ),
+                completion=CompletionConfig(commands=(f"{sys.executable} {gate}",)),
                 agent_profiles={
                     **runner.config.agent_profiles,
                     "review": review_agent,
