@@ -24,7 +24,11 @@ class EvalReleaseTests(unittest.TestCase):
     def test_default_release_matrix_includes_user_story_fixtures(self) -> None:
         matrix = release_gate_case_conditions()
 
-        self.assertEqual(sum(len(conditions) for conditions in matrix.values()), 21)
+        self.assertEqual(sum(len(conditions) for conditions in matrix.values()), 22)
+        self.assertEqual(
+            matrix["runtime-owned-implementation"],
+            ("vibe_loop_cli",),
+        )
         for case_id in (
             "explicit-list-profile",
             "kiro-user-story",

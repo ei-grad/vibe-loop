@@ -84,6 +84,7 @@ committed inside the fixture.
 | `review-remediation` | Validation library with a deliberately subtle edge case | Independent review, remediation, re-review, test evidence | yes |
 | `dirty-main-worktree` | Docs/code project with unrelated seeded user changes in the main checkout | Worktree discipline, unrelated-change preservation, conservative git behavior | yes |
 | `supervised-worker-report` | Fixture launched with supervisor run metadata and local `.vibe-loop/` state | Worker reporting, run result records, task lock ownership | yes |
+| `runtime-owned-implementation` | Runtime-provisioned implementation workspace with explicit reviewer/provenance contracts | Default runtime-owned prompt boundary, clean candidate commit, candidate report without worker-owned integration | yes |
 | `main-integration-lock` | Tiny package with two ready tasks and a seeded integration critical section | `main-integration` lock acquisition/release, final verification on `main` | yes |
 | `workspace-duplicate-worktree` | Worker-state repository with a claimed branch checked out in two worktrees | Workspace ownership diagnostics, no destructive cleanup | yes |
 | `workspace-missing-worktree` | Worker-state repository with an active lock claiming a missing worktree | Stale workspace claim blocking and reporting | yes |
@@ -480,6 +481,27 @@ Artifacts:
 - `task-lock-after.json`.
 - `runs-jsonl-tail.json`.
 - `report-command-result.json`.
+
+Budget: generated discovery or worker-state case.
+
+### `runtime-owned-implementation`
+
+Project type: a small Python package launched in a runtime-provisioned,
+runtime-claimed implementation workspace.
+
+The repository omits `orchestration.mode`, proving the runtime-owned default,
+while explicitly configuring the independent reviewer route and external
+task-provenance path required for a valid contract. The worker fixes the
+failing test, commits a clean candidate, and files a completed candidate report.
+It must not run review, acquire the integration lock, merge `main`, or mark the
+PLAN row done; those transitions belong to the runtime after the implementation
+stage. Deterministic graders require the candidate commit and report while
+asserting that `ROI-01` remains `Planned` in the worker checkout.
+
+This story complements the runtime integration and slow-gate regression tests:
+the eval proves the model-facing boundary, while the runner tests prove the
+runtime consumes the candidate through gate, review, integration, and
+provenance without unknown recovery.
 
 Budget: generated discovery or worker-state case.
 

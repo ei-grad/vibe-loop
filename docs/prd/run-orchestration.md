@@ -271,9 +271,10 @@ Related implementation IDs: `ORC-10` (`orc-scheduler-separation`).
 
 ## PRD-ORC-011 Migration And Legacy Compatibility
 
-An explicit `[orchestration] mode` selects worker-owned (initial default) or
-runtime-owned orchestration; the active mode and contract are recorded per
-run, and a run may never record a mode it does not execute — while the
+An explicit `[orchestration] mode` selects worker-owned compatibility mode or
+runtime-owned orchestration, which is the default; the active mode and contract
+are recorded per run, and a run may never record a mode it does not execute —
+while the
 runtime-owned path is incomplete, selecting it fails closed with an
 actionable not-yet-available diagnostic instead of silently executing the
 worker-owned lifecycle. Migration proceeds in independently shippable phases
@@ -285,7 +286,7 @@ without stage records are treated as worker-owned by recovery and are never
 reinterpreted. The default flips to runtime-owned only after the compatibility
 matrix (Codex/Claude in both roles, command-backed task sources and locks,
 recovery fixtures) is green; worker-owned removal is a separate later
-decision.
+decision governed by the documented release and repository-inventory criteria.
 
 Acceptance must cover mode selection and provenance, per-phase compatibility
 of worker-owned behavior, additive-journal tolerance, legacy recovery
@@ -293,3 +294,10 @@ semantics for pre-migration runs, and documented default-flip criteria.
 
 Related implementation IDs: `ORC-02` (`orc-run-contract-record`), `ORC-11`
 (`orc-migration-default-flip`).
+
+Acceptance evidence: provider-role and default-contract coverage lives in
+`tests/test_orchestration.py`; explicit worker-owned isolation, legacy-journal
+classification, and the slow-gate-to-review runtime lifecycle live in
+`tests/test_runner.py`; the runtime-owned implementation-stage user story and
+release matrix live under `eval/examples/local-demo-v1` and
+`src/vibe_loop/eval_release.py`.

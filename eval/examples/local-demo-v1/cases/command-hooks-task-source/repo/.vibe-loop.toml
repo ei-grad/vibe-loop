@@ -17,6 +17,9 @@ commands = [
   "python scripts/record_worklog.py",
 ]
 
+[orchestration]
+mode = "worker-owned"
+
 [autopilot]
 planning_command = "python scripts/planning_hook.py"
 require_clean_repo = false

@@ -328,6 +328,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
 )
 
 ORCHESTRATION_MODES = ("worker-owned", "runtime-owned")
+DEFAULT_ORCHESTRATION_MODE = "runtime-owned"
 ORCHESTRATION_TASK_PROVENANCE_MODES = ("external-confirmed", "adapter")
 ORCHESTRATION_CONFIG_KEYS = frozenset(
     {
@@ -766,7 +767,7 @@ class CompletionConfig:
 
 @dataclasses.dataclass(frozen=True)
 class OrchestrationConfig:
-    mode: str = "worker-owned"
+    mode: str = DEFAULT_ORCHESTRATION_MODE
     reviewer_profile: str | None = None
     gates: tuple[str, ...] = ()
     verify_on_main: tuple[str, ...] = ()
@@ -2187,7 +2188,7 @@ def parse_orchestration(
     mode = orchestration_enum_value(
         table,
         "mode",
-        default="worker-owned",
+        default=DEFAULT_ORCHESTRATION_MODE,
         allowed=ORCHESTRATION_MODES,
     )
 

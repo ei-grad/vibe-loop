@@ -358,7 +358,11 @@ class RunnerTests(unittest.TestCase):
         extension = (
             "Never merge to main.\nLeave the reviewed branch for the orchestrator."
         )
-        config = VibeConfig(repo=Path("."), worker_prompt_extra=extension)
+        config = VibeConfig(
+            repo=Path("."),
+            worker_prompt_extra=extension,
+            orchestration=OrchestrationConfig(mode="worker-owned"),
+        )
 
         for skill_prefix in ("$", "/"):
             with self.subTest(skill_prefix=skill_prefix):
@@ -386,7 +390,10 @@ class RunnerTests(unittest.TestCase):
                     prompt = build_worker_prompt(
                         skill_prefix,
                         task,
-                        VibeConfig(repo=Path(".")),
+                        VibeConfig(
+                            repo=Path("."),
+                            orchestration=OrchestrationConfig(mode="worker-owned"),
+                        ),
                     )
 
                 self.assertTrue(prompt.startswith(f"{skill_prefix}vibe-loop ASYNC-01"))
@@ -496,13 +503,14 @@ class RunnerTests(unittest.TestCase):
 
     def test_worker_prompt_omits_repo_extension_when_unset(self) -> None:
         task = Task(task_id="POLICY-02", title="Default policy", status="Next")
-        expected = f"$vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
-
-        for config in (None, VibeConfig(repo=Path("."))):
-            with self.subTest(config=config):
-                prompt = build_worker_prompt("$", task, config)
-
-                self.assertEqual(prompt, expected)
+        self.assertEqual(
+            build_worker_prompt("$", task, None),
+            f"$vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}",
+        )
+        self.assertEqual(
+            build_worker_prompt("$", task, VibeConfig(repo=Path("."))),
+            f"$vibe-loop {task.task_id}{RUNTIME_OWNED_WORKER_ADDENDUM}",
+        )
 
     def test_runtime_owned_worker_prompt_uses_slim_addendum(self) -> None:
         task = Task(task_id="ORC-10", title="Runtime lifecycle", status="Next")
@@ -6774,6 +6782,10 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                         skill_ref_prefix="$",
                     )
                 },
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
                 supervision=supervision or SupervisionConfig(),
             )
         )
@@ -6915,6 +6927,85 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # The backend that finalizes external run provenance at release
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_explicit_worker_owned_mode_does_not_run_runtime_lifecycle(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            runner.config = dataclasses.replace(
+                runner.config,
+                completion=CompletionConfig(commands=("false",)),
+                agent_profiles={
+                    **runner.config.agent_profiles,
+                    "review": AgentConfig(command="reviewer {prompt}"),
+                },
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    reviewer_profile="review",
+                    gates=("completion.commands[0]",),
+                    verify_on_main=("completion.commands[0]",),
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "gates", "verify_on_main"}
+                    ),
+                ),
+            )
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "completed"),
+            )
+            records = runner.run_store.read_records()
+
+        self.assertEqual(result.classification, "completed")
+        contract = next(
+            record
+            for record in records
+            if record.get("record_type") == "run_contract_resolved"
+        )
+        self.assertEqual(contract["mode"], "worker-owned")
+        self.assertTrue(
+            {
+                "candidate_recorded",
+                "gate_result",
+                "review_started",
+                "review_verdict",
+                "integration_result",
+                "task_provenance_committed",
+            }.isdisjoint(
+                record.get("record_type") for record in records
+            )
+        )
+
+    def test_legacy_journal_without_contract_or_stages_remains_worker_owned(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [], {})
+            runner.config = dataclasses.replace(
+                runner.config,
+                orchestration=OrchestrationConfig(),
+            )
+            runner.run_store.append_record(
+                {
+                    "record_type": "run_started",
+                    "run_id": "legacy-run",
+                    "task_id": "T-legacy",
+                    "started_at": "2026-07-01T00:00:00+00:00",
+                }
+            )
+
+            runtime_owned = runner._run_uses_runtime_owned_orchestration(
+                "legacy-run"
+            )
+            records = runner.run_store.read_records()
+
+        self.assertFalse(runtime_owned)
+        self.assertNotIn(
+            "stage_transition",
+            {record.get("record_type") for record in records},
+        )
 
     def test_runtime_owned_completion_commits_provenance_before_result(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
@@ -7233,14 +7324,24 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             reviewer = runner.config.repo / "reviewer.py"
             reviewer.write_text(
                 "import json\n"
+                "import sys\n"
+                "if '\"exit_class\": \"passed\"' not in sys.argv[-1]:\n"
+                "    raise SystemExit('review launched before gate terminal evidence')\n"
                 "print(json.dumps({\n"
                 "    'verdict': 'approve', 'findings': [],\n"
                 "    'session_id': '', 'session_id_source': '',\n"
                 "}))\n",
                 encoding="utf-8",
             )
+            gate = runner.config.repo / "gate.py"
+            gate.write_text(
+                "import time\n"
+                "time.sleep(0.15)\n"
+                "print('slow gate passed')\n",
+                encoding="utf-8",
+            )
             subprocess.run(
-                ["git", "add", "reviewer.py"],
+                ["git", "add", "reviewer.py", "gate.py"],
                 cwd=runner.config.repo,
                 check=True,
             )
@@ -7260,7 +7361,9 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             )
             runner.config = dataclasses.replace(
                 runner.config,
-                completion=CompletionConfig(commands=("git diff --quiet",)),
+                completion=CompletionConfig(
+                    commands=(f"{sys.executable} {gate}",)
+                ),
                 agent_profiles={
                     **runner.config.agent_profiles,
                     "review": review_agent,
@@ -7302,10 +7405,16 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             candidate_text = (runner.config.repo / "candidate.txt").read_text(
                 encoding="utf-8"
             )
+            task_recovery_records = [
+                record
+                for record in records
+                if record.get("record_type") == "task_recovery"
+            ]
 
         self.assertEqual(result.classification, "completed")
         self.assertEqual(source.status, "done")
         self.assertEqual(candidate_text, "candidate\n")
+        self.assertEqual(task_recovery_records, [])
         for required in (
             "candidate_recorded",
             "gate_result",
@@ -7315,6 +7424,10 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             "task_provenance_committed",
         ):
             self.assertIn(required, record_types)
+        self.assertLess(
+            record_types.index("gate_result"),
+            record_types.index("review_started"),
+        )
         self.assertLess(
             record_types.index("review_verdict"),
             record_types.index("integration_result"),

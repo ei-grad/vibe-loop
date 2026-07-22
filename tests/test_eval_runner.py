@@ -461,6 +461,18 @@ class EvalRunnerCliTests(unittest.TestCase):
             "$orchestrated-vibe-loop Do the task",
         )
 
+    def test_cli_prompt_builder_uses_runtime_owned_stage_contract(self) -> None:
+        prompt = build_eval_prompt(
+            "ROI-01",
+            "vibe_loop_cli",
+            orchestration_mode="runtime-owned",
+        )
+
+        self.assertIn("$vibe-loop ROI-01", prompt)
+        self.assertIn("Runtime-Owned Implementation Stage", prompt)
+        self.assertIn("vibe-loop worker candidate", prompt)
+        self.assertNotIn("main-integration", prompt)
+
     def test_timeout_keeps_failed_trial_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

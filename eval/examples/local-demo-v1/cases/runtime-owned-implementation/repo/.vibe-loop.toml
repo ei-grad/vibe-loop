@@ -1,0 +1,12 @@
+[agent.profiles.review]
+kind = "codex"
+command = "codex review {prompt}"
+
+[completion]
+commands = ["PYTHONPATH=src python3 -m unittest discover -s tests"]
+
+[orchestration]
+reviewer_profile = "review"
+gates = ["completion.commands[0]"]
+verify_on_main = ["completion.commands[0]"]
+task_provenance_mode = "external-confirmed"

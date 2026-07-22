@@ -27,6 +27,7 @@ RELEASE_GATE_CASE_CONDITIONS: Mapping[str, tuple[str, ...]] = {
     "negative-trigger-set": ("vibe_loop",),
     "openspec-user-story": ("vibe_loop",),
     "review-remediation": ("vibe_loop", "orchestrated_vibe_loop"),
+    "runtime-owned-implementation": ("vibe_loop_cli",),
     "supervised-worker-report": ("vibe_loop_cli",),
     "spec-kit-user-story": ("vibe_loop",),
     "workspace-duplicate-worktree": ("vibe_loop_cli",),

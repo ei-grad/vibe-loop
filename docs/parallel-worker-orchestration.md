@@ -1,12 +1,10 @@
 # Parallel Worker Orchestration
 
-> **Target direction.** This document describes the worker-owned operating
-> mode, where the worker agent owns its slice lifecycle end to end. The target
-> architecture moves that lifecycle into the deterministic `vibe-loop run`
-> runtime (`docs/deterministic-run-orchestration.md`,
-> `docs/prd/run-orchestration.md`); worker-owned mode remains a supported
-> compatibility mode during the staged migration, and this document stays
-> authoritative for it.
+> **Compatibility mode.** This document is authoritative only for repositories
+> that explicitly set `[orchestration] mode = "worker-owned"`. Runtime-owned
+> orchestration is the default; its lifecycle is documented in
+> `docs/deterministic-run-orchestration.md` and
+> `docs/prd/run-orchestration.md`.
 
 `vibe-loop` parallel mode supervises independent finite workers without taking
 over their implementation and integration flow. The runtime owns
@@ -19,6 +17,13 @@ The supervisor owns scheduling, locks, deterministic workspace provisioning,
 logs, visibility, and result collection. This keeps `main` integration semantics
 in the skill instructions while making `vibe-loop run-until-done --jobs N`
 useful for unattended work.
+
+Worker-owned compatibility mode is provenance-explicit and behavior-preserving:
+the resolved contract and `run_started` record identify it, and in-flight runs
+finish under their recorded mode. Journals without orchestration stage records
+remain legacy worker-owned runs during recovery. Removal requires the release
+and compatibility evidence listed in README; it is not part of the default
+flip.
 
 ## Operating Model
 

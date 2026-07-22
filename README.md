@@ -937,12 +937,12 @@ commands = [
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
 
-# Worker-owned remains the compatibility default until the migration flip.
-# Runtime-owned is available when its reviewer and task-source contracts are
-# configured explicitly.
+# Runtime-owned is the default. It fails closed until an independent reviewer
+# route and a task-provenance completion path are configured.
 [orchestration]
-mode = "worker-owned"
+mode = "runtime-owned"
 # reviewer_profile = "review"
+# task_provenance_mode = "external-confirmed"
 # max_initial_review_passes = 1
 # max_closure_review_passes = 2
 # reviewer_concurrency_budget = 1
@@ -1179,8 +1179,9 @@ effort = "high"
 command = "codex review {prompt}"
 
 [orchestration]
-mode = "worker-owned"
+mode = "runtime-owned"
 reviewer_profile = "review"
+task_provenance_mode = "external-confirmed"
 max_initial_review_passes = 1
 max_closure_review_passes = 2
 reviewer_concurrency_budget = 1
@@ -1217,12 +1218,28 @@ instead of resetting it. An unfinished `review_started` record parks as
 `review_wait_incomplete` and is never silently replayed. Reviewer prompts forbid
 nested model delegation, Claude receives launch-time Agent/Task denial, and any
 observable nested structured launch is a typed policy violation with separately
-attributed usage. `mode = "worker-owned"` preserves the existing worker-owned
-lifecycle. `mode = "runtime-owned"` runs candidate collection, configured
-gates, routed review, integration, and task provenance in the runtime.
+attributed usage. Runtime-owned mode is the default and runs candidate
+collection, configured gates, routed review, integration, and task provenance
+in the runtime.
 Runtime-owned command task sources that configure activation must also
 configure reset, and adapter completion requires `task_source.complete`; the
 resolved contract fails closed before activation when these paths are absent.
+
+Repositories that still require agent-owned verification, review, integration,
+and task-source mutation must opt into compatibility mode explicitly:
+
+```toml
+[orchestration]
+mode = "worker-owned"
+```
+
+That mode retains its recorded contract and existing worker-owned behavior. It
+is not scheduled for removal until release evidence shows no active repository
+depends on it, legacy and mixed-journal recovery remains green, both providers
+remain covered in implementer and reviewer roles, command-backed task/lock
+fixtures remain green, and at least one separately reviewed release completes
+without a compatibility-mode fallback. Removal is a later, explicit change;
+this migration does not execute it.
 
 ### Locks
 

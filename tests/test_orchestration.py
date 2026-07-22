@@ -76,11 +76,11 @@ from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
 class OrchestrationConfigTests(unittest.TestCase):
-    def test_defaults_preserve_worker_owned_execution(self) -> None:
+    def test_defaults_select_runtime_owned_execution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(Path(directory))
 
-        self.assertEqual(config.orchestration.mode, "worker-owned")
+        self.assertEqual(config.orchestration.mode, "runtime-owned")
         self.assertEqual(config.orchestration.gates, ())
         self.assertEqual(config.orchestration.verify_on_main, ())
         self.assertTrue(config.orchestration.integration_enabled)
@@ -194,9 +194,12 @@ class RunContractResolverTests(unittest.TestCase):
             agent_profiles={"review": reviewer},
             completion=CompletionConfig(commands=("test", "lint")),
             orchestration=OrchestrationConfig(
+                mode="worker-owned",
                 reviewer_profile="review",
                 max_remediation_rounds=7,
-                explicit_keys=frozenset({"reviewer_profile", "max_remediation_rounds"}),
+                explicit_keys=frozenset(
+                    {"mode", "reviewer_profile", "max_remediation_rounds"}
+                ),
             ),
         )
         skill = RunContractProposal(
@@ -244,9 +247,10 @@ class RunContractResolverTests(unittest.TestCase):
             agent=agent,
             completion=CompletionConfig(commands=(gate_canary,)),
             orchestration=OrchestrationConfig(
+                mode="worker-owned",
                 gates=("completion.commands[0]",),
                 verify_on_main=("completion.commands[0]",),
-                explicit_keys=frozenset({"gates", "verify_on_main"}),
+                explicit_keys=frozenset({"mode", "gates", "verify_on_main"}),
             ),
         )
         selection = AgentSelection(agent, "", "default")
@@ -268,6 +272,7 @@ class RunContractResolverTests(unittest.TestCase):
             config_path = repo / ".vibe-loop.toml"
             original = (
                 "[orchestration]\n"
+                'mode = "worker-owned"\n'
                 "max_remediation_rounds = 1\n"
                 "max_closure_review_passes = 1\n"
             )
@@ -292,7 +297,14 @@ class RunContractResolverTests(unittest.TestCase):
 
     def test_proposal_digest_accepts_non_dict_mapping(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
-        config = VibeConfig(repo=Path("/repo"), agent=agent)
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="worker-owned",
+                explicit_keys=frozenset({"mode"}),
+            ),
+        )
         proposal = RunContractProposal(
             kind="profile",
             source_id="profile:mapping",
@@ -446,6 +458,58 @@ class RunContractResolverTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_default_runtime_owned_contract_records_provider_role_matrix(self) -> None:
+        providers = {
+            "codex": AgentConfig(
+                command="codex exec {prompt}",
+                agent_kind="codex",
+            ),
+            "claude": AgentConfig(
+                command="claude -p {prompt}",
+                agent_kind="claude",
+            ),
+        }
+        for implementer_kind, reviewer_kind in (
+            ("codex", "codex"),
+            ("codex", "claude"),
+            ("claude", "codex"),
+            ("claude", "claude"),
+        ):
+            with self.subTest(
+                implementer=implementer_kind,
+                reviewer=reviewer_kind,
+            ):
+                implementer = providers[implementer_kind]
+                reviewer = providers[reviewer_kind]
+                config = VibeConfig(
+                    repo=Path("/repo"),
+                    agent=implementer,
+                    agent_profiles={"review": reviewer},
+                    orchestration=OrchestrationConfig(
+                        reviewer_profile="review",
+                        task_provenance_mode="external-confirmed",
+                        explicit_keys=frozenset(
+                            {"reviewer_profile", "task_provenance_mode"}
+                        ),
+                    ),
+                )
+
+                contract = RunContractResolver(config).resolve(
+                    AgentSelection(implementer, "", "default")
+                )
+
+                self.assertEqual(contract.payload["mode"], "runtime-owned")
+                self.assertEqual(
+                    contract.payload["implementer"]["provider"], implementer_kind
+                )
+                self.assertEqual(
+                    contract.payload["reviewer"]["provider"], reviewer_kind
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["mode"],
+                    "external-confirmed",
+                )
 
 
 class RunLifecycleStateMachineTests(unittest.TestCase):
@@ -3297,6 +3361,17 @@ class ReviewRouterTests(unittest.TestCase):
 
 
 class RunContractJournalTests(unittest.TestCase):
+    @staticmethod
+    def worker_owned_config(repo: Path, agent: AgentConfig) -> VibeConfig:
+        return VibeConfig(
+            repo=repo,
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="worker-owned",
+                explicit_keys=frozenset({"mode"}),
+            ),
+        )
+
     def test_contract_is_recorded_after_lock_and_before_activation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -3307,7 +3382,7 @@ class RunContractJournalTests(unittest.TestCase):
                 prompt_dialect="codex",
                 skill_ref_prefix="$",
             )
-            runner = VibeRunner(VibeConfig(repo=repo, agent=agent))
+            runner = VibeRunner(self.worker_owned_config(repo, agent))
             task = Task(task_id="T-1", title="Task", status="Next")
             activation_record_types: list[str] = []
 
@@ -3401,7 +3476,7 @@ class RunContractJournalTests(unittest.TestCase):
                 prompt_dialect="codex",
                 skill_ref_prefix="$",
             )
-            runner = VibeRunner(VibeConfig(repo=repo, agent=agent))
+            runner = VibeRunner(self.worker_owned_config(repo, agent))
             task = Task(task_id="T-1", title="Task", status="Next")
 
             with patch.object(runner, "ensure_spec_execution_gate"):
@@ -3437,17 +3512,13 @@ class RunContractJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
-            runner = VibeRunner(
-                VibeConfig(
-                    repo=repo,
-                    agent=AgentConfig(
-                        command="worker {prompt}",
-                        agent_kind="custom",
-                        prompt_dialect="codex",
-                        skill_ref_prefix="$",
-                    ),
-                )
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
             )
+            runner = VibeRunner(self.worker_owned_config(repo, agent))
             task = Task(task_id="T-1", title="Task", status="Next")
 
             with patch.object(runner, "ensure_spec_execution_gate"):
@@ -3481,15 +3552,11 @@ class RunContractJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
-            runner = VibeRunner(
-                VibeConfig(
-                    repo=repo,
-                    agent=AgentConfig(
-                        command="CLAUDE_HOME=.claude claude -p {prompt}",
-                        agent_kind="claude",
-                    ),
-                )
+            agent = AgentConfig(
+                command="CLAUDE_HOME=.claude claude -p {prompt}",
+                agent_kind="claude",
             )
+            runner = VibeRunner(self.worker_owned_config(repo, agent))
             task = Task(task_id="T-1", title="Task", status="Next")
 
             with patch.object(runner, "ensure_spec_execution_gate"):
@@ -3526,15 +3593,11 @@ class RunContractJournalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
-            runner = VibeRunner(
-                VibeConfig(
-                    repo=repo,
-                    agent=AgentConfig(
-                        command="CODEX_HOME=.codex codex exec {prompt}",
-                        agent_kind="codex",
-                    ),
-                )
+            agent = AgentConfig(
+                command="CODEX_HOME=.codex codex exec {prompt}",
+                agent_kind="codex",
             )
+            runner = VibeRunner(self.worker_owned_config(repo, agent))
             task = Task(task_id="T-1", title="Task", status="Next")
 
             with patch.object(runner, "ensure_spec_execution_gate"):

@@ -48,6 +48,7 @@ EXPECTED_CASE_IDS = {
     "negative-trigger-set",
     "openspec-user-story",
     "review-remediation",
+    "runtime-owned-implementation",
     "supervised-worker-report",
     "spec-kit-user-story",
     "workspace-duplicate-worktree",

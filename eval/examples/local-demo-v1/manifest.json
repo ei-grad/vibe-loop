@@ -94,6 +94,11 @@
       "primary_coverage": ["independent review", "review remediation", "re-review"]
     },
     {
+      "case_id": "runtime-owned-implementation",
+      "positive": true,
+      "primary_coverage": ["runtime-owned default", "runtime-provisioned workspace", "implementation-stage boundary", "candidate reporting"]
+    },
+    {
       "case_id": "supervised-worker-report",
       "positive": true,
       "primary_coverage": ["worker reporting", "active task lock preservation"]

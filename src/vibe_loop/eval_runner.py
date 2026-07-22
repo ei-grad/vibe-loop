@@ -701,15 +701,21 @@ def build_eval_prompt(
     raw_prompt: str,
     condition: str,
     skill_ref_prefix: str = "$",
+    orchestration_mode: str = "worker-owned",
 ) -> str:
-    from vibe_loop.runner import CLI_WORKER_ADDENDUM
+    from vibe_loop.runner import CLI_WORKER_ADDENDUM, RUNTIME_OWNED_WORKER_ADDENDUM
 
     if condition == "no_skill":
         return raw_prompt
     skill_id = skill_id_for_condition(condition)
     skill_ref = f"{skill_ref_prefix}{skill_id} {raw_prompt.strip()}"
     if condition in CLI_CONDITIONS:
-        return skill_ref + CLI_WORKER_ADDENDUM
+        addendum = (
+            RUNTIME_OWNED_WORKER_ADDENDUM
+            if orchestration_mode == "runtime-owned"
+            else CLI_WORKER_ADDENDUM
+        )
+        return skill_ref + addendum
     return skill_ref
 
 
@@ -759,6 +765,7 @@ def execute_trial_agent_commands(
         prompt_text,
         condition,
         skill_ref_prefix=skill_ref_prefix,
+        orchestration_mode=load_config(repo).orchestration.mode,
     )
     command = format_agent_command(
         effective_template,

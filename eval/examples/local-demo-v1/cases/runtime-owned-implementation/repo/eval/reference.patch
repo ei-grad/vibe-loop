@@ -1,0 +1,12 @@
+diff --git a/.vibe-loop/runs.jsonl b/.vibe-loop/runs.jsonl
+new file mode 100644
+--- /dev/null
++++ b/.vibe-loop/runs.jsonl
+@@ -0,0 +1 @@
++{"schema_version": 1, "record_type": "worker_report", "run_id": "eval-run-roi-01", "task_id": "ROI-01", "status": "completed", "commit": "HEAD", "message": "implementation candidate ready", "metadata": {}, "reported_at": "2026-05-09T00:00:00+00:00"}
+diff --git a/src/runtime_demo/reports.py b/src/runtime_demo/reports.py
+--- a/src/runtime_demo/reports.py
++++ b/src/runtime_demo/reports.py
+@@ -5,1 +5,1 @@
+-    return len(value.splitlines())
++    return sum(1 for line in value.splitlines() if line.strip())

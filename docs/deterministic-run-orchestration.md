@@ -505,13 +505,13 @@ rubric, and budgets through the validated contract.
 ## Migration And Compatibility
 
 Config: `[orchestration] mode = "worker-owned" | "runtime-owned"`, default
-`worker-owned` until the flip slice. The active mode and contract are recorded
+`runtime-owned`. The active mode and contract are recorded
 per run, so mixed histories stay interpretable. Generated profiles cannot set
 orchestration keys (same rule as other executable-adjacent config).
 
-Mode availability is staged: a run may never record a mode it does not
-execute. ORC-10 makes `mode = "runtime-owned"` available after composing the
-runtime-owned lifecycle; `worker-owned` remains the default until ORC-11.
+Mode availability was staged: a run may never record a mode it does not
+execute. ORC-10 made `mode = "runtime-owned"` available after composing the
+runtime-owned lifecycle; ORC-11 made it the default.
 Runtime-owned contract validation still fails closed before activation when
 its reviewer, completion, or failure-settlement paths are unavailable.
 
@@ -536,6 +536,11 @@ is removed):
 - **Phase 6 — default flip** to runtime-owned; worker-owned remains a
   documented compatibility mode with explicit provenance; removal is a later
   decision once evidence shows no repository depends on it.
+
+Phase 6 is implemented. Runtime-owned validation still fails closed before
+activation when the independent reviewer route, completion path, or failure
+settlement path is unavailable. Repositories needing the prior lifecycle must
+set `mode = "worker-owned"` explicitly; there is no implicit fallback.
 
 Compatibility specifics:
 
@@ -601,6 +606,14 @@ Compatibility specifics:
   throughout; mixed-journal readers; legacy recovery fixtures.
 - **Eval layer:** local-demo user stories for the runtime-owned flow
   (Phase 5+) mirroring the existing workspace/integration regression cases.
+
+Worker-owned removal is permitted only after all of the following remain green
+for at least one separately reviewed release: provider coverage for Codex and
+Claude in both roles; command-backed task-source and lock fixtures; runtime
+workspace, slow-gate, review, integration, and recovery evidence; explicit
+worker-owned regression coverage; and legacy/mixed-journal recovery. A removal
+slice must inventory active compatibility-mode repositories and provide a
+separate migration decision. ORC-11 does not remove the mode.
 
 ## Implementation Decomposition
 

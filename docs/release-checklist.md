@@ -29,6 +29,8 @@ The release gate requires:
 The default release matrix is intentionally smaller than the full paired eval
 suite. It excludes `no_skill`, covers finite `vibe_loop` behavior across the
 representative task domains, runs CLI-supervised cases under `vibe_loop_cli`,
+pins legacy workspace/integration stories to explicit worker-owned mode, runs
+`runtime-owned-implementation` with the slim runtime-owned worker contract,
 checks orchestration only on delegation-specific cases, and runs the negative
 trigger set under `vibe_loop`. Use `eval local-demo` for broad no-skill baseline
 comparisons. Use `--trials N --minimum-trials N` when a repeated release run is

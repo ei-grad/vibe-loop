@@ -329,6 +329,7 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             write_fake_git(bin_dir)
@@ -477,6 +478,7 @@ class CliTests(unittest.TestCase):
             source_path = Path(__file__).resolve().parents[1] / "src"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             write_fake_git(bin_dir)
@@ -708,6 +710,7 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             write_fake_git(bin_dir)
@@ -775,6 +778,7 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             write_fake_git(bin_dir)
             write_python_executable(
                 bin_dir / "claude",
@@ -910,6 +914,7 @@ class CliTests(unittest.TestCase):
                 'match_hazards_any = ["abi"]\n',
                 encoding="utf-8",
             )
+            configure_worker_owned_mode(repo)
             subprocess.run(
                 ["git", "add", ".vibe-loop.toml"],
                 cwd=repo,
@@ -991,6 +996,7 @@ class CliTests(unittest.TestCase):
             claude_home = Path(directory) / "claude-home"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             write_fake_git(bin_dir)
@@ -1180,6 +1186,7 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             write_fake_git(bin_dir)
@@ -1258,6 +1265,7 @@ class CliTests(unittest.TestCase):
             bin_dir = Path(directory) / "bin"
             repo.mkdir()
             bin_dir.mkdir()
+            configure_worker_owned_mode(repo)
             (repo / "docs").mkdir()
             (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
             write_fake_git(bin_dir)
@@ -6716,6 +6724,7 @@ class CliTests(unittest.TestCase):
                 + '\nrunnable_statuses = ["ready"]\n',
                 encoding="utf-8",
             )
+            configure_worker_owned_mode(repo)
             subprocess.run(
                 ["git", "add", "task_source.py", "agent.py", ".vibe-loop.toml"],
                 cwd=repo,
@@ -6840,6 +6849,7 @@ class CliTests(unittest.TestCase):
                 + '\nrunnable_statuses = ["ready"]\n',
                 encoding="utf-8",
             )
+            configure_worker_owned_mode(repo)
             stdout = StringIO()
             stderr = StringIO()
 
@@ -6956,6 +6966,7 @@ class CliTests(unittest.TestCase):
                         + '\nrunnable_statuses = ["ready"]\n',
                         encoding="utf-8",
                     )
+                    configure_worker_owned_mode(repo)
                     runner = VibeRunner(load_config(repo))
                     task = runner.source.list_tasks()[0]
 
@@ -9041,6 +9052,7 @@ class AutopilotCliTests(unittest.TestCase):
                 + command_lock_toml(command),
                 encoding="utf-8",
             )
+            configure_worker_owned_mode(repo)
             (repo / ".gitignore").write_text(
                 "agent-process.json\nlock_adapter.py\nlock_state.json\n",
                 encoding="utf-8",
@@ -10258,6 +10270,7 @@ def command_lock_state(state_path: Path) -> dict[str, object]:
 def init_planning_repo(repo: Path, plan_text: str) -> None:
     repo.mkdir()
     (repo / "PLAN.md").write_text(plan_text, encoding="utf-8")
+    configure_worker_owned_mode(repo)
     subprocess.run(
         ["git", "init", "--initial-branch", "main"],
         cwd=repo,
@@ -10271,7 +10284,9 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
         cwd=repo,
         check=True,
     )
-    subprocess.run(["git", "add", "PLAN.md"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "add", "PLAN.md", ".vibe-loop.toml"], cwd=repo, check=True
+    )
     subprocess.run(
         ["git", "commit", "--allow-empty", "-m", "baseline"],
         cwd=repo,
@@ -10282,6 +10297,7 @@ def init_planning_repo(repo: Path, plan_text: str) -> None:
 
 
 def init_worker_repo(repo: Path) -> None:
+    configure_worker_owned_mode(repo)
     if (repo / ".git").exists():
         return
     subprocess.run(
@@ -10308,6 +10324,20 @@ def init_worker_repo(repo: Path) -> None:
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+    )
+
+
+def configure_worker_owned_mode(repo: Path) -> None:
+    config_path = repo / ".vibe-loop.toml"
+    content = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
+    if "[orchestration]" in content:
+        return
+    separator = "" if not content or content.endswith("\n\n") else "\n"
+    config_path.write_text(
+        content
+        + separator
+        + '[orchestration]\nmode = "worker-owned"\n',
+        encoding="utf-8",
     )
 
 
