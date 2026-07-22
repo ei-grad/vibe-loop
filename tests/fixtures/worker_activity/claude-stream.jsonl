@@ -1,0 +1,4 @@
+{"type":"system","subtype":"init","session_id":"claude-session-1","model":"claude-opus-4-8","timestamp":"2026-07-22T05:00:00Z"}
+{"type":"assistant","timestamp":"2026-07-22T05:00:01Z","message":{"id":"msg-1","content":[{"type":"thinking","thinking":"PRIVATE THINKING CANARY"},{"type":"text","text":"PRIVATE MESSAGE CANARY"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"SECRET COMMAND CANARY","credential":"sk-secret-canary"}}]}}
+{"type":"user","timestamp":"2026-07-22T05:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"PRIVATE TOOL OUTPUT CANARY"}]}}
+{"type":"result","subtype":"success","timestamp":"2026-07-22T05:00:03Z","result":"PRIVATE RESULT CANARY","usage":{"input_tokens":12,"output_tokens":3}}

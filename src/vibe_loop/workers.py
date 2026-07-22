@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from vibe_loop.activity import ActivitySummary, summarize_activity_records
 from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
     TERMINAL_LOCK_OUTCOMES,
@@ -580,6 +581,7 @@ class WorkerView:
     lifecycle_progress: RunLifecycleProgress = dataclasses.field(
         default_factory=empty_run_lifecycle
     )
+    activity: ActivitySummary = dataclasses.field(default_factory=ActivitySummary)
     workspace_git_state: WorkspaceGitState | None = None
     workspace_diagnostics: tuple[WorkspaceDiagnostic, ...] = ()
 
@@ -653,6 +655,7 @@ class WorkerView:
             "result_metadata": self.result_metadata,
         }
         payload.update(self.lifecycle_progress.to_json())
+        payload.update(self.activity.to_json())
         redacted = redact_fencing_token_payload(payload)
         assert isinstance(redacted, dict)
         return redacted
@@ -1433,6 +1436,17 @@ def build_worker_views(
                 result_record_type=result_record_type,
                 result_metadata=result_metadata,
                 lifecycle_progress=worker_lifecycle_progress(active, records),
+                activity=summarize_activity_records(
+                    [
+                        record
+                        for record in records
+                        if record_matches_worker_identity(
+                            record,
+                            run_id=active.run_id,
+                            task_id=active.task_id,
+                        )
+                    ]
+                ),
                 workspace_git_state=workspace_git_state,
                 workspace_diagnostics=workspace_diagnostics,
             )

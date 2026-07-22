@@ -11,6 +11,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, BinaryIO, Mapping
 
+from vibe_loop.activity import (
+    ACTIVITY_CHECKPOINT_RECORD_TYPE,
+    ACTIVITY_RECORD_TYPES,
+    AGENT_COMPLETED_RECORD_TYPE,
+    AGENT_STARTED_RECORD_TYPE,
+    WORK_BLOCKED_RECORD_TYPE,
+    ActivityEmission,
+    ActivitySummary,
+    summarize_activity_records,
+)
 from vibe_loop.locks import redact_exact_fencing_token, redact_fencing_token_payload
 from vibe_loop.orchestration import StageTransition, derive_stage_progress
 from vibe_loop.telemetry import (
@@ -130,6 +140,10 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
+        AGENT_STARTED_RECORD_TYPE,
+        ACTIVITY_CHECKPOINT_RECORD_TYPE,
+        WORK_BLOCKED_RECORD_TYPE,
+        AGENT_COMPLETED_RECORD_TYPE,
         WORKSPACE_CLAIM_RECORD_TYPE,
         WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
         RUN_STATE_TRANSITION_RECORD_TYPE,
@@ -704,6 +718,25 @@ class RunLifecycleEvent:
         )
 
     @classmethod
+    def agent_activity(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        emission: ActivityEmission,
+        provider: str,
+        usage: Mapping[str, object],
+    ) -> RunLifecycleEvent:
+        if emission.record_type not in ACTIVITY_RECORD_TYPES:
+            raise ValueError("unsupported agent activity record type")
+        return cls(
+            record_type=emission.record_type,
+            run_id=run_id,
+            task_id=task_id,
+            payload=emission.to_payload(provider=provider, usage=usage),
+        )
+
+    @classmethod
     def review_started(
         cls,
         *,
@@ -1125,6 +1158,7 @@ class RunHistoryView:
     record_count: int
     latest_record: dict[str, Any]
     lifecycle_progress: RunLifecycleProgress
+    activity: ActivitySummary
 
     @classmethod
     def from_records(
@@ -1199,6 +1233,7 @@ class RunHistoryView:
             record_count=len(records),
             latest_record=latest,
             lifecycle_progress=derive_run_lifecycle(records),
+            activity=summarize_activity_records(records),
         )
 
     def to_json(self) -> dict[str, object]:
@@ -1246,6 +1281,7 @@ class RunHistoryView:
             "latest_record": self.latest_record,
         }
         payload.update(self.lifecycle_progress.to_json())
+        payload.update(self.activity.to_json())
         return payload
 
 

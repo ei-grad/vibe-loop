@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"codex-thread-1","timestamp":"2026-07-22T05:10:00Z"}
+{"type":"turn.started","turn_id":"turn-1","timestamp":"2026-07-22T05:10:01Z"}
+{"type":"item.started","timestamp":"2026-07-22T05:10:02Z","item":{"id":"item-1","type":"command_execution","command":"SECRET COMMAND CANARY","arguments":{"credential":"sk-secret-canary"}}}
+{"type":"item.completed","timestamp":"2026-07-22T05:10:03Z","item":{"id":"item-1","type":"command_execution","aggregated_output":"PRIVATE TOOL OUTPUT CANARY","exit_code":0}}
+{"type":"turn.completed","turn_id":"turn-1","timestamp":"2026-07-22T05:10:04Z","usage":{"input_tokens":20,"output_tokens":5},"message":"PRIVATE MESSAGE CANARY"}

@@ -259,6 +259,20 @@ mismatch detected), run state transitions (session observed, classified), and
 after an accepted terminal report, with the verified process-group teardown and
 its post-report duration).
 
+Native Claude and Codex structured envelopes also yield provider-neutral
+`agent_started`, coalesced `activity_checkpoint`, `gate_result`, `work_blocked`,
+and `agent_completed` records. Their projection exposes the last activity time,
+bounded classes/counters, phase durations, observed route model/effort with
+provenance, and authoritative normalized provider usage. Event identities make
+replayed batches idempotent across crash/restart observation. These records are
+strictly observational: provider completion is not task success, and they never
+trigger kill/restart behavior.
+
+Activity parsing is allowlist-only and bounded. Message/thinking text, prompts,
+tool arguments and output, commands, credentials, and review prose remain
+opaque and are neither persisted nor used as identifiers. Unknown/custom
+envelope types preserve the existing ignored-record behavior.
+
 Records must be additive — unknown types are ignored on read, consistent with
 the existing invalid JSON line tolerance. Each record carries `schema_version`,
 `record_type`, `occurred_at`, and a type-specific payload. Records for the same

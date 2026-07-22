@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
 
+from vibe_loop.activity import ActivityEmission, AgentActivityTracker
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -587,6 +588,8 @@ class AgentRuntimeObservation:
     runtime_context: AgentRuntimeContext = dataclasses.field(
         default_factory=AgentRuntimeContext
     )
+    activity_emissions: tuple[ActivityEmission, ...] = ()
+    activity_usage: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
     @property
     def empty(self) -> bool:
@@ -594,6 +597,7 @@ class AgentRuntimeObservation:
             self.session_id is None
             and self.session_id_source is None
             and self.runtime_context.empty
+            and not self.activity_emissions
         )
 
 
@@ -697,6 +701,7 @@ class AgentOutputObserver:
         self._runtime_context = AgentRuntimeContext()
         self._line_count = 0
         self._usage_observer = ProviderUsageObserver(provider)
+        self._activity_tracker = AgentActivityTracker()
 
     @property
     def usage(self) -> ProviderUsage:
@@ -725,7 +730,7 @@ class AgentOutputObserver:
         stream_name: str,
     ) -> AgentRuntimeObservation | None:
         self._usage_observer.observe_line(line)
-        session_id = parse_worker_session_id(line)
+        session_id = observe_worker_session_id(line)
         runtime_context = AgentRuntimeContext()
         with self._lock:
             self._line_count += 1
@@ -738,6 +743,7 @@ class AgentOutputObserver:
                 stream_name,
             )
         with self._lock:
+            activity_emissions = self._activity_tracker.observe_line(line)
             delta_session_id = None
             delta_session_id_source = None
             if session_id is not None and self._session_observation is None:
@@ -750,13 +756,31 @@ class AgentOutputObserver:
             delta_context = self._runtime_context.missing_delta(runtime_context)
             if not delta_context.empty:
                 self._runtime_context = self._runtime_context.overlay(delta_context)
-            if delta_session_id is None and delta_context.empty:
+            if (
+                delta_session_id is None
+                and delta_context.empty
+                and not activity_emissions
+            ):
                 return None
             return AgentRuntimeObservation(
                 session_id=delta_session_id,
                 session_id_source=delta_session_id_source,
                 runtime_context=delta_context,
+                activity_emissions=activity_emissions,
+                activity_usage=self._usage_observer.usage.to_stats(
+                    phase="implementation"
+                ),
             )
+
+    def flush_activity(self) -> AgentRuntimeObservation | None:
+        with self._lock:
+            emission = self._activity_tracker.flush()
+        if emission is None:
+            return None
+        return AgentRuntimeObservation(
+            activity_emissions=(emission,),
+            activity_usage=self._usage_observer.usage.to_stats(phase="implementation"),
+        )
 
 
 # Claude stream-json content blocks that represent structured tool activity
@@ -2270,6 +2294,19 @@ class VibeRunner:
                     ),
                 )
                 update_active_task_lock()
+                activity_provider = observation.activity_usage.get("provider")
+                if not isinstance(activity_provider, str):
+                    activity_provider = effective_context.model_provider
+                for emission in observation.activity_emissions:
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.agent_activity(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            emission=emission,
+                            provider=activity_provider,
+                            usage=observation.activity_usage,
+                        )
+                    )
                 if observation.session_id and not session_observed_recorded:
                     self.run_store.append_lifecycle_event(
                         RunLifecycleEvent.run_state_transition(
@@ -7119,6 +7156,22 @@ def parse_worker_session_id(line: str) -> str | None:
     return match.group("session_id")
 
 
+def observe_worker_session_id(line: str) -> str | None:
+    """Read identity fields without scanning structured message content."""
+    payload = agent_context_json_payload(line)
+    if payload is None:
+        return parse_worker_session_id(line)
+    nested = payload.get("payload")
+    event = nested if isinstance(nested, Mapping) else payload
+    for key in ("session_id", "thread_id"):
+        value = event.get(key)
+        if not isinstance(value, str) or len(value.encode("utf-8")) > 256:
+            continue
+        if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?", value):
+            return value
+    return None
+
+
 def write_log_header(
     log,
     task: Task,
@@ -7549,6 +7602,9 @@ def run_streaming_command(
     )
     stdout_thread.join()
     stderr_thread.join()
+    final_activity = output_observer.flush_activity()
+    if final_activity is not None and on_observation is not None:
+        on_observation(final_activity)
     observation = output_observer.observation
     post_report = post_report_monitor.snapshot(
         enforced_stop=wait_outcome.post_report_enforced,

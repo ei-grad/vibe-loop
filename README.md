@@ -234,6 +234,16 @@ their configured output mode. The wrapper log retains the provider stream,
 while run telemetry copies only recognized numeric usage fields and fixed
 provenance labels.
 
+The same native streams produce coalesced `agent_started`,
+`activity_checkpoint`, `gate_result`, `work_blocked`, and `agent_completed`
+records. `runs inspect` and `workers --json` project `last_activity_at`, bounded
+activity classes and counters, phase durations, the observed model/effort route,
+and the latest authoritative normalized usage from those records. Completion
+means only that the provider ended its turn; it is not evidence that the task
+succeeded. Unknown envelope types remain opaque. Message and thinking text,
+prompts, tool arguments/output, commands, credentials, and review prose are
+never copied into activity records.
+
 #### Provider usage telemetry
 
 Final `run_result` records include a versioned `stats` object. When exposed by
@@ -1500,10 +1510,14 @@ records carry the `run_id`, `started_at`, resolved `session_id` and source, the
 agent `transcript_path` when one is resolved, the agent command/selection
 sources, prompt dialect and skill reference sources, and the default agent
 policy source. Lifecycle records (`run_started`,
-`agent_context_observed`, `run_state_transition`) expose the same anchor plus
-bounded trailer-ready context — task IDs for `Plan-Item`/`Run-Id`/`Session-Id`,
-agent kind, prompt dialect, and model provider/ID/reasoning effort when the agent
-emits them. `vibe-loop` does not own commit hooks; repository tooling decides
+`agent_context_observed`, `agent_started`, `activity_checkpoint`, `gate_result`,
+`work_blocked`, `agent_completed`, `run_state_transition`) expose the same
+anchor plus bounded trailer-ready context — task IDs for
+`Plan-Item`/`Run-Id`/`Session-Id`, agent kind, prompt dialect, and model
+provider/ID/reasoning effort when the agent emits them. Activity checkpoints
+are coalesced and replay-deduplicated; they update diagnostic projections only
+and do not drive worker termination, restart, or task status. `vibe-loop` does
+not own commit hooks; repository tooling decides
 whether to persist this context into project history. Project worklogs should
 remain final evidence ledgers — attempt logs and failed runs belong in
 `.vibe-loop/`, not in completion records.
