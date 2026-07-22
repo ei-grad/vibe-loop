@@ -989,6 +989,32 @@ class PostReportActivity:
         return bool(self.activity_kind)
 
 
+def post_report_runtime_lifecycle_decision(
+    *,
+    runtime_owned: bool,
+    exit_code: int,
+    timed_out: bool,
+    worker_report: WorkerReport | None,
+    activity: PostReportActivity,
+) -> tuple[str, str]:
+    """Decide whether runtime orchestration may advance after a violation."""
+    if not runtime_owned:
+        return "refuse", "runtime_owned_orchestration_disabled"
+    if timed_out:
+        return "refuse", "worker_timed_out"
+    if worker_report is None:
+        return "refuse", "accepted_report_missing"
+    if worker_report.status != "completed":
+        return "refuse", "accepted_report_not_completed"
+    if exit_code == 0:
+        return "continue", "clean_exit_candidate_revalidation_required"
+    if not activity.enforced_stop:
+        return "refuse", "teardown_not_runtime_enforced"
+    if not activity.identity_verified:
+        return "refuse", "worker_identity_not_verified"
+    return "continue", "verified_runtime_enforced_teardown"
+
+
 def _post_report_usage_delta(
     baseline: Mapping[str, int | float], final: ProviderUsage
 ) -> ProviderUsage:
@@ -2554,7 +2580,18 @@ class VibeRunner:
                 elif exit_code == 0 and not runtime_owned:
                     message = self.run_completion_checks(log)
                 post_report_activity = stream_result.post_report
+                post_report_lifecycle_decision = ""
                 if post_report_activity is not None and post_report_activity.violation:
+                    (
+                        post_report_lifecycle_decision,
+                        post_report_lifecycle_reason,
+                    ) = post_report_runtime_lifecycle_decision(
+                        runtime_owned=runtime_owned,
+                        exit_code=exit_code,
+                        timed_out=worker_timed_out,
+                        worker_report=worker_report,
+                        activity=post_report_activity,
+                    )
                     report_status(
                         f"post-report policy violation for {task.task_id}: "
                         f"worker emitted {post_report_activity.activity_kind} "
@@ -2582,6 +2619,8 @@ class VibeRunner:
                             report_status=(
                                 worker_report.status if worker_report else ""
                             ),
+                            runtime_lifecycle_decision=(post_report_lifecycle_decision),
+                            runtime_lifecycle_reason=post_report_lifecycle_reason,
                         )
                     )
             try:
@@ -2592,7 +2631,7 @@ class VibeRunner:
                 output_tail = ""
             implementation_ready = bool(
                 runtime_owned
-                and exit_code == 0
+                and (exit_code == 0 or post_report_lifecycle_decision == "continue")
                 and not worker_timed_out
                 and (worker_report is None or worker_report.status == "completed")
             )
@@ -3091,6 +3130,10 @@ class VibeRunner:
         candidate = candidate_collector.latest_recorded()
         if candidate is None:
             candidate = candidate_collector.collect_derived()
+        # The worker may have mutated its claimed workspace after filing the
+        # accepted terminal report. Re-snapshot after the process has exited,
+        # including after an enforced teardown, before any gate can execute.
+        candidate_collector.ensure_recorded(candidate)
         self._require_runtime_task_source_unchanged(
             run_id=run_id,
             expected_task=task,

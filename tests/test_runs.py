@@ -764,6 +764,8 @@ class RunStoreTests(unittest.TestCase):
             identity_verified=True,
             terminated=True,
             report_status="completed",
+            runtime_lifecycle_decision="continue",
+            runtime_lifecycle_reason="verified_runtime_enforced_teardown",
         ).to_record()
 
         self.assertEqual(event["record_type"], POST_REPORT_ACTIVITY_RECORD_TYPE)
@@ -776,6 +778,11 @@ class RunStoreTests(unittest.TestCase):
         self.assertTrue(event["identity_verified"])
         self.assertTrue(event["terminated"])
         self.assertEqual(event["report_status"], "completed")
+        self.assertEqual(event["runtime_lifecycle_decision"], "continue")
+        self.assertEqual(
+            event["runtime_lifecycle_reason"],
+            "verified_runtime_enforced_teardown",
+        )
         self.assertIn(POST_REPORT_ACTIVITY_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
     def test_post_report_activity_event_round_trips_through_store(self) -> None:
@@ -794,6 +801,8 @@ class RunStoreTests(unittest.TestCase):
                     identity_verified=False,
                     terminated=False,
                     report_status="completed",
+                    runtime_lifecycle_decision="refuse",
+                    runtime_lifecycle_reason="worker_identity_not_verified",
                 )
             )
             records = store.read_records()

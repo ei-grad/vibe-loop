@@ -900,6 +900,8 @@ class RunLifecycleEvent:
         identity_verified: bool,
         terminated: bool,
         report_status: str,
+        runtime_lifecycle_decision: str,
+        runtime_lifecycle_reason: str,
     ) -> RunLifecycleEvent:
         # A worker that keeps mutating state after its accepted terminal report
         # violates the finite-worker boundary and burns quota; this record makes
@@ -920,6 +922,8 @@ class RunLifecycleEvent:
                 "identity_verified": identity_verified,
                 "terminated": terminated,
                 "report_status": report_status,
+                "runtime_lifecycle_decision": runtime_lifecycle_decision,
+                "runtime_lifecycle_reason": runtime_lifecycle_reason,
             },
         )
 

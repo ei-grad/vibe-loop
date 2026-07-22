@@ -41,6 +41,13 @@ The already accepted report — the first terminal report the supervisor observe
 — stays authoritative: enforced teardown neither downgrades a completed result to
 unknown nor creates a retry, a later contradicting report cannot override it, and
 finalization/next-task dispatch still waits for the worker process to exit.
+In runtime-owned orchestration, a nonzero exit caused by that positively verified
+post-report enforcement may advance to candidate collection only when the accepted
+report is `completed` and the run did not hit its wall-clock timeout. The runtime
+re-snapshots the claimed candidate after teardown and before any gate; an external
+termination, unverifiable identity, non-completed report, or changed candidate
+remains fail-closed. The activity event records the structured continue/refuse
+decision and reason without copying worker prompt or output text.
 
 The boundary is the report's own persistence instant, not the moment the
 supervisor's poll notices it, so structured activity emitted after persistence

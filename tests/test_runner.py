@@ -5104,6 +5104,51 @@ class FakeMonotonicClock:
 
 
 class ClassifyPostReportActivityTests(unittest.TestCase):
+    def test_runtime_lifecycle_decision_rejects_non_authoritative_exits(self) -> None:
+        activity = runner_module.PostReportActivity(
+            reported=True,
+            seconds=0.5,
+            activity_kind="tool_call",
+            activity_count=1,
+            enforced_stop=True,
+            identity_verified=True,
+            usage=runner_module.unavailable_usage("anthropic", "test_fixture"),
+        )
+        completed = WorkerReport(run_id="run-1", task_id="T-1", status="completed")
+        blocked = dataclasses.replace(completed, status="blocked")
+
+        self.assertEqual(
+            runner_module.post_report_runtime_lifecycle_decision(
+                runtime_owned=False,
+                exit_code=-signal.SIGTERM,
+                timed_out=False,
+                worker_report=completed,
+                activity=activity,
+            ),
+            ("refuse", "runtime_owned_orchestration_disabled"),
+        )
+
+        cases = (
+            ({"timed_out": True, "worker_report": completed}, "worker_timed_out"),
+            (
+                {"timed_out": False, "worker_report": None},
+                "accepted_report_missing",
+            ),
+            (
+                {"timed_out": False, "worker_report": blocked},
+                "accepted_report_not_completed",
+            ),
+        )
+        for overrides, reason in cases:
+            with self.subTest(reason=reason):
+                decision = runner_module.post_report_runtime_lifecycle_decision(
+                    runtime_owned=True,
+                    exit_code=-signal.SIGTERM,
+                    activity=activity,
+                    **overrides,
+                )
+                self.assertEqual(decision, ("refuse", reason))
+
     def test_claude_tool_use_block_is_tool_call(self) -> None:
         line = json.dumps(
             {
@@ -7428,6 +7473,163 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             record_types.index("integration_result"),
             record_types.index("task_provenance_committed"),
         )
+
+    def test_runtime_owned_lifecycle_continues_after_verified_post_report_teardown(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            def enforced_worker(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                    )
+                )
+                kwargs["on_start"](os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGTERM,
+                    post_report=runner_module.PostReportActivity(
+                        reported=True,
+                        seconds=0.5,
+                        activity_kind="tool_call",
+                        activity_count=1,
+                        enforced_stop=True,
+                        identity_verified=True,
+                        usage=runner_module.unavailable_usage(
+                            "anthropic", "test_fixture"
+                        ),
+                    ),
+                )
+
+            def complete_lifecycle(**kwargs):
+                self._record_runtime_integration(
+                    runner,
+                    kwargs["run_id"],
+                    kwargs["task"].task_id,
+                )
+                return runner_module.ClassificationResult(
+                    "completed", "runtime_lifecycle"
+                )
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=complete_lifecycle,
+            ) as lifecycle:
+                result = self._run_task(runner, task, enforced_worker)
+            activity = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "post_report_activity"
+            )
+
+        self.assertEqual(result.classification, "completed")
+        self.assertEqual(result.exit_code, -signal.SIGTERM)
+        lifecycle.assert_called_once()
+        self.assertEqual(activity["runtime_lifecycle_decision"], "continue")
+        self.assertEqual(
+            activity["runtime_lifecycle_reason"],
+            "verified_runtime_enforced_teardown",
+        )
+
+    def test_runtime_owned_lifecycle_refuses_unverified_post_report_exit(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            def externally_stopped_worker(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                    )
+                )
+                kwargs["on_start"](os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGTERM,
+                    post_report=runner_module.PostReportActivity(
+                        reported=True,
+                        seconds=0.5,
+                        activity_kind="tool_call",
+                        activity_count=1,
+                        enforced_stop=False,
+                        identity_verified=False,
+                        usage=runner_module.unavailable_usage(
+                            "anthropic", "test_fixture"
+                        ),
+                    ),
+                )
+
+            with patch.object(runner, "execute_runtime_owned_lifecycle") as lifecycle:
+                result = self._run_task(runner, task, externally_stopped_worker)
+            activity = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "post_report_activity"
+            )
+
+        lifecycle.assert_not_called()
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(activity["runtime_lifecycle_decision"], "refuse")
+        self.assertEqual(
+            activity["runtime_lifecycle_reason"],
+            "teardown_not_runtime_enforced",
+        )
+
+    def test_post_report_candidate_is_revalidated_before_runtime_gates(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            def invalidating_worker(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                    )
+                )
+                kwargs["on_start"](os.getpid())
+                (cwd / "README.md").write_text(
+                    "post-report mutation\n", encoding="utf-8"
+                )
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGTERM,
+                    post_report=runner_module.PostReportActivity(
+                        reported=True,
+                        seconds=0.5,
+                        activity_kind="tool_call",
+                        activity_count=1,
+                        enforced_stop=True,
+                        identity_verified=True,
+                        usage=runner_module.unavailable_usage(
+                            "anthropic", "test_fixture"
+                        ),
+                    ),
+                )
+
+            result = self._run_task(runner, task, invalidating_worker)
+            record_types = {
+                record.get("record_type") for record in runner.run_store.read_records()
+            }
+
+        self.assertEqual(result.classification, "failed")
+        self.assertEqual(result.classification_source, "runtime_stage_failed")
+        self.assertNotIn("gate_result", record_types)
+        self.assertNotIn("review_started", record_types)
 
     def test_runtime_owned_activation_crash_retains_lock_before_first_attempt(
         self,
