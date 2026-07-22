@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,10 @@ from vibe_loop.activity import (
 )
 from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore
 from vibe_loop.runner import AgentOutputObserver
+from vibe_loop.runner import (
+    parse_agent_runtime_context_from_command,
+    run_streaming_command,
+)
 from vibe_loop.telemetry import ProviderUsageObserver
 from vibe_loop.workers import ActiveRunState, WorkerView
 
@@ -176,6 +181,125 @@ def test_checkpoint_coalescing_and_replay_dedup_are_deterministic() -> None:
     assert summary.activity_counts[ACTIVITY_CHECKPOINT_RECORD_TYPE] == len(lines)
 
 
+def test_repeated_idless_codex_turns_have_replay_stable_occurrences() -> None:
+    completed = (
+        Path(__file__).parent / "fixtures" / "provider_usage" / "codex-present.json"
+    ).read_text(encoding="utf-8")
+    lines = [line for _ in range(3) for line in ('{"type":"turn.started"}', completed)]
+
+    def records(*, regroup: bool) -> list[dict[str, object]]:
+        ticks = iter(range(1000))
+        tracker = AgentActivityTracker(
+            monotonic=(lambda: float(next(ticks) * 6)) if regroup else (lambda: 1.0),
+            wallclock=lambda: 100.0,
+        )
+        emissions = []
+        for line in lines:
+            emissions.extend(tracker.observe_line(line))
+        final = tracker.flush()
+        if final is not None:
+            emissions.append(final)
+        return [
+            {
+                "record_type": emission.record_type,
+                **emission.to_payload(provider="openai", usage={}),
+            }
+            for emission in emissions
+        ]
+
+    original = records(regroup=False)
+    replay = records(regroup=True)
+    original_event_ids = {
+        event["id"] for record in original for event in record["activity_events"]
+    }
+    replay_event_ids = {
+        event["id"] for record in replay for event in record["activity_events"]
+    }
+    summary = summarize_activity_records([*original, *replay])
+
+    assert len(original_event_ids) == 6
+    assert replay_event_ids == original_event_ids
+    assert summary.activity_counts == {
+        ACTIVITY_CHECKPOINT_RECORD_TYPE: 3,
+        AGENT_COMPLETED_RECORD_TYPE: 3,
+    }
+    assert summary.activity_record_count == 6
+
+
+def test_projection_uses_latest_timestamp_not_reader_order() -> None:
+    tracker = AgentActivityTracker()
+    completed = tracker.observe_line(
+        '{"type":"turn.completed","turn_id":"turn-new",'
+        '"timestamp":"2026-07-22T10:00:10Z"}'
+    )[0]
+    older_tool = tracker.observe_line(
+        '{"type":"item.started","timestamp":"2026-07-22T10:00:05Z",'
+        '"item":{"type":"command_execution","id":"tool-old"}}'
+    )[0]
+    records = [
+        {
+            "record_type": completed.record_type,
+            **completed.to_payload(
+                provider="openai",
+                usage={"provider": "openai", "input_tokens": 20},
+            ),
+        },
+        {
+            "record_type": older_tool.record_type,
+            **older_tool.to_payload(
+                provider="openai",
+                usage={"provider": "openai", "input_tokens": 10},
+            ),
+        },
+    ]
+
+    summary = summarize_activity_records([*records, records[1]])
+
+    assert summary.last_activity_at == "2026-07-22T10:00:10+00:00"
+    assert summary.latest_activity_class == "completed"
+    assert summary.usage["input_tokens"] == 20
+    assert summary.activity_counts == {
+        AGENT_COMPLETED_RECORD_TYPE: 1,
+        ACTIVITY_CHECKPOINT_RECORD_TYPE: 1,
+    }
+
+
+def test_projection_timestamp_tie_uses_later_journal_record() -> None:
+    timestamp = "2026-07-22T10:30:00Z"
+    tracker = AgentActivityTracker()
+    started = tracker.observe_line(
+        json.dumps(
+            {
+                "type": "item.started",
+                "timestamp": timestamp,
+                "item": {"type": "command_execution", "id": "tool-tie"},
+            }
+        )
+    )[0]
+    completed = tracker.observe_line(
+        json.dumps({"type": "turn.completed", "turn_id": "tie", "timestamp": timestamp})
+    )[0]
+    records = [
+        {
+            "record_type": started.record_type,
+            **started.to_payload(
+                provider="openai", usage={"provider": "openai", "input_tokens": 1}
+            ),
+        },
+        {
+            "record_type": completed.record_type,
+            **completed.to_payload(
+                provider="openai", usage={"provider": "openai", "input_tokens": 2}
+            ),
+        },
+    ]
+
+    summary = summarize_activity_records(records)
+
+    assert summary.latest_activity_class == "completed"
+    assert summary.usage["input_tokens"] == 2
+
+
 def test_input_bounds_and_unknown_records_are_ignored() -> None:
     oversized = (
         '{"type":"turn.started","padding":"' + ("x" * MAX_STREAM_ENVELOPE_BYTES) + '"}'
@@ -198,6 +322,46 @@ def test_input_bounds_and_unknown_records_are_ignored() -> None:
         "usage": {},
         "phase_durations": {},
     }
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"type":"turn.started","integer":' + ("9" * 5000) + "}",
+        ("[" * 2000) + "0" + ("]" * 2000),
+    ],
+)
+def test_json_resource_adversaries_are_ignored_by_stream_observer(line: str) -> None:
+    observer = AgentOutputObserver("openai")
+
+    assert bounded_json_envelope(line) is None
+    assert observer.observe_line(line, "stdout") is None
+    assert observer.observation.empty
+
+
+def test_stream_drain_survives_json_resource_adversaries(tmp_path: Path) -> None:
+    script = tmp_path / "emit_adversarial_json.py"
+    script.write_text(
+        "print('{\"type\":\"turn.started\",\"integer\":' + '9' * 5000 + '}')\n"
+        "print('[' * 2000 + '0' + ']' * 2000)\n",
+        encoding="utf-8",
+    )
+    log_path = tmp_path / "run.log"
+    with log_path.open("w", encoding="utf-8") as log:
+        result = run_streaming_command(
+            f"{sys.executable} {script.name}",
+            tmp_path,
+            log,
+            env={"VIBE_LOOP_FENCING_TOKEN": "fencing-test-value"},
+            provider="openai",
+        )
+
+    assert result.exit_code == 0
+    assert result.runtime_context.empty
+    assert result.session_id is None
+    logged = log_path.read_text(encoding="utf-8")
+    assert '"integer":' + ("9" * 5000) in logged
+    assert ("[" * 2000) + "0" + ("]" * 2000) in logged
 
 
 def test_summary_derives_phase_durations_and_latest_authoritative_usage() -> None:
@@ -253,6 +417,18 @@ def test_runs_inspect_and_workers_expose_activity_projection(tmp_path: Path) -> 
         "input_tokens": 7,
         "output_tokens": 2,
     }
+    command_context = parse_agent_runtime_context_from_command(
+        "codex exec --model gpt-5.4-codex --reasoning-effort high"
+    )
+    observer = AgentOutputObserver("openai")
+    assert (
+        observer.observe_line(
+            "Final summary: model=gpt-9.9 effort=xhigh reasoning_effort=minimal",
+            "stdout",
+        )
+        is None
+    )
+    effective_context = command_context.prefer(observer.observation.runtime_context)
     store = RunStore(tmp_path / "runs.jsonl")
     store.append_lifecycle_event(
         RunLifecycleEvent.agent_activity(
@@ -272,12 +448,12 @@ def test_runs_inspect_and_workers_expose_activity_projection(tmp_path: Path) -> 
             log_path=tmp_path / "run.log",
             start_main="a",
             end_main="b",
-            model_provider="openai",
-            model_provider_source="native:stdout:json.model_provider",
-            model_id="gpt-5.4-codex",
-            model_id_source="native:stdout:json.model_id",
-            reasoning_effort="high",
-            reasoning_effort_source="native:stdout:json.effort",
+            model_provider=effective_context.model_provider,
+            model_provider_source=effective_context.model_provider_source,
+            model_id=effective_context.model_id,
+            model_id_source=effective_context.model_id_source,
+            reasoning_effort=effective_context.reasoning_effort,
+            reasoning_effort_source=effective_context.reasoning_effort_source,
         )
     )
 
@@ -288,9 +464,9 @@ def test_runs_inspect_and_workers_expose_activity_projection(tmp_path: Path) -> 
     assert payload["last_activity_at"] == "2026-07-22T08:00:00+00:00"
     assert payload["usage"]["input_tokens"] == 7
     assert payload["model_id"] == "gpt-5.4-codex"
-    assert payload["model_id_source"].startswith("native:")
+    assert payload["model_id_source"] == "command_arg:--model"
     assert payload["reasoning_effort"] == "high"
-    assert payload["reasoning_effort_source"].startswith("native:")
+    assert payload["reasoning_effort_source"] == "command_arg:--reasoning-effort"
 
     active = ActiveRunState.new(
         task_id="TASK-01",
@@ -298,12 +474,12 @@ def test_runs_inspect_and_workers_expose_activity_projection(tmp_path: Path) -> 
         log_path=tmp_path / "run.log",
         base_main="a",
         command="configured worker",
-        model_provider="openai",
-        model_provider_source="native:stdout:json.model_provider",
-        model_id="gpt-5.4-codex",
-        model_id_source="native:stdout:json.model_id",
-        reasoning_effort="high",
-        reasoning_effort_source="native:stdout:json.effort",
+        model_provider=effective_context.model_provider,
+        model_provider_source=effective_context.model_provider_source,
+        model_id=effective_context.model_id,
+        model_id_source=effective_context.model_id_source,
+        reasoning_effort=effective_context.reasoning_effort,
+        reasoning_effort_source=effective_context.reasoning_effort_source,
     )
     worker = WorkerView(
         active=active,

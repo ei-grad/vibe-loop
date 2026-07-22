@@ -697,7 +697,7 @@ class ProviderUsageObserver:
             return None
         try:
             payload = json.loads(text)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             return None
         if not isinstance(payload, dict):
             return None

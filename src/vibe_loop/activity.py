@@ -109,7 +109,7 @@ class ActivityEmission:
     activity_delta: Mapping[str, int]
     activity_counts: Mapping[str, int]
     coalesced_count: int
-    activity_events: tuple[tuple[str, str], ...]
+    activity_events: tuple[tuple[str, str, str, str], ...]
     reason_class: str = ""
 
     def to_payload(
@@ -124,8 +124,13 @@ class ActivityEmission:
             "activity_counts": dict(self.activity_counts),
             "coalesced_count": self.coalesced_count,
             "activity_events": [
-                {"id": event_id, "record_type": record_type}
-                for event_id, record_type in self.activity_events
+                {
+                    "id": event_id,
+                    "record_type": record_type,
+                    "observed_at": observed_at,
+                    "activity_class": activity_class,
+                }
+                for event_id, record_type, observed_at, activity_class in self.activity_events
             ],
             "provider": provider if provider in {"anthropic", "openai"} else "unknown",
         }
@@ -170,11 +175,20 @@ class AgentActivityTracker:
         self._counts = {record_type: 0 for record_type in ACTIVITY_RECORD_TYPES}
         self._pending: list[NativeActivity] = []
         self._last_emit_monotonic: float | None = None
+        self._event_occurrences: dict[str, int] = {}
 
     def observe_line(self, line: str) -> tuple[ActivityEmission, ...]:
         activity = parse_native_activity(line, wallclock=self._wallclock)
         if activity is None:
             return ()
+        occurrence = self._event_occurrences.get(activity.event_id, 0) + 1
+        self._event_occurrences[activity.event_id] = occurrence
+        activity = dataclasses.replace(
+            activity,
+            event_id=hashlib.sha256(
+                f"{activity.event_id}:{occurrence}".encode("ascii")
+            ).hexdigest(),
+        )
         self._counts[activity.record_type] = min(
             MAX_ACTIVITY_COUNTER,
             self._counts[activity.record_type] + 1,
@@ -220,7 +234,10 @@ class AgentActivityTracker:
                 MAX_ACTIVITY_COUNTER,
                 delta.get(activity.record_type, 0) + 1,
             )
-        latest = activities[-1]
+        latest = max(
+            enumerate(activities),
+            key=lambda item: (_parse_timestamp(item[1].observed_at), item[0]),
+        )[1]
         record_type = (
             GATE_RESULT_RECORD_TYPE
             if GATE_RESULT_RECORD_TYPE in delta
@@ -239,7 +256,13 @@ class AgentActivityTracker:
             activity_counts=dict(self._counts),
             coalesced_count=len(activities),
             activity_events=tuple(
-                (activity.event_id, activity.record_type) for activity in activities
+                (
+                    activity.event_id,
+                    activity.record_type,
+                    activity.observed_at,
+                    activity.activity_class,
+                )
+                for activity in activities
             ),
             reason_class=latest.reason_class,
         )
@@ -394,7 +417,7 @@ def bounded_json_envelope(line: str) -> dict[str, object] | None:
         return None
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(payload, dict) or not _json_shape_within_bounds(payload):
         return None
@@ -412,7 +435,8 @@ def summarize_activity_records(
     latest_class = ""
     usage: dict[str, object] = {}
     activity_record_count = 0
-    for record in records:
+    projection_key: tuple[datetime, int] | None = None
+    for record_index, record in enumerate(records):
         if record.get("activity_schema_version") != ACTIVITY_SCHEMA_VERSION:
             continue
         record_type = record.get("record_type")
@@ -434,9 +458,13 @@ def summarize_activity_records(
                     continue
                 event_id = event.get("id")
                 event_record_type = event.get("record_type")
+                event_observed_at = _parse_timestamp(event.get("observed_at"))
+                event_activity_class = event.get("activity_class")
                 if (
                     not _is_hex_id(event_id, length=64)
                     or event_record_type not in ACTIVITY_RECORD_TYPES
+                    or event_observed_at is None
+                    or event_activity_class not in ACTIVITY_CLASSES
                     or event_id in seen_event_ids
                 ):
                     continue
@@ -462,18 +490,21 @@ def summarize_activity_records(
         observed_at = record.get("observed_at")
         parsed_observed_at = _parse_timestamp(observed_at)
         if parsed_observed_at is not None:
-            current_last = _parse_timestamp(last_activity_at)
-            if current_last is None or parsed_observed_at > current_last:
+            candidate_key = (parsed_observed_at, record_index)
+            if projection_key is None or candidate_key > projection_key:
+                projection_key = candidate_key
                 last_activity_at = parsed_observed_at.isoformat()
+                activity_class = record.get("activity_class")
+                if activity_class in ACTIVITY_CLASSES:
+                    latest_class = str(activity_class)
+                candidate_usage = record.get("usage")
+                if isinstance(candidate_usage, Mapping):
+                    usage = _bounded_usage(candidate_usage)
         activity_class = record.get("activity_class")
-        if isinstance(activity_class, str) and activity_class in ACTIVITY_CLASSES:
-            latest_class = activity_class
+        if activity_class in ACTIVITY_CLASSES:
             if activity_class not in classes:
-                classes.append(activity_class)
+                classes.append(str(activity_class))
                 classes = classes[-8:]
-        candidate_usage = record.get("usage")
-        if isinstance(candidate_usage, Mapping):
-            usage = _bounded_usage(candidate_usage)
     return ActivitySummary(
         last_activity_at=last_activity_at,
         latest_activity_class=latest_class,

@@ -2888,20 +2888,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(context.reasoning_effort, "medium")
         self.assertEqual(context.reasoning_effort_source, "command_arg:--effort")
 
-    def test_text_line_parses_bare_effort_alias(self) -> None:
-        # Finding 3 (P2): the public `effort` alias must be recognized in text
-        # observation lines, not only the legacy `reasoning_effort` spelling.
+    def test_text_line_cannot_establish_route_provenance(self) -> None:
         bare = parse_agent_runtime_context_from_line("effort: high", "stdout")
-        self.assertEqual(bare.reasoning_effort, "high")
-        self.assertEqual(bare.reasoning_effort_source, "native:stdout:effort")
-
         legacy = parse_agent_runtime_context_from_line(
             "reasoning_effort: high", "stdout"
         )
-        self.assertEqual(legacy.reasoning_effort, "high")
-        self.assertEqual(
-            legacy.reasoning_effort_source, "native:stdout:reasoning_effort"
-        )
+
+        self.assertTrue(bare.empty)
+        self.assertTrue(legacy.empty)
 
     def test_streaming_command_reports_started_process_pid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

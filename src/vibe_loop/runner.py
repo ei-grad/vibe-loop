@@ -167,12 +167,6 @@ SESSION_ID_RE = re.compile(
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
-AGENT_CONTEXT_RE = re.compile(
-    r"\b(?P<key>model(?:[_ -]?(?:provider|id))?|provider|"
-    r"reasoning[_ -]?effort|effort)\s*[:=]\s*"
-    r"(?P<value>\"[^\"]+\"|'[^']+'|[^\s,;]+)",
-    re.IGNORECASE,
-)
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 # A bare top-level string `model` value is only a model identity inside these
 # structured lifecycle events. Any other JSON object carrying a `model` key
@@ -200,9 +194,6 @@ AGENT_CONTEXT_SOURCE_RANKS = (
     ("native:", 30),
     ("command_executable:", 10),
 )
-# Free-text log scraping (`native:stdout:model`) is weaker than a structured
-# native event (`native:stdout:json.model`) even though both are native.
-AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK = 20
 CLAUDE_MODEL_ALIASES = frozenset({"haiku", "opus", "sonnet"})
 AGENT_CONTEXT_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$")
 SHELL_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
@@ -946,7 +937,7 @@ def _provider_stream_epoch_from_line(line: str) -> float | None:
         return None
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -969,7 +960,7 @@ def classify_post_report_event(line: str) -> ActivityEvent | None:
         return None
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(payload, dict):
         return None
@@ -6797,9 +6788,9 @@ def agent_context_source_rank(source: str) -> int:
     for prefix, rank in AGENT_CONTEXT_SOURCE_RANKS:
         if source.startswith(prefix):
             if prefix == "native:" and ":json." not in source:
-                return AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK
+                return 0
             return rank
-    return AGENT_CONTEXT_UNSTRUCTURED_NATIVE_RANK
+    return 0
 
 
 def pick_agent_context_field(
@@ -6859,7 +6850,7 @@ def parse_agent_runtime_context_from_line(
         return parse_agent_runtime_context_from_json_payload(
             json_payload, source_prefix
         )
-    return parse_agent_runtime_context_from_text_line(line, source_prefix)
+    return AgentRuntimeContext()
 
 
 def agent_context_json_payload(line: str) -> dict[str, object] | None:
@@ -6870,7 +6861,7 @@ def agent_context_json_payload(line: str) -> dict[str, object] | None:
         return None
     try:
         payload = json.loads(text)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -6935,29 +6926,6 @@ def parse_agent_runtime_context_from_json_payload(
             if rejected
         ),
     )
-
-
-def parse_agent_runtime_context_from_text_line(
-    line: str,
-    source_prefix: str,
-) -> AgentRuntimeContext:
-    context = AgentRuntimeContext()
-    for match in AGENT_CONTEXT_RE.finditer(line):
-        key = normalize_agent_context_key(match.group("key"))
-        value = clean_agent_context_value(match.group("value"))
-        if not value:
-            continue
-        if key in {"effort", "reasoning_effort"}:
-            value = clean_reasoning_effort_value(match.group("value"))
-            if not value:
-                continue
-            context = context.overlay(
-                AgentRuntimeContext(
-                    reasoning_effort=value,
-                    reasoning_effort_source=f"{source_prefix}:{key}",
-                )
-            )
-    return context
 
 
 def payload_declares_model_identity(payload: dict[str, object]) -> bool:
@@ -7770,13 +7738,16 @@ def redact_worker_stream_line(line: str, fencing_token: str) -> str:
         return line
     try:
         payload = json.loads(line)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return redact_fencing_token_text(line, fencing_token)
-    if fencing_token_value(payload) == fencing_token:
-        newline = "\n" if line.endswith("\n") else ""
-        return FENCING_TOKEN_REDACTION + newline
-    field_redacted = redact_fencing_token_payload(payload)
-    redacted = redact_exact_fencing_token(field_redacted, fencing_token)
+    try:
+        if fencing_token_value(payload) == fencing_token:
+            newline = "\n" if line.endswith("\n") else ""
+            return FENCING_TOKEN_REDACTION + newline
+        field_redacted = redact_fencing_token_payload(payload)
+        redacted = redact_exact_fencing_token(field_redacted, fencing_token)
+    except RecursionError:
+        return redact_fencing_token_text(line, fencing_token)
     if redacted == payload:
         return line
     newline = "\n" if line.endswith("\n") else ""
