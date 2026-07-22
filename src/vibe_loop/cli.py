@@ -82,6 +82,7 @@ from vibe_loop.locks import (
     build_lock_manager,
     redact_fencing_token_payload,
 )
+from vibe_loop.budget import BudgetStore
 from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.orchestration import CandidateCollectionError, CandidateCollector
 from vibe_loop.runner import VibeRunner
@@ -1179,6 +1180,8 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
             hours=args.hours,
             slice_token_threshold=config.supervision.slice_token_threshold,
         )
+        budget_store = BudgetStore(config.state_path / "budget.jsonl", config.budget)
+        summary["budget"] = budget_store.projection(project=config.repo.name)
         if args.json:
             print(json.dumps(summary, indent=2))
         else:
@@ -2887,6 +2890,9 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
                             lines.append(
                                 "  forecast=" + json.dumps(forecast, sort_keys=True)
                             )
+    budget = summary.get("budget")
+    if isinstance(budget, Mapping):
+        lines.extend(render_budget_projection(budget))
     diagnostics = summary.get("diagnostics")
     if isinstance(diagnostics, list):
         lines.append(f"diagnostics: {len(diagnostics)}")
@@ -2894,6 +2900,49 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
             if isinstance(diagnostic, Mapping):
                 lines.append("- " + json.dumps(diagnostic, sort_keys=True))
     return "\n".join(lines)
+
+
+def render_budget_projection(budget: Mapping[str, object]) -> list[str]:
+    lines = [
+        "budget: "
+        f"enabled={str(bool(budget.get('enabled'))).lower()} "
+        f"metric={budget.get('metric')} "
+        f"fail_safe={budget.get('fail_safe')}"
+    ]
+    limits = budget.get("limits")
+    if isinstance(limits, list):
+        for limit in limits:
+            if not isinstance(limit, Mapping):
+                continue
+            lines.append(
+                f"- limit[{limit.get('limit_index')}] "
+                f"{limit.get('selector') or 'any'}: "
+                f"consumed={limit.get('consumed')} "
+                f"reserved={limit.get('reserved')} "
+                f"remaining={limit.get('remaining')} "
+                f"limit={limit.get('limit')} "
+                f"warning={str(bool(limit.get('warning'))).lower()} "
+                f"exceeded={str(bool(limit.get('exceeded'))).lower()}"
+            )
+    routes = budget.get("routes")
+    if isinstance(routes, list):
+        for route in routes:
+            if not isinstance(route, Mapping):
+                continue
+            lines.append(
+                f"- route {route.get('provider')}: "
+                f"reserved={route.get('reserved')} "
+                f"consumed={route.get('consumed')} "
+                f"authoritative={route.get('authoritative_consumed')} "
+                f"fail_safe={route.get('fail_safe_consumed')}"
+            )
+    decisions = budget.get("decisions")
+    if isinstance(decisions, Mapping):
+        lines.append("  decisions=" + json.dumps(decisions, sort_keys=True))
+    reservations = budget.get("reservations")
+    if isinstance(reservations, Mapping):
+        lines.append("  reservations=" + json.dumps(reservations, sort_keys=True))
+    return lines
 
 
 def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:

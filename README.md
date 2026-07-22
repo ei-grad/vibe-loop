@@ -997,6 +997,24 @@ cross_run_attempt_threshold = 3   # unchanged non-completed attempts before auto
 type = "directory"
 # lease_seconds = 300   # locks go stale after this many seconds without a heartbeat
 
+# Usage budgets are disabled by default; the whole [budget] block is optional and
+# omitting it leaves launch behavior unchanged. See "Usage budgets and
+# reservations" below.
+# [budget]
+# enabled = true
+# metric = "total_tokens"        # dimension every cap/allowance is denominated in
+# fail_safe = "reserved"         # charge unknown usage at the reserved allowance
+# default_declared = 150000      # conservative per-launch reservation
+# [budget.declared]
+# implementation = 200000
+# review = 150000
+# [[budget.limits]]
+# provider = "anthropic"
+# phase = "implementation"
+# limit = 5000000
+# warn_at = 0.8
+# window_hours = 24
+
 [autopilot]
 # Defaults for `autopilot run` and `autopilot start`; explicit CLI flags override
 # these.
@@ -1031,6 +1049,55 @@ When `--repo` points at a Git linked worktree without its own `.vibe-loop.toml`,
 `vibe-loop` falls back to the main worktree's config (warning on stderr).
 Runtime state, locks, logs, and caches still live under the invoked `--repo`
 worktree.
+
+### Usage budgets and reservations
+
+`[budget]` gates model launches on a configurable usage budget. It is disabled
+by default; when `enabled = false` (or the block is absent) admission is a no-op
+and behavior is unchanged. When enabled, every launch first *reserves* a
+conservative declared allowance against each matching cap, atomically, in a
+durable append-only ledger (`.vibe-loop/budget.jsonl`) that survives process
+restart. Concurrent jobs and runs therefore cannot oversubscribe a cap: a
+reservation that would exceed the remaining budget is refused before any model
+process starts (`on_insufficient = "block"` or `"defer"`), and the refusal is
+durable evidence in the ledger.
+
+Attribution is by **project, provider route, worker phase, model, and effort**.
+A `[[budget.limits]]` entry caps one scope; omit a selector to match any value on
+that axis. A launch must satisfy every limit it matches. `metric` is the single
+dimension caps, declared allowances, and fail-safe charges are denominated in
+(one of `input_tokens`, `output_tokens`, `total_tokens`,
+`non_cached_input_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`, `cost_usd`). The reconciliation ledger still
+records the full input/output/cache/gross/fresh/cost breakdown plus an
+authoritative/unknown marker for evidence.
+
+When a run reaches an authoritative terminal provider-usage figure, its
+reservation is reconciled **exactly once** against that figure. Usage a provider
+never reported (or reported malformed) is charged through the **fail-safe**
+policy — never as zero:
+
+- `fail_safe = "reserved"` (default) keeps the conservatively reserved declared
+  allowance as the charge.
+- `fail_safe = "fixed"` charges an explicit `fail_safe_amount` (validated
+  positive).
+
+Reservations orphaned by a crashed supervisor are recovered without
+double-spend: a reservation whose owner run has a durable terminal result
+reconciles from that result; one whose owner is provably dead with no result is
+charged fail-safe. Recovery runs at each dispatch start and is guarded by the
+same exactly-once check.
+
+`vibe-loop runs summary --json` includes a `budget` projection: per-limit
+consumed/reserved/remaining/utilization with warning and exceeded flags, and a
+per-provider (and per-provider-phase) route breakdown reported **separately and
+never summed across providers**, so Claude-versus-Codex route balancing has
+evidence without any cross-provider token equivalence.
+
+Admission bounds **subsequent launches**, not token production inside an
+already-running model process: the provider CLIs enforce no hard per-invocation
+cap, so a running worker can exceed its declared allowance and the overage is
+reconciled after the fact. `vibe-loop` does not claim a hard per-invocation cap.
 
 ### Agent command and prompt dialect
 

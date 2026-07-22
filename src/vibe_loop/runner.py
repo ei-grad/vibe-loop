@@ -21,6 +21,12 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
 
 from vibe_loop.activity import ActivityEmission, AgentActivityTracker
+from vibe_loop.budget import (
+    BudgetReservationDenied,
+    BudgetRunOutcome,
+    BudgetStore,
+    process_alive_locally,
+)
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -1405,6 +1411,9 @@ class VibeRunner:
         self._lock_manager: LockManager | None = None
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
+        self.budget_store = BudgetStore(
+            config.state_path / "budget.jsonl", config.budget
+        )
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
         self.last_analysis_usage = unavailable_usage(
@@ -1918,6 +1927,10 @@ class VibeRunner:
         task_source_terminal_confirmed = True
         durable_run_result_recorded = False
         post_release_settlement_intent = ""
+        # Set once a conservative budget allowance is reserved for this launch;
+        # released again if the run fails before the worker process starts, so a
+        # denied-then-abandoned pre-launch failure never leaves a phantom charge.
+        budget_reservation_id = ""
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -2010,6 +2023,14 @@ class VibeRunner:
         pre_launch_failure_reason = "run_contract_resolution_failed"
 
         def finalize_pre_launch_failure(failure: StageFailure) -> None:
+            if budget_reservation_id:
+                # No worker process launched, so the reserved allowance must be
+                # given back rather than reconciled as consumed usage.
+                self.budget_store.release(
+                    reservation_id=budget_reservation_id,
+                    run_id=run_id,
+                    reason=pre_launch_failure_reason,
+                )
             if stage_machine.stage is not None:
                 stage_machine.fail(
                     failure,
@@ -2070,6 +2091,26 @@ class VibeRunner:
             )
             if circuit_state.open:
                 raise AttemptCircuitOpen(circuit_state)
+            if self.config.budget.enabled:
+                budget_decision = self.budget_store.reserve(
+                    reservation_id=run_id,
+                    run_id=run_id,
+                    project=self.config.repo.name,
+                    provider=command_context.model_provider,
+                    phase="implementation",
+                    model=command_context.model_id,
+                    effort=command_context.reasoning_effort,
+                )
+                if not budget_decision.admitted:
+                    # Denial is durable evidence in the budget journal; no worker
+                    # process is launched and no task activation is attempted.
+                    raise BudgetReservationDenied(budget_decision)
+                budget_reservation_id = run_id
+                if budget_decision.warnings:
+                    report_status(
+                        f"budget warning for {task.task_id} implementation "
+                        f"launch: {len(budget_decision.warnings)} cap(s) near limit"
+                    )
             pre_launch_failure_reason = "task_activation_failed"
             activated_runtime_owned = (
                 runtime_owned
@@ -3877,7 +3918,7 @@ class VibeRunner:
                 task,
                 restart_count=restart_count,
             )
-        except AttemptCircuitOpen as exc:
+        except (AttemptCircuitOpen, BudgetReservationDenied) as exc:
             report_status(str(exc))
             excluded = set(exclude or set())
             excluded.add(task.task_id)
@@ -3930,6 +3971,7 @@ class VibeRunner:
                 "jobs": jobs,
             }
         )
+        self.recover_abandoned_budget()
         try:
             if jobs == 1:
                 return self.run_until_done_serial(
@@ -4346,7 +4388,7 @@ class VibeRunner:
                         )
                         skipped.add(task_id)
                         continue
-                    except AttemptCircuitOpen as exc:
+                    except (AttemptCircuitOpen, BudgetReservationDenied) as exc:
                         report_status(str(exc))
                         skipped.add(task_id)
                         continue
@@ -4783,6 +4825,14 @@ class VibeRunner:
                 blocker="attempt_circuit_open",
             )
             return None
+        except BudgetReservationDenied as exc:
+            report_status(str(exc))
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="budget_reservation_denied",
+            )
+            return None
         except LockBusy:
             report_status(
                 "unknown-run recovery deferred: task locked during acquire: "
@@ -4921,6 +4971,44 @@ class VibeRunner:
                 result,
                 threshold=self.config.supervision.cross_run_attempt_threshold,
             )
+            if self.config.budget.enabled:
+                # Charge this run's live reservation(s) exactly once against the
+                # terminal provider usage; unknown usage is charged fail-safe,
+                # never zero. A run without a live reservation is a no-op.
+                self.budget_store.reconcile_run(
+                    run_id=result.run_id,
+                    stats=result.stats,
+                    provider=result.model_provider,
+                )
+
+    def recover_abandoned_budget(self) -> int:
+        """Reconcile budget reservations orphaned by a crashed prior supervisor.
+
+        A reservation whose owner run has a durable terminal result reconciles
+        from that result's authoritative-or-unknown usage; one whose owner is
+        provably dead with no result is charged fail-safe. The exactly-once
+        guard makes this safe to call at every dispatch start.
+        """
+
+        if not self.config.budget.enabled:
+            return 0
+        terminal: dict[str, BudgetRunOutcome] = {}
+        for record in self.run_store.read_records():
+            if record.get("record_type") not in {None, "run_result"}:
+                continue
+            run_id = record.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            stats = record.get("stats")
+            provider = record.get("model_provider")
+            terminal[run_id] = BudgetRunOutcome(
+                stats=stats if isinstance(stats, dict) else {},
+                provider=provider if isinstance(provider, str) else "",
+            )
+        return self.budget_store.recover_abandoned(
+            resolve=terminal.get,
+            process_alive=process_alive_locally,
+        )
 
     def _report_limit_wall_pause(self, result: RunResult) -> None:
         detail = (result.message or "").strip()
