@@ -16,6 +16,7 @@ from vibe_loop.budget import (
     BUDGET_RECONCILED_RECORD_TYPE,
     BUDGET_RESERVED_RECORD_TYPE,
     BUDGET_SCHEMA_VERSION,
+    BudgetLedgerCorruption,
     BudgetReservationDenied,
     BudgetRunOutcome,
     BudgetStore,
@@ -42,6 +43,7 @@ from vibe_loop.orchestration import (
     GateRunSummary,
     ProvisionedWorkspace,
     ReviewConcurrencyBudget,
+    ReviewBudgetExhausted,
     ReviewExecutionError,
     ReviewFinding,
     ReviewRouter,
@@ -859,9 +861,33 @@ class F1MissingMetricTests(unittest.TestCase):
                 self.assertEqual(record["charge"], expected)
 
     def test_reported_metrics_presence(self) -> None:
-        self.assertIn("total_tokens", reported_metrics({"input_tokens": 5}))
+        self.assertNotIn("total_tokens", reported_metrics({"input_tokens": 5}))
+        self.assertNotIn("total_tokens", reported_metrics({"output_tokens": 5}))
+        self.assertIn(
+            "total_tokens",
+            reported_metrics({"input_tokens": 5, "output_tokens": 7}),
+        )
         self.assertIn("non_cached_input_tokens", reported_metrics({"input_tokens": 0}))
         self.assertNotIn("cost_usd", reported_metrics({"input_tokens": 5}))
+
+    def test_total_tokens_requires_complete_sources_or_explicit_total(self) -> None:
+        cases = (
+            ("input_only", {"input_tokens": 5}, 500.0, True),
+            ("output_only", {"output_tokens": 7}, 500.0, True),
+            ("both", {"input_tokens": 5, "output_tokens": 7}, 12.0, False),
+            (
+                "explicit_zero",
+                {"total_tokens": 0, "input_tokens": 5, "output_tokens": 7},
+                0.0,
+                False,
+            ),
+            ("no_sources", {}, 500.0, True),
+        )
+        for name, fields, expected_charge, fail_safe in cases:
+            with self.subTest(name=name):
+                record = self._reconcile("total_tokens", authoritative_stats(**fields))
+                self.assertEqual(record["charge"], expected_charge)
+                self.assertEqual(record["fail_safe_applied"], fail_safe)
 
 
 def _init_repo(path: Path) -> None:
@@ -1380,6 +1406,60 @@ class F3ReviewLaunchTests(unittest.TestCase):
                     )
                 )
 
+    def test_review_claim_failures_release_without_launch_or_charge(self) -> None:
+        failures = (
+            ("exhausted", ReviewBudgetExhausted("initial", 1)),
+            ("pending", ReviewWaitIncomplete("initial", 1, 1)),
+            ("malformed", ReviewExecutionError("invalid claim status")),
+            ("other", ValueError("claim failed")),
+        )
+        for phase in ("initial_review", "targeted_closure"):
+            for name, failure in failures:
+                with self.subTest(phase=phase, failure=name):
+                    store = self._store(
+                        make_config(
+                            default_declared=500.0,
+                            limits=(BudgetLimit(phase=phase, limit=1e12),),
+                        )
+                    )
+                    launched: list[str] = []
+
+                    def sentinel(command: str, **kwargs):
+                        launched.append(command)
+                        raise AssertionError("claim failure must prevent launch")
+
+                    router = self._router(store, sentinel)
+                    released_before = sum(
+                        record.get("record_type") == "budget_released"
+                        for record in store.read_records()
+                    )
+                    with patch.object(
+                        router, "_claim_review_attempt", side_effect=failure
+                    ):
+                        with self.assertRaises(type(failure)):
+                            self._review_phase(router, phase)
+                    records = store.read_records()
+                    self.assertEqual(launched, [])
+                    self.assertEqual(
+                        sum(
+                            record.get("record_type") == "budget_released"
+                            for record in records
+                        ),
+                        released_before + 1,
+                    )
+                    self.assertFalse(
+                        any(
+                            record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+                            for record in records
+                        )
+                    )
+                    projection = store.projection(project="proj")
+                    self.assertEqual(projection["reservations"]["live"], 0)
+                    self.assertEqual(
+                        sum(float(limit["consumed"]) for limit in projection["limits"]),
+                        0.0,
+                    )
+
 
 class F3RuntimeRemediationLaunchTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -1618,11 +1698,30 @@ class F4TerminalSchemaTests(unittest.TestCase):
             )
             self._assert_live_and_flagged(store, "identity_mismatch")
 
+    def test_terminal_for_other_run_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_reservation(directory)
+            self._append_raw(
+                store, json.dumps(self._valid_terminal(run_id="other-run"))
+            )
+            self._assert_live_and_flagged(store, "identity_mismatch")
+
     def test_generation_mismatch_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = self._store_with_reservation(directory)
             self._append_raw(store, json.dumps(self._valid_terminal(generation=99)))
             self._assert_live_and_flagged(store, "generation_mismatch")
+
+    def test_non_integer_generations_are_rejected(self) -> None:
+        for generation in ("1", True):
+            with self.subTest(generation=generation):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = self._store_with_reservation(directory)
+                    self._append_raw(
+                        store,
+                        json.dumps(self._valid_terminal(generation=generation)),
+                    )
+                    self._assert_live_and_flagged(store, "generation_mismatch")
 
     def test_missing_required_fields_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1673,16 +1772,22 @@ class F4TerminalSchemaTests(unittest.TestCase):
             consumed = sum(float(limit["consumed"]) for limit in projection["limits"])
             self.assertEqual(consumed, 10.0)
 
-    def test_legacy_terminal_without_identity_is_accepted(self) -> None:
+    def test_legacy_terminal_without_generation_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = self._store_with_reservation(directory)
             legacy = self._valid_terminal()
             del legacy["owner_run_id"]
             del legacy["generation"]
             self._append_raw(store, json.dumps(legacy))
-            projection = self._projection(store)
-            self.assertEqual(projection["reservations"]["reconciled"], 1)
-            self.assertEqual(projection["reservations"]["live"], 0)
+            self._assert_live_and_flagged(store, "generation_mismatch")
+
+    def test_legacy_terminal_for_other_run_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store_with_reservation(directory)
+            legacy = self._valid_terminal(run_id="other-run")
+            del legacy["owner_run_id"]
+            self._append_raw(store, json.dumps(legacy))
+            self._assert_live_and_flagged(store, "identity_mismatch")
 
 
 class F5BoundedStateTests(unittest.TestCase):
@@ -1794,6 +1899,60 @@ class F5BoundedStateTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(self._projection_consumed(store), 50.0)
+
+    def test_incomplete_and_forged_same_generation_checkpoints_fail_closed(
+        self,
+    ) -> None:
+        config = make_config(
+            default_declared=60.0,
+            limits=(BudgetLimit(limit=100.0),),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            store = BudgetStore(Path(directory) / "budget.jsonl", config)
+            old = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+            with patch("vibe_loop.budget.utc_now_iso", return_value=old):
+                store.reserve(
+                    reservation_id="r1",
+                    run_id="r1",
+                    project="proj",
+                    provider="anthropic",
+                    phase="implementation",
+                    model="m",
+                    effort="",
+                )
+                store.reconcile_reservation(
+                    reservation_id="r1",
+                    run_id="r1",
+                    stats=anthropic_stats(60),
+                    provider="anthropic",
+                )
+            self.assertTrue(store.compact())
+            original = json.loads(store.checkpoint_path.read_text(encoding="utf-8"))
+            cases = {
+                "incomplete": {
+                    key: value for key, value in original.items() if key != "integrity"
+                },
+                "forged_empty_spend": {
+                    **original,
+                    "cumulative": [],
+                    "reservation_counts": {},
+                },
+            }
+            for name, checkpoint in cases.items():
+                with self.subTest(name=name):
+                    store.checkpoint_path.write_text(
+                        json.dumps(checkpoint), encoding="utf-8"
+                    )
+                    with self.assertRaises(BudgetLedgerCorruption):
+                        store.reserve(
+                            reservation_id=f"r2-{name}",
+                            run_id=f"r2-{name}",
+                            project="proj",
+                            provider="anthropic",
+                            phase="implementation",
+                            model="m",
+                            effort="",
+                        )
 
     def test_sustained_denial_load_stays_bounded_and_audited(self) -> None:
         config = make_config(default_declared=100.0, limits=(BudgetLimit(limit=1.0),))

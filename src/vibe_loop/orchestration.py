@@ -1882,13 +1882,17 @@ class ReviewRouter:
         # Reserve the phase budget before claiming a review pass, so a denial
         # launches no reviewer process and consumes no review-budget slot.
         budget_reservation = self._reserve_review_budget(request, route)
-        pass_ordinal = self._claim_review_attempt(
-            request,
-            pass_ordinal=pass_ordinal,
-            attempt_ordinal=attempt_ordinal,
-            route=route,
-            continuation=continuation,
-        )
+        try:
+            pass_ordinal = self._claim_review_attempt(
+                request,
+                pass_ordinal=pass_ordinal,
+                attempt_ordinal=attempt_ordinal,
+                route=route,
+                continuation=continuation,
+            )
+        except BaseException:
+            self._release_review_budget(budget_reservation)
+            raise
         started = time.monotonic()
         try:
             with self.concurrency.slot():

@@ -25,6 +25,7 @@ per-invocation cap. That boundary is documented, not silently assumed away.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -128,6 +129,10 @@ class BudgetReservationDenied(RuntimeError):
         )
 
 
+class BudgetLedgerCorruption(RuntimeError):
+    """A compacted ledger cannot be reconstructed from its checkpoint."""
+
+
 @dataclasses.dataclass(frozen=True)
 class BudgetRunOutcome:
     """A run's authoritative-or-unknown terminal usage, for recovery."""
@@ -205,6 +210,12 @@ def budget_dimensions(stats: object, provider: str) -> dict[str, float]:
 
     mapping = stats if isinstance(stats, Mapping) else {}
     dims = {key: _number(mapping.get(key)) for key in BUDGET_DIMENSIONS}
+    if (
+        not _reported(mapping, "total_tokens")
+        and _reported(mapping, "input_tokens")
+        and _reported(mapping, "output_tokens")
+    ):
+        dims["total_tokens"] = dims["input_tokens"] + dims["output_tokens"]
     dims["non_cached_input_tokens"] = float(non_cached_input_tokens(mapping))
     dims["fresh_input_tokens"] = float(fresh_input_tokens(mapping, provider))
     return dims
@@ -238,7 +249,7 @@ def reported_metrics(stats: object) -> frozenset[str]:
             if (
                 _reported(mapping, "total_tokens")
                 or _reported(mapping, "input_tokens")
-                or _reported(mapping, "output_tokens")
+                and _reported(mapping, "output_tokens")
             ):
                 present.add(metric)
         elif _reported(mapping, metric):
@@ -305,11 +316,10 @@ def _terminal_integrity(
 ) -> str:
     """Return the corruption class, or "" when the terminal record is valid.
 
-    Enforces the durable identity/schema contract: schema version, run identity,
-    reservation generation (when the record carries one — legacy rows predate the
-    field and are accepted on run-id match), a bounded enum reason, and numeric
-    usage fields. Any failure keeps the reservation live rather than closing it
-    at a fabricated zero.
+    Enforces the durable identity/schema contract: schema version, exact run
+    identity and reservation generation, a bounded enum reason, and numeric usage
+    fields. Any failure keeps the reservation live rather than closing it at a
+    fabricated zero.
     """
 
     schema = record.get("schema_version")
@@ -317,8 +327,11 @@ def _terminal_integrity(
         return "missing_fields"
     if schema < 1 or schema > BUDGET_SCHEMA_VERSION:
         return "missing_fields"
-    if not string_value(record.get("run_id")):
+    record_run_id = string_value(record.get("run_id"))
+    if not record_run_id:
         return "missing_fields"
+    if record_run_id != string_value(reserved.get("run_id")):
+        return "identity_mismatch"
     reason = record.get("reason")
     if not isinstance(reason, str) or not _SAFE_REASON_RE.match(reason):
         return "missing_fields"
@@ -329,10 +342,9 @@ def _terminal_integrity(
         return "identity_mismatch"
     generation = record.get("generation")
     if (
-        generation is not None
-        and not isinstance(generation, bool)
-        and isinstance(generation, int)
-        and generation != _int_or_zero(reserved.get("generation"))
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation != _int_or_zero(reserved.get("generation"))
     ):
         return "generation_mismatch"
     if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE:
@@ -392,7 +404,8 @@ def _ledger_state(
     folded_integrity: dict[str, int] = {}
     checkpoint_matches = (
         checkpoint is not None
-        and _int_or_zero(checkpoint.get("generation")) == generation
+        and generation > 0
+        and _checkpoint_is_valid(checkpoint, generation)
     )
     if checkpoint_matches:
         assert checkpoint is not None
@@ -473,6 +486,76 @@ def _checkpoint_counts(value: object) -> dict[str, int]:
         if isinstance(key, str) and isinstance(raw, int) and not isinstance(raw, bool):
             counts[key] = raw
     return counts
+
+
+def _checkpoint_is_valid(checkpoint: Mapping[str, object], generation: int) -> bool:
+    expected_keys = {
+        "schema_version",
+        "generation",
+        "updated_at",
+        "cumulative",
+        "decision_counts",
+        "reservation_counts",
+        "integrity",
+    }
+    if set(checkpoint) != expected_keys:
+        return False
+    if checkpoint.get("schema_version") != BUDGET_CHECKPOINT_SCHEMA_VERSION:
+        return False
+    checkpoint_generation = checkpoint.get("generation")
+    if (
+        isinstance(checkpoint_generation, bool)
+        or not isinstance(checkpoint_generation, int)
+        or checkpoint_generation != generation
+        or checkpoint_generation <= 0
+    ):
+        return False
+    updated_at = checkpoint.get("updated_at")
+    if not isinstance(updated_at, str) or parse_timestamp(updated_at) is None:
+        return False
+    cumulative = checkpoint.get("cumulative")
+    if not isinstance(cumulative, list):
+        return False
+    signatures: set[tuple[str, ...]] = set()
+    for entry in cumulative:
+        if not isinstance(entry, Mapping):
+            return False
+        if set(entry) != {*BUDGET_SCOPE_KEYS, "charge"}:
+            return False
+        if any(not isinstance(entry.get(key), str) for key in BUDGET_SCOPE_KEYS):
+            return False
+        if not _finite_number(entry.get("charge")):
+            return False
+        signature = _scope_signature(entry)
+        if signature in signatures:
+            return False
+        signatures.add(signature)
+    allowed_counts = (
+        set(BUDGET_DECISIONS) | {"warnings"},
+        {"reconciled", "released", "fail_safe_applied"},
+        set(BUDGET_INTEGRITY_CLASSES),
+    )
+    for field, allowed in zip(
+        ("decision_counts", "reservation_counts", "integrity"),
+        allowed_counts,
+    ):
+        counts = checkpoint.get(field)
+        if not isinstance(counts, Mapping):
+            return False
+        for key, value in counts.items():
+            if (
+                key not in allowed
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+            ):
+                return False
+    return True
+
+
+def _checkpoint_digest(checkpoint: Mapping[str, object]) -> str:
+    payload = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _charge_of(
@@ -923,7 +1006,7 @@ class BudgetStore:
         current = now or datetime.now(UTC)
         with _APPEND_LOCK:
             with append_record_lock(self.path):
-                _generation, records, _pre = self._read_journal_unlocked()
+                _generation, records, _pre, _digest = self._read_journal_unlocked()
                 state = self._load_state_unlocked()
         limits_report: list[dict[str, object]] = []
         for index, limit in enumerate(self.config.limits):
@@ -1018,10 +1101,22 @@ class BudgetStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def _load_state_unlocked(self) -> _LedgerState:
-        generation, records, pre_integrity = self._read_journal_unlocked()
+        generation, records, pre_integrity, expected_digest = (
+            self._read_journal_unlocked()
+        )
+        checkpoint = self._read_checkpoint_unlocked()
+        if generation > 0 and (
+            checkpoint is None
+            or not _checkpoint_is_valid(checkpoint, generation)
+            or not expected_digest
+            or _checkpoint_digest(checkpoint) != expected_digest
+        ):
+            raise BudgetLedgerCorruption(
+                "compacted budget ledger has no valid matching checkpoint"
+            )
         return _ledger_state(
             records,
-            checkpoint=self._read_checkpoint_unlocked(),
+            checkpoint=checkpoint,
             generation=generation,
             pre_integrity=pre_integrity,
         )
@@ -1041,12 +1136,13 @@ class BudgetStore:
 
     def _read_journal_unlocked(
         self,
-    ) -> tuple[int, list[dict[str, object]], dict[str, int]]:
+    ) -> tuple[int, list[dict[str, object]], dict[str, int], str]:
         generation = 0
+        checkpoint_digest = ""
         records: list[dict[str, object]] = []
         pre_integrity: dict[str, int] = {}
         if not self.path.exists():
-            return generation, records, pre_integrity
+            return generation, records, pre_integrity, checkpoint_digest
         text = self.path.read_text(encoding="utf-8", errors="replace")
         for line in text.splitlines():
             line = line.strip()
@@ -1069,6 +1165,8 @@ class BudgetStore:
             record_type = payload.get("record_type")
             if record_type == BUDGET_JOURNAL_HEADER_RECORD_TYPE:
                 generation = _int_or_zero(payload.get("generation"))
+                digest = payload.get("checkpoint_sha256")
+                checkpoint_digest = digest if isinstance(digest, str) else ""
                 continue
             if record_type in BUDGET_RECORD_TYPES:
                 records.append(payload)
@@ -1076,7 +1174,7 @@ class BudgetStore:
                 pre_integrity["unknown_record_type"] = (
                     pre_integrity.get("unknown_record_type", 0) + 1
                 )
-        return generation, records, pre_integrity
+        return generation, records, pre_integrity, checkpoint_digest
 
     def _read_checkpoint_unlocked(self) -> dict[str, object] | None:
         path = self.checkpoint_path
@@ -1121,7 +1219,7 @@ class BudgetStore:
             default=0.0,
         )
         fold_before = now - timedelta(hours=max_window) if max_window > 0 else now
-        generation, records, _pre = self._read_journal_unlocked()
+        generation, records, _pre, _digest = self._read_journal_unlocked()
         # Fold closed reservations whose terminal charge is older than every
         # window, so it can only ever contribute to cumulative (window-0) caps.
         fold_reservations: set[str] = set()
@@ -1201,14 +1299,15 @@ class BudgetStore:
             ):
                 continue
             remaining.append(record)
+        checkpoint_digest = _checkpoint_digest(checkpoint)
         # Crash-safe ordering: publish the checkpoint (tagged new_generation)
         # BEFORE truncating the journal to the new generation. A crash between
-        # leaves checkpoint.generation ahead of the journal header, which the
-        # reader treats as a mismatch and ignores, replaying the still-complete
-        # old journal. Only when both land do generations agree and the folded
-        # rows are trusted from the checkpoint.
+        # leaves checkpoint.generation ahead of the first-generation journal,
+        # whose still-complete rows remain replayable. Once any compaction has
+        # landed, a generation or digest mismatch fails closed because prior
+        # folded rows no longer exist in the journal.
         self._write_checkpoint_atomic(checkpoint)
-        self._rewrite_journal_atomic(new_generation, remaining)
+        self._rewrite_journal_atomic(new_generation, remaining, checkpoint_digest)
         return True
 
     def _write_checkpoint_atomic(self, checkpoint: Mapping[str, object]) -> None:
@@ -1224,7 +1323,10 @@ class BudgetStore:
             raise
 
     def _rewrite_journal_atomic(
-        self, generation: int, records: list[dict[str, object]]
+        self,
+        generation: int,
+        records: list[dict[str, object]],
+        checkpoint_digest: str,
     ) -> None:
         tmp = self.path.with_name(
             f".{self.path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -1233,6 +1335,7 @@ class BudgetStore:
             "schema_version": BUDGET_SCHEMA_VERSION,
             "record_type": BUDGET_JOURNAL_HEADER_RECORD_TYPE,
             "generation": generation,
+            "checkpoint_sha256": checkpoint_digest,
         }
         lines = [json.dumps(header, separators=(",", ":"))]
         lines.extend(json.dumps(record, separators=(",", ":")) for record in records)
