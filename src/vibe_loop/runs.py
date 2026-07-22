@@ -898,6 +898,7 @@ class RunLifecycleEvent:
         session_id: int | None,
         process_birth_id: str,
         host: str,
+        activity_source_generation: str = "",
         recovery_payload: Mapping[str, Any] | None = None,
     ) -> RunLifecycleEvent:
         payload: dict[str, Any] = {
@@ -906,6 +907,15 @@ class RunLifecycleEvent:
             "worker_process_group_id": process_group_id,
             "worker_session_id": session_id,
             "worker_process_birth_id": process_birth_id,
+            "activity_source_generation": (
+                activity_source_generation.lower()
+                if len(activity_source_generation) == 64
+                and all(
+                    character in "0123456789abcdefABCDEF"
+                    for character in activity_source_generation
+                )
+                else ""
+            ),
             "pid_source": "popen",
             "pid_scope": "configured_command_process",
             "host": host,

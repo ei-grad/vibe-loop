@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 
 
-ACTIVITY_SCHEMA_VERSION = 1
+ACTIVITY_SCHEMA_VERSION = 2
 AGENT_STARTED_RECORD_TYPE = "agent_started"
 ACTIVITY_CHECKPOINT_RECORD_TYPE = "activity_checkpoint"
 GATE_RESULT_RECORD_TYPE = "gate_result"
@@ -39,6 +39,7 @@ MAX_JSON_DEPTH = 8
 MAX_JSON_CONTAINER_ITEMS = 256
 MAX_JSON_NODES = 1024
 MAX_ACTIVITY_COUNTER = 1_000_000
+MAX_ACTIVITY_SOURCE_POSITION = (1 << 63) - 1
 CHECKPOINT_EVENT_INTERVAL = 32
 CHECKPOINT_SECONDS = 5.0
 PHASE_CLASSES = frozenset(
@@ -97,6 +98,9 @@ class NativeActivity:
     activity_class: str
     event_id: str
     observed_at: str
+    source_generation: str = ""
+    source_stream: str = ""
+    source_position: int = 0
     reason_class: str = ""
 
 
@@ -109,7 +113,7 @@ class ActivityEmission:
     activity_delta: Mapping[str, int]
     activity_counts: Mapping[str, int]
     coalesced_count: int
-    activity_events: tuple[tuple[str, str, str, str], ...]
+    activity_events: tuple[tuple[str, str, str, str, str, str, int], ...]
     reason_class: str = ""
 
     def to_payload(
@@ -129,8 +133,19 @@ class ActivityEmission:
                     "record_type": record_type,
                     "observed_at": observed_at,
                     "activity_class": activity_class,
+                    "source_generation": source_generation,
+                    "source_stream": source_stream,
+                    "source_position": source_position,
                 }
-                for event_id, record_type, observed_at, activity_class in self.activity_events
+                for (
+                    event_id,
+                    record_type,
+                    observed_at,
+                    activity_class,
+                    source_generation,
+                    source_stream,
+                    source_position,
+                ) in self.activity_events
             ],
             "provider": provider if provider in {"anthropic", "openai"} else "unknown",
         }
@@ -175,19 +190,36 @@ class AgentActivityTracker:
         self._counts = {record_type: 0 for record_type in ACTIVITY_RECORD_TYPES}
         self._pending: list[NativeActivity] = []
         self._last_emit_monotonic: float | None = None
-        self._event_occurrences: dict[str, int] = {}
 
-    def observe_line(self, line: str) -> tuple[ActivityEmission, ...]:
+    def observe_line(
+        self,
+        line: str,
+        *,
+        source_generation: str,
+        source_stream: str,
+        source_position: int,
+    ) -> tuple[ActivityEmission, ...]:
         activity = parse_native_activity(line, wallclock=self._wallclock)
         if activity is None:
             return ()
-        occurrence = self._event_occurrences.get(activity.event_id, 0) + 1
-        self._event_occurrences[activity.event_id] = occurrence
+        if (
+            not _is_hex_id(source_generation, length=64)
+            or source_stream not in {"stdout", "stderr"}
+            or not isinstance(source_position, int)
+            or isinstance(source_position, bool)
+            or not 1 <= source_position <= MAX_ACTIVITY_SOURCE_POSITION
+        ):
+            return ()
         activity = dataclasses.replace(
             activity,
-            event_id=hashlib.sha256(
-                f"{activity.event_id}:{occurrence}".encode("ascii")
-            ).hexdigest(),
+            event_id=_source_event_id(
+                source_generation,
+                source_stream,
+                source_position,
+            ),
+            source_generation=source_generation,
+            source_stream=source_stream,
+            source_position=source_position,
         )
         self._counts[activity.record_type] = min(
             MAX_ACTIVITY_COUNTER,
@@ -261,6 +293,9 @@ class AgentActivityTracker:
                     activity.record_type,
                     activity.observed_at,
                     activity.activity_class,
+                    activity.source_generation,
+                    activity.source_stream,
+                    activity.source_position,
                 )
                 for activity in activities
             ),
@@ -460,11 +495,35 @@ def summarize_activity_records(
                 event_record_type = event.get("record_type")
                 event_observed_at = _parse_timestamp(event.get("observed_at"))
                 event_activity_class = event.get("activity_class")
+                event_source_generation = event.get("source_generation")
+                event_source_stream = event.get("source_stream")
+                event_source_position = event.get("source_position")
+                expected_event_id = (
+                    _source_event_id(
+                        event_source_generation,
+                        event_source_stream,
+                        event_source_position,
+                    )
+                    if _is_hex_id(event_source_generation, length=64)
+                    and isinstance(event_source_stream, str)
+                    and event_source_stream in {"stdout", "stderr"}
+                    and isinstance(event_source_position, int)
+                    and not isinstance(event_source_position, bool)
+                    and 1 <= event_source_position <= MAX_ACTIVITY_SOURCE_POSITION
+                    else ""
+                )
                 if (
                     not _is_hex_id(event_id, length=64)
                     or event_record_type not in ACTIVITY_RECORD_TYPES
                     or event_observed_at is None
                     or event_activity_class not in ACTIVITY_CLASSES
+                    or not _is_hex_id(event_source_generation, length=64)
+                    or not isinstance(event_source_stream, str)
+                    or event_source_stream not in {"stdout", "stderr"}
+                    or not isinstance(event_source_position, int)
+                    or isinstance(event_source_position, bool)
+                    or not 1 <= event_source_position <= MAX_ACTIVITY_SOURCE_POSITION
+                    or event_id != expected_event_id
                     or event_id in seen_event_ids
                 ):
                     continue
@@ -514,6 +573,16 @@ def summarize_activity_records(
         usage=usage,
         phase_durations=derive_phase_durations(records, last_activity_at),
     )
+
+
+def _source_event_id(
+    source_generation: str,
+    source_stream: str,
+    source_position: int,
+) -> str:
+    return hashlib.sha256(
+        f"{source_generation}:{source_stream}:{source_position}".encode("ascii")
+    ).hexdigest()
 
 
 def derive_phase_durations(

@@ -686,11 +686,12 @@ class AgentLimitWallError(RuntimeError):
 
 
 class AgentOutputObserver:
-    def __init__(self, provider: str = "unknown") -> None:
+    def __init__(self, provider: str, *, source_generation: str) -> None:
         self._lock = threading.Lock()
         self._session_observation: SessionIdObservation | None = None
         self._runtime_context = AgentRuntimeContext()
         self._line_count = 0
+        self._source_generation = source_generation
         self._usage_observer = ProviderUsageObserver(provider)
         self._activity_tracker = AgentActivityTracker()
 
@@ -719,6 +720,8 @@ class AgentOutputObserver:
         self,
         line: str,
         stream_name: str,
+        *,
+        source_position: int,
     ) -> AgentRuntimeObservation | None:
         self._usage_observer.observe_line(line)
         session_id = observe_worker_session_id(line)
@@ -734,7 +737,12 @@ class AgentOutputObserver:
                 stream_name,
             )
         with self._lock:
-            activity_emissions = self._activity_tracker.observe_line(line)
+            activity_emissions = self._activity_tracker.observe_line(
+                line,
+                source_generation=self._source_generation,
+                source_stream=stream_name,
+                source_position=source_position,
+            )
             delta_session_id = None
             delta_session_id_source = None
             if session_id is not None and self._session_observation is None:
@@ -2419,6 +2427,15 @@ class VibeRunner:
                                 identity.process_birth_id if identity else ""
                             ),
                             host=active_state.host,
+                            activity_source_generation=(
+                                configured_command_source_generation(
+                                    run_id=run_id,
+                                    process_id=worker_pid,
+                                    process_birth_id=(
+                                        identity.process_birth_id if identity else ""
+                                    ),
+                                )
+                            ),
                             recovery_payload=(
                                 recovery_context_payload(recovery)
                                 if recovery is not None
@@ -7523,7 +7540,15 @@ def run_streaming_command(
 
     log_lock = threading.Lock()
     fencing_token = fencing_token_value((env or {}).get("VIBE_LOOP_FENCING_TOKEN"))
-    output_observer = AgentOutputObserver(provider)
+    source_generation = configured_command_source_generation(
+        run_id=(env or {}).get("VIBE_LOOP_RUN_ID", ""),
+        process_id=process.pid,
+        process_birth_id=expected_birth_id,
+    )
+    output_observer = AgentOutputObserver(
+        provider,
+        source_generation=source_generation,
+    )
     post_report_monitor = PostReportActivityMonitor(provider)
     stdout_thread = threading.Thread(
         target=stream_pipe,
@@ -7587,6 +7612,25 @@ def run_streaming_command(
         usage=output_observer.usage,
         post_report=post_report if post_report.reported else None,
     )
+
+
+def configured_command_source_generation(
+    *,
+    run_id: str,
+    process_id: int,
+    process_birth_id: str,
+) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            [
+                "configured_command_process",
+                run_id,
+                process_id,
+                process_birth_id,
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8", "replace")
+    ).hexdigest()
 
 
 def worker_command_env(
@@ -7716,9 +7760,13 @@ def stream_pipe(
     post_report_monitor: PostReportActivityMonitor | None = None,
 ) -> None:
     try:
-        for line in pipe:
+        for source_position, line in enumerate(pipe, start=1):
             redacted_line = redact_worker_stream_line(line, fencing_token)
-            observation = output_observer.observe_line(redacted_line, stream_name)
+            observation = output_observer.observe_line(
+                redacted_line,
+                stream_name,
+                source_position=source_position,
+            )
             if observation is not None and on_observation is not None:
                 on_observation(observation)
             if post_report_monitor is not None:

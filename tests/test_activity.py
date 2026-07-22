@@ -21,7 +21,7 @@ from vibe_loop.activity import (
     summarize_activity_records,
 )
 from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore
-from vibe_loop.runner import AgentOutputObserver
+from vibe_loop.runner import AgentOutputObserver, AgentRuntimeObservation
 from vibe_loop.runner import (
     parse_agent_runtime_context_from_command,
     run_streaming_command,
@@ -39,6 +39,8 @@ SENSITIVE_CANARIES = (
     "SECRET COMMAND CANARY",
     "sk-secret-canary",
 )
+SOURCE_GENERATION_A = "a" * 64
+SOURCE_GENERATION_B = "b" * 64
 
 
 def fixture_lines(name: str) -> list[str]:
@@ -78,9 +80,16 @@ def test_native_fixtures_emit_bounded_content_free_activity(
     tracker = AgentActivityTracker()
     usage_observer = ProviderUsageObserver(provider)
     emissions = []
-    for line in fixture_lines(fixture_name):
+    for source_position, line in enumerate(fixture_lines(fixture_name), start=1):
         usage_observer.observe_line(line)
-        emissions.extend(tracker.observe_line(line))
+        emissions.extend(
+            tracker.observe_line(
+                line,
+                source_generation=SOURCE_GENERATION_A,
+                source_stream="stdout",
+                source_position=source_position,
+            )
+        )
     final = tracker.flush()
     if final is not None:
         emissions.append(final)
@@ -121,7 +130,7 @@ def test_provider_error_is_blocked_without_copying_error_text() -> None:
 
 
 def test_structured_message_content_cannot_supply_session_identity() -> None:
-    observer = AgentOutputObserver("openai")
+    observer = AgentOutputObserver("openai", source_generation=SOURCE_GENERATION_A)
 
     observation = observer.observe_line(
         json.dumps(
@@ -134,6 +143,7 @@ def test_structured_message_content_cannot_supply_session_identity() -> None:
             }
         ),
         "stdout",
+        source_position=1,
     )
 
     assert observation is None
@@ -158,8 +168,15 @@ def test_checkpoint_coalescing_and_replay_dedup_are_deterministic() -> None:
             monotonic=(lambda: float(next(ticks) * 6)) if regroup else (lambda: 1.0)
         )
         emissions = []
-        for line in lines:
-            emissions.extend(tracker.observe_line(line))
+        for source_position, line in enumerate(lines, start=1):
+            emissions.extend(
+                tracker.observe_line(
+                    line,
+                    source_generation=SOURCE_GENERATION_A,
+                    source_stream="stdout",
+                    source_position=source_position,
+                )
+            )
         final = tracker.flush()
         if final is not None:
             emissions.append(final)
@@ -181,21 +198,33 @@ def test_checkpoint_coalescing_and_replay_dedup_are_deterministic() -> None:
     assert summary.activity_counts[ACTIVITY_CHECKPOINT_RECORD_TYPE] == len(lines)
 
 
-def test_repeated_idless_codex_turns_have_replay_stable_occurrences() -> None:
+def test_idless_codex_identity_survives_replay_restart_and_reconstruction() -> None:
     completed = (
         Path(__file__).parent / "fixtures" / "provider_usage" / "codex-present.json"
     ).read_text(encoding="utf-8")
     lines = [line for _ in range(3) for line in ('{"type":"turn.started"}', completed)]
 
-    def records(*, regroup: bool) -> list[dict[str, object]]:
+    def records(
+        positioned_lines: list[tuple[int, str]],
+        *,
+        source_generation: str,
+        regroup: bool,
+    ) -> list[dict[str, object]]:
         ticks = iter(range(1000))
         tracker = AgentActivityTracker(
             monotonic=(lambda: float(next(ticks) * 6)) if regroup else (lambda: 1.0),
             wallclock=lambda: 100.0,
         )
         emissions = []
-        for line in lines:
-            emissions.extend(tracker.observe_line(line))
+        for source_position, line in positioned_lines:
+            emissions.extend(
+                tracker.observe_line(
+                    line,
+                    source_generation=source_generation,
+                    source_stream="stdout",
+                    source_position=source_position,
+                )
+            )
         final = tracker.flush()
         if final is not None:
             emissions.append(final)
@@ -207,34 +236,71 @@ def test_repeated_idless_codex_turns_have_replay_stable_occurrences() -> None:
             for emission in emissions
         ]
 
-    original = records(regroup=False)
-    replay = records(regroup=True)
+    full_prefix = list(enumerate(lines, start=1))
+    original = records(
+        full_prefix, source_generation=SOURCE_GENERATION_A, regroup=False
+    )
+    full_replay = records(
+        full_prefix, source_generation=SOURCE_GENERATION_A, regroup=True
+    )
+    partial_replay = records(
+        full_prefix[2:], source_generation=SOURCE_GENERATION_A, regroup=True
+    )
+    restarted_suffix = records(
+        list(enumerate(lines[:2], start=1)),
+        source_generation=SOURCE_GENERATION_B,
+        regroup=False,
+    )
     original_event_ids = {
         event["id"] for record in original for event in record["activity_events"]
     }
-    replay_event_ids = {
-        event["id"] for record in replay for event in record["activity_events"]
+    full_replay_ids = {
+        event["id"] for record in full_replay for event in record["activity_events"]
     }
-    summary = summarize_activity_records([*original, *replay])
+    partial_replay_ids = {
+        event["id"] for record in partial_replay for event in record["activity_events"]
+    }
+    restarted_ids = {
+        event["id"]
+        for record in restarted_suffix
+        for event in record["activity_events"]
+    }
+    journal_records = json.loads(
+        json.dumps([*original, *partial_replay, *full_replay, *restarted_suffix])
+    )
+    summary = summarize_activity_records(journal_records)
 
     assert len(original_event_ids) == 6
-    assert replay_event_ids == original_event_ids
+    assert full_replay_ids == original_event_ids
+    assert partial_replay_ids < original_event_ids
+    assert restarted_ids.isdisjoint(original_event_ids)
+    assert {
+        event["source_generation"]
+        for record in journal_records
+        for event in record["activity_events"]
+    } == {SOURCE_GENERATION_A, SOURCE_GENERATION_B}
     assert summary.activity_counts == {
-        ACTIVITY_CHECKPOINT_RECORD_TYPE: 3,
-        AGENT_COMPLETED_RECORD_TYPE: 3,
+        ACTIVITY_CHECKPOINT_RECORD_TYPE: 4,
+        AGENT_COMPLETED_RECORD_TYPE: 4,
     }
-    assert summary.activity_record_count == 6
+    assert summary.activity_record_count == 8
 
 
 def test_projection_uses_latest_timestamp_not_reader_order() -> None:
     tracker = AgentActivityTracker()
     completed = tracker.observe_line(
         '{"type":"turn.completed","turn_id":"turn-new",'
-        '"timestamp":"2026-07-22T10:00:10Z"}'
+        '"timestamp":"2026-07-22T10:00:10Z"}',
+        source_generation=SOURCE_GENERATION_A,
+        source_stream="stdout",
+        source_position=1,
     )[0]
     older_tool = tracker.observe_line(
         '{"type":"item.started","timestamp":"2026-07-22T10:00:05Z",'
-        '"item":{"type":"command_execution","id":"tool-old"}}'
+        '"item":{"type":"command_execution","id":"tool-old"}}',
+        source_generation=SOURCE_GENERATION_A,
+        source_stream="stdout",
+        source_position=2,
     )[0]
     records = [
         {
@@ -274,10 +340,18 @@ def test_projection_timestamp_tie_uses_later_journal_record() -> None:
                 "timestamp": timestamp,
                 "item": {"type": "command_execution", "id": "tool-tie"},
             }
-        )
+        ),
+        source_generation=SOURCE_GENERATION_A,
+        source_stream="stdout",
+        source_position=1,
     )[0]
     completed = tracker.observe_line(
-        json.dumps({"type": "turn.completed", "turn_id": "tie", "timestamp": timestamp})
+        json.dumps(
+            {"type": "turn.completed", "turn_id": "tie", "timestamp": timestamp}
+        ),
+        source_generation=SOURCE_GENERATION_A,
+        source_stream="stdout",
+        source_position=2,
     )[0]
     records = [
         {
@@ -332,10 +406,10 @@ def test_input_bounds_and_unknown_records_are_ignored() -> None:
     ],
 )
 def test_json_resource_adversaries_are_ignored_by_stream_observer(line: str) -> None:
-    observer = AgentOutputObserver("openai")
+    observer = AgentOutputObserver("openai", source_generation=SOURCE_GENERATION_A)
 
     assert bounded_json_envelope(line) is None
-    assert observer.observe_line(line, "stdout") is None
+    assert observer.observe_line(line, "stdout", source_position=1) is None
     assert observer.observation.empty
 
 
@@ -364,10 +438,54 @@ def test_stream_drain_survives_json_resource_adversaries(tmp_path: Path) -> None
     assert ("[" * 2000) + "0" + ("]" * 2000) in logged
 
 
+def test_stream_restart_assigns_a_new_process_generation(tmp_path: Path) -> None:
+    script = tmp_path / "emit_idless_turn.py"
+    script.write_text(
+        'print(\'{"type":"turn.started"}\')\nprint(\'{"type":"turn.completed"}\')\n',
+        encoding="utf-8",
+    )
+    process_events: list[list[dict[str, object]]] = []
+    for process_index in range(2):
+        events: list[dict[str, object]] = []
+
+        def capture(observation: AgentRuntimeObservation) -> None:
+            for emission in observation.activity_emissions:
+                events.extend(
+                    emission.to_payload(provider="openai", usage={})["activity_events"]
+                )
+
+        with (tmp_path / f"process-{process_index}.log").open(
+            "w", encoding="utf-8"
+        ) as log:
+            result = run_streaming_command(
+                f"{sys.executable} {script.name}",
+                tmp_path,
+                log,
+                env={"VIBE_LOOP_RUN_ID": "run-restart"},
+                provider="openai",
+                on_observation=capture,
+            )
+        assert result.exit_code == 0
+        process_events.append(events)
+
+    first_generations = {event["source_generation"] for event in process_events[0]}
+    second_generations = {event["source_generation"] for event in process_events[1]}
+    assert len(first_generations) == 1
+    assert len(second_generations) == 1
+    assert first_generations.isdisjoint(second_generations)
+    assert [event["source_position"] for event in process_events[0]] == [1, 2]
+    assert {event["id"] for event in process_events[0]}.isdisjoint(
+        event["id"] for event in process_events[1]
+    )
+
+
 def test_summary_derives_phase_durations_and_latest_authoritative_usage() -> None:
     tracker = AgentActivityTracker()
     emission = tracker.observe_line(
-        '{"type":"turn.completed","turn_id":"t1","timestamp":"2026-07-22T07:00:20Z"}'
+        '{"type":"turn.completed","turn_id":"t1","timestamp":"2026-07-22T07:00:20Z"}',
+        source_generation=SOURCE_GENERATION_A,
+        source_stream="stdout",
+        source_position=1,
     )[0]
     activity_record = {
         "record_type": emission.record_type,
@@ -408,7 +526,10 @@ def test_summary_derives_phase_durations_and_latest_authoritative_usage() -> Non
 def test_runs_inspect_and_workers_expose_activity_projection(tmp_path: Path) -> None:
     tracker = AgentActivityTracker()
     emission = tracker.observe_line(
-        '{"type":"turn.completed","turn_id":"t1","timestamp":"2026-07-22T08:00:00Z"}'
+        '{"type":"turn.completed","turn_id":"t1","timestamp":"2026-07-22T08:00:00Z"}',
+        source_generation=SOURCE_GENERATION_A,
+        source_stream="stdout",
+        source_position=1,
     )[0]
     usage = {
         "provider": "openai",
@@ -420,11 +541,12 @@ def test_runs_inspect_and_workers_expose_activity_projection(tmp_path: Path) -> 
     command_context = parse_agent_runtime_context_from_command(
         "codex exec --model gpt-5.4-codex --reasoning-effort high"
     )
-    observer = AgentOutputObserver("openai")
+    observer = AgentOutputObserver("openai", source_generation=SOURCE_GENERATION_A)
     assert (
         observer.observe_line(
             "Final summary: model=gpt-9.9 effort=xhigh reasoning_effort=minimal",
             "stdout",
+            source_position=1,
         )
         is None
     )

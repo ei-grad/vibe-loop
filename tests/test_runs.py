@@ -739,6 +739,7 @@ class RunStoreTests(unittest.TestCase):
             session_id=123,
             process_birth_id="boot-id:500",
             host="test-host",
+            activity_source_generation="a" * 64,
         ).to_record()
 
         self.assertEqual(event["record_type"], WORKER_PROCESS_STARTED_RECORD_TYPE)
@@ -747,6 +748,7 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(event["worker_process_group_id"], 123)
         self.assertEqual(event["worker_session_id"], 123)
         self.assertEqual(event["worker_process_birth_id"], "boot-id:500")
+        self.assertEqual(event["activity_source_generation"], "a" * 64)
         self.assertEqual(event["pid_source"], "popen")
         self.assertIn(WORKER_PROCESS_STARTED_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
