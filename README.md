@@ -1174,8 +1174,6 @@ effort = "medium"
 
 [agent.profiles.review]
 kind = "codex"
-model = "gpt-5.6-terra"
-effort = "xhigh"
 command = "codex review {prompt}"
 
 [orchestration]
@@ -1195,24 +1193,18 @@ ordinals. Initial and closure passes have separate budgets, and reviewer
 concurrency is bounded separately from implementation `--jobs`; `--jobs 1`
 continues to mean one implementation task.
 
-Runtime-owned review has one provider-specific exception to the ordinary
-explicit-command placeholder rule. An exact explicit `codex review {prompt}`
-profile with both `model` and `effort` uses a temporary project config layer
-containing only `model`, `review_model`, and `model_reasoning_effort`. The
-command argv stays unchanged. The layer lives in an ignored, unique descendant
-of the task worktree, so Codex's documented project-config precedence applies
-while Git still resolves the same worktree root and root-to-cwd project
-instructions. `CODEX_HOME` is unchanged: user/system config, authentication,
-global instructions, and managed requirements keep their normal precedence.
-The runtime accepts the review only after a newly created native Codex rollout
-reports the requested built-in provider, model, and effort for that exact
-descendant cwd. A missing or mismatched observation—including a project config
-ignored because the repository is untrusted—fails closed. Journals contain
-only the requested/resolved allowlisted route fields, never the temporary path,
-config contents, auth material, or transcript text. Runtime cleanup removes the
-known temporary shape after every exit, and a later launch reaps only bounded,
-dead-owner stale bindings. Claude, custom, placeholder-based, and worker-owned
-commands retain the general command-template behavior.
+The exact explicit `codex review {prompt}` form is supported only without
+first-class `model` or `effort`. Codex project config cannot bind
+`model_provider`, and the exact command exposes no supported effective-route
+metadata. Consequently vibe-loop cannot prove the provider/model/effort before
+disclosing the candidate or verify that route without reading private session
+rollouts. If either first-class setting is present, run-contract resolution
+fails before the reviewer executor starts and explains that the repository must
+permit an explicit placeholder-capable command or the settings must be unset.
+No Codex transcript, temporary project config, authentication state, or
+`CODEX_HOME` value is read, copied, or mutated by this rejected route. Claude,
+custom, placeholder-based, worker-owned, and unbound exact review commands keep
+their ordinary behavior.
 
 Reviewer output is one schema-validated JSON verdict. Findings are persisted in
 a candidate-scoped ledger, malformed output gets one bounded re-ask, and a

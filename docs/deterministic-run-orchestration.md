@@ -386,13 +386,12 @@ implementation retries.
   with the same validation as agent profiles. A repository-mandated review
   command (e.g. `codex review`) becomes a typed reviewer route, not a prose
   instruction to the implementer.
-- An exact runtime-owned `codex review {prompt}` route binds its configured
-  model and effort through a temporary descendant Codex project-config layer,
-  leaving argv and `CODEX_HOME` unchanged. Acceptance requires a new native
-  rollout from that launch cwd whose built-in provider/model/effort match the
-  request; missing, untrusted-project-ignored, or mismatched provenance fails
-  closed. Only allowlisted route identity is journaled, and bounded dead-owner
-  cleanup removes the known temporary shape without inspecting transcript text.
+- An exact runtime-owned `codex review {prompt}` command is valid only with
+  first-class model and effort unset. Project config cannot bind
+  `model_provider`, and this exact command exposes no supported effective-route
+  metadata. A configured model or effort therefore fails at run-contract
+  resolution before candidate disclosure; the runtime does not inspect session
+  rollouts, rewrite `CODEX_HOME`, or create temporary binding state.
 - Reviewer concurrency is budgeted separately from `--jobs` (implementation
   slots). `jobs=1` keeps meaning one implementation task per project.
 - Continuation: remediation resumes the same implementer session and targeted

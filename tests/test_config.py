@@ -1838,7 +1838,7 @@ class AgentProfileRoutingTests(unittest.TestCase):
         )
         self.assertEqual(placeholder.agent.to_json()["effort"], "high")
 
-    def test_exact_codex_reviewer_command_uses_role_scoped_config_binding(
+    def test_exact_codex_reviewer_command_rejects_first_class_route_settings(
         self,
     ) -> None:
         config = self._load_with_both_clis(
@@ -1851,32 +1851,32 @@ class AgentProfileRoutingTests(unittest.TestCase):
         )
         reviewer = config.agent_profiles["review"]
 
-        self.assertEqual(reviewer.require_reviewer_command(), "codex review {prompt}")
-        with self.assertRaisesRegex(AgentResolutionError, "cannot receive"):
-            reviewer.require_command()
+        with self.assertRaisesRegex(
+            AgentResolutionError,
+            "cannot safely receive.*model_provider.*effective-route metadata",
+        ):
+            reviewer.require_reviewer_command()
 
-    def test_codex_reviewer_config_binding_requires_safe_complete_route(
+    def test_exact_codex_reviewer_command_without_route_settings_is_preserved(
         self,
     ) -> None:
-        missing_effort = self._load_with_both_clis(
+        reviewer = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'command = "codex review {prompt}"\n'
+        ).agent_profiles["review"]
+        self.assertEqual(reviewer.require_reviewer_command(), "codex review {prompt}")
+
+        model_only = self._load_with_both_clis(
             "[agent.profiles.review]\n"
             'kind = "codex"\n'
             'model = "gpt-5.6-terra"\n'
             'command = "codex review {prompt}"\n'
         ).agent_profiles["review"]
-        with self.assertRaisesRegex(AgentResolutionError, "set both"):
-            missing_effort.require_reviewer_command()
+        with self.assertRaisesRegex(AgentResolutionError, "cannot safely receive"):
+            model_only.require_reviewer_command()
 
-        invalid_model = self._load_with_both_clis(
-            "[agent.profiles.review]\n"
-            'kind = "codex"\n'
-            'model = "gpt model"\n'
-            'effort = "high"\n'
-            'command = "codex review {prompt}"\n'
-        ).agent_profiles["review"]
-        with self.assertRaisesRegex(AgentResolutionError, "model is invalid"):
-            invalid_model.require_reviewer_command()
-
+    def test_custom_reviewer_keeps_placeholder_validation(self) -> None:
         custom = self._load_with_both_clis(
             "[agent.profiles.review]\n"
             'kind = "custom"\n'
