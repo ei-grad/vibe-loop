@@ -40,13 +40,22 @@ from vibe_loop.orchestration import (
     CandidateRecord,
     GateResult,
     GateRunSummary,
+    ProvisionedWorkspace,
     ReviewConcurrencyBudget,
+    ReviewExecutionError,
+    ReviewFinding,
     ReviewRouter,
+    ReviewStageResultError,
     ReviewWaitIncomplete,
 )
-from vibe_loop.runner import VibeRunner, run_streaming_command  # noqa: F401
+from vibe_loop.runner import (
+    StreamingCommandResult,
+    VibeRunner,
+    run_streaming_command,  # noqa: F401
+)
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.tasks import Task
+from vibe_loop.telemetry import ProviderUsage, unavailable_usage
 
 
 def _multiprocess_reserve(path: str, index: int, start, results) -> None:
@@ -1057,11 +1066,24 @@ class F3ReviewLaunchTests(unittest.TestCase):
             budget=PhaseBudget(store, "proj"),
         )
 
-    def _approve(self, usage: dict | None):
+    def _approve(self, usage: dict | None, *, closure: bool = False):
         def execute(command: str, **kwargs):
             verdict = {
                 "verdict": "approve",
-                "findings": [],
+                "findings": (
+                    [
+                        {
+                            "id": "F1",
+                            "severity": "P1",
+                            "summary": "Correct the candidate",
+                            "evidence": "Focused reproduction",
+                            "files": ["src/example.py"],
+                            "state": "remediated",
+                        }
+                    ]
+                    if closure
+                    else []
+                ),
                 "session_id": "",
                 "session_id_source": "",
                 "continuation_ordinal": 0,
@@ -1073,6 +1095,24 @@ class F3ReviewLaunchTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, stdout="\n".join(lines))
 
         return execute
+
+    def _review_phase(self, router: ReviewRouter, phase: str):
+        if phase == "initial_review":
+            return router.review(self.gates)
+        self.assertEqual(phase, "targeted_closure")
+        return router.review(
+            self.gates,
+            pass_kind="closure:1",
+            prior_findings=(
+                ReviewFinding(
+                    finding_id="F1",
+                    severity="P1",
+                    summary="Correct the candidate",
+                    evidence="Focused reproduction",
+                    files=("src/example.py",),
+                ),
+            ),
+        )
 
     def test_initial_review_denial_launches_no_reviewer(self) -> None:
         store = self._store(
@@ -1214,6 +1254,305 @@ class F3ReviewLaunchTests(unittest.TestCase):
         self.assertTrue(review["fail_safe_applied"])
         self.assertEqual(review["charge"], 500.0)
         self.assertGreaterEqual(recovered, 1)
+
+    def test_targeted_closure_defer_launches_no_reviewer(self) -> None:
+        store = self._store(
+            make_config(
+                default_declared=1000.0,
+                on_insufficient="defer",
+                limits=(BudgetLimit(phase="targeted_closure", limit=1.0),),
+            )
+        )
+        launched: list[str] = []
+
+        def sentinel(command: str, **kwargs):
+            launched.append(command)
+            raise AssertionError("targeted closure must not launch when deferred")
+
+        router = self._router(store, sentinel)
+        with self.assertRaises(BudgetReservationDenied) as caught:
+            self._review_phase(router, "targeted_closure")
+        self.assertEqual(caught.exception.decision.decision, "defer")
+        self.assertEqual(caught.exception.decision.phase, "targeted_closure")
+        self.assertEqual(launched, [])
+
+    def test_targeted_closure_reconciles_own_usage_once(self) -> None:
+        store = self._store(
+            make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
+        )
+        router = self._router(
+            store,
+            self._approve(
+                {"usage": {"input_tokens": 60, "output_tokens": 15}}, closure=True
+            ),
+        )
+        self._review_phase(router, "targeted_closure")
+        reconciled = [
+            record
+            for record in store.read_records()
+            if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+        ]
+        self.assertEqual(len(reconciled), 1)
+        reservation = next(
+            record
+            for record in store.read_records()
+            if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+            and record.get("reservation_id") == reconciled[0]["reservation_id"]
+        )
+        self.assertEqual(reservation["phase"], "targeted_closure")
+        self.assertEqual(reconciled[0]["charge"], 75.0)
+        self.assertEqual(
+            store.recover_abandoned(
+                resolve=lambda reservation_id: None,
+                process_alive=lambda pid, host: False,
+                grace_seconds=0,
+            ),
+            0,
+        )
+        self.assertEqual(
+            sum(
+                record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+                for record in store.read_records()
+            ),
+            1,
+        )
+
+    def test_targeted_closure_timeout_charges_fail_safe(self) -> None:
+        store = self._store(
+            make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
+        )
+
+        def execute(command: str, **kwargs):
+            raise subprocess.TimeoutExpired(command, 1)
+
+        with self.assertRaises(ReviewWaitIncomplete):
+            self._review_phase(self._router(store, execute), "targeted_closure")
+        reconciled = [
+            record
+            for record in store.read_records()
+            if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+        ]
+        self.assertEqual(len(reconciled), 1)
+        reservation = next(
+            record
+            for record in store.read_records()
+            if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+            and record.get("reservation_id") == reconciled[0]["reservation_id"]
+        )
+        self.assertEqual(reservation["phase"], "targeted_closure")
+        self.assertTrue(reconciled[0]["fail_safe_applied"])
+        self.assertEqual(reconciled[0]["charge"], 500.0)
+
+    def test_review_launch_oserror_releases_both_review_phases(self) -> None:
+        for phase in ("initial_review", "targeted_closure"):
+            with self.subTest(phase=phase):
+                store = self._store(
+                    make_config(
+                        default_declared=500.0,
+                        limits=(BudgetLimit(phase=phase, limit=1e12),),
+                    )
+                )
+
+                def execute(command: str, **kwargs):
+                    raise OSError("launch failed")
+
+                with self.assertRaises(ReviewExecutionError):
+                    self._review_phase(self._router(store, execute), phase)
+                records = store.read_records()
+                reservation_phases = {
+                    record["reservation_id"]: record["phase"]
+                    for record in records
+                    if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+                }
+                released = [
+                    record
+                    for record in records
+                    if record.get("record_type") == "budget_released"
+                    and reservation_phases.get(record.get("reservation_id")) == phase
+                ]
+                self.assertEqual(len(released), 1)
+                self.assertFalse(
+                    any(
+                        record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+                        and reservation_phases.get(record.get("reservation_id"))
+                        == phase
+                        for record in records
+                    )
+                )
+
+
+class F3RuntimeRemediationLaunchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        _init_repo(self.repo)
+        self.task = Task(task_id="TASK-01", title="Task", status="Next")
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.workspace = ProvisionedWorkspace(
+            mode="existing",
+            branch="main",
+            worktree=self.repo,
+            base_commit=head,
+            head_commit=head,
+            owner_run_id="run-1",
+        )
+
+    def _runner(self, budget: BudgetConfig) -> VibeRunner:
+        runner = VibeRunner(
+            VibeConfig(
+                repo=self.repo,
+                agent=_reviewer_agent("claude"),
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned", explicit_keys=frozenset({"mode"})
+                ),
+                budget=budget,
+            )
+        )
+        runner.runs_dir.mkdir(parents=True, exist_ok=True)
+        return runner
+
+    def _launch(self, runner: VibeRunner) -> None:
+        runner._launch_runtime_remediation(
+            task=self.task,
+            run_id="run-1",
+            workspace=self.workspace,
+            agent=runner.config.agent,
+            agent_profile="",
+            command_env={},
+            implementation_session_id="",
+            implementation_session_id_source="",
+            round_number=1,
+        )
+
+    def test_remediation_defer_launches_no_process_or_lifecycle(self) -> None:
+        runner = self._runner(
+            make_config(
+                default_declared=1000.0,
+                on_insufficient="defer",
+                limits=(BudgetLimit(phase="remediation", limit=1.0),),
+            )
+        )
+        launched: list[str] = []
+
+        def sentinel(*args, **kwargs):
+            launched.append("launched")
+            raise AssertionError("remediation must not launch when deferred")
+
+        with patch("vibe_loop.runner.run_streaming_command", sentinel):
+            with self.assertRaises(BudgetReservationDenied) as caught:
+                self._launch(runner)
+        self.assertEqual(caught.exception.decision.decision, "defer")
+        self.assertEqual(caught.exception.decision.phase, "remediation")
+        self.assertEqual(launched, [])
+        self.assertFalse(
+            any(
+                record.get("to_state") == "remediation_started"
+                for record in runner.run_store.read_records()
+            )
+        )
+
+    def test_remediation_reconciles_own_usage_once_and_recovery_is_noop(
+        self,
+    ) -> None:
+        runner = self._runner(
+            make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
+        )
+        result = StreamingCommandResult(
+            exit_code=0,
+            usage=ProviderUsage(
+                provider="anthropic",
+                source="native:test",
+                version="1",
+                values={"input_tokens": 80, "output_tokens": 20, "total_tokens": 100},
+            ),
+        )
+        with patch("vibe_loop.runner.run_streaming_command", return_value=result):
+            self._launch(runner)
+        reconciled = [
+            record
+            for record in runner.budget_store.read_records()
+            if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+        ]
+        self.assertEqual(len(reconciled), 1)
+        reservation = next(
+            record
+            for record in runner.budget_store.read_records()
+            if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+            and record.get("reservation_id") == reconciled[0]["reservation_id"]
+        )
+        self.assertEqual(reservation["phase"], "remediation")
+        self.assertEqual(reconciled[0]["charge"], 100.0)
+        self.assertEqual(runner.recover_abandoned_budget(), 0)
+        self.assertEqual(
+            sum(
+                record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+                for record in runner.budget_store.read_records()
+            ),
+            1,
+        )
+        self.assertTrue(
+            any(
+                record.get("to_state") == "remediation_started"
+                for record in runner.run_store.read_records()
+            )
+        )
+
+    def test_remediation_timeout_unavailable_usage_charges_fail_safe(self) -> None:
+        runner = self._runner(
+            make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
+        )
+        result = StreamingCommandResult(
+            exit_code=124,
+            timed_out=True,
+            usage=unavailable_usage("anthropic", "provider_usage_not_reported"),
+        )
+        with patch("vibe_loop.runner.run_streaming_command", return_value=result):
+            with self.assertRaises(ReviewStageResultError):
+                self._launch(runner)
+        reconciled = [
+            record
+            for record in runner.budget_store.read_records()
+            if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+        ]
+        self.assertEqual(len(reconciled), 1)
+        reservation = next(
+            record
+            for record in runner.budget_store.read_records()
+            if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+            and record.get("reservation_id") == reconciled[0]["reservation_id"]
+        )
+        self.assertEqual(reservation["phase"], "remediation")
+        self.assertTrue(reconciled[0]["fail_safe_applied"])
+        self.assertEqual(reconciled[0]["charge"], 500.0)
+
+    def test_remediation_launch_oserror_releases_reservation(self) -> None:
+        runner = self._runner(
+            make_config(default_declared=500.0, limits=(BudgetLimit(limit=1e12),))
+        )
+        with patch(
+            "vibe_loop.runner.run_streaming_command",
+            side_effect=OSError("launch failed"),
+        ):
+            with self.assertRaises(OSError):
+                self._launch(runner)
+        records = runner.budget_store.read_records()
+        self.assertEqual(
+            sum(record.get("record_type") == "budget_released" for record in records),
+            1,
+        )
+        self.assertFalse(
+            any(
+                record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+                for record in records
+            )
+        )
 
 
 class F4TerminalSchemaTests(unittest.TestCase):
