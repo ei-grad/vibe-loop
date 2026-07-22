@@ -1838,6 +1838,56 @@ class AgentProfileRoutingTests(unittest.TestCase):
         )
         self.assertEqual(placeholder.agent.to_json()["effort"], "high")
 
+    def test_exact_codex_reviewer_command_uses_role_scoped_config_binding(
+        self,
+    ) -> None:
+        config = self._load_with_both_clis(
+            '[agent]\nkind = "claude"\n\n'
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'model = "gpt-5.6-terra"\n'
+            'effort = "xhigh"\n'
+            'command = "codex review {prompt}"\n'
+        )
+        reviewer = config.agent_profiles["review"]
+
+        self.assertEqual(reviewer.require_reviewer_command(), "codex review {prompt}")
+        with self.assertRaisesRegex(AgentResolutionError, "cannot receive"):
+            reviewer.require_command()
+
+    def test_codex_reviewer_config_binding_requires_safe_complete_route(
+        self,
+    ) -> None:
+        missing_effort = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'model = "gpt-5.6-terra"\n'
+            'command = "codex review {prompt}"\n'
+        ).agent_profiles["review"]
+        with self.assertRaisesRegex(AgentResolutionError, "set both"):
+            missing_effort.require_reviewer_command()
+
+        invalid_model = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'model = "gpt model"\n'
+            'effort = "high"\n'
+            'command = "codex review {prompt}"\n'
+        ).agent_profiles["review"]
+        with self.assertRaisesRegex(AgentResolutionError, "model is invalid"):
+            invalid_model.require_reviewer_command()
+
+        custom = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "custom"\n'
+            'prompt_dialect = "codex"\n'
+            'model = "gpt-5.6-terra"\n'
+            'effort = "high"\n'
+            'command = "review-wrapper {prompt}"\n'
+        ).agent_profiles["review"]
+        with self.assertRaisesRegex(AgentResolutionError, "cannot receive"):
+            custom.require_reviewer_command()
+
     def test_recognizable_executable_outranks_kind_for_effort_compat(self) -> None:
         # Finding 1 (P1): a Codex kind with an explicit Claude command must be
         # validated against Claude, not the declared kind, so an xhigh value

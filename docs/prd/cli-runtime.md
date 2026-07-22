@@ -87,7 +87,15 @@ authoritative executable templates. `command` receives `{prompt}`, `{model}`,
 when a template references an unresolved value. When first-class `effort` is
 configured, an explicit command must use `{effort}` and cannot also embed a
 native effort flag; templates that omit `{effort}` remain unchanged only when
-no first-class effort is configured. The worker prompt is
+no first-class effort is configured. The sole role-scoped exception is a
+runtime-owned reviewer profile whose exact explicit command is `codex review
+{prompt}` and which supplies both a safe `model` and a Codex-supported `effort`.
+That route binds `model`, `review_model`, and `model_reasoning_effort` through a
+temporary descendant project config layer without changing argv or
+`CODEX_HOME`, then requires matching native rollout provider/model/effort
+provenance before accepting output. Missing or ignored project config and any
+native mismatch fail closed; worker-owned, implementation, selection, analysis,
+Claude, custom, and placeholder commands retain the ordinary rule. The worker prompt is
 constructed from the selected skill reference syntax, the normalized task, and
 the runner's worker addendum. An optional top-level
 `agent.worker_prompt_extra` plain-text value is appended to every generated

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import stat
 import subprocess
 import threading
 import time
@@ -24,13 +25,19 @@ from vibe_loop.config import (
     TaskSourceConfig,
     VibeConfig,
     agent_command_provider,
+    codex_review_project_binding_requested,
     command_template_uses_field,
     format_agent_command,
     parse_orchestration,
+    validate_codex_review_project_binding,
 )
 from vibe_loop.retry import LimitWallSignal, detect_limit_wall
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
-from vibe_loop.telemetry import ProviderUsage, ProviderUsageObserver, unavailable_usage
+from vibe_loop.telemetry import (
+    ProviderUsage,
+    ProviderUsageObserver,
+    unavailable_usage,
+)
 
 
 RUN_CONTRACT_VERSION = 1
@@ -61,6 +68,13 @@ NESTED_REVIEW_EVENT_TYPES = frozenset(
 NESTED_REVIEW_TOOL_NAMES = frozenset(
     {"agent", "task", "workflow", "spawn_agent", "delegate_agent"}
 )
+CODEX_REVIEW_BINDING_ROOT = Path(".vibe-loop/reviewer-bindings")
+CODEX_REVIEW_BINDING_PREFIX = "codex-review-"
+CODEX_REVIEW_BINDING_SCHEMA_VERSION = 1
+CODEX_REVIEW_BINDING_SCAN_LIMIT = 4096
+CODEX_REVIEW_ROLLOUT_BYTE_LIMIT = 2 * 1024 * 1024
+CODEX_REVIEW_ROLLOUT_LINE_LIMIT = 512
+CODEX_REVIEW_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,159}$")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,6 +137,336 @@ def provider_capabilities(provider: str, role: str) -> ProviderCapabilities:
             structured_output=False,
             nested_delegation_disable=False,
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class CodexReviewNativeProvenance:
+    session_id: str
+    model: str
+    effort: str
+    provider: str
+
+    def route_fields(self) -> dict[str, str]:
+        return {
+            "resolved_provider": self.provider,
+            "resolved_provider_source": "native:codex:rollout:session_meta",
+            "resolved_model": self.model,
+            "resolved_model_source": "native:codex:rollout:turn_context",
+            "resolved_effort": self.effort,
+            "resolved_effort_source": "native:codex:rollout:turn_context",
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class CodexReviewLaunchBinding:
+    binding_dir: Path
+    launch_cwd: Path
+    codex_home: Path
+    rollout_snapshot: Mapping[Path, tuple[int, int]]
+    model: str
+    effort: str
+
+    def observe(self) -> CodexReviewNativeProvenance:
+        matches: list[tuple[int, CodexReviewNativeProvenance]] = []
+        for path, state in _codex_rollout_snapshot(self.codex_home).items():
+            if self.rollout_snapshot.get(path) == state:
+                continue
+            parsed = _parse_codex_review_rollout(path, self.launch_cwd)
+            if parsed is not None:
+                matches.append((state[0], parsed))
+        if not matches:
+            raise ReviewExecutionError(
+                "Codex reviewer native session provenance was not observed"
+            )
+        provenance = max(matches, key=lambda item: item[0])[1]
+        if provenance.provider != "openai":
+            raise ReviewExecutionError(
+                "Codex reviewer native provider differs from the requested route"
+            )
+        if provenance.model != self.model:
+            raise ReviewExecutionError(
+                "Codex reviewer native model differs from the requested route"
+            )
+        if provenance.effort != self.effort:
+            raise ReviewExecutionError(
+                "Codex reviewer native effort differs from the requested route"
+            )
+        return provenance
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _safe_binding_root(worktree: Path) -> Path:
+    root = Path(worktree) / CODEX_REVIEW_BINDING_ROOT
+    state_dir = root.parent
+    for path in (state_dir, root):
+        try:
+            path.mkdir(mode=0o700, parents=path == state_dir, exist_ok=True)
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise ReviewExecutionError(
+                "Codex reviewer binding state directory is unavailable"
+            ) from exc
+        if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
+            raise ReviewExecutionError(
+                "Codex reviewer binding state directory is unsafe"
+            )
+    return root
+
+
+def _binding_owner_pid(path: Path) -> int | None:
+    marker = path / "binding.json"
+    try:
+        if marker.lstat().st_size > 4096 or marker.is_symlink():
+            return None
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("schema_version") != CODEX_REVIEW_BINDING_SCHEMA_VERSION:
+        return None
+    owner_pid = payload.get("owner_pid")
+    if isinstance(owner_pid, bool) or not isinstance(owner_pid, int):
+        return None
+    return owner_pid
+
+
+def _remove_codex_review_binding(path: Path) -> bool:
+    try:
+        if path.is_symlink() or not stat.S_ISDIR(path.lstat().st_mode):
+            return False
+        entries = {entry.name for entry in path.iterdir()}
+        if not entries.issubset({"binding.json", ".codex"}):
+            return False
+        codex_dir = path / ".codex"
+        if codex_dir.exists():
+            if codex_dir.is_symlink() or not stat.S_ISDIR(codex_dir.lstat().st_mode):
+                return False
+            config_entries = {entry.name for entry in codex_dir.iterdir()}
+            if not config_entries.issubset({"config.toml"}):
+                return False
+            config = codex_dir / "config.toml"
+            if config.exists():
+                if config.is_symlink() or not stat.S_ISREG(config.lstat().st_mode):
+                    return False
+                config.unlink()
+            codex_dir.rmdir()
+        marker = path / "binding.json"
+        if marker.exists():
+            if marker.is_symlink() or not stat.S_ISREG(marker.lstat().st_mode):
+                return False
+            marker.unlink()
+        path.rmdir()
+    except OSError:
+        return False
+    return True
+
+
+def cleanup_stale_codex_review_bindings(worktree: Path) -> int:
+    root = _safe_binding_root(worktree)
+    removed = 0
+    try:
+        candidates = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError as exc:
+        raise ReviewExecutionError(
+            "Codex reviewer binding state could not be inspected"
+        ) from exc
+    for path in candidates[:CODEX_REVIEW_BINDING_SCAN_LIMIT]:
+        if not re.fullmatch(r"codex-review-[0-9a-f]{32}", path.name):
+            continue
+        owner_pid = _binding_owner_pid(path)
+        if owner_pid is None or _pid_is_alive(owner_pid):
+            continue
+        if _remove_codex_review_binding(path):
+            removed += 1
+    return removed
+
+
+def _resolve_codex_home(cwd: Path) -> Path:
+    configured = os.environ.get("CODEX_HOME", "")
+    if not configured:
+        return Path.home() / ".codex"
+    candidate = Path(configured).expanduser()
+    return candidate if candidate.is_absolute() else Path(cwd) / candidate
+
+
+def _codex_rollout_snapshot(codex_home: Path) -> dict[Path, tuple[int, int]]:
+    try:
+        paths = sorted((codex_home / "sessions").glob("*/*/*/*.jsonl"))
+    except OSError as exc:
+        raise ReviewExecutionError(
+            "Codex reviewer session store could not be inspected"
+        ) from exc
+    if len(paths) > CODEX_REVIEW_BINDING_SCAN_LIMIT:
+        paths = paths[-CODEX_REVIEW_BINDING_SCAN_LIMIT:]
+    snapshot: dict[Path, tuple[int, int]] = {}
+    for path in paths:
+        try:
+            info = path.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            snapshot[path] = (info.st_mtime_ns, info.st_size)
+    return snapshot
+
+
+def _parse_codex_review_rollout(
+    path: Path, launch_cwd: Path
+) -> CodexReviewNativeProvenance | None:
+    session_id = ""
+    session_cwd = ""
+    provider = ""
+    model = ""
+    effort = ""
+    total_bytes = 0
+    try:
+        path_info = path.lstat()
+        if not stat.S_ISREG(path_info.st_mode) or stat.S_ISLNK(path_info.st_mode):
+            return None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        opened_info = os.fstat(descriptor)
+        if (opened_info.st_dev, opened_info.st_ino) != (
+            path_info.st_dev,
+            path_info.st_ino,
+        ):
+            os.close(descriptor)
+            return None
+        with os.fdopen(descriptor, "rb") as rollout:
+            for ordinal, raw_line in enumerate(rollout):
+                if ordinal >= CODEX_REVIEW_ROLLOUT_LINE_LIMIT:
+                    break
+                total_bytes += len(raw_line)
+                if total_bytes > CODEX_REVIEW_ROLLOUT_BYTE_LIMIT:
+                    break
+                if (
+                    re.search(
+                        rb'"type"\s*:\s*"(?:session_meta|turn_context)"', raw_line
+                    )
+                    is None
+                ):
+                    continue
+                try:
+                    record = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, Mapping):
+                    continue
+                payload = record.get("payload")
+                if not isinstance(payload, Mapping):
+                    continue
+                if record.get("type") == "session_meta":
+                    raw_id = payload.get("id")
+                    raw_cwd = payload.get("cwd")
+                    raw_provider = payload.get("model_provider")
+                    if isinstance(raw_id, str):
+                        session_id = raw_id
+                    if isinstance(raw_cwd, str):
+                        session_cwd = raw_cwd
+                    if isinstance(raw_provider, str):
+                        provider = raw_provider
+                elif record.get("type") == "turn_context":
+                    raw_model = payload.get("model")
+                    raw_effort = payload.get("effort")
+                    if isinstance(raw_model, str):
+                        model = raw_model
+                    if isinstance(raw_effort, str):
+                        effort = raw_effort
+    except (OSError, UnicodeError):
+        return None
+    if (
+        CODEX_REVIEW_SESSION_ID_RE.fullmatch(session_id) is None
+        or not session_cwd
+        or not provider
+        or not model
+        or not effort
+    ):
+        return None
+    try:
+        if Path(session_cwd).resolve() != Path(launch_cwd).resolve():
+            return None
+    except OSError:
+        return None
+    return CodexReviewNativeProvenance(
+        session_id=session_id,
+        model=model,
+        effort=effort,
+        provider=provider,
+    )
+
+
+@contextmanager
+def codex_review_launch_binding(
+    reviewer: AgentConfig,
+    worktree: Path,
+) -> Any:
+    validate_codex_review_project_binding(reviewer)
+    root = _safe_binding_root(worktree)
+    cleanup_stale_codex_review_bindings(worktree)
+    binding_dir: Path | None = None
+    for _attempt in range(4):
+        candidate = root / f"{CODEX_REVIEW_BINDING_PREFIX}{uuid.uuid4().hex}"
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        binding_dir = candidate
+        break
+    if binding_dir is None:
+        raise ReviewExecutionError(
+            "Codex reviewer binding directory could not be allocated"
+        )
+    try:
+        os.chmod(binding_dir, 0o700)
+        marker = binding_dir / "binding.json"
+        marker.write_text(
+            json.dumps(
+                {
+                    "schema_version": CODEX_REVIEW_BINDING_SCHEMA_VERSION,
+                    "owner_pid": os.getpid(),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(marker, 0o600)
+        codex_dir = binding_dir / ".codex"
+        codex_dir.mkdir(mode=0o700)
+        config = codex_dir / "config.toml"
+        config.write_text(
+            "# Ephemeral runtime-owned reviewer route.\n"
+            f"model = {json.dumps(reviewer.model)}\n"
+            f"review_model = {json.dumps(reviewer.model)}\n"
+            f"model_reasoning_effort = {json.dumps(reviewer.effort)}\n",
+            encoding="utf-8",
+        )
+        os.chmod(config, 0o600)
+        codex_home = _resolve_codex_home(binding_dir)
+        binding = CodexReviewLaunchBinding(
+            binding_dir=binding_dir,
+            launch_cwd=binding_dir,
+            codex_home=codex_home,
+            rollout_snapshot=_codex_rollout_snapshot(codex_home),
+            model=reviewer.model or "",
+            effort=reviewer.effort or "",
+        )
+        yield binding
+    finally:
+        if not _remove_codex_review_binding(binding_dir):
+            raise ReviewExecutionError(
+                "Codex reviewer binding state could not be cleaned up"
+            )
 
 
 class RunStage(enum.StrEnum):
@@ -1352,7 +1696,7 @@ class ReviewRouter:
             pass_kind=pass_kind,
             prior_findings=prior,
         )
-        command_template = self.reviewer.require_command()
+        command_template = self.reviewer.require_reviewer_command()
         if not command_template_uses_field(command_template, "prompt"):
             raise AgentResolutionError(
                 "reviewer command must include {prompt}; otherwise the typed "
@@ -1428,7 +1772,7 @@ class ReviewRouter:
         reask: bool,
         continuation: ContinuationContext,
     ) -> ReviewResult:
-        command_template = self.reviewer.require_command()
+        command_template = self.reviewer.require_reviewer_command()
         if not command_template_uses_field(command_template, "prompt"):
             raise AgentResolutionError(
                 "reviewer command must include {prompt}; otherwise the typed "
@@ -1452,50 +1796,77 @@ class ReviewRouter:
             continuation=continuation,
         )
         started = time.monotonic()
-        with self.concurrency.slot():
-            try:
-                completed = self.executor(
-                    command,
-                    cwd=self.worktree,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-            except OSError as exc:
-                duration = max(0.0, time.monotonic() - started)
-                self._record_error(
-                    request,
-                    route,
-                    pass_ordinal,
-                    attempt_ordinal,
-                    "fatal",
-                    duration,
-                    unavailable_usage(
-                        self._usage_provider(), "provider_usage_not_reported"
-                    ),
-                    continuation=continuation,
-                )
-                self._fail_stage_for_result("fatal")
-                raise ReviewExecutionError(
-                    f"reviewer command could not be executed: {type(exc).__name__}"
-                ) from exc
-            except subprocess.TimeoutExpired as exc:
-                self._record_wait_incomplete(
-                    request, pass_ordinal, attempt_ordinal, continuation
-                )
-                self._fail_stage_for_result("timeout")
-                raise ReviewWaitIncomplete(
-                    request.pass_kind, pass_ordinal, attempt_ordinal
-                ) from exc
+        native_provenance: CodexReviewNativeProvenance | None = None
+        try:
+            with self.concurrency.slot():
+                with self._launch_binding() as binding:
+                    completed = self.executor(
+                        command,
+                        cwd=(binding.launch_cwd if binding else self.worktree),
+                        shell=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if binding is not None and completed.returncode == 0:
+                        native_provenance = binding.observe()
+        except OSError as exc:
+            duration = max(0.0, time.monotonic() - started)
+            self._record_error(
+                request,
+                route,
+                pass_ordinal,
+                attempt_ordinal,
+                "fatal",
+                duration,
+                unavailable_usage(
+                    self._usage_provider(), "provider_usage_not_reported"
+                ),
+                continuation=continuation,
+            )
+            self._fail_stage_for_result("fatal")
+            raise ReviewExecutionError(
+                f"reviewer command could not be executed: {type(exc).__name__}"
+            ) from exc
+        except ReviewExecutionError:
+            duration = max(0.0, time.monotonic() - started)
+            self._record_error(
+                request,
+                route,
+                pass_ordinal,
+                attempt_ordinal,
+                "fatal",
+                duration,
+                unavailable_usage(
+                    self._usage_provider(), "provider_usage_not_reported"
+                ),
+                continuation=continuation,
+            )
+            self._fail_stage_for_result("fatal")
+            raise
+        except subprocess.TimeoutExpired as exc:
+            self._record_wait_incomplete(
+                request, pass_ordinal, attempt_ordinal, continuation
+            )
+            self._fail_stage_for_result("timeout")
+            raise ReviewWaitIncomplete(
+                request.pass_kind, pass_ordinal, attempt_ordinal
+            ) from exc
         duration = max(0.0, time.monotonic() - started)
         output = completed.stdout or ""
         observer = ProviderUsageObserver(self._usage_provider())
         for line in output.splitlines():
             observer.observe_line(line)
         usage = observer.usage
+        if native_provenance is not None:
+            continuation = dataclasses.replace(
+                continuation,
+                session_id=native_provenance.session_id,
+                session_id_source="native:codex:rollout",
+            )
+            route = self._route_payload(native_provenance)
         nested_launches, nested_usage = self._nested_launch_evidence(output)
         if nested_launches:
             self._record_error(
@@ -1784,11 +2155,13 @@ class ReviewRouter:
         route = self._route_payload()
         provider = str(route["provider"])
         if request.family == "initial" and previous is None:
-            return plan_session_continuation(
-                provider=provider,
-                role="reviewer",
-                continuing=False,
-                session_id_factory=self.session_id_factory,
+            return self._native_pending_context(
+                plan_session_continuation(
+                    provider=provider,
+                    role="reviewer",
+                    continuing=False,
+                    session_id_factory=self.session_id_factory,
+                )
             )
 
         prior_session_id = ""
@@ -1811,14 +2184,27 @@ class ReviewRouter:
                 raise ReviewExecutionError(
                     "continuation availability returned an invalid reason"
                 )
-        return plan_session_continuation(
-            provider=provider,
-            role="reviewer",
-            continuing=True,
-            prior_session_id=prior_session_id,
-            prior_ordinal=prior_ordinal,
-            availability_reason=fallback_reason,
-            session_id_factory=self.session_id_factory,
+        return self._native_pending_context(
+            plan_session_continuation(
+                provider=provider,
+                role="reviewer",
+                continuing=True,
+                prior_session_id=prior_session_id,
+                prior_ordinal=prior_ordinal,
+                availability_reason=fallback_reason,
+                session_id_factory=self.session_id_factory,
+            )
+        )
+
+    def _native_pending_context(
+        self, context: ContinuationContext
+    ) -> ContinuationContext:
+        if not codex_review_project_binding_requested(self.reviewer):
+            return context
+        return dataclasses.replace(
+            context,
+            session_id="",
+            session_id_source="native_pending",
         )
 
     def _default_continuation_availability(
@@ -1829,7 +2215,7 @@ class ReviewRouter:
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", session_id) is None:
             return "transcript_missing"
         try:
-            argv = shlex.split(self.reviewer.require_command())
+            argv = shlex.split(self.reviewer.require_reviewer_command())
         except ValueError:
             return "transcript_missing"
         configured_home = ""
@@ -1901,6 +2287,14 @@ class ReviewRouter:
         if capabilities.nested_delegation_disable:
             effective = prepare_claude_review_command(effective)
         return effective
+
+    @contextmanager
+    def _launch_binding(self) -> Any:
+        if codex_review_project_binding_requested(self.reviewer):
+            with codex_review_launch_binding(self.reviewer, self.worktree) as binding:
+                yield binding
+            return
+        yield None
 
     def _claim_review_attempt(
         self,
@@ -2256,22 +2650,32 @@ class ReviewRouter:
             ),
         }
 
-    def _route_payload(self) -> dict[str, object]:
+    def _route_payload(
+        self,
+        native: CodexReviewNativeProvenance | None = None,
+    ) -> dict[str, object]:
         provider = agent_command_provider(
             self.reviewer.command or "",
             self.reviewer.executable_kind or self.reviewer.agent_kind,
         )
-        return {
+        payload: dict[str, object] = {
             "profile": self.reviewer_profile,
             "provider": provider or "unknown",
             "model": self.reviewer.model,
+            "model_source": self.reviewer.model_source,
             "effort": self.reviewer.effort,
+            "effort_source": self.reviewer.effort_source,
             "command_key": (
                 f"agent.profiles.{self.reviewer_profile}.command"
                 if self.reviewer_profile
                 else "agent.command"
             ),
         }
+        if codex_review_project_binding_requested(self.reviewer):
+            payload["launch_binding"] = "codex_project_config"
+        if native is not None:
+            payload.update(native.route_fields())
+        return payload
 
     def _usage_provider(self) -> str:
         provider = self._route_payload()["provider"]
@@ -4004,8 +4408,12 @@ class RunContractResolver:
         else:
             reviewer_agent = self.config.agent_profiles[reviewer_profile]
         reviewer_command = reviewer_agent.command
-        if configured_reviewer_profile is not None and reviewer_command is None:
-            reviewer_agent.require_command()
+        if configured_reviewer_profile is not None:
+            reviewer_command = (
+                reviewer_agent.require_reviewer_command()
+                if effective.mode == "runtime-owned"
+                else reviewer_agent.require_command()
+            )
         if configured_reviewer_profile is not None and not command_template_uses_field(
             reviewer_command or "", "prompt"
         ):

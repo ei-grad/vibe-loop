@@ -353,6 +353,7 @@ AGENT_PROVIDER_EFFORT_VALUES = {
     "codex": AGENT_EFFORT_VALUES,
     "claude": frozenset({"low", "medium", "high"}),
 }
+CODEX_REVIEW_BINDING_MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,159}$")
 AGENT_ROUTING_PREDICATE_KEYS = frozenset(
     {
         "match_hazards_any",
@@ -475,6 +476,20 @@ class AgentConfig:
                 self.detected,
             )
         )
+
+    def require_reviewer_command(self) -> str:
+        """Resolve a reviewer command, admitting the exact Codex review binding.
+
+        ``codex review`` has no review-specific model/effort flags that satisfy
+        repositories which mandate the exact command form. Runtime-owned review
+        can deliver those two values through a documented project config layer;
+        implementation, selection, Claude, and custom commands retain the
+        ordinary placeholder contract.
+        """
+        if self.command and codex_review_project_binding_requested(self):
+            validate_codex_review_project_binding(self)
+            return self.command
+        return self.require_command()
 
     def require_effort_delivery(self, key: str) -> None:
         diagnostic = self.effort_delivery_diagnostic(key)
@@ -607,6 +622,35 @@ class AgentConfig:
             "default_policy": AGENT_DEFAULT_POLICY,
             "diagnostics": self.diagnostics(),
         }
+
+
+def codex_review_project_binding_requested(agent: AgentConfig) -> bool:
+    if agent.command_source != "explicit" or not agent.command:
+        return False
+    try:
+        argv = shlex.split(agent.command)
+    except ValueError:
+        return False
+    return argv == ["codex", "review", "{prompt}"] and bool(agent.model or agent.effort)
+
+
+def validate_codex_review_project_binding(agent: AgentConfig) -> None:
+    setting = f"agent.profiles.{agent.profile_name}" if agent.profile_name else "agent"
+    if agent.model is None or agent.effort is None:
+        raise AgentResolutionError(
+            f"{setting}.command uses the Codex review project-config binding; "
+            f"set both {setting}.model and {setting}.effort"
+        )
+    if CODEX_REVIEW_BINDING_MODEL_RE.fullmatch(agent.model) is None:
+        raise AgentResolutionError(
+            f"{setting}.model is invalid for the Codex review project-config binding"
+        )
+    allowed = AGENT_PROVIDER_EFFORT_VALUES["codex"]
+    if agent.effort not in allowed:
+        raise AgentResolutionError(
+            f"{setting}.effort {agent.effort!r} is not supported by codex; "
+            f"allowed values: {', '.join(sorted(allowed))}"
+        )
 
 
 @dataclasses.dataclass(frozen=True)

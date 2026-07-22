@@ -117,6 +117,18 @@ explicit continuation fallback with the reason and supplies prior-session
 artifacts as context. Session identity, model/effort, and native usage are
 recorded for every initial and closure pass.
 
+For the exact runtime-owned Codex reviewer command `codex review {prompt}`, the
+configured model and effort are launch context rather than argv placeholders.
+The runtime creates a bounded temporary descendant project config layer with
+only `model`, `review_model`, and `model_reasoning_effort`, preserves the normal
+`CODEX_HOME` authentication/user/system/managed layers and root-to-cwd project
+instructions, and verifies a new native rollout for the same Git worktree and
+launch cwd before accepting the verdict. Provider, model, and effort must match
+the requested built-in Codex route. The temporary path/config and transcript
+content are private; only allowlisted requested/resolved provenance is
+journaled. Normal exit and dead-owner recovery remove only the known temporary
+shape. Other providers, roles, and command forms do not receive this exception.
+
 Acceptance must cover independent route configuration and validation, typed
 request/response round trips, Claude-implementer/Codex-reviewer and
 Codex-implementer/Claude-reviewer matrices, missing reviewer command

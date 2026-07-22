@@ -42,6 +42,7 @@ from vibe_loop.orchestration import (
     ReviewBudgetExhausted,
     ReviewConcurrencyBudget,
     ReviewDelegationPolicyError,
+    ReviewExecutionError,
     ReviewFinding,
     ReviewLimitWallError,
     ReviewRouter,
@@ -59,6 +60,7 @@ from vibe_loop.orchestration import (
     TaskSourceSettler,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
+    cleanup_stale_codex_review_bindings,
     derive_stage_progress,
     inject_provider_continuation,
     plan_session_continuation,
@@ -183,6 +185,80 @@ class OrchestrationConfigTests(unittest.TestCase):
 
 
 class RunContractResolverTests(unittest.TestCase):
+    def test_runtime_contract_accepts_exact_codex_review_binding_before_launch(
+        self,
+    ) -> None:
+        implementer = AgentConfig(
+            command="claude -p {prompt}", agent_kind="claude", profile_name="impl"
+        )
+        reviewer = AgentConfig(
+            command="codex review {prompt}",
+            command_source="explicit",
+            model="gpt-5.6-terra",
+            model_source="explicit",
+            effort="xhigh",
+            effort_source="explicit",
+            agent_kind="codex",
+            executable_kind="codex",
+            profile_name="review",
+        )
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=implementer,
+            agent_profiles={"review": reviewer},
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="review",
+                task_provenance_mode="external-confirmed",
+                explicit_keys=frozenset(
+                    {"mode", "reviewer_profile", "task_provenance_mode"}
+                ),
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(implementer, "impl", "profile")
+        )
+
+        reviewer_route = contract.payload["reviewer"]
+        assert isinstance(reviewer_route, dict)
+        self.assertEqual(reviewer_route["provider"], "codex")
+        self.assertEqual(reviewer_route["model"], "gpt-5.6-terra")
+        self.assertEqual(reviewer_route["effort"], "xhigh")
+
+        missing = dataclasses.replace(reviewer, effort=None)
+        with self.assertRaisesRegex(AgentResolutionError, "set both"):
+            RunContractResolver(
+                dataclasses.replace(config, agent_profiles={"review": missing})
+            ).resolve(AgentSelection(implementer, "impl", "profile"))
+
+    def test_worker_owned_contract_keeps_placeholder_validation(self) -> None:
+        implementer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        reviewer = AgentConfig(
+            command="codex review {prompt}",
+            command_source="explicit",
+            model="gpt-5.6-terra",
+            effort="xhigh",
+            agent_kind="codex",
+            executable_kind="codex",
+            profile_name="review",
+        )
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=implementer,
+            agent_profiles={"review": reviewer},
+            orchestration=OrchestrationConfig(
+                mode="worker-owned",
+                reviewer_profile="review",
+                explicit_keys=frozenset({"mode", "reviewer_profile"}),
+            ),
+        )
+
+        with self.assertRaisesRegex(AgentResolutionError, "cannot receive"):
+            RunContractResolver(config).resolve(
+                AgentSelection(implementer, "", "default")
+            )
+
     def test_explicit_config_wins_over_profile_and_profile_wins_over_skill(
         self,
     ) -> None:
@@ -2251,6 +2327,303 @@ class ReviewRouterTests(unittest.TestCase):
                 for result in self.gates.results
             ),
         )
+
+    def exact_codex_router(self, executor) -> ReviewRouter:
+        reviewer = dataclasses.replace(
+            self.agent("codex", command="codex review {prompt}"),
+            model="gpt-5.6-terra",
+            effort="xhigh",
+        )
+        return ReviewRouter(
+            reviewer=reviewer,
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=2,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=executor,
+            session_id_factory=lambda: "runtime-placeholder",
+        )
+
+    def test_exact_codex_review_binding_preserves_git_root_and_native_route(
+        self,
+    ) -> None:
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        (self.repo / "AGENTS.md").write_text("project instructions\n", encoding="utf-8")
+        source = self.repo / "src" / "example.py"
+        source.parent.mkdir()
+        source.write_text("old = True\n", encoding="utf-8")
+        subprocess.run(["git", "-C", self.repo, "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                self.repo,
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+            check=True,
+        )
+        source.write_text("old = False\n", encoding="utf-8")
+
+        codex_home = self.repo / "codex-home"
+        codex_home.mkdir()
+        (codex_home / "AGENTS.md").write_text("global instructions\n", encoding="utf-8")
+        (codex_home / "auth.json").write_text(
+            '"auth-secret-canary"\n', encoding="utf-8"
+        )
+        observed: dict[str, object] = {}
+
+        def execute(command: str, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            observed["command"] = command
+            observed["cwd"] = cwd
+            observed["config"] = (cwd / ".codex" / "config.toml").read_text()
+            observed["auth_copied"] = (cwd / ".codex" / "auth.json").exists()
+            observed["top"] = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=cwd,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.strip()
+            observed["diff"] = subprocess.run(
+                ["git", "diff", "--name-only"],
+                cwd=cwd,
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+            ).stdout.splitlines()
+            observed["project_instructions"] = any(
+                (ancestor / "AGENTS.md").is_file() for ancestor in (cwd, *cwd.parents)
+            )
+            rollout = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "07"
+                / "22"
+                / "rollout-native-session-1.jsonl"
+            )
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "native-session-1",
+                            "cwd": str(cwd),
+                            "model_provider": "openai",
+                            "instructions": "must-not-be-read",
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "turn_context",
+                        "payload": {
+                            "model": "gpt-5.6-terra",
+                            "effort": "xhigh",
+                            "user_instructions": "must-not-be-journaled",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            verdict = {
+                "verdict": "approve",
+                "findings": [],
+                "session_id": "",
+                "session_id_source": "",
+                "continuation_ordinal": 0,
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(verdict))
+
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            result = self.exact_codex_router(execute).review(self.gates)
+
+        self.assertEqual(shlex.split(str(observed["command"]))[:2], ["codex", "review"])
+        self.assertNotIn("--model", str(observed["command"]))
+        self.assertNotIn("--effort", str(observed["command"]))
+        self.assertNotIn("model_reasoning_effort", str(observed["command"]))
+        self.assertRegex(
+            Path(observed["cwd"]).name,
+            r"^codex-review-[0-9a-f]{32}$",
+        )
+        self.assertEqual(observed["top"], str(self.repo))
+        self.assertEqual(observed["diff"], ["src/example.py"])
+        self.assertTrue(observed["project_instructions"])
+        self.assertIn('review_model = "gpt-5.6-terra"', str(observed["config"]))
+        self.assertIn('model_reasoning_effort = "xhigh"', str(observed["config"]))
+        self.assertFalse(observed["auth_copied"])
+        self.assertEqual(result.session_id, "native-session-1")
+        self.assertEqual(result.session_id_source, "native:codex:rollout")
+        verdict = self.store.read_records()[-2]
+        started = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_started"
+        )
+        self.assertEqual(started["session_id"], "")
+        self.assertEqual(started["session_id_source"], "native_pending")
+        route = verdict["route"]
+        self.assertEqual(route["launch_binding"], "codex_project_config")
+        self.assertEqual(route["resolved_provider"], "openai")
+        self.assertEqual(route["resolved_model"], "gpt-5.6-terra")
+        self.assertEqual(route["resolved_effort"], "xhigh")
+        serialized = json.dumps(self.store.read_records())
+        self.assertNotIn("auth-secret-canary", serialized)
+        self.assertNotIn("must-not-be-read", serialized)
+        self.assertNotIn("must-not-be-journaled", serialized)
+        self.assertNotIn("reviewer-bindings", serialized)
+        self.assertNotIn(str(observed["cwd"]), serialized)
+        binding_root = self.repo / ".vibe-loop" / "reviewer-bindings"
+        self.assertEqual(list(binding_root.iterdir()), [])
+
+    def test_codex_review_binding_fails_closed_when_project_layer_is_ignored(
+        self,
+    ) -> None:
+        codex_home = self.repo / "codex-home"
+        codex_home.mkdir()
+
+        def execute(command: str, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            rollout = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "07"
+                / "22"
+                / "rollout-untrusted-session.jsonl"
+            )
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "untrusted-session",
+                            "cwd": str(cwd),
+                            "model_provider": "openai",
+                        },
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "turn_context",
+                        "payload": {"model": "default-model", "effort": "medium"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="{}")
+
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            with self.assertRaisesRegex(ReviewExecutionError, "native model differs"):
+                self.exact_codex_router(execute).review(self.gates)
+        self.assertEqual(
+            list((self.repo / ".vibe-loop" / "reviewer-bindings").iterdir()),
+            [],
+        )
+
+    def test_codex_review_binding_requires_native_provider_and_cleans_on_spawn_error(
+        self,
+    ) -> None:
+        codex_home = self.repo / "codex-home"
+        codex_home.mkdir()
+
+        def missing_provider(command: str, **kwargs):
+            cwd = Path(kwargs["cwd"])
+            rollout = (
+                codex_home
+                / "sessions"
+                / "2026"
+                / "07"
+                / "22"
+                / "rollout-missing-provider.jsonl"
+            )
+            rollout.parent.mkdir(parents=True)
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {"id": "missing-provider", "cwd": str(cwd)},
+                    }
+                )
+                + "\n"
+                + json.dumps(
+                    {
+                        "type": "turn_context",
+                        "payload": {
+                            "model": "gpt-5.6-terra",
+                            "effort": "xhigh",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(command, 0, stdout="{}")
+
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            with self.assertRaisesRegex(
+                ReviewExecutionError, "native session provenance was not observed"
+            ):
+                self.exact_codex_router(missing_provider).review(self.gates)
+
+        def spawn_error(_command: str, **_kwargs):
+            raise OSError("spawn failed")
+
+        self.store = RunStore(self.repo / "spawn-error.jsonl")
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            with self.assertRaisesRegex(
+                ReviewExecutionError, "reviewer command could not be executed"
+            ):
+                self.exact_codex_router(spawn_error).review(self.gates)
+        self.assertEqual(
+            list((self.repo / ".vibe-loop" / "reviewer-bindings").iterdir()),
+            [],
+        )
+
+    def test_codex_review_binding_cleanup_is_idempotent_and_pid_gated(self) -> None:
+        root = self.repo / ".vibe-loop" / "reviewer-bindings"
+        stale = root / ("codex-review-" + "a" * 32)
+        (stale / ".codex").mkdir(parents=True)
+        (stale / ".codex" / "config.toml").write_text(
+            'model = "safe"\n', encoding="utf-8"
+        )
+        (stale / "binding.json").write_text(
+            json.dumps({"schema_version": 1, "owner_pid": 99999999}) + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(cleanup_stale_codex_review_bindings(self.repo), 1)
+        self.assertEqual(cleanup_stale_codex_review_bindings(self.repo), 0)
+
+        live = root / ("codex-review-" + "b" * 32)
+        (live / ".codex").mkdir(parents=True)
+        (live / ".codex" / "config.toml").write_text(
+            'model = "safe"\n', encoding="utf-8"
+        )
+        (live / "binding.json").write_text(
+            json.dumps({"schema_version": 1, "owner_pid": os.getpid()}) + "\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(cleanup_stale_codex_review_bindings(self.repo), 0)
+        self.assertTrue(live.is_dir())
 
     def test_routes_cross_provider_matrices_with_provenance_and_usage(self) -> None:
         cases = (
