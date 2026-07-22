@@ -34,6 +34,7 @@ from vibe_loop.runs import (
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+    WORKSPACE_PREFLIGHT_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     WORKER_REPORT_SCHEMA_VERSION,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
@@ -749,6 +750,36 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(event["worker_process_birth_id"], "boot-id:500")
         self.assertEqual(event["pid_source"], "popen")
         self.assertIn(WORKER_PROCESS_STARTED_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_workspace_preflight_event_has_closed_retry_vocabulary(self) -> None:
+        event = RunLifecycleEvent.workspace_preflight(
+            run_id="run-1",
+            task_id="TASK-01",
+            decision="rejected",
+            reason="workspace_stale_current_base",
+            retry_disposition="defer_until_workspace_changes",
+            worker_launch_allowed=False,
+            branch="vibe/TASK-01",
+            worktree=Path("/workspace/TASK-01"),
+            selected_base="a" * 40,
+            workspace_base="b" * 40,
+            head_commit="c" * 40,
+        ).to_record()
+
+        self.assertEqual(event["record_type"], WORKSPACE_PREFLIGHT_RECORD_TYPE)
+        self.assertEqual(event["decision"], "rejected")
+        self.assertEqual(event["retry_disposition"], "defer_until_workspace_changes")
+        self.assertFalse(event["worker_launch_allowed"])
+        self.assertIn(WORKSPACE_PREFLIGHT_RECORD_TYPE, KNOWN_RECORD_TYPES)
+        with self.assertRaisesRegex(ValueError, "retry disposition"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-2",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="retry_immediately",
+                worker_launch_allowed=False,
+            )
 
     def test_post_report_activity_event_records_violation_and_teardown(
         self,

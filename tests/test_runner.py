@@ -4015,6 +4015,13 @@ class TransientWorkerFailureTests(unittest.TestCase):
             )
             records_after_block = first.run_store.read_records()
             self.assertEqual(len(first.run_store.pending_recovery_records()), 1)
+            deferred = [
+                record
+                for record in records_after_block
+                if record.get("record_type") == "task_recovery"
+                and record.get("phase") == "deferred"
+            ]
+            self.assertEqual(deferred[0]["retry_disposition"], "retry_later")
             self.assertFalse(
                 any(
                     record.get("record_type") == "task_restart"

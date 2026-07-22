@@ -74,7 +74,12 @@ worktree as its working directory. A clean primary worktree remains on the
 configured main branch and byte-for-byte unchanged from worker launch through
 candidate integration. Existing task worktrees may be adopted only after
 ownership, branch, cleanliness, base, and liveness checks; dirty or ambiguous
-existing work is preserved fail-closed, never reset or deleted. Provisioning
+existing work is preserved fail-closed, never reset or deleted. Adoption also
+requires the recorded current main base to be an ancestor of the workspace
+HEAD; an older workspace base appearing in current main history is not
+sufficient. The preflight records a bounded typed decision and retry disposition
+before any implementation process starts, so stale or diverged workspaces defer
+until their state changes without consuming a model launch. Provisioning
 failures unwind without leaking task locks or half-created workspaces.
 Parallel jobs receive distinct worktrees and can never claim the primary
 worktree. Recovery reuses a preserved worker-owned workspace for the same task

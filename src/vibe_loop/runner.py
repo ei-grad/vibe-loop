@@ -4377,6 +4377,7 @@ class VibeRunner:
         recovery_run_id: str = "",
         outcome: str = "",
         blocker: str = "",
+        retry_disposition: str = "",
     ) -> None:
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_recovery(
@@ -4395,6 +4396,7 @@ class VibeRunner:
                     **recovery_context_payload(recovery),
                     "recovery_run_id": recovery_run_id,
                     "blocker": blocker,
+                    "retry_disposition": retry_disposition,
                 },
             )
         )
@@ -4561,6 +4563,7 @@ class VibeRunner:
                 recovery,
                 phase="deferred",
                 blocker=exc.code,
+                retry_disposition=exc.retry_disposition,
             )
             return None
         except (OSError, subprocess.SubprocessError) as exc:

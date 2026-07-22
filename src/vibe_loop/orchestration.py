@@ -4138,7 +4138,37 @@ class WorkspaceProvisionError(RuntimeError):
     ) -> None:
         self.code = code
         self.details = dict(details or {})
+        self.retry_disposition = workspace_retry_disposition(code)
         super().__init__(message)
+
+
+WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
+    {
+        "ambiguous_owned_workspaces",
+        "dirty_existing_workspace",
+        "incomplete_recovery_workspace",
+        "primary_workspace_forbidden",
+        "recovery_base_changed",
+        "recovery_dirty_content_changed",
+        "recovery_dirty_snapshot_changed",
+        "recovery_git_common_dir_changed",
+        "recovery_head_changed",
+        "workspace_base_mismatch",
+        "workspace_base_unverified",
+        "workspace_collision",
+        "workspace_foreign_owner",
+        "workspace_live_owner",
+        "workspace_main_history_mismatch",
+        "workspace_ownership_unverified",
+        "workspace_stale_current_base",
+    }
+)
+
+
+def workspace_retry_disposition(code: str) -> str:
+    if code in WORKSPACE_STATE_CHANGE_REQUIRED:
+        return "defer_until_workspace_changes"
+    return "retry_later"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4200,26 +4230,65 @@ class WorkspaceProvisioner:
         from vibe_loop.runs import RunLifecycleEvent
         from vibe_loop.workers import claim_worker_workspace
 
-        self._validate_primary(base_commit)
-        branch, worktree = self._workspace_identity(
-            task_id=task_id,
-            recovery_branch=recovery_branch,
-            recovery_worktree=recovery_worktree,
-        )
-        workspace = self._create_or_adopt(
-            task_id=task_id,
-            run_id=run_id,
-            branch=branch,
-            worktree=worktree,
-            base_commit=base_commit,
-            recovery_run_id=recovery_run_id,
-            recovery_git_common_dir=recovery_git_common_dir,
-            recovery_base_commit=recovery_base_commit,
-            recovery_head_commit=recovery_head_commit,
-            recovery_dirty_snapshot=recovery_dirty_snapshot,
-            recovery_dirty_fingerprint=recovery_dirty_fingerprint,
-        )
+        branch = ""
+        worktree: Path | None = None
         try:
+            self._validate_primary(base_commit)
+            branch, worktree = self._workspace_identity(
+                task_id=task_id,
+                recovery_branch=recovery_branch,
+                recovery_worktree=recovery_worktree,
+            )
+            workspace = self._create_or_adopt(
+                task_id=task_id,
+                run_id=run_id,
+                branch=branch,
+                worktree=worktree,
+                base_commit=base_commit,
+                recovery_run_id=recovery_run_id,
+                recovery_git_common_dir=recovery_git_common_dir,
+                recovery_base_commit=recovery_base_commit,
+                recovery_head_commit=recovery_head_commit,
+                recovery_dirty_snapshot=recovery_dirty_snapshot,
+                recovery_dirty_fingerprint=recovery_dirty_fingerprint,
+            )
+        except WorkspaceProvisionError as exc:
+            workspace_base = workspace_commit_evidence(
+                exc.details.get("workspace_base") or exc.details.get("base_commit")
+            )
+            head_commit = workspace_commit_evidence(exc.details.get("head_commit"))
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id=run_id,
+                    task_id=task_id,
+                    decision="rejected",
+                    reason=exc.code,
+                    retry_disposition=exc.retry_disposition,
+                    worker_launch_allowed=False,
+                    branch=branch,
+                    worktree=worktree,
+                    selected_base=base_commit,
+                    workspace_base=workspace_base,
+                    head_commit=head_commit,
+                )
+            )
+            raise
+        try:
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id=run_id,
+                    task_id=task_id,
+                    decision=("created" if workspace.mode == "created" else "reusable"),
+                    reason=f"workspace_{workspace.mode}",
+                    retry_disposition="not_needed",
+                    worker_launch_allowed=True,
+                    branch=workspace.branch,
+                    worktree=workspace.worktree,
+                    selected_base=base_commit,
+                    workspace_base=workspace.base_commit,
+                    head_commit=workspace.head_commit,
+                )
+            )
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.workspace_provisioned(
                     run_id=run_id,
@@ -4554,6 +4623,25 @@ class WorkspaceProvisioner:
                     "selected_base": base_commit,
                 },
             )
+        if (
+            self._git_returncode_at(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                base_commit,
+                head,
+            )
+            != 0
+        ):
+            raise WorkspaceProvisionError(
+                "workspace_stale_current_base",
+                "existing workspace does not contain the selected current base",
+                details={
+                    "selected_base": base_commit,
+                    "workspace_base": owner_base,
+                    "head_commit": head,
+                },
+            )
         dirty, dirty_fingerprint = git_dirty_snapshot(
             worktree,
             ignored_dirty_paths=self.ignored_dirty_paths,
@@ -4591,7 +4679,7 @@ class WorkspaceProvisioner:
             mode="preserved" if dirty else "adopted",
             branch=branch,
             worktree=worktree.resolve(),
-            base_commit=owner_base,
+            base_commit=base_commit,
             head_commit=head,
             owner_run_id=str(owner.get("run_id") or ""),
             dirty_at_adoption=bool(dirty),
@@ -4808,6 +4896,14 @@ def workspace_name(task_id: str) -> str:
     digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:10]
     prefix_limit = WORKSPACE_NAME_MAX_LENGTH - len(digest) - 1
     return f"{normalized[:prefix_limit]}-{digest}"
+
+
+def workspace_commit_evidence(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value) is None:
+        return ""
+    return value.lower()
 
 
 def overlay_explicit_orchestration(

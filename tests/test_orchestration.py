@@ -3872,7 +3872,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             )
             self.assertEqual(
                 [record["record_type"] for record in records],
-                ["workspace_provisioned", "workspace_claim"],
+                ["workspace_preflight", "workspace_provisioned", "workspace_claim"],
             )
             self.assertEqual(primary_snapshot(repo), primary_before)
             self.assertEqual(
@@ -3921,6 +3921,11 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(adopted.mode, "adopted")
             self.assertEqual(adopted.worktree, first.worktree)
             self.assertEqual(adopted.owner_run_id, "run-1")
+            preflight = store.read_records()[-3]
+            self.assertEqual(preflight["record_type"], "workspace_preflight")
+            self.assertEqual(preflight["decision"], "reusable")
+            self.assertEqual(preflight["retry_disposition"], "not_needed")
+            self.assertTrue(preflight["worker_launch_allowed"])
 
     def test_adopts_legacy_path_with_matching_task_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4213,7 +4218,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
 
                     self.assertEqual(raised.exception.code, expected_code)
 
-    def test_recovery_allows_main_to_advance_from_recorded_base(self) -> None:
+    def test_recovery_rejects_workspace_that_does_not_contain_current_base(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
@@ -4243,48 +4250,117 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 store=store,
             )
 
-            recovered = WorkspaceProvisioner(
-                repo=repo,
-                main_branch="main",
-                lock_manager=manager,
-                run_store=store,
-            ).provision(
-                task_id="TASK-01",
-                run_id="run-2",
-                base_commit=current_base,
-                fencing_token=token,
-                recovery_run_id="run-1",
-                recovery_branch=first.branch,
-                recovery_worktree=first.worktree,
-            )
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                WorkspaceProvisioner(
+                    repo=repo,
+                    main_branch="main",
+                    lock_manager=manager,
+                    run_store=store,
+                ).provision(
+                    task_id="TASK-01",
+                    run_id="run-2",
+                    base_commit=current_base,
+                    fencing_token=token,
+                    recovery_run_id="run-1",
+                    recovery_branch=first.branch,
+                    recovery_worktree=first.worktree,
+                )
 
-            self.assertEqual(recovered.mode, "adopted")
-            self.assertEqual(recovered.base_commit, first_base)
-            manager.release(manager.current_lock("TASK-01"))
-            manager, _, token = acquire_run(
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            self.assertEqual(
+                raised.exception.retry_disposition,
+                "defer_until_workspace_changes",
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), first_base
+            )
+            self.assertTrue(first.worktree.exists())
+            preflight = store.read_records()[-1]
+            self.assertEqual(preflight["record_type"], "workspace_preflight")
+            self.assertEqual(preflight["decision"], "rejected")
+            self.assertEqual(preflight["reason"], "workspace_stale_current_base")
+            self.assertEqual(
+                preflight["retry_disposition"], "defer_until_workspace_changes"
+            )
+            self.assertFalse(preflight["worker_launch_allowed"])
+
+    def test_runner_rejects_stale_adoption_before_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(
+                RunContractJournalTests.worker_owned_config(repo, agent)
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+            manager, store, token = acquire_run(
                 repo,
-                "TASK-01",
-                "run-3",
-                store=store,
+                task.task_id,
+                "prior-run",
+                store=runner.run_store,
             )
-
-            recovered_again = WorkspaceProvisioner(
+            old_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            workspace = WorkspaceProvisioner(
                 repo=repo,
                 main_branch="main",
                 lock_manager=manager,
                 run_store=store,
             ).provision(
-                task_id="TASK-01",
-                run_id="run-3",
-                base_commit=current_base,
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=old_base,
                 fencing_token=token,
-                recovery_run_id="run-2",
-                recovery_branch=first.branch,
-                recovery_worktree=first.worktree,
             )
+            (workspace.worktree / "candidate.txt").write_text(
+                "interrupted candidate\n", encoding="utf-8"
+            )
+            git(workspace.worktree, "add", "candidate.txt")
+            git(workspace.worktree, "commit", "-m", "interrupted candidate")
+            stale_head = git(workspace.worktree, "rev-parse", "HEAD").stdout.strip()
+            manager.release(manager.current_lock(task.task_id))
+            (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            git(repo, "add", "current-base.txt")
+            git(repo, "commit", "-m", "advance main")
 
-            self.assertEqual(recovered_again.mode, "adopted")
-            self.assertEqual(recovered_again.base_commit, first_base)
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch("vibe_loop.runner.run_streaming_command") as launch:
+                        with self.assertRaises(WorkspaceProvisionError) as raised:
+                            runner.run_task(task)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            launch.assert_not_called()
+            self.assertTrue(workspace.worktree.exists())
+            self.assertEqual(
+                git(workspace.worktree, "rev-parse", "HEAD").stdout.strip(),
+                stale_head,
+            )
+            self.assertFalse(runner.lock_manager.is_locked(task.task_id))
+            records = runner.run_store.read_records()
+            rejected = [
+                record
+                for record in records
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("decision") == "rejected"
+            ]
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(
+                rejected[0]["retry_disposition"],
+                "defer_until_workspace_changes",
+            )
+            self.assertNotIn(
+                "worker_process_started",
+                [record.get("record_type") for record in records],
+            )
 
     def test_recovery_rejects_latest_foreign_ownership_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

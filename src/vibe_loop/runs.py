@@ -44,6 +44,7 @@ LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
 RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKSPACE_PROVISIONED_RECORD_TYPE = "workspace_provisioned"
+WORKSPACE_PREFLIGHT_RECORD_TYPE = "workspace_preflight"
 CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 REVIEW_STARTED_RECORD_TYPE = "review_started"
@@ -115,6 +116,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         RUN_STARTED_RECORD_TYPE,
         RUN_CONTRACT_RESOLVED_RECORD_TYPE,
         WORKSPACE_PROVISIONED_RECORD_TYPE,
+        WORKSPACE_PREFLIGHT_RECORD_TYPE,
         CANDIDATE_RECORDED_RECORD_TYPE,
         GATE_RESULT_RECORD_TYPE,
         REVIEW_STARTED_RECORD_TYPE,
@@ -668,6 +670,57 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=WORKSPACE_PROVISIONED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def workspace_preflight(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        decision: str,
+        reason: str,
+        retry_disposition: str,
+        worker_launch_allowed: bool,
+        branch: str = "",
+        worktree: Path | None = None,
+        selected_base: str = "",
+        workspace_base: str = "",
+        head_commit: str = "",
+    ) -> RunLifecycleEvent:
+        if decision not in {"created", "reusable", "rejected"}:
+            raise ValueError("workspace preflight decision is invalid")
+        if retry_disposition not in {
+            "not_needed",
+            "defer_until_workspace_changes",
+            "retry_later",
+        }:
+            raise ValueError("workspace preflight retry disposition is invalid")
+        if not reason or len(reason.encode("utf-8", "replace")) > 128:
+            raise ValueError("workspace preflight reason is invalid")
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "decision": decision,
+            "reason": reason,
+            "retry_disposition": retry_disposition,
+            "worker_launch_allowed": worker_launch_allowed,
+        }
+        if branch and len(branch.encode("utf-8", "replace")) <= 1024:
+            payload["branch"] = branch
+        worktree_text = str(worktree) if worktree is not None else ""
+        if worktree_text and len(worktree_text.encode("utf-8", "replace")) <= 4096:
+            payload["worktree"] = worktree_text
+        if selected_base and len(selected_base.encode("utf-8", "replace")) <= 128:
+            payload["selected_base"] = selected_base
+        if workspace_base and len(workspace_base.encode("utf-8", "replace")) <= 128:
+            payload["workspace_base"] = workspace_base
+        if head_commit and len(head_commit.encode("utf-8", "replace")) <= 128:
+            payload["head_commit"] = head_commit
+        return cls(
+            record_type=WORKSPACE_PREFLIGHT_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,
