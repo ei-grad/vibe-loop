@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from vibe_loop.budget import (
     BUDGET_DECISION_RECORD_TYPE,
+    BUDGET_JOURNAL_HEADER_RECORD_TYPE,
     BUDGET_RECONCILED_RECORD_TYPE,
     BUDGET_RESERVED_RECORD_TYPE,
     BUDGET_SCHEMA_VERSION,
@@ -1794,6 +1795,45 @@ class F5BoundedStateTests(unittest.TestCase):
     def _old_config(self) -> BudgetConfig:
         return make_config(default_declared=100.0, limits=(BudgetLimit(limit=1e12),))
 
+    def _compacted_cap_store(self, directory: str) -> BudgetStore:
+        store = BudgetStore(
+            Path(directory) / "budget.jsonl",
+            make_config(
+                default_declared=60.0,
+                limits=(BudgetLimit(limit=100.0),),
+            ),
+        )
+        old = (datetime.now(UTC) - timedelta(hours=5)).isoformat()
+        with patch("vibe_loop.budget.utc_now_iso", return_value=old):
+            store.reserve(
+                reservation_id="r1",
+                run_id="r1",
+                project="proj",
+                provider="anthropic",
+                phase="implementation",
+                model="m",
+                effort="",
+            )
+            store.reconcile_reservation(
+                reservation_id="r1",
+                run_id="r1",
+                stats=anthropic_stats(60),
+                provider="anthropic",
+            )
+        self.assertTrue(store.compact())
+        return store
+
+    def _reserve_second_allowance(self, store: BudgetStore):
+        return store.reserve(
+            reservation_id="r2",
+            run_id="r2",
+            project="proj",
+            provider="anthropic",
+            phase="implementation",
+            model="m",
+            effort="",
+        )
+
     def test_config_rejects_excess_limits(self) -> None:
         limits = [{"limit": 10, "phase": "implementation"}] * (BUDGET_MAX_LIMITS + 1)
         with self.assertRaises(ValueError):
@@ -1953,6 +1993,108 @@ class F5BoundedStateTests(unittest.TestCase):
                             model="m",
                             effort="",
                         )
+
+    def test_appended_generation_zero_header_cannot_erase_compacted_spend(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._compacted_cap_store(directory)
+            forged = {
+                "schema_version": BUDGET_SCHEMA_VERSION,
+                "record_type": BUDGET_JOURNAL_HEADER_RECORD_TYPE,
+                "generation": 0,
+                "checkpoint_sha256": "0" * 64,
+            }
+            with store.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(forged) + "\n")
+            with self.assertRaises(BudgetLedgerCorruption):
+                self._reserve_second_allowance(store)
+            self.assertNotIn(
+                '"reservation_id":"r2"', store.path.read_text(encoding="utf-8")
+            )
+
+    def test_duplicate_valid_header_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._compacted_cap_store(directory)
+            header = store.path.read_text(encoding="utf-8").splitlines()[0]
+            with store.path.open("a", encoding="utf-8") as handle:
+                handle.write(header + "\n")
+            with self.assertRaises(BudgetLedgerCorruption):
+                self._reserve_second_allowance(store)
+
+    def test_malformed_canonical_header_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._compacted_cap_store(directory)
+            store.path.write_text(
+                '{"record_type":"budget_journal_header"\n', encoding="utf-8"
+            )
+            with self.assertRaises(BudgetLedgerCorruption):
+                self._reserve_second_allowance(store)
+
+    def test_invalid_canonical_header_matrix_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._compacted_cap_store(directory)
+            lines = store.path.read_text(encoding="utf-8").splitlines()
+            valid = json.loads(lines[0])
+            cases = {
+                "missing_digest": {
+                    key: value
+                    for key, value in valid.items()
+                    if key != "checkpoint_sha256"
+                },
+                "extra_field": {**valid, "unexpected": 1},
+                "schema_bool": {**valid, "schema_version": True},
+                "schema_string": {**valid, "schema_version": "1"},
+                "generation_zero": {**valid, "generation": 0},
+                "generation_bool": {**valid, "generation": True},
+                "generation_string": {**valid, "generation": "1"},
+                "stale_generation": {**valid, "generation": valid["generation"] + 1},
+                "digest_short": {**valid, "checkpoint_sha256": "0" * 63},
+                "digest_wrong_value": {**valid, "checkpoint_sha256": "0" * 64},
+                "digest_uppercase": {
+                    **valid,
+                    "checkpoint_sha256": valid["checkpoint_sha256"].upper(),
+                },
+            }
+            remainder = "\n".join(lines[1:])
+            for name, header in cases.items():
+                with self.subTest(name=name):
+                    journal = json.dumps(header, separators=(",", ":")) + "\n"
+                    if remainder:
+                        journal += remainder + "\n"
+                    store.path.write_text(journal, encoding="utf-8")
+                    with self.assertRaises(BudgetLedgerCorruption):
+                        self._reserve_second_allowance(store)
+
+    def test_no_header_legacy_journal_preserves_spend(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = BudgetStore(
+                Path(directory) / "budget.jsonl",
+                make_config(
+                    default_declared=60.0,
+                    limits=(BudgetLimit(limit=100.0),),
+                ),
+            )
+            store.reserve(
+                reservation_id="r1",
+                run_id="r1",
+                project="proj",
+                provider="anthropic",
+                phase="implementation",
+                model="m",
+                effort="",
+            )
+            store.reconcile_reservation(
+                reservation_id="r1",
+                run_id="r1",
+                stats=anthropic_stats(60),
+                provider="anthropic",
+            )
+            self.assertNotIn(
+                BUDGET_JOURNAL_HEADER_RECORD_TYPE,
+                store.path.read_text(encoding="utf-8").splitlines()[0],
+            )
+            self.assertFalse(self._reserve_second_allowance(store).admitted)
 
     def test_sustained_denial_load_stays_bounded_and_audited(self) -> None:
         config = make_config(default_declared=100.0, limits=(BudgetLimit(limit=1.0),))

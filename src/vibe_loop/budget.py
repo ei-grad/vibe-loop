@@ -1105,6 +1105,19 @@ class BudgetStore:
             self._read_journal_unlocked()
         )
         checkpoint = self._read_checkpoint_unlocked()
+        checkpoint_generation = (
+            checkpoint.get("generation") if checkpoint is not None else None
+        )
+        if (
+            generation == 0
+            and checkpoint is not None
+            and isinstance(checkpoint_generation, int)
+            and not isinstance(checkpoint_generation, bool)
+            and _checkpoint_is_valid(checkpoint, checkpoint_generation)
+        ):
+            raise BudgetLedgerCorruption(
+                "budget checkpoint exists without its canonical journal header"
+            )
         if generation > 0 and (
             checkpoint is None
             or not _checkpoint_is_valid(checkpoint, generation)
@@ -1144,7 +1157,7 @@ class BudgetStore:
         if not self.path.exists():
             return generation, records, pre_integrity, checkpoint_digest
         text = self.path.read_text(encoding="utf-8", errors="replace")
-        for line in text.splitlines():
+        for line_number, line in enumerate(text.splitlines()):
             line = line.strip()
             if not line:
                 continue
@@ -1164,9 +1177,32 @@ class BudgetStore:
                 continue
             record_type = payload.get("record_type")
             if record_type == BUDGET_JOURNAL_HEADER_RECORD_TYPE:
-                generation = _int_or_zero(payload.get("generation"))
+                expected_keys = {
+                    "schema_version",
+                    "record_type",
+                    "generation",
+                    "checkpoint_sha256",
+                }
+                schema_version = payload.get("schema_version")
+                header_generation = payload.get("generation")
                 digest = payload.get("checkpoint_sha256")
-                checkpoint_digest = digest if isinstance(digest, str) else ""
+                if (
+                    line_number != 0
+                    or set(payload) != expected_keys
+                    or isinstance(schema_version, bool)
+                    or not isinstance(schema_version, int)
+                    or schema_version != BUDGET_SCHEMA_VERSION
+                    or isinstance(header_generation, bool)
+                    or not isinstance(header_generation, int)
+                    or header_generation <= 0
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    raise BudgetLedgerCorruption(
+                        "budget journal has an invalid or misplaced header"
+                    )
+                generation = header_generation
+                checkpoint_digest = digest
                 continue
             if record_type in BUDGET_RECORD_TYPES:
                 records.append(payload)
@@ -1183,9 +1219,8 @@ class BudgetStore:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            # A torn or unreadable checkpoint fails safe: ignore it and fall back
-            # to full journal replay, which is always complete before compaction
-            # truncates it.
+            # Generation zero still has the complete legacy journal to replay.
+            # A compacted journal rejects this missing checkpoint in _load_state.
             return None
         if not isinstance(payload, dict):
             return None
