@@ -7595,6 +7595,35 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             def invalidating_worker(command, cwd, log, **kwargs):
                 env = kwargs.get("env") or {}
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                branch = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                candidate = CandidateRecord(
+                    branch=branch,
+                    worktree=cwd,
+                    base_main=head,
+                    head_commit=head,
+                    changed_paths=(),
+                    source="derived",
+                )
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.candidate_recorded(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        payload=candidate.to_payload(),
+                    )
+                )
                 runner.run_store.append_report(
                     WorkerReport(
                         run_id=env["VIBE_LOOP_RUN_ID"],
@@ -7602,6 +7631,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                         status="completed",
                     )
                 )
+                self.assertTrue(kwargs["reap_check"]())
                 kwargs["on_start"](os.getpid())
                 (cwd / "README.md").write_text(
                     "post-report mutation\n", encoding="utf-8"
@@ -7622,12 +7652,18 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 )
 
             result = self._run_task(runner, task, invalidating_worker)
-            record_types = {
-                record.get("record_type") for record in runner.run_store.read_records()
-            }
+            records = runner.run_store.read_records()
+            record_types = {record.get("record_type") for record in records}
+            candidate_records = [
+                record
+                for record in records
+                if record.get("record_type") == "candidate_recorded"
+            ]
 
         self.assertEqual(result.classification, "failed")
         self.assertEqual(result.classification_source, "runtime_stage_failed")
+        self.assertIn("candidate no longer matches", result.message)
+        self.assertEqual(len(candidate_records), 1)
         self.assertNotIn("gate_result", record_types)
         self.assertNotIn("review_started", record_types)
 
