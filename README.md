@@ -937,8 +937,9 @@ commands = [
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
 
-# Runtime-owned orchestration is landing in dependency-ordered slices. Keep
-# worker-owned compatibility mode until the migration default flip is released.
+# Worker-owned remains the compatibility default until the migration flip.
+# Runtime-owned is available when its reviewer and task-source contracts are
+# configured explicitly.
 [orchestration]
 mode = "worker-owned"
 # reviewer_profile = "review"
@@ -1216,9 +1217,12 @@ instead of resetting it. An unfinished `review_started` record parks as
 `review_wait_incomplete` and is never silently replayed. Reviewer prompts forbid
 nested model delegation, Claude receives launch-time Agent/Task denial, and any
 observable nested structured launch is a typed policy violation with separately
-attributed usage. The runtime-owned mode switch still lands in a subsequent
-orchestration slice. Until then, `mode = "worker-owned"` preserves the existing
-worker-owned lifecycle and `mode = "runtime-owned"` fails closed.
+attributed usage. `mode = "worker-owned"` preserves the existing worker-owned
+lifecycle. `mode = "runtime-owned"` runs candidate collection, configured
+gates, routed review, integration, and task provenance in the runtime.
+Runtime-owned command task sources that configure activation must also
+configure reset, and adapter completion requires `task_source.complete`; the
+resolved contract fails closed before activation when these paths are absent.
 
 ### Locks
 

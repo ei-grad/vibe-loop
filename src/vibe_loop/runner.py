@@ -15,7 +15,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
@@ -27,6 +27,7 @@ from vibe_loop.config import (
     AgentDetection,
     AgentResolutionError,
     VibeConfig,
+    agent_command_provider,
     command_template_uses_field,
     format_agent_command,
     require_project_binding,
@@ -61,6 +62,22 @@ from vibe_loop.locks import (
     redact_fencing_token_text,
 )
 from vibe_loop.orchestration import (
+    CandidateCollectionError,
+    CandidateCollector,
+    CandidateRecord,
+    GateExecutionError,
+    GateRunner,
+    GateRunSummary,
+    Integrator,
+    IntegrationResult,
+    ReviewBudgetExhausted,
+    ReviewConcurrencyBudget,
+    ReviewExecutionError,
+    ReviewFinding,
+    ReviewLimitWallError,
+    ReviewRouter,
+    ReviewStageResultError,
+    RuntimeGateController,
     ProvisionedWorkspace,
     RunContractResolver,
     RunLifecycleStateMachine,
@@ -74,6 +91,8 @@ from vibe_loop.orchestration import (
     WorkspaceProvisionError,
     WorkspaceProvisioner,
     inject_claude_session,
+    inject_provider_continuation,
+    plan_session_continuation,
     run_configured_command,
 )
 from vibe_loop.processes import read_process_node
@@ -88,6 +107,7 @@ from vibe_loop.retry import (
 from vibe_loop.runs import (
     AttemptCircuitInputs,
     LIFECYCLE_EVENT_SCHEMA_VERSION,
+    LIFECYCLE_RECORD_TYPES,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
@@ -210,6 +230,9 @@ SPEC_WORKER_CONTEXT_MAX_REF_CHARS = 300
 SPEC_WORKER_CONTEXT_MAX_LIST_ITEMS = 20
 SPEC_WORKER_CONTEXT_MAX_FINGERPRINTS = 20
 SPEC_WORKER_CONTEXT_LINE_CONTEXT = 3
+WORKER_OUTPUT_RECORD_TYPE_RE = re.compile(
+    r"""["']record_type["']\s*:\s*["'](?P<record_type>[a-z0-9_]+)["']"""
+)
 
 FENCING_TOKEN_NONDISCLOSURE = """\
 VIBE_LOOP_FENCING_TOKEN is a secret. Never print or echo its value, include it
@@ -341,6 +364,55 @@ source. That source may be explicit configuration, a generated profile cache,
 command-backed adapters, issue trackers, or Markdown planning docs. If task
 details are insufficient, inspect repo-local sources and the vibe-loop task
 CLI output before making assumptions.
+"""
+
+RUNTIME_OWNED_WORKER_ADDENDUM = f"""\
+
+## vibe-loop Runtime-Owned Implementation Stage
+
+You are the implementation worker for one lifecycle owned by the vibe-loop
+runtime. The following environment variables identify the fenced run:
+- VIBE_LOOP_REPO - canonical path to the claimed task workspace
+- VIBE_LOOP_RUN_ID - unique run identifier
+- VIBE_LOOP_TASK_ID - task being worked on
+- VIBE_LOOP_LOG - path to the run log file
+- VIBE_LOOP_STATE_DIR - path to shared runtime control state for this repository
+- VIBE_LOOP_WORKTREE - the same canonical claimed task workspace path
+- VIBE_LOOP_BRANCH - branch checked out in the worker worktree
+- VIBE_LOOP_FENCING_TOKEN - optional lock generation token when present
+
+{FENCING_TOKEN_NONDISCLOSURE}
+
+The runtime already activated the task and provisioned and claimed the current
+workspace. Verify that `VIBE_LOOP_REPO`, `VIBE_LOOP_WORKTREE`, the current
+directory, and `git rev-parse --show-toplevel` resolve to the same canonical
+path, and that `git branch --show-current` matches `VIBE_LOOP_BRANCH`. Stop and
+file a blocked report if they do not. Do not create, switch, or claim another
+branch or worktree.
+
+Implement and stabilize the requested change in this workspace. You may run
+focused checks needed while implementing, but the runtime owns configured
+gates, independent review, remediation budgets, integration, task-source
+completion, final classification, and lock release. Do not perform those
+lifecycle steps or attempt to trigger them through output text.
+
+The fenced worker commands available during this stage are:
+
+```bash
+vibe-loop worker candidate --repo "$VIBE_LOOP_REPO" \\
+  --run-id "$VIBE_LOOP_RUN_ID" --task-id "$VIBE_LOOP_TASK_ID" \\
+  --head HEAD
+
+vibe-loop report --repo "$VIBE_LOOP_REPO" --run-id "$VIBE_LOOP_RUN_ID" \\
+  --task-id "$VIBE_LOOP_TASK_ID" --status completed --commit HEAD \\
+  --message "implementation candidate ready"
+```
+
+A `completed` worker report means only that the implementation candidate is
+ready for runtime-owned gates and review; it does not complete the task. Use a
+`blocked` or `failed` report for a precise implementation-stage terminal
+condition. The runtime can derive the candidate after a clean exit when no
+candidate declaration was filed.
 """
 RESOURCE_SCHEDULER_LOCK_TIMEOUT_SECONDS = 5.0
 RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
@@ -1223,6 +1295,9 @@ class VibeRunner:
         # driver so the verdict is written exactly once.
         self._exhausted_recovery_results: dict[str, RunResult] = {}
         self._durably_exhausted_recovery_tasks: set[str] = set()
+        self._review_concurrency = ReviewConcurrencyBudget(
+            config.orchestration.reviewer_concurrency_budget
+        )
 
     @property
     def lock_manager(self) -> LockManager:
@@ -1858,6 +1933,21 @@ class VibeRunner:
                 RunStage.ACTIVATION,
                 reason="run_contract_resolved",
             )
+            circuit_inputs = attempt_circuit_inputs(
+                task,
+                self.config,
+                base=base_main,
+                candidate=start_main,
+                agent=agent,
+                profile=agent_profile,
+            )
+            circuit_state = self.run_store.reserve_attempt_circuit(
+                run_id=run_id,
+                inputs=circuit_inputs,
+                threshold=self.config.supervision.cross_run_attempt_threshold,
+            )
+            if circuit_state.open:
+                raise AttemptCircuitOpen(circuit_state)
             pre_launch_failure_reason = "task_activation_failed"
             activated_runtime_owned = (
                 runtime_owned
@@ -2177,26 +2267,6 @@ class VibeRunner:
                     )
 
         try:
-            circuit_inputs = attempt_circuit_inputs(
-                task,
-                self.config,
-                base=base_main,
-                candidate=start_main,
-                agent=agent,
-                profile=agent_profile,
-            )
-            circuit_state = self.run_store.reserve_attempt_circuit(
-                run_id=run_id,
-                inputs=circuit_inputs,
-                threshold=self.config.supervision.cross_run_attempt_threshold,
-            )
-            if circuit_state.open:
-                self._reset_task_source_status(
-                    task.task_id,
-                    run_id=run_id,
-                    task_lock=task_lock,
-                )
-                raise AttemptCircuitOpen(circuit_state)
             with log_path.open("w", encoding="utf-8") as log:
                 write_log_header(
                     log,
@@ -2481,7 +2551,7 @@ class VibeRunner:
                             f"worker report commit={worker_report.commit}",
                             log,
                         )
-                elif exit_code == 0:
+                elif exit_code == 0 and not runtime_owned:
                     message = self.run_completion_checks(log)
                 post_report_activity = stream_result.post_report
                 if post_report_activity is not None and post_report_activity.violation:
@@ -2514,23 +2584,90 @@ class VibeRunner:
                             ),
                         )
                     )
-            end_main = git_rev_parse(self.config.repo, "HEAD")
             try:
                 output_tail = _read_log_tail(
                     log_path, LOG_TAIL_LINES_FOR_TRANSIENT_CHECK
                 )
             except OSError:
                 output_tail = ""
-            classification = self.classify(
-                task.task_id,
-                exit_code,
-                start_main,
-                end_main,
-                message,
-                worker_report,
-                output_tail,
-                timed_out=worker_timed_out,
+            implementation_ready = bool(
+                runtime_owned
+                and exit_code == 0
+                and not worker_timed_out
+                and (worker_report is None or worker_report.status == "completed")
             )
+            if implementation_ready:
+                try:
+                    classification = self.execute_runtime_owned_lifecycle(
+                        task=task,
+                        run_id=run_id,
+                        provisioned_workspace=provisioned_workspace,
+                        base_main=base_main,
+                        stage_machine=stage_machine,
+                        contract=run_contract.payload,
+                        agent=agent,
+                        agent_profile=agent_profile,
+                        command_env=command_env,
+                        implementation_session_id=session_id,
+                        implementation_session_id_source=session_id_source,
+                        output_log_path=log_path,
+                    )
+                except ReviewBudgetExhausted as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        "review_budget_exhausted",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except ReviewLimitWallError as exc:
+                    classification = ClassificationResult(
+                        "limit_wall",
+                        "reviewer_limit_wall",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except ReviewStageResultError as exc:
+                    status = {
+                        "limit_wall": "limit_wall",
+                        "timeout": "timed_out",
+                    }.get(exc.retry_classification, "failed")
+                    classification = ClassificationResult(
+                        status,
+                        f"reviewer_{exc.retry_classification}",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except TaskSourceCompletionError as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        exc.code,
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except (
+                    CandidateCollectionError,
+                    GateExecutionError,
+                    ReviewExecutionError,
+                    RuntimeError,
+                ) as exc:
+                    classification = ClassificationResult(
+                        "failed",
+                        "runtime_stage_failed",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+            else:
+                classification = self.classify(
+                    task.task_id,
+                    exit_code,
+                    start_main,
+                    git_rev_parse(self.config.repo, "HEAD"),
+                    message,
+                    worker_report,
+                    output_tail,
+                    timed_out=worker_timed_out,
+                )
+            end_main = git_rev_parse(self.config.repo, "HEAD")
             if runtime_owned and classification.status == "completed":
                 stage_machine = RunLifecycleStateMachine.from_records(
                     [
@@ -2910,6 +3047,410 @@ class VibeRunner:
                 "worker was not launched"
             )
         return confirmed
+
+    def execute_runtime_owned_lifecycle(
+        self,
+        *,
+        task: Task,
+        run_id: str,
+        provisioned_workspace: ProvisionedWorkspace,
+        base_main: str,
+        stage_machine: RunLifecycleStateMachine,
+        contract: Mapping[str, object],
+        agent: AgentConfig,
+        agent_profile: str,
+        command_env: Mapping[str, str],
+        implementation_session_id: str,
+        implementation_session_id_source: str,
+        output_log_path: Path,
+    ) -> ClassificationResult:
+        self._journal_worker_output_bypass_attempts(
+            run_id=run_id,
+            task_id=task.task_id,
+            log_path=output_log_path,
+        )
+        prior_integration = self._runtime_integration_result(
+            run_id=run_id,
+            task_id=task.task_id,
+        )
+        if prior_integration is not None:
+            return ClassificationResult("completed", "runtime_integration_recovered")
+        candidate_collector = CandidateCollector(
+            worktree=provisioned_workspace.worktree,
+            branch=provisioned_workspace.branch,
+            base_main=base_main,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task.task_id,
+        )
+        if stage_machine.stage is RunStage.IMPLEMENTING:
+            stage_machine.transition(
+                RunStage.CANDIDATE,
+                reason="candidate_collection_started",
+            )
+        candidate = candidate_collector.latest_recorded()
+        if candidate is None:
+            candidate = candidate_collector.collect_derived()
+        self._require_runtime_task_source_unchanged(
+            run_id=run_id,
+            expected_task=task,
+            candidate=candidate,
+        )
+        gates = tuple(
+            str(item["command_key"])
+            for item in contract.get("gates", ())
+            if isinstance(item, Mapping) and isinstance(item.get("command_key"), str)
+        )
+        remediation = contract.get("remediation")
+        max_remediation_rounds = (
+            int(remediation.get("max_rounds", 0))
+            if isinstance(remediation, Mapping)
+            else 0
+        )
+        gate_runner = GateRunner(
+            completion_commands=self.config.completion.commands,
+            gate_keys=gates,
+            candidate_collector=candidate_collector,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task.task_id,
+            log_dir=self.runs_dir / f"{run_id}-gates",
+        )
+
+        def launch_gate_remediation(
+            round_number: int,
+            summary: GateRunSummary,
+        ) -> None:
+            self._launch_runtime_remediation(
+                task=task,
+                run_id=run_id,
+                workspace=provisioned_workspace,
+                agent=agent,
+                agent_profile=agent_profile,
+                command_env=command_env,
+                implementation_session_id=implementation_session_id,
+                implementation_session_id_source=implementation_session_id_source,
+                round_number=round_number,
+                failed_gates=summary.failed_gate_keys,
+            )
+
+        gate_controller = RuntimeGateController(
+            candidate_collector=candidate_collector,
+            gate_runner=gate_runner,
+            stage_machine=stage_machine,
+            max_remediation_rounds=max_remediation_rounds,
+            remediation_launcher=launch_gate_remediation,
+        )
+        gate_summary = gate_controller.run(candidate)
+
+        reviewer_contract = contract.get("reviewer")
+        reviewer_profile = (
+            str(reviewer_contract.get("profile") or "")
+            if isinstance(reviewer_contract, Mapping)
+            else ""
+        )
+        reviewer = self.config.agent_profiles.get(reviewer_profile, agent)
+        router = ReviewRouter(
+            reviewer=reviewer,
+            reviewer_profile=reviewer_profile,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task.task_id,
+            worktree=provisioned_workspace.worktree,
+            policy_references=self._runtime_review_policy_references(),
+            max_initial_passes=(
+                int(reviewer_contract.get("max_initial_passes", 1))
+                if isinstance(reviewer_contract, Mapping)
+                else 1
+            ),
+            max_closure_passes=(
+                int(reviewer_contract.get("max_closure_passes", 0))
+                if isinstance(reviewer_contract, Mapping)
+                else 0
+            ),
+            concurrency=self._review_concurrency,
+            stage_machine=stage_machine,
+            limit_wall_patterns=self.config.supervision.limit_wall_patterns or None,
+        )
+        review_result = router.review(gate_summary)
+        closure_ordinal = 0
+        while not review_result.approved or router.ledger.open():
+            remediation_round = stage_machine.ordinal_for(RunStage.REMEDIATION)
+            if remediation_round > max_remediation_rounds:
+                stage_machine.fail(
+                    StageFailure.BLOCKED,
+                    reason="review_remediation_budget_exhausted",
+                )
+                raise ReviewBudgetExhausted(
+                    "remediation",
+                    max_remediation_rounds,
+                )
+            open_findings = router.ledger.open()
+            self._launch_runtime_remediation(
+                task=task,
+                run_id=run_id,
+                workspace=provisioned_workspace,
+                agent=agent,
+                agent_profile=agent_profile,
+                command_env=command_env,
+                implementation_session_id=implementation_session_id,
+                implementation_session_id_source=implementation_session_id_source,
+                round_number=remediation_round,
+                findings=open_findings,
+            )
+            stage_machine.transition(
+                RunStage.CANDIDATE,
+                reason=f"review_remediation_candidate:{remediation_round}",
+            )
+            gate_summary = gate_controller.run()
+            closure_ordinal += 1
+            review_result = router.review(
+                gate_summary,
+                pass_kind=f"closure:{closure_ordinal}",
+                prior_findings=open_findings,
+            )
+
+        integration = contract.get("integration")
+        if not isinstance(integration, Mapping) or not integration.get("enabled"):
+            stage_machine.fail(
+                StageFailure.BLOCKED,
+                reason="runtime_integration_disabled",
+            )
+            raise TaskSourceCompletionError(
+                "runtime_integration_disabled",
+                "runtime-owned lifecycle requires runtime integration",
+            )
+        integration_result = Integrator(
+            repo=self.config.repo,
+            main_branch=self.config.main_branch,
+            candidate=gate_summary.candidate,
+            completion_commands=self.config.completion.commands,
+            integration_keys=gates,
+            verify_on_main_keys=tuple(
+                str(item)
+                for item in integration.get("verify_on_main", ())
+                if isinstance(item, str)
+            ),
+            lock_manager=self.lock_manager,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task.task_id,
+            log_dir=self.runs_dir / f"{run_id}-integration",
+            stage_machine=stage_machine,
+        ).run()
+        if not integration_result.completed:
+            return ClassificationResult(
+                integration_result.status,
+                integration_result.reason,
+                detail=integration_result.reason,
+            )
+        return ClassificationResult("completed", "runtime_lifecycle")
+
+    def _launch_runtime_remediation(
+        self,
+        *,
+        task: Task,
+        run_id: str,
+        workspace: ProvisionedWorkspace,
+        agent: AgentConfig,
+        agent_profile: str,
+        command_env: Mapping[str, str],
+        implementation_session_id: str,
+        implementation_session_id_source: str,
+        round_number: int,
+        failed_gates: Sequence[str] = (),
+        findings: Sequence[ReviewFinding] = (),
+    ) -> None:
+        provider = agent_command_provider(
+            agent.command or "",
+            agent.executable_kind or agent.agent_kind,
+        )
+        resumable_session_id = (
+            implementation_session_id
+            if implementation_session_id
+            and implementation_session_id_source != "fallback:run_id"
+            else ""
+        )
+        continuation = plan_session_continuation(
+            provider=provider or "unknown",
+            role="implementer",
+            continuing=True,
+            prior_session_id=resumable_session_id,
+            prior_ordinal=max(0, round_number - 1),
+        )
+        template = inject_provider_continuation(
+            agent.require_command(),
+            provider=provider or "unknown",
+            role="implementer",
+            continuation=continuation,
+        )
+        prompt = (
+            f"Resume implementation for task {task.task_id}. The runtime owns the "
+            "lifecycle; modify only the claimed workspace, commit the remediation, "
+            "and return control without launching review or integration.\n"
+            + json.dumps(
+                {
+                    "stage": f"remediation:{round_number}",
+                    "failed_gates": list(failed_gates),
+                    "findings": [finding.to_payload() for finding in findings],
+                },
+                sort_keys=True,
+            )
+        )
+        command = format_agent_command(
+            template,
+            prompt=prompt,
+            model=agent.model,
+            effort=agent.effort,
+            task=task,
+            profile=agent_profile,
+            task_id=task.task_id,
+            run_id=run_id,
+        )
+        log_path = self.runs_dir / f"{run_id}-remediation-{round_number}.log"
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task.task_id,
+                from_state="remediation_pending",
+                to_state="remediation_started",
+                reason=f"round:{round_number}",
+            )
+        )
+        with log_path.open("w", encoding="utf-8") as log:
+            result = run_streaming_command(
+                command,
+                workspace.worktree,
+                log,
+                env=dict(command_env),
+                forward_stderr=agent.forward_stderr,
+                timeout_seconds=self.config.supervision.worker_timeout_seconds,
+                provider={"codex": "openai", "claude": "anthropic"}.get(
+                    provider,
+                    "unknown",
+                ),
+            )
+        if result.timed_out:
+            raise ReviewStageResultError("timeout")
+        if result.exit_code != 0:
+            raise ReviewExecutionError(
+                f"remediation implementer exited with code {result.exit_code}"
+            )
+
+    def _runtime_review_policy_references(self) -> tuple[str, ...]:
+        return tuple(
+            name
+            for name in ("AGENTS.md", "CLAUDE.md", "REVIEW.md")
+            if (self.config.repo / name).is_file()
+        )
+
+    def _runtime_integration_result(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+    ) -> IntegrationResult | None:
+        result = None
+        for record in self.run_store.read_records():
+            if record.get("run_id") == run_id and record.get("task_id") == task_id:
+                candidate = IntegrationResult.from_record(record)
+                if candidate is not None and candidate.completed:
+                    result = candidate
+        return result
+
+    def _require_runtime_task_source_unchanged(
+        self,
+        *,
+        run_id: str,
+        expected_task: Task,
+        candidate: CandidateRecord,
+    ) -> None:
+        task_id = expected_task.task_id
+        try:
+            if self.source_resolution.task_source.activate_command is None:
+                candidate_source = build_task_source(
+                    candidate.worktree,
+                    self.source_resolution.task_source,
+                    runtime_context=self.config.runtime_environment,
+                )
+                task = candidate_source.probe(task_id)
+                unchanged = bool(
+                    task is not None
+                    and task.task_id == task_id
+                    and task.status.casefold() == expected_task.status.casefold()
+                )
+            else:
+                task = self.source.probe(task_id)
+                runnable = {
+                    status.casefold()
+                    for status in self.source_resolution.task_source.runnable_statuses
+                }
+                unchanged = bool(
+                    task is not None
+                    and task.task_id == task_id
+                    and not task.done
+                    and task.status.casefold() not in BLOCKED_FAMILY_STATUSES
+                    and task.status.casefold() not in runnable
+                )
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            raise TaskSourceCompletionError(
+                "implementation_task_source_probe_failed",
+                f"could not verify task source after implementation: {type(exc).__name__}",
+            ) from exc
+        if unchanged:
+            return
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task_id,
+                from_state="implementing",
+                to_state="invariant_bypass_rejected",
+                reason="worker_task_source_mutation",
+                payload={
+                    "observed_status": task.status if task is not None else "missing"
+                },
+            )
+        )
+        raise TaskSourceCompletionError(
+            "worker_task_source_mutation",
+            "worker changed authoritative task-source state during implementation",
+        )
+
+    def _journal_worker_output_bypass_attempts(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        log_path: Path,
+    ) -> None:
+        attempted_set: set[str] = set()
+        try:
+            with log_path.open(
+                "r",
+                encoding="utf-8",
+                errors="replace",
+            ) as log:
+                for line in log:
+                    attempted_set.update(
+                        match.group("record_type")
+                        for match in WORKER_OUTPUT_RECORD_TYPE_RE.finditer(line)
+                        if match.group("record_type") in LIFECYCLE_RECORD_TYPES
+                    )
+        except OSError:
+            return
+        attempted = tuple(sorted(attempted_set))
+        if not attempted:
+            return
+        self.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task_id,
+                from_state="implementing",
+                to_state="invariant_bypass_rejected",
+                reason="worker_output_transition_ignored",
+                payload={"attempted_record_types": list(attempted)},
+            )
+        )
 
     def complete_runtime_task_source(
         self,
@@ -4554,7 +5095,12 @@ def build_worker_prompt(
     *,
     include_repo_extension: bool = True,
 ) -> str:
-    prompt = f"{skill_prefix}vibe-loop {task.task_id}{CLI_WORKER_ADDENDUM}"
+    addendum = (
+        RUNTIME_OWNED_WORKER_ADDENDUM
+        if config is not None and config.orchestration.mode == "runtime-owned"
+        else CLI_WORKER_ADDENDUM
+    )
+    prompt = f"{skill_prefix}vibe-loop {task.task_id}{addendum}"
     if task.has_traceability:
         prompt = (
             f"{prompt}\n\n"

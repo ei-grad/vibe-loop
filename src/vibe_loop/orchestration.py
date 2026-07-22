@@ -4019,6 +4019,16 @@ class RunContractResolver:
             )
 
         if effective.mode == "runtime-owned":
+            if configured_reviewer_profile is None:
+                raise ValueError(
+                    "runtime-owned orchestration requires an explicit independent "
+                    "orchestration.reviewer_profile"
+                )
+            if configured_reviewer_profile == agent_selection.profile:
+                raise ValueError(
+                    "runtime-owned orchestration reviewer_profile must differ "
+                    "from the implementer profile"
+                )
             if "task_provenance_mode" not in effective.explicit_keys:
                 raise ValueError(
                     "runtime-owned orchestration requires an explicit "

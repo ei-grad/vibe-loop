@@ -670,6 +670,38 @@ class CliTests(unittest.TestCase):
         self.assertIn("VIBE_LOOP_FENCING_TOKEN is a secret", CLI_WORKER_ADDENDUM)
         self.assertIn("Never print or echo its value", CLI_WORKER_ADDENDUM)
 
+    def test_runtime_owned_worker_addendum_contains_only_implementation_stage(
+        self,
+    ) -> None:
+        from vibe_loop.runner import RUNTIME_OWNED_WORKER_ADDENDUM
+
+        self.assertIn(
+            "Runtime-Owned Implementation Stage",
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+        self.assertIn(
+            "vibe-loop worker candidate",
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+        self.assertIn(
+            'vibe-loop report --repo "$VIBE_LOOP_REPO"',
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+        self.assertIn(
+            "completed` worker report means only",
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+        self.assertIn(
+            "runtime owns configured\ngates",
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+        self.assertNotIn("main-integration", RUNTIME_OWNED_WORKER_ADDENDUM)
+        self.assertNotIn("Task Source Context", RUNTIME_OWNED_WORKER_ADDENDUM)
+        self.assertNotIn(
+            "update the repository's active task source",
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+
     def test_run_next_uses_claude_default_when_only_claude_is_available(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -6835,6 +6867,7 @@ class CliTests(unittest.TestCase):
                 "lock_acquired",
                 "run_contract_resolved",
                 "stage_transition",
+                "attempt_circuit_attempt",
                 "stage_transition",
                 "stage_transition",
                 "lock_released",
@@ -6952,6 +6985,7 @@ class CliTests(unittest.TestCase):
                         "lock_acquired",
                         "run_contract_resolved",
                         "stage_transition",
+                        "attempt_circuit_attempt",
                         "stage_transition",
                         "stage_transition",
                         "lock_released",

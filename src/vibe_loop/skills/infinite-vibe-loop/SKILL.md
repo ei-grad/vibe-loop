@@ -15,6 +15,13 @@ permitted, clean up, and summarize before selecting the next slice. The
 infinite-loop difference is continuation after each completed, parked, or
 blocked slice.
 
+When a trusted supervisor invokes this skill only as implementation-stage
+content inside a runtime-owned lifecycle, the finite skill's supervised-stage
+boundary applies: implement and stabilize the candidate, then return control.
+The supervisor owns configured gates, review, integration, task-source
+completion, and cross-slice continuation. This exception does not narrow an
+ordinary interactive infinite-loop invocation.
+
 ## Mandatory Continuation
 
 Assume an unattended session. Never voluntarily stop: continue after clean

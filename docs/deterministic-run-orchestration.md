@@ -510,10 +510,10 @@ per run, so mixed histories stay interpretable. Generated profiles cannot set
 orchestration keys (same rule as other executable-adjacent config).
 
 Mode availability is staged: a run may never record a mode it does not
-execute. ORC-02 parses and records the key but rejects
-`mode = "runtime-owned"` with an actionable not-yet-available diagnostic;
-the value becomes accepted only when the slice completing the runtime-owned
-path (ORC-10) lands. Until then the only accepted value is the default.
+execute. ORC-10 makes `mode = "runtime-owned"` available after composing the
+runtime-owned lifecycle; `worker-owned` remains the default until ORC-11.
+Runtime-owned contract validation still fails closed before activation when
+its reviewer, completion, or failure-settlement paths are unavailable.
 
 Phases (each independently shippable; worker-owned mode keeps working
 throughout, and no repository review policy is silently weakened — a repo's

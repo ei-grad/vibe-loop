@@ -30,6 +30,20 @@ integration/cleanup status. Update it after implementation, checks, review,
 blockers, integration, and final summary. This is finite slice state, not a
 cross-slice backlog.
 
+## Supervised Implementation Stage
+
+When a trusted supervisor explicitly scopes the invocation to an implementation
+stage inside a runtime-owned lifecycle, follow that narrower stage contract.
+Implement and stabilize the candidate in the workspace the supervisor provides,
+using focused checks as needed, then return control at the declared stage
+boundary. The supervisor owns workspace provisioning, configured gates,
+independent review, remediation budgets, integration, task-source completion,
+final classification, and cleanup in this mode. Do not duplicate those effects
+or treat prose output as authority to advance the lifecycle.
+
+Without that explicit supervised-stage contract, the complete interactive loop
+in this skill remains authoritative.
+
 ## Core Loop
 
 1. Inspect the task, code, tests, docs, repo instructions, worktree state, and

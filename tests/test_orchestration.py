@@ -126,14 +126,24 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_remediation_rounds, 4)
         self.assertFalse(config.orchestration.integration_enabled)
 
-    def test_rejects_modes_routes_and_non_allowlisted_executables(self) -> None:
+    def test_accepts_runtime_owned_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[orchestration]\nmode = "runtime-owned"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.orchestration.mode, "runtime-owned")
+
+    def test_rejects_invalid_modes_routes_and_non_allowlisted_executables(
+        self,
+    ) -> None:
         cases = (
             ('mode = "other"\n', "orchestration.mode must be one of"),
             ('mode = ""\n', "orchestration.mode must be one of"),
-            (
-                'mode = "runtime-owned"\n',
-                "runtime-owned.*not yet available.*orc-scheduler-separation",
-            ),
             (
                 'reviewer_profile = "missing"\n',
                 "must reference a configured agent.profiles entry",
@@ -303,11 +313,13 @@ class RunContractResolverTests(unittest.TestCase):
         self,
     ) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
         cases = (
             (
                 OrchestrationConfig(
                     mode="runtime-owned",
-                    explicit_keys=frozenset({"mode"}),
+                    reviewer_profile="review",
+                    explicit_keys=frozenset({"mode", "reviewer_profile"}),
                 ),
                 TaskSourceConfig(),
                 "explicit.*task_provenance_mode",
@@ -315,8 +327,11 @@ class RunContractResolverTests(unittest.TestCase):
             (
                 OrchestrationConfig(
                     mode="runtime-owned",
+                    reviewer_profile="review",
                     task_provenance_mode="adapter",
-                    explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
                 ),
                 TaskSourceConfig(),
                 "requires task_source.complete",
@@ -324,8 +339,11 @@ class RunContractResolverTests(unittest.TestCase):
             (
                 OrchestrationConfig(
                     mode="runtime-owned",
+                    reviewer_profile="review",
                     task_provenance_mode="external-confirmed",
-                    explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
                 ),
                 TaskSourceConfig(
                     type="command",
@@ -340,6 +358,7 @@ class RunContractResolverTests(unittest.TestCase):
                 config = VibeConfig(
                     repo=Path("/repo"),
                     agent=agent,
+                    agent_profiles={"review": reviewer},
                     orchestration=orchestration,
                     task_source=task_source,
                 )
@@ -348,15 +367,59 @@ class RunContractResolverTests(unittest.TestCase):
                         AgentSelection(agent, "", "default")
                     )
 
+    def test_runtime_owned_contract_requires_independent_reviewer_profile(
+        self,
+    ) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        task_source = TaskSourceConfig()
+        for orchestration, selection, diagnostic in (
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    task_provenance_mode="external-confirmed",
+                    explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+                ),
+                AgentSelection(agent, "", "default"),
+                "requires an explicit independent.*reviewer_profile",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="implementer",
+                    task_provenance_mode="external-confirmed",
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
+                ),
+                AgentSelection(agent, "implementer", "task.agent"),
+                "reviewer_profile must differ from the implementer profile",
+            ),
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                config = VibeConfig(
+                    repo=Path("/repo"),
+                    agent=agent,
+                    agent_profiles={"implementer": agent},
+                    orchestration=orchestration,
+                    task_source=task_source,
+                )
+                with self.assertRaisesRegex(ValueError, diagnostic):
+                    RunContractResolver(config).resolve(selection)
+
     def test_runtime_owned_contract_records_allowlisted_source_adapters(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
         config = VibeConfig(
             repo=Path("/repo"),
             agent=agent,
+            agent_profiles={"review": reviewer},
             orchestration=OrchestrationConfig(
                 mode="runtime-owned",
+                reviewer_profile="review",
                 task_provenance_mode="adapter",
-                explicit_keys=frozenset({"mode", "task_provenance_mode"}),
+                explicit_keys=frozenset(
+                    {"mode", "reviewer_profile", "task_provenance_mode"}
+                ),
             ),
             task_source=TaskSourceConfig(
                 type="command",
@@ -3291,7 +3354,12 @@ class RunContractJournalTests(unittest.TestCase):
         record_types = [record.get("record_type") for record in records]
         self.assertEqual(
             activation_record_types,
-            ["lock_acquired", "run_contract_resolved", "stage_transition"],
+            [
+                "lock_acquired",
+                "run_contract_resolved",
+                "stage_transition",
+                "attempt_circuit_attempt",
+            ],
         )
         self.assertLess(
             record_types.index("run_contract_resolved"),

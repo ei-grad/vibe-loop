@@ -2190,11 +2190,6 @@ def parse_orchestration(
         default="worker-owned",
         allowed=ORCHESTRATION_MODES,
     )
-    if mode == "runtime-owned":
-        raise ValueError(
-            'orchestration.mode = "runtime-owned" is not yet available; '
-            'use "worker-owned" until orc-scheduler-separation is complete'
-        )
 
     reviewer_profile = optional_nonempty_string(table.get("reviewer_profile"))
     if reviewer_profile is not None and reviewer_profile not in agent_profiles:
