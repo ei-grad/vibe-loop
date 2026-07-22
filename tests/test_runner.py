@@ -3246,6 +3246,154 @@ class LimitWallLoopTests(unittest.TestCase):
 
 
 class TransientWorkerFailureTests(unittest.TestCase):
+    def test_normal_workspace_deferral_waits_across_cycles_for_state_change(
+        self,
+    ) -> None:
+        for mode in ("serial", "parallel"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory) / "repo"
+                repo.mkdir()
+                subprocess.run(
+                    ["git", "init", "-b", "main"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "test@example.com"],
+                    cwd=repo,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Test"],
+                    cwd=repo,
+                    check=True,
+                )
+                (repo / "README.md").write_text("base\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "base"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                base = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                runner = VibeRunner(
+                    VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                )
+                source = MutableTaskSource(
+                    [Task(task_id="TASK-01", title="Task", status="Next", order=1)]
+                )
+                runner._source = source
+                dispatch_calls = 0
+
+                def reject_dispatch(task: Task, restart_count: int = 0) -> RunResult:
+                    nonlocal dispatch_calls
+                    dispatch_calls += 1
+                    fingerprint = runner_module.workspace_state_fingerprint(
+                        repo=repo,
+                        main_branch="main",
+                        branch="main",
+                        worktree=repo,
+                        expected_base=base,
+                    )
+                    runner.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.workspace_preflight(
+                            run_id="run-1",
+                            task_id=task.task_id,
+                            decision="rejected",
+                            reason="workspace_stale_current_base",
+                            retry_disposition="defer_until_workspace_changes",
+                            worker_launch_allowed=False,
+                            branch="main",
+                            worktree=repo,
+                            selected_base=base,
+                            workspace_state_fingerprint=fingerprint,
+                        )
+                    )
+                    raise WorkspaceProvisionError(
+                        "workspace_stale_current_base",
+                        "workspace does not contain current base",
+                    )
+
+                runner.run_task_with_supervision = reject_dispatch
+
+                def run_cycle() -> list[RunResult]:
+                    if mode == "serial":
+                        return runner.run_until_done_serial(max_slices=1)
+                    return runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    )
+
+                with patch.object(runner, "ensure_spec_execution_gate"):
+                    self.assertEqual(run_cycle(), [])
+                    records_after_rejection = runner.run_store.read_records()
+                    budget_records_after_rejection = [
+                        record
+                        for record in records_after_rejection
+                        if record.get("record_type")
+                        in {
+                            "attempt_circuit_attempt",
+                            "task_recovery",
+                            "task_restart",
+                            "worker_process_started",
+                        }
+                    ]
+                    self.assertEqual(run_cycle(), [])
+                    self.assertEqual(run_cycle(), [])
+
+                    self.assertEqual(dispatch_calls, 1)
+                    self.assertEqual(
+                        [
+                            record
+                            for record in runner.run_store.read_records()
+                            if record.get("record_type")
+                            in {
+                                "attempt_circuit_attempt",
+                                "task_recovery",
+                                "task_restart",
+                                "worker_process_started",
+                            }
+                        ],
+                        budget_records_after_rejection,
+                    )
+
+                    (repo / "changed.txt").write_text("wake\n", encoding="utf-8")
+
+                    def complete_dispatch(
+                        task: Task,
+                        restart_count: int = 0,
+                    ) -> RunResult:
+                        nonlocal dispatch_calls
+                        dispatch_calls += 1
+                        source.mark_done(task.task_id)
+                        return RunResult(
+                            run_id="run-2",
+                            task_id=task.task_id,
+                            classification="completed",
+                            exit_code=0,
+                            log_path=repo / "run-2.log",
+                            start_main=base,
+                            end_main=base,
+                        )
+
+                    runner.run_task_with_supervision = complete_dispatch
+                    changed = run_cycle()
+
+                self.assertEqual(
+                    [result.classification for result in changed], ["completed"]
+                )
+                self.assertEqual(dispatch_calls, 2)
+
     def test_deferred_workspace_recovery_waits_for_state_change(self) -> None:
         for mode in ("serial", "parallel"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:

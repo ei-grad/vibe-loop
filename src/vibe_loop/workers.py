@@ -934,6 +934,68 @@ def git_dirty_snapshot(
     return status, digest
 
 
+def workspace_state_fingerprint(
+    *,
+    repo: Path,
+    main_branch: str,
+    branch: str = "",
+    worktree: Path | None = None,
+    expected_base: str = "",
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> str:
+    repo = repo.resolve()
+    worktree = worktree.resolve() if worktree is not None else None
+
+    def git_observation(cwd: Path, *args: str) -> str:
+        result = run_git_result(cwd, *args)
+        if result is None or result.returncode != 0:
+            return "unavailable"
+        return result.stdout.strip()
+
+    topology = git_observation(repo, "worktree", "list", "--porcelain")
+    state: dict[str, object] = {
+        "schema_version": 1,
+        "selected_base": git_observation(repo, "rev-parse", "--verify", main_branch),
+        "expected_base": expected_base,
+        "expected_branch": branch,
+        "branch_head": (
+            git_observation(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+            if branch
+            else ""
+        ),
+        "worktree": str(worktree) if worktree is not None else "",
+        "worktree_topology": topology,
+    }
+    if worktree is None or not worktree.is_dir():
+        state["workspace_state"] = "missing"
+    else:
+        state.update(
+            {
+                "workspace_state": "present",
+                "branch": git_observation(worktree, "branch", "--show-current"),
+                "head": git_observation(worktree, "rev-parse", "--verify", "HEAD"),
+                "git_common_dir": git_observation(
+                    worktree, "rev-parse", "--git-common-dir"
+                ),
+            }
+        )
+        try:
+            _dirty, dirty_fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=ignored_dirty_paths,
+            )
+        except WorkspaceClaimError:
+            dirty_fingerprint = "unavailable"
+        state["dirty_fingerprint"] = dirty_fingerprint
+    encoded = json.dumps(
+        state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def git_status_args(repo: Path, ignored_dirty_paths: Iterable[Path]) -> tuple[str, ...]:
     excludes = git_status_exclude_pathspecs(repo, ignored_dirty_paths)
     if not excludes:

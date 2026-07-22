@@ -690,6 +690,7 @@ class RunLifecycleEvent:
         selected_base: str = "",
         workspace_base: str = "",
         head_commit: str = "",
+        workspace_state_fingerprint: str = "",
     ) -> RunLifecycleEvent:
         if decision not in {"created", "reusable", "rejected"}:
             raise ValueError("workspace preflight decision is invalid")
@@ -719,6 +720,13 @@ class RunLifecycleEvent:
             payload["workspace_base"] = workspace_base
         if head_commit and len(head_commit.encode("utf-8", "replace")) <= 128:
             payload["head_commit"] = head_commit
+        if workspace_state_fingerprint:
+            if len(workspace_state_fingerprint) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in workspace_state_fingerprint
+            ):
+                raise ValueError("workspace state fingerprint is invalid")
+            payload["workspace_state_fingerprint"] = workspace_state_fingerprint
         return cls(
             record_type=WORKSPACE_PREFLIGHT_RECORD_TYPE,
             run_id=run_id,

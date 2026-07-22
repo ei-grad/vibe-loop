@@ -85,7 +85,9 @@ content-sensitive dirty snapshot; a change between preflight and claim fails
 closed. Deferred recovery persists only a bounded state fingerprint and remains
 suppressed in serial and parallel dispatch until the relevant base, branch,
 `HEAD`, Git identity, or dirty state changes. Suppressed checks do not consume
-restart or recovery budget. Provisioning
+restart, recovery, or attempt budget. The same durable state gate applies to a
+normal dispatch rejected before launch, preventing ordinary task selection from
+bypassing the deferral on later supervisor cycles. Provisioning
 failures unwind without leaking task locks or half-created workspaces.
 Parallel jobs receive distinct worktrees and can never claim the primary
 worktree. Recovery reuses a preserved worker-owned workspace for the same task

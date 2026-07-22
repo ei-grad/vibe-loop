@@ -764,12 +764,14 @@ class RunStoreTests(unittest.TestCase):
             selected_base="a" * 40,
             workspace_base="b" * 40,
             head_commit="c" * 40,
+            workspace_state_fingerprint="d" * 64,
         ).to_record()
 
         self.assertEqual(event["record_type"], WORKSPACE_PREFLIGHT_RECORD_TYPE)
         self.assertEqual(event["decision"], "rejected")
         self.assertEqual(event["retry_disposition"], "defer_until_workspace_changes")
         self.assertFalse(event["worker_launch_allowed"])
+        self.assertEqual(event["workspace_state_fingerprint"], "d" * 64)
         self.assertIn(WORKSPACE_PREFLIGHT_RECORD_TYPE, KNOWN_RECORD_TYPES)
         with self.assertRaisesRegex(ValueError, "retry disposition"):
             RunLifecycleEvent.workspace_preflight(
@@ -779,6 +781,16 @@ class RunStoreTests(unittest.TestCase):
                 reason="workspace_stale_current_base",
                 retry_disposition="retry_immediately",
                 worker_launch_allowed=False,
+            )
+        with self.assertRaisesRegex(ValueError, "state fingerprint"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-3",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="defer_until_workspace_changes",
+                worker_launch_allowed=False,
+                workspace_state_fingerprint="not-a-fingerprint",
             )
 
     def test_post_report_activity_event_records_violation_and_teardown(

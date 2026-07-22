@@ -4232,7 +4232,24 @@ class WorkspaceProvisioner:
         recovery_dirty_fingerprint: str = "",
     ) -> ProvisionedWorkspace:
         from vibe_loop.runs import RunLifecycleEvent
-        from vibe_loop.workers import WorkspaceClaimError, claim_worker_workspace
+        from vibe_loop.workers import (
+            WorkspaceClaimError,
+            claim_worker_workspace,
+            workspace_state_fingerprint,
+        )
+
+        def current_workspace_state_fingerprint(
+            candidate_branch: str,
+            candidate_worktree: Path | None,
+        ) -> str:
+            return workspace_state_fingerprint(
+                repo=self.repo,
+                main_branch=self.main_branch,
+                branch=candidate_branch,
+                worktree=candidate_worktree,
+                expected_base=base_commit,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
 
         branch = ""
         worktree: Path | None = None
@@ -4274,6 +4291,9 @@ class WorkspaceProvisioner:
                     selected_base=base_commit,
                     workspace_base=workspace_base,
                     head_commit=head_commit,
+                    workspace_state_fingerprint=current_workspace_state_fingerprint(
+                        branch, worktree
+                    ),
                 )
             )
             raise
@@ -4340,6 +4360,11 @@ class WorkspaceProvisioner:
                             exc.details.get("actual_head_commit")
                             or exc.details.get("head_commit")
                         ),
+                        workspace_state_fingerprint=(
+                            current_workspace_state_fingerprint(
+                                workspace.branch, workspace.worktree
+                            )
+                        ),
                     )
                 )
                 raise failure from exc
@@ -4361,6 +4386,11 @@ class WorkspaceProvisioner:
                         branch=workspace.branch,
                         worktree=workspace.worktree,
                         selected_base=base_commit,
+                        workspace_state_fingerprint=(
+                            current_workspace_state_fingerprint(
+                                workspace.branch, workspace.worktree
+                            )
+                        ),
                     )
                 )
                 raise
