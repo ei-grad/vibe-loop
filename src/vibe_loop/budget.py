@@ -34,6 +34,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from vibe_loop.config import BudgetConfig
+from vibe_loop.processes import process_birth_identity
 from vibe_loop.runs import append_record_lock, string_value, utc_now_iso
 from vibe_loop.telemetry import (
     fresh_input_tokens,
@@ -389,6 +390,7 @@ class BudgetStore:
                         "generation": generation,
                         "host": socket.gethostname(),
                         "pid": os.getpid(),
+                        "owner_process_birth_id": process_birth_identity(os.getpid()),
                         "project": project,
                         "provider": provider,
                         "phase": phase,
@@ -504,6 +506,7 @@ class BudgetStore:
         *,
         resolve: Callable[[str], BudgetRunOutcome | None],
         process_alive: Callable[[int | None, str], bool],
+        process_birth: Callable[[int], str] = process_birth_identity,
         now: datetime | None = None,
         grace_seconds: float = 900.0,
     ) -> int:
@@ -545,8 +548,18 @@ class BudgetStore:
                         # Another host owns this reservation; only its own
                         # supervisor can judge the owner's liveness.
                         continue
-                    if process_alive(pid if isinstance(pid, int) else None, host):
-                        continue
+                    owner_pid = pid if isinstance(pid, int) else None
+                    if process_alive(owner_pid, host):
+                        expected_birth = string_value(
+                            record.get("owner_process_birth_id")
+                        )
+                        if owner_pid is None or not expected_birth:
+                            # Legacy or unverifiable identities stay reserved:
+                            # liveness without birth identity cannot rule out PID reuse.
+                            continue
+                        actual_birth = process_birth(owner_pid)
+                        if not actual_birth or actual_birth == expected_birth:
+                            continue
                     age = current - (
                         parse_timestamp(record.get("occurred_at")) or current
                     )

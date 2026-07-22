@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import multiprocessing
+import os
 import subprocess
 import tempfile
 import unittest
@@ -29,6 +31,40 @@ from vibe_loop.config import (
 from vibe_loop.runner import VibeRunner, run_streaming_command  # noqa: F401
 from vibe_loop.runs import RunResult
 from vibe_loop.tasks import Task
+
+
+def _multiprocess_reserve(path: str, index: int, start, results) -> None:
+    config = make_config(default_declared=100.0, limits=(BudgetLimit(limit=400.0),))
+    store = BudgetStore(Path(path), config)
+    start.wait()
+    decision = store.reserve(
+        reservation_id=f"process-{index}",
+        run_id=f"process-{index}",
+        project="proj",
+        provider="anthropic",
+        phase="implementation",
+        model="claude-opus-4-8",
+        effort="high",
+    )
+    results.put(decision.admitted)
+
+
+def _reserve_then_crash(path: str, ready) -> None:
+    store = BudgetStore(
+        Path(path),
+        make_config(default_declared=100.0, limits=(BudgetLimit(limit=400.0),)),
+    )
+    store.reserve(
+        reservation_id="crashed-process",
+        run_id="crashed-process",
+        project="proj",
+        provider="anthropic",
+        phase="implementation",
+        model="claude-opus-4-8",
+        effort="high",
+    )
+    ready.set()
+    os._exit(0)
 
 
 def make_config(**overrides: object) -> BudgetConfig:
@@ -123,6 +159,46 @@ class BudgetStoreCoreTests(unittest.TestCase):
                 if r.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
             ]
             self.assertEqual(len(reserved), 4)
+
+    def test_independent_processes_cannot_oversubscribe_shared_ledger(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "budget.jsonl")
+            start = context.Event()
+            results = context.Queue()
+            processes = [
+                context.Process(
+                    target=_multiprocess_reserve,
+                    args=(path, index, start, results),
+                )
+                for index in range(10)
+            ]
+            try:
+                for process in processes:
+                    process.start()
+                start.set()
+                for process in processes:
+                    process.join(timeout=15)
+                self.assertTrue(all(not process.is_alive() for process in processes))
+                self.assertEqual([process.exitcode for process in processes], [0] * 10)
+                admissions = [results.get(timeout=2) for _ in processes]
+            finally:
+                for process in processes:
+                    if process.is_alive():
+                        process.terminate()
+                    process.join(timeout=2)
+                results.close()
+            self.assertEqual(sum(admissions), 4)
+            records = BudgetStore(
+                Path(path),
+                make_config(default_declared=100.0, limits=(BudgetLimit(limit=400.0),)),
+            ).read_records()
+            reservations = [
+                record
+                for record in records
+                if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+            ]
+            self.assertEqual(len(reservations), 4)
 
     def test_defer_policy_reports_defer(self) -> None:
         config = make_config(
@@ -269,6 +345,82 @@ class BudgetStoreCoreTests(unittest.TestCase):
                 process_alive=lambda pid, host: True,
             )
             self.assertEqual(recovered, 0)
+
+    def test_recovery_detects_reused_pid_by_process_birth_identity(self) -> None:
+        config = make_config(limits=(BudgetLimit(limit=1e9),))
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory, config)
+            self._reserve(store, "r1")
+            recovered = store.recover_abandoned(
+                resolve=lambda run_id: None,
+                process_alive=lambda pid, host: True,
+                process_birth=lambda pid: "different-boot:123",
+                grace_seconds=0,
+            )
+            self.assertEqual(recovered, 1)
+            self.assertEqual(
+                store.recover_abandoned(
+                    resolve=lambda run_id: None,
+                    process_alive=lambda pid, host: True,
+                    process_birth=lambda pid: "different-boot:123",
+                    grace_seconds=0,
+                ),
+                0,
+            )
+
+    def test_crashed_process_reservation_recovers_exactly_once(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "budget.jsonl"
+            ready = context.Event()
+            process = context.Process(
+                target=_reserve_then_crash, args=(str(path), ready)
+            )
+            process.start()
+            self.assertTrue(ready.wait(timeout=10))
+            process.join(timeout=10)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+                self.fail("reservation owner did not exit")
+            self.assertEqual(process.exitcode, 0)
+
+            config = make_config(
+                default_declared=100.0, limits=(BudgetLimit(limit=400.0),)
+            )
+            store = self._store(directory, config)
+            reservation = next(
+                record
+                for record in store.read_records()
+                if record.get("record_type") == BUDGET_RESERVED_RECORD_TYPE
+            )
+            self.assertEqual(reservation["pid"], process.pid)
+            self.assertTrue(reservation["owner_process_birth_id"])
+
+            self.assertEqual(
+                store.recover_abandoned(
+                    resolve=lambda run_id: None,
+                    process_alive=lambda pid, host: False,
+                    grace_seconds=0,
+                ),
+                1,
+            )
+            self.assertEqual(
+                store.recover_abandoned(
+                    resolve=lambda run_id: None,
+                    process_alive=lambda pid, host: False,
+                    grace_seconds=0,
+                ),
+                0,
+            )
+            reconciliations = [
+                record
+                for record in store.read_records()
+                if record.get("record_type") == BUDGET_RECONCILED_RECORD_TYPE
+            ]
+            self.assertEqual(len(reconciliations), 1)
+            self.assertEqual(reconciliations[0]["charge"], 100.0)
+            self.assertEqual(reconciliations[0]["reason"], "recovered_abandoned")
 
     def test_phase_and_provider_are_separately_attributable(self) -> None:
         # Two caps: one Anthropic implementation, one OpenAI review. Each launch

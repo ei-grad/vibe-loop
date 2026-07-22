@@ -1087,6 +1087,10 @@ double-spend: a reservation whose owner run has a durable terminal result
 reconciles from that result; one whose owner is provably dead with no result is
 charged fail-safe. Recovery runs at each dispatch start and is guarded by the
 same exactly-once check.
+Local ownership persists the kernel process-birth identity as well as PID and
+host. Recovery therefore distinguishes a still-running owner from an unrelated
+process that reused its PID; an unavailable birth identity remains reserved
+conservatively rather than being silently released.
 
 `vibe-loop runs summary --json` includes a `budget` projection: per-limit
 consumed/reserved/remaining/utilization with warning and exceeded flags, and a
