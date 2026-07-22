@@ -1724,6 +1724,7 @@ class ReviewRouter:
         executor: ReviewExecutor = subprocess.run,
         continuation_availability: ContinuationAvailability | None = None,
         session_id_factory: Callable[[], str] | None = None,
+        budget: object | None = None,
     ) -> None:
         if max_initial_passes <= 0:
             raise ValueError("max_initial_passes must be positive")
@@ -1744,6 +1745,7 @@ class ReviewRouter:
         self.executor = executor
         self.continuation_availability = continuation_availability
         self.session_id_factory = session_id_factory or (lambda: str(uuid.uuid4()))
+        self.budget = budget
         self.ledger = FindingsLedger(run_store, run_id, task_id)
 
     def review(
@@ -1877,6 +1879,9 @@ class ReviewRouter:
             profile=self.reviewer_profile,
         )
         route = self._route_payload()
+        # Reserve the phase budget before claiming a review pass, so a denial
+        # launches no reviewer process and consumes no review-budget slot.
+        budget_reservation = self._reserve_review_budget(request, route)
         pass_ordinal = self._claim_review_attempt(
             request,
             pass_ordinal=pass_ordinal,
@@ -1899,6 +1904,7 @@ class ReviewRouter:
                 )
         except OSError as exc:
             duration = max(0.0, time.monotonic() - started)
+            self._release_review_budget(budget_reservation)
             self._record_error(
                 request,
                 route,
@@ -1917,6 +1923,7 @@ class ReviewRouter:
             ) from exc
         except ReviewExecutionError:
             duration = max(0.0, time.monotonic() - started)
+            self._reconcile_review_budget(budget_reservation, None)
             self._record_error(
                 request,
                 route,
@@ -1932,6 +1939,7 @@ class ReviewRouter:
             self._fail_stage_for_result("fatal")
             raise
         except subprocess.TimeoutExpired as exc:
+            self._reconcile_review_budget(budget_reservation, None)
             self._record_wait_incomplete(
                 request, pass_ordinal, attempt_ordinal, continuation
             )
@@ -1945,6 +1953,9 @@ class ReviewRouter:
         for line in output.splitlines():
             observer.observe_line(line)
         usage = observer.usage
+        # A launched reviewer is reconciled exactly once against its own usage;
+        # unavailable usage is charged fail-safe, never zero.
+        self._reconcile_review_budget(budget_reservation, usage)
         nested_launches, nested_usage = self._nested_launch_evidence(output)
         if nested_launches:
             self._record_error(
@@ -2794,6 +2805,43 @@ class ReviewRouter:
     def _usage_provider(self) -> str:
         provider = self._route_payload()["provider"]
         return {"codex": "openai", "claude": "anthropic"}.get(str(provider), "unknown")
+
+    def _reserve_review_budget(
+        self, request: ReviewRequest, route: Mapping[str, object]
+    ) -> str:
+        if self.budget is None or not getattr(self.budget, "enabled", False):
+            return ""
+        reservation_id = f"{self.run_id}:{request.phase}:{uuid.uuid4().hex}"
+        return self.budget.admit(
+            reservation_id=reservation_id,
+            run_id=self.run_id,
+            provider=self._usage_provider(),
+            phase=request.phase,
+            model=str(route.get("model") or ""),
+            effort=str(route.get("effort") or ""),
+        )
+
+    def _reconcile_review_budget(
+        self, reservation_id: str, usage: ProviderUsage | None
+    ) -> None:
+        if self.budget is None or not reservation_id:
+            return
+        stats = usage.to_stats(phase="review") if usage is not None else {}
+        self.budget.reconcile(
+            reservation_id=reservation_id,
+            run_id=self.run_id,
+            stats=stats,
+            provider=self._usage_provider(),
+        )
+
+    def _release_review_budget(self, reservation_id: str) -> None:
+        if self.budget is None or not reservation_id:
+            return
+        self.budget.release(
+            reservation_id=reservation_id,
+            run_id=self.run_id,
+            reason="review_launch_failed",
+        )
 
     def _transition_to_review(self, request: ReviewRequest) -> None:
         if self.stage_machine is None:

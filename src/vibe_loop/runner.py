@@ -25,7 +25,10 @@ from vibe_loop.budget import (
     BudgetReservationDenied,
     BudgetRunOutcome,
     BudgetStore,
+    PhaseBudget,
     process_alive_locally,
+    resolve_budget_ledger_path,
+    resolve_budget_project,
 )
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
@@ -1411,9 +1414,13 @@ class VibeRunner:
         self._lock_manager: LockManager | None = None
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
+        # One shared ledger and canonical project identity per repository, so
+        # concurrent linked worktrees admit against the same durable budget.
         self.budget_store = BudgetStore(
-            config.state_path / "budget.jsonl", config.budget
+            resolve_budget_ledger_path(config), config.budget
         )
+        self.budget_project = resolve_budget_project(config)
+        self.phase_budget = PhaseBudget(self.budget_store, self.budget_project)
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
         self.last_analysis_usage = unavailable_usage(
@@ -2095,7 +2102,7 @@ class VibeRunner:
                 budget_decision = self.budget_store.reserve(
                     reservation_id=run_id,
                     run_id=run_id,
-                    project=self.config.repo.name,
+                    project=self.budget_project,
                     provider=command_context.model_provider,
                     phase="implementation",
                     model=command_context.model_id,
@@ -2809,6 +2816,16 @@ class VibeRunner:
                         implementation_session_id_source=session_id_source,
                         output_log_path=log_path,
                     )
+                except BudgetReservationDenied as exc:
+                    # A review or remediation launch was refused: no reviewer or
+                    # remediation process started, and the run ends blocked so it
+                    # is re-dispatched once budget frees rather than left dangling.
+                    classification = ClassificationResult(
+                        "blocked",
+                        f"budget_{exc.decision.phase}_denied",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
                 except ReviewBudgetExhausted as exc:
                     classification = ClassificationResult(
                         "blocked",
@@ -3418,6 +3435,7 @@ class VibeRunner:
             concurrency=self._review_concurrency,
             stage_machine=stage_machine,
             limit_wall_patterns=self.config.supervision.limit_wall_patterns or None,
+            budget=self.phase_budget,
         )
         review_result = router.review(gate_summary)
         closure_ordinal = 0
@@ -3512,6 +3530,20 @@ class VibeRunner:
             agent.command or "",
             agent.executable_kind or agent.agent_kind,
         )
+        usage_provider = {"codex": "openai", "claude": "anthropic"}.get(
+            provider, "unknown"
+        )
+        # Reserve the remediation phase budget before building or launching the
+        # implementer; a denial raises BudgetReservationDenied and starts no
+        # process, which the lifecycle records as blocked.
+        budget_reservation = self.phase_budget.admit(
+            reservation_id=f"{run_id}:remediation:{round_number}:{uuid.uuid4().hex}",
+            run_id=run_id,
+            provider=usage_provider,
+            phase="remediation",
+            model=agent.model or "",
+            effort=agent.effort or "",
+        )
         resumable_session_id = (
             implementation_session_id
             if implementation_session_id
@@ -3564,19 +3596,34 @@ class VibeRunner:
                 reason=f"round:{round_number}",
             )
         )
-        with log_path.open("w", encoding="utf-8") as log:
-            result = run_streaming_command(
-                command,
-                workspace.worktree,
-                log,
-                env=dict(command_env),
-                forward_stderr=agent.forward_stderr,
-                timeout_seconds=self.config.supervision.worker_timeout_seconds,
-                provider={"codex": "openai", "claude": "anthropic"}.get(
-                    provider,
-                    "unknown",
-                ),
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    command,
+                    workspace.worktree,
+                    log,
+                    env=dict(command_env),
+                    forward_stderr=agent.forward_stderr,
+                    timeout_seconds=self.config.supervision.worker_timeout_seconds,
+                    provider=usage_provider,
+                )
+        except BaseException:
+            # The implementer process never produced a result, so return the
+            # reserved allowance rather than charging a launch that did not run.
+            self.phase_budget.release(
+                reservation_id=budget_reservation,
+                run_id=run_id,
+                reason="remediation_launch_failed",
             )
+            raise
+        # A launched remediation implementer is reconciled exactly once against
+        # its own usage; unavailable usage is charged fail-safe, never zero.
+        self.phase_budget.reconcile(
+            reservation_id=budget_reservation,
+            run_id=run_id,
+            stats=result.usage.to_stats(phase="remediation"),
+            provider=usage_provider,
+        )
         if result.timed_out:
             raise ReviewStageResultError("timeout")
         if result.exit_code != 0:

@@ -1062,9 +1062,25 @@ reservation that would exceed the remaining budget is refused before any model
 process starts (`on_insufficient = "block"` or `"defer"`), and the refusal is
 durable evidence in the ledger.
 
+Every runtime-owned model launch is gated, not only worker-owned
+implementation: the initial and full review passes and the targeted
+remediation/closure launches each reserve under their own phase
+(`initial_review`, `targeted_closure`, `remediation`) using the actual reviewer
+or remediation route, and each reconciles its own usage against its own
+reservation. A denial launches no reviewer or remediation process and records
+the run as blocked. A run's aggregate terminal usage reconciles only its
+implementation reservation, so usage is never double-counted across phase
+boundaries or during recovery.
+
+The ledger is one shared file per repository, keyed on the repository-common
+root so all linked Git worktrees admit against the same durable budget and OS
+lock, while unrelated repositories stay isolated. Ordinary repositories and
+disabled/unconfigured budgets keep their prior per-repo path and do no Git work.
+
 Attribution is by **project, provider route, worker phase, model, and effort**.
 A `[[budget.limits]]` entry caps one scope; omit a selector to match any value on
-that axis. A launch must satisfy every limit it matches. `metric` is the single
+that axis. A launch must satisfy every limit it matches (route cardinality is
+bounded and an over-large config is rejected). `metric` is the single
 dimension caps, declared allowances, and fail-safe charges are denominated in
 (one of `input_tokens`, `output_tokens`, `total_tokens`,
 `non_cached_input_tokens`, `cache_read_input_tokens`,
@@ -1092,11 +1108,29 @@ host. Recovery therefore distinguishes a still-running owner from an unrelated
 process that reused its PID; an unavailable birth identity remains reserved
 conservatively rather than being silently released.
 
+The durable ledger enforces a strict terminal-record schema and identity
+contract: a reconciliation or release must match its reservation's id, owner
+run, and generation and carry valid typed usage fields. Malformed, forged,
+mismatched, duplicate, orphaned, or torn rows never close a live reservation at
+zero; they are counted as bounded, content-free integrity diagnostics and the
+reservation stays live (conservatively charged) until a valid terminal arrives
+or recovery charges it fail-safe.
+
+To keep replay, admission, and inspect work bounded, the ledger is compacted
+under the same OS lock: closed, out-of-window reservations and aged-out decision
+rows fold into a crash-safe durable checkpoint that preserves cumulative
+consumption and audit counters, while live reservations and recent activity stay
+in the active journal. A torn or stale-generation checkpoint is ignored and the
+journal is replayed in full, so partial compaction never double-counts or loses
+spend.
+
 `vibe-loop runs summary --json` includes a `budget` projection: per-limit
 consumed/reserved/remaining/utilization with warning and exceeded flags, and a
 per-provider (and per-provider-phase) route breakdown reported **separately and
 never summed across providers**, so Claude-versus-Codex route balancing has
-evidence without any cross-provider token equivalence.
+evidence without any cross-provider token equivalence. Projection lists are
+deterministically truncated with a dropped-count rather than emitted unbounded,
+and integrity/compaction counters accompany the report.
 
 Admission bounds **subsequent launches**, not token production inside an
 already-running model process: the provider CLIs enforce no hard per-invocation

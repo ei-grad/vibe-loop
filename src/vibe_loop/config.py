@@ -297,6 +297,10 @@ BUDGET_CONFIG_KEYS = frozenset(
 # Provider labels a budget selector may pin. Mirrors the usage-group providers
 # in telemetry; a selector never sums tokens across two of them.
 BUDGET_PROVIDERS = frozenset({"anthropic", "openai", "unknown"})
+# Route/limit cardinality is bounded so replay, admission, and inspect work stay
+# bounded; a configuration exceeding this is rejected rather than silently
+# truncated.
+BUDGET_MAX_LIMITS = 256
 # Worker phases a reservation may be attributed to. Imported from telemetry so
 # the budget vocabulary cannot drift from the usage-attribution vocabulary.
 BUDGET_PHASES = USAGE_PHASES
@@ -3085,6 +3089,11 @@ def parse_budget_limits(value: object) -> tuple[BudgetLimit, ...]:
         return ()
     if not isinstance(value, list):
         raise ValueError("budget.limits must be an array of limit tables")
+    if len(value) > BUDGET_MAX_LIMITS:
+        raise ValueError(
+            f"budget.limits has too many entries ({len(value)}); "
+            f"maximum {BUDGET_MAX_LIMITS}"
+        )
     limits: list[BudgetLimit] = []
     for index, entry in enumerate(value):
         label = f"budget.limits[{index}]"

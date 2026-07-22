@@ -82,7 +82,11 @@ from vibe_loop.locks import (
     build_lock_manager,
     redact_fencing_token_payload,
 )
-from vibe_loop.budget import BudgetStore
+from vibe_loop.budget import (
+    BudgetStore,
+    resolve_budget_ledger_path,
+    resolve_budget_project,
+)
 from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.orchestration import CandidateCollectionError, CandidateCollector
 from vibe_loop.runner import VibeRunner
@@ -1180,8 +1184,10 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
             hours=args.hours,
             slice_token_threshold=config.supervision.slice_token_threshold,
         )
-        budget_store = BudgetStore(config.state_path / "budget.jsonl", config.budget)
-        summary["budget"] = budget_store.projection(project=config.repo.name)
+        budget_store = BudgetStore(resolve_budget_ledger_path(config), config.budget)
+        summary["budget"] = budget_store.projection(
+            project=resolve_budget_project(config)
+        )
         if args.json:
             print(json.dumps(summary, indent=2))
         else:
