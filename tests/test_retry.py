@@ -433,30 +433,61 @@ class RetrySubprocessRunTests(unittest.TestCase):
         # Regression: the observed wall matches the transient patterns
         # ("usage limit"), so before limit-wall classification it burned all
         # three jittered retries against a wall that could not clear for days.
-        fake_sleep = MagicMock()
-        on_retry = MagicMock()
-        walls: list[LimitWallSignal] = []
-        wall_result = subprocess.CompletedProcess(
-            args=["test"], returncode=1, stdout="", stderr=OBSERVED_USAGE_WALL
+        # OBSERVED_USAGE_WALL advertises a fixed calendar instant, so the delay
+        # it yields shrinks as the ambient clock approaches it. Inject the
+        # reference instant: the wall must short-circuit the retries whether the
+        # advertised reset is days out or hours out.
+        reset = datetime.datetime(2026, 7, 25, 3, 24, tzinfo=datetime.timezone.utc)
+        for now in (
+            datetime.datetime(2026, 7, 20, 10, 19, tzinfo=datetime.timezone.utc),
+            datetime.datetime(2026, 7, 24, 22, 46, tzinfo=datetime.timezone.utc),
+        ):
+            with self.subTest(now=now):
+                fake_sleep = MagicMock()
+                on_retry = MagicMock()
+                walls: list[LimitWallSignal] = []
+                wall_result = subprocess.CompletedProcess(
+                    args=["test"], returncode=1, stdout="", stderr=OBSERVED_USAGE_WALL
+                )
+                with patch("subprocess.run", return_value=wall_result) as mock_run:
+                    result = retry_subprocess_run(
+                        ["test"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        max_retries=3,
+                        sleep=fake_sleep,
+                        on_retry=on_retry,
+                        detect_limit_walls=True,
+                        on_limit_wall=walls.append,
+                        now=now,
+                    )
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(mock_run.call_count, 1)
+                fake_sleep.assert_not_called()
+                on_retry.assert_not_called()
+                self.assertEqual(len(walls), 1)
+                self.assertAlmostEqual(
+                    walls[0].reset_delay,
+                    (reset - now).total_seconds() + QUOTA_RESET_MARGIN_SECONDS,
+                    delta=1.0,
+                )
+        # The two clocks straddle the transient cap, so the short-circuit above
+        # is not an artifact of the wall happening to advertise a long wait.
+        self.assertGreater(
+            (
+                reset
+                - datetime.datetime(2026, 7, 20, 10, 19, tzinfo=datetime.timezone.utc)
+            ).total_seconds(),
+            QUOTA_RESET_MAX_DELAY_SECONDS,
         )
-        with patch("subprocess.run", return_value=wall_result) as mock_run:
-            result = retry_subprocess_run(
-                ["test"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                max_retries=3,
-                sleep=fake_sleep,
-                on_retry=on_retry,
-                detect_limit_walls=True,
-                on_limit_wall=walls.append,
-            )
-        self.assertEqual(result.returncode, 1)
-        self.assertEqual(mock_run.call_count, 1)
-        fake_sleep.assert_not_called()
-        on_retry.assert_not_called()
-        self.assertEqual(len(walls), 1)
-        self.assertGreater(walls[0].reset_delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+        self.assertLess(
+            (
+                reset
+                - datetime.datetime(2026, 7, 24, 22, 46, tzinfo=datetime.timezone.utc)
+            ).total_seconds(),
+            QUOTA_RESET_MAX_DELAY_SECONDS,
+        )
 
     def test_limit_wall_on_stdout_is_detected(self) -> None:
         # Agent CLIs differ on which stream carries the refusal notice.

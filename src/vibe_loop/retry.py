@@ -456,8 +456,15 @@ def retry_subprocess_run(
     detect_limit_walls: bool = False,
     limit_wall_patterns: Iterable[str] | None = None,
     on_limit_wall: Callable[[LimitWallSignal], None] | None = None,
+    now: datetime.datetime | None = None,
     **subprocess_kwargs: Any,
 ) -> subprocess.CompletedProcess[str]:
+    """Run ``cmd`` with bounded retries.
+
+    ``now`` overrides the reference instant used to resolve an advertised reset
+    into a delay; it exists so callers (and tests) can reason about a wall
+    message against a fixed clock instead of the ambient one.
+    """
     interrupt_process_group = bool(
         subprocess_kwargs.pop("interrupt_process_group", False)
     )
@@ -488,7 +495,7 @@ def retry_subprocess_run(
         retry_as_transient = False
         if detect_limit_walls:
             wall, retry_as_transient = classify_limit_wall_result(
-                result, limit_wall_patterns
+                result, limit_wall_patterns, now=now
             )
             if wall is not None:
                 if on_limit_wall is not None:
@@ -508,7 +515,7 @@ def retry_subprocess_run(
             # into the same refusal.
             if detect_limit_walls and on_limit_wall is not None:
                 exhausted = detect_limit_wall(
-                    subprocess_result_output(result), limit_wall_patterns
+                    subprocess_result_output(result), limit_wall_patterns, now=now
                 )
                 if exhausted is not None:
                     on_limit_wall(exhausted)
