@@ -5213,8 +5213,14 @@ def execute_autopilot_cycle(
     planning_limit_wall_pause: float | None = None
     planning_backoff_pause: float | None = None
 
+    # A post-result strand is classified `result_recorded`, which wins over
+    # `missing_process` in the staleness chain, so filtering on the latter
+    # alone left exactly the locks that block the whole queue unreachable by
+    # any automatic recovery.
     cleanup_candidates = tuple(
-        lock for lock in status.stale_locks if lock.stale_reason == "missing_process"
+        lock
+        for lock in status.stale_locks
+        if lock.stale_reason == "missing_process" or lock.settlement_pending
     )
     if cleanup_candidates:
         lock_manager = build_lock_manager(
@@ -5229,16 +5235,23 @@ def execute_autopilot_cycle(
             return runner.source, runner.source_resolution.task_source
 
         # The cycle never forces: a settlement-pending lock is released here
-        # only when the authoritative source is confirmed settled, so a stale
-        # latch cannot keep the whole repository's dispatch blocked.
+        # only when the authoritative source is confirmed settled or the fenced
+        # settle-then-release path succeeds, so a stale latch cannot keep the
+        # whole repository's dispatch blocked while an unsettled source still
+        # holds its lock.
         clean_result = clean_stale_locks(
             list(cleanup_candidates),
             lock_manager,
             settlement_recovery=TaskSourceSettlementRecovery(autopilot_task_source),
+            run_store=run_store,
         )
         record_expired_locks(run_store, clean_result.cleaned)
         if clean_result.cleaned:
             actions.append(f"cleaned_stale_locks:{len(clean_result.cleaned)}")
+        if clean_result.recovered:
+            actions.append(
+                f"settled_stale_locks:{len(clean_result.recovered)}",
+            )
         if clean_result.errors:
             cleanup_errors = len(clean_result.errors)
             actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")

@@ -2655,6 +2655,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
             settlement_recovery=TaskSourceSettlementRecovery(
                 lambda: (runner.source, runner.source_resolution.task_source),
             ),
+            run_store=runner.run_store,
             force=True,
         )
         record_expired_locks(runner.run_store, result.cleaned)
@@ -2664,6 +2665,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
                     {
                         "stale_locks": [s.to_json() for s in stale],
                         "cleaned": [s.to_json() for s in result.cleaned],
+                        "recovered": [s.to_json() for s in result.recovered],
                         "errors": [
                             {"lock": s.to_json(), "error": msg}
                             for s, msg in result.errors
@@ -2674,6 +2676,9 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
                 )
             )
         else:
+            if result.recovered:
+                print(f"Settled and released {len(result.recovered)} stale lock(s):")
+                print(render_stale_locks(result.recovered))
             if result.cleaned:
                 print(f"Removed {len(result.cleaned)} stale lock(s):")
                 print(render_stale_locks(result.cleaned))
@@ -2681,9 +2686,10 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
                 print(f"settlement: {note}")
             for lock, msg in result.errors:
                 print(f"error: {lock.task_id}: {msg}", file=sys.stderr)
-            if not result.cleaned and result.errors:
+            if not result.cleaned and not result.recovered and result.errors:
                 print("No locks were removed due to errors.", file=sys.stderr)
-        return 1 if result.errors and not result.cleaned else 0
+        released_any = bool(result.cleaned or result.recovered)
+        return 1 if result.errors and not released_any else 0
     if args.json:
         print(
             json.dumps(

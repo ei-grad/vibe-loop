@@ -27,8 +27,9 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
     validate_lock_fencing_token,
 )
+from vibe_loop.config import TaskSourceConfig
 from vibe_loop.processes import process_birth_identity
-from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES
+from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
@@ -1867,32 +1868,36 @@ SETTLED_SOURCE_STATUSES = frozenset({"on-hold", "on_hold", "parked", "done"})
 
 
 class TaskSourceSettlementRecovery:
-    """Authoritative-source view used to recover a settlement-pending lock.
+    """Recovery ladder for a lock stranded by a failed task-source settlement.
 
-    `settlement_pending` is a latch recorded when the runtime's own settlement
-    attempts failed. It says nothing about the source's current status, so
-    recovery re-reads the source instead of trusting the latch: a source that
-    somebody has since settled must not keep a lock unreleasable. The reset
-    here carries no fencing claim - it is the operator-conservative path an
-    adapter is allowed to serve once the lock is released.
+    Three rungs, strongest first. `settlement_pending` is a latch recorded when
+    the runtime's own settlement attempts failed; it says nothing about the
+    source's current status, so recovery re-reads the source first - a source
+    somebody has since settled must not keep a lock unreleasable. Otherwise it
+    replays the designed fenced path (`recover_and_release`) under this
+    installation's own recorded lock generation, which settles while the lock
+    is still held and releases only after confirmation. Only when that also
+    fails does the caller fall back to an explicit forced release, after which
+    `reset` runs the operator-conservative path, carrying no fencing claim,
+    that an adapter serves for a released task.
     """
 
     def __init__(
         self,
-        source_provider: Callable[[], tuple[Any, Any]],
+        source_provider: Callable[[], tuple[TaskSource, TaskSourceConfig]],
     ) -> None:
         self.source_provider = source_provider
-        self._resolved: tuple[Any, Any] | None = None
+        self._resolved: tuple[TaskSource | None, TaskSourceConfig | None] | None = None
 
     @property
-    def source(self) -> Any | None:
+    def source(self) -> TaskSource | None:
         return self._resolve()[0]
 
     @property
-    def task_source_config(self) -> Any | None:
+    def task_source_config(self) -> TaskSourceConfig | None:
         return self._resolve()[1]
 
-    def _resolve(self) -> tuple[Any | None, Any | None]:
+    def _resolve(self) -> tuple[TaskSource | None, TaskSourceConfig | None]:
         if self._resolved is None:
             try:
                 self._resolved = self.source_provider()
@@ -1907,22 +1912,91 @@ class TaskSourceSettlementRecovery:
 
     def settled(self, task_id: str) -> bool:
         task = self.probe(task_id)
-        if task is None:
+        config = self.task_source_config
+        if task is None or config is None or not task.status:
             return False
-        status = str(getattr(task, "status", "")).casefold()
-        if not status:
-            return False
-        runnable = {
-            candidate.casefold()
-            for candidate in getattr(self.task_source_config, "runnable_statuses", ())
-        }
+        status = task.status.casefold()
+        runnable = {candidate.casefold() for candidate in config.runnable_statuses}
         return (
             status in runnable
             or status in BLOCKED_FAMILY_STATUSES
             or status in SETTLED_SOURCE_STATUSES
         )
 
-    def probe(self, task_id: str) -> Any | None:
+    def recover_and_release(
+        self,
+        lock: StaleLock,
+        lock_manager: LockManager,
+        run_store: RunStore | None,
+    ) -> tuple[bool, str]:
+        """Settle under the held lock, then release - the designed fenced path.
+
+        The claim is this installation's recorded acquire generation, not the
+        generation read back from the lock itself, so the ownership check is a
+        real comparison rather than a tautology. The adapter is invoked with
+        the same fenced runtime context the run used, which is what lets a
+        backend permit settlement while the owner still holds its lock.
+        """
+
+        from vibe_loop.orchestration import (
+            TaskSourceCompletionError,
+            TaskSourceSettler,
+            settlement_intent,
+        )
+
+        source, config = self._resolve()
+        if source is None or config is None:
+            return False, "the configured task source could not be loaded"
+        if run_store is None:
+            return False, "fenced recovery requires the run store"
+        if not lock.run_id:
+            return False, "the lock records no run id to claim ownership with"
+        token = fencing_token_value(lock_manager.local_fencing_token(lock.task_id))
+        if not token:
+            return False, "this installation recorded no acquire generation"
+        try:
+            current = lock_manager.current_lock(lock.task_id)
+        except LockBackendError as exc:
+            return False, str(exc)
+        metadata = dict(current.metadata)
+        metadata["fencing_token"] = token
+        settler = TaskSourceSettler(
+            source=source,
+            task_source_config=config,
+            lock_manager=lock_manager,
+            task_lock=TaskLock(
+                task_id=lock.task_id,
+                path=current.path,
+                metadata=metadata,
+            ),
+            run_store=run_store,
+            run_id=lock.run_id,
+            task_id=lock.task_id,
+            runtime_context={
+                "VIBE_LOOP_TASK_ID": lock.task_id,
+                "VIBE_LOOP_RUN_ID": lock.run_id,
+                "VIBE_LOOP_FENCING_TOKEN": token,
+            },
+            max_attempts=1,
+            backoff_seconds=0,
+        )
+        intent = settlement_intent(lock.settled_classification)
+        try:
+            result = settler.recover_and_release(intent)
+        except (
+            TaskSourceCompletionError,
+            LockBackendError,
+            LockFencingMismatch,
+            OSError,
+            subprocess.SubprocessError,
+            ValueError,
+        ) as exc:
+            return False, str(exc)
+        if not result.settled:
+            return False, "the adapter did not settle the source under its own lock"
+        return True, ""
+
+    def probe(self, task_id: str) -> Task | None:
         source = self.source
         if source is None:
             return None
@@ -1932,10 +2006,10 @@ class TaskSourceSettlementRecovery:
             return None
 
     def reset(self, task_id: str) -> tuple[bool, str]:
-        source = self.source
-        if source is None:
+        source, config = self._resolve()
+        if source is None or config is None:
             return False, "the configured task source could not be loaded"
-        if not getattr(self.task_source_config, "reset_command", ""):
+        if not config.reset_command:
             return False, "no task_source.reset adapter is configured"
         try:
             source.reset(task_id)
@@ -1946,7 +2020,8 @@ class TaskSourceSettlementRecovery:
         return True, ""
 
     def reset_command(self, task_id: str) -> str:
-        template = getattr(self.task_source_config, "reset_command", "") or ""
+        config = self.task_source_config
+        template = (config.reset_command if config is not None else "") or ""
         if not template:
             return ""
         try:
@@ -1960,6 +2035,10 @@ class CleanResult:
     cleaned: list[StaleLock]
     errors: list[tuple[StaleLock, str]]
     notes: list[str] = dataclasses.field(default_factory=list)
+    # Locks the fenced settle-then-release path recovered. They are released
+    # under their own run identity with a `lock_released` record, so they are
+    # deliberately not `cleaned`: they did not expire, they settled.
+    recovered: list[StaleLock] = dataclasses.field(default_factory=list)
 
 
 def clean_stale_locks(
@@ -1967,35 +2046,53 @@ def clean_stale_locks(
     lock_manager: LockManager | None = None,
     *,
     settlement_recovery: TaskSourceSettlementRecovery | None = None,
+    run_store: RunStore | None = None,
     force: bool = False,
 ) -> CleanResult:
     cleaned: list[StaleLock] = []
     errors: list[tuple[StaleLock, str]] = []
     notes: list[str] = []
+    recovered: list[StaleLock] = []
     forced_unsettled: list[StaleLock] = []
     for lock in stale_locks:
         if lock.settlement_pending:
             settled = settlement_recovery is not None and settlement_recovery.settled(
                 lock.task_id
             )
+            fenced_detail = ""
+            if not settled and settlement_recovery is not None and lock_manager:
+                fenced, fenced_detail = settlement_recovery.recover_and_release(
+                    lock,
+                    lock_manager,
+                    run_store,
+                )
+                if fenced:
+                    notes.append(
+                        f"{lock.task_id}: settled the task source under the "
+                        "run's own fenced lock ownership, then released"
+                    )
+                    recovered.append(lock)
+                    continue
             if settled:
                 notes.append(
                     f"{lock.task_id}: task source is already settled; "
                     "releasing the lock its settlement latch was holding"
                 )
             elif force:
-                # Refusing here is what made the state terminal: the source
-                # refuses to settle under a held lock, so the lock must go
-                # first and settlement is retried after the release.
+                # Refusing here is what made the state terminal: an adapter may
+                # refuse every call made while the lock is held, so once fenced
+                # settlement has failed the lock must go first and settlement
+                # is retried after the release.
                 forced_unsettled.append(lock)
             else:
+                detail = f" ({fenced_detail})" if fenced_detail else ""
                 errors.append(
                     (
                         lock,
-                        "task-source settlement pending; the authoritative "
-                        "source is not settled. Run `vibe-loop workers clean "
-                        "--force` to release the lock and settle the source "
-                        "afterwards",
+                        "task-source settlement pending; fenced recovery could "
+                        f"not settle the authoritative source{detail}. Run "
+                        "`vibe-loop workers clean --force` to release the lock "
+                        "and settle the source afterwards",
                     )
                 )
                 continue
@@ -2033,7 +2130,12 @@ def clean_stale_locks(
         notes.extend(
             settle_released_task_source(lock.task_id, settlement_recovery),
         )
-    return CleanResult(cleaned=cleaned, errors=errors, notes=notes)
+    return CleanResult(
+        cleaned=cleaned,
+        errors=errors,
+        notes=notes,
+        recovered=recovered,
+    )
 
 
 def settle_released_task_source(

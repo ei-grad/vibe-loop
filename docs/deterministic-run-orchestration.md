@@ -217,12 +217,19 @@ with its durable outcome and retries settlement once more with no fencing
 claim, on the operator-conservative path the adapter serves for a released
 task, appending `task_source_settled` on success and a `post_release`
 `task_source_settlement_attempted` (naming the adapter command to run) on
-failure. Generic stale-lock cleanup keeps refusing a settlement-pending lock
-by default, but re-reads the authoritative source first — a source somebody
-has since settled releases immediately — and `vibe-loop workers clean
---force` is terminal: it releases the lock and then settles the source. The
-task source is authoritative for dispatch, so a released lock over an
-unsettled (still in-progress) source blocks nothing and dispatches nothing.
+failure.
+
+Stale-lock cleanup runs the same contract as a recovery ladder, strongest rung
+first: re-read the authoritative source (a source somebody has since settled
+releases immediately); else replay the fenced settle-then-release path under
+this installation's recorded acquire generation; else refuse, naming
+`vibe-loop workers clean --force`, which is terminal — it releases the lock and
+then settles the source. The autopilot cycle runs the first two rungs (never
+`--force`), and its cleanup candidates include settlement-pending locks, whose
+`result_recorded` staleness would otherwise put them out of reach of every
+automatic recovery while they block the whole queue. The task source is
+authoritative for dispatch, so a released lock over an unsettled (still
+in-progress) source blocks nothing and dispatches nothing.
 
 Recovery: `run` (or the scheduler's unknown-run recovery) resumes from the
 last journaled stage instead of restarting the whole lifecycle from scratch.
