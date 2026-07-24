@@ -4,6 +4,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -801,6 +802,59 @@ class RuntimeGateTests(unittest.TestCase):
             CandidateCollectionError, "does not match the claimed workspace"
         ):
             self.collector.collect_declared(head_commit=self.base)
+
+    def test_candidate_declaration_resolves_revisions_before_comparing(self) -> None:
+        for revision in ("HEAD", self.head[:8], self.head):
+            with self.subTest(revision=revision):
+                declared = self.collector.collect_declared(
+                    head_commit=revision, base_main="HEAD~1"
+                )
+                self.assertEqual(declared.head_commit, self.head)
+                self.assertEqual(declared.base_main, self.base)
+
+    def test_candidate_declaration_of_other_commit_is_still_a_mismatch(self) -> None:
+        with self.assertRaisesRegex(
+            CandidateCollectionError, "does not match the claimed workspace"
+        ):
+            self.collector.collect_declared(head_commit="HEAD~1")
+
+        with self.assertRaisesRegex(
+            CandidateCollectionError, "does not match the claimed workspace"
+        ):
+            self.collector.collect_declared(head_commit="HEAD", base_main=self.head)
+
+    def test_candidate_declaration_of_unresolvable_revision_is_named(self) -> None:
+        with self.assertRaises(CandidateCollectionError) as raised:
+            self.collector.collect_declared(head_commit="no-such-revision")
+
+        self.assertEqual(
+            raised.exception.code, "candidate_declaration_unresolvable_revision"
+        )
+        self.assertEqual(raised.exception.details["field"], "head_commit")
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            self.collector.collect_declared(
+                head_commit="HEAD", base_main="no-such-revision"
+            )
+
+        self.assertEqual(
+            raised.exception.code, "candidate_declaration_unresolvable_revision"
+        )
+        self.assertEqual(raised.exception.details["field"], "base_main")
+
+    def test_worker_prompt_template_candidate_command_is_accepted(self) -> None:
+        from vibe_loop.runner import RUNTIME_OWNED_WORKER_ADDENDUM
+
+        templated = re.search(
+            r"vibe-loop worker candidate\b[^`]*?--head (\S+)",
+            RUNTIME_OWNED_WORKER_ADDENDUM,
+        )
+        self.assertIsNotNone(templated, "worker prompt no longer declares a candidate")
+        assert templated is not None
+
+        declared = self.collector.collect_declared(head_commit=templated.group(1))
+
+        self.assertEqual(declared.head_commit, self.head)
 
     def test_candidate_rejects_uncommitted_tracked_changes(self) -> None:
         (self.repo / "tracked.txt").write_text("changed\n", encoding="utf-8")

@@ -553,16 +553,23 @@ class CandidateCollector:
     ) -> CandidateRecord:
         candidate = self.snapshot(source="worker_command")
         mismatches: dict[str, object] = {}
-        if head_commit != candidate.head_commit:
+        resolved_head = self._resolve_declared_revision("head_commit", head_commit)
+        if resolved_head != candidate.head_commit:
             mismatches["head_commit"] = {
                 "declared": head_commit,
+                "resolved": resolved_head,
                 "observed": candidate.head_commit,
             }
-        if base_main and base_main != candidate.base_main:
-            mismatches["base_main"] = {
-                "declared": base_main,
-                "observed": candidate.base_main,
-            }
+        if base_main:
+            resolved_declared_base = self._resolve_declared_revision(
+                "base_main", base_main
+            )
+            if resolved_declared_base != candidate.base_main:
+                mismatches["base_main"] = {
+                    "declared": base_main,
+                    "resolved": resolved_declared_base,
+                    "observed": candidate.base_main,
+                }
         if changed_paths:
             declared_paths = tuple(sorted(set(changed_paths)))
             if declared_paths != candidate.changed_paths:
@@ -578,6 +585,27 @@ class CandidateCollector:
             )
         self._record(candidate)
         return candidate
+
+    def _resolve_declared_revision(self, field: str, revision: str) -> str:
+        """Resolve a worker-declared revision inside the claimed workspace.
+
+        Declarations are Git revisions, not necessarily object ids: the worker
+        prompt template declares ``--head HEAD``. Resolving before comparison
+        keeps ``worker candidate`` consistent with ``report --commit``.
+        """
+
+        result = self._git_result(
+            "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"
+        )
+        resolved = result.stdout.strip()
+        if result.returncode != 0 or not resolved:
+            raise CandidateCollectionError(
+                "candidate_declaration_unresolvable_revision",
+                "candidate declaration names a revision that does not resolve "
+                "in the claimed workspace",
+                details={"field": field, "declared": revision},
+            )
+        return resolved
 
     def snapshot(self, *, source: str) -> CandidateRecord:
         observed_branch = self._git_text("branch", "--show-current")
