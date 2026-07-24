@@ -7731,6 +7731,88 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 release_metadata["fencing_token"],
             )
 
+    def test_post_result_settlement_refusal_releases_then_settles_unfenced(
+        self,
+    ) -> None:
+        # Live deadlock (2026-07-24): a run that failed after its result was
+        # recorded settled through an adapter that refuses every call made
+        # while the lock is held. The lock then refused to release before
+        # settlement and the source refused to settle before release, which
+        # stranded the task and, through it, the whole repository's dispatch.
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            fenced_attempts: list[dict[str, str]] = []
+
+            def refuse_while_locked(
+                task_id: str,
+                *args: object,
+                runtime_context: dict[str, str] | None = None,
+                **kwargs: object,
+            ) -> bool:
+                if lock_manager.is_locked(task_id):
+                    fenced_attempts.append(dict(runtime_context or {}))
+                    raise subprocess.CalledProcessError(
+                        3,
+                        f"task-source-reset {task_id}",
+                        stderr=(
+                            f'task-source: task "{task_id}" has an unreleased '
+                            "lock; refusing unfenced reset\n"
+                        ),
+                    )
+                source.settlement_context = dict(runtime_context or {})
+                source.status = "ready"
+                return True
+
+            source.reset = refuse_while_locked  # type: ignore[method-assign]
+            source.park = refuse_while_locked  # type: ignore[method-assign]
+
+            def timed_out_worker(command, cwd, log, **kwargs):
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGKILL,
+                    timed_out=True,
+                )
+
+            result = self._run_task(runner, task, timed_out_worker)
+            records = runner.run_store.read_records()
+
+        self.assertEqual(result.classification, "timed_out")
+        # The fenced path was tried first and its refusal is diagnosable.
+        attempted = [
+            record
+            for record in records
+            if record.get("record_type") == "task_source_settlement_attempted"
+        ]
+        self.assertTrue(attempted)
+        self.assertEqual(attempted[0]["error_class"], "CalledProcessError")
+        self.assertEqual(attempted[0]["exit_code"], 3)
+        self.assertIn("refusing unfenced reset", attempted[0]["stderr"])
+        self.assertEqual(attempted[0]["confirmed_status"], "active")
+        self.assertTrue(fenced_attempts[0]["VIBE_LOOP_FENCING_TOKEN"])
+        # Recovery converged: the lock released and the source settled after.
+        self.assertFalse(lock_manager.is_locked("T-1"))
+        self.assertEqual(source.status, "ready")
+        settled = [
+            record
+            for record in records
+            if record.get("record_type") == "task_source_settled"
+        ]
+        self.assertEqual(len(settled), 1)
+        self.assertTrue(settled[0]["settled"])
+        self.assertTrue(settled[0]["recovered"])
+        self.assertEqual(settled[0]["confirmed_status"], "ready")
+        stale = collect_stale_locks(
+            lock_manager,
+            runner.run_store,
+            current_host=socket.gethostname(),
+            process_exists=lambda pid: False,
+        )
+        self.assertEqual(stale, [])
+
     def test_first_accepted_report_survives_a_later_differing_report(self) -> None:
         # A worker that files ``completed``, has that report accepted (observed
         # by the watchdog), then files a second ``failed`` report before teardown

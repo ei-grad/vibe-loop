@@ -18,6 +18,7 @@ from vibe_loop.locks import (
     build_lock_manager,
 )
 from vibe_loop.orchestration import RunStage, StageTransition
+from vibe_loop.tasks import Task
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     RunLifecycleEvent,
@@ -40,6 +41,7 @@ from vibe_loop.workers import (
     KEEP_UNMERGED_WORKTREE,
     ActiveRunState,
     StaleLock,
+    TaskSourceSettlementRecovery,
     WorkerView,
     WorkspaceClaim,
     WorktreeDispositionDecision,
@@ -1681,6 +1683,38 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
+@dataclasses.dataclass
+class _RecoveryConfig:
+    reset_command: str = "reset {task_id}"
+    runnable_statuses: tuple[str, ...] = ("ready",)
+
+
+class _RecoverySource:
+    """Task source double for settlement recovery over a stranded lock."""
+
+    def __init__(
+        self,
+        status: str,
+        *,
+        settled_status: str = "",
+        reset_error: Exception | None = None,
+    ) -> None:
+        self.status = status
+        self.settled_status = settled_status
+        self.reset_error = reset_error
+        self.reset_calls = 0
+
+    def probe(self, task_id: str) -> Task:
+        return Task(task_id=task_id, title="Task", status=self.status)
+
+    def reset(self, task_id: str, **kwargs: object) -> bool:
+        self.reset_calls += 1
+        if self.reset_error is not None:
+            raise self.reset_error
+        self.status = self.settled_status or self.status
+        return True
+
+
 class StaleLockTests(unittest.TestCase):
     def test_collect_stale_task_lock_with_missing_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1844,8 +1878,125 @@ class StaleLockTests(unittest.TestCase):
             self.assertEqual(len(stale), 1)
             self.assertTrue(stale[0].settlement_pending)
             self.assertEqual(result.cleaned, [])
-            self.assertIn("stage-aware fenced recovery", result.errors[0][1])
+            self.assertIn(
+                "vibe-loop workers clean --force",
+                result.errors[0][1],
+            )
             self.assertTrue(manager.is_locked("TASK-01"))
+
+    def _settlement_pending_lock(
+        self,
+        repo: Path,
+    ) -> tuple[LockManager, RunStore, list[StaleLock]]:
+        manager = LockManager(repo / ".vibe-loop" / "locks")
+        run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+        state = ActiveRunState(
+            task_id="TASK-01",
+            run_id="run-1",
+            worker_pid=100,
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+            base_main="abc123",
+            command="agent TASK-01",
+        )
+        manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.task_source_settlement_attempted(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload={
+                    "intent": "requeue",
+                    "adapter": "task_source.reset",
+                    "retry_ordinal": 1,
+                    "error_class": "CalledProcessError",
+                    "exit_code": 3,
+                },
+            )
+        )
+        stale = collect_stale_locks(
+            manager,
+            run_store,
+            current_host="test-host",
+            process_exists=lambda pid: False,
+        )
+        return manager, run_store, stale
+
+    def test_settled_source_clears_a_stale_settlement_latch(self) -> None:
+        # The latch records that settlement failed once, not that the source is
+        # still unsettled: an operator who settled it by hand must not have to
+        # reach into the lock backend to get the lock released.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, _, stale = self._settlement_pending_lock(Path(directory))
+            recovery = TaskSourceSettlementRecovery(
+                lambda: (_RecoverySource("ready"), _RecoveryConfig())
+            )
+
+            result = clean_stale_locks(stale, manager, settlement_recovery=recovery)
+
+            self.assertEqual([lock.task_id for lock in result.cleaned], ["TASK-01"])
+            self.assertEqual(result.errors, [])
+            self.assertIn("already settled", result.notes[0])
+            self.assertFalse(manager.is_locked("TASK-01"))
+
+    def test_force_releases_then_settles_an_unsettled_source(self) -> None:
+        # The terminal recovery for the deadlock: --force releases the lock the
+        # source refused to settle under, then settles the source afterwards.
+        with tempfile.TemporaryDirectory() as directory:
+            manager, _, stale = self._settlement_pending_lock(Path(directory))
+            source = _RecoverySource("active", settled_status="ready")
+            recovery = TaskSourceSettlementRecovery(lambda: (source, _RecoveryConfig()))
+
+            result = clean_stale_locks(
+                stale,
+                manager,
+                settlement_recovery=recovery,
+                force=True,
+            )
+
+            self.assertEqual([lock.task_id for lock in result.cleaned], ["TASK-01"])
+            self.assertEqual(result.errors, [])
+            self.assertEqual(source.reset_calls, 1)
+            self.assertIn("settled after the lock release", result.notes[0])
+            self.assertFalse(manager.is_locked("TASK-01"))
+
+    def test_force_names_the_adapter_command_when_settlement_still_fails(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, _, stale = self._settlement_pending_lock(Path(directory))
+            source = _RecoverySource("active", reset_error=OSError("adapter down"))
+            recovery = TaskSourceSettlementRecovery(lambda: (source, _RecoveryConfig()))
+
+            result = clean_stale_locks(
+                stale,
+                manager,
+                settlement_recovery=recovery,
+                force=True,
+            )
+
+            self.assertEqual([lock.task_id for lock in result.cleaned], ["TASK-01"])
+            self.assertFalse(manager.is_locked("TASK-01"))
+            self.assertIn("adapter down", result.notes[0])
+            self.assertIn("run: reset TASK-01", result.notes[0])
+
+    def test_force_releases_without_a_loadable_task_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manager, _, stale = self._settlement_pending_lock(Path(directory))
+
+            def broken_source() -> tuple[object, object]:
+                raise RuntimeError("no task source configured")
+
+            result = clean_stale_locks(
+                stale,
+                manager,
+                settlement_recovery=TaskSourceSettlementRecovery(broken_source),
+                force=True,
+            )
+
+            self.assertEqual([lock.task_id for lock in result.cleaned], ["TASK-01"])
+            self.assertFalse(manager.is_locked("TASK-01"))
+            self.assertIn("still unsettled", result.notes[0])
 
     def test_generic_cleanup_refuses_activated_runtime_run_before_first_attempt(
         self,

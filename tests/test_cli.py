@@ -39,6 +39,7 @@ from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
+    RunLifecycleEvent,
     RunStore,
     utc_now_iso,
 )
@@ -8200,6 +8201,94 @@ class CliTests(unittest.TestCase):
         self.assertEqual(records[0]["task_id"], "TASK-01")
         self.assertEqual(records[0]["lock_kind"], "integration")
         self.assertEqual(records[0]["started_at"], "2026-05-09T00:00:00+00:00")
+
+    def test_workers_clean_force_settles_a_source_that_refuses_while_locked(
+        self,
+    ) -> None:
+        # End-to-end cover for the post-result settlement deadlock: the adapter
+        # refuses every call made while the lock is held, so --force has to
+        # release first and settle afterwards instead of refusing in turn.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            state = repo / "task-state.json"
+            state.write_text(
+                json.dumps({"id": "TASK-01", "title": "Task", "status": "active"}),
+                encoding="utf-8",
+            )
+            lock_path = repo / ".vibe-loop" / "locks" / "TASK-01.lock"
+            (repo / "reset.py").write_text(
+                "import json, pathlib, sys\n"
+                f"lock = pathlib.Path({str(lock_path)!r})\n"
+                f"state = pathlib.Path({str(state)!r})\n"
+                "if lock.exists():\n"
+                "    sys.stderr.write("
+                '\'task "TASK-01" has an unreleased lock; '
+                "refusing unfenced reset\\n')\n"
+                "    raise SystemExit(3)\n"
+                "payload = json.loads(state.read_text())\n"
+                "payload['status'] = 'ready'\n"
+                "state.write_text(json.dumps(payload))\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "command"\n'
+                f'list = "{sys.executable} -c \\"import pathlib,sys;'
+                f"sys.stdout.write('['+pathlib.Path(r'{state}').read_text()+']')\\\"\"\n"
+                f'probe = "cat {state}"\n'
+                f'reset = "{sys.executable} {repo / "reset.py"} {{task_id}}"\n'
+                'runnable_statuses = ["ready"]\n',
+                encoding="utf-8",
+            )
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata={
+                    "record_type": "active_run",
+                    "schema_version": 1,
+                    "task_id": "TASK-01",
+                    "run_id": "run-1",
+                    "pid": 999999999,
+                    "worker_pid": 999999999,
+                    "host": socket.gethostname(),
+                    "started_at": "2026-05-09T00:00:00+00:00",
+                    "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                    "base_main": "abc123",
+                    "command": "agent TASK-01",
+                },
+            )
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.task_source_settlement_attempted(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    payload={
+                        "intent": "requeue",
+                        "adapter": "task_source.reset",
+                        "retry_ordinal": 3,
+                        "error_class": "CalledProcessError",
+                        "exit_code": 3,
+                    },
+                )
+            )
+
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                refused = main(["workers", "--repo", str(repo), "clean"])
+            self.assertEqual(refused, 0)
+            self.assertTrue(manager.is_locked("TASK-01"))
+
+            forced_out = StringIO()
+            with redirect_stdout(forced_out):
+                exit_code = main(["workers", "--repo", str(repo), "clean", "--force"])
+            still_locked = manager.is_locked("TASK-01")
+            final_status = json.loads(state.read_text(encoding="utf-8"))["status"]
+
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(still_locked)
+        self.assertEqual(final_status, "ready")
+        self.assertIn("settled after the lock release", forced_out.getvalue())
 
     def test_workers_clean_json_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

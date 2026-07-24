@@ -66,8 +66,12 @@ results are missing or ambiguous.
   project-owned through explicit task-source adapters. `task_source.complete`
   confirms done only after integration; `task_source.reset` confirms requeue;
   optional `task_source.park` confirms a held terminal-failure state. Failed or
-  unconfirmed settlement retains the exact task lock for fenced recovery, and
-  generic stale-lock cleanup refuses that settlement-pending generation.
+  unconfirmed settlement retains the exact task lock for bounded fenced
+  recovery, and generic stale-lock cleanup refuses that settlement-pending
+  generation by default. Retention is bounded: an adapter that refuses while
+  the lock is held would otherwise strand the task forever, so exhausted fenced
+  attempts and `vibe-loop workers clean --force` release the lock and settle the
+  source afterwards.
 - Keeping task state in the active task source is a deliberate design choice.
   Agents and humans working without the `vibe-loop` supervisor must be able to
   manage task status through the same project-owned plan, tracker, or adapter.

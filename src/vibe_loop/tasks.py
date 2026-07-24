@@ -18,9 +18,11 @@ from vibe_loop.config import (
 from vibe_loop.locks import (
     fencing_token_value,
     redact_exact_fencing_token,
+    redact_fencing_token_text,
 )
 
 
+TASK_SOURCE_ERROR_STREAM_LIMIT = 2000
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
@@ -2453,6 +2455,49 @@ def redact_task_source_subprocess_error(
     error.cmd = redact_exact_fencing_token(error.cmd, fencing_token)
     error.output = redact_exact_fencing_token(error.output, fencing_token)
     error.stderr = redact_exact_fencing_token(error.stderr, fencing_token)
+
+
+def task_source_error_diagnostics(
+    error: BaseException,
+    fencing_token: str = "",
+) -> dict[str, object]:
+    """Diagnosable evidence for a failed task-source adapter call.
+
+    Redaction removes the exact fencing token and nothing else: an adapter's
+    own refusal text is the only thing that explains why settlement failed, so
+    stripping it would leave `error_class` alone - which is what made the
+    post-result settlement deadlock undiagnosable from the run record. The
+    captured stream is bounded to its tail because adapters put the refusal on
+    the last line.
+    """
+
+    diagnostics: dict[str, object] = {"error_class": type(error).__name__}
+    exit_code = getattr(error, "returncode", None)
+    if isinstance(exit_code, int):
+        diagnostics["exit_code"] = exit_code
+    timeout = getattr(error, "timeout", None)
+    if isinstance(timeout, (int, float)):
+        diagnostics["timeout_seconds"] = float(timeout)
+    stderr = bounded_error_stream(getattr(error, "stderr", None))
+    if stderr:
+        diagnostics["stderr"] = redact_fencing_token_text(stderr, fencing_token)
+    return diagnostics
+
+
+def bounded_error_stream(
+    value: object,
+    limit: int = TASK_SOURCE_ERROR_STREAM_LIMIT,
+) -> str:
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    elif isinstance(value, str):
+        text = value
+    else:
+        return ""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return f"...{text[-limit:]}"
 
 
 def task_from_mapping(value: object, order: int) -> Task:

@@ -2308,6 +2308,123 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         )
         self.assertEqual(record_types[-1], "lock_released")
 
+    def test_failed_settlement_records_exit_code_and_redacted_stderr(self) -> None:
+        source = MutableTaskSource()
+        token = "fencing-generation-8125"
+
+        def refusing_reset(task_id: str, **kwargs: object) -> bool:
+            raise subprocess.CalledProcessError(
+                3,
+                f"task-source-reset {task_id}",
+                stderr=(
+                    f'task-source: task "{task_id}" has an unreleased lock; '
+                    f"refusing unfenced reset (token {token})\n"
+                ),
+            )
+
+        source.reset = refusing_reset  # type: ignore[method-assign]
+        settler = self.settler(
+            source,
+            park=False,
+            max_attempts=1,
+            runtime_context=MappingProxyType({"VIBE_LOOP_FENCING_TOKEN": token}),
+        )
+
+        result = settler.settle("requeue")
+
+        self.assertTrue(result.settlement_pending)
+        attempted = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "task_source_settlement_attempted"
+        ]
+        self.assertEqual(len(attempted), 1)
+        self.assertEqual(attempted[0]["error_class"], "CalledProcessError")
+        self.assertEqual(attempted[0]["exit_code"], 3)
+        # The diagnosis survives redaction; only the token is removed.
+        self.assertIn("refusing unfenced reset", attempted[0]["stderr"])
+        self.assertNotIn(token, json.dumps(attempted[0]))
+        self.assertEqual(attempted[0]["confirmed_status"], "active")
+
+    def test_settlement_recognizes_a_source_settled_under_a_failing_adapter(
+        self,
+    ) -> None:
+        source = MutableTaskSource()
+
+        def failing_reset(task_id: str, **kwargs: object) -> bool:
+            source.status = "ready"
+            raise subprocess.CalledProcessError(1, "reset", stderr="lost response\n")
+
+        source.reset = failing_reset  # type: ignore[method-assign]
+
+        result = self.settler(source, park=False, max_attempts=1).settle("requeue")
+
+        self.assertTrue(result.settled)
+        self.assertEqual(result.confirmed_status, "ready")
+        self.assertNotIn(
+            "task_source_settlement_attempted",
+            [record["record_type"] for record in self.store.read_records()],
+        )
+
+    def test_post_release_settlement_runs_unfenced_and_names_the_command(self) -> None:
+        source = MutableTaskSource()
+        contexts: list[dict[str, str]] = []
+
+        def refuse_while_locked(task_id: str, **kwargs: object) -> bool:
+            contexts.append(dict(kwargs.get("runtime_context") or {}))  # type: ignore[arg-type]
+            if self.manager.is_locked(task_id):
+                raise subprocess.CalledProcessError(
+                    3,
+                    "reset",
+                    stderr="unreleased lock; refusing unfenced reset\n",
+                )
+            source.status = "ready"
+            return True
+
+        source.reset = refuse_while_locked  # type: ignore[method-assign]
+        settler = self.settler(
+            source,
+            park=False,
+            max_attempts=1,
+            runtime_context=MappingProxyType({"VIBE_LOOP_FENCING_TOKEN": "7"}),
+        )
+        self.assertTrue(settler.settle("requeue").settlement_pending)
+
+        self.manager.release(self.task_lock)
+        settled = settler.settle_after_release("requeue")
+
+        self.assertTrue(settled.settled)
+        self.assertTrue(settled.recovered)
+        self.assertEqual(source.status, "ready")
+        # The fenced attempt carried the token; the post-release one must not.
+        self.assertEqual(contexts[0]["VIBE_LOOP_FENCING_TOKEN"], "7")
+        self.assertEqual(contexts[-1], {})
+        self.assertEqual(settler.recovery_command("requeue"), "reset TASK-01")
+
+    def test_post_release_settlement_failure_records_the_operator_command(
+        self,
+    ) -> None:
+        source = MutableTaskSource()
+
+        def always_refuse(task_id: str, **kwargs: object) -> bool:
+            raise subprocess.CalledProcessError(3, "reset", stderr="still refusing\n")
+
+        source.reset = always_refuse  # type: ignore[method-assign]
+        settler = self.settler(source, park=False, max_attempts=1)
+        self.manager.release(self.task_lock)
+
+        result = settler.settle_after_release("requeue")
+
+        self.assertFalse(result.settled)
+        attempted = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "task_source_settlement_attempted"
+        ]
+        self.assertEqual(attempted[-1]["phase"], "post_release")
+        self.assertEqual(attempted[-1]["recovery_command"], "reset TASK-01")
+        self.assertIn("still refusing", attempted[-1]["stderr"])
+
 
 class ReviewRouterTests(unittest.TestCase):
     def setUp(self) -> None:

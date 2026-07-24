@@ -28,8 +28,14 @@ from vibe_loop.config import (
     format_agent_command,
     parse_orchestration,
 )
+from vibe_loop.locks import fencing_token_value
 from vibe_loop.retry import LimitWallSignal, detect_limit_wall
-from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
+from vibe_loop.tasks import (
+    BLOCKED_FAMILY_STATUSES,
+    Task,
+    TaskSource,
+    task_source_error_diagnostics,
+)
 from vibe_loop.telemetry import (
     ProviderUsage,
     ProviderUsageObserver,
@@ -3655,6 +3661,12 @@ class TaskSourceCompleter:
         return None
 
 
+def settlement_intent(classification: str) -> str:
+    """Settlement intent a terminal run classification asks the source for."""
+
+    return "park" if classification in {"blocked", "failed"} else "requeue"
+
+
 @dataclasses.dataclass(frozen=True)
 class TaskSourceSettlementResult:
     intent: str
@@ -3753,7 +3765,7 @@ class TaskSourceSettler:
             )
 
         for attempt in range(1, self.max_attempts + 1):
-            error_class = "unconfirmed_status"
+            diagnostics: dict[str, object] = {"error_class": "unconfirmed_status"}
             try:
                 if effective_intent == "park":
                     self.source.park(
@@ -3768,8 +3780,16 @@ class TaskSourceSettler:
                     )
                 confirmed = self._probe_for_settlement()
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                error_class = type(exc).__name__
-                confirmed = None
+                diagnostics = task_source_error_diagnostics(
+                    exc,
+                    fencing_token_value(
+                        self.runtime_context.get("VIBE_LOOP_FENCING_TOKEN")
+                    ),
+                )
+                # The adapter can fail after it mutated the source, and an
+                # operator can settle the source underneath a retry loop, so a
+                # failed call is not evidence that the source is unsettled.
+                confirmed = self._probe_after_failure()
             if self._confirmed(confirmed, effective_intent):
                 return self._record_settled(
                     TaskSourceSettlementResult(
@@ -3788,7 +3808,7 @@ class TaskSourceSettler:
                 adapter=adapter,
                 fallback=fallback,
                 attempt=attempt,
-                error_class=error_class,
+                diagnostics=diagnostics,
                 confirmed_status=confirmed.status if confirmed is not None else "",
             )
             if attempt < self.max_attempts:
@@ -3801,6 +3821,87 @@ class TaskSourceSettler:
             attempts=self.max_attempts,
             settled=False,
         )
+
+    def settle_after_release(self, intent: str) -> TaskSourceSettlementResult:
+        """Settle the source once the fenced owner has already released.
+
+        The fenced settle-while-held path is the preferred one, but an adapter
+        that refuses every fenced attempt used to leave the task unrecoverable:
+        the source refused to settle under a held lock and the lock refused to
+        release before settlement. This is the other half of that contract -
+        one operator-conservative attempt with no fencing claim, run after the
+        release, so the circular refusal cannot happen. It never touches the
+        lock, so it is safe to call when the lock is gone.
+        """
+
+        if intent not in {"requeue", "park"}:
+            raise ValueError(f"unsupported task-source settlement intent: {intent}")
+        prior = self._prior_result()
+        if prior is not None:
+            return prior
+        fallback = intent == "park" and not self.task_source_config.park_command
+        effective_intent = "requeue" if fallback else intent
+        adapter = (
+            "task_source.park" if effective_intent == "park" else "task_source.reset"
+        )
+        diagnostics: dict[str, object] = {"error_class": "unconfirmed_status"}
+        try:
+            if effective_intent == "park":
+                self.source.park(self.task_id, self.run_id)
+            else:
+                self.source.reset(self.task_id)
+            confirmed = self._probe_for_settlement()
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            diagnostics = task_source_error_diagnostics(exc)
+            confirmed = self._probe_after_failure()
+        if self._confirmed(confirmed, effective_intent):
+            return self._record_settled(
+                TaskSourceSettlementResult(
+                    intent=intent,
+                    adapter=adapter,
+                    confirmed_status=confirmed.status if confirmed is not None else "",
+                    fallback_to_requeue=fallback,
+                    attempts=1,
+                    settled=True,
+                    recovered=True,
+                )
+            )
+        self._record_attempt(
+            intent=intent,
+            adapter=adapter,
+            fallback=fallback,
+            attempt=1,
+            diagnostics={
+                **diagnostics,
+                "recovery_command": self.recovery_command(intent),
+            },
+            confirmed_status=confirmed.status if confirmed is not None else "",
+            phase="post_release",
+        )
+        return TaskSourceSettlementResult(
+            intent=intent,
+            adapter=adapter,
+            confirmed_status=confirmed.status if confirmed is not None else "",
+            fallback_to_requeue=fallback,
+            attempts=1,
+            settled=False,
+        )
+
+    def recovery_command(self, intent: str) -> str:
+        """The adapter command an operator can run once the lock is released."""
+
+        park = intent == "park" and bool(self.task_source_config.park_command)
+        template = (
+            self.task_source_config.park_command
+            if park
+            else self.task_source_config.reset_command
+        ) or ""
+        if not template:
+            return ""
+        try:
+            return template.format(task_id=self.task_id, run_id=self.run_id)
+        except (KeyError, IndexError, ValueError):
+            return template
 
     def recover_and_release(self, intent: str) -> TaskSourceSettlementResult:
         result = self.settle(intent)
@@ -3864,6 +3965,12 @@ class TaskSourceSettler:
     def _probe_for_settlement(self) -> Task | None:
         return self.source.probe(self.task_id)
 
+    def _probe_after_failure(self) -> Task | None:
+        try:
+            return self._probe_for_settlement()
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+
     def _confirmed(self, task: Task | None, intent: str) -> bool:
         if task is None or task.task_id != self.task_id:
             return False
@@ -3886,24 +3993,28 @@ class TaskSourceSettler:
         adapter: str,
         fallback: bool,
         attempt: int,
-        error_class: str,
+        diagnostics: Mapping[str, object],
         confirmed_status: str,
+        settlement_pending: bool = True,
+        phase: str = "fenced",
     ) -> None:
         from vibe_loop.runs import RunLifecycleEvent
 
+        payload: dict[str, object] = {
+            "intent": intent,
+            "adapter": adapter,
+            "fallback_to_requeue": fallback,
+            "retry_ordinal": attempt,
+            "confirmed_status": confirmed_status,
+            "settlement_pending": settlement_pending,
+            "phase": phase,
+        }
+        payload.update(diagnostics)
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_source_settlement_attempted(
                 run_id=self.run_id,
                 task_id=self.task_id,
-                payload={
-                    "intent": intent,
-                    "adapter": adapter,
-                    "fallback_to_requeue": fallback,
-                    "retry_ordinal": attempt,
-                    "error_class": error_class,
-                    "confirmed_status": confirmed_status,
-                    "settlement_pending": True,
-                },
+                payload=payload,
             )
         )
 

@@ -95,6 +95,7 @@ from vibe_loop.orchestration import (
     inject_provider_continuation,
     plan_session_continuation,
     run_configured_command,
+    settlement_intent,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.retry import (
@@ -1845,6 +1846,7 @@ class VibeRunner:
         activated_runtime_owned = False
         task_source_terminal_confirmed = True
         durable_run_result_recorded = False
+        post_release_settlement_intent = ""
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -2823,6 +2825,15 @@ class VibeRunner:
                     classification=classification.status,
                 )
                 task_source_terminal_confirmed = settlement.settled
+                if not settlement.settled:
+                    # Holding the lock for a fenced retry only helps when the
+                    # adapter can settle under a held lock. When it cannot, the
+                    # lock and the source refuse each other forever, so the run
+                    # releases and retries settlement unfenced afterwards.
+                    post_release_settlement_intent = settlement_intent(
+                        classification.status
+                    )
+                    task_source_terminal_confirmed = True
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.run_state_transition(
                     run_id=run_id,
@@ -3036,6 +3047,14 @@ class VibeRunner:
                         },
                     )
                 )
+                if post_release_settlement_intent:
+                    self.settle_task_source_after_release(
+                        task_id=task.task_id,
+                        run_id=run_id,
+                        task_lock=task_lock,
+                        intent=post_release_settlement_intent,
+                        report_status=report_status,
+                    )
 
     def acquire_scheduled_task_lock(
         self,
@@ -3577,7 +3596,7 @@ class VibeRunner:
         runtime_context: Mapping[str, str],
         classification: str,
     ) -> TaskSourceSettlementResult:
-        intent = "park" if classification in {"blocked", "failed"} else "requeue"
+        intent = settlement_intent(classification)
         return TaskSourceSettler(
             source=self.source,
             task_source_config=self.source_resolution.task_source,
@@ -3593,6 +3612,52 @@ class VibeRunner:
                 runtime_context=runtime_context,
             ),
         ).settle(intent)
+
+    def settle_task_source_after_release(
+        self,
+        *,
+        task_id: str,
+        run_id: str,
+        task_lock: TaskLock,
+        intent: str,
+        report_status: Callable[[str], None],
+    ) -> TaskSourceSettlementResult | None:
+        """Retry settlement unfenced once the lock is gone, never re-raising.
+
+        This runs from the run's `finally`: the durable result is already
+        recorded and the lock is already released, so a settlement failure here
+        must be reported and recorded, not propagated over the run's own
+        outcome.
+        """
+
+        settler = TaskSourceSettler(
+            source=self.source,
+            task_source_config=self.source_resolution.task_source,
+            lock_manager=self.lock_manager,
+            task_lock=task_lock,
+            run_store=self.run_store,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        try:
+            settlement = settler.settle_after_release(intent)
+        except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            report_status(
+                f"post-release task-source settlement failed for {task_id}: {exc}"
+            )
+            return None
+        if settlement.settled:
+            report_status(
+                f"settled task source for {task_id} after lock release: "
+                f"{settlement.confirmed_status or settlement.intent}"
+            )
+            return settlement
+        command = settler.recovery_command(intent)
+        report_status(
+            f"task source for {task_id} is still unsettled after lock release; "
+            f"the lock is free, so run: {command or 'the task_source reset adapter'}"
+        )
+        return settlement
 
     def task_source_runtime_context(
         self,

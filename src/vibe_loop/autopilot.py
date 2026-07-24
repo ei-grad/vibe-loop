@@ -109,6 +109,7 @@ from vibe_loop.workers import (
     WorktreeDispositionEvidence,
     WorktreeDispositionOutcome,
     WorkerView,
+    TaskSourceSettlementRecovery,
     clean_stale_locks,
     collect_stale_locks,
     collect_worktree_disposition_evidence,
@@ -5222,7 +5223,19 @@ def execute_autopilot_cycle(
             config.locks,
             runtime_context=config.runtime_environment,
         )
-        clean_result = clean_stale_locks(list(cleanup_candidates), lock_manager)
+
+        def autopilot_task_source() -> tuple[object, object]:
+            runner = VibeRunner(config)
+            return runner.source, runner.source_resolution.task_source
+
+        # The cycle never forces: a settlement-pending lock is released here
+        # only when the authoritative source is confirmed settled, so a stale
+        # latch cannot keep the whole repository's dispatch blocked.
+        clean_result = clean_stale_locks(
+            list(cleanup_candidates),
+            lock_manager,
+            settlement_recovery=TaskSourceSettlementRecovery(autopilot_task_source),
+        )
         record_expired_locks(run_store, clean_result.cleaned)
         if clean_result.cleaned:
             actions.append(f"cleaned_stale_locks:{len(clean_result.cleaned)}")

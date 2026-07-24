@@ -197,15 +197,32 @@ in-progress state to strand; settlement records `not_applicable`.
 `task_source_settled` records only a confirmed settlement: the authoritative
 task source observed non-in-progress after the adapter call (or probe). A
 failed settlement attempt, or a crash between the adapter and its record,
-instead appends `task_source_settlement_attempted`; that record never
-satisfies the settlement step, the durable-outcome settlement gate, or
-fenced task-lock release. The run enters `settlement_pending`, retains the
-task lock, and retries settlement with bounded backoff. If the process dies
-while `settlement_pending`, stage-aware fenced recovery — using that run's
-exact private lock identity — re-runs the settlement, confirms the
-authoritative task source non-in-progress, appends `task_source_settled`,
-and only then releases the lock. Generic stale-lock cleanup must never
-release a settlement-pending lock ahead of this recovery path.
+instead appends `task_source_settlement_attempted` — carrying the adapter's
+exit code and its redacted stderr, so a refusal is diagnosable from the run
+record alone. That record never satisfies the settlement step, the
+durable-outcome settlement gate, or fenced task-lock release. The run enters
+`settlement_pending` and retries settlement with bounded backoff, holding the
+task lock so a fenced retry (and, after a crash, stage-aware fenced recovery
+using that run's exact private lock identity) can settle while it still owns
+the lock.
+
+Holding the lock is bounded, not terminal. An adapter is allowed to refuse
+every call made while the lock is held — loopyard's `task-source-reset`
+refuses an unfenced reset of a locked task, and a deployed adapter build may
+not implement the fenced settle-while-held path at all — so waiting for a
+fenced settlement that can never succeed would strand the task permanently
+and, with it, every task queued behind the repository's dispatch. When the
+bounded fenced attempts are exhausted, the run therefore releases the lock
+with its durable outcome and retries settlement once more with no fencing
+claim, on the operator-conservative path the adapter serves for a released
+task, appending `task_source_settled` on success and a `post_release`
+`task_source_settlement_attempted` (naming the adapter command to run) on
+failure. Generic stale-lock cleanup keeps refusing a settlement-pending lock
+by default, but re-reads the authoritative source first — a source somebody
+has since settled releases immediately — and `vibe-loop workers clean
+--force` is terminal: it releases the lock and then settles the source. The
+task source is authoritative for dispatch, so a released lock over an
+unsettled (still in-progress) source blocks nothing and dispatches nothing.
 
 Recovery: `run` (or the scheduler's unknown-run recovery) resumes from the
 last journaled stage instead of restarting the whole lifecycle from scratch.
@@ -280,8 +297,10 @@ New record types:
 - `task_provenance_committed` — task-source completion adapter result.
 - `task_source_settlement_attempted` — a settlement attempt that failed or
   could not be confirmed: intent, adapter identity redacted to its
-  configured key, error class, retry ordinal. Never a substitute for
-  `task_source_settled`.
+  configured key, error class, retry ordinal, the adapter's exit code and
+  bounded stderr with only the fencing token redacted, the phase (`fenced` or
+  `post_release`), and for a post-release failure the adapter command an
+  operator can run. Never a substitute for `task_source_settled`.
 - `task_source_settled` — confirmed failure-settlement outcome: intent
   (`requeue` | `park` | `not_applicable`), adapter identity redacted to its
   configured key, park-to-requeue fallback flag, and the confirmed
@@ -303,8 +322,11 @@ settlement first: failure event → `task_source_settled` durable → 11 → 12 
 13. Only a confirmed `task_source_settled` record satisfies the settlement
 step: `task_source_settlement_attempted` never advances the tail, so the run
 holds at `settlement_pending` with the task lock retained (retrying with
-bounded backoff) until confirmation, and after process death the fenced
-settlement-recovery path above is the only route to 13.
+bounded backoff) until confirmation. After process death the fenced
+settlement-recovery path above is the preferred route to 13; when the fenced
+attempts are exhausted (or the operator forces cleanup), 13 proceeds with the
+durable outcome and settlement is retried unfenced afterwards, so the pair of
+refusals can never make the task unrecoverable.
 
 ## Typed Stage Contracts
 

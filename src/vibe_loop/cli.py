@@ -119,6 +119,7 @@ from vibe_loop.tasks import Task
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
+    TaskSourceSettlementRecovery,
     WorkerView,
     WorkspaceClaimError,
     build_worker_views,
@@ -2648,7 +2649,14 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
             print("No stale locks found.")
         return 0
     if args.force:
-        result = clean_stale_locks(stale, runner.lock_manager)
+        result = clean_stale_locks(
+            stale,
+            runner.lock_manager,
+            settlement_recovery=TaskSourceSettlementRecovery(
+                lambda: (runner.source, runner.source_resolution.task_source),
+            ),
+            force=True,
+        )
         record_expired_locks(runner.run_store, result.cleaned)
         if args.json:
             print(
@@ -2660,6 +2668,7 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
                             {"lock": s.to_json(), "error": msg}
                             for s, msg in result.errors
                         ],
+                        "settlement_notes": list(result.notes),
                     },
                     indent=2,
                 )
@@ -2668,6 +2677,8 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
             if result.cleaned:
                 print(f"Removed {len(result.cleaned)} stale lock(s):")
                 print(render_stale_locks(result.cleaned))
+            for note in result.notes:
+                print(f"settlement: {note}")
             for lock, msg in result.errors:
                 print(f"error: {lock.task_id}: {msg}", file=sys.stderr)
             if not result.cleaned and result.errors:
