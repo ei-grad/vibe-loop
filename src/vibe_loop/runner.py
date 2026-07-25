@@ -21,6 +21,15 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
 
 from vibe_loop.activity import ActivityEmission, AgentActivityTracker
+from vibe_loop.budget import (
+    BudgetReservationDenied,
+    BudgetRunOutcome,
+    BudgetStore,
+    PhaseBudget,
+    process_alive_locally,
+    resolve_budget_ledger_path,
+    resolve_budget_project,
+)
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -1405,6 +1414,13 @@ class VibeRunner:
         self._lock_manager: LockManager | None = None
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
+        # One shared ledger and canonical project identity per repository, so
+        # concurrent linked worktrees admit against the same durable budget.
+        self.budget_store = BudgetStore(
+            resolve_budget_ledger_path(config), config.budget
+        )
+        self.budget_project = resolve_budget_project(config)
+        self.phase_budget = PhaseBudget(self.budget_store, self.budget_project)
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
         self.last_analysis_usage = unavailable_usage(
@@ -1918,6 +1934,10 @@ class VibeRunner:
         task_source_terminal_confirmed = True
         durable_run_result_recorded = False
         post_release_settlement_intent = ""
+        # Set once a conservative budget allowance is reserved for this launch;
+        # released again if the run fails before the worker process starts, so a
+        # denied-then-abandoned pre-launch failure never leaves a phantom charge.
+        budget_reservation_id = ""
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -2010,6 +2030,14 @@ class VibeRunner:
         pre_launch_failure_reason = "run_contract_resolution_failed"
 
         def finalize_pre_launch_failure(failure: StageFailure) -> None:
+            if budget_reservation_id:
+                # No worker process launched, so the reserved allowance must be
+                # given back rather than reconciled as consumed usage.
+                self.budget_store.release(
+                    reservation_id=budget_reservation_id,
+                    run_id=run_id,
+                    reason=pre_launch_failure_reason,
+                )
             if stage_machine.stage is not None:
                 stage_machine.fail(
                     failure,
@@ -2070,6 +2098,26 @@ class VibeRunner:
             )
             if circuit_state.open:
                 raise AttemptCircuitOpen(circuit_state)
+            if self.config.budget.enabled:
+                budget_decision = self.budget_store.reserve(
+                    reservation_id=run_id,
+                    run_id=run_id,
+                    project=self.budget_project,
+                    provider=command_context.model_provider,
+                    phase="implementation",
+                    model=command_context.model_id,
+                    effort=command_context.reasoning_effort,
+                )
+                if not budget_decision.admitted:
+                    # Denial is durable evidence in the budget journal; no worker
+                    # process is launched and no task activation is attempted.
+                    raise BudgetReservationDenied(budget_decision)
+                budget_reservation_id = run_id
+                if budget_decision.warnings:
+                    report_status(
+                        f"budget warning for {task.task_id} implementation "
+                        f"launch: {len(budget_decision.warnings)} cap(s) near limit"
+                    )
             pre_launch_failure_reason = "task_activation_failed"
             activated_runtime_owned = (
                 runtime_owned
@@ -2768,6 +2816,16 @@ class VibeRunner:
                         implementation_session_id_source=session_id_source,
                         output_log_path=log_path,
                     )
+                except BudgetReservationDenied as exc:
+                    # A review or remediation launch was refused: no reviewer or
+                    # remediation process started, and the run ends blocked so it
+                    # is re-dispatched once budget frees rather than left dangling.
+                    classification = ClassificationResult(
+                        "blocked",
+                        f"budget_{exc.decision.phase}_denied",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
                 except ReviewBudgetExhausted as exc:
                     classification = ClassificationResult(
                         "blocked",
@@ -3377,6 +3435,7 @@ class VibeRunner:
             concurrency=self._review_concurrency,
             stage_machine=stage_machine,
             limit_wall_patterns=self.config.supervision.limit_wall_patterns or None,
+            budget=self.phase_budget,
         )
         review_result = router.review(gate_summary)
         closure_ordinal = 0
@@ -3471,6 +3530,20 @@ class VibeRunner:
             agent.command or "",
             agent.executable_kind or agent.agent_kind,
         )
+        usage_provider = {"codex": "openai", "claude": "anthropic"}.get(
+            provider, "unknown"
+        )
+        # Reserve the remediation phase budget before building or launching the
+        # implementer; a denial raises BudgetReservationDenied and starts no
+        # process, which the lifecycle records as blocked.
+        budget_reservation = self.phase_budget.admit(
+            reservation_id=f"{run_id}:remediation:{round_number}:{uuid.uuid4().hex}",
+            run_id=run_id,
+            provider=usage_provider,
+            phase="remediation",
+            model=agent.model or "",
+            effort=agent.effort or "",
+        )
         resumable_session_id = (
             implementation_session_id
             if implementation_session_id
@@ -3523,19 +3596,34 @@ class VibeRunner:
                 reason=f"round:{round_number}",
             )
         )
-        with log_path.open("w", encoding="utf-8") as log:
-            result = run_streaming_command(
-                command,
-                workspace.worktree,
-                log,
-                env=dict(command_env),
-                forward_stderr=agent.forward_stderr,
-                timeout_seconds=self.config.supervision.worker_timeout_seconds,
-                provider={"codex": "openai", "claude": "anthropic"}.get(
-                    provider,
-                    "unknown",
-                ),
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    command,
+                    workspace.worktree,
+                    log,
+                    env=dict(command_env),
+                    forward_stderr=agent.forward_stderr,
+                    timeout_seconds=self.config.supervision.worker_timeout_seconds,
+                    provider=usage_provider,
+                )
+        except BaseException:
+            # The implementer process never produced a result, so return the
+            # reserved allowance rather than charging a launch that did not run.
+            self.phase_budget.release(
+                reservation_id=budget_reservation,
+                run_id=run_id,
+                reason="remediation_launch_failed",
             )
+            raise
+        # A launched remediation implementer is reconciled exactly once against
+        # its own usage; unavailable usage is charged fail-safe, never zero.
+        self.phase_budget.reconcile(
+            reservation_id=budget_reservation,
+            run_id=run_id,
+            stats=result.usage.to_stats(phase="remediation"),
+            provider=usage_provider,
+        )
         if result.timed_out:
             raise ReviewStageResultError("timeout")
         if result.exit_code != 0:
@@ -3877,7 +3965,7 @@ class VibeRunner:
                 task,
                 restart_count=restart_count,
             )
-        except AttemptCircuitOpen as exc:
+        except (AttemptCircuitOpen, BudgetReservationDenied) as exc:
             report_status(str(exc))
             excluded = set(exclude or set())
             excluded.add(task.task_id)
@@ -3930,6 +4018,7 @@ class VibeRunner:
                 "jobs": jobs,
             }
         )
+        self.recover_abandoned_budget()
         try:
             if jobs == 1:
                 return self.run_until_done_serial(
@@ -4346,7 +4435,7 @@ class VibeRunner:
                         )
                         skipped.add(task_id)
                         continue
-                    except AttemptCircuitOpen as exc:
+                    except (AttemptCircuitOpen, BudgetReservationDenied) as exc:
                         report_status(str(exc))
                         skipped.add(task_id)
                         continue
@@ -4783,6 +4872,14 @@ class VibeRunner:
                 blocker="attempt_circuit_open",
             )
             return None
+        except BudgetReservationDenied as exc:
+            report_status(str(exc))
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="budget_reservation_denied",
+            )
+            return None
         except LockBusy:
             report_status(
                 "unknown-run recovery deferred: task locked during acquire: "
@@ -4921,6 +5018,44 @@ class VibeRunner:
                 result,
                 threshold=self.config.supervision.cross_run_attempt_threshold,
             )
+            if self.config.budget.enabled:
+                # Charge this run's live reservation(s) exactly once against the
+                # terminal provider usage; unknown usage is charged fail-safe,
+                # never zero. A run without a live reservation is a no-op.
+                self.budget_store.reconcile_run(
+                    run_id=result.run_id,
+                    stats=result.stats,
+                    provider=result.model_provider,
+                )
+
+    def recover_abandoned_budget(self) -> int:
+        """Reconcile budget reservations orphaned by a crashed prior supervisor.
+
+        A reservation whose owner run has a durable terminal result reconciles
+        from that result's authoritative-or-unknown usage; one whose owner is
+        provably dead with no result is charged fail-safe. The exactly-once
+        guard makes this safe to call at every dispatch start.
+        """
+
+        if not self.config.budget.enabled:
+            return 0
+        terminal: dict[str, BudgetRunOutcome] = {}
+        for record in self.run_store.read_records():
+            if record.get("record_type") not in {None, "run_result"}:
+                continue
+            run_id = record.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            stats = record.get("stats")
+            provider = record.get("model_provider")
+            terminal[run_id] = BudgetRunOutcome(
+                stats=stats if isinstance(stats, dict) else {},
+                provider=provider if isinstance(provider, str) else "",
+            )
+        return self.budget_store.recover_abandoned(
+            resolve=terminal.get,
+            process_alive=process_alive_locally,
+        )
 
     def _report_limit_wall_pause(self, result: RunResult) -> None:
         detail = (result.message or "").strip()

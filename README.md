@@ -997,6 +997,24 @@ cross_run_attempt_threshold = 3   # unchanged non-completed attempts before auto
 type = "directory"
 # lease_seconds = 300   # locks go stale after this many seconds without a heartbeat
 
+# Usage budgets are disabled by default; the whole [budget] block is optional and
+# omitting it leaves launch behavior unchanged. See "Usage budgets and
+# reservations" below.
+# [budget]
+# enabled = true
+# metric = "total_tokens"        # dimension every cap/allowance is denominated in
+# fail_safe = "reserved"         # charge unknown usage at the reserved allowance
+# default_declared = 150000      # conservative per-launch reservation
+# [budget.declared]
+# implementation = 200000
+# review = 150000
+# [[budget.limits]]
+# provider = "anthropic"
+# phase = "implementation"
+# limit = 5000000
+# warn_at = 0.8
+# window_hours = 24
+
 [autopilot]
 # Defaults for `autopilot run` and `autopilot start`; explicit CLI flags override
 # these.
@@ -1031,6 +1049,105 @@ When `--repo` points at a Git linked worktree without its own `.vibe-loop.toml`,
 `vibe-loop` falls back to the main worktree's config (warning on stderr).
 Runtime state, locks, logs, and caches still live under the invoked `--repo`
 worktree.
+
+### Usage budgets and reservations
+
+`[budget]` gates model launches on a configurable usage budget. It is disabled
+by default; when `enabled = false` (or the block is absent) admission is a no-op
+and behavior is unchanged. When enabled, every launch first *reserves* a
+conservative declared allowance against each matching cap, atomically, in a
+durable append-only ledger (`.vibe-loop/budget.jsonl`) that survives process
+restart. Concurrent jobs and runs therefore cannot oversubscribe a cap: a
+reservation that would exceed the remaining budget is refused before any model
+process starts (`on_insufficient = "block"` or `"defer"`), and the refusal is
+durable evidence in the ledger.
+
+Every runtime-owned model launch is gated, not only worker-owned
+implementation: the initial and full review passes and the targeted
+remediation/closure launches each reserve under their own phase
+(`initial_review`, `targeted_closure`, `remediation`) using the actual reviewer
+or remediation route, and each reconciles its own usage against its own
+reservation. A denial launches no reviewer or remediation process and records
+the run as blocked. A run's aggregate terminal usage reconciles only its
+implementation reservation, so usage is never double-counted across phase
+boundaries or during recovery.
+
+The ledger is one shared file per repository, keyed on the repository-common
+root so all linked Git worktrees admit against the same durable budget and OS
+lock, while unrelated repositories stay isolated. Ordinary repositories and
+disabled/unconfigured budgets keep their prior per-repo path and do no Git work.
+
+Attribution is by **project, provider route, worker phase, model, and effort**.
+A `[[budget.limits]]` entry caps one scope; omit a selector to match any value on
+that axis. The `project` axis names the **repository** the ledger is keyed on —
+the basename of the repository-common root, shared by all its linked worktrees.
+It is deliberately not the task-backend project from `[project_binding]`, which
+scopes dispatch rather than spend; the two need not agree, and renaming a
+checkout changes which caps a `project` selector matches. A launch must satisfy every limit it matches (route cardinality is
+bounded and an over-large config is rejected). `metric` is the single
+dimension caps, declared allowances, and fail-safe charges are denominated in
+(one of `input_tokens`, `output_tokens`, `total_tokens`,
+`non_cached_input_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`, `cost_usd`). The reconciliation ledger still
+records the full input/output/cache/gross/fresh/cost breakdown plus an
+authoritative/unknown marker for evidence.
+
+When a run reaches an authoritative terminal provider-usage figure, its
+reservation is reconciled **exactly once** against that figure. Usage a provider
+never reported (or reported malformed) is charged through the **fail-safe**
+policy — never as zero:
+
+- `fail_safe = "reserved"` (default) keeps the conservatively reserved declared
+  allowance as the charge.
+- `fail_safe = "fixed"` charges an explicit `fail_safe_amount` (validated
+  positive).
+
+Reservations orphaned by a crashed supervisor are recovered without
+double-spend: a reservation whose owner run has a durable terminal result
+reconciles from that result; one whose owner is provably dead with no result is
+charged fail-safe. Recovery runs at each dispatch start and is guarded by the
+same exactly-once check.
+Local ownership persists the kernel process-birth identity as well as PID and
+host. Recovery therefore distinguishes a still-running owner from an unrelated
+process that reused its PID; an unavailable birth identity remains reserved
+conservatively rather than being silently released.
+
+The durable ledger enforces a strict terminal-record schema and identity
+contract: a reconciliation or release must match its reservation's id, owner
+run, and generation and carry valid typed usage fields. Malformed, mismatched,
+duplicate, orphaned, or torn rows never close a live reservation at zero; they
+are counted as bounded, content-free integrity diagnostics and the reservation
+stays live (conservatively charged) until a valid terminal arrives or recovery
+charges it fail-safe.
+
+These checks detect **corruption**, not tampering. The journal header, the
+checkpoint, and its unkeyed SHA-256 digest live in the same state directory
+under the same permissions, so anything that can write one can write a
+consistent pair. The ledger trusts every writer of the state directory; it
+defends against torn writes, stale or rolled-back checkpoints, and partial
+compaction, and it is not an integrity control against an adversary with write
+access there.
+
+To keep replay, admission, and inspect work bounded, the ledger is compacted
+under the same OS lock: closed, out-of-window reservations and aged-out decision
+rows fold into a crash-safe durable checkpoint that preserves cumulative
+consumption and audit counters, while live reservations and recent activity stay
+in the active journal. A torn or stale-generation checkpoint is ignored and the
+journal is replayed in full, so partial compaction never double-counts or loses
+spend.
+
+`vibe-loop runs summary --json` includes a `budget` projection: per-limit
+consumed/reserved/remaining/utilization with warning and exceeded flags, and a
+per-provider (and per-provider-phase) route breakdown reported **separately and
+never summed across providers**, so Claude-versus-Codex route balancing has
+evidence without any cross-provider token equivalence. Projection lists are
+deterministically truncated with a dropped-count rather than emitted unbounded,
+and integrity/compaction counters accompany the report.
+
+Admission bounds **subsequent launches**, not token production inside an
+already-running model process: the provider CLIs enforce no hard per-invocation
+cap, so a running worker can exceed its declared allowance and the overage is
+reconciled after the fact. `vibe-loop` does not claim a hard per-invocation cap.
 
 ### Agent command and prompt dialect
 

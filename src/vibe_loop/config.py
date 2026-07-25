@@ -16,6 +16,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from vibe_loop.telemetry import PHASES as USAGE_PHASES
+
 
 def shell_quote(s: str) -> str:
     if sys.platform == "win32":
@@ -265,6 +267,43 @@ AUTOPILOT_DEFAULT_PLANNING_BACKOFF_SECONDS = 21600.0
 AUTOPILOT_DEFAULT_PLANNING_MAX_LAUNCHES_PER_DAY = 4
 AUTOPILOT_DEFAULT_PLANNING_UNPRODUCTIVE_THRESHOLD = 2
 AUTOPILOT_MIN_INTERVAL_SECONDS = 60.0
+BUDGET_METRICS = (
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "non_cached_input_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cost_usd",
+)
+BUDGET_FAIL_SAFE_POLICIES = ("reserved", "fixed")
+BUDGET_ON_INSUFFICIENT = ("block", "defer")
+BUDGET_SELECTOR_KEYS = ("project", "provider", "phase", "model", "effort")
+BUDGET_LIMIT_KEYS = frozenset(
+    {*BUDGET_SELECTOR_KEYS, "limit", "warn_at", "window_hours"}
+)
+BUDGET_CONFIG_KEYS = frozenset(
+    {
+        "enabled",
+        "metric",
+        "fail_safe",
+        "fail_safe_amount",
+        "default_declared",
+        "on_insufficient",
+        "declared",
+        "limits",
+    }
+)
+# Provider labels a budget selector may pin. Mirrors the usage-group providers
+# in telemetry; a selector never sums tokens across two of them.
+BUDGET_PROVIDERS = frozenset({"anthropic", "openai", "unknown"})
+# Route/limit cardinality is bounded so replay, admission, and inspect work stay
+# bounded; a configuration exceeding this is rejected rather than silently
+# truncated.
+BUDGET_MAX_LIMITS = 256
+# Worker phases a reservation may be attributed to. Imported from telemetry so
+# the budget vocabulary cannot drift from the usage-attribution vocabulary.
+BUDGET_PHASES = USAGE_PHASES
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -1171,6 +1210,119 @@ class SpecDiagnosticsConfig:
 
 
 @dataclasses.dataclass(frozen=True)
+class BudgetLimit:
+    """One independent usage cap, optionally narrowed by selector fields.
+
+    A ``None`` selector matches any value on that axis; a launch must satisfy
+    *every* limit whose selectors it matches. ``window_hours`` of ``0`` means the
+    cap is cumulative (all-time consumed), otherwise consumed usage is counted
+    only inside the trailing window. Live (not-yet-reconciled) reservations
+    always count regardless of the window, so a cap cannot be oversubscribed by
+    in-flight launches.
+    """
+
+    limit: float
+    project: str | None = None
+    provider: str | None = None
+    phase: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    warn_at: float | None = None
+    window_hours: float = 0.0
+
+    def selector(self) -> dict[str, str]:
+        return {
+            key: value
+            for key in BUDGET_SELECTOR_KEYS
+            if (value := getattr(self, key)) is not None
+        }
+
+    def matches(
+        self,
+        *,
+        project: str,
+        provider: str,
+        phase: str,
+        model: str,
+        effort: str,
+    ) -> bool:
+        candidate = {
+            "project": project,
+            "provider": provider,
+            "phase": phase,
+            "model": model,
+            "effort": effort,
+        }
+        return all(value == candidate[key] for key, value in self.selector().items())
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "limit": self.limit,
+            "selector": self.selector(),
+            "window_hours": self.window_hours,
+        }
+        if self.warn_at is not None:
+            payload["warn_at"] = self.warn_at
+        return payload
+
+
+@dataclasses.dataclass(frozen=True)
+class BudgetConfig:
+    """Per-project usage-budget policy.
+
+    Unconfigured (the default) leaves ``enabled`` false and every collection
+    empty, so admission is a no-op and behavior is unchanged. ``metric`` is the
+    single dimension every cap, declared allowance, and fail-safe charge is
+    denominated in; the reconciliation ledger still records the full dimension
+    breakdown for evidence. ``fail_safe`` governs how usage that a provider never
+    reported (or reported malformed) is charged — never as zero.
+    """
+
+    enabled: bool = False
+    metric: str = "total_tokens"
+    fail_safe: str = "reserved"
+    fail_safe_amount: float | None = None
+    default_declared: float = 0.0
+    on_insufficient: str = "block"
+    declared: tuple[tuple[str, float], ...] = ()
+    limits: tuple[BudgetLimit, ...] = ()
+    explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+
+    def is_explicit(self, key: str) -> bool:
+        return key in self.explicit_keys
+
+    def declared_for(self, phase: str) -> float:
+        for name, amount in self.declared:
+            if name == phase:
+                return amount
+        return self.default_declared
+
+    def fail_safe_charge(self, declared: float) -> float:
+        """Metric units charged when terminal usage is not authoritative.
+
+        Never zero: the reserved (declared) allowance is retained by default, or
+        an explicit fixed floor is used. Both are validated positive at load.
+        """
+
+        if self.fail_safe == "fixed" and self.fail_safe_amount is not None:
+            return self.fail_safe_amount
+        return declared
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "enabled": self.enabled,
+            "metric": self.metric,
+            "fail_safe": self.fail_safe,
+            "fail_safe_amount": self.fail_safe_amount,
+            "default_declared": self.default_declared,
+            "on_insufficient": self.on_insufficient,
+            "declared": {name: amount for name, amount in self.declared},
+            "limits": [limit.to_json() for limit in self.limits],
+            "explicit_keys": sorted(self.explicit_keys),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class VibeConfig:
     repo: Path
     main_branch: str = "main"
@@ -1194,6 +1346,7 @@ class VibeConfig:
     specs: SpecDiagnosticsConfig = dataclasses.field(
         default_factory=SpecDiagnosticsConfig
     )
+    budget: BudgetConfig = dataclasses.field(default_factory=BudgetConfig)
     config_path: Path | None = None
     config_source: str = "default"
     config_digest: str = ""
@@ -1263,6 +1416,7 @@ def load_config(
     project_binding = parse_project_binding(data.get("project_binding", {}))
     autopilot = parse_autopilot(data.get("autopilot", {}))
     specs = parse_specs(data.get("specs", {}))
+    budget = parse_budget(data.get("budget", {}))
     normalized_runtime_context = normalize_registry_runtime_context(runtime_context)
     validate_required_project_binding_values(
         project_binding.require,
@@ -1291,6 +1445,7 @@ def load_config(
         project_binding=project_binding,
         autopilot=autopilot,
         specs=specs,
+        budget=budget,
         runtime_context=normalized_runtime_context,
     )
 
@@ -2855,6 +3010,149 @@ def parse_specs(data: object) -> SpecDiagnosticsConfig:
         ),
         explicit_keys=explicit_keys,
     )
+
+
+def parse_budget(data: object) -> BudgetConfig:
+    table = expect_table(data, "budget")
+    explicit_keys = frozenset(str(key) for key in table)
+    unknown_keys = sorted(explicit_keys - BUDGET_CONFIG_KEYS)
+    if unknown_keys:
+        raise ValueError(f"budget contains unsupported keys: {', '.join(unknown_keys)}")
+    enabled = optional_bool(table.get("enabled"), False, "budget.enabled")
+    metric = optional_nonempty_string(table.get("metric")) or "total_tokens"
+    if metric not in BUDGET_METRICS:
+        allowed = ", ".join(BUDGET_METRICS)
+        raise ValueError(f"budget.metric must be one of: {allowed}")
+    fail_safe = optional_nonempty_string(table.get("fail_safe")) or "reserved"
+    if fail_safe not in BUDGET_FAIL_SAFE_POLICIES:
+        allowed = ", ".join(BUDGET_FAIL_SAFE_POLICIES)
+        raise ValueError(f"budget.fail_safe must be one of: {allowed}")
+    fail_safe_amount = optional_positive_number(
+        table.get("fail_safe_amount"), "budget.fail_safe_amount"
+    )
+    if fail_safe == "fixed" and fail_safe_amount is None:
+        raise ValueError(
+            "budget.fail_safe = 'fixed' requires a positive budget.fail_safe_amount"
+        )
+    on_insufficient = optional_nonempty_string(table.get("on_insufficient")) or "block"
+    if on_insufficient not in BUDGET_ON_INSUFFICIENT:
+        allowed = ", ".join(BUDGET_ON_INSUFFICIENT)
+        raise ValueError(f"budget.on_insufficient must be one of: {allowed}")
+    default_declared = (
+        optional_positive_number(
+            table.get("default_declared"), "budget.default_declared"
+        )
+        or 0.0
+    )
+    declared = parse_budget_declared(table.get("declared"))
+    limits = parse_budget_limits(table.get("limits"))
+    if enabled and default_declared <= 0.0 and not declared:
+        raise ValueError(
+            "budget.enabled requires a positive budget.default_declared or at "
+            "least one budget.declared phase allowance"
+        )
+    return BudgetConfig(
+        enabled=enabled,
+        metric=metric,
+        fail_safe=fail_safe,
+        fail_safe_amount=fail_safe_amount,
+        default_declared=default_declared,
+        on_insufficient=on_insufficient,
+        declared=declared,
+        limits=limits,
+        explicit_keys=explicit_keys,
+    )
+
+
+def parse_budget_declared(value: object) -> tuple[tuple[str, float], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ValueError("budget.declared must be a table of phase allowances")
+    declared: list[tuple[str, float]] = []
+    for raw_phase, raw_amount in value.items():
+        phase = str(raw_phase)
+        if phase not in BUDGET_PHASES:
+            allowed = ", ".join(sorted(BUDGET_PHASES))
+            raise ValueError(
+                f"budget.declared phase {phase!r} must be one of: {allowed}"
+            )
+        amount = optional_positive_number(raw_amount, f"budget.declared.{phase}")
+        if amount is None:
+            raise ValueError(f"budget.declared.{phase} must be a positive number")
+        declared.append((phase, amount))
+    return tuple(sorted(declared))
+
+
+def parse_budget_limits(value: object) -> tuple[BudgetLimit, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("budget.limits must be an array of limit tables")
+    if len(value) > BUDGET_MAX_LIMITS:
+        raise ValueError(
+            f"budget.limits has too many entries ({len(value)}); "
+            f"maximum {BUDGET_MAX_LIMITS}"
+        )
+    limits: list[BudgetLimit] = []
+    for index, entry in enumerate(value):
+        label = f"budget.limits[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be a table")
+        keys = frozenset(str(key) for key in entry)
+        unknown = sorted(keys - BUDGET_LIMIT_KEYS)
+        if unknown:
+            raise ValueError(f"{label} contains unsupported keys: {', '.join(unknown)}")
+        limit_value = optional_positive_number(entry.get("limit"), f"{label}.limit")
+        if limit_value is None:
+            raise ValueError(f"{label}.limit is required and must be a positive number")
+        warn_at = optional_fraction_over_zero(entry.get("warn_at"), f"{label}.warn_at")
+        window_hours = nonnegative_float(
+            entry.get("window_hours"), 0.0, f"{label}.window_hours"
+        )
+        provider = optional_nonempty_string(entry.get("provider"))
+        if provider is not None and provider not in BUDGET_PROVIDERS:
+            allowed = ", ".join(sorted(BUDGET_PROVIDERS))
+            raise ValueError(f"{label}.provider must be one of: {allowed}")
+        phase = optional_nonempty_string(entry.get("phase"))
+        if phase is not None and phase not in BUDGET_PHASES:
+            allowed = ", ".join(sorted(BUDGET_PHASES))
+            raise ValueError(f"{label}.phase must be one of: {allowed}")
+        limits.append(
+            BudgetLimit(
+                limit=limit_value,
+                project=optional_nonempty_string(entry.get("project")),
+                provider=provider,
+                phase=phase,
+                model=optional_nonempty_string(entry.get("model")),
+                effort=optional_nonempty_string(entry.get("effort")),
+                warn_at=warn_at,
+                window_hours=window_hours,
+            )
+        )
+    return tuple(limits)
+
+
+def optional_positive_number(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{name} must be finite")
+    if number <= 0.0:
+        raise ValueError(f"{name} must be a positive number")
+    return number
+
+
+def optional_fraction_over_zero(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    number = bounded_float(value, 0.0, name, minimum=0.0, maximum=1.0)
+    if number <= 0.0:
+        raise ValueError(f"{name} must be greater than 0 and at most 1")
+    return number
 
 
 def expect_table(value: object, name: str) -> dict[str, Any]:
