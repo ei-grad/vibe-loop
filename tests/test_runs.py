@@ -765,6 +765,7 @@ class RunStoreTests(unittest.TestCase):
             workspace_base="b" * 40,
             head_commit="c" * 40,
             workspace_state_fingerprint="d" * 64,
+            refresh_refused="unique_commits",
         ).to_record()
 
         self.assertEqual(event["record_type"], WORKSPACE_PREFLIGHT_RECORD_TYPE)
@@ -772,7 +773,17 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(event["retry_disposition"], "defer_until_workspace_changes")
         self.assertFalse(event["worker_launch_allowed"])
         self.assertEqual(event["workspace_state_fingerprint"], "d" * 64)
+        self.assertEqual(event["refresh_refused"], "unique_commits")
         self.assertIn(WORKSPACE_PREFLIGHT_RECORD_TYPE, KNOWN_RECORD_TYPES)
+        omitted = RunLifecycleEvent.workspace_preflight(
+            run_id="run-1b",
+            task_id="TASK-01",
+            decision="rejected",
+            reason="workspace_stale_current_base",
+            retry_disposition="defer_until_workspace_changes",
+            worker_launch_allowed=False,
+        ).to_record()
+        self.assertNotIn("refresh_refused", omitted)
         with self.assertRaisesRegex(ValueError, "retry disposition"):
             RunLifecycleEvent.workspace_preflight(
                 run_id="run-2",
@@ -791,6 +802,16 @@ class RunStoreTests(unittest.TestCase):
                 retry_disposition="defer_until_workspace_changes",
                 worker_launch_allowed=False,
                 workspace_state_fingerprint="not-a-fingerprint",
+            )
+        with self.assertRaisesRegex(ValueError, "refresh refusal"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-4",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="defer_until_workspace_changes",
+                worker_launch_allowed=False,
+                refresh_refused="because_i_said_so",
             )
 
     def test_post_report_activity_event_records_violation_and_teardown(

@@ -16,6 +16,7 @@ from types import MappingProxyType
 from unittest.mock import patch
 
 import vibe_loop.runner as runner_module
+import vibe_loop.workers as workers_module
 from vibe_loop.config import (
     AgentConfig,
     AgentResolutionError,
@@ -4280,6 +4281,16 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             fencing_token=token,
         )
 
+    def _last_rejected_preflight(self, store: object) -> dict[str, object]:
+        rejected = [
+            record
+            for record in store.read_records()
+            if record.get("record_type") == "workspace_preflight"
+            and record.get("decision") == "rejected"
+        ]
+        self.assertTrue(rejected)
+        return rejected[-1]
+
     def test_clean_stale_workspace_is_refreshed_and_adopted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo, store, first, stale_base, current_base = self._stale_workspace(
@@ -4363,6 +4374,11 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 self.assertEqual(
                     raised.exception.details["refresh_refused"], expected_refusal
                 )
+                # An operator reads the journal, not the exception.
+                self.assertEqual(
+                    self._last_rejected_preflight(store)["refresh_refused"],
+                    expected_refusal,
+                )
                 # The half that matters: a guard that refuses after refreshing
                 # is worse than no guard.
                 self.assertEqual(
@@ -4441,9 +4457,59 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                     raised.exception.details["refresh_refused"], expected_refusal
                 )
                 self.assertEqual(
+                    self._last_rejected_preflight(store)["refresh_refused"],
+                    expected_refusal,
+                )
+                self.assertEqual(
                     git(worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
                 )
                 self.assertFalse((worktree / "main-change.txt").exists())
+
+    def test_stale_workspace_refresh_defers_when_the_dirty_snapshot_is_unreadable(
+        self,
+    ) -> None:
+        # git_dirty_snapshot reports failure by raising its own error type
+        # rather than a returncode, and it runs through workers.run_git, so the
+        # returncode matrix above cannot reach this path.
+        real_run_git = workers_module.run_git
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            worktree = first.worktree
+
+            def break_diff(
+                path: Path, *args: str
+            ) -> subprocess.CompletedProcess[str]:
+                if Path(path) == worktree and args[:1] == ("diff",):
+                    return subprocess.CompletedProcess(
+                        ["git", *args], 128, "", "simulated git failure"
+                    )
+                return real_run_git(path, *args)
+
+            with patch("vibe_loop.workers.run_git", side_effect=break_diff):
+                with self.assertRaises(WorkspaceProvisionError) as raised:
+                    self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            self.assertEqual(
+                raised.exception.retry_disposition,
+                "defer_until_workspace_changes",
+            )
+            self.assertEqual(
+                raised.exception.details["refresh_refused"],
+                "dirty_snapshot_unreadable",
+            )
+            # The point of the wrap: a recorded deferral, not an untyped escape
+            # past the handler that writes it.
+            self.assertEqual(
+                self._last_rejected_preflight(store)["refresh_refused"],
+                "dirty_snapshot_unreadable",
+            )
+            self.assertEqual(
+                git(worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+            )
+            self.assertFalse((worktree / "main-change.txt").exists())
 
     def test_stale_workspace_refresh_rejects_head_that_did_not_reach_the_base(
         self,

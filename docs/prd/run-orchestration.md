@@ -83,10 +83,11 @@ lose: no commit reachable only from it, no tracked modification, and a
 fast-forward onto the current base that Git itself accepts. Any condition that
 cannot be proven -- an unreadable Git state, a HEAD that moved under the check,
 a recovery adoption resuming against a recorded workspace state -- falls back to
-deferral. The preflight records a bounded typed decision and retry disposition
+deferral. The preflight records a bounded typed decision, retry disposition, and
+-- when a refresh was declined -- the closed-vocabulary reason it was declined,
 before any implementation process starts, so a stale or diverged workspace that
 cannot be refreshed defers until its state changes without consuming a model
-launch. The durable claim must still match the validated branch, current base,
+launch, and an operator can tell a preserved workspace from an unreadable one. The durable claim must still match the validated branch, current base,
 `HEAD`, and content-sensitive dirty snapshot; a change between preflight and
 claim fails closed. Deferred recovery persists only a bounded state fingerprint and remains
 suppressed in serial and parallel dispatch until the relevant base, branch,

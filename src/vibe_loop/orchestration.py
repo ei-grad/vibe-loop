@@ -4141,6 +4141,20 @@ class WorkspaceProvisionError(RuntimeError):
         self.retry_disposition = workspace_retry_disposition(code)
         super().__init__(message)
 
+    @property
+    def diagnostic(self) -> str:
+        """Operator-facing code, qualified by why a refresh was declined.
+
+        The bare code cannot distinguish a workspace preserved because it holds
+        real work from one deferred because Git could not be read, and that is
+        the distinction that decides whether a human needs to step in.
+        """
+
+        refusal = self.details.get("refresh_refused")
+        if isinstance(refusal, str) and refusal:
+            return f"{self.code} ({refusal})"
+        return self.code
+
 
 WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
     {
@@ -4282,6 +4296,7 @@ class WorkspaceProvisioner:
                 exc.details.get("workspace_base") or exc.details.get("base_commit")
             )
             head_commit = workspace_commit_evidence(exc.details.get("head_commit"))
+            refresh_refused = exc.details.get("refresh_refused")
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.workspace_preflight(
                     run_id=run_id,
@@ -4297,6 +4312,9 @@ class WorkspaceProvisioner:
                     head_commit=head_commit,
                     workspace_state_fingerprint=current_workspace_state_fingerprint(
                         branch, worktree
+                    ),
+                    refresh_refused=(
+                        refresh_refused if isinstance(refresh_refused, str) else ""
                     ),
                 )
             )
@@ -4781,7 +4799,7 @@ class WorkspaceProvisioner:
         that demonstrably holds nothing the refresh could lose.
         """
 
-        from vibe_loop.workers import git_dirty_snapshot
+        from vibe_loop.workers import WorkspaceClaimError, git_dirty_snapshot
 
         def defer(refusal: str, **evidence: object) -> WorkspaceProvisionError:
             return WorkspaceProvisionError(
@@ -4820,10 +4838,17 @@ class WorkspaceProvisioner:
             # worktree counts as unique even when its content landed elsewhere,
             # because reachability is what a refresh would drop.
             raise defer("unique_commits", unique_commits=unique.stdout.strip())
-        dirty, _fingerprint = git_dirty_snapshot(
-            worktree,
-            ignored_dirty_paths=self.ignored_dirty_paths,
-        )
+        try:
+            dirty, _fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+        except WorkspaceClaimError as exc:
+            # This is the one unprovable input that does not arrive as a
+            # returncode: git_dirty_snapshot raises its own error type, which is
+            # not a WorkspaceProvisionError and would otherwise escape provision
+            # past the handler that records the deferral.
+            raise defer("dirty_snapshot_unreadable") from exc
         if dirty:
             raise defer("dirty_workspace", dirty_summary=list(dirty)[:20])
         # git_dirty_snapshot excludes .vibe-loop and any configured ignored

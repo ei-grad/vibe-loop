@@ -45,6 +45,24 @@ RUN_STARTED_RECORD_TYPE = "run_started"
 RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKSPACE_PROVISIONED_RECORD_TYPE = "workspace_provisioned"
 WORKSPACE_PREFLIGHT_RECORD_TYPE = "workspace_preflight"
+# Why an automatic refresh of a stale workspace was declined. Closed so the
+# journal stays a bounded vocabulary, and recorded because the deferral reason
+# alone cannot tell an operator whether real work is being preserved, whether
+# git could not be read, or whether a refresh was never attempted.
+WORKSPACE_REFRESH_REFUSALS = frozenset(
+    {
+        "dirty_snapshot_unreadable",
+        "dirty_workspace",
+        "fast_forward_refused",
+        "head_unreadable_or_moved",
+        "recovery_adoption",
+        "refresh_did_not_reach_base",
+        "status_unreadable",
+        "tracked_modification_behind_ignored_path",
+        "unique_commits",
+        "unique_commits_unreadable",
+    }
+)
 CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 REVIEW_STARTED_RECORD_TYPE = "review_started"
@@ -691,6 +709,7 @@ class RunLifecycleEvent:
         workspace_base: str = "",
         head_commit: str = "",
         workspace_state_fingerprint: str = "",
+        refresh_refused: str = "",
     ) -> RunLifecycleEvent:
         if decision not in {"created", "reusable", "rejected"}:
             raise ValueError("workspace preflight decision is invalid")
@@ -702,6 +721,8 @@ class RunLifecycleEvent:
             raise ValueError("workspace preflight retry disposition is invalid")
         if not reason or len(reason.encode("utf-8", "replace")) > 128:
             raise ValueError("workspace preflight reason is invalid")
+        if refresh_refused and refresh_refused not in WORKSPACE_REFRESH_REFUSALS:
+            raise ValueError("workspace preflight refresh refusal is invalid")
         payload: dict[str, Any] = {
             "task_id": task_id,
             "decision": decision,
@@ -727,6 +748,8 @@ class RunLifecycleEvent:
             ):
                 raise ValueError("workspace state fingerprint is invalid")
             payload["workspace_state_fingerprint"] = workspace_state_fingerprint
+        if refresh_refused:
+            payload["refresh_refused"] = refresh_refused
         return cls(
             record_type=WORKSPACE_PREFLIGHT_RECORD_TYPE,
             run_id=run_id,

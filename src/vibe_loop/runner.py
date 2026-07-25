@@ -3666,7 +3666,7 @@ class VibeRunner:
         except WorkspaceProvisionError as exc:
             report_status(
                 "workspace dispatch deferred before worker launch: "
-                f"{task.task_id}: {exc.code}"
+                f"{task.task_id}: {exc.diagnostic}"
             )
             excluded = set(exclude or set())
             excluded.add(task.task_id)
@@ -4199,7 +4199,7 @@ class VibeRunner:
                     except WorkspaceProvisionError as exc:
                         report_status(
                             "workspace dispatch deferred before worker launch: "
-                            f"{task_id}: {exc.code}"
+                            f"{task_id}: {exc.diagnostic}"
                         )
                         skipped.add(task_id)
                         continue
@@ -4648,7 +4648,7 @@ class VibeRunner:
         except WorkspaceProvisionError as exc:
             report_status(
                 "unknown-run recovery deferred before worker launch: "
-                f"{recovery.task_id}: {exc.code}"
+                f"{recovery.task_id}: {exc.diagnostic}"
             )
             workspace_state_fingerprint = ""
             if exc.retry_disposition == "defer_until_workspace_changes":
