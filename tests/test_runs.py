@@ -878,6 +878,34 @@ class RunStoreTests(unittest.TestCase):
         self.assertIsNone(records[0]["worker_pid"])
         self.assertFalse(records[0]["terminated"])
 
+    def test_post_report_closure_records_bounded_teardown_evidence(self) -> None:
+        event = RunLifecycleEvent.post_report_closure(
+            run_id="run-1",
+            task_id="TASK-01",
+            post_report_seconds=0.4,
+            teardown_seconds=0.03,
+            worker_pid=101,
+            process_group_id=101,
+            process_count=2,
+            identity_verified=True,
+            descendants_verified=True,
+            terminated=True,
+            report_status="completed",
+            teardown_reason="accepted_report_runtime_closure",
+            runtime_lifecycle_decision="continue",
+            runtime_lifecycle_reason=("verified_accepted_report_runtime_closure"),
+        ).to_record()
+
+        self.assertEqual(event["record_type"], "post_report_closure")
+        self.assertEqual(event["policy"], "accepted_report_runtime_closure")
+        self.assertEqual(event["teardown_process_count"], 2)
+        self.assertTrue(event["identity_verified"])
+        self.assertTrue(event["descendants_verified"])
+        self.assertTrue(event["terminated"])
+        encoded = json.dumps(event)
+        self.assertNotIn("prompt", encoded)
+        self.assertNotIn("tool_payload", encoded)
+
     def test_lifecycle_event_rejects_unknown_type(self) -> None:
         with self.assertRaises(ValueError):
             RunLifecycleEvent(record_type="surprise", run_id="run-1")

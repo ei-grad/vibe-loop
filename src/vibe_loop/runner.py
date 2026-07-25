@@ -109,7 +109,12 @@ from vibe_loop.orchestration import (
     run_configured_command,
     settlement_intent,
 )
-from vibe_loop.processes import read_process_node
+from vibe_loop.processes import (
+    ProcessNode,
+    collect_owned_descendants,
+    read_process_node,
+    read_process_table,
+)
 from vibe_loop.retry import (
     LimitWallSignal,
     detect_limit_wall,
@@ -1089,6 +1094,10 @@ class PostReportActivity:
     enforced_stop: bool
     identity_verified: bool
     usage: ProviderUsage
+    teardown_reason: str = ""
+    descendants_verified: bool = False
+    teardown_process_count: int = 0
+    teardown_seconds: float = 0.0
 
     @property
     def violation(self) -> bool:
@@ -1103,7 +1112,7 @@ def post_report_runtime_lifecycle_decision(
     worker_report: WorkerReport | None,
     activity: PostReportActivity,
 ) -> tuple[str, str]:
-    """Decide whether runtime orchestration may advance after a violation."""
+    """Decide whether runtime orchestration may advance after worker closure."""
     if not runtime_owned:
         return "refuse", "runtime_owned_orchestration_disabled"
     if timed_out:
@@ -1112,6 +1121,16 @@ def post_report_runtime_lifecycle_decision(
         return "refuse", "accepted_report_missing"
     if worker_report.status != "completed":
         return "refuse", "accepted_report_not_completed"
+    if activity.teardown_reason:
+        if activity.teardown_reason != "accepted_report_runtime_closure":
+            return "refuse", activity.teardown_reason
+        if not activity.enforced_stop:
+            return "refuse", "teardown_not_runtime_enforced"
+        if not activity.identity_verified:
+            return "refuse", "worker_identity_not_verified"
+        if not activity.descendants_verified:
+            return "refuse", "worker_descendants_not_verified"
+        return "continue", "verified_accepted_report_runtime_closure"
     if exit_code == 0:
         return "continue", "clean_exit_candidate_revalidation_required"
     if not activity.enforced_stop:
@@ -2600,6 +2619,40 @@ class VibeRunner:
                     # monitor attributes only activity emitted after it.
                     return worker_report_persistence_epoch(first_accepted_report)
 
+                closure_decision = ""
+
+                def accepted_report_runtime_closure() -> str:
+                    nonlocal closure_decision
+                    if closure_decision:
+                        return closure_decision
+                    report = first_accepted_report
+                    if report is None:
+                        return ""
+                    if report.status != "completed":
+                        closure_decision = "accepted_report_not_completed"
+                        return closure_decision
+                    if not report.commit:
+                        closure_decision = "accepted_report_commit_missing"
+                        return closure_decision
+                    collector = CandidateCollector(
+                        worktree=provisioned_workspace.worktree,
+                        branch=provisioned_workspace.branch,
+                        base_main=provisioned_workspace.base_commit,
+                        run_store=self.run_store,
+                        run_id=run_id,
+                        task_id=task.task_id,
+                    )
+                    candidate = collector.latest_recorded()
+                    if candidate is None:
+                        return ""
+                    elif candidate.head_commit != report.commit:
+                        closure_decision = "accepted_report_candidate_mismatch"
+                    elif not collector.matches(candidate):
+                        closure_decision = "accepted_candidate_initially_changed"
+                    else:
+                        closure_decision = "accepted_completed_candidate"
+                    return closure_decision
+
                 stage_machine.transition(
                     RunStage.IMPLEMENTING,
                     reason="worker_process_launch",
@@ -2614,6 +2667,9 @@ class VibeRunner:
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
                     report_persistence_epoch=report_persistence_epoch,
+                    post_report_closure_check=(
+                        accepted_report_runtime_closure if runtime_owned else None
+                    ),
                     timeout_seconds=self.config.supervision.worker_timeout_seconds,
                     provider=(
                         command_context.model_provider
@@ -2757,7 +2813,10 @@ class VibeRunner:
                     message = self.run_completion_checks(log)
                 post_report_activity = stream_result.post_report
                 post_report_lifecycle_decision = ""
-                if post_report_activity is not None and post_report_activity.violation:
+                if post_report_activity is not None and (
+                    post_report_activity.violation
+                    or post_report_activity.teardown_reason
+                ):
                     (
                         post_report_lifecycle_decision,
                         post_report_lifecycle_reason,
@@ -2768,6 +2827,7 @@ class VibeRunner:
                         worker_report=worker_report,
                         activity=post_report_activity,
                     )
+                if post_report_activity is not None and post_report_activity.violation:
                     report_status(
                         f"post-report policy violation for {task.task_id}: "
                         f"worker emitted {post_report_activity.activity_kind} "
@@ -2799,6 +2859,32 @@ class VibeRunner:
                             runtime_lifecycle_reason=post_report_lifecycle_reason,
                         )
                     )
+                if (
+                    post_report_activity is not None
+                    and post_report_activity.teardown_reason
+                ):
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.post_report_closure(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            post_report_seconds=post_report_activity.seconds,
+                            teardown_seconds=post_report_activity.teardown_seconds,
+                            worker_pid=worker_pid_value,
+                            process_group_id=worker_process_group_id,
+                            process_count=(post_report_activity.teardown_process_count),
+                            identity_verified=(post_report_activity.identity_verified),
+                            descendants_verified=(
+                                post_report_activity.descendants_verified
+                            ),
+                            terminated=post_report_activity.enforced_stop,
+                            report_status=(
+                                worker_report.status if worker_report else ""
+                            ),
+                            teardown_reason=post_report_activity.teardown_reason,
+                            runtime_lifecycle_decision=(post_report_lifecycle_decision),
+                            runtime_lifecycle_reason=post_report_lifecycle_reason,
+                        )
+                    )
             try:
                 output_tail = _read_log_tail(
                     log_path, LOG_TAIL_LINES_FOR_TRANSIENT_CHECK
@@ -2808,10 +2894,23 @@ class VibeRunner:
             implementation_ready = bool(
                 runtime_owned
                 and (exit_code == 0 or post_report_lifecycle_decision == "continue")
+                and post_report_lifecycle_decision != "refuse"
                 and not worker_timed_out
                 and (worker_report is None or worker_report.status == "completed")
             )
-            if implementation_ready:
+            if (
+                runtime_owned
+                and worker_report is not None
+                and worker_report.status == "completed"
+                and post_report_lifecycle_decision == "refuse"
+            ):
+                classification = ClassificationResult(
+                    "blocked",
+                    "post_report_closure_refused",
+                    detail=post_report_lifecycle_reason,
+                )
+                message = post_report_lifecycle_reason
+            elif implementation_ready:
                 try:
                     classification = self.execute_runtime_owned_lifecycle(
                         task=task,
@@ -3014,6 +3113,13 @@ class VibeRunner:
                     "enforced_stop": pr.enforced_stop,
                     "activity_count": pr.activity_count,
                 }
+                if pr.teardown_reason:
+                    post_report_stats["teardown_reason"] = pr.teardown_reason
+                    post_report_stats["descendants_verified"] = pr.descendants_verified
+                    post_report_stats["teardown_process_count"] = (
+                        pr.teardown_process_count
+                    )
+                    post_report_stats["teardown_seconds"] = pr.teardown_seconds
                 if pr.activity_kind:
                     post_report_stats["activity_kind"] = pr.activity_kind
                 if pr.usage.available:
@@ -7794,15 +7900,151 @@ def terminate_worker_process_group(
 
 
 @dataclasses.dataclass(frozen=True)
+class VerifiedWorkerTeardown:
+    terminated: bool
+    identity_verified: bool
+    descendants_verified: bool
+    reason: str
+    process_count: int = 0
+
+
+def terminate_verified_worker_process_group(
+    process: subprocess.Popen,
+    log: TextIO,
+    *,
+    expected_birth_id: str,
+    sigkill_after_seconds: float = 2.0,
+    process_table: Callable[[], dict[int, ProcessNode]] = read_process_table,
+    process_node: Callable[[int], ProcessNode | None] = read_process_node,
+) -> VerifiedWorkerTeardown:
+    """Stop only the verified worker group and prove its captured tree exited."""
+    if not expected_birth_id:
+        return VerifiedWorkerTeardown(
+            False, False, False, "worker_identity_unavailable"
+        )
+    table = process_table()
+    root = table.get(process.pid)
+    if (
+        root is None
+        or root.process_birth_id != expected_birth_id
+        or root.process_group_id != process.pid
+        or root.session_id != process.pid
+    ):
+        return VerifiedWorkerTeardown(False, False, False, "worker_identity_mismatch")
+
+    descendants = collect_owned_descendants(table, {process.pid: expected_birth_id})
+    descendant_pids = {node.pid for node in descendants}
+    group = [node for node in table.values() if node.process_group_id == process.pid]
+    if any(node.pid not in descendant_pids for node in group):
+        return VerifiedWorkerTeardown(
+            False, True, False, "process_group_contains_unowned_member"
+        )
+    if any(node.process_group_id != process.pid for node in descendants):
+        return VerifiedWorkerTeardown(
+            False, True, False, "descendant_outside_worker_process_group"
+        )
+    for node in descendants:
+        current = process_node(node.pid)
+        if current is None:
+            if node.pid == process.pid:
+                return VerifiedWorkerTeardown(
+                    False,
+                    False,
+                    False,
+                    "worker_identity_unavailable",
+                    len(descendants),
+                )
+            continue
+        if (
+            current.process_birth_id != node.process_birth_id
+            or current.parent_pid != node.parent_pid
+            or current.process_group_id != node.process_group_id
+            or current.session_id != node.session_id
+        ):
+            return VerifiedWorkerTeardown(
+                False,
+                True,
+                False,
+                "descendant_identity_unverified",
+                len(descendants),
+            )
+
+    terminate_worker_process_group(
+        process,
+        log,
+        sigkill_after_seconds=sigkill_after_seconds,
+    )
+    deadline = time.monotonic() + sigkill_after_seconds
+    remaining = list(descendants)
+    while remaining and time.monotonic() < deadline:
+        remaining = [
+            node
+            for node in remaining
+            if (
+                (current := process_node(node.pid)) is not None
+                and current.process_birth_id == node.process_birth_id
+                and current.state not in {"Z", "X", "x"}
+            )
+        ]
+        if remaining:
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    if remaining:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except (PermissionError, OSError):
+            return VerifiedWorkerTeardown(
+                False,
+                True,
+                True,
+                "verified_processes_remain",
+                len(descendants),
+            )
+        deadline = time.monotonic() + sigkill_after_seconds
+        while remaining and time.monotonic() < deadline:
+            remaining = [
+                node
+                for node in remaining
+                if (
+                    (current := process_node(node.pid)) is not None
+                    and current.process_birth_id == node.process_birth_id
+                    and current.state not in {"Z", "X", "x"}
+                )
+            ]
+            if remaining:
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    if remaining:
+        return VerifiedWorkerTeardown(
+            False,
+            True,
+            True,
+            "verified_processes_remain",
+            len(descendants),
+        )
+    return VerifiedWorkerTeardown(
+        True,
+        True,
+        True,
+        "accepted_report_runtime_closure",
+        len(descendants),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class WaitOutcome:
     exit_code: int
     # True when the wall-clock deadline fired and the process group was killed.
     timed_out: bool = False
-    # True when the worker's verified process group was stopped because it kept
-    # performing structured activity after filing its terminal report. Distinct
-    # from timed_out so the accepted report stays authoritative for
-    # classification and the run is never turned into a retry.
+    # True when the worker's verified process group was stopped at a post-report
+    # boundary, either for structured activity or accepted runtime closure.
+    # Distinct from timed_out so an accepted report remains authoritative.
     post_report_enforced: bool = False
+    post_report_teardown_reason: str = ""
+    post_report_identity_verified: bool = False
+    post_report_descendants_verified: bool = False
+    post_report_teardown_process_count: int = 0
+    post_report_teardown_seconds: float = 0.0
 
 
 def wait_with_reap_watchdog(
@@ -7819,10 +8061,12 @@ def wait_with_reap_watchdog(
     identity_verified_ok: Callable[[], bool] | None = None,
     post_report_activity_grace_seconds: float = 0.0,
     report_boundary_wall: Callable[[], float | None] | None = None,
+    post_report_closure_check: Callable[[], str] | None = None,
+    post_report_teardown: Callable[[], VerifiedWorkerTeardown] | None = None,
 ) -> WaitOutcome:
     """Wait for a worker, reaping it if it hangs or overruns its report.
 
-    Three independent reap conditions apply:
+    Four independent reap conditions apply:
 
     * Wall-clock deadline (``timeout_seconds``): an absolute upper bound on the
       run regardless of whether the worker ever filed a report. When it fires
@@ -7842,6 +8086,11 @@ def wait_with_reap_watchdog(
       after ``post_report_activity_grace_seconds`` with ``post_report_enforced``
       set. This bounds the quota a worker burns by continuing to act past its
       accepted terminal report while leaving that report authoritative.
+    * Accepted-report closure (``post_report_closure_check``): runtime-owned
+      workers whose completed report and recorded candidate pass initial
+      acceptance are stopped immediately through ``post_report_teardown``.
+      This is a normal runtime stage boundary, not a timeout or activity
+      violation.
 
     Identity gating is fail-closed on every reap path (hang, timeout, and
     post-report enforcement): the group is signalled only on a positive
@@ -7918,6 +8167,21 @@ def wait_with_reap_watchdog(
 
     reap_eligible_since: float | None = None
     activity_eligible_since: float | None = None
+    closure_checked = False
+    closure_teardown = VerifiedWorkerTeardown(False, False, False, "")
+    closure_teardown_seconds = 0.0
+
+    def _wait_outcome(exit_code: int) -> WaitOutcome:
+        return WaitOutcome(
+            exit_code,
+            post_report_enforced=closure_teardown.terminated,
+            post_report_teardown_reason=closure_teardown.reason,
+            post_report_identity_verified=closure_teardown.identity_verified,
+            post_report_descendants_verified=closure_teardown.descendants_verified,
+            post_report_teardown_process_count=closure_teardown.process_count,
+            post_report_teardown_seconds=closure_teardown_seconds,
+        )
+
     while True:
         wait_for = poll_seconds
         if deadline is not None:
@@ -7931,7 +8195,7 @@ def wait_with_reap_watchdog(
             pass
         else:
             _reconcile_boundary_on_exit()
-            return WaitOutcome(exit_code)
+            return _wait_outcome(exit_code)
         if deadline is not None and monotonic() - deadline >= 0:
             return _reap_for_timeout()
         eligible = False
@@ -7944,6 +8208,64 @@ def wait_with_reap_watchdog(
                 eligible = False
         if eligible and not report_marked:
             _mark_boundary()
+        if (
+            report_marked
+            and not closure_checked
+            and post_report_closure_check is not None
+        ):
+            try:
+                closure_reason = post_report_closure_check()
+            # The acceptance callback combines journal reads and Git
+            # subprocesses; any unexpected failure must refuse closure without
+            # crashing supervision or signalling the worker.
+            except Exception:
+                closure_reason = "closure_acceptance_check_failed"
+            if closure_reason:
+                closure_checked = True
+                if closure_reason == "accepted_completed_candidate":
+                    started = monotonic()
+                    if post_report_teardown is None:
+                        closure_teardown = VerifiedWorkerTeardown(
+                            False,
+                            False,
+                            False,
+                            "teardown_handler_unavailable",
+                        )
+                    else:
+                        try:
+                            closure_teardown = post_report_teardown()
+                        # Teardown combines process snapshots, identity reads,
+                        # waits, and signals. Any unexpected failure is a
+                        # fail-closed result, never permission to continue.
+                        except Exception:
+                            closure_teardown = VerifiedWorkerTeardown(
+                                False,
+                                False,
+                                False,
+                                "teardown_handler_failed",
+                            )
+                    closure_teardown_seconds = max(0.0, monotonic() - started)
+                    if closure_teardown.terminated:
+                        report_status(
+                            f"worker pid={process.pid} accepted completed report "
+                            "and candidate; verified runtime closure stopped its "
+                            "process group",
+                            log,
+                        )
+                        return _wait_outcome(process.wait())
+                    report_status(
+                        f"worker pid={process.pid} accepted completed report but "
+                        "verified runtime closure failed: "
+                        f"{closure_teardown.reason}",
+                        log,
+                    )
+                else:
+                    closure_teardown = VerifiedWorkerTeardown(
+                        False,
+                        False,
+                        False,
+                        closure_reason,
+                    )
         if (
             post_report_monitor is not None
             and report_marked
@@ -8003,6 +8325,7 @@ def run_streaming_command(
     reap_poll_seconds: float = 10.0,
     post_report_activity_grace_seconds: float = 0.0,
     report_persistence_epoch: Callable[[], float | None] | None = None,
+    post_report_closure_check: Callable[[], str] | None = None,
     timeout_seconds: float | None = None,
     provider: str = "unknown",
 ) -> StreamingCommandResult:
@@ -8140,6 +8463,12 @@ def run_streaming_command(
         identity_verified_ok=identity_verified,
         post_report_activity_grace_seconds=post_report_activity_grace_seconds,
         report_boundary_wall=report_persistence_epoch,
+        post_report_closure_check=post_report_closure_check,
+        post_report_teardown=lambda: terminate_verified_worker_process_group(
+            process,
+            log,
+            expected_birth_id=expected_birth_id,
+        ),
     )
     stdout_thread.join()
     stderr_thread.join()
@@ -8149,7 +8478,15 @@ def run_streaming_command(
     observation = output_observer.observation
     post_report = post_report_monitor.snapshot(
         enforced_stop=wait_outcome.post_report_enforced,
-        identity_verified=wait_outcome.post_report_enforced and bool(expected_birth_id),
+        identity_verified=wait_outcome.post_report_identity_verified
+        or (wait_outcome.post_report_enforced and bool(expected_birth_id)),
+    )
+    post_report = dataclasses.replace(
+        post_report,
+        teardown_reason=wait_outcome.post_report_teardown_reason,
+        descendants_verified=wait_outcome.post_report_descendants_verified,
+        teardown_process_count=wait_outcome.post_report_teardown_process_count,
+        teardown_seconds=wait_outcome.post_report_teardown_seconds,
     )
     return StreamingCommandResult(
         exit_code=wait_outcome.exit_code,

@@ -41,7 +41,7 @@ from vibe_loop.locks import (
     SettledOutcomeNotPersisted,
     TaskLock,
 )
-from vibe_loop.processes import read_process_node
+from vibe_loop.processes import ProcessNode, read_process_node
 from vibe_loop.orchestration import (
     CandidateRecord,
     CandidateReanchorRetryExhausted,
@@ -105,6 +105,7 @@ from vibe_loop.runner import (
     resolve_codex_home,
     resolve_codex_rollout,
     run_streaming_command,
+    terminate_verified_worker_process_group,
     terminate_worker_process_group,
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
@@ -5306,6 +5307,82 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     @unittest.skipUnless(
         hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
     )
+    def test_accepted_report_teardown_refuses_descendant_outside_worker_group(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        escaped = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=proc.pid,
+            process_group_id=proc.pid + 1,
+            session_id=proc.pid + 1,
+            process_birth_id="boot:child",
+        )
+        nodes = {root.pid: root, escaped.pid: escaped}
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = terminate_verified_worker_process_group(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                process_table=lambda: nodes,
+                process_node=nodes.get,
+            )
+
+        self.assertFalse(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "descendant_outside_worker_process_group")
+        self.assertEqual(killed, [])
+
+    def test_accepted_completed_candidate_uses_immediate_closure_path(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000, returncode=-signal.SIGTERM)
+        monitor = FakePostReportMonitor(violates=False)
+        teardown_calls = 0
+
+        def teardown() -> runner_module.VerifiedWorkerTeardown:
+            nonlocal teardown_calls
+            teardown_calls += 1
+            return runner_module.VerifiedWorkerTeardown(
+                True,
+                True,
+                True,
+                "accepted_report_runtime_closure",
+                2,
+            )
+
+        result = wait_with_reap_watchdog(
+            proc,
+            StringIO(),
+            reap_check=lambda: True,
+            grace_seconds=120.0,
+            poll_seconds=0.001,
+            post_report_monitor=monitor,
+            post_report_closure_check=lambda: "accepted_completed_candidate",
+            post_report_teardown=teardown,
+        )
+
+        self.assertEqual(teardown_calls, 1)
+        self.assertTrue(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(
+            result.post_report_teardown_reason,
+            "accepted_report_runtime_closure",
+        )
+        self.assertTrue(result.post_report_identity_verified)
+        self.assertTrue(result.post_report_descendants_verified)
+        self.assertEqual(result.post_report_teardown_process_count, 2)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_wall_clock_timeout_kills_process_group_and_flags_timed_out(self):
         # A worker that never becomes reap-eligible but overruns the wall-clock
         # deadline must be force-killed via its process GROUP (it is launched
@@ -6175,6 +6252,90 @@ class RunStreamingPostReportTests(unittest.TestCase):
         # dispatch can overlap an unfinalized process.
         self.assertTrue(pids)
         self.assertIsNone(read_process_node(pids[0]))
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "killpg"),
+        "verified process-tree teardown requires Linux",
+    )
+    def test_accepted_report_immediately_drains_lingering_process_tree(self):
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sentinel_node = read_process_node(sentinel.pid)
+        self.assertIsNotNone(sentinel_node)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                child_pid_path = root / "child.pid"
+                script = root / "cmd.py"
+                script.write_text(
+                    "import pathlib, subprocess, sys, time\n"
+                    "child = subprocess.Popen("
+                    "[sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                    "pathlib.Path('child.pid').write_text(str(child.pid))\n"
+                    "time.sleep(60)\n",
+                    encoding="utf-8",
+                )
+                log_path = root / "run.log"
+                started = time.monotonic()
+                with log_path.open("w", encoding="utf-8") as log:
+                    result = run_streaming_command(
+                        f"{sys.executable} cmd.py",
+                        root,
+                        log,
+                        reap_check=child_pid_path.exists,
+                        reap_grace_seconds=120.0,
+                        reap_poll_seconds=0.02,
+                        post_report_closure_check=(
+                            lambda: "accepted_completed_candidate"
+                        ),
+                        provider="anthropic",
+                    )
+                elapsed = time.monotonic() - started
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+
+                self.assertLess(elapsed, 5.0)
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertFalse(result.timed_out)
+                self.assertIsNotNone(result.post_report)
+                self.assertTrue(result.post_report.enforced_stop)
+                self.assertTrue(result.post_report.identity_verified)
+                self.assertTrue(result.post_report.descendants_verified)
+                self.assertEqual(
+                    result.post_report.teardown_reason,
+                    "accepted_report_runtime_closure",
+                )
+                self.assertGreaterEqual(result.post_report.teardown_process_count, 2)
+                child = read_process_node(child_pid)
+                self.assertTrue(
+                    child is None or child.state in {"Z", "X", "x"},
+                    "lingering worker child survived verified teardown",
+                )
+                surviving_sentinel = read_process_node(sentinel.pid)
+                self.assertIsNotNone(surviving_sentinel)
+                self.assertEqual(
+                    surviving_sentinel.process_birth_id,
+                    sentinel_node.process_birth_id,
+                )
+        finally:
+            current = read_process_node(sentinel.pid)
+            if (
+                current is not None
+                and current.process_birth_id == sentinel_node.process_birth_id
+            ):
+                sentinel.terminate()
+            try:
+                sentinel.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                current = read_process_node(sentinel.pid)
+                if (
+                    current is not None
+                    and current.process_birth_id == sentinel_node.process_birth_id
+                ):
+                    sentinel.kill()
+                sentinel.wait(timeout=5)
 
     def test_tool_activity_before_a_poll_is_still_recorded(self):
         # F1: a worker that reports, invokes a tool, and exits within a single
@@ -8063,6 +8224,111 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertEqual(
             activity["runtime_lifecycle_reason"],
             "verified_runtime_enforced_teardown",
+        )
+
+    def test_runtime_owned_accepts_reported_candidate_for_immediate_closure(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            def closed_worker(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                branch = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                candidate = CandidateRecord(
+                    branch=branch,
+                    worktree=cwd,
+                    base_main=head,
+                    head_commit=head,
+                    changed_paths=(),
+                    source="worker_command",
+                )
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.candidate_recorded(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        payload=candidate.to_payload(),
+                    )
+                )
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                        commit=head,
+                    )
+                )
+                self.assertTrue(kwargs["reap_check"]())
+                self.assertEqual(
+                    kwargs["post_report_closure_check"](),
+                    "accepted_completed_candidate",
+                )
+                kwargs["on_start"](os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGTERM,
+                    post_report=runner_module.PostReportActivity(
+                        reported=True,
+                        seconds=0.1,
+                        activity_kind="",
+                        activity_count=0,
+                        enforced_stop=True,
+                        identity_verified=True,
+                        usage=runner_module.unavailable_usage(
+                            "anthropic", "test_fixture"
+                        ),
+                        teardown_reason="accepted_report_runtime_closure",
+                        descendants_verified=True,
+                        teardown_process_count=2,
+                        teardown_seconds=0.02,
+                    ),
+                )
+
+            def complete_lifecycle(**kwargs):
+                self._record_runtime_integration(
+                    runner,
+                    kwargs["run_id"],
+                    kwargs["task"].task_id,
+                )
+                return runner_module.ClassificationResult(
+                    "completed", "runtime_lifecycle"
+                )
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=complete_lifecycle,
+            ) as lifecycle:
+                result = self._run_task(runner, task, closed_worker)
+            closure = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "post_report_closure"
+            )
+
+        self.assertEqual(result.classification, "completed")
+        lifecycle.assert_called_once()
+        self.assertTrue(closure["terminated"])
+        self.assertTrue(closure["identity_verified"])
+        self.assertTrue(closure["descendants_verified"])
+        self.assertEqual(closure["teardown_process_count"], 2)
+        self.assertEqual(
+            closure["runtime_lifecycle_reason"],
+            "verified_accepted_report_runtime_closure",
         )
 
     def test_runtime_owned_lifecycle_refuses_unverified_post_report_exit(

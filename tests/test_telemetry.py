@@ -210,6 +210,10 @@ def test_stats_expose_post_report_teardown_breakdown() -> None:
         post_report={
             "duration_seconds": 63.5,
             "enforced_stop": True,
+            "teardown_reason": "accepted_report_runtime_closure",
+            "descendants_verified": True,
+            "teardown_process_count": 2,
+            "teardown_seconds": 0.04,
             "activity_kind": "tool_call",
             "activity_count": 4,
             "usage": {"input_tokens": 435000, "output_tokens": 900},
@@ -219,6 +223,10 @@ def test_stats_expose_post_report_teardown_breakdown() -> None:
     assert stats["post_report"] == {
         "duration_seconds": 63.5,
         "enforced_stop": True,
+        "teardown_reason": "accepted_report_runtime_closure",
+        "descendants_verified": True,
+        "teardown_process_count": 2,
+        "teardown_seconds": 0.04,
         "activity_kind": "tool_call",
         "activity_count": 4,
         "usage": {"input_tokens": 435000, "output_tokens": 900},

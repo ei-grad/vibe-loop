@@ -88,6 +88,7 @@ TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE = "task_source_settlement_attempted
 TASK_SOURCE_SETTLED_RECORD_TYPE = "task_source_settled"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
+POST_REPORT_CLOSURE_RECORD_TYPE = "post_report_closure"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
@@ -161,6 +162,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         TASK_SOURCE_SETTLED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
+        POST_REPORT_CLOSURE_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
         AGENT_STARTED_RECORD_TYPE,
         ACTIVITY_CHECKPOINT_RECORD_TYPE,
@@ -1066,6 +1068,66 @@ class RunLifecycleEvent:
                 "identity_verified": identity_verified,
                 "terminated": terminated,
                 "report_status": report_status,
+                "runtime_lifecycle_decision": runtime_lifecycle_decision,
+                "runtime_lifecycle_reason": runtime_lifecycle_reason,
+            },
+        )
+
+    @classmethod
+    def post_report_closure(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        post_report_seconds: float,
+        teardown_seconds: float,
+        worker_pid: int | None,
+        process_group_id: int | None,
+        process_count: int,
+        identity_verified: bool,
+        descendants_verified: bool,
+        terminated: bool,
+        report_status: str,
+        teardown_reason: str,
+        runtime_lifecycle_decision: str,
+        runtime_lifecycle_reason: str,
+    ) -> RunLifecycleEvent:
+        allowed_reasons = {
+            "accepted_candidate_initially_changed",
+            "accepted_candidate_missing",
+            "accepted_report_candidate_mismatch",
+            "accepted_report_commit_missing",
+            "accepted_report_not_completed",
+            "accepted_report_runtime_closure",
+            "closure_acceptance_check_failed",
+            "descendant_identity_unverified",
+            "descendant_outside_worker_process_group",
+            "process_group_contains_unowned_member",
+            "teardown_handler_failed",
+            "teardown_handler_unavailable",
+            "verified_processes_remain",
+            "worker_identity_mismatch",
+            "worker_identity_unavailable",
+        }
+        if teardown_reason not in allowed_reasons:
+            raise ValueError("post-report closure reason is invalid")
+        return cls(
+            record_type=POST_REPORT_CLOSURE_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "task_id": task_id,
+                "policy": "accepted_report_runtime_closure",
+                "post_report_seconds": max(0.0, post_report_seconds),
+                "teardown_seconds": max(0.0, teardown_seconds),
+                "worker_pid": worker_pid,
+                "worker_process_group_id": process_group_id,
+                "teardown_process_count": max(0, process_count),
+                "identity_verified": identity_verified,
+                "descendants_verified": descendants_verified,
+                "terminated": terminated,
+                "report_status": report_status,
+                "teardown_reason": teardown_reason,
                 "runtime_lifecycle_decision": runtime_lifecycle_decision,
                 "runtime_lifecycle_reason": runtime_lifecycle_reason,
             },

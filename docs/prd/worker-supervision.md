@@ -41,13 +41,25 @@ The already accepted report — the first terminal report the supervisor observe
 — stays authoritative: enforced teardown neither downgrades a completed result to
 unknown nor creates a retry, a later contradicting report cannot override it, and
 finalization/next-task dispatch still waits for the worker process to exit.
-In runtime-owned orchestration, a nonzero exit caused by that positively verified
-post-report enforcement may advance to candidate collection only when the accepted
-report is `completed` and the run did not hit its wall-clock timeout. The runtime
-re-snapshots the claimed candidate after teardown and before any gate; an external
-termination, unverifiable identity, non-completed report, or changed candidate
-remains fail-closed. The activity event records the structured continue/refuse
-decision and reason without copying worker prompt or output text.
+In runtime-owned orchestration, the bounded-summary grace does not apply after a
+completed report whose resolved commit matches a recorded candidate and whose
+candidate still matches the claimed workspace. That accepted pair is the terminal
+implementation contract: the supervisor promptly verifies that the isolated
+process group contains only the worker's birth-identified process tree, stops the
+group, and proves the captured descendants exited. A nonzero exit caused by this
+closure may advance to candidate collection only when closure identity,
+descendant verification, and termination all succeeded and the run did not hit
+its wall-clock timeout. The runtime re-snapshots the claimed candidate after
+teardown and before any gate. An external termination, missing or mismatched
+candidate, unverifiable identity or descendants, non-completed report, teardown
+failure, or changed candidate remains fail-closed.
+
+Runtime-initiated accepted-report closure is recorded separately from
+`post_report_activity` and timeout evidence. Its closed reason vocabulary,
+post-report and teardown durations, process count, identity/descendant
+verification flags, termination result, and lifecycle continue/refuse decision
+are safe to persist; worker transcript, prompt, tool arguments, and tool results
+are not.
 
 The boundary is the report's own persistence instant, not the moment the
 supervisor's poll notices it, so structured activity emitted after persistence
@@ -257,7 +269,8 @@ run start snapshots, observed agent runtime context, workspace events (claimed,
 mismatch detected), run state transitions (session observed, classified), and
 `post_report_activity` policy violations (structured worker activity observed
 after an accepted terminal report, with the verified process-group teardown and
-its post-report duration).
+its post-report duration) and `post_report_closure` events (runtime-owned
+accepted-report process-tree closure with bounded typed verification evidence).
 
 Native Claude and Codex structured envelopes also yield provider-neutral
 `agent_started`, coalesced `activity_checkpoint`, `gate_result`, `work_blocked`,
