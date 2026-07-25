@@ -76,6 +76,7 @@ from vibe_loop.orchestration import (
     ReviewExecutionError,
     ReviewFinding,
     ReviewLimitWallError,
+    ReviewOutputMalformed,
     ReviewRouter,
     ReviewStageResultError,
     RuntimeGateController,
@@ -2705,6 +2706,13 @@ class VibeRunner:
                     classification = ClassificationResult(
                         "blocked",
                         "review_budget_exhausted",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except ReviewOutputMalformed as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        "review_output_malformed",
                         detail=str(exc),
                     )
                     message = str(exc)

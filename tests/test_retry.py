@@ -491,6 +491,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
 
     def test_limit_wall_on_stdout_is_detected(self) -> None:
         # Agent CLIs differ on which stream carries the refusal notice.
+        now = datetime.datetime(2026, 7, 24, 22, 46, tzinfo=datetime.timezone.utc)
         fake_sleep = MagicMock()
         walls: list[LimitWallSignal] = []
         wall_result = subprocess.CompletedProcess(
@@ -506,6 +507,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 sleep=fake_sleep,
                 detect_limit_walls=True,
                 on_limit_wall=walls.append,
+                now=now,
             )
         self.assertEqual(mock_run.call_count, 1)
         fake_sleep.assert_not_called()

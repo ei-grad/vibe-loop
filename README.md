@@ -1219,7 +1219,18 @@ their ordinary behavior.
 Reviewer output is one schema-validated JSON verdict. Findings are persisted in
 a candidate-scoped ledger, malformed output gets one bounded re-ask, and a
 provider limit wall is attributed to the reviewer route without consuming the
-implementation restart budget. Runtime usage phases are `initial_review` and
+implementation restart budget. Finding `files` and `lines` are arrays of
+strings; a bare scalar is read as a one-element list and integers are coerced
+to text, so the common reviewer rendering does not discard the run. The re-ask
+names the specific parse violation rather than only reporting that the previous
+answer was malformed. If the re-ask is also malformed, the review stage is
+classified as blocked instead of a generic runtime failure — the candidate and
+passed gate evidence were already retained by the worktree-keep guardrail for
+any unsuccessful terminal status — and the journal stores a bounded,
+secret-redacted output tail under the distinct `malformed` classification.
+Reviewer stdout is line-capped and windowed before redaction, so an unbounded
+prose answer cannot stall the run inside the redactor. Runtime usage phases are
+`initial_review` and
 `targeted_closure`; compatibility worker reports may continue using `review`.
 
 Continuation capability is explicit by provider and role. Claude implementer
