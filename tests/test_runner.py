@@ -7974,11 +7974,19 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 for record in records
                 if record.get("record_type") == "task_recovery"
             ]
+            provenance_records = [
+                record
+                for record in records
+                if record.get("record_type") == "task_provenance_committed"
+            ]
 
         self.assertEqual(result.classification, "completed")
         self.assertEqual(source.status, "done")
         self.assertEqual(candidate_text, "candidate\n")
         self.assertEqual(task_recovery_records, [])
+        self.assertEqual(len(provenance_records), 1)
+        self.assertEqual(provenance_records[0]["mode"], "adapter")
+        self.assertEqual(provenance_records[0]["confirmed_status"], "done")
         for required in (
             "candidate_recorded",
             "gate_result",

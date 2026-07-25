@@ -101,6 +101,7 @@ class OrchestrationConfigTests(unittest.TestCase):
             config.orchestration.task_provenance_mode,
             "external-confirmed",
         )
+        self.assertIsNone(config.orchestration.external_completion_actor)
 
     def test_parses_typed_allowlisted_contract_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -122,7 +123,8 @@ class OrchestrationConfigTests(unittest.TestCase):
                 "max_remediation_rounds = 4\n"
                 "max_candidate_reanchors = 3\n"
                 "integration_enabled = false\n"
-                'task_provenance_mode = "external-confirmed"\n',
+                'task_provenance_mode = "external-confirmed"\n'
+                'external_completion_actor = "operator"\n',
                 encoding="utf-8",
             )
 
@@ -140,6 +142,7 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_remediation_rounds, 4)
         self.assertEqual(config.orchestration.max_candidate_reanchors, 3)
         self.assertFalse(config.orchestration.integration_enabled)
+        self.assertEqual(config.orchestration.external_completion_actor, "operator")
 
     def test_accepts_runtime_owned_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -174,6 +177,10 @@ class OrchestrationConfigTests(unittest.TestCase):
             (
                 'task_provenance_mode = ""\n',
                 "orchestration.task_provenance_mode must be one of",
+            ),
+            (
+                'external_completion_actor = ""\n',
+                "orchestration.external_completion_actor must be one of",
             ),
         )
         for settings, diagnostic in cases:
@@ -223,10 +230,17 @@ class RunContractResolverTests(unittest.TestCase):
                 mode="runtime-owned",
                 reviewer_profile="review",
                 task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
                 explicit_keys=frozenset(
-                    {"mode", "reviewer_profile", "task_provenance_mode"}
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
                 ),
             ),
+            task_source=TaskSourceConfig(probe_command="probe {task_id}"),
         )
 
         with self.assertRaisesRegex(
@@ -453,17 +467,90 @@ class RunContractResolverTests(unittest.TestCase):
                 OrchestrationConfig(
                     mode="runtime-owned",
                     reviewer_profile="review",
-                    task_provenance_mode="external-confirmed",
+                    task_provenance_mode="adapter",
+                    external_completion_actor="operator",
                     explicit_keys=frozenset(
-                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(complete_command="complete {task_id}"),
+                "external_completion_actor is only valid",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
                     ),
                 ),
                 TaskSourceConfig(
                     type="command",
                     list_command="list",
+                    probe_command="probe {task_id}",
                     activate_command="activate {task_id}",
                 ),
                 "requires task_source.reset",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
+                ),
+                TaskSourceConfig(probe_command="probe {task_id}"),
+                "requires an explicit.*external_completion_actor",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(),
+                "requires task_source.probe",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="worker",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(probe_command="probe {task_id}"),
+                "workers are forbidden from transitioning",
             ),
         )
         for orchestration, task_source, diagnostic in cases:
@@ -553,6 +640,8 @@ class RunContractResolverTests(unittest.TestCase):
             {
                 "mode": "adapter",
                 "complete_adapter": "task_source.complete",
+                "confirmation_adapter": "task_source.complete",
+                "transition_actor": "runtime",
                 "settlement": {
                     "requeue_adapter": "task_source.reset",
                     "park_adapter": "task_source.park",
@@ -590,9 +679,17 @@ class RunContractResolverTests(unittest.TestCase):
                     orchestration=OrchestrationConfig(
                         reviewer_profile="review",
                         task_provenance_mode="external-confirmed",
+                        external_completion_actor="external-system",
                         explicit_keys=frozenset(
-                            {"reviewer_profile", "task_provenance_mode"}
+                            {
+                                "reviewer_profile",
+                                "task_provenance_mode",
+                                "external_completion_actor",
+                            }
                         ),
+                    ),
+                    task_source=TaskSourceConfig(
+                        probe_command="probe {task_id}",
                     ),
                 )
 
@@ -610,6 +707,14 @@ class RunContractResolverTests(unittest.TestCase):
                 self.assertEqual(
                     contract.payload["task_provenance"]["mode"],
                     "external-confirmed",
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["transition_actor"],
+                    "external-system",
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["confirmation_adapter"],
+                    "task_source.probe",
                 )
 
 

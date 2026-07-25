@@ -215,10 +215,14 @@ no-commit `branch_already_merged` no-op case. In runtime-owned mode the
 contract must declare a completion path and contract validation fails closed
 before any mutation when none is available: either the runtime performs the
 transition through an explicit `task_source.complete` adapter under the held
-lock, or the contract declares external-confirmed completion and the runtime
-confirms the authoritative done state by probing the task source before
-recording provenance and reporting completed — a probe still showing the task
-in progress parks the run blocked with the integrated candidate preserved.
+lock, or the contract declares external-confirmed completion with an explicit
+operator or external-system transition actor and the runtime confirms the
+authoritative done state through a configured `task_source.probe` before
+recording provenance and reporting completed — a probe still showing the task in
+progress parks the run blocked with the integrated candidate preserved. A
+runtime-owned contract that names the implementation worker as the transition
+actor is rejected because that worker is forbidden from changing the
+authoritative task source.
 Completion is never silently delegated back to prose. Ordering is invariant
 and recoverable: review verdict before
 integration, integration before provenance, provenance before the completed

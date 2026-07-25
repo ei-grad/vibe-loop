@@ -607,17 +607,20 @@ Compatibility specifics:
   completion paths, and contract validation fails closed before any mutation
   when neither is available: `adapter` (the runtime invokes
   `task_source.complete` under the held lock) or `external-confirmed` (an
-  authorized external actor — worker step, human, or tracker automation —
-  performs the transition, and the runtime confirms the authoritative done
-  state by probing the task source before recording
+  explicitly named operator or external system performs the transition, and
+  the runtime confirms the authoritative done state through a configured
+  `task_source.probe` before recording
   `task_provenance_committed` and reporting completed; a probe that still
   shows the task in progress parks the run `blocked` with the integrated
-  candidate preserved and a precise diagnostic). Completion is never silently
-  delegated back to prose. Failure settlement follows the same fail-closed
-  rule: a source that configures `task_source.activate` must also configure
-  `task_source.reset` (optionally `task_source.park` for terminal parking)
-  before runtime-owned mode will resolve a contract. Worker-owned mode keeps
-  today's behavior unchanged.
+  candidate preserved and a precise diagnostic). The external path requires
+  `orchestration.external_completion_actor = "operator" | "external-system"`;
+  `worker` is rejected because the runtime-owned implementation prompt forbids
+  the worker from transitioning the task. Completion is never silently
+  delegated back to prose. Failure settlement follows the same fail-closed rule:
+  a source that configures `task_source.activate` must also configure
+  `task_source.reset` (optionally `task_source.park` for terminal parking) before
+  runtime-owned mode will resolve a contract. Worker-owned mode keeps today's
+  behavior unchanged.
 - **Existing run journals:** all new types are additive; existing readers
   ignore them; `derive_run_lifecycle` gains stages only for runs that
   recorded them.

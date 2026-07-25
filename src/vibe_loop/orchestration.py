@@ -4744,13 +4744,34 @@ class RunContractResolver:
                     "runtime-owned orchestration requires an explicit "
                     "orchestration.task_provenance_mode completion path"
                 )
-            if (
-                effective.task_provenance_mode == "adapter"
-                and self.config.task_source.complete_command is None
-            ):
-                raise ValueError(
-                    "runtime-owned adapter completion requires task_source.complete"
-                )
+            if effective.task_provenance_mode == "adapter":
+                if self.config.task_source.complete_command is None:
+                    raise ValueError(
+                        "runtime-owned adapter completion requires task_source.complete"
+                    )
+                if "external_completion_actor" in effective.explicit_keys:
+                    raise ValueError(
+                        "orchestration.external_completion_actor is only valid "
+                        'with task_provenance_mode = "external-confirmed"'
+                    )
+            else:
+                if "external_completion_actor" not in effective.explicit_keys:
+                    raise ValueError(
+                        "runtime-owned external-confirmed completion requires an "
+                        "explicit orchestration.external_completion_actor"
+                    )
+                if effective.external_completion_actor == "worker":
+                    raise ValueError(
+                        "runtime-owned workers are forbidden from transitioning "
+                        "the authoritative task source; configure task_source.complete "
+                        'with task_provenance_mode = "adapter", or name an operator '
+                        "or external-system completion actor"
+                    )
+                if self.config.task_source.probe_command is None:
+                    raise ValueError(
+                        "runtime-owned external-confirmed completion requires "
+                        "task_source.probe to observe the authoritative done state"
+                    )
             if (
                 self.config.task_source.activate_command is not None
                 and self.config.task_source.reset_command is None
@@ -4789,6 +4810,16 @@ class RunContractResolver:
             "task_provenance": {
                 "mode": effective.task_provenance_mode,
                 "complete_adapter": None,
+                "confirmation_adapter": (
+                    "task_source.complete"
+                    if effective.task_provenance_mode == "adapter"
+                    else "task_source.probe"
+                ),
+                "transition_actor": (
+                    "runtime"
+                    if effective.task_provenance_mode == "adapter"
+                    else effective.external_completion_actor
+                ),
                 "settlement": {
                     "requeue_adapter": (
                         "task_source.reset"
@@ -4809,7 +4840,7 @@ class RunContractResolver:
         }
         task_provenance = payload["task_provenance"]
         assert isinstance(task_provenance, dict)
-        if self.config.task_source.complete_command is not None:
+        if effective.task_provenance_mode == "adapter":
             task_provenance["complete_adapter"] = "task_source.complete"
         return ResolvedRunContract(payload=payload, digest=sha256_digest(payload))
 

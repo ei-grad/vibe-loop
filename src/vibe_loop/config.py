@@ -366,12 +366,18 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "max_candidate_reanchors",
         "integration_enabled",
         "task_provenance_mode",
+        "external_completion_actor",
     }
 )
 
 ORCHESTRATION_MODES = ("worker-owned", "runtime-owned")
 DEFAULT_ORCHESTRATION_MODE = "runtime-owned"
 ORCHESTRATION_TASK_PROVENANCE_MODES = ("external-confirmed", "adapter")
+ORCHESTRATION_EXTERNAL_COMPLETION_ACTORS = (
+    "worker",
+    "operator",
+    "external-system",
+)
 ORCHESTRATION_CONFIG_KEYS = frozenset(
     {
         "mode",
@@ -385,6 +391,7 @@ ORCHESTRATION_CONFIG_KEYS = frozenset(
         "max_candidate_reanchors",
         "integration_enabled",
         "task_provenance_mode",
+        "external_completion_actor",
     }
 )
 ORCHESTRATION_COMMAND_REF_RE = re.compile(r"^completion\.commands\[(\d+)]$")
@@ -847,6 +854,7 @@ class OrchestrationConfig:
     max_candidate_reanchors: int = 2
     integration_enabled: bool = True
     task_provenance_mode: str = "external-confirmed"
+    external_completion_actor: str | None = None
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
 
     def is_explicit(self, key: str) -> bool:
@@ -865,6 +873,7 @@ class OrchestrationConfig:
             "max_candidate_reanchors": self.max_candidate_reanchors,
             "integration_enabled": self.integration_enabled,
             "task_provenance_mode": self.task_provenance_mode,
+            "external_completion_actor": self.external_completion_actor,
             "explicit_keys": sorted(self.explicit_keys),
         }
 
@@ -2459,6 +2468,11 @@ def parse_orchestration(
         default="external-confirmed",
         allowed=ORCHESTRATION_TASK_PROVENANCE_MODES,
     )
+    external_completion_actor = optional_orchestration_enum_value(
+        table,
+        "external_completion_actor",
+        allowed=ORCHESTRATION_EXTERNAL_COMPLETION_ACTORS,
+    )
 
     return OrchestrationConfig(
         mode=mode,
@@ -2496,6 +2510,7 @@ def parse_orchestration(
             "orchestration.integration_enabled",
         ),
         task_provenance_mode=task_provenance_mode,
+        external_completion_actor=external_completion_actor,
         explicit_keys=explicit_keys,
     )
 
@@ -2534,6 +2549,20 @@ def orchestration_enum_value(
     if not isinstance(value, str) or not value:
         raise ValueError(f"orchestration.{key} must be one of: " + ", ".join(allowed))
     if value not in allowed:
+        raise ValueError(f"orchestration.{key} must be one of: " + ", ".join(allowed))
+    return value
+
+
+def optional_orchestration_enum_value(
+    table: Mapping[str, object],
+    key: str,
+    *,
+    allowed: Sequence[str],
+) -> str | None:
+    if key not in table:
+        return None
+    value = table[key]
+    if not isinstance(value, str) or value not in allowed:
         raise ValueError(f"orchestration.{key} must be one of: " + ", ".join(allowed))
     return value
 
