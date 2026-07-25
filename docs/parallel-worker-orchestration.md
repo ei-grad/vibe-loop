@@ -136,16 +136,26 @@ results are missing or ambiguous.
   run's work whatever the outcome. The reviewer variable accompanies the
   completion transition only: it answers "who approved what was merged", and a
   settled or reset run merged nothing.
-- Either variable is absent when the runtime has nothing attributable -- no
-  observation, no approval, a source the runtime did not itself decide (a
-  fallback that names the run, or a label reported by an agent), an id outside
-  the identifier alphabet, or an id equal to the run id. Absent is the
+- Either variable is absent when the run recorded nothing usable -- no
+  observation, no approval, a source outside the runtime's own vocabulary, an id
+  outside the identifier alphabet, or an id equal to the run id. Absent is the
   fail-closed signal, so the runtime exports no empty value and no placeholder,
   and the adapter's environment is built by removing these names before the
   supplied context is applied -- an ambient value in the supervisor's own
   environment cannot satisfy a name the runtime withheld. `VIBE_LOOP_REPO`,
   `VIBE_LOOP_WORKTREE`, `VIBE_LOOP_BRANCH`, and `VIBE_LOOP_FENCING_TOKEN` are
   withheld the same way.
+- How strongly an exported id is attested depends on the provider, and the
+  export does not yet say which case applies. A provider that supports session
+  injection -- claude, in both roles -- is given its session id by the runtime,
+  and a reported id that differs from the injected one is rejected, so the value
+  is bound to what the runtime issued. A provider without session injection --
+  the codex reviewer, and any unrecognized provider, which defaults to none --
+  cannot be told which session to be, so it reports both the id and the source
+  itself, and the exported value is self-reported. The source vocabulary is
+  still checked, and the run id is refused on every path, but a reviewer on the
+  non-injecting path can name its own session. Treat the reviewer profile's
+  provider as part of how much the recorded attribution is worth.
 - `workers --json` and `doctor --json` cross-check claimed workspace metadata
   against `git worktree list`, the current claimed worktree status, and branch
   containment in `main` or `origin/main`. They emit diagnostic codes and manual

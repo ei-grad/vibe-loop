@@ -27,7 +27,7 @@ from vibe_loop.locks import (
 TASK_SOURCE_ERROR_STREAM_LIMIT = 2000
 TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
 # Names whose *absence* from an adapter invocation is an assertion the runtime
-# makes, not an accident. The session pair says "the runtime attested no such
+# makes, not an accident. The session pair says "this run recorded no such
 # session"; the fencing token says "this invocation is unfenced"; the workspace
 # triple says "an adapter may not assume a worktree" and is popped for that
 # reason. `os.environ.copy()` would re-supply any of them from whatever

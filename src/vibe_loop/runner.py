@@ -184,17 +184,34 @@ REVIEWER_SESSION_ENV = "VIBE_LOOP_REVIEWER_SESSION"
 # the run id. That value identifies the run, not a session, so it attributes
 # nothing.
 SESSION_ID_FALLBACK_SOURCE = "fallback:run_id"
-# Sources the runtime can vouch for, because it decided them itself: a session
-# it observed in provider output (`observed`, `native:<stream>`), one it
-# generated and injected, one it resumed, or a launch it planned. Every other
-# source string reached the record from an agent's own report -- a reviewer
-# supplies both fields when the provider cannot be told a session id
-# (`orchestration._parse_result`) -- and an unrecognized label is a claim the
-# runtime never made, so it attributes nothing.
-ATTESTED_SESSION_ID_SOURCES = frozenset(
+# The source vocabulary the runtime itself uses: a session it observed in
+# provider output (`observed`, `native:<stream>`), one it generated and
+# injected, one it resumed, or a launch it planned. A label outside this set was
+# invented by an agent and names no provenance the runtime recognizes, so it
+# attributes nothing.
+#
+# Recognizing the label is not the same as attesting the id, and this list does
+# not make it so. How strong the attestation is depends on the provider:
+#
+# - `session_injection` providers (claude, both roles): the runtime generates
+#   the id, injects it, and records `runtime_injected` -- or resumes a prior id
+#   and records `runtime_resumed`. `orchestration._parse_result` then rejects a
+#   reported id that differs from the injected one, so the id is runtime-bound.
+# - Providers without session injection (codex reviewer, and any unknown
+#   provider, which defaults to no injection): the runtime cannot tell the
+#   agent which session to be, records `runtime_launch`, and
+#   `orchestration._parse_result` takes BOTH the id and the source from the
+#   agent's own JSON. An agent on this path can therefore report any id it
+#   likes under any label in this set. The value is self-reported, not attested.
+#
+# What this list does buy on that path is bounded vocabulary; the run-id refusal
+# in `exportable_session_id` covers the one value that must never escape. Making
+# the distinction visible to the backend needs the export to carry attestation
+# quality, which is separate work.
+RECOGNIZED_SESSION_ID_SOURCES = frozenset(
     {"observed", "runtime_injected", "runtime_launch", "runtime_resumed"}
 )
-ATTESTED_SESSION_ID_SOURCE_PREFIXES = ("native:",)
+RECOGNIZED_SESSION_ID_SOURCE_PREFIXES = ("native:",)
 # Session ids reach the runtime from provider output and from reviewer-reported
 # JSON, so an exported value is agent-influenced text. Accept only the bounded
 # identifier alphabet the session observers already produce; anything else is
@@ -7338,24 +7355,30 @@ def observe_worker_session_id(line: str) -> str | None:
 
 
 def exportable_session_id(record: Mapping[str, object], *, run_id: str) -> str:
-    """Return the attributable session id a lifecycle record carries, else "".
+    """Return the exportable session id a lifecycle record carries, else "".
 
-    A record attributes a session only when it names both the id and a source
-    the runtime itself decided. A missing id, an unattested source, an id
+    A record names a session only when it carries both the id and a source from
+    the runtime's own vocabulary. A missing id, an unrecognized source, an id
     outside the identifier alphabet, or an id equal to the run id all mean
     "unknown", which the caller must express by omitting the variable rather
-    than exporting the value. The run id is refused whatever the source says:
-    it names the run rather than a session, and under `runtime_launch` the id
+    than exporting the value. The run id is refused whatever the source says: it
+    names the run rather than a session, and on the `runtime_launch` path the id
     is reported by the agent, which could otherwise report it back as its own.
+
+    How much the returned id is worth depends on the provider -- see
+    `RECOGNIZED_SESSION_ID_SOURCES`. On an injecting provider it is bound to the
+    id the runtime issued; on a non-injecting one the agent supplied it. This
+    function cannot tell a caller which, because the record does not distinguish
+    them; the export carries no attestation-quality signal today.
     """
 
     session_id = record.get("session_id")
     session_id_source = record.get("session_id_source")
     if not isinstance(session_id, str) or not isinstance(session_id_source, str):
         return ""
-    if session_id_source not in ATTESTED_SESSION_ID_SOURCES and not any(
+    if session_id_source not in RECOGNIZED_SESSION_ID_SOURCES and not any(
         session_id_source.startswith(prefix)
-        for prefix in ATTESTED_SESSION_ID_SOURCE_PREFIXES
+        for prefix in RECOGNIZED_SESSION_ID_SOURCE_PREFIXES
     ):
         return ""
     if EXPORTABLE_SESSION_ID_RE.fullmatch(session_id) is None:
@@ -7404,7 +7427,7 @@ def reviewer_session_from_records(
     exit pass today, and stays correct rather than merely lucky if a later
     change ever makes a second approving pass reachable: an earlier pass never
     stands in for a later one, including when the later one recorded no
-    attributable session.
+    exportable session.
     """
 
     session_id = ""

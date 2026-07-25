@@ -9137,7 +9137,10 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
     A backend attributes a status transition to those sessions, and refuses to
     close a task whose reviewer is absent, so the runtime exports a value only
-    when the run actually recorded an attributable session for that role.
+    when the run actually recorded a usable session for that role. How strongly
+    the id is attested depends on the provider -- see
+    `runner.RECOGNIZED_SESSION_ID_SOURCES`; these tests cover what is exported,
+    not how much it is worth.
     """
 
     RUN_ID = "run-session-export"
@@ -9316,9 +9319,10 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             "worker-session-a",
         )
 
-    def test_an_agent_reported_source_is_not_an_attestation(self) -> None:
-        # Under `runtime_launch` the reviewer supplies both fields, so a source
-        # the runtime never decided is a claim it cannot vouch for.
+    def test_a_source_outside_the_runtime_vocabulary_is_not_exported(self) -> None:
+        # Only the label is checked here. On the `runtime_launch` path the agent
+        # supplies both fields, so a recognized label does not make the id
+        # runtime-bound -- it only keeps the vocabulary closed.
         with tempfile.TemporaryDirectory() as directory:
             runner = self._runner(directory)
             self._record_review_verdict(
