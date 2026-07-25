@@ -889,7 +889,9 @@ safe `runtime_event_adapter_error` category. PID and deadline checks retain
 their existing precedence, and no runtime adapter is invoked when either is
 already satisfied.
 
-Related implementation IDs: `AUTO-22`.
+Related implementation evidence: commit
+`79bf01f3b42c71a7724d405ded06deedc2d81cc9` for the direct-message adapter and
+task `wait-helper-actionable-runtime-event-wake` for typed runtime events.
 
 Autopilot may also use an explicit trusted `[autopilot] idle_wake_command`
 between adaptive task-source fallback listings. The command receives the

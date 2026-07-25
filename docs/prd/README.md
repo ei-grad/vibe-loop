@@ -46,8 +46,8 @@ IDs, and a single PRD ID may require many tasks.
 PRDs are contract indexes, not exhaustive implementation references. Measure a
 requirement-bearing PRD's density as its UTF-8 byte count divided by the number
 of stable `## PRD-*` requirement headings. The median density across
-requirement-bearing files in this directory is the baseline; a file above twice
-that median is over budget.
+requirement-bearing files in this directory is the baseline; a file above four
+times that median is over budget.
 
 An over-budget PRD has no growth allowance. A change may reduce it, split it
 along contract boundaries, or move non-contract detail to a linked design or

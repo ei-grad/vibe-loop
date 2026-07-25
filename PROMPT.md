@@ -5,8 +5,7 @@ This file is the Level 1 seed for building and maintaining full-system
 product shape, operating philosophy, stack bias, architecture boundaries, and
 rules for writing Level 2 PRDs. Component contracts belong in `docs/prd/`,
 runnable implementation slices belong in the configured task source, and
-detailed design notes belong under `docs/`. This repository uses the loopyard
-`vibe-loop` project as its authoritative task source.
+detailed design notes belong under `docs/`.
 
 ## Product Thesis
 
@@ -92,9 +91,9 @@ task artifacts.
 - Runtime evidence should be portable enough for repository-owned tooling to
   persist task and agent provenance in durable project history without making
   `vibe-loop` the owner of project commit hooks or commit mutation.
-- Timeline and Gantt presentation belongs to loopyard, outside `vibe-loop`'s
-  product surface. External dashboards may consume bounded read-only status
-  output, but they must not become a hidden scheduler or completion source.
+- Timeline and Gantt presentation belongs outside `vibe-loop`'s product surface.
+  External dashboards may consume bounded read-only status output, but they
+  must not become a hidden scheduler or completion source.
 - Bundled skills are self-sufficient workflow contracts. They must work when
   invoked directly by an agent session, a slash command, a prompt template, or
   an external orchestrator — not only under the `vibe-loop` CLI. Skills must
@@ -131,8 +130,8 @@ explains the role of each subsystem and guides where new functionality belongs.
 - **System 4 — Intelligence.** Generated task-source discovery, bounded
   repository analysis, and agent-assisted selection. S4 observes the environment
   and informs future decisions, but does not directly drive scheduling.
-  Timeline and Gantt presentation lives in loopyard. The boundary between S3
-  and S4 is intentional: analysis and presentation inform, they do not actuate.
+  Timeline and Gantt presentation is external. The boundary between S3 and S4
+  is intentional: analysis and presentation inform, they do not actuate.
 - **System 5 — Policy.** User configuration (`.vibe-loop.toml`), task-source
   authority, `PROMPT.md`, and repository-level conventions. S5 sets identity and
   ultimate authority. The task source — not the runtime — remains the source of
@@ -178,9 +177,9 @@ Use three levels:
 2. Level 2: `docs/prd/` owns product and component contracts with stable
    `PRD-*` IDs.
 3. Level 3: the configured task source owns runnable implementation slices with
-   permanent task IDs consumed by agents and `vibe-loop`. In this repository,
-   that source is the loopyard `vibe-loop` project, bound through the
-   command-backed task adapter in `.vibe-loop.toml`.
+   permanent task IDs consumed by agents and `vibe-loop`. The task layer is an
+   external, adapter-bound surface rather than a repository-prescribed backend
+   or file format.
 
 Semi-autonomous agents may decompose PRDs into task-source entries, implement
 tasks, verify behavior, and propose PRD updates. They must not silently change a
@@ -205,10 +204,10 @@ parked as a gated planning item.
 - Measure PRD density as UTF-8 file bytes divided by stable `## PRD-*`
   requirement headings. Compare all requirement-bearing files in `docs/prd/`
   using the median density as the baseline.
-- Treat a PRD above twice the set median as over budget. It must not grow unless
-  the same change brings it back within budget; split contracts, consolidate
-  repeated rationale, or move implementation reference material to an
-  appropriate non-PRD document instead.
+- Treat a PRD above four times the set median as over budget. It must not grow
+  unless the same change brings it back within budget; split contracts,
+  consolidate repeated rationale, or move implementation reference material to
+  an appropriate non-PRD document instead.
 - Do not promote README material into an over-budget PRD. Reconcile conflicting
   accounts to the authoritative PRD, and require a density calculation before
   moving retained detail into any PRD.

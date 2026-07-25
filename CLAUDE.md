@@ -23,7 +23,7 @@ the loopyard `vibe-loop` project for implementation slices.
 ## Repository Task Status Authority
 
 The loopyard `vibe-loop` project is authoritative for implementation task
-bodies, dispatch, dependencies, and current status. `.vibe-loop.toml` binds the
-runtime to that command-backed task source. Do not create a repository-local
-mirror of the board; use loopyard task bodies for acceptance text and loopyard
-workflow states for task status.
+bodies, dispatch, dependencies, and current status. The task-source binding is
+operator/runtime configuration and is not a tracked repository artifact. Do not
+create a repository-local mirror of the board; use loopyard task bodies for
+acceptance text and loopyard workflow states for task status.
