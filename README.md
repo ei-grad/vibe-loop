@@ -535,13 +535,32 @@ this repo in the project registry. A value present only in the ambient
 environment does not resolve it — that is the ambiguity this table closes.
 Explicit values must contain at least one non-whitespace character.
 
+An ambient value that *disagrees* with the resolved one is refused rather than
+ignored. `--repo` selects the repository; the binding selects the project. A
+caller who exports `LOOPYARD_PROJECT=other` and runs a command against a
+repository bound to `vibe-loop` is asking two different questions at once, and
+answering from the binding alone would return this repository's queue, locks,
+and supervisor state under the other project's name with nothing in the output
+to contradict it. Unset the variable, or point `--repo` at the repository that
+variable selects — the diagnostic says so wherever it is reported, including
+`autopilot status`, which reports it rather than failing.
+
+The comparison applies only where the caller chose the target. Commands that
+enumerate targets from the project registry — `autopilot projects status` and
+`autopilot projects inspect` — do not compare it: each entry supplies its own
+selector context, one ambient value cannot be a claim about several entries at
+once, and refusing per entry would blank most of the aggregate. An ambient value
+that is empty or whitespace-only names no project and is treated as absent, so
+`LOOPYARD_PROJECT= vibe-loop …` is a way to apply the remedy rather than another
+way to trip it.
+
 Supervisor run, start, stop, and stale-recovery operations; task selection;
 worker inspection and cleanup; integration locking; and fenced reporting refuse
 an unresolved binding *before* invoking a command adapter. The diagnostic names
 the variable and the reason (`project_binding_unset:…`,
-`project_binding_ambient_only:…`, `project_binding_conflict:…`) and never echoes
-the value. `autopilot status` reports the same diagnostics as blockers rather
-than failing.
+`project_binding_ambient_only:…`, `project_binding_conflict:…`,
+`project_binding_ambient_conflict:…`) and never echoes the value.
+`autopilot status` reports the same diagnostics as blockers rather than failing.
 
 `autopilot status --json` includes a `project_binding` block reporting each
 required selector's resolved value and whether it came from `config` or

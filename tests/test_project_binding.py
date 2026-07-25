@@ -19,6 +19,7 @@ from vibe_loop.autopilot import (
     ProjectRegistry,
     collect_project_status,
     collect_registry_status,
+    load_registry_entry_config,
     run_autopilot,
     runtime_context_subprocess_transport,
     start_detached_autopilot,
@@ -28,6 +29,7 @@ from vibe_loop.config import (
     RUNTIME_CONTEXT_REDACTION,
     load_config,
     parse_project_binding,
+    project_binding_guidance,
     resolve_project_binding,
 )
 from vibe_loop import cli
@@ -247,14 +249,14 @@ class ProjectBindingResolutionTests(unittest.TestCase):
         self.assertIsNone(binding.blocker)
         self.assertEqual(binding.entries, ())
 
-    def test_config_pin_resolves_and_ignores_ambient(self) -> None:
+    def test_config_pin_resolves_without_ambient(self) -> None:
         config = self.build_config(
             "[project_binding]\n"
             f'require = ["{SELECTOR}"]\n'
             "[project_binding.context]\n"
             f'{SELECTOR} = "alpha"\n'
         )
-        binding = resolve_project_binding(config, environ={SELECTOR: "intruder"})
+        binding = resolve_project_binding(config, environ={})
 
         self.assertIsNone(binding.blocker)
         self.assertEqual(len(binding.entries), 1)
@@ -263,6 +265,121 @@ class ProjectBindingResolutionTests(unittest.TestCase):
             (entry.name, entry.value, entry.source), (SELECTOR, "alpha", "config")
         )
         self.assertEqual(config.runtime_environment, {SELECTOR: "alpha"})
+
+    def test_agreeing_ambient_value_resolves(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+        binding = resolve_project_binding(config, environ={SELECTOR: "alpha"})
+
+        self.assertIsNone(binding.blocker)
+        self.assertEqual(binding.entries[0].source, "config")
+
+    def test_disagreeing_ambient_value_is_refused(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+        binding = resolve_project_binding(config, environ={SELECTOR: "intruder"})
+
+        self.assertEqual(
+            binding.blocker, f"project_binding_ambient_conflict:{SELECTOR}"
+        )
+        self.assertEqual(binding.entries, ())
+
+    def test_disagreeing_ambient_value_is_refused_against_registry_context(
+        self,
+    ) -> None:
+        config = self.build_config(
+            f'[project_binding]\nrequire = ["{SELECTOR}"]\n',
+            runtime_context={SELECTOR: "beta"},
+        )
+        binding = resolve_project_binding(config, environ={SELECTOR: "alpha"})
+
+        self.assertEqual(
+            binding.blocker, f"project_binding_ambient_conflict:{SELECTOR}"
+        )
+
+    def test_ambient_value_naming_no_project_is_not_a_conflict(self) -> None:
+        # `NAME=` is how much shell and unit-file code unsets a variable, which
+        # is the remedy this diagnostic recommends; refusing it would make the
+        # remedy fail when followed. Padding is a capture artifact.
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+
+        for ambient in ("", "   ", "\n", "alpha", " alpha ", "\talpha\n"):
+            with self.subTest(ambient=ambient):
+                binding = resolve_project_binding(config, environ={SELECTOR: ambient})
+
+                self.assertIsNone(binding.blocker)
+                self.assertEqual(binding.entries[0].value, "alpha")
+
+    def test_ambient_value_naming_no_project_is_not_ambient_only(self) -> None:
+        config = self.build_config(f'[project_binding]\nrequire = ["{SELECTOR}"]\n')
+
+        binding = resolve_project_binding(config, environ={SELECTOR: "  "})
+
+        self.assertEqual(binding.blocker, f"project_binding_unset:{SELECTOR}")
+
+    def test_an_enumerated_target_does_not_compare_the_ambient_value(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+
+        binding = resolve_project_binding(
+            dataclasses.replace(config, ambient_selects_target=False),
+            environ={SELECTOR: "intruder"},
+        )
+
+        self.assertIsNone(binding.blocker)
+        self.assertEqual(binding.entries[0].value, "alpha")
+
+    def test_guidance_is_emitted_only_for_an_ambient_conflict(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+        conflicting = resolve_project_binding(config, environ={SELECTOR: "intruder"})
+        unset = resolve_project_binding(
+            self.build_config(f'[project_binding]\nrequire = ["{SELECTOR}"]\n'),
+            environ={},
+        )
+
+        guidance = project_binding_guidance(conflicting)
+
+        self.assertIn(SELECTOR, guidance)
+        self.assertIn("unset it", guidance)
+        self.assertIn("--repo", guidance)
+        self.assertNotIn("intruder", guidance)
+        self.assertNotIn("alpha", guidance)
+        self.assertEqual(project_binding_guidance(unset), "")
+        self.assertIn(guidance, str(ProjectBindingError(conflicting)))
+
+    def test_ambient_conflict_diagnostics_do_not_leak_values(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+        binding = resolve_project_binding(config, environ={SELECTOR: "intruder"})
+
+        self.assertNotIn("intruder", json.dumps(binding.to_json()))
+        self.assertNotIn("alpha", json.dumps(binding.to_json()))
 
     def test_registry_context_resolves(self) -> None:
         config = self.build_config(
@@ -398,7 +515,10 @@ class ProjectBindingGateTests(unittest.TestCase):
                 ),
             ),
             mock.patch("vibe_loop.autopilot.subprocess.Popen", side_effect=fake_popen),
-            mock.patch.dict(os.environ, {SELECTOR: "capos"}),
+            # Agreeing ambient value: a disagreeing one is a separate refusal
+            # (test_detached_start_blocks_on_disagreeing_ambient), so it cannot
+            # also demonstrate that the launch drops the name from the child.
+            mock.patch.dict(os.environ, {SELECTOR: "beta"}),
         ):
             # Verification is expected to time out against the mocked child;
             # this asserts what the launch handed to the child, not liveness.
@@ -409,6 +529,22 @@ class ProjectBindingGateTests(unittest.TestCase):
         self.assertEqual(command[command.index("--interval") + 1], "0.0")
         self.assertNotIn(SELECTOR, captured["env"])
         self.assertTrue(captured["pass_fds"])
+
+    @unittest.skipUnless(os.name == "posix", "detached start is POSIX only")
+    def test_detached_start_blocks_on_disagreeing_ambient(self) -> None:
+        config = load_config(self.repo, runtime_context={SELECTOR: "beta"})
+
+        with (
+            mock.patch("vibe_loop.autopilot.build_lock_manager") as lock_manager,
+            mock.patch("vibe_loop.autopilot.subprocess.Popen") as popen,
+            mock.patch.dict(os.environ, {SELECTOR: "capos"}),
+        ):
+            launch = start_detached_autopilot(config)
+
+        self.assertFalse(launch.started)
+        self.assertEqual(launch.blocker, f"project_binding_ambient_conflict:{SELECTOR}")
+        lock_manager.assert_not_called()
+        popen.assert_not_called()
 
     def test_subprocess_transport_drops_ambient_bound_names(self) -> None:
         with mock.patch.dict(os.environ, {SELECTOR: "capos"}):
@@ -467,6 +603,18 @@ class CrossProjectIsolationTests(unittest.TestCase):
         if not self.invocation_log.is_file():
             return []
         return self.invocation_log.read_text(encoding="utf-8").splitlines()
+
+    @contextlib.contextmanager
+    def ambient_selector_unset(self):
+        """Drop the class-wide intruding ambient selector for one test.
+
+        A disagreeing ambient value is refused outright, so per-namespace
+        routing is only observable with the selector absent.
+        """
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(SELECTOR, None)
+            yield
 
     def guarded_cli_operations(self, repo: Path) -> list[tuple[str, list[str], int]]:
         repo_arg = str(repo)
@@ -575,6 +723,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
         return load_config(repo)
 
     def test_task_selection_and_locks_cannot_cross_projects(self) -> None:
+        self.enterContext(self.ambient_selector_unset())
         self.seed_tasks("alpha", ["ALPHA-1", "SHARED-1"])
         self.seed_tasks("beta", ["BETA-1", "SHARED-1"])
         alpha = self.build_repo("alpha-repo", "alpha")
@@ -624,6 +773,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
 
     def test_status_reports_resolved_namespace_per_repository(self) -> None:
+        self.enterContext(self.ambient_selector_unset())
         self.seed_tasks("alpha", ["ALPHA-1"])
         self.seed_tasks("beta", ["BETA-1"])
         alpha = self.build_repo("alpha-repo", "alpha")
@@ -837,6 +987,78 @@ class CrossProjectIsolationTests(unittest.TestCase):
                     )
                     self.assertEqual(self.adapter_invocations(), invocations)
 
+    def test_disagreeing_ambient_blocks_every_guarded_cli_operation(self) -> None:
+        # The class-wide ambient selector names "intruder"; this repo is pinned
+        # to "alpha". Answering from the pin would report alpha's state to a
+        # caller who asked for intruder, with nothing in the output to say so.
+        config = self.build_unbound_repo(
+            name="ambient-conflicting-repo",
+            pinned_context="alpha",
+        )
+
+        with mock.patch(
+            "vibe_loop.cli.inherited_runtime_context",
+            return_value={},
+        ):
+            for operation, arguments, expected_exit in self.guarded_cli_operations(
+                config.repo
+            ):
+                with self.subTest(operation=operation):
+                    invocations = self.adapter_invocations()
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                    ):
+                        exit_code = cli.main(arguments)
+
+                    output = stdout.getvalue() + stderr.getvalue()
+                    self.assertEqual(exit_code, expected_exit)
+                    self.assertIn(
+                        f"project_binding_ambient_conflict:{SELECTOR}", output
+                    )
+                    self.assertNotIn("intruder", output)
+                    self.assertNotIn("alpha", output)
+                    self.assertEqual(self.adapter_invocations(), invocations)
+
+    def test_disagreeing_ambient_blocks_status_without_reporting_a_queue(self) -> None:
+        self.seed_tasks("alpha", ["ALPHA-1"])
+        self.seed_tasks("intruder", ["INTRUDER-1"])
+        config = self.build_repo("ambient-conflicting-status-repo", "alpha")
+
+        status = collect_project_status(config).to_json()
+
+        self.assertIn(
+            f"project_binding_ambient_conflict:{SELECTOR}", status["blockers"]
+        )
+        self.assertEqual(status["queue"]["runnable_tasks"], [])
+        self.assertEqual(
+            status["queue"]["source_error"],
+            f"project_binding_ambient_conflict:{SELECTOR}",
+        )
+        self.assertEqual(status["supervisor"]["state"], "unknown")
+
+    def test_status_renders_the_remedy_on_the_command_that_reports_it(self) -> None:
+        # `status` reports the blocker instead of raising, so it is the one path
+        # where the operator would otherwise be handed a bare diagnostic code --
+        # and it is the path the incident was found on.
+        config = self.build_repo("ambient-conflicting-render-repo", "alpha")
+        stdout = io.StringIO()
+
+        with (
+            mock.patch("vibe_loop.cli.inherited_runtime_context", return_value={}),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = cli.main(["autopilot", "status", "--repo", str(config.repo)])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn(f"project_binding_ambient_conflict:{SELECTOR}", output)
+        self.assertIn("unset it", output)
+        self.assertIn("--repo", output)
+        self.assertNotIn("intruder", output)
+
     def test_empty_pinned_binding_is_rejected_without_adapter_invocation(self) -> None:
         repo = self.write_unbound_repo(
             name="empty-pinned-binding-repo",
@@ -901,7 +1123,38 @@ class CrossProjectIsolationTests(unittest.TestCase):
         self.assertIn(f"project_binding_ambient_only:{SELECTOR}", message)
         self.assertNotIn("generated task-source cache", message)
 
+    def test_aggregate_reports_every_entry_under_a_disagreeing_ambient(self) -> None:
+        # The class-wide ambient selector names "intruder", so it disagrees with
+        # both entries. The aggregate asks about every registered project at
+        # once; refusing per entry would blank the answer the command exists to
+        # give, and the entry's own binding is what routes its adapter anyway.
+        self.seed_tasks("alpha", ["ALPHA-1"])
+        self.seed_tasks("beta", ["BETA-1"])
+        alpha = self.build_repo("aggregate-alpha", "alpha").repo
+        beta = self.build_repo("aggregate-beta", "beta").repo
+        registry = ProjectRegistry(
+            path=self.root / "aggregate-registry.json",
+            entries=(
+                ProjectEntry(name="alpha", repo=alpha, runtime_context=()),
+                ProjectEntry(name="beta", repo=beta, runtime_context=()),
+            ),
+        )
+
+        payloads = [item.to_json() for item in collect_registry_status(registry)]
+
+        self.assertEqual([item["error"] for item in payloads], ["", ""])
+        for payload, expected in zip(payloads, ("ALPHA-1", "BETA-1"), strict=True):
+            status = payload["status"]
+            self.assertEqual(status["blockers"], [])
+            self.assertEqual(status["project_binding"]["diagnostics"], [])
+            self.assertEqual(
+                [task["id"] for task in status["queue"]["runnable_tasks"]],
+                [expected],
+            )
+
     def test_registry_status_reports_binding_without_redacting_it(self) -> None:
+        # Runs under the class-wide intruding ambient selector: the registry
+        # aggregate must resolve from the entry, not refuse.
         self.seed_tasks("beta", ["BETA-1"])
         repo = self.build_repo("registry-repo", "beta").repo
         entry = ProjectEntry(
@@ -927,9 +1180,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
             runtime_context=((SELECTOR, "beta"),),
         )
 
-        status = collect_project_status(
-            load_config(repo, runtime_context=dict(entry.runtime_context))
-        )
+        status = collect_project_status(load_registry_entry_config(entry))
         worker = WorkerView(
             active=ActiveRunState.new(
                 task_id="worker-1",
@@ -981,9 +1232,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
             entries=(entry,),
         )
         registry.save()
-        status = collect_project_status(
-            load_config(repo, runtime_context=dict(entry.runtime_context))
-        )
+        status = collect_project_status(load_registry_entry_config(entry))
         worker = WorkerView(
             active=ActiveRunState.new(
                 task_id="worker-1",
