@@ -5342,6 +5342,46 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertEqual(result.reason, "descendant_outside_worker_process_group")
         self.assertEqual(killed, [])
 
+    def test_accepted_report_teardown_owns_reparented_same_group_child(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        orphan = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:orphan",
+        )
+        nodes = {root.pid: root, orphan.pid: orphan}
+
+        def terminated_group(*args, **kwargs) -> None:
+            nodes.clear()
+
+        with patch.object(
+            runner_module,
+            "terminate_worker_process_group",
+            side_effect=terminated_group,
+        ):
+            result = terminate_verified_worker_process_group(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                process_table=lambda: nodes.copy(),
+                process_node=nodes.get,
+            )
+
+        self.assertTrue(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "accepted_report_runtime_closure")
+        self.assertEqual(result.process_count, 2)
+
     def test_accepted_completed_candidate_uses_immediate_closure_path(self):
         proc = FakeWatchdogProcess(alive_polls=10_000, returncode=-signal.SIGTERM)
         monitor = FakePostReportMonitor(violates=False)
@@ -5379,6 +5419,122 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
         self.assertTrue(result.post_report_identity_verified)
         self.assertTrue(result.post_report_descendants_verified)
         self.assertEqual(result.post_report_teardown_process_count, 2)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_activity_enforcement_preserves_failed_closure_evidence(self):
+        proc = FakeWatchdogProcess(
+            alive_polls=10_000,
+            returncode=-signal.SIGTERM,
+        )
+        monitor = FakePostReportMonitor(violates=True)
+        failed = runner_module.VerifiedWorkerTeardown(
+            False,
+            True,
+            False,
+            "process_group_contains_unowned_member",
+            3,
+        )
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                post_report_monitor=monitor,
+                identity_verified_ok=lambda: True,
+                post_report_activity_grace_seconds=0.0,
+                post_report_closure_check=lambda: "accepted_completed_candidate",
+                post_report_teardown=lambda: failed,
+            )
+
+        self.assertTrue(result.post_report_enforced)
+        self.assertEqual(
+            result.post_report_teardown_reason,
+            "process_group_contains_unowned_member",
+        )
+        self.assertTrue(result.post_report_identity_verified)
+        self.assertFalse(result.post_report_descendants_verified)
+        self.assertEqual(result.post_report_teardown_process_count, 3)
+        self.assertTrue(killed)
+        activity = runner_module.PostReportActivity(
+            reported=True,
+            seconds=0.1,
+            activity_kind="tool_call",
+            activity_count=1,
+            enforced_stop=result.post_report_enforced,
+            identity_verified=result.post_report_identity_verified,
+            usage=runner_module.unavailable_usage("anthropic", "test_fixture"),
+            teardown_reason=result.post_report_teardown_reason,
+            descendants_verified=result.post_report_descendants_verified,
+            teardown_process_count=result.post_report_teardown_process_count,
+        )
+        completed = WorkerReport(
+            run_id="run-1",
+            task_id="T-1",
+            status="completed",
+        )
+        self.assertEqual(
+            runner_module.post_report_runtime_lifecycle_decision(
+                runtime_owned=True,
+                exit_code=result.exit_code,
+                timed_out=False,
+                worker_report=completed,
+                activity=activity,
+            ),
+            ("refuse", "process_group_contains_unowned_member"),
+        )
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_timeout_preserves_failed_closure_evidence(self):
+        proc = FakeWatchdogProcess(
+            alive_polls=10_000,
+            returncode=-signal.SIGKILL,
+        )
+        monitor = FakePostReportMonitor(violates=False)
+        failed = runner_module.VerifiedWorkerTeardown(
+            False,
+            True,
+            False,
+            "process_group_contains_unowned_member",
+            3,
+        )
+        clock = FakeMonotonicClock(([0.0] * 7) + [2.0])
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                timeout_seconds=1.0,
+                monotonic=clock,
+                post_report_monitor=monitor,
+                identity_verified_ok=lambda: True,
+                post_report_closure_check=lambda: "accepted_completed_candidate",
+                post_report_teardown=lambda: failed,
+            )
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.post_report_enforced)
+        self.assertEqual(
+            result.post_report_teardown_reason,
+            "process_group_contains_unowned_member",
+        )
+        self.assertTrue(result.post_report_identity_verified)
+        self.assertFalse(result.post_report_descendants_verified)
+        self.assertEqual(result.post_report_teardown_process_count, 3)
+        self.assertTrue(killed)
 
     @unittest.skipUnless(
         hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
@@ -6269,12 +6425,33 @@ class RunStreamingPostReportTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 child_pid_path = root / "child.pid"
+                orphan_ready_path = root / "orphan.ready"
+                report_path = root / "reported"
+                spawner = root / "spawn_child.py"
+                spawner.write_text(
+                    "import pathlib, subprocess, sys\n"
+                    "child = subprocess.Popen([sys.executable, '-c', "
+                    '"import os, pathlib, time; '
+                    "deadline = time.monotonic() + 10; "
+                    "\\nwhile os.getppid() != 1 and time.monotonic() < deadline: "
+                    "time.sleep(0.01); "
+                    "\\npathlib.Path('orphan.ready').write_text('ready'); "
+                    'time.sleep(60)"])\n'
+                    "pathlib.Path('child.pid').write_text(str(child.pid))\n",
+                    encoding="utf-8",
+                )
                 script = root / "cmd.py"
                 script.write_text(
                     "import pathlib, subprocess, sys, time\n"
-                    "child = subprocess.Popen("
-                    "[sys.executable, '-c', 'import time; time.sleep(60)'])\n"
-                    "pathlib.Path('child.pid').write_text(str(child.pid))\n"
+                    "intermediate = subprocess.Popen("
+                    "[sys.executable, 'spawn_child.py'])\n"
+                    "intermediate.wait()\n"
+                    "deadline = time.monotonic() + 10\n"
+                    "while not pathlib.Path('orphan.ready').exists():\n"
+                    "    if time.monotonic() >= deadline:\n"
+                    "        raise RuntimeError('child was not reparented')\n"
+                    "    time.sleep(0.01)\n"
+                    "pathlib.Path('reported').write_text('completed')\n"
                     "time.sleep(60)\n",
                     encoding="utf-8",
                 )
@@ -6285,7 +6462,7 @@ class RunStreamingPostReportTests(unittest.TestCase):
                         f"{sys.executable} cmd.py",
                         root,
                         log,
-                        reap_check=child_pid_path.exists,
+                        reap_check=report_path.exists,
                         reap_grace_seconds=120.0,
                         reap_poll_seconds=0.02,
                         post_report_closure_check=(
@@ -6295,6 +6472,7 @@ class RunStreamingPostReportTests(unittest.TestCase):
                     )
                 elapsed = time.monotonic() - started
                 child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                self.assertTrue(orphan_ready_path.exists())
 
                 self.assertLess(elapsed, 5.0)
                 self.assertNotEqual(result.exit_code, 0)
@@ -6336,6 +6514,34 @@ class RunStreamingPostReportTests(unittest.TestCase):
                 ):
                     sentinel.kill()
                 sentinel.wait(timeout=5)
+
+    def test_unsupported_identity_platform_keeps_clean_exit_fallback(self):
+        closure_checks = 0
+
+        def accepted_closure() -> str:
+            nonlocal closure_checks
+            closure_checks += 1
+            return "accepted_completed_candidate"
+
+        with (
+            patch.object(runner_module.sys, "platform", "darwin"),
+            patch.object(runner_module, "read_process_node", return_value=None),
+        ):
+            result = self._run(
+                "import time\ntime.sleep(0.05)\n",
+                reap_check=lambda: True,
+                reap_grace_seconds=60.0,
+                reap_poll_seconds=0.01,
+                post_report_closure_check=accepted_closure,
+                provider="anthropic",
+            )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(closure_checks, 0)
+        self.assertIsNotNone(result.post_report)
+        self.assertEqual(result.post_report.teardown_reason, "")
+        self.assertFalse(result.post_report.enforced_stop)
 
     def test_tool_activity_before_a_poll_is_still_recorded(self):
         # F1: a worker that reports, invokes a tool, and exits within a single

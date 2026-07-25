@@ -7933,9 +7933,8 @@ def terminate_verified_worker_process_group(
         return VerifiedWorkerTeardown(False, False, False, "worker_identity_mismatch")
 
     descendants = collect_owned_descendants(table, {process.pid: expected_birth_id})
-    descendant_pids = {node.pid for node in descendants}
     group = [node for node in table.values() if node.process_group_id == process.pid]
-    if any(node.pid not in descendant_pids for node in group):
+    if any(node.session_id != process.pid for node in group):
         return VerifiedWorkerTeardown(
             False, True, False, "process_group_contains_unowned_member"
         )
@@ -7943,7 +7942,9 @@ def terminate_verified_worker_process_group(
         return VerifiedWorkerTeardown(
             False, True, False, "descendant_outside_worker_process_group"
         )
-    for node in descendants:
+    owned = {node.pid: node for node in group}
+    owned.update((node.pid, node) for node in descendants)
+    for node in owned.values():
         current = process_node(node.pid)
         if current is None:
             if node.pid == process.pid:
@@ -7952,7 +7953,7 @@ def terminate_verified_worker_process_group(
                     False,
                     False,
                     "worker_identity_unavailable",
-                    len(descendants),
+                    len(owned),
                 )
             continue
         if (
@@ -7966,7 +7967,7 @@ def terminate_verified_worker_process_group(
                 True,
                 False,
                 "descendant_identity_unverified",
-                len(descendants),
+                len(owned),
             )
 
     terminate_worker_process_group(
@@ -7975,7 +7976,7 @@ def terminate_verified_worker_process_group(
         sigkill_after_seconds=sigkill_after_seconds,
     )
     deadline = time.monotonic() + sigkill_after_seconds
-    remaining = list(descendants)
+    remaining = list(owned.values())
     while remaining and time.monotonic() < deadline:
         remaining = [
             node
@@ -7999,7 +8000,7 @@ def terminate_verified_worker_process_group(
                 True,
                 True,
                 "verified_processes_remain",
-                len(descendants),
+                len(owned),
             )
         deadline = time.monotonic() + sigkill_after_seconds
         while remaining and time.monotonic() < deadline:
@@ -8020,14 +8021,14 @@ def terminate_verified_worker_process_group(
             True,
             True,
             "verified_processes_remain",
-            len(descendants),
+            len(owned),
         )
     return VerifiedWorkerTeardown(
         True,
         True,
         True,
         "accepted_report_runtime_closure",
-        len(descendants),
+        len(owned),
     )
 
 
@@ -8154,17 +8155,6 @@ def wait_with_reap_watchdog(
         if eligible_now:
             _mark_boundary()
 
-    def _reap_for_timeout() -> WaitOutcome:
-        report_status(
-            f"worker pid={process.pid} exceeded its "
-            f"{timeout_seconds:.0f}s wall-clock timeout; killing its process "
-            "group so the task returns to runnable and the batch proceeds",
-            log,
-        )
-        if _identity_verified():
-            terminate_worker_process_group(process, log)
-        return WaitOutcome(process.wait(), timed_out=True)
-
     reap_eligible_since: float | None = None
     activity_eligible_since: float | None = None
     closure_checked = False
@@ -8180,6 +8170,21 @@ def wait_with_reap_watchdog(
             post_report_descendants_verified=closure_teardown.descendants_verified,
             post_report_teardown_process_count=closure_teardown.process_count,
             post_report_teardown_seconds=closure_teardown_seconds,
+        )
+
+    def _reap_for_timeout() -> WaitOutcome:
+        report_status(
+            f"worker pid={process.pid} exceeded its "
+            f"{timeout_seconds:.0f}s wall-clock timeout; killing its process "
+            "group so the task returns to runnable and the batch proceeds",
+            log,
+        )
+        if _identity_verified():
+            terminate_worker_process_group(process, log)
+        return dataclasses.replace(
+            _wait_outcome(process.wait()),
+            timed_out=True,
+            post_report_enforced=False,
         )
 
     while True:
@@ -8283,7 +8288,11 @@ def wait_with_reap_watchdog(
                 )
                 if _identity_verified():
                     terminate_worker_process_group(process, log)
-                    return WaitOutcome(process.wait(), post_report_enforced=True)
+                    return dataclasses.replace(
+                        _wait_outcome(process.wait()),
+                        post_report_enforced=True,
+                        post_report_identity_verified=True,
+                    )
                 # Identity could not be positively verified: the live PID may be
                 # a recycled, unrelated group, so enforcement stands down. The
                 # accepted report is already authoritative.
@@ -8292,7 +8301,7 @@ def wait_with_reap_watchdog(
                     "not signalling post-report teardown",
                     log,
                 )
-                return WaitOutcome(process.wait())
+                return _wait_outcome(process.wait())
         if not eligible:
             continue
         now = monotonic()
@@ -8308,7 +8317,7 @@ def wait_with_reap_watchdog(
             )
             if _identity_verified():
                 terminate_worker_process_group(process, log)
-            return WaitOutcome(process.wait())
+            return _wait_outcome(process.wait())
 
 
 def run_streaming_command(
@@ -8463,7 +8472,9 @@ def run_streaming_command(
         identity_verified_ok=identity_verified,
         post_report_activity_grace_seconds=post_report_activity_grace_seconds,
         report_boundary_wall=report_persistence_epoch,
-        post_report_closure_check=post_report_closure_check,
+        post_report_closure_check=(
+            post_report_closure_check if sys.platform == "linux" else None
+        ),
         post_report_teardown=lambda: terminate_verified_worker_process_group(
             process,
             log,
