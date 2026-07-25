@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import MappingProxyType
@@ -43,6 +44,7 @@ from vibe_loop.orchestration import (
     ReviewBudgetExhausted,
     ReviewConcurrencyBudget,
     ReviewDelegationPolicyError,
+    ReviewExecutionError,
     ReviewFinding,
     ReviewLimitWallError,
     ReviewOutputMalformed,
@@ -61,6 +63,7 @@ from vibe_loop.orchestration import (
     TaskSourceSettler,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
+    bound_malformed_review_output,
     derive_stage_progress,
     inject_provider_continuation,
     plan_session_continuation,
@@ -2876,7 +2879,7 @@ class ReviewRouterTests(unittest.TestCase):
                                 "summary": "candidate can bypass review",
                                 "evidence": "reproduction",
                                 "files": ["src/example.py"],
-                                "lines": "12",
+                                "lines": [{"line": 12}],
                                 "state": "open",
                             }
                         ],
@@ -2936,6 +2939,147 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertIn("<redacted>", first_output["text"])
         self.assertNotIn("previous response was malformed", commands[0])
         self.assertIn("previous response was malformed", commands[1])
+        # The re-ask must name the specific violation; a bare "that was
+        # malformed" makes the reviewer re-emit the identical bad shape.
+        self.assertNotIn("missing JSON verdict", commands[0])
+        self.assertIn("missing JSON verdict", commands[1])
+        self.assertIn("Fix exactly that violation", commands[1])
+
+    def test_scalar_finding_line_shapes_no_longer_discard_the_run(self) -> None:
+        # The shape that destroyed six runs across both reviewer providers:
+        # "lines" emitted as a bare string or as integers instead of an array
+        # of strings. It must now parse on the first attempt.
+        verdict = {
+            "verdict": "findings",
+            "findings": [
+                {
+                    "id": "F1",
+                    "severity": "P1",
+                    "summary": "candidate can bypass review",
+                    "evidence": "reproduction",
+                    "files": "src/example.py",
+                    "lines": 12,
+                    "state": "open",
+                }
+            ],
+            "session_id": "session-1",
+            "session_id_source": "provider",
+        }
+        commands: list[str] = []
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(verdict))
+
+        router = self.router("codex", execute)
+        result = router.review(self.gates)
+
+        self.assertEqual(result.verdict, "findings")
+        self.assertEqual(result.attempt_ordinal, 1)
+        self.assertEqual(len(commands), 1)
+        self.assertEqual(result.findings[0].files, ("src/example.py",))
+        self.assertEqual(result.findings[0].lines, ("12",))
+        self.assertEqual(
+            [
+                record["output_classification"]
+                for record in self.store.read_records()
+                if record["record_type"] == "review_verdict"
+            ],
+            ["parsed"],
+        )
+
+    def test_review_prompt_states_the_files_and_lines_array_contract(self) -> None:
+        commands: list[str] = []
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            verdict = {
+                "verdict": "approve",
+                "findings": [],
+                "session_id": "session-1",
+                "session_id_source": "provider",
+            }
+            return subprocess.CompletedProcess(command, 0, stdout=json.dumps(verdict))
+
+        self.router("codex", execute).review(self.gates)
+
+        self.assertIn("files and lines are JSON arrays of strings", commands[0])
+        self.assertIn("never a bare string and never numbers", commands[0])
+
+    def test_finding_line_normalization_keeps_rejecting_unusable_shapes(self) -> None:
+        base = {
+            "id": "F1",
+            "severity": "P1",
+            "summary": "candidate can bypass review",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "state": "open",
+        }
+        for lines in ([{"line": 12}], [None], [True], {"line": "12"}, [""], ""):
+            with self.subTest(lines=lines):
+                with self.assertRaises(ReviewExecutionError) as raised:
+                    ReviewFinding.from_payload({**base, "lines": lines})
+                self.assertIn("lines must be a JSON array", str(raised.exception))
+        for files in ([{"path": "a"}], [None], ""):
+            with self.subTest(files=files):
+                with self.assertRaises(ReviewExecutionError) as raised:
+                    ReviewFinding.from_payload({**base, "files": files, "lines": []})
+                self.assertIn("files must be a JSON array", str(raised.exception))
+
+    def test_malformed_output_evidence_bounds_unbounded_reviewer_stdout(self) -> None:
+        # redact_evidence_text is quadratic in line length. Unbounded, a 64KB
+        # single-line answer costs ~83s of CPU while holding the task lock; the
+        # bound must keep it flat regardless of how much the reviewer wrote.
+        prose = "The candidate looks acceptable overall and the gates passed. "
+        stdout = (prose * 4000)[:240_000] + "\napi_token=super-secret\n"
+        router = self.router("codex", lambda command, **kwargs: None)
+
+        started = time.perf_counter()
+        evidence = router._malformed_output_evidence(stdout)
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(evidence["original_chars"], len(stdout))
+        self.assertTrue(evidence["truncated"])
+        self.assertLessEqual(len(evidence["text"]), 4096)
+        self.assertNotIn("super-secret", evidence["text"])
+        self.assertIn("<redacted>", evidence["text"])
+
+    def test_malformed_output_evidence_redacts_quoted_fencing_token(self) -> None:
+        router = self.router("codex", lambda command, **kwargs: None)
+
+        evidence = router._malformed_output_evidence(
+            "I could not review this.\nfencing_token: lock-token-9f3a\n"
+        )
+
+        self.assertNotIn("lock-token-9f3a", evidence["text"])
+        self.assertTrue(evidence["redacted"])
+
+    def test_bound_malformed_review_output_drops_cut_leading_line(self) -> None:
+        # A mid-line cut can orphan a secret value from the key= label the
+        # redactor keys on, so the partial leading line is dropped entirely.
+        filler = "F" * 99
+        secret_line = "api_token=super-secret-value"
+        # Place the secret so the 8192-char tail window starts 10 chars into it,
+        # i.e. immediately after "api_token=" and before the value.
+        suffix_length = 8192 + 10 - len(secret_line) - 1
+        suffix_lines = suffix_length // (len(filler) + 1)
+        suffix = "\n".join([filler] * suffix_lines)
+        suffix += "P" * (suffix_length - len(suffix))
+        stdout = "\n".join([filler] * 300) + "\n" + secret_line + "\n" + suffix
+
+        naive_tail = stdout[-8192:]
+        bounded = bound_malformed_review_output(stdout)
+
+        self.assertTrue(naive_tail.startswith("super-secret-value\n"))
+        self.assertNotIn("super-secret-value", bounded)
+        self.assertLessEqual(len(bounded), 8192)
+        self.assertEqual(bounded.split("\n")[0], filler)
+        self.assertTrue(all(len(line) <= 1032 for line in bounded.split("\n")))
+
+    def test_bound_malformed_review_output_preserves_short_output(self) -> None:
+        self.assertEqual(bound_malformed_review_output("not json"), "not json")
+        self.assertEqual(bound_malformed_review_output(""), "")
 
     def test_targeted_closure_updates_ledger_and_phase(self) -> None:
         initial = ReviewFinding(

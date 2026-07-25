@@ -29,7 +29,7 @@ from vibe_loop.config import (
     parse_orchestration,
 )
 from vibe_loop.generated_discovery import redact_evidence_text
-from vibe_loop.locks import fencing_token_value
+from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
 from vibe_loop.retry import LimitWallSignal, detect_limit_wall
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
@@ -53,6 +53,14 @@ GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
 MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
+# ``redact_evidence_text`` is superlinear in line length, so reviewer stdout is
+# bounded before redaction: each line is capped and only a tail window survives.
+# Without both bounds a single multi-kilobyte prose line -- exactly the shape a
+# reviewer emits when it answers in prose instead of JSON -- turns a fast parse
+# failure into a multi-minute CPU stall holding the task lock and a jobs slot.
+MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS = 1024
+MALFORMED_REVIEW_OUTPUT_RAW_WINDOW_CHARS = 8192
+MALFORMED_REVIEW_OUTPUT_ELISION = "<elided>"
 FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
 FINDING_STATES = ("open", "remediated", "accepted", "rejected")
 CONTINUATION_FALLBACK_REASONS = (
@@ -931,6 +939,36 @@ class ReviewFinding:
     lines: tuple[str, ...] = ()
     state: str = "open"
 
+    @staticmethod
+    def _string_sequence(value: object, *, field: str) -> tuple[str, ...]:
+        """Normalize the ``files``/``lines`` shapes reviewers actually emit.
+
+        A bare scalar becomes a one-element list and integers are coerced to
+        text; both are unambiguous renderings of the same finding. Every other
+        shape still fails, so the malformed-output path keeps its meaning.
+        """
+        error = ReviewExecutionError(f"review finding {field} must be a JSON array")
+        if isinstance(value, list):
+            items: list[object] = list(value)
+        elif isinstance(value, str) or (
+            isinstance(value, int) and not isinstance(value, bool)
+        ):
+            items = [value]
+        else:
+            raise error
+        normalized: list[str] = []
+        for item in items:
+            if isinstance(item, str):
+                text = item
+            elif isinstance(item, int) and not isinstance(item, bool):
+                text = str(item)
+            else:
+                raise error
+            if not text:
+                raise error
+            normalized.append(text)
+        return tuple(normalized)
+
     @classmethod
     def from_payload(cls, value: object) -> ReviewFinding:
         if not isinstance(value, Mapping):
@@ -955,14 +993,8 @@ class ReviewFinding:
             raise ReviewExecutionError("review finding summary is required")
         if not isinstance(evidence, str) or not evidence.strip():
             raise ReviewExecutionError("review finding evidence is required")
-        if not isinstance(files, list) or not all(
-            isinstance(path, str) and path for path in files
-        ):
-            raise ReviewExecutionError("review finding files must be a JSON array")
-        if not isinstance(lines, list) or not all(
-            isinstance(line, str) and line for line in lines
-        ):
-            raise ReviewExecutionError("review finding lines must be a JSON array")
+        normalized_files = cls._string_sequence(files, field="files")
+        normalized_lines = cls._string_sequence(lines, field="lines")
         if state not in FINDING_STATES:
             raise ReviewExecutionError(
                 "review finding state must be one of: " + ", ".join(FINDING_STATES)
@@ -972,8 +1004,8 @@ class ReviewFinding:
             severity=str(severity),
             summary=summary.strip(),
             evidence=evidence.strip(),
-            files=tuple(files),
-            lines=tuple(lines),
+            files=normalized_files,
+            lines=normalized_lines,
             state=str(state),
         )
 
@@ -1335,6 +1367,33 @@ class FindingsLedger:
         )
 
 
+def bound_malformed_review_output(output: str) -> str:
+    """Bound raw reviewer stdout before it reaches ``redact_evidence_text``.
+
+    Redaction is superlinear in line length, so an unbounded reviewer answer --
+    prose, or a stream-json result line carrying the whole response -- would
+    cost minutes of CPU per failed review. Each line is capped first so no
+    single line can dominate, then a tail window is kept; when that window cuts
+    into a line the leading partial line is dropped, because a mid-line cut can
+    orphan a secret value from the ``key=`` label the redactor keys on.
+    """
+    lines = output.split("\n")
+    capped = "\n".join(
+        (
+            line
+            if len(line) <= MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS
+            else line[:MALFORMED_REVIEW_OUTPUT_LINE_MAX_CHARS]
+            + MALFORMED_REVIEW_OUTPUT_ELISION
+        )
+        for line in lines
+    )
+    window = capped[-MALFORMED_REVIEW_OUTPUT_RAW_WINDOW_CHARS:]
+    if len(window) < len(capped):
+        newline = window.find("\n")
+        window = window[newline + 1 :] if newline >= 0 else ""
+    return window
+
+
 ReviewExecutor = Callable[..., subprocess.CompletedProcess[str]]
 ContinuationAvailability = Callable[[str, str, str], str]
 
@@ -1416,6 +1475,7 @@ class ReviewRouter:
         )
         self._transition_to_review(request)
         malformed: ReviewExecutionError | None = None
+        reask_reason = ""
         continuation = self._continuation_context(request)
         for attempt_ordinal in (1, 2):
             try:
@@ -1425,6 +1485,7 @@ class ReviewRouter:
                         pass_ordinal=pass_ordinal,
                         attempt_ordinal=attempt_ordinal,
                         reask=attempt_ordinal == 2,
+                        reask_reason=reask_reason,
                         continuation=continuation,
                     )
                 except ReviewSessionExpired:
@@ -1444,11 +1505,15 @@ class ReviewRouter:
                         pass_ordinal=pass_ordinal,
                         attempt_ordinal=attempt_ordinal,
                         reask=attempt_ordinal == 2,
+                        reask_reason=reask_reason,
                         continuation=continuation,
                     )
             except ReviewExecutionError as exc:
                 malformed = exc
                 if attempt_ordinal == 1 and str(exc).startswith("malformed review"):
+                    # Feed the specific parse violation back to the reviewer;
+                    # a bare "that was malformed" makes it re-emit the same shape.
+                    reask_reason = str(exc)
                     continuation = self._continuation_context(
                         request, previous=continuation
                     )
@@ -1481,6 +1546,7 @@ class ReviewRouter:
         pass_ordinal: int,
         attempt_ordinal: int,
         reask: bool,
+        reask_reason: str = "",
         continuation: ContinuationContext,
     ) -> ReviewResult:
         command_template = self.reviewer.require_reviewer_command()
@@ -1490,7 +1556,12 @@ class ReviewRouter:
                 "review request cannot be delivered"
             )
         effective_template = self._continuation_command(command_template, continuation)
-        prompt = self._prompt(request, reask=reask, continuation=continuation)
+        prompt = self._prompt(
+            request,
+            reask=reask,
+            reask_reason=reask_reason,
+            continuation=continuation,
+        )
         command = format_agent_command(
             effective_template,
             prompt=prompt,
@@ -1816,13 +1887,18 @@ class ReviewRouter:
         request: ReviewRequest,
         *,
         reask: bool,
+        reask_reason: str = "",
         continuation: ContinuationContext,
     ) -> str:
-        instruction = (
-            "The previous response was malformed. Return only one JSON object. "
-            if reask
-            else ""
-        )
+        instruction = ""
+        if reask:
+            instruction = "The previous response was malformed. "
+            if reask_reason:
+                instruction += (
+                    f"The runtime rejected it with: {reask_reason}. "
+                    "Fix exactly that violation. "
+                )
+            instruction += "Return only one JSON object. "
         return (
             instruction
             + "Review this candidate directly. Do not launch, delegate to, or "
@@ -1831,7 +1907,9 @@ class ReviewRouter:
             "JSON object with verdict (approve|findings|error), findings, session_id, "
             "and session_id_source. The runtime owns continuation ordinals and "
             "review budgets; do not propose or reset either. Each finding requires id, "
-            "severity (P0-P3), summary, evidence, files, lines, and state.\n"
+            "severity (P0-P3), summary, evidence, files, lines, and state. files and "
+            "lines are JSON arrays of strings, never a bare string and never numbers: "
+            'use "lines": ["12", "40-52"], not "lines": "12" or "lines": [12].\n'
             + json.dumps(
                 {
                     **request.to_payload(),
@@ -1850,14 +1928,23 @@ class ReviewRouter:
         )
 
     def _malformed_output_evidence(self, output: str) -> dict[str, object]:
-        redacted = redact_evidence_text(output)
-        truncated = len(redacted) > MALFORMED_REVIEW_OUTPUT_MAX_CHARS
+        bounded = bound_malformed_review_output(output)
+        redacted = redact_evidence_text(bounded)
+        # Label-based only: reviewer stdout can quote a lock diagnostic such as
+        # ``fencing_token: <value>``. It cannot carry the run's own token value
+        # unlabeled -- the reviewer subprocess is launched without ``env=`` so it
+        # does not inherit VIBE_LOOP_FENCING_TOKEN, and ReviewRequest.to_payload
+        # carries no token field -- so no exact-value redaction is threaded here.
+        redacted = redact_fencing_token_diagnostic(redacted, {})
+        truncated = (
+            bounded != output or len(redacted) > MALFORMED_REVIEW_OUTPUT_MAX_CHARS
+        )
         return {
             "text": redacted[-MALFORMED_REVIEW_OUTPUT_MAX_CHARS:],
             "original_chars": len(output),
             "redacted_chars": len(redacted),
             "truncated": truncated,
-            "redacted": redacted != output,
+            "redacted": redacted != bounded,
         }
 
     def _continuation_context(

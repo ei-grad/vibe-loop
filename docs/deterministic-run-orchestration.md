@@ -390,11 +390,21 @@ entries to verify.
 Collected output (`ReviewResult`, schema-validated): verdict (`approve` |
 `findings` | `error`), findings list (id, severity, summary, evidence,
 files/lines), session identity and continuation ordinal, native usage, retry
-classification. Malformed output gets one bounded deterministic re-ask, then
-the run parks as blocked with the candidate and passed gate evidence preserved.
-Each malformed attempt records a bounded, secret-redacted output tail and a
-distinct `output_classification = "malformed"`; a schema-valid reviewer error
-uses `output_classification = "parsed"` instead.
+classification. `files` and `lines` are arrays of strings; a bare scalar is
+normalized to a one-element list and integers are coerced to text, so a
+cosmetic rendering difference does not discard a run whose gates passed.
+Malformed output gets one bounded deterministic re-ask that names the specific
+parse violation, then the run parks as blocked rather than failing generically.
+Candidate and passed gate evidence retention is not new here: the worktree-keep
+guardrail already keeps them for any unsuccessful terminal status. What this
+path adds is the classification and the diagnosability — each malformed attempt
+records a bounded, secret-redacted output tail and a distinct
+`output_classification = "malformed"`; a schema-valid reviewer error uses
+`output_classification = "parsed"` instead. Reviewer stdout is capped per line
+and windowed to a bounded tail *before* redaction, because the evidence
+redactor is superlinear in line length and an unbounded prose answer would
+otherwise stall the run while holding the task lock; redaction still runs
+before the final truncation so no unredacted fragment is stored.
 
 Delivery mechanism: reviewer commands are configured templates like agent
 commands today; the runtime passes the request via file/stdin and requires
@@ -635,7 +645,8 @@ Compatibility specifics:
   pause, and correct phase attribution.
 - **Reviewer continuity:** same-session closure on resume-capable providers;
   recorded `continuation_fallback` otherwise; budget exhaustion behavior;
-  malformed reviewer output re-ask then blocked candidate preservation.
+  malformed reviewer output re-ask naming the parse violation, then a blocked
+  review-stage classification.
 - **Isolation:** `jobs=1` — one implementation lifecycle, reviewer budget
   independent; `jobs=2` — distinct worktrees, no primary-worktree claim,
   conflict domains still enforced, reviewer concurrency budget shared
