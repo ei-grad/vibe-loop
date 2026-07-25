@@ -554,6 +554,13 @@ def _checkpoint_is_valid(checkpoint: Mapping[str, object], generation: int) -> b
 
 
 def _checkpoint_digest(checkpoint: Mapping[str, object]) -> str:
+    """Unkeyed digest binding a journal header to its checkpoint file.
+
+    This detects a torn, stale, or rolled-back checkpoint, not tampering: the
+    header and the checkpoint sit in the same state directory under the same
+    permissions, so any writer able to replace one can write a matching pair.
+    """
+
     payload = json.dumps(checkpoint, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -655,6 +662,18 @@ class BudgetStore:
         with _APPEND_LOCK:
             with append_record_lock(self.path):
                 state = self._load_state_unlocked()
+                if (
+                    reservation_id in state.reserved
+                    and reservation_id not in state.terminal
+                ):
+                    # Reservation ids are single-use. Replaying one while it is
+                    # live would overwrite its reserved row (last write wins),
+                    # after which the earlier generation's terminal validates
+                    # against the newer row, is classified generation_mismatch,
+                    # and its charge disappears from consumption.
+                    raise ValueError(
+                        f"budget reservation id is already live: {reservation_id}"
+                    )
                 binding: list[dict[str, object]] = []
                 warnings: list[dict[str, object]] = []
                 for index, limit in enumerate(self.config.limits):
@@ -1608,7 +1627,14 @@ def resolve_budget_ledger_path(config: object) -> Path:
 
 
 def resolve_budget_project(config: object) -> str:
-    """Stable canonical project identity, independent of the checkout basename."""
+    """Repository identity a ``budget.limits[].project`` selector matches.
+
+    This is the basename of the repository-common root, so every linked
+    worktree of one checkout shares a cap. It is a different axis from
+    ``config.resolve_project_binding``, which resolves the task-backend
+    namespace: spend is scoped to a repository, dispatch to a project, and the
+    two are not required to agree.
+    """
 
     if not _budget_enabled(config):
         return Path(getattr(config, "repo")).name

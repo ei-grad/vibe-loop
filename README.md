@@ -1079,7 +1079,11 @@ disabled/unconfigured budgets keep their prior per-repo path and do no Git work.
 
 Attribution is by **project, provider route, worker phase, model, and effort**.
 A `[[budget.limits]]` entry caps one scope; omit a selector to match any value on
-that axis. A launch must satisfy every limit it matches (route cardinality is
+that axis. The `project` axis names the **repository** the ledger is keyed on —
+the basename of the repository-common root, shared by all its linked worktrees.
+It is deliberately not the task-backend project from `[project_binding]`, which
+scopes dispatch rather than spend; the two need not agree, and renaming a
+checkout changes which caps a `project` selector matches. A launch must satisfy every limit it matches (route cardinality is
 bounded and an over-large config is rejected). `metric` is the single
 dimension caps, declared allowances, and fail-safe charges are denominated in
 (one of `input_tokens`, `output_tokens`, `total_tokens`,
@@ -1110,11 +1114,19 @@ conservatively rather than being silently released.
 
 The durable ledger enforces a strict terminal-record schema and identity
 contract: a reconciliation or release must match its reservation's id, owner
-run, and generation and carry valid typed usage fields. Malformed, forged,
-mismatched, duplicate, orphaned, or torn rows never close a live reservation at
-zero; they are counted as bounded, content-free integrity diagnostics and the
-reservation stays live (conservatively charged) until a valid terminal arrives
-or recovery charges it fail-safe.
+run, and generation and carry valid typed usage fields. Malformed, mismatched,
+duplicate, orphaned, or torn rows never close a live reservation at zero; they
+are counted as bounded, content-free integrity diagnostics and the reservation
+stays live (conservatively charged) until a valid terminal arrives or recovery
+charges it fail-safe.
+
+These checks detect **corruption**, not tampering. The journal header, the
+checkpoint, and its unkeyed SHA-256 digest live in the same state directory
+under the same permissions, so anything that can write one can write a
+consistent pair. The ledger trusts every writer of the state directory; it
+defends against torn writes, stale or rolled-back checkpoints, and partial
+compaction, and it is not an integrity control against an adversary with write
+access there.
 
 To keep replay, admission, and inspect work bounded, the ledger is compacted
 under the same OS lock: closed, out-of-window reservations and aged-out decision

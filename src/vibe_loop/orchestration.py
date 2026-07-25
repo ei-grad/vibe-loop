@@ -1927,7 +1927,9 @@ class ReviewRouter:
             ) from exc
         except ReviewExecutionError:
             duration = max(0.0, time.monotonic() - started)
-            self._reconcile_review_budget(budget_reservation, None)
+            self._reconcile_review_budget(
+                budget_reservation, None, phase=request.phase
+            )
             self._record_error(
                 request,
                 route,
@@ -1943,7 +1945,9 @@ class ReviewRouter:
             self._fail_stage_for_result("fatal")
             raise
         except subprocess.TimeoutExpired as exc:
-            self._reconcile_review_budget(budget_reservation, None)
+            self._reconcile_review_budget(
+                budget_reservation, None, phase=request.phase
+            )
             self._record_wait_incomplete(
                 request, pass_ordinal, attempt_ordinal, continuation
             )
@@ -1959,7 +1963,7 @@ class ReviewRouter:
         usage = observer.usage
         # A launched reviewer is reconciled exactly once against its own usage;
         # unavailable usage is charged fail-safe, never zero.
-        self._reconcile_review_budget(budget_reservation, usage)
+        self._reconcile_review_budget(budget_reservation, usage, phase=request.phase)
         nested_launches, nested_usage = self._nested_launch_evidence(output)
         if nested_launches:
             self._record_error(
@@ -2826,11 +2830,14 @@ class ReviewRouter:
         )
 
     def _reconcile_review_budget(
-        self, reservation_id: str, usage: ProviderUsage | None
+        self, reservation_id: str, usage: ProviderUsage | None, *, phase: str
     ) -> None:
         if self.budget is None or not reservation_id:
             return
-        stats = usage.to_stats(phase="review") if usage is not None else {}
+        # The stats payload must name the phase the reservation was made under,
+        # not the review family, or a terminal record attributes a
+        # targeted_closure launch to "review".
+        stats = usage.to_stats(phase=phase) if usage is not None else {}
         self.budget.reconcile(
             reservation_id=reservation_id,
             run_id=self.run_id,
