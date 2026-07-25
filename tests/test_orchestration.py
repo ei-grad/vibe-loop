@@ -3488,6 +3488,75 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertEqual(wall["retry_classification"], "limit_wall")
         self.assertEqual(wall["route"]["provider"], "codex")
 
+    def test_reviewer_that_read_limit_wall_fixtures_is_not_a_wall(self) -> None:
+        # The observed false positive. Reviewing a limit-wall slice means reading
+        # its classifier fixtures, so the reviewer transcript quotes the phrases
+        # verbatim; the reviewer then finished and approved. Text below is
+        # verbatim from run 20260725T192937Z-...-58298d25-remediation-1, which
+        # paused dispatch 1800s and was reported to the operator as an exhausted
+        # provider quota.
+        transcript = "\n".join(
+            (
+                "Reading tests/test_retry.py",
+                '        ("Error 429: Too Many Requests. usage limit exceeded, '
+                'retry after 30s", True),',
+                '        ("503: weekly limit reached, service temporarily '
+                'unavailable", True),',
+                "You've hit your usage limit is the phrase the detector matches.",
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=transcript)
+
+        result = self.router("codex", execute).review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertEqual(
+            [
+                record.get("retry_classification")
+                for record in self.store.read_records()
+                if record.get("record_type") == "review_verdict"
+            ],
+            ["ok"],
+        )
+
+    def test_reviewer_wall_in_a_provider_envelope_still_pauses(self) -> None:
+        # The real thing, in the shape the provider emits it: the reviewer
+        # process failed and its terminal record carries the refusal. Matches
+        # tests/fixtures/provider_usage/claude-limit-wall.json.
+        envelope = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "result": "usage limit reached",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+        )
+        transcript = "\n".join(("reading src/vibe_loop/retry.py", envelope))
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 1, stdout=transcript)
+
+        with self.assertRaises(ReviewLimitWallError) as raised:
+            self.router("codex", execute).review(self.gates)
+
+        message = str(raised.exception)
+        self.assertIn("usage limit reached", message)
+        # The diagnostic must name what qualified the match, so an operator
+        # reading a recorded pause can tell it from a quoted phrase.
+        self.assertIn(f"[exit=1; scanned all {len(transcript)} chars]", message)
+
     def test_missing_prompt_delivery_fails_before_launch(self) -> None:
         router = ReviewRouter(
             reviewer=self.agent(
