@@ -1219,7 +1219,10 @@ their ordinary behavior.
 Reviewer output is one schema-validated JSON verdict. Findings are persisted in
 a candidate-scoped ledger, malformed output gets one bounded re-ask, and a
 provider limit wall is attributed to the reviewer route without consuming the
-implementation restart budget. Runtime usage phases are `initial_review` and
+implementation restart budget. If the re-ask is also malformed, the run is
+blocked with its candidate and passed gates preserved; the journal stores a
+bounded, secret-redacted output tail under the distinct `malformed`
+classification. Runtime usage phases are `initial_review` and
 `targeted_closure`; compatibility worker reports may continue using `review`.
 
 Continuation capability is explicit by provider and role. Claude implementer

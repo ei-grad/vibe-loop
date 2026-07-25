@@ -391,13 +391,22 @@ Collected output (`ReviewResult`, schema-validated): verdict (`approve` |
 `findings` | `error`), findings list (id, severity, summary, evidence,
 files/lines), session identity and continuation ordinal, native usage, retry
 classification. Malformed output gets one bounded deterministic re-ask, then
-`stage_failed(review, malformed_output)` — never silent acceptance.
+the run parks as blocked with the candidate and passed gate evidence preserved.
+Each malformed attempt records a bounded, secret-redacted output tail and a
+distinct `output_classification = "malformed"`; a schema-valid reviewer error
+uses `output_classification = "parsed"` instead.
 
 Delivery mechanism: reviewer commands are configured templates like agent
 commands today; the runtime passes the request via file/stdin and requires
 schema-conforming output (mirroring the analysis-agent strict-JSON path),
 falling back to a fenced ingestion command for reviewers that cannot emit
 structured output directly.
+
+The generic route does not add a provider-specific JSON-schema flag. Exact
+`codex review {prompt}` has no supported structured-output option, and custom
+reviewer commands do not share a portable schema flag. The runtime therefore
+validates the returned JSON itself and uses the bounded re-ask across all
+providers rather than silently changing configured command semantics.
 
 ### Retry classification (shared)
 
@@ -626,7 +635,7 @@ Compatibility specifics:
   pause, and correct phase attribution.
 - **Reviewer continuity:** same-session closure on resume-capable providers;
   recorded `continuation_fallback` otherwise; budget exhaustion behavior;
-  malformed reviewer output re-ask then typed failure.
+  malformed reviewer output re-ask then blocked candidate preservation.
 - **Isolation:** `jobs=1` — one implementation lifecycle, reviewer budget
   independent; `jobs=2` — distinct worktrees, no primary-worktree claim,
   conflict domains still enforced, reviewer concurrency budget shared

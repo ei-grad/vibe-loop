@@ -45,6 +45,7 @@ from vibe_loop.orchestration import (
     ReviewDelegationPolicyError,
     ReviewFinding,
     ReviewLimitWallError,
+    ReviewOutputMalformed,
     ReviewRouter,
     ReviewStageResultError,
     ReviewWaitIncomplete,
@@ -2806,9 +2807,19 @@ class ReviewRouterTests(unittest.TestCase):
 
         router = self.router("codex", execute)
         result = router.review(self.gates)
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
 
         self.assertEqual(result.verdict, "findings")
         self.assertEqual(result.attempt_ordinal, 2)
+        self.assertEqual(
+            [record["output_classification"] for record in verdicts],
+            ["malformed", "parsed"],
+        )
+        self.assertEqual(verdicts[0]["malformed_output"]["text"], "not json")
         self.assertEqual(
             [
                 finding.finding_id
@@ -2850,6 +2861,81 @@ class ReviewRouterTests(unittest.TestCase):
                 "review_budget",
             ],
         )
+
+    def test_malformed_reask_exhaustion_blocks_with_redacted_output(self) -> None:
+        outputs = iter(
+            (
+                "x" * 5000 + "\napi_token=super-secret",
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "candidate can bypass review",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": "12",
+                                "state": "open",
+                            }
+                        ],
+                    }
+                ),
+            )
+        )
+        commands: list[str] = []
+
+        def execute(command: str, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        router = self.router("codex", execute)
+        router.stage_machine = machine
+
+        with self.assertRaises(ReviewOutputMalformed) as raised:
+            router.review(self.gates)
+
+        verdicts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        ]
+        self.assertEqual(raised.exception.attempts, 2)
+        self.assertIn("review finding lines", raised.exception.reason)
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        self.assertEqual(transitions[-1]["failure"], "blocked")
+        self.assertEqual(transitions[-1]["reason"], "review_output_malformed")
+        self.assertEqual(len(verdicts), 2)
+        self.assertTrue(
+            all(record["output_classification"] == "malformed" for record in verdicts)
+        )
+        self.assertTrue(
+            all(
+                record["candidate_fingerprint"] == self.candidate.fingerprint
+                for record in verdicts
+            )
+        )
+        first_output = verdicts[0]["malformed_output"]
+        self.assertTrue(first_output["truncated"])
+        self.assertTrue(first_output["redacted"])
+        self.assertLessEqual(len(first_output["text"]), 4096)
+        self.assertNotIn("super-secret", first_output["text"])
+        self.assertIn("<redacted>", first_output["text"])
+        self.assertNotIn("previous response was malformed", commands[0])
+        self.assertIn("previous response was malformed", commands[1])
 
     def test_targeted_closure_updates_ledger_and_phase(self) -> None:
         initial = ReviewFinding(

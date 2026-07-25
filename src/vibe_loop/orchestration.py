@@ -28,6 +28,7 @@ from vibe_loop.config import (
     format_agent_command,
     parse_orchestration,
 )
+from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import fencing_token_value
 from vibe_loop.retry import LimitWallSignal, detect_limit_wall
 from vibe_loop.tasks import (
@@ -51,6 +52,7 @@ CANDIDATE_RECORD_SOURCE_KINDS = ("worker_command", "derived")
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
+MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 FINDING_SEVERITIES = ("P0", "P1", "P2", "P3")
 FINDING_STATES = ("open", "remediated", "accepted", "rejected")
 CONTINUATION_FALLBACK_REASONS = (
@@ -213,6 +215,16 @@ class ReviewBudgetExhausted(ReviewExecutionError):
         self.pass_kind = pass_kind
         self.limit = limit
         super().__init__(f"review budget exhausted for {pass_kind}: limit={limit}")
+
+
+class ReviewOutputMalformed(ReviewExecutionError):
+    def __init__(self, reason: str, attempts: int) -> None:
+        self.reason = reason
+        self.attempts = attempts
+        super().__init__(
+            "reviewer output remained malformed after "
+            f"{attempts} attempts; candidate and passed gates preserved: {reason}"
+        )
 
 
 class ReviewWaitIncomplete(ReviewExecutionError):
@@ -1442,7 +1454,12 @@ class ReviewRouter:
                     )
                     continue
                 if str(exc).startswith("malformed review"):
-                    self._fail_stage_for_result("fatal")
+                    if self.stage_machine is not None:
+                        self.stage_machine.fail(
+                            StageFailure.BLOCKED,
+                            reason="review_output_malformed",
+                        )
+                    raise ReviewOutputMalformed(str(exc), attempt_ordinal) from exc
                 raise
             pass_ordinal = result.pass_ordinal
             self._record_findings(request, result.findings)
@@ -1620,7 +1637,7 @@ class ReviewRouter:
                 duration=duration,
                 continuation=continuation,
             )
-        except ReviewExecutionError:
+        except ReviewExecutionError as exc:
             self._record_error(
                 request,
                 route,
@@ -1630,6 +1647,9 @@ class ReviewRouter:
                 duration,
                 usage,
                 continuation=continuation,
+                output_classification="malformed",
+                malformed_output=self._malformed_output_evidence(output),
+                parse_error=str(exc),
             )
             raise
         self._append_event(
@@ -1828,6 +1848,17 @@ class ReviewRouter:
                 ensure_ascii=False,
             )
         )
+
+    def _malformed_output_evidence(self, output: str) -> dict[str, object]:
+        redacted = redact_evidence_text(output)
+        truncated = len(redacted) > MALFORMED_REVIEW_OUTPUT_MAX_CHARS
+        return {
+            "text": redacted[-MALFORMED_REVIEW_OUTPUT_MAX_CHARS:],
+            "original_chars": len(output),
+            "redacted_chars": len(redacted),
+            "truncated": truncated,
+            "redacted": redacted != output,
+        }
 
     def _continuation_context(
         self,
@@ -2252,6 +2283,9 @@ class ReviewRouter:
         nested_launches: int = 0,
         nested_usage: Mapping[str, int | float] | None = None,
         policy_violation: str = "",
+        output_classification: str = "unavailable",
+        malformed_output: Mapping[str, object] | None = None,
+        parse_error: str = "",
     ) -> None:
         context = continuation or ContinuationContext()
         result = ReviewResult(
@@ -2270,10 +2304,15 @@ class ReviewRouter:
             nested_launches=nested_launches,
         )
         payload = self._result_payload(result, request, route)
+        payload["output_classification"] = output_classification
         if nested_usage:
             payload["nested_usage"] = dict(nested_usage)
         if policy_violation:
             payload["policy_violation"] = policy_violation
+        if malformed_output is not None:
+            payload["malformed_output"] = dict(malformed_output)
+        if parse_error:
+            payload["parse_error"] = parse_error
         self._append_event(
             "review_verdict",
             payload,
@@ -2291,6 +2330,7 @@ class ReviewRouter:
             "attempt_ordinal": result.attempt_ordinal,
             "candidate_fingerprint": request.candidate.fingerprint,
             "verdict": result.verdict,
+            "output_classification": "parsed",
             "findings_count": len(result.findings),
             "session_id": result.session_id,
             "session_id_source": result.session_id_source,
