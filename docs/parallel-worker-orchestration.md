@@ -127,13 +127,25 @@ results are missing or ambiguous.
   `VIBE_LOOP_REVIEWER_SESSION` so a backend can attribute a status transition to
   the session that produced the candidate and the session that approved it. Both
   are derived from the run's own records: the run's observed worker session, and
-  the session recorded for the last approving review pass, which is the pass the
-  review loop exits into integration on. Either variable is absent when the
-  runtime has nothing attributable -- no observation, no approval, a fallback
-  source that names the run rather than a session, or an id outside the
-  identifier alphabet. Absent is the fail-closed signal; the runtime never
-  exports an empty value, a placeholder, or a value inherited from the ambient
-  environment.
+  the session recorded for the last approving review pass. The review output
+  parser refuses an `approve` that carries findings or that leaves a prior
+  finding open, so the approve that exits the review loop into integration is by
+  construction the last one a run records.
+- The implementer variable accompanies every runtime task-source transition,
+  including settlement and reset, because it names the session that did this
+  run's work whatever the outcome. The reviewer variable accompanies the
+  completion transition only: it answers "who approved what was merged", and a
+  settled or reset run merged nothing.
+- Either variable is absent when the runtime has nothing attributable -- no
+  observation, no approval, a source the runtime did not itself decide (a
+  fallback that names the run, or a label reported by an agent), an id outside
+  the identifier alphabet, or an id equal to the run id. Absent is the
+  fail-closed signal, so the runtime exports no empty value and no placeholder,
+  and the adapter's environment is built by removing these names before the
+  supplied context is applied -- an ambient value in the supervisor's own
+  environment cannot satisfy a name the runtime withheld. `VIBE_LOOP_REPO`,
+  `VIBE_LOOP_WORKTREE`, `VIBE_LOOP_BRANCH`, and `VIBE_LOOP_FENCING_TOKEN` are
+  withheld the same way.
 - `workers --json` and `doctor --json` cross-check claimed workspace metadata
   against `git worktree list`, the current claimed worktree status, and branch
   containment in `main` or `origin/main`. They emit diagnostic codes and manual

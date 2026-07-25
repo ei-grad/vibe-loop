@@ -184,8 +184,17 @@ REVIEWER_SESSION_ENV = "VIBE_LOOP_REVIEWER_SESSION"
 # the run id. That value identifies the run, not a session, so it attributes
 # nothing.
 SESSION_ID_FALLBACK_SOURCE = "fallback:run_id"
-# A continuation reconstructed from a start record with no recorded source.
-SESSION_ID_UNAVAILABLE_SOURCE = "unavailable"
+# Sources the runtime can vouch for, because it decided them itself: a session
+# it observed in provider output (`observed`, `native:<stream>`), one it
+# generated and injected, one it resumed, or a launch it planned. Every other
+# source string reached the record from an agent's own report -- a reviewer
+# supplies both fields when the provider cannot be told a session id
+# (`orchestration._parse_result`) -- and an unrecognized label is a claim the
+# runtime never made, so it attributes nothing.
+ATTESTED_SESSION_ID_SOURCES = frozenset(
+    {"observed", "runtime_injected", "runtime_launch", "runtime_resumed"}
+)
+ATTESTED_SESSION_ID_SOURCE_PREFIXES = ("native:",)
 # Session ids reach the runtime from provider output and from reviewer-reported
 # JSON, so an exported value is agent-influenced text. Accept only the bounded
 # identifier alphabet the session observers already produce; anything else is
@@ -3656,6 +3665,7 @@ class VibeRunner:
                 run_id=run_id,
                 task_lock=task_lock,
                 runtime_context=runtime_context,
+                include_reviewer_session=True,
             ),
             stage_machine=stage_machine,
         ).complete()
@@ -3739,6 +3749,7 @@ class VibeRunner:
         run_id: str,
         task_lock: TaskLock,
         runtime_context: Mapping[str, str] | None = None,
+        include_reviewer_session: bool = False,
     ) -> dict[str, str]:
         context = dict(runtime_context or {})
         context.update(
@@ -3761,6 +3772,8 @@ class VibeRunner:
         # attribute the transition to a session that did not do the work, and
         # the consumer cannot tell that apart from a derived one. Unknown must
         # reach the adapter as an absent variable, so drop before setting.
+        # `tasks.WITHHELD_ADAPTER_ENV` carries the same removal across the
+        # process boundary, which `dict.update` on `os.environ` cannot.
         records = self.run_store.read_records()
         context.pop(IMPLEMENTER_SESSION_ENV, None)
         context.pop(REVIEWER_SESSION_ENV, None)
@@ -3771,6 +3784,13 @@ class VibeRunner:
         )
         if implementer_session:
             context[IMPLEMENTER_SESSION_ENV] = implementer_session
+        # The reviewer variable answers "who approved what was merged", so only
+        # the completion path may carry it. A settlement or reset transition
+        # merged nothing -- integration can fail after an approval -- and
+        # exporting the approver there would let a backend attribute a failure
+        # to the session that approved a candidate no one shipped.
+        if not include_reviewer_session:
+            return context
         reviewer_session = reviewer_session_from_records(
             records,
             run_id=run_id,
@@ -7317,26 +7337,30 @@ def observe_worker_session_id(line: str) -> str | None:
     return None
 
 
-def exportable_session_id(record: Mapping[str, object]) -> str:
+def exportable_session_id(record: Mapping[str, object], *, run_id: str) -> str:
     """Return the attributable session id a lifecycle record carries, else "".
 
-    A record attributes a session only when it names both the id and where the
-    id came from. A missing id, a missing or unattributable source, or an id
-    outside the identifier alphabet all mean "unknown", which the caller must
-    express by omitting the variable rather than exporting the value.
+    A record attributes a session only when it names both the id and a source
+    the runtime itself decided. A missing id, an unattested source, an id
+    outside the identifier alphabet, or an id equal to the run id all mean
+    "unknown", which the caller must express by omitting the variable rather
+    than exporting the value. The run id is refused whatever the source says:
+    it names the run rather than a session, and under `runtime_launch` the id
+    is reported by the agent, which could otherwise report it back as its own.
     """
 
     session_id = record.get("session_id")
     session_id_source = record.get("session_id_source")
     if not isinstance(session_id, str) or not isinstance(session_id_source, str):
         return ""
-    if session_id_source in {
-        "",
-        SESSION_ID_FALLBACK_SOURCE,
-        SESSION_ID_UNAVAILABLE_SOURCE,
-    }:
+    if session_id_source not in ATTESTED_SESSION_ID_SOURCES and not any(
+        session_id_source.startswith(prefix)
+        for prefix in ATTESTED_SESSION_ID_SOURCE_PREFIXES
+    ):
         return ""
     if EXPORTABLE_SESSION_ID_RE.fullmatch(session_id) is None:
+        return ""
+    if session_id == run_id:
         return ""
     return session_id
 
@@ -7361,7 +7385,7 @@ def implementer_session_from_records(
             continue
         if record.get("to_state") != "session_observed":
             continue
-        session_id = exportable_session_id(record)
+        session_id = exportable_session_id(record, run_id=run_id)
     return session_id
 
 
@@ -7373,13 +7397,14 @@ def reviewer_session_from_records(
 ) -> str:
     """Session id behind the approval integration relied on, else "".
 
-    A run can approve more than once: an initial approval that still leaves
-    open findings sends the candidate back through remediation and another
-    pass, and continuation may or may not resume the same reviewer session.
-    The review loop only exits into integration on the *last* approving pass,
-    so that pass's recorded session is the one that approved what was merged.
-    Reading the last approving verdict record also means an earlier pass never
-    stands in for a later one that recorded no attributable session.
+    The review loop exits into integration only on an approving pass, and the
+    output parser refuses an `approve` that carries findings or that leaves any
+    prior finding open, so the approve that ends the loop is by construction the
+    last one a run records. Reading the last approving verdict is therefore the
+    exit pass today, and stays correct rather than merely lucky if a later
+    change ever makes a second approving pass reachable: an earlier pass never
+    stands in for a later one, including when the later one recorded no
+    attributable session.
     """
 
     session_id = ""
@@ -7390,7 +7415,7 @@ def reviewer_session_from_records(
             continue
         if record.get("verdict") != "approve":
             continue
-        session_id = exportable_session_id(record)
+        session_id = exportable_session_id(record, run_id=run_id)
     return session_id
 
 
