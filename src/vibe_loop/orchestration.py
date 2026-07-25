@@ -1932,9 +1932,17 @@ class ReviewRouter:
         redacted = redact_evidence_text(bounded)
         # Label-based only: reviewer stdout can quote a lock diagnostic such as
         # ``fencing_token: <value>``. It cannot carry the run's own token value
-        # unlabeled -- the reviewer subprocess is launched without ``env=`` so it
-        # does not inherit VIBE_LOOP_FENCING_TOKEN, and ReviewRequest.to_payload
-        # carries no token field -- so no exact-value redaction is threaded here.
+        # unlabeled, for two reasons. The token never reaches the reviewer's
+        # environment: it is read from the task-lock metadata into a local
+        # ``command_env`` dict and passed only via ``env=`` to the worker and
+        # remediation launches, and nothing in this package assigns to
+        # ``os.environ`` -- so the reviewer, which inherits the runner's
+        # environment, inherits an environment that does not hold it. (Note a
+        # supervisor started from a shell that itself exports the token would
+        # break that, since the run child's env is copied from ``os.environ``.)
+        # And ReviewRequest/CandidateRecord/GateResult payloads carry no token
+        # field, so the prompt cannot hand it over either. Hence no exact-value
+        # redaction is threaded here.
         redacted = redact_fencing_token_diagnostic(redacted, {})
         truncated = (
             bounded != output or len(redacted) > MALFORMED_REVIEW_OUTPUT_MAX_CHARS
