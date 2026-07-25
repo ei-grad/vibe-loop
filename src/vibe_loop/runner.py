@@ -7785,6 +7785,8 @@ def worker_command_env(
             "VIBE_LOOP_AGENT_PROFILE": agent_profile,
         }
     )
+    if agent_kind == "claude":
+        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     return env
 
 

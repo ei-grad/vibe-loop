@@ -108,13 +108,25 @@ task-source probe. Runtime-owned orchestration may still derive and validate a
 candidate after a clean report-less exit, preserving the candidate, workspace,
 and gate evidence it records during the runtime stages.
 
-Headless Claude implementers cannot safely park on asynchronous Agent/Task work:
+Headless Claude implementers cannot safely park on asynchronous work:
 `claude -p` ends when the model returns its progress summary and has no later
-turn in which to receive a completion notification. The launch policy therefore
-denies Agent and Task tools for Claude implementation workers while preserving
-any repository-configured tool denials. Provider limit-wall exits are separate:
-they exit nonzero and retain the existing `limit_wall` classification and reset
-evidence.
+turn in which to receive a background Bash, Agent, or Task completion
+notification. The launch policy therefore sets
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and denies Agent and Task tools for
+Claude implementation workers while preserving any repository-configured tool
+denials. Provider limit-wall exits are separate: they exit nonzero and retain
+the existing `limit_wall` classification and reset evidence.
+
+The 2026-07-24 historical measurement supports this mechanism rather than a
+wall-clock or repository-specific explanation. Across capOS, vibe-loop, and
+loopyard, all 124 Claude `unknown` results were clean exits with classification
+source `fallback`. Of the 120 results with UUID session evidence, 103 launched
+background work and 42 ended on an explicit waiting message; only 34 used the
+Agent tool, so denying Agent alone does not cover the observed background Bash
+path. All 11 Claude `limit_wall` results were nonzero exits with source
+`limit_wall`, so they do not share the clean-exit mechanism. These are baseline
+measurements from `runs.jsonl`; post-deployment rates must be measured from new
+run records rather than inferred from the regression suite.
 
 A settled run must also finalize where external provenance lives. Once the run
 is classified, the supervisor publishes a settled outcome — one of `completed`,

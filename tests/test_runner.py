@@ -102,6 +102,7 @@ from vibe_loop.runner import (
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
     wait_with_reap_watchdog,
+    worker_command_env,
     worker_report_persistence_epoch,
     worker_usage_provenance,
 )
@@ -6270,6 +6271,31 @@ class SessionIdInjectionTests(unittest.TestCase):
             command,
         )
 
+    def test_claude_implementer_disables_background_tasks_in_environment(
+        self,
+    ) -> None:
+        with patch.dict(
+            os.environ,
+            {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"},
+        ):
+            claude_env = worker_command_env(
+                run_id="run-1",
+                task_id="TASK-01",
+                log_path=Path("/tmp/run.log"),
+                agent_kind="claude",
+                agent_profile="claude-opus",
+            )
+            codex_env = worker_command_env(
+                run_id="run-2",
+                task_id="TASK-02",
+                log_path=Path("/tmp/run.log"),
+                agent_kind="codex",
+                agent_profile="codex",
+            )
+
+        self.assertEqual(claude_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+        self.assertEqual(codex_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "0")
+
     def test_worker_usage_provenance_is_allowlisted(self) -> None:
         report = WorkerReport(
             run_id="run-1",
@@ -7072,6 +7098,55 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             self.assertIn("terminal worker report", result.message)
             self.assertIsNone(result.worker_report)
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "failed")
+
+    def test_runtime_owned_claude_exit_without_report_continues_to_candidate(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _source = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+            claude = AgentConfig(
+                agent_kind="claude",
+                command="claude -p {prompt}",
+                prompt_dialect="claude",
+                skill_ref_prefix="/",
+            )
+            runner.config = dataclasses.replace(
+                runner.config,
+                agent=claude,
+                agent_profiles={
+                    **runner.config.agent_profiles,
+                    "worker": claude,
+                },
+            )
+
+            def complete_runtime_lifecycle(**kwargs):
+                self._record_runtime_integration(
+                    runner,
+                    kwargs["run_id"],
+                    kwargs["task"].task_id,
+                )
+                return runner_module.ClassificationResult(
+                    "completed",
+                    "runtime_lifecycle",
+                )
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=complete_runtime_lifecycle,
+            ) as lifecycle:
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "", report=False),
+                )
+
+            lifecycle.assert_called_once()
+            self.assertEqual(result.classification, "completed")
+            self.assertIsNone(result.worker_report)
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
 
     def test_explicit_worker_owned_mode_does_not_run_runtime_lifecycle(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
