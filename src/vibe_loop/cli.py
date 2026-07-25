@@ -42,6 +42,7 @@ from vibe_loop.config import (
     require_project_binding,
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
+    AUTOPILOT_MIN_INTERVAL_SECONDS,
     AUTOPILOT_WORKTREE_DISPOSITION_POLICIES,
     AgentResolutionError,
     git_main_worktree_path,
@@ -862,11 +863,12 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--interval",
-        type=nonnegative_float,
+        type=autopilot_interval,
         default=None,
         help=(
             "Seconds to sleep between supervision cycles in the persistent loop "
-            "(overrides [autopilot] interval_seconds; default 0)"
+            "(minimum 60; overrides [autopilot] interval_seconds; omitted uses "
+            "drain mode)"
         ),
     )
     parser.add_argument(
@@ -1445,7 +1447,11 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             )
             config = dataclasses.replace(config, autopilot=ap)
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
-        interval = _first_set(getattr(args, "interval", None), ap.interval_seconds, 0.0)
+        interval = _first_set(
+            getattr(args, "interval", None),
+            ap.interval_seconds,
+            0.0,
+        )
         min_ready = _first_set(getattr(args, "min_ready", None), ap.min_ready, 1)
         if command == "start":
             launch = start_detached_autopilot(
@@ -3493,6 +3499,15 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def autopilot_interval(value: str) -> float:
+    parsed = positive_float(value)
+    if parsed < AUTOPILOT_MIN_INTERVAL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"must be at least {AUTOPILOT_MIN_INTERVAL_SECONDS:.0f} seconds"
+        )
     return parsed
 
 

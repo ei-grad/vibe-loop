@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import select
 import shutil
@@ -21,6 +22,7 @@ from typing import Any, BinaryIO
 
 from vibe_loop.config import (
     AgentResolutionError,
+    AUTOPILOT_MIN_INTERVAL_SECONDS,
     DISK_RESERVE_DEFAULT_MIN_FREE_BYTES,
     DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION,
     DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION,
@@ -135,6 +137,21 @@ AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
 )
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
 BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
+
+
+def require_autopilot_interval(interval: float) -> float:
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(interval)
+        or interval < 0
+        or 0 < interval < AUTOPILOT_MIN_INTERVAL_SECONDS
+    ):
+        raise ValueError(
+            "autopilot interval must be zero for drain mode or at least "
+            f"{AUTOPILOT_MIN_INTERVAL_SECONDS:.0f} seconds"
+        )
+    return float(interval)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1357,6 +1374,7 @@ def start_detached_autopilot(
 ) -> DetachedAutopilotLaunch:
     """Start and verify a detached POSIX autopilot supervisor."""
 
+    interval = require_autopilot_interval(interval)
     if os.name != "posix" or not hasattr(os, "setsid"):
         return DetachedAutopilotLaunch(
             repo=config.repo,
@@ -6072,6 +6090,7 @@ def run_autopilot(
     is reported without being stolen. Each cycle is append-recorded; launch is
     blocked, never force-recovered, when preflight diagnostics are unsafe.
     """
+    interval = require_autopilot_interval(interval)
     min_ready = require_positive_min_ready(min_ready)
 
     supervisor_run_id = new_run_id("autopilot")

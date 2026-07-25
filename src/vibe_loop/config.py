@@ -263,6 +263,7 @@ DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION = 0.02
 AUTOPILOT_DEFAULT_PLANNING_BACKOFF_SECONDS = 21600.0
 AUTOPILOT_DEFAULT_PLANNING_MAX_LAUNCHES_PER_DAY = 4
 AUTOPILOT_DEFAULT_PLANNING_UNPRODUCTIVE_THRESHOLD = 2
+AUTOPILOT_MIN_INTERVAL_SECONDS = 60.0
 SPEC_DIAGNOSTICS_DEFAULT_APPROVED_STATES = ("approved",)
 SPEC_DIAGNOSTICS_CONFIG_KEYS = frozenset(
     {
@@ -2440,11 +2441,18 @@ def parse_autopilot(data: object) -> AutopilotConfig:
     ):
         allowed = ", ".join(AUTOPILOT_WORKTREE_DISPOSITION_POLICIES)
         raise ValueError("autopilot.worktree_disposition must be one of: " + allowed)
+    raw_interval = table.get("interval_seconds")
     return AutopilotConfig(
         jobs=optional_positive_int(table.get("jobs"), "autopilot.jobs"),
-        interval_seconds=optional_nonnegative_float(
-            table.get("interval_seconds"),
-            "autopilot.interval_seconds",
+        interval_seconds=(
+            None
+            if raw_interval is None
+            else positive_float(
+                raw_interval,
+                AUTOPILOT_MIN_INTERVAL_SECONDS,
+                "autopilot.interval_seconds",
+                minimum=AUTOPILOT_MIN_INTERVAL_SECONDS,
+            )
         ),
         min_ready=optional_positive_int(table.get("min_ready"), "autopilot.min_ready"),
         planning_recheck_seconds=positive_float(

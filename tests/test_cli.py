@@ -8791,6 +8791,16 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIn("--min-ready", stderr.getvalue())
         self.assertIn("must be a positive integer", stderr.getvalue())
 
+    def test_run_rejects_interval_below_one_minute(self) -> None:
+        stderr = StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                main(["autopilot", "run", "--interval", "59.9"])
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--interval", stderr.getvalue())
+        self.assertIn("must be at least 60 seconds", stderr.getvalue())
+
     def test_bare_autopilot_routes_to_run_and_terminates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
@@ -8877,7 +8887,7 @@ class AutopilotCliTests(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--interval",
-                    "30",
+                    "60",
                     "--json",
                 ],
                 cwd=repo,
@@ -8934,7 +8944,7 @@ class AutopilotCliTests(unittest.TestCase):
                         "--repo",
                         str(repo),
                         "--interval",
-                        "30",
+                        "60",
                         "--json",
                     ],
                     cwd=repo,
@@ -9009,7 +9019,7 @@ class AutopilotCliTests(unittest.TestCase):
                         "--repo",
                         str(repo),
                         "--interval",
-                        "30",
+                        "60",
                         "--json",
                     ],
                     cwd=repo,
@@ -9076,7 +9086,7 @@ class AutopilotCliTests(unittest.TestCase):
                     text=True,
                 )
 
-            start = run_cli("start", "--repo", str(repo), "--interval", "30", "--json")
+            start = run_cli("start", "--repo", str(repo), "--interval", "60", "--json")
             self.assertEqual(start.returncode, 0, start.stderr)
             launch = json.loads(start.stdout)
             pid = launch["pid"]
@@ -9099,7 +9109,7 @@ class AutopilotCliTests(unittest.TestCase):
                 self.assertNotIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
 
                 restart = run_cli(
-                    "start", "--repo", str(repo), "--interval", "30", "--json"
+                    "start", "--repo", str(repo), "--interval", "60", "--json"
                 )
                 self.assertEqual(restart.returncode, 0, restart.stderr)
                 restarted = json.loads(restart.stdout)
@@ -9175,7 +9185,7 @@ class AutopilotCliTests(unittest.TestCase):
                     text=True,
                 )
 
-            start = run_cli("start", "--repo", str(repo), "--interval", "30", "--json")
+            start = run_cli("start", "--repo", str(repo), "--interval", "60", "--json")
             self.assertEqual(start.returncode, 0, start.stderr)
             launch = json.loads(start.stdout)
             supervisor_pid = launch["pid"]

@@ -1305,7 +1305,7 @@ class AutopilotRunTests(unittest.TestCase):
                 return real_status(manager, process_exists=process_exists)
 
             with mock.patch.object(LockManager, "autopilot_status", flaky_status):
-                launch = start_detached_autopilot(config, interval=30)
+                launch = start_detached_autopilot(config, interval=60)
 
             self.assertFalse(launch.started)
             self.assertIn("verification_failed:LockBackendError", launch.blocker)
@@ -1333,7 +1333,7 @@ class AutopilotRunTests(unittest.TestCase):
                 "append_record",
                 side_effect=OSError("injected journal failure"),
             ):
-                launch = start_detached_autopilot(config, interval=30)
+                launch = start_detached_autopilot(config, interval=60)
 
             self.assertFalse(launch.started)
             self.assertIn("verification_failed:OSError", launch.blocker)
@@ -1540,7 +1540,7 @@ class AutopilotRunTests(unittest.TestCase):
                 repo,
                 runtime_context={"PROJECT_SELECTOR": selector},
             )
-            launch = start_detached_autopilot(config, interval=30)
+            launch = start_detached_autopilot(config, interval=60)
             stop_result = None
             try:
                 deadline = time.monotonic() + 10.0
@@ -1603,7 +1603,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
             config = load_config(repo, runtime_context=dict(runtime_context))
 
-            launch = start_detached_autopilot(config, interval=30)
+            launch = start_detached_autopilot(config, interval=60)
             try:
                 self.assertTrue(launch.started, launch.blocker)
                 status = collect_project_status(config)
@@ -1971,7 +1971,7 @@ class AutopilotRunTests(unittest.TestCase):
             summary = run_autopilot(
                 config,
                 max_cycles=3,
-                interval=5.0,
+                interval=60.0,
                 launcher=launcher,
                 sleep=sleeps.append,
             )
@@ -1979,7 +1979,40 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertTrue(summary.started)
         self.assertEqual(len(summary.cycles), 3)
         self.assertEqual(len(calls), 3)
-        self.assertEqual(sleeps, [5.0, 5.0])
+        self.assertEqual(sleeps, [60.0, 60.0])
+
+    def test_rejects_interval_below_one_minute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "autopilot interval must be zero for drain mode or at least 60 seconds",
+            ):
+                run_autopilot(
+                    config,
+                    max_cycles=2,
+                    interval=59.9,
+                    launcher=launcher,
+                    sleep=lambda _seconds: None,
+                )
+
+        self.assertEqual(calls, [])
+
+    def test_detached_start_rejects_interval_below_one_minute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "autopilot interval must be zero for drain mode or at least 60 seconds",
+            ):
+                start_detached_autopilot(config, interval=59.9)
 
     def test_child_command_includes_configured_flags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4253,7 +4286,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             summary = run_autopilot(
                 config,
                 max_cycles=2,
-                interval=0.02,
+                interval=60.0,
                 launcher=launcher,
                 sleep=sleeper,
             )
@@ -4261,7 +4294,7 @@ class AutopilotRecheckTests(unittest.TestCase):
         first = summary.cycles[0]
         self.assertEqual(active_statuses[0].supervisor.state, "active_cycle")
         self.assertEqual(active_statuses[0].next_wake, "")
-        self.assertEqual(sleeping_statuses[0][0], 0.02)
+        self.assertEqual(sleeping_statuses[0][0], 60.0)
         sleeping_status = sleeping_statuses[0][1]
         self.assertEqual(sleeping_status.supervisor.state, "sleeping")
         self.assertEqual(sleeping_status.next_wake, first.next_wake)

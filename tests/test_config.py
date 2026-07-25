@@ -574,7 +574,7 @@ class ConfigTests(unittest.TestCase):
             (repo / ".vibe-loop.toml").write_text(
                 "[autopilot]\n"
                 "jobs = 2\n"
-                "interval_seconds = 30.0\n"
+                "interval_seconds = 60.0\n"
                 "min_ready = 2\n"
                 "planning_recheck_seconds = 45.0\n"
                 "idle_poll_max_seconds = 300.0\n"
@@ -589,7 +589,7 @@ class ConfigTests(unittest.TestCase):
             config = load_config(repo)
 
         self.assertEqual(config.autopilot.jobs, 2)
-        self.assertEqual(config.autopilot.interval_seconds, 30.0)
+        self.assertEqual(config.autopilot.interval_seconds, 60.0)
         self.assertEqual(config.autopilot.min_ready, 2)
         self.assertEqual(config.autopilot.planning_recheck_seconds, 45.0)
         self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 45.0)
@@ -630,6 +630,7 @@ class ConfigTests(unittest.TestCase):
             ("jobs = 0\n", "autopilot.jobs"),
             ("min_ready = -1\n", "autopilot.min_ready"),
             ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
+            ("interval_seconds = 59.9\n", "at least 60.0 seconds"),
             ("planning_recheck_seconds = 0\n", "autopilot.planning_recheck_seconds"),
             ("planning_recheck_seconds = -5\n", "autopilot.planning_recheck_seconds"),
             ("idle_poll_max_seconds = 0\n", "autopilot.idle_poll_max_seconds"),
