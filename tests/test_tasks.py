@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,11 +12,15 @@ from unittest import mock
 
 from vibe_loop.config import TaskSourceConfig
 from vibe_loop.tasks import (
+    WITHHELD_ADAPTER_ENV,
     CommandTaskSource,
     MarkdownPlanSource,
     MarkdownProfileSource,
     Task,
+    build_adapter_environment,
     build_task_source,
+    run_json_command,
+    run_reset_command,
     runnable_tasks,
     task_from_mapping,
     task_sort_key,
@@ -1822,6 +1828,132 @@ def spec_driven_fixture_text(name: str) -> str:
     return (Path(__file__).parent / "fixtures" / "spec-driven" / name).read_text(
         encoding="utf-8"
     )
+
+
+class WithheldAdapterEnvironmentTests(unittest.TestCase):
+    """A name the runtime withholds must be absent in the adapter process.
+
+    The runtime asserts absence by leaving a name out of the runtime context,
+    but the child environment starts from `os.environ.copy()` and `dict.update`
+    cannot remove a key. Without an explicit removal an ambient value satisfies
+    a name the runtime deliberately withheld -- which, for the session pair,
+    converts "no attestation" into an attestation a consumer then acts on.
+    """
+
+    AMBIENT = {
+        "VIBE_LOOP_BRANCH": "ambient-branch",
+        "VIBE_LOOP_FENCING_TOKEN": "ambient-generation",
+        "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-implementer",
+        "VIBE_LOOP_REPO": "/ambient/repo",
+        "VIBE_LOOP_REVIEWER_SESSION": "ambient-reviewer",
+        "VIBE_LOOP_WORKTREE": "/ambient/worktree",
+    }
+
+    def test_withheld_names_are_removed_from_an_inherited_environment(self) -> None:
+        with mock.patch.dict(os.environ, self.AMBIENT):
+            environment = build_adapter_environment({"PROJECT_SELECTOR": "configured"})
+
+        for name in WITHHELD_ADAPTER_ENV:
+            self.assertNotIn(name, environment)
+        self.assertEqual(environment["PROJECT_SELECTOR"], "configured")
+        # Only the withheld set is affected; unrelated inheritance is intact.
+        self.assertEqual(environment["PATH"], os.environ["PATH"])
+
+    def test_supplied_names_override_the_ambient_value(self) -> None:
+        with mock.patch.dict(os.environ, self.AMBIENT):
+            environment = build_adapter_environment(
+                {"VIBE_LOOP_REVIEWER_SESSION": "derived-reviewer"}
+            )
+
+        self.assertEqual(environment["VIBE_LOOP_REVIEWER_SESSION"], "derived-reviewer")
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", environment)
+
+    def test_state_dir_and_run_identity_are_still_inherited(self) -> None:
+        # Deliberately not withheld: these locate shared control state for a
+        # nested `vibe-loop` call, and no contract rests on their absence.
+        ambient = {
+            "VIBE_LOOP_STATE_DIR": "/ambient/state",
+            "VIBE_LOOP_RUN_ID": "ambient-run",
+            "VIBE_LOOP_TASK_ID": "AMBIENT-01",
+            "VIBE_LOOP_PRIMARY_REPO": "/ambient/primary",
+            "VIBE_LOOP_LOG": "/ambient/run.log",
+        }
+        with mock.patch.dict(os.environ, ambient):
+            environment = build_adapter_environment(None)
+
+        for name, value in ambient.items():
+            self.assertEqual(environment[name], value)
+
+    def _report_command(self, directory: str) -> str:
+        script = Path(directory) / "report_env.py"
+        script.write_text(
+            "import json\n"
+            "import os\n"
+            "names = sorted(n for n in os.environ if n.startswith('VIBE_LOOP_'))\n"
+            "print(json.dumps({'names': names}))\n",
+            encoding="utf-8",
+        )
+        return f"{shlex.quote(sys.executable)} report_env.py"
+
+    def test_json_adapter_process_does_not_observe_withheld_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            command = self._report_command(directory)
+            with mock.patch.dict(os.environ, self.AMBIENT):
+                payload = run_json_command(
+                    Path(directory),
+                    command,
+                    runtime_context={"VIBE_LOOP_TASK_ID": "TASK-01"},
+                )
+
+        assert isinstance(payload, dict)
+        self.assertEqual(
+            [name for name in payload["names"] if name in WITHHELD_ADAPTER_ENV],
+            [],
+        )
+        self.assertIn("VIBE_LOOP_TASK_ID", payload["names"])
+
+    def test_reset_adapter_process_does_not_observe_withheld_names(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            observed = Path(directory) / "observed.json"
+            script = Path(directory) / "reset_env.py"
+            script.write_text(
+                "import json\n"
+                "import os\n"
+                "import pathlib\n"
+                "names = sorted(n for n in os.environ if n.startswith('VIBE_LOOP_'))\n"
+                f"pathlib.Path({str(observed)!r}).write_text(\n"
+                "    json.dumps({'names': names}), encoding='utf-8'\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            command = f"{shlex.quote(sys.executable)} reset_env.py"
+            with mock.patch.dict(os.environ, self.AMBIENT):
+                run_reset_command(Path(directory), command)
+
+            payload = json.loads(observed.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            [name for name in payload["names"] if name in WITHHELD_ADAPTER_ENV],
+            [],
+        )
+
+    def test_an_ambient_token_does_not_become_the_redaction_target(self) -> None:
+        # `run_json_command` reads its redaction token from the environment it
+        # built. An inherited token would both fake a fence for the adapter and
+        # redirect redaction at a generation the runtime never issued.
+        token = "ambient-generation"
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "leak.py"
+            script.write_text(
+                f"import json\nprint(json.dumps({{'echo': {token!r}}}))\n",
+                encoding="utf-8",
+            )
+            command = f"{shlex.quote(sys.executable)} leak.py"
+            with mock.patch.dict(os.environ, self.AMBIENT):
+                payload = run_json_command(Path(directory), command)
+
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["echo"], token)
 
 
 if __name__ == "__main__":
