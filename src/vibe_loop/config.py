@@ -212,6 +212,7 @@ PROJECT_BINDING_SOURCE_RUNTIME_CONTEXT = "runtime_context"
 PROJECT_BINDING_REASON_UNSET = "unset"
 PROJECT_BINDING_REASON_AMBIENT_ONLY = "ambient_only"
 PROJECT_BINDING_REASON_CONFLICT = "conflict"
+PROJECT_BINDING_REASON_AMBIENT_CONFLICT = "ambient_conflict"
 AUTOPILOT_COMMAND_KEYS = frozenset(
     {
         "health_command",
@@ -1098,10 +1099,22 @@ class ResolvedProjectBinding:
 
 class ProjectBindingError(ValueError):
     def __init__(self, binding: ResolvedProjectBinding) -> None:
-        super().__init__(
-            "command backend project binding is unresolved: "
-            + ", ".join(item.code for item in binding.diagnostics)
+        message = "command backend project binding is unresolved: " + ", ".join(
+            item.code for item in binding.diagnostics
         )
+        if any(
+            item.reason == PROJECT_BINDING_REASON_AMBIENT_CONFLICT
+            for item in binding.diagnostics
+        ):
+            # The remedy is not the same as for the other reasons: the binding
+            # itself is fine, the caller's environment names a different
+            # project than the repository this command was pointed at.
+            message += (
+                "; the ambient environment names a different project than this "
+                "repository is bound to -- unset it, or point --repo at the "
+                "repository that variable selects"
+            )
+        super().__init__(message)
         self.binding = binding
 
 
@@ -2679,7 +2692,11 @@ def resolve_project_binding(
     """Resolve declared namespace selectors from explicit sources only.
 
     A value inherited solely from the ambient process environment is refused:
-    that is the routing ambiguity this binding exists to close.
+    that is the routing ambiguity this binding exists to close. An ambient
+    value that *disagrees* with the resolved one is refused as well. Ignoring
+    it would answer a command aimed at one project with another project's
+    state, which reads as authoritative because nothing in the output
+    contradicts the selector the caller supplied.
     """
 
     binding = config.project_binding
@@ -2706,23 +2723,24 @@ def resolve_project_binding(
                 ProjectBindingDiagnostic(name, PROJECT_BINDING_REASON_CONFLICT)
             )
             continue
+        resolved_value: str | None = None
+        resolved_source = ""
         if supplied_value is not None:
-            entries.append(
-                ResolvedBindingEntry(
-                    name,
-                    supplied_value,
-                    PROJECT_BINDING_SOURCE_RUNTIME_CONTEXT,
+            resolved_value = supplied_value
+            resolved_source = PROJECT_BINDING_SOURCE_RUNTIME_CONTEXT
+        elif pinned_value is not None:
+            resolved_value = pinned_value
+            resolved_source = PROJECT_BINDING_SOURCE_CONFIG
+        if resolved_value is not None:
+            ambient_value = ambient.get(name)
+            if ambient_value is not None and ambient_value != resolved_value:
+                diagnostics.append(
+                    ProjectBindingDiagnostic(
+                        name, PROJECT_BINDING_REASON_AMBIENT_CONFLICT
+                    )
                 )
-            )
-            continue
-        if pinned_value is not None:
-            entries.append(
-                ResolvedBindingEntry(
-                    name,
-                    pinned_value,
-                    PROJECT_BINDING_SOURCE_CONFIG,
-                )
-            )
+                continue
+            entries.append(ResolvedBindingEntry(name, resolved_value, resolved_source))
             continue
         reason = (
             PROJECT_BINDING_REASON_AMBIENT_ONLY
