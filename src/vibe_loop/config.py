@@ -322,6 +322,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "max_closure_review_passes",
         "reviewer_concurrency_budget",
         "max_remediation_rounds",
+        "max_candidate_reanchors",
         "integration_enabled",
         "task_provenance_mode",
     }
@@ -340,6 +341,7 @@ ORCHESTRATION_CONFIG_KEYS = frozenset(
         "max_closure_review_passes",
         "reviewer_concurrency_budget",
         "max_remediation_rounds",
+        "max_candidate_reanchors",
         "integration_enabled",
         "task_provenance_mode",
     }
@@ -801,6 +803,7 @@ class OrchestrationConfig:
     max_closure_review_passes: int = 2
     reviewer_concurrency_budget: int = 1
     max_remediation_rounds: int = 2
+    max_candidate_reanchors: int = 2
     integration_enabled: bool = True
     task_provenance_mode: str = "external-confirmed"
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
@@ -818,6 +821,7 @@ class OrchestrationConfig:
             "max_closure_review_passes": self.max_closure_review_passes,
             "reviewer_concurrency_budget": self.reviewer_concurrency_budget,
             "max_remediation_rounds": self.max_remediation_rounds,
+            "max_candidate_reanchors": self.max_candidate_reanchors,
             "integration_enabled": self.integration_enabled,
             "task_provenance_mode": self.task_provenance_mode,
             "explicit_keys": sorted(self.explicit_keys),
@@ -2282,6 +2286,11 @@ def parse_orchestration(
             table.get("max_remediation_rounds"),
             2,
             "orchestration.max_remediation_rounds",
+        ),
+        max_candidate_reanchors=nonnegative_int(
+            table.get("max_candidate_reanchors"),
+            2,
+            "orchestration.max_candidate_reanchors",
         ),
         integration_enabled=optional_bool(
             table.get("integration_enabled"),

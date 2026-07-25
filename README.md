@@ -956,6 +956,7 @@ mode = "runtime-owned"
 # max_initial_review_passes = 1
 # max_closure_review_passes = 2
 # reviewer_concurrency_budget = 1
+# max_candidate_reanchors = 2
 
 [supervision]
 max_restarts = 3
@@ -1193,6 +1194,7 @@ task_provenance_mode = "external-confirmed"
 max_initial_review_passes = 1
 max_closure_review_passes = 2
 reviewer_concurrency_budget = 1
+max_candidate_reanchors = 2
 ```
 
 The reviewer command must accept `{prompt}` so the runtime can deliver the
@@ -1256,6 +1258,10 @@ in the runtime.
 Runtime-owned command task sources that configure activation must also
 configure reset, and adapter completion requires `task_source.complete`; the
 resolved contract fails closed before activation when these paths are absent.
+Before gates, a candidate based on an older `main` is rebased only when Git
+reports no conflict and the aggregate binary diff remains byte-identical. The
+runtime reruns gates for the rewritten candidate and stops blocked after
+`max_candidate_reanchors` consecutive base advances.
 
 Repositories that still require agent-owned verification, review, integration,
 and task-source mutation must opt into compatibility mode explicitly:

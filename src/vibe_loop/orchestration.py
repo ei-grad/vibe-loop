@@ -49,6 +49,12 @@ RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
 WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
 CANDIDATE_RECORD_SOURCE_KINDS = ("worker_command", "derived")
+CANDIDATE_BASE_ANCHOR_OUTCOMES = (
+    "base-unchanged",
+    "re-anchored-clean",
+    "refused-conflict",
+    "refused-retry-bound",
+)
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
@@ -208,6 +214,26 @@ class CandidateCollectionError(RuntimeError):
         self.code = code
         self.details = dict(details or {})
         super().__init__(message)
+
+
+class CandidateReanchorRetryExhausted(CandidateCollectionError):
+    def __init__(
+        self,
+        *,
+        attempts: int,
+        candidate_base: str,
+        observed_base: str,
+    ) -> None:
+        self.attempts = attempts
+        super().__init__(
+            "candidate_reanchor_retry_bound",
+            "candidate base kept advancing during bounded clean re-anchor",
+            details={
+                "attempts": attempts,
+                "candidate_base": candidate_base,
+                "observed_base": observed_base,
+            },
+        )
 
 
 class GateExecutionError(RuntimeError):
@@ -633,7 +659,12 @@ class CandidateCollector:
             )
         return resolved
 
-    def snapshot(self, *, source: str) -> CandidateRecord:
+    def snapshot(
+        self,
+        *,
+        source: str,
+        base_main: str | None = None,
+    ) -> CandidateRecord:
         observed_branch = self._git_text("branch", "--show-current")
         if observed_branch != self.branch:
             raise CandidateCollectionError(
@@ -642,7 +673,9 @@ class CandidateCollector:
                 details={"expected": self.branch, "observed": observed_branch},
             )
         head_commit = self._git_text("rev-parse", "--verify", "HEAD")
-        resolved_base = self._git_text("rev-parse", "--verify", self.base_main)
+        resolved_base = self._git_text(
+            "rev-parse", "--verify", base_main or self.base_main
+        )
         if (
             self._git_result(
                 "merge-base", "--is-ancestor", resolved_base, head_commit
@@ -689,7 +722,10 @@ class CandidateCollector:
     def matches(self, candidate: CandidateRecord) -> bool:
         try:
             return (
-                self.snapshot(source=candidate.source).fingerprint
+                self.snapshot(
+                    source=candidate.source,
+                    base_main=candidate.base_main,
+                ).fingerprint
                 == candidate.fingerprint
             )
         except CandidateCollectionError:
@@ -752,6 +788,14 @@ class CandidateCollector:
             )
         if not self.is_recorded(candidate):
             self._record(candidate)
+
+    def record(self, candidate: CandidateRecord) -> None:
+        if not self.matches(candidate):
+            raise CandidateCollectionError(
+                "candidate_changed",
+                "candidate no longer matches the claimed workspace",
+            )
+        self._record(candidate)
 
     def latest_recorded(self) -> CandidateRecord | None:
         for record in reversed(self.run_store.read_records()):
@@ -834,6 +878,200 @@ class CandidateCollector:
                 "candidate Git state could not be read",
                 details={"error": str(exc)},
             ) from exc
+
+
+class CandidateBaseReanchorer:
+    def __init__(
+        self,
+        *,
+        candidate_collector: CandidateCollector,
+        main_branch: str,
+        max_attempts: int,
+    ) -> None:
+        if max_attempts < 0:
+            raise ValueError("max_attempts must be non-negative")
+        self.candidate_collector = candidate_collector
+        self.main_branch = main_branch
+        self.max_attempts = max_attempts
+
+    def stabilize(self, candidate: CandidateRecord) -> CandidateRecord:
+        attempts = self._prior_attempts(candidate.head_commit)
+        attempted_in_call = False
+        while True:
+            observed_base = self._git_text("rev-parse", "--verify", self.main_branch)
+            if observed_base == candidate.base_main:
+                if not attempted_in_call:
+                    self._record(
+                        "base-unchanged",
+                        candidate_base=candidate.base_main,
+                        observed_base=observed_base,
+                        attempts=attempts,
+                    )
+                return candidate
+            if attempts >= self.max_attempts:
+                self._record(
+                    "refused-retry-bound",
+                    candidate_base=candidate.base_main,
+                    observed_base=observed_base,
+                    attempts=attempts,
+                )
+                raise CandidateReanchorRetryExhausted(
+                    attempts=attempts,
+                    candidate_base=candidate.base_main,
+                    observed_base=observed_base,
+                )
+
+            attempts += 1
+            attempted_in_call = True
+            previous = candidate
+            previous_diff = self._candidate_diff(
+                previous.base_main,
+                previous.head_commit,
+            )
+            result = self._git_result(
+                "rebase",
+                "--onto",
+                observed_base,
+                previous.base_main,
+                previous.branch,
+            )
+            if result.returncode != 0:
+                self._abort_rebase(previous.head_commit)
+                refusal_reason = (
+                    "merge_conflict"
+                    if "CONFLICT" in f"{result.stdout}\n{result.stderr}"
+                    else "rebase_failed"
+                )
+                self._record(
+                    "refused-conflict",
+                    candidate_base=previous.base_main,
+                    observed_base=observed_base,
+                    attempts=attempts,
+                    reason=refusal_reason,
+                )
+                raise CandidateCollectionError(
+                    "candidate_base_mismatch",
+                    "candidate could not be mechanically re-anchored onto "
+                    "the advanced integration base",
+                    details={
+                        "reason": refusal_reason,
+                        "candidate_base": previous.base_main,
+                        "observed_base": observed_base,
+                    },
+                )
+
+            rebased = self.candidate_collector.snapshot(
+                source=previous.source,
+                base_main=observed_base,
+            )
+            if (
+                rebased.changed_paths != previous.changed_paths
+                or self._candidate_diff(rebased.base_main, rebased.head_commit)
+                != previous_diff
+            ):
+                self._restore_candidate(previous.head_commit)
+                self._record(
+                    "refused-conflict",
+                    candidate_base=previous.base_main,
+                    observed_base=observed_base,
+                    attempts=attempts,
+                    reason="content_divergence",
+                )
+                raise CandidateCollectionError(
+                    "candidate_base_mismatch",
+                    "candidate re-anchor changed the candidate diff",
+                    details={
+                        "reason": "content_divergence",
+                        "candidate_base": previous.base_main,
+                        "observed_base": observed_base,
+                    },
+                )
+
+            candidate = rebased
+            self.candidate_collector.record(candidate)
+            self._record(
+                "re-anchored-clean",
+                candidate_base=previous.base_main,
+                candidate_head=previous.head_commit,
+                observed_base=observed_base,
+                reanchored_head=candidate.head_commit,
+                attempts=attempts,
+            )
+
+    def _prior_attempts(self, candidate_head: str) -> int:
+        attempts = 0
+        expected_head = candidate_head
+        records = self.candidate_collector.run_store.read_records()
+        for record in reversed(records):
+            if (
+                record.get("run_id") != self.candidate_collector.run_id
+                or record.get("task_id") != self.candidate_collector.task_id
+                or record.get("record_type") != "candidate_base_anchor"
+                or record.get("outcome") != "re-anchored-clean"
+                or record.get("reanchored_head") != expected_head
+            ):
+                continue
+            previous_head = record.get("candidate_head")
+            if not isinstance(previous_head, str) or not previous_head:
+                break
+            attempts += 1
+            expected_head = previous_head
+        return attempts
+
+    def _candidate_diff(self, base: str, head: str) -> bytes:
+        return self.candidate_collector._git_bytes(
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            f"{base}...{head}",
+        )
+
+    def _abort_rebase(self, expected_head: str) -> None:
+        self._git_result("rebase", "--abort")
+        if self._git_text("rev-parse", "--verify", "HEAD") != expected_head:
+            raise CandidateCollectionError(
+                "candidate_reanchor_restore_failed",
+                "candidate re-anchor conflict could not restore the original head",
+            )
+
+    def _restore_candidate(self, expected_head: str) -> None:
+        result = self._git_result("reset", "--hard", expected_head)
+        if (
+            result.returncode != 0
+            or self._git_text("rev-parse", "--verify", "HEAD") != expected_head
+        ):
+            raise CandidateCollectionError(
+                "candidate_reanchor_restore_failed",
+                "candidate diff divergence could not restore the original head",
+            )
+
+    def _record(self, outcome: str, **payload: object) -> None:
+        if outcome not in CANDIDATE_BASE_ANCHOR_OUTCOMES:
+            raise ValueError(f"unsupported candidate base-anchor outcome: {outcome}")
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.candidate_collector.run_store.append_lifecycle_event(
+            RunLifecycleEvent.candidate_base_anchor(
+                run_id=self.candidate_collector.run_id,
+                task_id=self.candidate_collector.task_id,
+                payload={"outcome": outcome, **payload},
+            )
+        )
+
+    def _git_text(self, *args: str) -> str:
+        result = self._git_result(*args)
+        if result.returncode != 0:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate Git state could not be read",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+        return result.stdout.strip()
+
+    def _git_result(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.candidate_collector._git_result(*args)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4416,6 +4654,9 @@ class RunContractResolver:
                         else None
                     ),
                 },
+            },
+            "candidate_stabilization": {
+                "max_reanchors": effective.max_candidate_reanchors,
             },
             "remediation": {"max_rounds": effective.max_remediation_rounds},
         }

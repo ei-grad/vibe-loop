@@ -63,9 +63,11 @@ from vibe_loop.locks import (
     redact_fencing_token_text,
 )
 from vibe_loop.orchestration import (
+    CandidateBaseReanchorer,
     CandidateCollectionError,
     CandidateCollector,
     CandidateRecord,
+    CandidateReanchorRetryExhausted,
     GateExecutionError,
     GateRunner,
     GateRunSummary,
@@ -2738,6 +2740,13 @@ class VibeRunner:
                         detail=str(exc),
                     )
                     message = str(exc)
+                except CandidateReanchorRetryExhausted as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        exc.code,
+                        detail=str(exc),
+                    )
+                    message = str(exc)
                 except (
                     CandidateCollectionError,
                     GateExecutionError,
@@ -3206,6 +3215,17 @@ class VibeRunner:
         # accepted terminal report. Re-snapshot after the process has exited,
         # including after an enforced teardown, before any gate can execute.
         candidate_collector.ensure_recorded(candidate)
+        candidate_stabilization = contract.get("candidate_stabilization")
+        max_candidate_reanchors = (
+            int(candidate_stabilization.get("max_reanchors", 0))
+            if isinstance(candidate_stabilization, Mapping)
+            else 0
+        )
+        candidate = CandidateBaseReanchorer(
+            candidate_collector=candidate_collector,
+            main_branch=self.config.main_branch,
+            max_attempts=max_candidate_reanchors,
+        ).stabilize(candidate)
         self._require_runtime_task_source_unchanged(
             run_id=run_id,
             expected_task=task,

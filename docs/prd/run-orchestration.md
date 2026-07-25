@@ -97,6 +97,13 @@ recorded as typed evidence referencing the gate's configuration key, exit
 class, duration, and log. Gate failure routes to bounded remediation, not to
 silent completion; gate evidence is part of the review request.
 
+When the integration base advances before gates, the runtime may re-anchor the
+candidate only through a conflict-free rebase whose aggregate binary diff and
+changed paths are unchanged. Every attempt records a typed base-anchor outcome,
+the rewritten candidate receives fresh gate evidence, and repeated base drift
+is bounded by the resolved run contract. Conflicts, content divergence, and
+retry exhaustion fail closed.
+
 Acceptance must cover gate execution and evidence records, candidate
 declaration and derivation, remediation budget enforcement on gate failure,
 and refusal to enter review without a recorded candidate and passing gates.

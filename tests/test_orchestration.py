@@ -29,9 +29,11 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
 )
 from vibe_loop.orchestration import (
+    CandidateBaseReanchorer,
     CandidateRecord,
     CandidateCollectionError,
     CandidateCollector,
+    CandidateReanchorRetryExhausted,
     GateExecutionError,
     GateRemediationExhausted,
     GateResult,
@@ -90,6 +92,7 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.mode, "runtime-owned")
         self.assertEqual(config.orchestration.gates, ())
         self.assertEqual(config.orchestration.verify_on_main, ())
+        self.assertEqual(config.orchestration.max_candidate_reanchors, 2)
         self.assertTrue(config.orchestration.integration_enabled)
         self.assertEqual(
             config.orchestration.task_provenance_mode,
@@ -114,6 +117,7 @@ class OrchestrationConfigTests(unittest.TestCase):
                 "max_closure_review_passes = 3\n"
                 "reviewer_concurrency_budget = 2\n"
                 "max_remediation_rounds = 4\n"
+                "max_candidate_reanchors = 3\n"
                 "integration_enabled = false\n"
                 'task_provenance_mode = "external-confirmed"\n',
                 encoding="utf-8",
@@ -131,6 +135,7 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_closure_review_passes, 3)
         self.assertEqual(config.orchestration.reviewer_concurrency_budget, 2)
         self.assertEqual(config.orchestration.max_remediation_rounds, 4)
+        self.assertEqual(config.orchestration.max_candidate_reanchors, 3)
         self.assertFalse(config.orchestration.integration_enabled)
 
     def test_accepts_runtime_owned_mode(self) -> None:
@@ -315,6 +320,10 @@ class RunContractResolverTests(unittest.TestCase):
         )
 
         self.assertEqual(contract.payload["remediation"], {"max_rounds": 7})
+        self.assertEqual(
+            contract.payload["candidate_stabilization"],
+            {"max_reanchors": 2},
+        )
         reviewer_payload = contract.payload["reviewer"]
         assert isinstance(reviewer_payload, dict)
         self.assertEqual(reviewer_payload["max_closure_passes"], 3)
@@ -1298,6 +1307,213 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertEqual(executor_calls, [])
         self.assertEqual(len(remediation_summaries), 1)
         self.assertTrue(remediation_summaries[0].results[0].resumed)
+
+
+class CandidateBaseReanchorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        init_git_repo(self.repo)
+        self.base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.worktree = Path(self.directory.name) / "task-worktree"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/TASK-01",
+            str(self.worktree),
+        )
+        self.store = RunStore(self.repo / ".vibe-loop" / "runs.jsonl")
+        self.collector = CandidateCollector(
+            worktree=self.worktree,
+            branch="worker/TASK-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+
+    def commit_candidate(self) -> CandidateRecord:
+        (self.worktree / "candidate.txt").write_text(
+            "candidate\n",
+            encoding="utf-8",
+        )
+        git(self.worktree, "add", "candidate.txt")
+        git(self.worktree, "commit", "-m", "candidate")
+        return self.collector.collect_derived()
+
+    def advance_main(self, content: str) -> str:
+        (self.repo / "main.txt").write_text(content, encoding="utf-8")
+        git(self.repo, "add", "main.txt")
+        git(self.repo, "commit", "-m", "advance main")
+        return git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_clean_advance_reanchors_and_reruns_candidate_gates(self) -> None:
+        candidate = self.commit_candidate()
+        gate_calls: list[str] = []
+
+        def pass_gate(command, **kwargs):
+            gate_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        old_summary = GateRunner(
+            completion_commands=("verify",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(candidate)
+        advanced_base = self.advance_main("advanced\n")
+
+        reanchored = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+        fresh_summary = GateRunner(
+            completion_commands=("verify",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(reanchored)
+
+        self.assertTrue(old_summary.passed)
+        self.assertTrue(fresh_summary.passed)
+        self.assertEqual(gate_calls, ["verify", "verify"])
+        self.assertEqual(reanchored.base_main, advanced_base)
+        self.assertNotEqual(reanchored.fingerprint, candidate.fingerprint)
+        self.assertEqual(reanchored.changed_paths, candidate.changed_paths)
+        self.assertEqual(
+            git(
+                self.worktree,
+                "merge-base",
+                "--is-ancestor",
+                advanced_base,
+                reanchored.head_commit,
+            ).returncode,
+            0,
+        )
+        anchor_records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "candidate_base_anchor"
+        ]
+        self.assertEqual(
+            [record["outcome"] for record in anchor_records],
+            ["re-anchored-clean"],
+        )
+
+    def test_unchanged_base_records_typed_noop(self) -> None:
+        candidate = self.commit_candidate()
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "candidate_base_anchor")
+        self.assertEqual(record["outcome"], "base-unchanged")
+        self.assertEqual(record["candidate_base"], self.base)
+        self.assertEqual(record["observed_base"], self.base)
+
+    def test_conflicting_advance_fails_closed_and_restores_candidate(self) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate version\n",
+            encoding="utf-8",
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate")
+        candidate = self.collector.collect_derived()
+        (self.repo / "README.md").write_text("main version\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "advance main")
+
+        with self.assertRaises(CandidateCollectionError) as raised:
+            CandidateBaseReanchorer(
+                candidate_collector=self.collector,
+                main_branch="main",
+                max_attempts=2,
+            ).stabilize(candidate)
+
+        self.assertEqual(raised.exception.code, "candidate_base_mismatch")
+        self.assertEqual(raised.exception.details["reason"], "merge_conflict")
+        self.assertEqual(
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            candidate.head_commit,
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "candidate_base_anchor")
+        self.assertEqual(record["outcome"], "refused-conflict")
+        self.assertEqual(record["reason"], "merge_conflict")
+
+    def test_content_divergence_fails_closed_and_restores_candidate(self) -> None:
+        candidate = self.commit_candidate()
+        self.advance_main("advanced\n")
+        reanchorer = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        )
+
+        with patch.object(
+            reanchorer,
+            "_candidate_diff",
+            side_effect=(b"original diff", b"diverged diff"),
+        ):
+            with self.assertRaises(CandidateCollectionError) as raised:
+                reanchorer.stabilize(candidate)
+
+        self.assertEqual(raised.exception.details["reason"], "content_divergence")
+        self.assertEqual(
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            candidate.head_commit,
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["outcome"], "refused-conflict")
+        self.assertEqual(record["reason"], "content_divergence")
+
+    def test_retry_bound_reports_concrete_base_drift(self) -> None:
+        candidate = self.commit_candidate()
+        first_advance = self.advance_main("first\n")
+        reanchored = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=1,
+        ).stabilize(candidate)
+        self.advance_main("second\n")
+        second_advance = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        with self.assertRaises(CandidateReanchorRetryExhausted) as raised:
+            CandidateBaseReanchorer(
+                candidate_collector=self.collector,
+                main_branch="main",
+                max_attempts=1,
+            ).stabilize(reanchored)
+
+        self.assertEqual(raised.exception.attempts, 1)
+        self.assertEqual(raised.exception.details["candidate_base"], first_advance)
+        self.assertEqual(raised.exception.details["observed_base"], second_advance)
+        anchor_records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "candidate_base_anchor"
+        ]
+        self.assertEqual(
+            [record["outcome"] for record in anchor_records],
+            ["re-anchored-clean", "refused-retry-bound"],
+        )
 
 
 class RuntimeIntegrationTests(unittest.TestCase):

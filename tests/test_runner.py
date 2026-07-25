@@ -43,6 +43,7 @@ from vibe_loop.locks import (
 from vibe_loop.processes import read_process_node
 from vibe_loop.orchestration import (
     CandidateRecord,
+    CandidateReanchorRetryExhausted,
     IntegrationResult,
     ProvisionedWorkspace,
     ReviewOutputMalformed,
@@ -7288,6 +7289,34 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 record_types.index("run_result"),
             )
             self.assertEqual(source.status, "on-hold")
+
+    def test_candidate_reanchor_retry_bound_parks_as_blocked(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=CandidateReanchorRetryExhausted(
+                    attempts=2,
+                    candidate_base="a" * 40,
+                    observed_base="b" * 40,
+                ),
+            ):
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(
+            result.classification_source,
+            "candidate_reanchor_retry_bound",
+        )
+        self.assertEqual(source.status, "on-hold")
 
     def test_runtime_owned_worker_output_cannot_inject_lifecycle_records(
         self,
