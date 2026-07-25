@@ -316,18 +316,44 @@ class TaskSource(Protocol):
         ...
 
 
+def task_source_uses_command_backend(config: TaskSourceConfig) -> bool:
+    return bool(
+        config.type == "command"
+        or config.list_command
+        or config.next_command
+        or config.probe_command
+    )
+
+
+def task_source_probe_capability(config: TaskSourceConfig) -> str | None:
+    if task_source_uses_command_backend(config):
+        return "task_source.probe" if config.list_command else None
+    if (
+        config.type in {"markdown-plan", "markdown-profile"}
+        or config.type in {"ralphex-markdown", "ralphex-plan"}
+        or config.type in SPEC_TOOL_TASK_SOURCE_TYPES
+    ):
+        return "task_source.probe"
+    return None
+
+
+def task_source_completion_capability(config: TaskSourceConfig) -> str | None:
+    if (
+        task_source_uses_command_backend(config)
+        and config.list_command
+        and config.complete_command
+    ):
+        return "task_source.complete"
+    return None
+
+
 def build_task_source(
     repo: Path,
     config: TaskSourceConfig,
     *,
     runtime_context: Mapping[str, str] | None = None,
 ) -> TaskSource:
-    if (
-        config.type == "command"
-        or config.list_command
-        or config.next_command
-        or config.probe_command
-    ):
+    if task_source_uses_command_backend(config):
         return CommandTaskSource(repo, config, runtime_context=runtime_context)
     if config.type in {"markdown-plan", "markdown-profile"}:
         if config.profile is not None:

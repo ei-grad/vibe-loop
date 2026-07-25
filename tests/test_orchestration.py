@@ -83,7 +83,7 @@ from vibe_loop.locks import (
 )
 from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore, WorkerReport
 from vibe_loop import tasks as tasks_module
-from vibe_loop.tasks import CommandTaskSource, Task
+from vibe_loop.tasks import CommandTaskSource, Task, build_task_source
 from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
@@ -240,7 +240,7 @@ class RunContractResolverTests(unittest.TestCase):
                     }
                 ),
             ),
-            task_source=TaskSourceConfig(probe_command="probe {task_id}"),
+            task_source=TaskSourceConfig(type="markdown-plan"),
         )
 
         with self.assertRaisesRegex(
@@ -468,6 +468,21 @@ class RunContractResolverTests(unittest.TestCase):
                     mode="runtime-owned",
                     reviewer_profile="review",
                     task_provenance_mode="adapter",
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
+                ),
+                TaskSourceConfig(
+                    type="markdown-plan",
+                    complete_command="complete {task_id}",
+                ),
+                "task_source.complete on a command task source",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="adapter",
                     external_completion_actor="operator",
                     explicit_keys=frozenset(
                         {
@@ -513,7 +528,7 @@ class RunContractResolverTests(unittest.TestCase):
                         {"mode", "reviewer_profile", "task_provenance_mode"}
                     ),
                 ),
-                TaskSourceConfig(probe_command="probe {task_id}"),
+                TaskSourceConfig(type="markdown-plan"),
                 "requires an explicit.*external_completion_actor",
             ),
             (
@@ -531,8 +546,8 @@ class RunContractResolverTests(unittest.TestCase):
                         }
                     ),
                 ),
-                TaskSourceConfig(),
-                "requires task_source.probe",
+                TaskSourceConfig(type="command"),
+                "requires a task source with probe capability",
             ),
             (
                 OrchestrationConfig(
@@ -549,7 +564,7 @@ class RunContractResolverTests(unittest.TestCase):
                         }
                     ),
                 ),
-                TaskSourceConfig(probe_command="probe {task_id}"),
+                TaskSourceConfig(type="markdown-plan"),
                 "workers are forbidden from transitioning",
             ),
         )
@@ -649,6 +664,141 @@ class RunContractResolverTests(unittest.TestCase):
             },
         )
 
+    def test_external_confirmation_accepts_native_markdown_probe(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "PLAN.md").write_text(
+                "# Plan\n\n"
+                "| ID | Priority | Status | Dependencies | Scope | Acceptance | "
+                "Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | P1 | Done | none | Native source. | Works. | Test. |\n",
+                encoding="utf-8",
+            )
+            task_source = TaskSourceConfig(type="markdown-plan")
+            config = VibeConfig(
+                repo=repo,
+                agent=agent,
+                agent_profiles={"review": reviewer},
+                orchestration=OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                task_source=task_source,
+            )
+
+            contract = RunContractResolver(config).resolve(
+                AgentSelection(agent, "", "default")
+            )
+            confirmed = build_task_source(repo, task_source).probe("TASK-01")
+
+        self.assertEqual(
+            contract.payload["task_provenance"]["confirmation_adapter"],
+            "task_source.probe",
+        )
+        self.assertIsNotNone(confirmed)
+        assert confirmed is not None
+        self.assertTrue(confirmed.done)
+
+    def test_worker_owned_contract_omits_runtime_confirmation_evidence(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="worker-owned",
+                explicit_keys=frozenset({"mode"}),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                complete_command="complete {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"],
+            {
+                "mode": "external-confirmed",
+                "complete_adapter": "task_source.complete",
+                "settlement": {
+                    "requeue_adapter": None,
+                    "park_adapter": None,
+                },
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "external_completion_actor is only valid.*runtime-owned",
+        ):
+            RunContractResolver(
+                dataclasses.replace(
+                    config,
+                    orchestration=OrchestrationConfig(
+                        mode="worker-owned",
+                        external_completion_actor="worker",
+                        explicit_keys=frozenset({"mode", "external_completion_actor"}),
+                    ),
+                )
+            ).resolve(AgentSelection(agent, "", "default"))
+
+    def test_external_confirmation_preserves_available_complete_adapter(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            agent_profiles={"review": reviewer},
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="review",
+                task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
+                explicit_keys=frozenset(
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
+                ),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                complete_command="complete {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"]["complete_adapter"],
+            "task_source.complete",
+        )
+        self.assertEqual(
+            contract.payload["task_provenance"]["confirmation_adapter"],
+            "task_source.probe",
+        )
+
     def test_default_runtime_owned_contract_records_provider_role_matrix(self) -> None:
         providers = {
             "codex": AgentConfig(
@@ -688,9 +838,7 @@ class RunContractResolverTests(unittest.TestCase):
                             }
                         ),
                     ),
-                    task_source=TaskSourceConfig(
-                        probe_command="probe {task_id}",
-                    ),
+                    task_source=TaskSourceConfig(type="markdown-plan"),
                 )
 
                 contract = RunContractResolver(config).resolve(

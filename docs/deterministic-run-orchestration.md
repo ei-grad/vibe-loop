@@ -353,11 +353,19 @@ recorded as `run_contract_resolved` before any mutation:
                "max_initial_passes": 1, "max_closure_passes": 2, "concurrency_budget": 1},
   "gates": [{"id": "tests", "command_key": "completion.commands[1]"}],
   "integration": {"enabled": true, "verify_on_main": ["..."]},
-  "task_provenance": {"mode": "adapter | external-confirmed", "complete_adapter": "task_source.complete",
-                      "settlement": {"requeue_adapter": "task_source.reset", "park_adapter": "task_source.park | null"}},
+  "task_provenance": {"mode": "adapter | external-confirmed", "complete_adapter": "task_source.complete | null",
+                      "confirmation_adapter": "task_source.complete | task_source.probe",
+                      "transition_actor": "runtime | operator | external-system",
+                      "settlement": {"requeue_adapter": "task_source.reset | null", "park_adapter": "task_source.park | null"}},
   "remediation": {"max_rounds": 2}
 }
 ```
+
+`confirmation_adapter` and `transition_actor` are runtime-owned contract fields
+and are omitted from worker-owned compatibility contracts. `complete_adapter`
+records whether `task_source.complete` is configured independently of the
+selected provenance mode; `confirmation_adapter` records the capability the
+selected runtime-owned mode will actually use.
 
 Repository policy becomes validated runtime input: gate commands, reviewer
 routes, and budgets are allowlisted/typed configuration keys, never arbitrary
@@ -608,11 +616,14 @@ Compatibility specifics:
   when neither is available: `adapter` (the runtime invokes
   `task_source.complete` under the held lock) or `external-confirmed` (an
   explicitly named operator or external system performs the transition, and
-  the runtime confirms the authoritative done state through a configured
-  `task_source.probe` before recording
+  the runtime confirms the authoritative done state through the selected task
+  source's probe capability before recording
   `task_provenance_committed` and reporting completed; a probe that still
   shows the task in progress parks the run `blocked` with the integrated
-  candidate preserved and a precise diagnostic). The external path requires
+  candidate preserved and a precise diagnostic). File-backed Markdown,
+  Ralphex, and spec-tool sources provide native probes; command sources probe
+  through their required `task_source.list` command or an optional dedicated
+  `task_source.probe`. The external path requires
   `orchestration.external_completion_actor = "operator" | "external-system"`;
   `worker` is rejected because the runtime-owned implementation prompt forbids
   the worker from transitioning the task. Completion is never silently

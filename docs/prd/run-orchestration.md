@@ -217,9 +217,10 @@ before any mutation when none is available: either the runtime performs the
 transition through an explicit `task_source.complete` adapter under the held
 lock, or the contract declares external-confirmed completion with an explicit
 operator or external-system transition actor and the runtime confirms the
-authoritative done state through a configured `task_source.probe` before
-recording provenance and reporting completed — a probe still showing the task in
-progress parks the run blocked with the integrated candidate preserved. A
+authoritative done state through the selected task source's native or
+command-backed probe capability before recording provenance and reporting
+completed — a probe still showing the task in progress parks the run blocked
+with the integrated candidate preserved. A
 runtime-owned contract that names the implementation worker as the transition
 actor is rejected because that worker is forbidden from changing the
 authoritative task source.

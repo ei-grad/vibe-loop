@@ -980,7 +980,7 @@ commands = [
 mode = "runtime-owned"
 # reviewer_profile = "review"
 # task_provenance_mode = "external-confirmed"
-# external_completion_actor = "external-system"  # also requires task_source.probe
+# external_completion_actor = "external-system"  # source must support probe()
 # max_initial_review_passes = 1
 # max_closure_review_passes = 2
 # reviewer_concurrency_budget = 1
@@ -1538,13 +1538,15 @@ shell-quoted `{task_id}` and `{run_id}` values and return one normalized task
 JSON object. `complete` must confirm a terminal done status after integration;
 `park` must confirm the source's non-runnable held status for terminal failure
 settlement. Runtime-owned adapter completion fails contract validation without
-`complete`. Runtime-owned external-confirmed completion requires both a
-configured `probe` and an explicit `orchestration.external_completion_actor`
-of `operator` or `external-system`. `worker` is rejected in runtime-owned mode
-because the supervised implementation contract forbids workers from changing
-the authoritative task source. Any runtime-owned activation-capable source
-fails validation without `reset`. A missing `park` uses a recorded
-reset/requeue fallback.
+`complete` on a command source with `list`. Runtime-owned external-confirmed
+completion requires a task source with probe capability and an explicit
+`orchestration.external_completion_actor` of `operator` or `external-system`.
+Markdown, Ralphex, and spec-tool sources provide native probes; command sources
+probe through their required `list` command or an optional dedicated `probe`
+command. `worker` is rejected in runtime-owned mode because the supervised
+implementation contract forbids workers from changing the authoritative task
+source. Any runtime-owned activation-capable source fails validation without
+`reset`. A missing `park` uses a recorded reset/requeue fallback.
 Completion and failure settlement run while the exact task lock remains held;
 an unconfirmed settlement retains that lock for stage-aware fenced recovery.
 

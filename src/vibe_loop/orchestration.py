@@ -35,7 +35,9 @@ from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
     TaskSource,
+    task_source_completion_capability,
     task_source_error_diagnostics,
+    task_source_probe_capability,
 )
 from vibe_loop.telemetry import (
     ProviderUsage,
@@ -4728,6 +4730,18 @@ class RunContractResolver:
                 f"{command_key} must include {{prompt}} for reviewer request delivery"
             )
 
+        probe_capability = task_source_probe_capability(self.config.task_source)
+        completion_capability = task_source_completion_capability(
+            self.config.task_source
+        )
+        if (
+            effective.mode != "runtime-owned"
+            and "external_completion_actor" in effective.explicit_keys
+        ):
+            raise ValueError(
+                "orchestration.external_completion_actor is only valid with "
+                'mode = "runtime-owned"'
+            )
         if effective.mode == "runtime-owned":
             if configured_reviewer_profile is None:
                 raise ValueError(
@@ -4745,14 +4759,16 @@ class RunContractResolver:
                     "orchestration.task_provenance_mode completion path"
                 )
             if effective.task_provenance_mode == "adapter":
-                if self.config.task_source.complete_command is None:
-                    raise ValueError(
-                        "runtime-owned adapter completion requires task_source.complete"
-                    )
                 if "external_completion_actor" in effective.explicit_keys:
                     raise ValueError(
                         "orchestration.external_completion_actor is only valid "
                         'with task_provenance_mode = "external-confirmed"'
+                    )
+                if completion_capability is None:
+                    raise ValueError(
+                        "runtime-owned adapter completion requires "
+                        "task_source.complete on a command task source with "
+                        "task_source.list"
                     )
             else:
                 if "external_completion_actor" not in effective.explicit_keys:
@@ -4767,10 +4783,11 @@ class RunContractResolver:
                         'with task_provenance_mode = "adapter", or name an operator '
                         "or external-system completion actor"
                     )
-                if self.config.task_source.probe_command is None:
+                if probe_capability is None:
                     raise ValueError(
                         "runtime-owned external-confirmed completion requires "
-                        "task_source.probe to observe the authoritative done state"
+                        "a task source with probe capability; command sources "
+                        "require task_source.list"
                     )
             if (
                 self.config.task_source.activate_command is not None
@@ -4780,6 +4797,42 @@ class RunContractResolver:
                     "runtime-owned activation-capable task source requires "
                     "task_source.reset"
                 )
+
+        task_provenance_payload: dict[str, object] = {
+            "mode": effective.task_provenance_mode,
+            "complete_adapter": (
+                "task_source.complete"
+                if self.config.task_source.complete_command is not None
+                else None
+            ),
+            "settlement": {
+                "requeue_adapter": (
+                    "task_source.reset"
+                    if self.config.task_source.reset_command is not None
+                    else None
+                ),
+                "park_adapter": (
+                    "task_source.park"
+                    if self.config.task_source.park_command is not None
+                    else None
+                ),
+            },
+        }
+        if effective.mode == "runtime-owned":
+            task_provenance_payload.update(
+                {
+                    "confirmation_adapter": (
+                        completion_capability
+                        if effective.task_provenance_mode == "adapter"
+                        else probe_capability
+                    ),
+                    "transition_actor": (
+                        "runtime"
+                        if effective.task_provenance_mode == "adapter"
+                        else effective.external_completion_actor
+                    ),
+                }
+            )
 
         payload: dict[str, object] = {
             "contract_version": RUN_CONTRACT_VERSION,
@@ -4807,41 +4860,12 @@ class RunContractResolver:
                 "enabled": effective.integration_enabled,
                 "verify_on_main": list(effective.verify_on_main),
             },
-            "task_provenance": {
-                "mode": effective.task_provenance_mode,
-                "complete_adapter": None,
-                "confirmation_adapter": (
-                    "task_source.complete"
-                    if effective.task_provenance_mode == "adapter"
-                    else "task_source.probe"
-                ),
-                "transition_actor": (
-                    "runtime"
-                    if effective.task_provenance_mode == "adapter"
-                    else effective.external_completion_actor
-                ),
-                "settlement": {
-                    "requeue_adapter": (
-                        "task_source.reset"
-                        if self.config.task_source.reset_command is not None
-                        else None
-                    ),
-                    "park_adapter": (
-                        "task_source.park"
-                        if self.config.task_source.park_command is not None
-                        else None
-                    ),
-                },
-            },
+            "task_provenance": task_provenance_payload,
             "candidate_stabilization": {
                 "max_reanchors": effective.max_candidate_reanchors,
             },
             "remediation": {"max_rounds": effective.max_remediation_rounds},
         }
-        task_provenance = payload["task_provenance"]
-        assert isinstance(task_provenance, dict)
-        if effective.task_provenance_mode == "adapter":
-            task_provenance["complete_adapter"] = "task_source.complete"
         return ResolvedRunContract(payload=payload, digest=sha256_digest(payload))
 
 
