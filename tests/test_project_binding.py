@@ -19,6 +19,7 @@ from vibe_loop.autopilot import (
     ProjectRegistry,
     collect_project_status,
     collect_registry_status,
+    load_registry_entry_config,
     run_autopilot,
     runtime_context_subprocess_transport,
     start_detached_autopilot,
@@ -28,6 +29,7 @@ from vibe_loop.config import (
     RUNTIME_CONTEXT_REDACTION,
     load_config,
     parse_project_binding,
+    project_binding_guidance,
     resolve_project_binding,
 )
 from vibe_loop import cli
@@ -302,6 +304,70 @@ class ProjectBindingResolutionTests(unittest.TestCase):
         self.assertEqual(
             binding.blocker, f"project_binding_ambient_conflict:{SELECTOR}"
         )
+
+    def test_ambient_value_naming_no_project_is_not_a_conflict(self) -> None:
+        # `NAME=` is how much shell and unit-file code unsets a variable, which
+        # is the remedy this diagnostic recommends; refusing it would make the
+        # remedy fail when followed. Padding is a capture artifact.
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+
+        for ambient in ("", "   ", "\n", "alpha", " alpha ", "\talpha\n"):
+            with self.subTest(ambient=ambient):
+                binding = resolve_project_binding(config, environ={SELECTOR: ambient})
+
+                self.assertIsNone(binding.blocker)
+                self.assertEqual(binding.entries[0].value, "alpha")
+
+    def test_ambient_value_naming_no_project_is_not_ambient_only(self) -> None:
+        config = self.build_config(f'[project_binding]\nrequire = ["{SELECTOR}"]\n')
+
+        binding = resolve_project_binding(config, environ={SELECTOR: "  "})
+
+        self.assertEqual(binding.blocker, f"project_binding_unset:{SELECTOR}")
+
+    def test_an_enumerated_target_does_not_compare_the_ambient_value(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+
+        binding = resolve_project_binding(
+            dataclasses.replace(config, ambient_selects_target=False),
+            environ={SELECTOR: "intruder"},
+        )
+
+        self.assertIsNone(binding.blocker)
+        self.assertEqual(binding.entries[0].value, "alpha")
+
+    def test_guidance_is_emitted_only_for_an_ambient_conflict(self) -> None:
+        config = self.build_config(
+            "[project_binding]\n"
+            f'require = ["{SELECTOR}"]\n'
+            "[project_binding.context]\n"
+            f'{SELECTOR} = "alpha"\n'
+        )
+        conflicting = resolve_project_binding(config, environ={SELECTOR: "intruder"})
+        unset = resolve_project_binding(
+            self.build_config(f'[project_binding]\nrequire = ["{SELECTOR}"]\n'),
+            environ={},
+        )
+
+        guidance = project_binding_guidance(conflicting)
+
+        self.assertIn(SELECTOR, guidance)
+        self.assertIn("unset it", guidance)
+        self.assertIn("--repo", guidance)
+        self.assertNotIn("intruder", guidance)
+        self.assertNotIn("alpha", guidance)
+        self.assertEqual(project_binding_guidance(unset), "")
+        self.assertIn(guidance, str(ProjectBindingError(conflicting)))
 
     def test_ambient_conflict_diagnostics_do_not_leak_values(self) -> None:
         config = self.build_config(
@@ -973,6 +1039,26 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
         self.assertEqual(status["supervisor"]["state"], "unknown")
 
+    def test_status_renders_the_remedy_on_the_command_that_reports_it(self) -> None:
+        # `status` reports the blocker instead of raising, so it is the one path
+        # where the operator would otherwise be handed a bare diagnostic code --
+        # and it is the path the incident was found on.
+        config = self.build_repo("ambient-conflicting-render-repo", "alpha")
+        stdout = io.StringIO()
+
+        with (
+            mock.patch("vibe_loop.cli.inherited_runtime_context", return_value={}),
+            contextlib.redirect_stdout(stdout),
+        ):
+            exit_code = cli.main(["autopilot", "status", "--repo", str(config.repo)])
+
+        output = stdout.getvalue()
+        self.assertEqual(exit_code, 0)
+        self.assertIn(f"project_binding_ambient_conflict:{SELECTOR}", output)
+        self.assertIn("unset it", output)
+        self.assertIn("--repo", output)
+        self.assertNotIn("intruder", output)
+
     def test_empty_pinned_binding_is_rejected_without_adapter_invocation(self) -> None:
         repo = self.write_unbound_repo(
             name="empty-pinned-binding-repo",
@@ -1037,8 +1123,38 @@ class CrossProjectIsolationTests(unittest.TestCase):
         self.assertIn(f"project_binding_ambient_only:{SELECTOR}", message)
         self.assertNotIn("generated task-source cache", message)
 
+    def test_aggregate_reports_every_entry_under_a_disagreeing_ambient(self) -> None:
+        # The class-wide ambient selector names "intruder", so it disagrees with
+        # both entries. The aggregate asks about every registered project at
+        # once; refusing per entry would blank the answer the command exists to
+        # give, and the entry's own binding is what routes its adapter anyway.
+        self.seed_tasks("alpha", ["ALPHA-1"])
+        self.seed_tasks("beta", ["BETA-1"])
+        alpha = self.build_repo("aggregate-alpha", "alpha").repo
+        beta = self.build_repo("aggregate-beta", "beta").repo
+        registry = ProjectRegistry(
+            path=self.root / "aggregate-registry.json",
+            entries=(
+                ProjectEntry(name="alpha", repo=alpha, runtime_context=()),
+                ProjectEntry(name="beta", repo=beta, runtime_context=()),
+            ),
+        )
+
+        payloads = [item.to_json() for item in collect_registry_status(registry)]
+
+        self.assertEqual([item["error"] for item in payloads], ["", ""])
+        for payload, expected in zip(payloads, ("ALPHA-1", "BETA-1"), strict=True):
+            status = payload["status"]
+            self.assertEqual(status["blockers"], [])
+            self.assertEqual(status["project_binding"]["diagnostics"], [])
+            self.assertEqual(
+                [task["id"] for task in status["queue"]["runnable_tasks"]],
+                [expected],
+            )
+
     def test_registry_status_reports_binding_without_redacting_it(self) -> None:
-        self.enterContext(self.ambient_selector_unset())
+        # Runs under the class-wide intruding ambient selector: the registry
+        # aggregate must resolve from the entry, not refuse.
         self.seed_tasks("beta", ["BETA-1"])
         repo = self.build_repo("registry-repo", "beta").repo
         entry = ProjectEntry(
@@ -1056,7 +1172,6 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
 
     def test_registry_supplied_binding_survives_aggregate_redaction(self) -> None:
-        self.enterContext(self.ambient_selector_unset())
         self.seed_tasks("beta", ["BETA-1"])
         repo = self.build_registry_bound_repo("registry-only-repo")
         entry = ProjectEntry(
@@ -1065,9 +1180,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
             runtime_context=((SELECTOR, "beta"),),
         )
 
-        status = collect_project_status(
-            load_config(repo, runtime_context=dict(entry.runtime_context))
-        )
+        status = collect_project_status(load_registry_entry_config(entry))
         worker = WorkerView(
             active=ActiveRunState.new(
                 task_id="worker-1",
@@ -1107,7 +1220,6 @@ class CrossProjectIsolationTests(unittest.TestCase):
         )
 
     def test_registry_inspect_preserves_only_authoritative_binding(self) -> None:
-        self.enterContext(self.ambient_selector_unset())
         self.seed_tasks("beta", ["BETA-1"])
         repo = self.build_registry_bound_repo("registry-inspect-repo")
         entry = ProjectEntry(
@@ -1120,9 +1232,7 @@ class CrossProjectIsolationTests(unittest.TestCase):
             entries=(entry,),
         )
         registry.save()
-        status = collect_project_status(
-            load_config(repo, runtime_context=dict(entry.runtime_context))
-        )
+        status = collect_project_status(load_registry_entry_config(entry))
         worker = WorkerView(
             active=ActiveRunState.new(
                 task_id="worker-1",

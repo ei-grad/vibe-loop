@@ -6651,6 +6651,21 @@ class AggregateProjectStatus:
         return redacted
 
 
+def load_registry_entry_config(entry: ProjectEntry) -> VibeConfig:
+    """Load the config for a target the command enumerated from the registry.
+
+    The entry named this target and supplies its own selector context, so the
+    caller's ambient environment is not a competing claim about it. Every
+    registry-driven read must go through here, because the binding is
+    re-resolved from the config by each downstream gate.
+    """
+
+    return dataclasses.replace(
+        load_config(entry.repo, runtime_context=dict(entry.runtime_context)),
+        ambient_selects_target=False,
+    )
+
+
 def collect_registry_status(
     registry: ProjectRegistry,
     *,
@@ -6659,10 +6674,7 @@ def collect_registry_status(
     results: list[AggregateProjectStatus] = []
     for entry in registry.entries:
         try:
-            config = load_config(
-                entry.repo,
-                runtime_context=dict(entry.runtime_context),
-            )
+            config = load_registry_entry_config(entry)
             status = collect_project_status(config, process_exists=process_exists)
             results.append(
                 AggregateProjectStatus(

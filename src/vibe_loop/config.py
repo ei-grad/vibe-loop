@@ -1097,23 +1097,40 @@ class ResolvedProjectBinding:
         }
 
 
+def project_binding_guidance(binding: ResolvedProjectBinding) -> str:
+    """Remedy text for a binding failure, or ``""`` when there is nothing to add.
+
+    The remedy for an ambient conflict is not the remedy for the other reasons:
+    the binding itself is fine, and what has to change is the caller's
+    environment. Every surface that reports the diagnostic renders this, so the
+    operator is not told a bare code on whichever path they happened to hit.
+    """
+
+    names = sorted(
+        {
+            item.name
+            for item in binding.diagnostics
+            if item.reason == PROJECT_BINDING_REASON_AMBIENT_CONFLICT
+        }
+    )
+    if not names:
+        return ""
+    return (
+        f"{', '.join(names)} names a different project than this repository is "
+        "bound to; unset it, or point --repo at the repository that variable "
+        "selects. The binding is pinned in this repository's "
+        f"{CONFIG_FILE_NAME} or in its project-registry entry."
+    )
+
+
 class ProjectBindingError(ValueError):
     def __init__(self, binding: ResolvedProjectBinding) -> None:
         message = "command backend project binding is unresolved: " + ", ".join(
             item.code for item in binding.diagnostics
         )
-        if any(
-            item.reason == PROJECT_BINDING_REASON_AMBIENT_CONFLICT
-            for item in binding.diagnostics
-        ):
-            # The remedy is not the same as for the other reasons: the binding
-            # itself is fine, the caller's environment names a different
-            # project than the repository this command was pointed at.
-            message += (
-                "; the ambient environment names a different project than this "
-                "repository is bound to -- unset it, or point --repo at the "
-                "repository that variable selects"
-            )
+        guidance = project_binding_guidance(binding)
+        if guidance:
+            message += f"; {guidance}"
         super().__init__(message)
         self.binding = binding
 
@@ -1182,6 +1199,18 @@ class VibeConfig:
     config_digest: str = ""
     worker_prompt_extra: str | None = None
     runtime_context: tuple[tuple[str, str], ...] = ()
+    # Whether the caller's ambient environment is claiming to name *this*
+    # target. True when the target is the repository the caller pointed at with
+    # --repo or cwd: an ambient selector naming a different project is then a
+    # second, contradictory statement about what the command is asking, and
+    # answering from the binding alone reports one project's state under the
+    # other's name. False for a target the command enumerated from the project
+    # registry, where the entry supplies its own context, no single ambient
+    # value can be a claim about any one of several entries, and refusing would
+    # blank the answer the command exists to give. It rides on the config
+    # because every downstream gate -- task source, lock manager, dispatch --
+    # re-resolves the binding from it.
+    ambient_selects_target: bool = True
 
     @property
     def state_path(self) -> Path:
@@ -2684,6 +2713,24 @@ def parse_project_binding_require(value: object) -> tuple[str, ...]:
     return tuple(names)
 
 
+def ambient_selector_claim(ambient: Mapping[str, str], name: str) -> str | None:
+    """The project an ambient variable actually names, or ``None``.
+
+    A value that is empty or whitespace-only names nothing. Explicit sources are
+    held to exactly this standard already, and `NAME=` is how a large amount of
+    shell and unit-file code unsets a variable -- which is the remedy this
+    binding's own diagnostic recommends, so treating it as a competing selector
+    makes the remedy fail when followed. Surrounding whitespace is a capture
+    artifact (`NAME=$(cmd)` keeps the trailing newline), not a different
+    project.
+    """
+
+    value = ambient.get(name)
+    if value is None:
+        return None
+    return value.strip() or None
+
+
 def resolve_project_binding(
     config: VibeConfig,
     *,
@@ -2692,11 +2739,10 @@ def resolve_project_binding(
     """Resolve declared namespace selectors from explicit sources only.
 
     A value inherited solely from the ambient process environment is refused:
-    that is the routing ambiguity this binding exists to close. An ambient
-    value that *disagrees* with the resolved one is refused as well. Ignoring
-    it would answer a command aimed at one project with another project's
-    state, which reads as authoritative because nothing in the output
-    contradicts the selector the caller supplied.
+    that is the routing ambiguity this binding exists to close. An ambient value
+    that *disagrees* with the resolved one is refused too, but only when this
+    config's target was selected by the caller rather than enumerated -- see
+    ``VibeConfig.ambient_selects_target``.
     """
 
     binding = config.project_binding
@@ -2732,8 +2778,12 @@ def resolve_project_binding(
             resolved_value = pinned_value
             resolved_source = PROJECT_BINDING_SOURCE_CONFIG
         if resolved_value is not None:
-            ambient_value = ambient.get(name)
-            if ambient_value is not None and ambient_value != resolved_value:
+            ambient_claim = ambient_selector_claim(ambient, name)
+            if (
+                config.ambient_selects_target
+                and ambient_claim is not None
+                and ambient_claim != resolved_value.strip()
+            ):
                 diagnostics.append(
                     ProjectBindingDiagnostic(
                         name, PROJECT_BINDING_REASON_AMBIENT_CONFLICT
@@ -2744,7 +2794,7 @@ def resolve_project_binding(
             continue
         reason = (
             PROJECT_BINDING_REASON_AMBIENT_ONLY
-            if ambient.get(name) is not None
+            if ambient_selector_claim(ambient, name) is not None
             else PROJECT_BINDING_REASON_UNSET
         )
         diagnostics.append(ProjectBindingDiagnostic(name, reason))

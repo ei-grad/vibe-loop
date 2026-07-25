@@ -25,6 +25,7 @@ from vibe_loop.autopilot import (
     collect_project_status,
     collect_registry_status,
     cycle_schedule_deadline,
+    load_registry_entry_config,
     default_registry_path,
     parse_wait_deadline,
     poll_wait_message_command,
@@ -39,6 +40,7 @@ from vibe_loop.autopilot import (
 )
 from vibe_loop.config import (
     ProjectBindingError,
+    project_binding_guidance,
     require_project_binding,
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -1572,6 +1574,11 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.blockers:
         lines.append("blockers:")
         lines.extend(f"  - {blocker}" for blocker in status.blockers)
+        # `status` reports binding failures rather than raising, so without this
+        # the path the operator actually hits shows a bare diagnostic code.
+        guidance = project_binding_guidance(status.project_binding)
+        if guidance:
+            lines.append(f"  {guidance}")
     elif status.observations:
         lines.append("observations:")
         lines.extend(f"  - {observation}" for observation in status.observations)
@@ -1789,12 +1796,7 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
         if entry is None:
             print(f"not in registry: {args.project}", file=sys.stderr)
             return 2
-        status = collect_project_status(
-            load_config(
-                entry.repo,
-                runtime_context=dict(entry.runtime_context),
-            )
-        )
+        status = collect_project_status(load_registry_entry_config(entry))
         if use_json:
             status_payload = status.to_json()
             project_binding = status_payload.pop("project_binding", None)

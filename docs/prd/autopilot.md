@@ -381,6 +381,15 @@ ambiguous request, and silently preferring the binding answers it with this
 repository's queue, locks, and supervisor state reported under the project name
 the caller actually asked for.
 
+That comparison is scoped to targets the caller selected. Where a command
+enumerates its targets from the project registry, each entry names its own
+project and supplies its own context, so one ambient value is not a claim about
+any particular entry and refusing would remove most of the aggregate's content —
+the failure the comparison exists to prevent, in a different form. An ambient
+value that is empty or whitespace-only names no project and must be treated as
+absent, since setting a variable empty is a common way to unset it and is the
+remedy the diagnostic recommends.
+
 Resolution must fail closed before any observable effect. Supervisor run,
 start, stop, and stale-recovery operations; task selection; worker inspection
 and cleanup; integration locking; and fenced reporting refuse a missing,

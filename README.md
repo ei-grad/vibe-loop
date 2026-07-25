@@ -537,7 +537,17 @@ repository bound to `vibe-loop` is asking two different questions at once, and
 answering from the binding alone would return this repository's queue, locks,
 and supervisor state under the other project's name with nothing in the output
 to contradict it. Unset the variable, or point `--repo` at the repository that
-variable selects.
+variable selects — the diagnostic says so wherever it is reported, including
+`autopilot status`, which reports it rather than failing.
+
+The comparison applies only where the caller chose the target. Commands that
+enumerate targets from the project registry — `autopilot projects status` and
+`autopilot projects inspect` — do not compare it: each entry supplies its own
+selector context, one ambient value cannot be a claim about several entries at
+once, and refusing per entry would blank most of the aggregate. An ambient value
+that is empty or whitespace-only names no project and is treated as absent, so
+`LOOPYARD_PROJECT= vibe-loop …` is a way to apply the remedy rather than another
+way to trip it.
 
 Supervisor run, start, stop, and stale-recovery operations; task selection;
 worker inspection and cleanup; integration locking; and fenced reporting refuse
