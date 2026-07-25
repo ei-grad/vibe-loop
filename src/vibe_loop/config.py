@@ -2444,15 +2444,9 @@ def parse_autopilot(data: object) -> AutopilotConfig:
     raw_interval = table.get("interval_seconds")
     return AutopilotConfig(
         jobs=optional_positive_int(table.get("jobs"), "autopilot.jobs"),
-        interval_seconds=(
-            None
-            if raw_interval is None
-            else positive_float(
-                raw_interval,
-                AUTOPILOT_MIN_INTERVAL_SECONDS,
-                "autopilot.interval_seconds",
-                minimum=AUTOPILOT_MIN_INTERVAL_SECONDS,
-            )
+        interval_seconds=optional_autopilot_interval(
+            raw_interval,
+            "autopilot.interval_seconds",
         ),
         min_ready=optional_positive_int(table.get("min_ready"), "autopilot.min_ready"),
         planning_recheck_seconds=positive_float(
@@ -2915,6 +2909,18 @@ def optional_nonnegative_float(value: object, name: str) -> float | None:
     if value is None:
         return None
     return nonnegative_float(value, 0.0, name)
+
+
+def optional_autopilot_interval(value: object, name: str) -> float | None:
+    if value is None:
+        return None
+    parsed = nonnegative_float(value, 0.0, name)
+    if 0 < parsed < AUTOPILOT_MIN_INTERVAL_SECONDS:
+        raise ValueError(
+            f"{name} must be zero for drain mode or at least "
+            f"{AUTOPILOT_MIN_INTERVAL_SECONDS} seconds"
+        )
+    return parsed
 
 
 def positive_float(

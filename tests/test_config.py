@@ -625,12 +625,27 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.autopilot.idle_wake_command)
         self.assertEqual(config.autopilot.explicit_keys, frozenset())
 
+    def test_autopilot_config_accepts_zero_interval_for_drain_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[autopilot]\ninterval_seconds = 0\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.autopilot.interval_seconds, 0.0)
+
     def test_autopilot_config_rejects_invalid_values(self) -> None:
         cases = [
             ("jobs = 0\n", "autopilot.jobs"),
             ("min_ready = -1\n", "autopilot.min_ready"),
             ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
-            ("interval_seconds = 59.9\n", "at least 60.0 seconds"),
+            (
+                "interval_seconds = 59.9\n",
+                "zero for drain mode or at least 60.0 seconds",
+            ),
             ("planning_recheck_seconds = 0\n", "autopilot.planning_recheck_seconds"),
             ("planning_recheck_seconds = -5\n", "autopilot.planning_recheck_seconds"),
             ("idle_poll_max_seconds = 0\n", "autopilot.idle_poll_max_seconds"),

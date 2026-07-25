@@ -761,10 +761,11 @@ configured `summary_command` still runs alongside this native summary.
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
 task source, an unavailable agent command, or exhausted disk/inode capacity.
-`--once` runs one cycle. Without `--interval`, it drains runnable work and exits
-when a cycle is idle or blocked; with `--interval N` (minimum 60 seconds) it
-stays resident until `--max-cycles` or an interrupt. Idle cycles use bounded
-adaptive task-source rechecks: the first listing follows
+`--once` runs one cycle. Without `--interval`, or with an interval of zero, it
+drains runnable work and exits when a cycle is idle or blocked; with a positive
+`--interval N` (minimum 60 seconds) it stays resident until `--max-cycles` or an
+interrupt. Idle cycles use bounded adaptive task-source rechecks: the first
+listing follows
 `planning_recheck_seconds` (60s by default), delays double up to
 `idle_poll_max_seconds` (600s by default), and the last delay is shortened to
 preserve the outer interval deadline. A

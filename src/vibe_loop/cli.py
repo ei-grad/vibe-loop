@@ -867,8 +867,8 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=(
             "Seconds to sleep between supervision cycles in the persistent loop "
-            "(minimum 60; overrides [autopilot] interval_seconds; omitted uses "
-            "drain mode)"
+            "(minimum 60; overrides [autopilot] interval_seconds; zero or "
+            "omitted uses drain mode)"
         ),
     )
     parser.add_argument(
@@ -3503,10 +3503,11 @@ def positive_float(value: str) -> float:
 
 
 def autopilot_interval(value: str) -> float:
-    parsed = positive_float(value)
-    if parsed < AUTOPILOT_MIN_INTERVAL_SECONDS:
+    parsed = nonnegative_float(value)
+    if 0 < parsed < AUTOPILOT_MIN_INTERVAL_SECONDS:
         raise argparse.ArgumentTypeError(
-            f"must be at least {AUTOPILOT_MIN_INTERVAL_SECONDS:.0f} seconds"
+            "must be zero for drain mode or at least "
+            f"{AUTOPILOT_MIN_INTERVAL_SECONDS:.0f} seconds"
         )
     return parsed
 

@@ -382,6 +382,7 @@ class ProjectBindingGateTests(unittest.TestCase):
         captured: dict[str, object] = {}
 
         def fake_popen(command, **kwargs):
+            captured["command"] = list(command)
             captured["env"] = dict(kwargs["env"])
             captured["pass_fds"] = kwargs["pass_fds"]
             fd = int(captured["env"][AUTOPILOT_RUNTIME_CONTEXT_FD_ENV])
@@ -404,6 +405,8 @@ class ProjectBindingGateTests(unittest.TestCase):
             start_detached_autopilot(config, verification_timeout=0.0)
 
         self.assertEqual(captured["transported"], {SELECTOR: "beta"})
+        command = captured["command"]
+        self.assertEqual(command[command.index("--interval") + 1], "0.0")
         self.assertNotIn(SELECTOR, captured["env"])
         self.assertTrue(captured["pass_fds"])
 

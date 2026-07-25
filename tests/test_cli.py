@@ -8799,7 +8799,37 @@ class AutopilotCliTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("--interval", stderr.getvalue())
-        self.assertIn("must be at least 60 seconds", stderr.getvalue())
+        self.assertIn(
+            "must be zero for drain mode or at least 60 seconds",
+            stderr.getvalue(),
+        )
+
+    def test_run_accepts_zero_interval_for_drain_mode(self) -> None:
+        class Summary:
+            exit_code = 0
+
+            def to_json(self):
+                return {"cycles": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            with patch.object(
+                cli_module, "run_autopilot", return_value=Summary()
+            ) as run:
+                exit_code = main(
+                    [
+                        "autopilot",
+                        "run",
+                        "--repo",
+                        str(repo),
+                        "--interval",
+                        "0",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run.call_args.kwargs["interval"], 0.0)
 
     def test_bare_autopilot_routes_to_run_and_terminates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
