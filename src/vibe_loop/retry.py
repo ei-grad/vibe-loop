@@ -63,6 +63,16 @@ LIMIT_WALL_RESET_PATTERN = re.compile(
 )
 QUOTA_RESET_MARGIN_SECONDS = 120.0
 QUOTA_RESET_MAX_DELAY_SECONDS = 8 * 3600.0
+# A clock-only reset carries no date, so an instant that already passed is
+# ambiguous: either the provider meant that clock time tomorrow (message
+# produced late in the day, e.g. "resets at 1am" seen at 23:00), or the
+# advertised instant elapsed between the provider producing the message and
+# this parse. Providers only ever advertise a reset that is future at message
+# time, so the second reading holds whenever the instant passed recently --
+# bounded here by the longest plausible gap between the wall and its
+# classification. Beyond that bound the tomorrow reading is the only one that
+# can be true.
+QUOTA_RESET_ELAPSED_GRACE_SECONDS = 3600.0
 
 
 def _reset_delay_from_match(
@@ -83,6 +93,8 @@ def _reset_delay_from_match(
     current = now if now is not None else datetime.datetime.now(datetime.timezone.utc)
     reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if reset <= current:
+        if (current - reset).total_seconds() <= QUOTA_RESET_ELAPSED_GRACE_SECONDS:
+            return QUOTA_RESET_MARGIN_SECONDS
         reset += datetime.timedelta(days=1)
     delay = (reset - current).total_seconds() + QUOTA_RESET_MARGIN_SECONDS
     return min(delay, QUOTA_RESET_MAX_DELAY_SECONDS)

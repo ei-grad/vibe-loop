@@ -2206,6 +2206,21 @@ class ReviewRouter:
                     "Fix exactly that violation. "
                 )
             instruction += "Return only one JSON object. "
+        if request.family == "closure":
+            family_contract = (
+                "This is a closure pass. Return every finding listed in "
+                "prior_findings exactly once, keyed by the same id, and return no "
+                "other finding: the id set of your findings must equal the id set "
+                "of prior_findings. Carry a finding forward by repeating its id "
+                "with an updated state; never drop one you consider resolved and "
+                "never introduce a new one. Use verdict approve when no finding "
+                'remains "open", and verdict findings when at least one does.\n'
+            )
+        else:
+            family_contract = (
+                "This is an initial pass. Every finding you report must have "
+                'state "open".\n'
+            )
         return (
             instruction
             + "Review this candidate directly. Do not launch, delegate to, or "
@@ -2216,7 +2231,11 @@ class ReviewRouter:
             "review budgets; do not propose or reset either. Each finding requires id, "
             "severity (P0-P3), summary, evidence, files, lines, and state. files and "
             "lines are JSON arrays of strings, never a bare string and never numbers: "
-            'use "lines": ["12", "40-52"], not "lines": "12" or "lines": [12].\n'
+            'use "lines": ["12", "40-52"], not "lines": "12" or "lines": [12]. '
+            "state must be exactly one of: "
+            + ", ".join(FINDING_STATES)
+            + ".\n"
+            + family_contract
             + json.dumps(
                 {
                     **request.to_payload(),
