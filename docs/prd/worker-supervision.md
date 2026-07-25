@@ -99,6 +99,23 @@ consider worker exit status, configured completion commands, task probing, and
 main-branch change heuristics while marking the result as less authoritative
 than a matching worker report.
 
+A clean Claude process exit without a matching worker report is an observed
+contract failure, not an unknown runtime outcome. If task probing cannot prove a
+terminal task state and compatibility-mode fallback reaches that condition, the
+run records `failed` with reason `worker_report_missing`. `unknown` remains for
+cases where the runtime itself could not observe enough state, such as a failed
+task-source probe. Runtime-owned orchestration may still derive and validate a
+candidate after a clean report-less exit, preserving the candidate, workspace,
+and gate evidence it records during the runtime stages.
+
+Headless Claude implementers cannot safely park on asynchronous Agent/Task work:
+`claude -p` ends when the model returns its progress summary and has no later
+turn in which to receive a completion notification. The launch policy therefore
+denies Agent and Task tools for Claude implementation workers while preserving
+any repository-configured tool denials. Provider limit-wall exits are separate:
+they exit nonzero and retain the existing `limit_wall` classification and reset
+evidence.
+
 A settled run must also finalize where external provenance lives. Once the run
 is classified, the supervisor publishes a settled outcome — one of `completed`,
 `failed`, `blocked`, `unknown` — into the task lock metadata while it still owns

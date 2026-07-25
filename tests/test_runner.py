@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -80,6 +81,7 @@ from vibe_loop.runner import (
     classify_post_report_event,
     inject_claude_resume,
     inject_claude_session_id,
+    inject_claude_implementer_tool_denial,
     inject_structured_usage_output,
     parse_agent_runtime_context_from_command,
     parse_agent_runtime_context_from_line,
@@ -1163,6 +1165,51 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(result.status, "unknown")
         self.assertEqual(result.source, "task_probe_error")
+
+    def test_clean_claude_exit_without_report_has_specific_failure_reason(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            runner._source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Active", order=1)]
+            )
+
+            result = runner.classify(
+                "TASK-01",
+                0,
+                "aaa",
+                "aaa",
+                "",
+                None,
+                agent_kind="claude",
+            )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.source, "worker_report_missing")
+        self.assertIn("terminal worker report", result.detail)
+
+    def test_clean_codex_exit_without_report_keeps_legacy_unknown_fallback(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = VibeRunner(VibeConfig(repo=Path(directory)))
+            runner._source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Active", order=1)]
+            )
+
+            result = runner.classify(
+                "TASK-01",
+                0,
+                "aaa",
+                "aaa",
+                "",
+                None,
+                agent_kind="codex",
+            )
+
+        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.source, "fallback")
 
     def test_classify_detects_limit_wall_before_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -6195,6 +6242,34 @@ class SessionIdInjectionTests(unittest.TestCase):
             "MODE=review /usr/bin/codex --model gpt-5 exec --json {prompt}",
         )
 
+    def test_claude_implementer_denies_nested_agent_and_task_tools(self) -> None:
+        prepared = inject_claude_implementer_tool_denial(
+            "CLAUDE_HOME=.claude claude -p {prompt}", "claude"
+        )
+
+        argv = shlex.split(prepared)
+        denied = argv.index("--disallowedTools")
+        self.assertEqual(argv[denied + 1 :], ["Agent,Task"])
+        self.assertIn("{prompt}", argv)
+
+    def test_claude_implementer_preserves_existing_tool_denials(self) -> None:
+        prepared = inject_claude_implementer_tool_denial(
+            "claude -p {prompt} --disallowedTools Edit Write", "auto"
+        )
+
+        argv = shlex.split(prepared)
+        self.assertEqual(argv.count("--disallowedTools"), 1)
+        denied = argv.index("--disallowedTools")
+        self.assertEqual(argv[denied + 1 :], ["Agent,Task", "Edit", "Write"])
+
+    def test_claude_implementer_policy_does_not_change_codex_path(self) -> None:
+        command = "codex exec {prompt}"
+
+        self.assertEqual(
+            inject_claude_implementer_tool_denial(command, "codex"),
+            command,
+        )
+
     def test_worker_usage_provenance_is_allowlisted(self) -> None:
         report = WorkerReport(
             run_id="run-1",
@@ -6966,6 +7041,37 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # The backend that finalizes external run provenance at release
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
+
+    def test_claude_worker_clean_exit_without_report_is_recorded_failed(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        active = dataclasses.replace(task, status="Active")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _source = self._build_runner(
+                directory, [task], {"T-1": active}
+            )
+            claude = AgentConfig(
+                agent_kind="claude",
+                command="claude -p {prompt}",
+                prompt_dialect="claude",
+                skill_ref_prefix="/",
+            )
+            runner.config = dataclasses.replace(
+                runner.config,
+                agent=claude,
+                agent_profiles={"worker": claude},
+            )
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "", report=False),
+            )
+
+            self.assertEqual(result.classification, "failed")
+            self.assertEqual(result.classification_source, "worker_report_missing")
+            self.assertIn("terminal worker report", result.message)
+            self.assertIsNone(result.worker_report)
+            self.assertEqual(lock_manager.outcome_at_release("T-1"), "failed")
 
     def test_explicit_worker_owned_mode_does_not_run_runtime_lifecycle(self) -> None:
         task = Task(task_id="T-1", title="Task", status="Next", agent="worker")

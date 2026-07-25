@@ -1785,6 +1785,9 @@ class VibeRunner:
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
+        effective_template = inject_claude_implementer_tool_denial(
+            effective_template, agent_kind
+        )
         effective_template = inject_structured_usage_output(
             effective_template, agent_kind
         )
@@ -2752,7 +2755,13 @@ class VibeRunner:
                     worker_report,
                     output_tail,
                     timed_out=worker_timed_out,
+                    agent_kind=agent_kind,
                 )
+                if (
+                    classification.source == "worker_report_missing"
+                    and classification.detail
+                ):
+                    message = classification.detail
             end_main = git_rev_parse(self.config.repo, "HEAD")
             if runtime_owned and classification.status == "completed":
                 stage_machine = RunLifecycleStateMachine.from_records(
@@ -4723,6 +4732,7 @@ class VibeRunner:
         output_tail: str = "",
         *,
         timed_out: bool = False,
+        agent_kind: str = "",
     ) -> ClassificationResult:
         # A wall-clock timeout force-killed the worker mid-run: its output is
         # inconclusive and any partial report is stale, so the run is neither a
@@ -4780,6 +4790,12 @@ class VibeRunner:
             return ClassificationResult("blocked", "task_probe")
         if start_main != end_main and task is None:
             return ClassificationResult("completed", "main_change")
+        if agent_kind == "claude":
+            return ClassificationResult(
+                "failed",
+                "worker_report_missing",
+                detail="Claude worker exited cleanly without a terminal worker report",
+            )
         return ClassificationResult("unknown", "fallback")
 
     def record_result(self, result: RunResult) -> None:
@@ -6682,6 +6698,57 @@ def inject_structured_usage_output(command: str, agent_kind: str) -> str:
             "claude ", "claude --output-format stream-json --verbose ", 1
         )
     return command
+
+
+def inject_claude_implementer_tool_denial(command: str, agent_kind: str) -> str:
+    """Prevent a headless Claude implementer from parking on nested work.
+
+    A one-shot ``claude -p`` process has no later turn in which to receive an
+    Agent/Task completion notification. Denying those asynchronous launch
+    surfaces keeps the implementation lifecycle in the supervised process.
+    Existing tool denials are preserved and consolidated into one option.
+    """
+    if agent_kind not in {"auto", "claude"}:
+        return command
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    if command_executable_name(argv) != "claude":
+        return command
+
+    existing_denials: list[str] = []
+    stripped: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token.startswith(("--disallowedTools=", "--disallowed-tools=")):
+            _, _, values = token.partition("=")
+            if values:
+                existing_denials.append(values)
+            index += 1
+            continue
+        if token not in {"--disallowedTools", "--disallowed-tools"}:
+            stripped.append(token)
+            index += 1
+            continue
+        index += 1
+        while index < len(argv):
+            value = argv[index]
+            if value == "{prompt}" or value.startswith("-"):
+                break
+            existing_denials.append(value)
+            index += 1
+
+    denied = ["Agent,Task"]
+    denied.extend(
+        value
+        for value in existing_denials
+        if value and value not in {"Agent", "Task", "Agent,Task"}
+    )
+    stripped.extend(("--disallowedTools", *denied))
+    prepared = shlex.join(stripped)
+    return prepared.replace(shlex.quote("{prompt}"), "{prompt}")
 
 
 def worker_usage_provenance(worker_report: WorkerReport | None) -> tuple[str, str]:
