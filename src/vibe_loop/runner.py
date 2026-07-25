@@ -876,7 +876,11 @@ def _contract_nonnegative_int(value: object, default: int = 0) -> int:
         return default
     try:
         parsed = int(value)
-    except ValueError:
+    except (ValueError, OverflowError):
+        # OverflowError covers the infinities: ``json.loads`` parses a literal
+        # ``Infinity`` into ``float('inf')``, so a corrupted durable record
+        # would otherwise raise the exact unclassified failure this helper
+        # exists to prevent.
         return default
     return parsed if parsed >= 0 else default
 
