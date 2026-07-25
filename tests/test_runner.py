@@ -7318,6 +7318,142 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         )
         self.assertEqual(source.status, "on-hold")
 
+    def test_adopted_workspace_older_than_main_reanchors_before_gates(self) -> None:
+        """An adopted workspace base is older than `main` by design.
+
+        The provisioner only requires the workspace base to be an ancestor of
+        the selected base, so the candidate must reach the re-anchorer instead
+        of being rejected during collection for not descending from run-start
+        `main`.
+        """
+
+        class GatesReached(RuntimeError):
+            pass
+
+        def git_at(cwd: Path, *args: str) -> str:
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        observed_candidates: list[CandidateRecord] = []
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            source.status = "active"
+            repo = runner.config.repo
+            workspace_base = git_at(repo, "rev-parse", "HEAD")
+            with tempfile.TemporaryDirectory() as workspace_directory:
+                worktree = Path(workspace_directory) / "T-1"
+                git_at(
+                    repo,
+                    "worktree",
+                    "add",
+                    "-b",
+                    "vibe-loop/T-1",
+                    str(worktree),
+                    workspace_base,
+                )
+                (worktree / "candidate.txt").write_text(
+                    "candidate\n",
+                    encoding="utf-8",
+                )
+                git_at(worktree, "add", "candidate.txt")
+                git_at(worktree, "commit", "-m", "candidate")
+                candidate_head = git_at(worktree, "rev-parse", "HEAD")
+                (repo / "main.txt").write_text("advanced\n", encoding="utf-8")
+                git_at(repo, "add", "main.txt")
+                git_at(repo, "commit", "-m", "advance main")
+                advanced_main = git_at(repo, "rev-parse", "HEAD")
+
+                workspace = ProvisionedWorkspace(
+                    mode="adopted",
+                    branch="vibe-loop/T-1",
+                    worktree=worktree,
+                    base_commit=workspace_base,
+                    head_commit=candidate_head,
+                    owner_run_id="run-0",
+                )
+                stage_machine = RunLifecycleStateMachine(lambda transition: None)
+                stage_machine.transition(RunStage.ACTIVATION, reason="test")
+                stage_machine.transition(RunStage.WORKSPACE, reason="test")
+                stage_machine.transition(RunStage.IMPLEMENTING, reason="test")
+                log_path = repo / "worker.log"
+                log_path.write_text("", encoding="utf-8")
+
+                class StubGateController:
+                    def __init__(self, **kwargs: object) -> None:
+                        self.kwargs = kwargs
+
+                    def run(
+                        self,
+                        candidate: CandidateRecord | None = None,
+                    ) -> None:
+                        observed_candidates.append(candidate)
+                        raise GatesReached("gates reached")
+
+                with patch.object(
+                    runner_module,
+                    "RuntimeGateController",
+                    StubGateController,
+                ):
+                    with self.assertRaises(GatesReached):
+                        runner.execute_runtime_owned_lifecycle(
+                            task=task,
+                            run_id="run-1",
+                            provisioned_workspace=workspace,
+                            stage_machine=stage_machine,
+                            contract={
+                                "candidate_stabilization": {"max_reanchors": 2},
+                                "gates": (),
+                                "remediation": {"max_rounds": 0},
+                                "reviewer": {"profile": "review"},
+                                "integration": {"enabled": True},
+                            },
+                            agent=runner.config.agent,
+                            agent_profile="worker",
+                            command_env={},
+                            implementation_session_id="session-1",
+                            implementation_session_id_source="fallback:run_id",
+                            output_log_path=log_path,
+                        )
+
+                anchors = [
+                    record
+                    for record in runner.run_store.read_records()
+                    if record.get("record_type") == "candidate_base_anchor"
+                ]
+                self.assertEqual(
+                    [record["outcome"] for record in anchors],
+                    ["re-anchored-clean"],
+                )
+                self.assertEqual(len(observed_candidates), 1)
+                stabilized = observed_candidates[0]
+                self.assertIsNotNone(stabilized)
+                assert stabilized is not None
+                self.assertEqual(stabilized.base_main, advanced_main)
+                self.assertNotEqual(stabilized.head_commit, candidate_head)
+                self.assertEqual(stabilized.changed_paths, ("candidate.txt",))
+                self.assertEqual(
+                    subprocess.run(
+                        [
+                            "git",
+                            "merge-base",
+                            "--is-ancestor",
+                            advanced_main,
+                            stabilized.head_commit,
+                        ],
+                        cwd=worktree,
+                        capture_output=True,
+                        text=True,
+                    ).returncode,
+                    0,
+                )
+
     def test_runtime_owned_worker_output_cannot_inject_lifecycle_records(
         self,
     ) -> None:

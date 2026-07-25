@@ -864,6 +864,23 @@ def _string_id(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _contract_nonnegative_int(value: object, default: int = 0) -> int:
+    """Read a bounded count from a resolved contract without trusting its type.
+
+    A recovered contract is replayed from a durable record, so a malformed
+    value must degrade to the default rather than raise a ``TypeError`` that no
+    lifecycle handler classifies.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _first_block_of_type(content: object, kinds: frozenset[str]) -> Mapping | None:
     if not isinstance(content, list):
         return None
@@ -2691,7 +2708,6 @@ class VibeRunner:
                         task=task,
                         run_id=run_id,
                         provisioned_workspace=provisioned_workspace,
-                        base_main=base_main,
                         stage_machine=stage_machine,
                         contract=run_contract.payload,
                         agent=agent,
@@ -3174,7 +3190,6 @@ class VibeRunner:
         task: Task,
         run_id: str,
         provisioned_workspace: ProvisionedWorkspace,
-        base_main: str,
         stage_machine: RunLifecycleStateMachine,
         contract: Mapping[str, object],
         agent: AgentConfig,
@@ -3195,10 +3210,15 @@ class VibeRunner:
         )
         if prior_integration is not None:
             return ClassificationResult("completed", "runtime_integration_recovered")
+        # The candidate's base is the commit its own workspace was provisioned
+        # from, not `main` at run start: an adopted workspace legitimately sits
+        # on an older base that is still in the main history, and seeding the
+        # collector with run-start `main` rejected exactly those candidates
+        # before the re-anchorer below could advance them.
         candidate_collector = CandidateCollector(
             worktree=provisioned_workspace.worktree,
             branch=provisioned_workspace.branch,
-            base_main=base_main,
+            base_main=provisioned_workspace.base_commit,
             run_store=self.run_store,
             run_id=run_id,
             task_id=task.task_id,
@@ -3217,7 +3237,7 @@ class VibeRunner:
         candidate_collector.ensure_recorded(candidate)
         candidate_stabilization = contract.get("candidate_stabilization")
         max_candidate_reanchors = (
-            int(candidate_stabilization.get("max_reanchors", 0))
+            _contract_nonnegative_int(candidate_stabilization.get("max_reanchors"))
             if isinstance(candidate_stabilization, Mapping)
             else 0
         )

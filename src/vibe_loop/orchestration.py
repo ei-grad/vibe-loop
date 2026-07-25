@@ -53,6 +53,8 @@ CANDIDATE_BASE_ANCHOR_OUTCOMES = (
     "base-unchanged",
     "re-anchored-clean",
     "refused-conflict",
+    "refused-disabled",
+    "refused-restore-failed",
     "refused-retry-bound",
 )
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
@@ -227,7 +229,9 @@ class CandidateReanchorRetryExhausted(CandidateCollectionError):
         self.attempts = attempts
         super().__init__(
             "candidate_reanchor_retry_bound",
-            "candidate base kept advancing during bounded clean re-anchor",
+            "candidate base kept advancing during bounded clean re-anchor: "
+            f"candidate base {candidate_base} vs observed base {observed_base} "
+            f"after {attempts} clean re-anchor(s)",
             details={
                 "attempts": attempts,
                 "candidate_base": candidate_base,
@@ -895,6 +899,18 @@ class CandidateBaseReanchorer:
         self.max_attempts = max_attempts
 
     def stabilize(self, candidate: CandidateRecord) -> CandidateRecord:
+        """Advance a candidate onto the live integration base when that is free.
+
+        Re-anchoring is an optimization that keeps gate evidence attached to the
+        base the candidate will actually merge into. When it cannot be performed
+        mechanically the candidate itself is still valid, so a refusal returns
+        the original candidate and leaves the advance to the merge that
+        integration already performs after review. The one exception is a base
+        that keeps advancing past a bounded number of successful re-anchors:
+        that run cannot produce evidence against a settled base at all, so it
+        parks rather than spending gates and a reviewer.
+        """
+
         attempts = self._prior_attempts(candidate.head_commit)
         attempted_in_call = False
         while True:
@@ -909,6 +925,15 @@ class CandidateBaseReanchorer:
                     )
                 return candidate
             if attempts >= self.max_attempts:
+                if attempts == 0:
+                    self._record(
+                        "refused-disabled",
+                        candidate_base=candidate.base_main,
+                        observed_base=observed_base,
+                        attempts=attempts,
+                        reason="reanchor_disabled",
+                    )
+                    return candidate
                 self._record(
                     "refused-retry-bound",
                     candidate_base=candidate.base_main,
@@ -928,15 +953,24 @@ class CandidateBaseReanchorer:
                 previous.base_main,
                 previous.head_commit,
             )
+            # Ambient Git config must not decide whether the rebase is clean.
+            # `rerere` in particular can resolve a conflicting advance from a
+            # previously recorded resolution, which is a human judgement this
+            # mechanical check is not entitled to inherit.
             result = self._git_result(
+                "-c",
+                "rerere.enabled=false",
+                "-c",
+                "commit.gpgsign=false",
                 "rebase",
+                "--no-autostash",
                 "--onto",
                 observed_base,
                 previous.base_main,
                 previous.branch,
             )
             if result.returncode != 0:
-                self._abort_rebase(previous.head_commit)
+                self._abort_rebase(previous.head_commit, observed_base, attempts)
                 refusal_reason = (
                     "merge_conflict"
                     if "CONFLICT" in f"{result.stdout}\n{result.stderr}"
@@ -949,16 +983,7 @@ class CandidateBaseReanchorer:
                     attempts=attempts,
                     reason=refusal_reason,
                 )
-                raise CandidateCollectionError(
-                    "candidate_base_mismatch",
-                    "candidate could not be mechanically re-anchored onto "
-                    "the advanced integration base",
-                    details={
-                        "reason": refusal_reason,
-                        "candidate_base": previous.base_main,
-                        "observed_base": observed_base,
-                    },
-                )
+                return previous
 
             rebased = self.candidate_collector.snapshot(
                 source=previous.source,
@@ -969,7 +994,7 @@ class CandidateBaseReanchorer:
                 or self._candidate_diff(rebased.base_main, rebased.head_commit)
                 != previous_diff
             ):
-                self._restore_candidate(previous.head_commit)
+                self._restore_candidate(previous.head_commit, observed_base, attempts)
                 self._record(
                     "refused-conflict",
                     candidate_base=previous.base_main,
@@ -977,18 +1002,14 @@ class CandidateBaseReanchorer:
                     attempts=attempts,
                     reason="content_divergence",
                 )
-                raise CandidateCollectionError(
-                    "candidate_base_mismatch",
-                    "candidate re-anchor changed the candidate diff",
-                    details={
-                        "reason": "content_divergence",
-                        "candidate_base": previous.base_main,
-                        "observed_base": observed_base,
-                    },
-                )
+                return previous
 
             candidate = rebased
             self.candidate_collector.record(candidate)
+            # The collector's own base is the base later derived snapshots (gate
+            # reruns after remediation) are taken against, so it has to follow
+            # the candidate onto the base it was actually re-anchored to.
+            self.candidate_collector.base_main = candidate.base_main
             self._record(
                 "re-anchored-clean",
                 candidate_base=previous.base_main,
@@ -1028,24 +1049,72 @@ class CandidateBaseReanchorer:
             f"{base}...{head}",
         )
 
-    def _abort_rebase(self, expected_head: str) -> None:
+    def _abort_rebase(
+        self,
+        expected_head: str,
+        observed_base: str,
+        attempts: int,
+    ) -> None:
         self._git_result("rebase", "--abort")
-        if self._git_text("rev-parse", "--verify", "HEAD") != expected_head:
-            raise CandidateCollectionError(
-                "candidate_reanchor_restore_failed",
+        observed_head = self._git_text("rev-parse", "--verify", "HEAD")
+        if observed_head != expected_head:
+            self._fail_restore(
                 "candidate re-anchor conflict could not restore the original head",
+                expected_head=expected_head,
+                observed_head=observed_head,
+                observed_base=observed_base,
+                attempts=attempts,
+                reason="rebase_abort_failed",
             )
 
-    def _restore_candidate(self, expected_head: str) -> None:
+    def _restore_candidate(
+        self,
+        expected_head: str,
+        observed_base: str,
+        attempts: int,
+    ) -> None:
         result = self._git_result("reset", "--hard", expected_head)
-        if (
-            result.returncode != 0
-            or self._git_text("rev-parse", "--verify", "HEAD") != expected_head
-        ):
-            raise CandidateCollectionError(
-                "candidate_reanchor_restore_failed",
+        observed_head = self._git_text("rev-parse", "--verify", "HEAD")
+        if result.returncode != 0 or observed_head != expected_head:
+            self._fail_restore(
                 "candidate diff divergence could not restore the original head",
+                expected_head=expected_head,
+                observed_head=observed_head,
+                observed_base=observed_base,
+                attempts=attempts,
+                reason="reset_failed",
             )
+
+    def _fail_restore(
+        self,
+        message: str,
+        *,
+        expected_head: str,
+        observed_head: str,
+        observed_base: str,
+        attempts: int,
+        reason: str,
+    ) -> None:
+        # A workspace left mid-rebase or off its candidate head is the one
+        # outcome nothing downstream can recover from, so it is recorded before
+        # the raise rather than being visible only as a stage failure.
+        self._record(
+            "refused-restore-failed",
+            candidate_head=expected_head,
+            observed_head=observed_head,
+            observed_base=observed_base,
+            attempts=attempts,
+            reason=reason,
+        )
+        raise CandidateCollectionError(
+            "candidate_reanchor_restore_failed",
+            message,
+            details={
+                "reason": reason,
+                "expected_head": expected_head,
+                "observed_head": observed_head,
+            },
+        )
 
     def _record(self, outcome: str, **payload: object) -> None:
         if outcome not in CANDIDATE_BASE_ANCHOR_OUTCOMES:

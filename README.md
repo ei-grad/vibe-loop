@@ -1258,10 +1258,16 @@ in the runtime.
 Runtime-owned command task sources that configure activation must also
 configure reset, and adapter completion requires `task_source.complete`; the
 resolved contract fails closed before activation when these paths are absent.
-Before gates, a candidate based on an older `main` is rebased only when Git
-reports no conflict and the aggregate binary diff remains byte-identical. The
-runtime reruns gates for the rewritten candidate and stops blocked after
-`max_candidate_reanchors` consecutive base advances.
+Before gates, a candidate based on an older `main` — including the adopted
+workspace of a continued task, whose base is older by design — is rebased only
+when Git reports no conflict and the aggregate binary diff remains
+byte-identical. The runtime reruns gates for the rewritten candidate. A
+conflict or a changed diff refuses the re-anchor and keeps the original
+candidate, leaving the advance to the merge integration performs after review;
+setting `max_candidate_reanchors = 0` refuses the same way. Only a base that
+keeps advancing past `max_candidate_reanchors` successful re-anchors stops
+blocked. The bound applies per run, so a continued task starts each run with a
+fresh budget.
 
 Repositories that still require agent-owned verification, review, integration,
 and task-source mutation must opt into compatibility mode explicitly:

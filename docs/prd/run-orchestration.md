@@ -97,12 +97,17 @@ recorded as typed evidence referencing the gate's configuration key, exit
 class, duration, and log. Gate failure routes to bounded remediation, not to
 silent completion; gate evidence is part of the review request.
 
-When the integration base advances before gates, the runtime may re-anchor the
+The candidate's base is the commit its workspace was provisioned from, which
+for an adopted workspace is legitimately older than `main` at run start. When
+that base is behind the integration branch, the runtime may re-anchor the
 candidate only through a conflict-free rebase whose aggregate binary diff and
-changed paths are unchanged. Every attempt records a typed base-anchor outcome,
-the rewritten candidate receives fresh gate evidence, and repeated base drift
-is bounded by the resolved run contract. Conflicts, content divergence, and
-retry exhaustion fail closed.
+changed paths are unchanged. Every attempt records a typed base-anchor outcome
+and the rewritten candidate receives fresh gate evidence. Re-anchoring is an
+optimization over the merge integration already performs, so a conflict or a
+content divergence refuses and preserves the candidate rather than failing the
+run before review. Repeated base drift past the bound resolved in the run
+contract is the one case that parks the run, because such a run cannot produce
+gate evidence against a settled base at all.
 
 Acceptance must cover gate execution and evidence records, candidate
 declaration and derivation, remediation budget enforcement on gate failure,

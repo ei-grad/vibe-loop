@@ -1428,7 +1428,7 @@ class CandidateBaseReanchorTests(unittest.TestCase):
         self.assertEqual(record["candidate_base"], self.base)
         self.assertEqual(record["observed_base"], self.base)
 
-    def test_conflicting_advance_fails_closed_and_restores_candidate(self) -> None:
+    def test_conflicting_advance_refuses_and_preserves_candidate(self) -> None:
         (self.worktree / "README.md").write_text(
             "candidate version\n",
             encoding="utf-8",
@@ -1440,25 +1440,54 @@ class CandidateBaseReanchorTests(unittest.TestCase):
         git(self.repo, "add", "README.md")
         git(self.repo, "commit", "-m", "advance main")
 
-        with self.assertRaises(CandidateCollectionError) as raised:
-            CandidateBaseReanchorer(
-                candidate_collector=self.collector,
-                main_branch="main",
-                max_attempts=2,
-            ).stabilize(candidate)
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
 
-        self.assertEqual(raised.exception.code, "candidate_base_mismatch")
-        self.assertEqual(raised.exception.details["reason"], "merge_conflict")
+        # A conflicting advance is not a run failure: integration still merges
+        # main after review and reports the conflicted paths from there.
+        self.assertEqual(stabilized, candidate)
         self.assertEqual(
             git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
             candidate.head_commit,
+        )
+        self.assertEqual(
+            git(self.worktree, "status", "--porcelain=v1").stdout.strip(),
+            "",
         )
         record = self.store.read_records()[-1]
         self.assertEqual(record["record_type"], "candidate_base_anchor")
         self.assertEqual(record["outcome"], "refused-conflict")
         self.assertEqual(record["reason"], "merge_conflict")
 
-    def test_content_divergence_fails_closed_and_restores_candidate(self) -> None:
+    def test_advance_containing_the_candidate_patch_refuses_and_preserves(
+        self,
+    ) -> None:
+        candidate = self.commit_candidate()
+        # Main lands an equivalent patch, so the rebase drops the candidate
+        # commit and the re-anchored branch carries a different diff.
+        (self.repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "candidate.txt")
+        git(self.repo, "commit", "-m", "same change upstream")
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        self.assertEqual(
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            candidate.head_commit,
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["outcome"], "refused-conflict")
+        self.assertEqual(record["reason"], "content_divergence")
+
+    def test_content_divergence_refuses_and_restores_candidate(self) -> None:
         candidate = self.commit_candidate()
         self.advance_main("advanced\n")
         reanchorer = CandidateBaseReanchorer(
@@ -1472,10 +1501,9 @@ class CandidateBaseReanchorTests(unittest.TestCase):
             "_candidate_diff",
             side_effect=(b"original diff", b"diverged diff"),
         ):
-            with self.assertRaises(CandidateCollectionError) as raised:
-                reanchorer.stabilize(candidate)
+            stabilized = reanchorer.stabilize(candidate)
 
-        self.assertEqual(raised.exception.details["reason"], "content_divergence")
+        self.assertEqual(stabilized, candidate)
         self.assertEqual(
             git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
             candidate.head_commit,
@@ -1483,6 +1511,60 @@ class CandidateBaseReanchorTests(unittest.TestCase):
         record = self.store.read_records()[-1]
         self.assertEqual(record["outcome"], "refused-conflict")
         self.assertEqual(record["reason"], "content_divergence")
+
+    def test_failed_restore_records_before_raising(self) -> None:
+        candidate = self.commit_candidate()
+        self.advance_main("advanced\n")
+        reanchorer = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        )
+
+        real_git_result = reanchorer._git_result
+
+        def failing_reset(*args: str):
+            if args[:2] == ("reset", "--hard"):
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    1,
+                    stdout="",
+                    stderr="fatal: unable to reset\n",
+                )
+            return real_git_result(*args)
+
+        with patch.object(
+            reanchorer,
+            "_candidate_diff",
+            side_effect=(b"original diff", b"diverged diff"),
+        ):
+            with patch.object(reanchorer, "_git_result", side_effect=failing_reset):
+                with self.assertRaises(CandidateCollectionError) as raised:
+                    reanchorer.stabilize(candidate)
+
+        self.assertEqual(
+            raised.exception.code,
+            "candidate_reanchor_restore_failed",
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "candidate_base_anchor")
+        self.assertEqual(record["outcome"], "refused-restore-failed")
+        self.assertEqual(record["reason"], "reset_failed")
+
+    def test_disabled_reanchoring_refuses_without_parking_the_run(self) -> None:
+        candidate = self.commit_candidate()
+        advanced_base = self.advance_main("advanced\n")
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=0,
+        ).stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["outcome"], "refused-disabled")
+        self.assertEqual(record["observed_base"], advanced_base)
 
     def test_retry_bound_reports_concrete_base_drift(self) -> None:
         candidate = self.commit_candidate()
