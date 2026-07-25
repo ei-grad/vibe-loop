@@ -4362,6 +4362,90 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 [record.get("record_type") for record in records],
             )
 
+    def test_rejection_suppression_survives_ignored_dirty_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(
+                RunContractJournalTests.worker_owned_config(repo, agent)
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+            manager, store, token = acquire_run(
+                repo,
+                task.task_id,
+                "prior-run",
+                store=runner.run_store,
+            )
+            old_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=old_base,
+                fencing_token=token,
+            )
+            (workspace.worktree / "candidate.txt").write_text(
+                "interrupted candidate\n", encoding="utf-8"
+            )
+            git(workspace.worktree, "add", "candidate.txt")
+            git(workspace.worktree, "commit", "-m", "interrupted candidate")
+            manager.release(manager.current_lock(task.task_id))
+            (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            git(repo, "add", "current-base.txt")
+            git(repo, "commit", "-m", "advance main")
+            scratch = workspace.worktree / "scratch"
+            scratch.mkdir()
+            (scratch / "note.txt").write_text("excluded dirt\n", encoding="utf-8")
+            runner.workspace_ignored_dirty_paths = (scratch,)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch("vibe_loop.runner.run_streaming_command") as launch:
+                        with self.assertRaises(WorkspaceProvisionError) as raised:
+                            runner.run_task(task)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            launch.assert_not_called()
+            rejected = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("decision") == "rejected"
+            ]
+            self.assertEqual(len(rejected), 1)
+            recorded_fingerprint = rejected[0]["workspace_state_fingerprint"]
+            selected_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            # The exclusion has to be load-bearing, or the suppression assertion
+            # below would hold even if the recompute dropped the argument.
+            self.assertNotEqual(
+                recorded_fingerprint,
+                runner_module.workspace_state_fingerprint(
+                    repo=repo,
+                    main_branch="main",
+                    branch=str(rejected[0]["branch"]),
+                    worktree=workspace.worktree,
+                    expected_base=selected_base,
+                ),
+            )
+            self.assertEqual(
+                runner.unchanged_workspace_dispatch_deferrals(),
+                {task.task_id},
+            )
+
     def test_runner_rejects_head_change_between_preflight_and_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

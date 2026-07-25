@@ -4156,7 +4156,6 @@ WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
         "workspace_base_mismatch",
         "workspace_base_unverified",
         "workspace_changed_during_claim",
-        "workspace_claim_snapshot_mismatch",
         "workspace_collision",
         "workspace_foreign_owner",
         "workspace_live_owner",
@@ -4321,7 +4320,7 @@ class WorkspaceProvisioner:
                 )
             )
             try:
-                claim = claim_worker_workspace(
+                claim_worker_workspace(
                     self.lock_manager,
                     self.run_store,
                     task_id=task_id,
@@ -4368,32 +4367,6 @@ class WorkspaceProvisioner:
                     )
                 )
                 raise failure from exc
-            try:
-                self._validate_durable_claim(
-                    claim=claim,
-                    workspace=workspace,
-                    selected_base=base_commit,
-                )
-            except WorkspaceProvisionError as failure:
-                self.run_store.append_lifecycle_event(
-                    RunLifecycleEvent.workspace_preflight(
-                        run_id=run_id,
-                        task_id=task_id,
-                        decision="rejected",
-                        reason=failure.code,
-                        retry_disposition=failure.retry_disposition,
-                        worker_launch_allowed=False,
-                        branch=workspace.branch,
-                        worktree=workspace.worktree,
-                        selected_base=base_commit,
-                        workspace_state_fingerprint=(
-                            current_workspace_state_fingerprint(
-                                workspace.branch, workspace.worktree
-                            )
-                        ),
-                    )
-                )
-                raise
         except KeyboardInterrupt:
             if workspace.mode == "created":
                 self.compensate_created(workspace)
@@ -4782,28 +4755,6 @@ class WorkspaceProvisioner:
             dirty_snapshot=tuple(dirty),
             dirty_fingerprint=dirty_fingerprint,
         )
-
-    def _validate_durable_claim(
-        self,
-        *,
-        claim: object,
-        workspace: ProvisionedWorkspace,
-        selected_base: str,
-    ) -> None:
-        from vibe_loop.workers import DIRTY_SUMMARY_LIMIT, WorkspaceClaim
-
-        if not isinstance(claim, WorkspaceClaim) or (
-            claim.branch != workspace.branch
-            or claim.worktree.resolve() != workspace.worktree.resolve()
-            or claim.base_commit != selected_base
-            or claim.head_commit != workspace.head_commit
-            or claim.dirty_fingerprint != workspace.dirty_fingerprint
-            or claim.dirty_summary != workspace.dirty_snapshot[:DIRTY_SUMMARY_LIMIT]
-        ):
-            raise WorkspaceProvisionError(
-                "workspace_claim_snapshot_mismatch",
-                "durable workspace claim does not match validated preflight state",
-            )
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context

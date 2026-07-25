@@ -1324,6 +1324,12 @@ class VibeRunner:
         self._exhausted_recovery_results: dict[str, RunResult] = {}
         self._durably_exhausted_recovery_tasks: set[str] = set()
         self._workspace_deferred_recovery_tasks: set[str] = set()
+        # Workspace-state fingerprints only suppress redundant dispatch while
+        # the provisioner that records one and every site that recomputes it
+        # exclude exactly the same paths; any divergence makes the recorded and
+        # recomputed digests permanently unequal and silently disables
+        # suppression. This is the single source both sides read.
+        self.workspace_ignored_dirty_paths: tuple[Path, ...] = ()
         self._review_concurrency = ReviewConcurrencyBudget(
             config.orchestration.reviewer_concurrency_budget
         )
@@ -2038,6 +2044,7 @@ class VibeRunner:
             main_branch=self.config.main_branch,
             lock_manager=self.lock_manager,
             run_store=self.run_store,
+            ignored_dirty_paths=self.workspace_ignored_dirty_paths,
         )
 
         def compensate_unstarted_workspace() -> None:
@@ -3808,6 +3815,7 @@ class VibeRunner:
                     repo=self.config.repo,
                     main_branch=self.config.main_branch,
                     recovery=context,
+                    ignored_dirty_paths=self.workspace_ignored_dirty_paths,
                 )
                 if current_fingerprint == context.workspace_state_fingerprint:
                     self._workspace_deferred_recovery_tasks.add(context.task_id)
@@ -3854,6 +3862,7 @@ class VibeRunner:
                     if isinstance(record.get("selected_base"), str)
                     else ""
                 ),
+                ignored_dirty_paths=self.workspace_ignored_dirty_paths,
             )
             if current_fingerprint == recorded_fingerprint:
                 unchanged.add(task_id)
@@ -4647,6 +4656,7 @@ class VibeRunner:
                     repo=self.config.repo,
                     main_branch=self.config.main_branch,
                     recovery=recovery,
+                    ignored_dirty_paths=self.workspace_ignored_dirty_paths,
                 )
             self.record_recovery_phase(
                 recovery,
@@ -4991,6 +5001,7 @@ def workspace_retry_state_fingerprint(
     repo: Path,
     main_branch: str,
     recovery: RecoveryContext,
+    ignored_dirty_paths: Sequence[Path] = (),
 ) -> str:
     return workspace_state_fingerprint(
         repo=repo,
@@ -4998,6 +5009,7 @@ def workspace_retry_state_fingerprint(
         branch=recovery.branch,
         worktree=Path(recovery.worktree) if recovery.worktree else None,
         expected_base=recovery.base_commit,
+        ignored_dirty_paths=ignored_dirty_paths,
     )
 
 
