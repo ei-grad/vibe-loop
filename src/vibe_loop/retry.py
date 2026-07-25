@@ -240,6 +240,13 @@ def parse_quota_reset_delay(
 # transient 429/overloaded errors above, which retry quickly). Re-dispatching
 # straight into the same wall burns restart budget and stalls the loop, so
 # these are classified separately and paused until the advertised reset.
+#
+# The phrases below are the wall's wording, not proof that a wall happened: an
+# agent writing or reviewing limit-wall handling emits them as ordinary content
+# (fixtures, diffs, quoted tool output) in a run that then succeeds. Matching a
+# phrase anywhere in a captured transcript is therefore not a detector -- see
+# detect_provider_limit_wall for the conditions that make a match provider
+# evidence.
 DEFAULT_LIMIT_WALL_PATTERNS: tuple[str, ...] = (
     # The bound and the sentence-boundary exclusion keep the marker inside one
     # clause, so a lazy match cannot run past a period into unrelated text.
@@ -252,6 +259,13 @@ LIMIT_WALL_DEFAULT_BACKOFF_SECONDS = 1800.0
 # marker so an unrelated "reset at N" elsewhere in the tail cannot inflate the
 # pause.
 LIMIT_WALL_RESET_WINDOW_CHARS = 200
+# A provider refusal is the last thing the run emits: the process stops there.
+# Agent-authored occurrences of the same phrases sit wherever the agent happened
+# to read or write them, which on a long run is far from the end. Bounding the
+# marker search to the trailing window keeps a terminal refusal envelope (the
+# message plus its usage/session tail) in scope while leaving a mid-transcript
+# fixture out of it.
+LIMIT_WALL_TAIL_WINDOW_CHARS = 8000
 
 
 @dataclasses.dataclass(frozen=True)
@@ -261,12 +275,15 @@ class LimitWallSignal:
     ``marker`` is the matched limit phrase. ``reset_text`` is the advertised
     reset phrase (e.g. "resets 1am (UTC)") when present, and ``reset_delay`` is
     the parsed seconds until that reset, or None when the wall carries no
-    parseable reset time.
+    parseable reset time. ``evidence`` names what qualified the match as
+    provider output rather than agent-authored text, so an operator reading a
+    pause can tell the two apart; it is empty for a bare phrase match.
     """
 
     marker: str
     reset_text: str = ""
     reset_delay: float | None = None
+    evidence: str = ""
 
 
 def compile_limit_wall_patterns(
@@ -343,6 +360,54 @@ def detect_limit_wall(
             reset_delay=found[1] if found is not None else None,
         )
     return None
+
+
+def detect_provider_limit_wall(
+    text: str,
+    patterns: Iterable[str] | None = None,
+    *,
+    exit_code: int,
+    tail_chars: int = LIMIT_WALL_TAIL_WINDOW_CHARS,
+    now: datetime.datetime | None = None,
+) -> LimitWallSignal | None:
+    """Detect a provider limit wall in the output of a *finished* agent run.
+
+    Unlike detect_limit_wall, which only answers whether text contains a limit
+    phrase, this answers whether the provider refused this run. Two conditions
+    must hold, and each excludes a distinct source of agent-authored matches:
+
+    * ``exit_code`` is nonzero. A provider that refuses further work stops the
+      run; an agent that merely wrote or read a limit phrase goes on to finish.
+      This is the condition the classification comment above has always
+      described, and it alone clears the observed failure mode -- a worker
+      authoring limit-wall fixtures, or a reviewer reading them, exiting 0.
+    * the match falls inside the trailing ``tail_chars`` of the output. A run
+      can fail for an unrelated reason after quoting a limit phrase somewhere in
+      a long transcript; the refusal itself is always at the end.
+
+    Both are needed: exit status alone still admits a phrase quoted mid-run by a
+    worker that later died of something else, and the tail alone still admits a
+    successful run whose final report discusses limit handling. Neither is
+    tightened further, because the error costs are asymmetric -- a false wall
+    pauses every task for the backoff window, while a missed wall costs one
+    dispatch that the ordinary retry and restart budget already absorbs. When
+    the evidence is ambiguous this returns None and the loop keeps working.
+
+    The returned signal carries an ``evidence`` string naming the qualifying
+    conditions so a recorded pause is legible.
+    """
+    if exit_code == 0:
+        return None
+    window = text[-tail_chars:] if tail_chars > 0 else text
+    signal = detect_limit_wall(window, patterns, now=now)
+    if signal is None:
+        return None
+    scanned = (
+        f"scanned last {len(window)} of {len(text)} chars"
+        if len(window) < len(text)
+        else f"scanned all {len(text)} chars"
+    )
+    return dataclasses.replace(signal, evidence=f"exit={exit_code}; {scanned}")
 
 
 def limit_wall_backoff_seconds(
@@ -423,7 +488,9 @@ def classify_limit_wall_result(
     output = subprocess_result_output(result)
     if not output:
         return None, False
-    signal = detect_limit_wall(output, patterns, now=now)
+    signal = detect_provider_limit_wall(
+        output, patterns, exit_code=result.returncode, now=now
+    )
     if signal is None:
         return None, False
     if signal.reset_delay is None and is_transient_stderr(output):
@@ -526,8 +593,11 @@ def retry_subprocess_run(
             # the caller apply its configured backoff instead of redispatching
             # into the same refusal.
             if detect_limit_walls and on_limit_wall is not None:
-                exhausted = detect_limit_wall(
-                    subprocess_result_output(result), limit_wall_patterns, now=now
+                exhausted = detect_provider_limit_wall(
+                    subprocess_result_output(result),
+                    limit_wall_patterns,
+                    exit_code=result.returncode,
+                    now=now,
                 )
                 if exhausted is not None:
                     on_limit_wall(exhausted)

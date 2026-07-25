@@ -30,7 +30,7 @@ from vibe_loop.config import (
 )
 from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
-from vibe_loop.retry import LimitWallSignal, detect_limit_wall
+from vibe_loop.retry import LimitWallSignal, detect_provider_limit_wall
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
@@ -303,7 +303,10 @@ class ReviewLimitWallError(ReviewExecutionError):
         self.route = route
         self.phase = phase
         detail = f" ({signal.reset_text})" if signal.reset_text else ""
-        super().__init__(f"reviewer limit wall on {route}: {signal.marker}{detail}")
+        evidence = f" [{signal.evidence}]" if signal.evidence else ""
+        super().__init__(
+            f"reviewer limit wall on {route}: {signal.marker}{detail}{evidence}"
+        )
 
 
 class ReviewStageResultError(ReviewExecutionError):
@@ -1983,7 +1986,16 @@ class ReviewRouter:
             )
             self._fail_stage_for_result("fatal")
             raise ReviewDelegationPolicyError(nested_launches)
-        wall = detect_limit_wall(output, self.limit_wall_patterns)
+        # A reviewer reads the diff and the files it touches, so on a limit-wall
+        # slice its transcript quotes the wall phrases as ordinary content. Only
+        # a failed reviewer whose trailing output carries the phrase is a wall;
+        # a reviewer that finishes reports one through its typed
+        # retry_classification below, not by mentioning it.
+        wall = detect_provider_limit_wall(
+            output,
+            self.limit_wall_patterns,
+            exit_code=completed.returncode,
+        )
         if wall is not None:
             self._record_error(
                 request,
