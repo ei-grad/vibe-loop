@@ -34,6 +34,7 @@ from vibe_loop.runs import (
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+    WORKSPACE_PREFLIGHT_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     WORKER_REPORT_SCHEMA_VERSION,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
@@ -751,6 +752,69 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(event["activity_source_generation"], "a" * 64)
         self.assertEqual(event["pid_source"], "popen")
         self.assertIn(WORKER_PROCESS_STARTED_RECORD_TYPE, KNOWN_RECORD_TYPES)
+
+    def test_workspace_preflight_event_has_closed_retry_vocabulary(self) -> None:
+        event = RunLifecycleEvent.workspace_preflight(
+            run_id="run-1",
+            task_id="TASK-01",
+            decision="rejected",
+            reason="workspace_stale_current_base",
+            retry_disposition="defer_until_workspace_changes",
+            worker_launch_allowed=False,
+            branch="vibe/TASK-01",
+            worktree=Path("/workspace/TASK-01"),
+            selected_base="a" * 40,
+            workspace_base="b" * 40,
+            head_commit="c" * 40,
+            workspace_state_fingerprint="d" * 64,
+            refresh_refused="unique_commits",
+        ).to_record()
+
+        self.assertEqual(event["record_type"], WORKSPACE_PREFLIGHT_RECORD_TYPE)
+        self.assertEqual(event["decision"], "rejected")
+        self.assertEqual(event["retry_disposition"], "defer_until_workspace_changes")
+        self.assertFalse(event["worker_launch_allowed"])
+        self.assertEqual(event["workspace_state_fingerprint"], "d" * 64)
+        self.assertEqual(event["refresh_refused"], "unique_commits")
+        self.assertIn(WORKSPACE_PREFLIGHT_RECORD_TYPE, KNOWN_RECORD_TYPES)
+        omitted = RunLifecycleEvent.workspace_preflight(
+            run_id="run-1b",
+            task_id="TASK-01",
+            decision="rejected",
+            reason="workspace_stale_current_base",
+            retry_disposition="defer_until_workspace_changes",
+            worker_launch_allowed=False,
+        ).to_record()
+        self.assertNotIn("refresh_refused", omitted)
+        with self.assertRaisesRegex(ValueError, "retry disposition"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-2",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="retry_immediately",
+                worker_launch_allowed=False,
+            )
+        with self.assertRaisesRegex(ValueError, "state fingerprint"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-3",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="defer_until_workspace_changes",
+                worker_launch_allowed=False,
+                workspace_state_fingerprint="not-a-fingerprint",
+            )
+        with self.assertRaisesRegex(ValueError, "refresh refusal"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-4",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="defer_until_workspace_changes",
+                worker_launch_allowed=False,
+                refresh_refused="because_i_said_so",
+            )
 
     def test_post_report_activity_event_records_violation_and_teardown(
         self,

@@ -4824,7 +4824,52 @@ class WorkspaceProvisionError(RuntimeError):
     ) -> None:
         self.code = code
         self.details = dict(details or {})
+        self.retry_disposition = workspace_retry_disposition(code)
         super().__init__(message)
+
+    @property
+    def diagnostic(self) -> str:
+        """Operator-facing code, qualified by why a refresh was declined.
+
+        The bare code cannot distinguish a workspace preserved because it holds
+        real work from one deferred because Git could not be read, and that is
+        the distinction that decides whether a human needs to step in.
+        """
+
+        refusal = self.details.get("refresh_refused")
+        if isinstance(refusal, str) and refusal:
+            return f"{self.code} ({refusal})"
+        return self.code
+
+
+WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
+    {
+        "ambiguous_owned_workspaces",
+        "dirty_existing_workspace",
+        "incomplete_recovery_workspace",
+        "primary_workspace_forbidden",
+        "recovery_base_changed",
+        "recovery_dirty_content_changed",
+        "recovery_dirty_snapshot_changed",
+        "recovery_git_common_dir_changed",
+        "recovery_head_changed",
+        "workspace_base_mismatch",
+        "workspace_base_unverified",
+        "workspace_changed_during_claim",
+        "workspace_collision",
+        "workspace_foreign_owner",
+        "workspace_live_owner",
+        "workspace_main_history_mismatch",
+        "workspace_ownership_unverified",
+        "workspace_stale_current_base",
+    }
+)
+
+
+def workspace_retry_disposition(code: str) -> str:
+    if code in WORKSPACE_STATE_CHANGE_REQUIRED:
+        return "defer_until_workspace_changes"
+    return "retry_later"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4836,6 +4881,11 @@ class ProvisionedWorkspace:
     head_commit: str
     owner_run_id: str = ""
     dirty_at_adoption: bool = False
+    dirty_snapshot: tuple[str, ...] = ()
+    dirty_fingerprint: str = ""
+    # Pre-refresh HEAD when a provably disposable stale workspace was
+    # fast-forwarded onto the selected base during adoption; empty otherwise.
+    refreshed_from: str = ""
 
     def to_record_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -4848,6 +4898,8 @@ class ProvisionedWorkspace:
         }
         if self.owner_run_id:
             payload["owner_run_id"] = self.owner_run_id
+        if self.refreshed_from:
+            payload["refreshed_from"] = self.refreshed_from
         return payload
 
 
@@ -4884,28 +4936,91 @@ class WorkspaceProvisioner:
         recovery_dirty_fingerprint: str = "",
     ) -> ProvisionedWorkspace:
         from vibe_loop.runs import RunLifecycleEvent
-        from vibe_loop.workers import claim_worker_workspace
+        from vibe_loop.workers import (
+            WorkspaceClaimError,
+            claim_worker_workspace,
+            workspace_state_fingerprint,
+        )
 
-        self._validate_primary(base_commit)
-        branch, worktree = self._workspace_identity(
-            task_id=task_id,
-            recovery_branch=recovery_branch,
-            recovery_worktree=recovery_worktree,
-        )
-        workspace = self._create_or_adopt(
-            task_id=task_id,
-            run_id=run_id,
-            branch=branch,
-            worktree=worktree,
-            base_commit=base_commit,
-            recovery_run_id=recovery_run_id,
-            recovery_git_common_dir=recovery_git_common_dir,
-            recovery_base_commit=recovery_base_commit,
-            recovery_head_commit=recovery_head_commit,
-            recovery_dirty_snapshot=recovery_dirty_snapshot,
-            recovery_dirty_fingerprint=recovery_dirty_fingerprint,
-        )
+        def current_workspace_state_fingerprint(
+            candidate_branch: str,
+            candidate_worktree: Path | None,
+        ) -> str:
+            return workspace_state_fingerprint(
+                repo=self.repo,
+                main_branch=self.main_branch,
+                branch=candidate_branch,
+                worktree=candidate_worktree,
+                expected_base=base_commit,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+
+        branch = ""
+        worktree: Path | None = None
         try:
+            self._validate_primary(base_commit)
+            branch, worktree = self._workspace_identity(
+                task_id=task_id,
+                recovery_branch=recovery_branch,
+                recovery_worktree=recovery_worktree,
+            )
+            workspace = self._create_or_adopt(
+                task_id=task_id,
+                run_id=run_id,
+                branch=branch,
+                worktree=worktree,
+                base_commit=base_commit,
+                recovery_run_id=recovery_run_id,
+                recovery_git_common_dir=recovery_git_common_dir,
+                recovery_base_commit=recovery_base_commit,
+                recovery_head_commit=recovery_head_commit,
+                recovery_dirty_snapshot=recovery_dirty_snapshot,
+                recovery_dirty_fingerprint=recovery_dirty_fingerprint,
+            )
+        except WorkspaceProvisionError as exc:
+            workspace_base = workspace_commit_evidence(
+                exc.details.get("workspace_base") or exc.details.get("base_commit")
+            )
+            head_commit = workspace_commit_evidence(exc.details.get("head_commit"))
+            refresh_refused = exc.details.get("refresh_refused")
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id=run_id,
+                    task_id=task_id,
+                    decision="rejected",
+                    reason=exc.code,
+                    retry_disposition=exc.retry_disposition,
+                    worker_launch_allowed=False,
+                    branch=branch,
+                    worktree=worktree,
+                    selected_base=base_commit,
+                    workspace_base=workspace_base,
+                    head_commit=head_commit,
+                    workspace_state_fingerprint=current_workspace_state_fingerprint(
+                        branch, worktree
+                    ),
+                    refresh_refused=(
+                        refresh_refused if isinstance(refresh_refused, str) else ""
+                    ),
+                )
+            )
+            raise
+        try:
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id=run_id,
+                    task_id=task_id,
+                    decision=("created" if workspace.mode == "created" else "reusable"),
+                    reason=f"workspace_{workspace.mode}",
+                    retry_disposition="not_needed",
+                    worker_launch_allowed=True,
+                    branch=workspace.branch,
+                    worktree=workspace.worktree,
+                    selected_base=base_commit,
+                    workspace_base=workspace.base_commit,
+                    head_commit=workspace.head_commit,
+                )
+            )
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.workspace_provisioned(
                     run_id=run_id,
@@ -4913,18 +5028,54 @@ class WorkspaceProvisioner:
                     payload=workspace.to_record_payload(),
                 )
             )
-            claim_worker_workspace(
-                self.lock_manager,
-                self.run_store,
-                task_id=task_id,
-                run_id=run_id,
-                branch=workspace.branch,
-                worktree=workspace.worktree,
-                repo=self.repo,
-                base_commit=workspace.base_commit,
-                fencing_token=fencing_token,
-                ignored_dirty_paths=self.ignored_dirty_paths,
-            )
+            try:
+                claim_worker_workspace(
+                    self.lock_manager,
+                    self.run_store,
+                    task_id=task_id,
+                    run_id=run_id,
+                    branch=workspace.branch,
+                    worktree=workspace.worktree,
+                    repo=self.repo,
+                    base_commit=workspace.base_commit,
+                    fencing_token=fencing_token,
+                    ignored_dirty_paths=self.ignored_dirty_paths,
+                    expected_head_commit=workspace.head_commit,
+                    expected_dirty_fingerprint=workspace.dirty_fingerprint,
+                    required_ancestor_base=base_commit,
+                )
+            except WorkspaceClaimError as exc:
+                if exc.code != "workspace_snapshot_changed":
+                    raise
+                failure = WorkspaceProvisionError(
+                    "workspace_changed_during_claim",
+                    "workspace changed after preflight and before durable claim",
+                    details=exc.details,
+                )
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.workspace_preflight(
+                        run_id=run_id,
+                        task_id=task_id,
+                        decision="rejected",
+                        reason=failure.code,
+                        retry_disposition=failure.retry_disposition,
+                        worker_launch_allowed=False,
+                        branch=workspace.branch,
+                        worktree=workspace.worktree,
+                        selected_base=base_commit,
+                        workspace_base=workspace.base_commit,
+                        head_commit=workspace_commit_evidence(
+                            exc.details.get("actual_head_commit")
+                            or exc.details.get("head_commit")
+                        ),
+                        workspace_state_fingerprint=(
+                            current_workspace_state_fingerprint(
+                                workspace.branch, workspace.worktree
+                            )
+                        ),
+                    )
+                )
+                raise failure from exc
         except KeyboardInterrupt:
             if workspace.mode == "created":
                 self.compensate_created(workspace)
@@ -5132,7 +5283,17 @@ class WorkspaceProvisioner:
                     base_commit=base_commit,
                 )
                 raise
-            return dataclasses.replace(workspace, head_commit=head_commit)
+            dirty, dirty_fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+            return dataclasses.replace(
+                workspace,
+                head_commit=head_commit,
+                dirty_at_adoption=bool(dirty),
+                dirty_snapshot=tuple(dirty),
+                dirty_fingerprint=dirty_fingerprint,
+            )
         if (
             len(branch_entries) != 1
             or len(path_entries) != 1
@@ -5240,6 +5401,25 @@ class WorkspaceProvisioner:
                     "selected_base": base_commit,
                 },
             )
+        refreshed_from = ""
+        if (
+            self._git_returncode_at(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                base_commit,
+                head,
+            )
+            != 0
+        ):
+            refreshed_from = head
+            head = self._refresh_stale_workspace(
+                worktree=worktree,
+                base_commit=base_commit,
+                owner_base=owner_base,
+                head=head,
+                recovery_run_id=recovery_run_id,
+            )
         dirty, dirty_fingerprint = git_dirty_snapshot(
             worktree,
             ignored_dirty_paths=self.ignored_dirty_paths,
@@ -5277,11 +5457,114 @@ class WorkspaceProvisioner:
             mode="preserved" if dirty else "adopted",
             branch=branch,
             worktree=worktree.resolve(),
-            base_commit=owner_base,
+            base_commit=base_commit,
             head_commit=head,
             owner_run_id=str(owner.get("run_id") or ""),
             dirty_at_adoption=bool(dirty),
+            dirty_snapshot=tuple(dirty),
+            dirty_fingerprint=dirty_fingerprint,
+            refreshed_from=refreshed_from,
         )
+
+    def _refresh_stale_workspace(
+        self,
+        *,
+        worktree: Path,
+        base_commit: str,
+        owner_base: str,
+        head: str,
+        recovery_run_id: str,
+    ) -> str:
+        """Fast-forward a provably disposable stale workspace onto the base.
+
+        Returns the refreshed HEAD, or raises the ordinary
+        ``workspace_stale_current_base`` deferral when refresh cannot be
+        *proven* safe. Every unprovable input -- a failed git invocation, an
+        unreadable worktree, a HEAD that moved under the check -- takes the
+        deferral path, so the automatic repair only ever runs on a workspace
+        that demonstrably holds nothing the refresh could lose.
+        """
+
+        from vibe_loop.workers import WorkspaceClaimError, git_dirty_snapshot
+
+        def defer(refusal: str, **evidence: object) -> WorkspaceProvisionError:
+            return WorkspaceProvisionError(
+                "workspace_stale_current_base",
+                "existing workspace does not contain the selected current base",
+                details={
+                    "selected_base": base_commit,
+                    "workspace_base": owner_base,
+                    "head_commit": head,
+                    "refresh_refused": refusal,
+                    **evidence,
+                },
+            )
+
+        if recovery_run_id:
+            # A recovery adoption resumes against a durable pending intent that
+            # records this worktree's exact head and dirt. Moving HEAD out from
+            # under that record is a separate decision from repairing an
+            # ordinary stale workspace, so recovery keeps deferring.
+            raise defer("recovery_adoption")
+        # Re-read HEAD rather than trusting the caller's earlier read, so every
+        # condition below is evaluated against one observation of the worktree.
+        head_now = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
+        if head_now.returncode != 0 or head_now.stdout.strip() != head:
+            raise defer("head_unreadable_or_moved")
+        unique = self._git_result_at(
+            worktree,
+            "rev-list",
+            "--count",
+            f"{base_commit}..{head}",
+        )
+        if unique.returncode != 0:
+            raise defer("unique_commits_unreadable")
+        if unique.stdout.strip() != "0":
+            # Positive proof of disposability: a commit reachable only from this
+            # worktree counts as unique even when its content landed elsewhere,
+            # because reachability is what a refresh would drop.
+            raise defer("unique_commits", unique_commits=unique.stdout.strip())
+        try:
+            dirty, _fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+        except WorkspaceClaimError as exc:
+            # This is the one unprovable input that does not arrive as a
+            # returncode: git_dirty_snapshot raises its own error type, which is
+            # not a WorkspaceProvisionError and would otherwise escape provision
+            # past the handler that records the deferral.
+            raise defer("dirty_snapshot_unreadable") from exc
+        if dirty:
+            raise defer("dirty_workspace", dirty_summary=list(dirty)[:20])
+        # git_dirty_snapshot excludes .vibe-loop and any configured ignored
+        # paths, so on its own it is silent about them. Untracked files there
+        # count as clean, because a fast-forward never deletes an untracked file
+        # (and refuses outright when one is in its way). A *tracked*
+        # modification behind an exclusion does not: the fast-forward would
+        # rewrite that file whenever the base touches it. Since the snapshot
+        # above is already empty, every remaining status entry comes from an
+        # excluded path, so requiring them all to be untracked is exactly that
+        # distinction.
+        status = self._git_result_at(worktree, "status", "--short")
+        if status.returncode != 0:
+            raise defer("status_unreadable")
+        for line in status.stdout.splitlines():
+            if line.strip() and not line.startswith("??"):
+                raise defer("tracked_modification_behind_ignored_path")
+        # The act re-checks both conditions itself: --ff-only refuses when HEAD
+        # is not an ancestor of the base, and merge refuses when local tracked
+        # or untracked changes would be overwritten. That leaves no window in
+        # which this call can destroy work the checks above did not see, which a
+        # `reset --hard` could not offer. It is exactly equivalent to a reset
+        # here, since zero unique commits makes the base a descendant of HEAD.
+        merged = self._git_result_at(worktree, "merge", "--ff-only", base_commit)
+        if merged.returncode != 0:
+            raise defer("fast_forward_refused")
+        refreshed = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
+        if refreshed.returncode != 0 or refreshed.stdout.strip() != base_commit:
+            raise defer("refresh_did_not_reach_base")
+        return base_commit
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context
@@ -5494,6 +5777,14 @@ def workspace_name(task_id: str) -> str:
     digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:10]
     prefix_limit = WORKSPACE_NAME_MAX_LENGTH - len(digest) - 1
     return f"{normalized[:prefix_limit]}-{digest}"
+
+
+def workspace_commit_evidence(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value) is None:
+        return ""
+    return value.lower()
 
 
 def overlay_explicit_orchestration(

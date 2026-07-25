@@ -74,7 +74,27 @@ worktree as its working directory. A clean primary worktree remains on the
 configured main branch and byte-for-byte unchanged from worker launch through
 candidate integration. Existing task worktrees may be adopted only after
 ownership, branch, cleanliness, base, and liveness checks; dirty or ambiguous
-existing work is preserved fail-closed, never reset or deleted. Provisioning
+existing work is preserved fail-closed, never reset or deleted. Adoption also
+requires the recorded current main base to be an ancestor of the workspace
+HEAD; an older workspace base appearing in current main history is not
+sufficient. An ordinary adoption whose workspace fails that requirement is
+refreshed automatically, but only when the workspace provably holds nothing to
+lose: no commit reachable only from it, no tracked modification, and a
+fast-forward onto the current base that Git itself accepts. Any condition that
+cannot be proven -- an unreadable Git state, a HEAD that moved under the check,
+a recovery adoption resuming against a recorded workspace state -- falls back to
+deferral. The preflight records a bounded typed decision, retry disposition, and
+-- when a refresh was declined -- the closed-vocabulary reason it was declined,
+before any implementation process starts, so a stale or diverged workspace that
+cannot be refreshed defers until its state changes without consuming a model
+launch, and an operator can tell a preserved workspace from an unreadable one. The durable claim must still match the validated branch, current base,
+`HEAD`, and content-sensitive dirty snapshot; a change between preflight and
+claim fails closed. Deferred recovery persists only a bounded state fingerprint and remains
+suppressed in serial and parallel dispatch until the relevant base, branch,
+`HEAD`, Git identity, or dirty state changes. Suppressed checks do not consume
+restart, recovery, or attempt budget. The same durable state gate applies to a
+normal dispatch rejected before launch, preventing ordinary task selection from
+bypassing the deferral on later supervisor cycles. Provisioning
 failures unwind without leaking task locks or half-created workspaces.
 Parallel jobs receive distinct worktrees and can never claim the primary
 worktree. Recovery reuses a preserved worker-owned workspace for the same task
