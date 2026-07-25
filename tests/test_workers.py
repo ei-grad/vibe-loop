@@ -1975,6 +1975,80 @@ class StaleLockTests(unittest.TestCase):
             self.assertIn("already settled", result.notes[0])
             self.assertFalse(manager.is_locked("TASK-01"))
 
+    def test_recovery_refuses_a_run_whose_process_is_not_proven_dead(self) -> None:
+        # A runtime-owned run latches `settlement_pending` at its activation
+        # stage and has no worker pid until the worker launches, so the latch
+        # marks live runs too. Recovery mutates the authoritative source and
+        # releases the lock, so it must act on a missing process, not on the
+        # latch - including under --force.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    contract={"mode": "runtime-owned"},
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    transition=StageTransition(
+                        from_stage=None,
+                        to_stage=RunStage.ACTIVATION,
+                        reason="run_contract_resolved",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: True,
+            )
+            source = _RecoverySource("active", settled_status="ready")
+            recovery = TaskSourceSettlementRecovery(lambda: (source, _RecoveryConfig()))
+
+            result = clean_stale_locks(
+                stale,
+                manager,
+                settlement_recovery=recovery,
+                run_store=run_store,
+                force=True,
+            )
+
+            self.assertEqual(len(stale), 1)
+            self.assertTrue(stale[0].settlement_pending)
+            self.assertEqual(stale[0].stale_reason, "missing_worker_pid")
+            self.assertEqual(stale[0].process_state, "unknown_pid")
+            self.assertFalse(stale[0].process_proven_dead)
+            # Nothing was settled, released, or even asked of the source.
+            self.assertEqual(result.cleaned, [])
+            self.assertEqual(result.recovered, [])
+            self.assertEqual(source.reset_calls, 0)
+            self.assertEqual(source.status, "active")
+            self.assertIn("not proven dead", result.errors[0][1])
+            self.assertTrue(manager.is_locked("TASK-01"))
+            self.assertNotIn(
+                "task_source_settled",
+                [record["record_type"] for record in run_store.read_records()],
+            )
+
     def test_fenced_recovery_settles_under_the_held_lock_and_releases(self) -> None:
         # The designed path, previously implemented but never called from
         # production code: settle while the lock is still held, under this

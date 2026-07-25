@@ -70,8 +70,10 @@ from vibe_loop.locks import (
     MAIN_INTEGRATION_LOCK_NAME,
     LockFencingMismatch,
     LockManager,
+    fencing_token_value,
 )
 from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore, WorkerReport
+from vibe_loop import tasks as tasks_module
 from vibe_loop.tasks import CommandTaskSource, Task
 from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
@@ -2345,6 +2347,83 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertIn("refusing unfenced reset", attempted[0]["stderr"])
         self.assertNotIn(token, json.dumps(attempted[0]))
         self.assertEqual(attempted[0]["confirmed_status"], "active")
+
+    def test_post_release_diagnostics_redact_a_token_the_call_never_sent(
+        self,
+    ) -> None:
+        # The post-release attempt carries no fencing claim, but the refusal it
+        # provokes quotes the generation the backend has stored - which, after
+        # a re-acquire, belongs to whichever run holds the lock now.
+        stored_token = fencing_token_value(self.task_lock.metadata["fencing_token"])
+        self.assertTrue(stored_token)
+        source = MutableTaskSource()
+
+        def refusing_reset(task_id: str, **kwargs: object) -> bool:
+            raise subprocess.CalledProcessError(
+                3,
+                "reset",
+                stderr=(
+                    f"refusing reset: expected fencing token {stored_token}, "
+                    f"caller sent none (token {stored_token})\n"
+                ),
+            )
+
+        source.reset = refusing_reset  # type: ignore[method-assign]
+        settler = self.settler(source, park=False, max_attempts=1)
+        self.manager.release(self.task_lock)
+
+        settler.settle_after_release("requeue")
+
+        attempted = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "task_source_settlement_attempted"
+        ]
+        stderr = str(attempted[-1]["stderr"])
+        self.assertNotIn(stored_token, stderr)
+        self.assertIn("refusing reset", stderr)
+
+    def test_truncated_diagnostics_cannot_leak_a_token_at_the_boundary(self) -> None:
+        # Bounding before redacting would cut the token's left boundary off and
+        # leave the lookbehind unable to match it.
+        token = "fencing-generation-8125"
+        source = MutableTaskSource()
+        limit = tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT
+        # Place the token so the kept tail begins four characters into it.
+        # Bounding first would keep the fragment "ing-generation-8125", whose
+        # left boundary is gone, so neither the exact-value lookbehind nor the
+        # named-field patterns can match it - the shape the reviewer
+        # reproduced as a stderr field starting "...8125 is not the current".
+        trailing = "y" * (limit + 4 - len(token) - 1)
+        stderr_text = f"xxxxx {token} {trailing}"
+
+        def refusing_reset(task_id: str, **kwargs: object) -> bool:
+            raise subprocess.CalledProcessError(3, "reset", stderr=f"{stderr_text}\n")
+
+        source.reset = refusing_reset  # type: ignore[method-assign]
+        settler = self.settler(
+            source,
+            park=False,
+            max_attempts=1,
+            runtime_context=MappingProxyType({"VIBE_LOOP_FENCING_TOKEN": token}),
+        )
+
+        settler.settle("requeue")
+
+        attempted = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "task_source_settlement_attempted"
+        ]
+        stderr = str(attempted[-1]["stderr"])
+        self.assertLessEqual(
+            len(stderr),
+            limit + len(tasks_module.TASK_SOURCE_ERROR_TRUNCATION_MARKER),
+        )
+        self.assertNotIn(token, stderr)
+        # No surviving fragment either: a truncated token is still a token.
+        self.assertNotIn("generation-8125", stderr)
+        self.assertNotIn("8125", stderr)
 
     def test_settlement_recognizes_a_source_settled_under_a_failing_adapter(
         self,

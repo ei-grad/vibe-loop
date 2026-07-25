@@ -139,6 +139,7 @@ from vibe_loop.processes import (
     read_process_node,
     read_process_table,
 )
+from vibe_loop.orchestration import RunStage, StageTransition
 from vibe_loop.workers import (
     KEEP_EVIDENCE_CHANGED,
     ActiveRunState,
@@ -1727,6 +1728,80 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertNotIn("cleaned_stale_locks:1", cycle.actions)
         self.assertFalse(
             any(record.get("record_type") == "lock_expired" for record in records)
+        )
+
+    def test_does_not_settle_a_live_run_still_in_its_activation_window(self) -> None:
+        # `settlement_pending` latches at the activation stage of every
+        # runtime-owned run, and a run that has not launched its worker yet has
+        # no pid to check. Admitting that pair would hand a LIVE run to
+        # settlement recovery, which resets its task to ready mid-run.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo, config.state_path / "locks", config.locks
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            active = ActiveRunState.new(
+                task_id="ACTIVATING-01",
+                run_id="run-activating",
+                log_path=config.state_path / "runs" / "run-activating.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+            )
+            manager.acquire(
+                "ACTIVATING-01",
+                "run-activating",
+                metadata=active.to_lock_metadata(),
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id="run-activating",
+                    task_id="ACTIVATING-01",
+                    contract={"mode": "runtime-owned"},
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-activating",
+                    task_id="ACTIVATING-01",
+                    transition=StageTransition(
+                        from_stage=None,
+                        to_stage=RunStage.ACTIVATION,
+                        reason="run_contract_resolved",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                process_exists=lambda pid: False,
+            )
+            live_lock = manager.status("ACTIVATING-01")
+            records = run_store.read_records()
+
+        self.assertIsNotNone(live_lock)
+        cycle = summary.cycles[0]
+        self.assertIn("stale_locks_present", cycle.blockers)
+        self.assertNotIn("stale_lock_cleanup_failed", cycle.blockers)
+        self.assertFalse(
+            [action for action in cycle.actions if action.startswith("cleaned_stale")]
+        )
+        self.assertFalse(
+            [action for action in cycle.actions if action.startswith("settled_stale")]
+        )
+        self.assertFalse(
+            any(
+                record.get("record_type")
+                in {"lock_expired", "lock_released", "task_source_settled"}
+                for record in records
+            )
         )
 
     def test_low_ready_queue_is_idle_without_launch(self) -> None:

@@ -1702,6 +1702,17 @@ class StaleLock:
     settled_outcome: str = ""
     settled_classification: str = ""
     settlement_pending: bool = False
+    # Live-process disposition from `classify_process`. Only "missing" is
+    # positive evidence that the run is over: "unknown_pid" is the ordinary
+    # state of a live run between lock acquisition and worker launch, and
+    # "foreign_host" says nothing about a process this host cannot see.
+    # Settlement recovery mutates the authoritative task source, so it must
+    # act on that evidence rather than on staleness alone.
+    process_state: str = ""
+
+    @property
+    def process_proven_dead(self) -> bool:
+        return self.process_state == "missing"
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1713,6 +1724,7 @@ class StaleLock:
             "recovery_command": self.recovery_command,
             "started_at": self.started_at,
             "settlement_pending": self.settlement_pending,
+            "process_state": self.process_state,
         }
 
 
@@ -1760,6 +1772,7 @@ def collect_stale_locks(
                 settled_outcome=settlement[0],
                 settled_classification=settlement[1],
                 settlement_pending=view.active.run_id in source_settlement_pending,
+                process_state=view.process_state,
             )
         )
 
@@ -2056,6 +2069,25 @@ def clean_stale_locks(
     forced_unsettled: list[StaleLock] = []
     for lock in stale_locks:
         if lock.settlement_pending:
+            if not lock.process_proven_dead:
+                # `settlement_pending` latches at the activation stage of every
+                # runtime-owned run, so it marks live runs too - a run is in it
+                # from activation until it settles. Recovery here settles the
+                # authoritative source and releases the lock, so acting on the
+                # latch alone would requeue a running task mid-run and pull the
+                # lock out from under its own worker. Staleness is not death;
+                # only a missing process is.
+                errors.append(
+                    (
+                        lock,
+                        "task-source settlement pending for a run whose process "
+                        f"is not proven dead (process_state="
+                        f"{lock.process_state or 'unknown'}); refusing to settle "
+                        "or release it. Recovery applies once the process is "
+                        "gone",
+                    )
+                )
+                continue
             settled = settlement_recovery is not None and settlement_recovery.settled(
                 lock.task_id
             )

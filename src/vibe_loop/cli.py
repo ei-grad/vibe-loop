@@ -586,7 +586,11 @@ def build_parser() -> argparse.ArgumentParser:
     workers_clean.add_argument(
         "--force",
         action="store_true",
-        help="Actually remove stale locks (default is dry-run)",
+        help=(
+            "Actually recover stale locks (default is dry-run). Releases the "
+            "locks and, for a settlement-pending lock, settles the task source "
+            "through the configured reset adapter"
+        ),
     )
 
     runs = subparsers.add_parser("runs", help="Inspect recorded run results")

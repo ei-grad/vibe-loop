@@ -5216,11 +5216,21 @@ def execute_autopilot_cycle(
     # A post-result strand is classified `result_recorded`, which wins over
     # `missing_process` in the staleness chain, so filtering on the latter
     # alone left exactly the locks that block the whole queue unreachable by
-    # any automatic recovery.
+    # any automatic recovery. The added class is that one reason and nothing
+    # broader: `settlement_pending` alone latches from the activation stage of
+    # every runtime-owned run, and a live run in its activation window has no
+    # worker pid yet (`missing_worker_pid`), so admitting the latch would feed
+    # running tasks to a recovery that settles their source and releases their
+    # lock. The proven-dead requirement is the same one cleanup enforces.
     cleanup_candidates = tuple(
         lock
         for lock in status.stale_locks
-        if lock.stale_reason == "missing_process" or lock.settlement_pending
+        if lock.stale_reason == "missing_process"
+        or (
+            lock.stale_reason == "result_recorded"
+            and lock.settlement_pending
+            and lock.process_proven_dead
+        )
     )
     if cleanup_candidates:
         lock_manager = build_lock_manager(

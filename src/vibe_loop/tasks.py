@@ -17,12 +17,15 @@ from vibe_loop.config import (
 )
 from vibe_loop.locks import (
     fencing_token_value,
+    fencing_token_values,
     redact_exact_fencing_token,
+    redact_fencing_token_diagnostic,
     redact_fencing_token_text,
 )
 
 
 TASK_SOURCE_ERROR_STREAM_LIMIT = 2000
+TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
@@ -2460,15 +2463,23 @@ def redact_task_source_subprocess_error(
 def task_source_error_diagnostics(
     error: BaseException,
     fencing_token: str = "",
+    lock_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Diagnosable evidence for a failed task-source adapter call.
 
-    Redaction removes the exact fencing token and nothing else: an adapter's
-    own refusal text is the only thing that explains why settlement failed, so
-    stripping it would leave `error_class` alone - which is what made the
-    post-result settlement deadlock undiagnosable from the run record. The
-    captured stream is bounded to its tail because adapters put the refusal on
-    the last line.
+    Redaction removes fencing tokens and nothing else: an adapter's own refusal
+    text is the only thing that explains why settlement failed, so stripping it
+    would leave `error_class` alone - which is what made the post-result
+    settlement deadlock undiagnosable from the run record. The captured stream
+    is bounded to its tail because adapters put the refusal on the last line.
+
+    Two token sources, because a refusal quotes tokens the caller never sent:
+    `fencing_token` is the claim this call carried, and `lock_metadata` covers
+    the generation the backend has stored - an unfenced call gets refusals like
+    "expected fencing token N" naming a token that may belong to whichever run
+    holds the lock now. Redaction runs before bounding, so a token straddling
+    the truncation point cannot survive as a fragment the exact-value
+    lookarounds no longer match.
     """
 
     diagnostics: dict[str, object] = {"error_class": type(error).__name__}
@@ -2478,26 +2489,35 @@ def task_source_error_diagnostics(
     timeout = getattr(error, "timeout", None)
     if isinstance(timeout, (int, float)):
         diagnostics["timeout_seconds"] = float(timeout)
-    stderr = bounded_error_stream(getattr(error, "stderr", None))
+    stderr = decoded_error_stream(getattr(error, "stderr", None))
     if stderr:
-        diagnostics["stderr"] = redact_fencing_token_text(stderr, fencing_token)
+        redacted = redact_fencing_token_diagnostic(stderr, lock_metadata or {})
+        redacted = redact_fencing_token_text(redacted, fencing_token)
+        for token in fencing_token_values(lock_metadata or {}):
+            redacted = redact_fencing_token_text(redacted, token)
+        diagnostics["stderr"] = bounded_error_stream(redacted)
     return diagnostics
+
+
+def decoded_error_stream(value: object) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace").strip()
+    if isinstance(value, str):
+        return value.strip()
+    return ""
 
 
 def bounded_error_stream(
     value: object,
     limit: int = TASK_SOURCE_ERROR_STREAM_LIMIT,
 ) -> str:
-    if isinstance(value, bytes):
-        text = value.decode("utf-8", errors="replace")
-    elif isinstance(value, str):
-        text = value
-    else:
-        return ""
-    text = text.strip()
-    if len(text) <= limit:
+    text = decoded_error_stream(value)
+    if not text or len(text) <= limit:
         return text
-    return f"...{text[-limit:]}"
+    # The marker deliberately avoids FENCING_TOKEN_VALUE_CHARACTERS: a marker
+    # made of token-class characters merges with the following text and
+    # defeats the lookbehind in the exact-token redaction.
+    return f"{TASK_SOURCE_ERROR_TRUNCATION_MARKER}{text[-limit:]}"
 
 
 def task_from_mapping(value: object, order: int) -> Task:

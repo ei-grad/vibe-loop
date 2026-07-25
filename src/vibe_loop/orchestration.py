@@ -3780,12 +3780,7 @@ class TaskSourceSettler:
                     )
                 confirmed = self._probe_for_settlement()
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                diagnostics = task_source_error_diagnostics(
-                    exc,
-                    fencing_token_value(
-                        self.runtime_context.get("VIBE_LOOP_FENCING_TOKEN")
-                    ),
-                )
+                diagnostics = self._error_diagnostics(exc)
                 # The adapter can fail after it mutated the source, and an
                 # operator can settle the source underneath a retry loop, so a
                 # failed call is not evidence that the source is unsettled.
@@ -3832,6 +3827,16 @@ class TaskSourceSettler:
         one operator-conservative attempt with no fencing claim, run after the
         release, so the circular refusal cannot happen. It never touches the
         lock, so it is safe to call when the lock is gone.
+
+        Releasing before the source is settled is safe under one configuration
+        constraint, not universally: the source's in-progress status must not
+        be in `task_source.runnable_statuses`. Dispatch admits a task by that
+        list, so an unsettled (still in-progress) task stays undispatchable and
+        an unlocked, unsettled task blocks nothing and starts nothing. A
+        configuration that lists its in-progress status as runnable - note
+        `DEFAULT_RUNNABLE_STATUSES` contains "Active" for markdown plans, whose
+        in-progress marker is different - would instead let the next dispatch
+        pick the task straight back up.
         """
 
         if intent not in {"requeue", "park"}:
@@ -3852,7 +3857,10 @@ class TaskSourceSettler:
                 self.source.reset(self.task_id)
             confirmed = self._probe_for_settlement()
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
-            diagnostics = task_source_error_diagnostics(exc)
+            # No fencing claim was sent, but the refusal can still quote the
+            # generation the backend has stored - which, after a re-acquire,
+            # belongs to a different live run.
+            diagnostics = self._error_diagnostics(exc)
             confirmed = self._probe_after_failure()
         if self._confirmed(confirmed, effective_intent):
             return self._record_settled(
@@ -3888,7 +3896,15 @@ class TaskSourceSettler:
         )
 
     def recovery_command(self, intent: str) -> str:
-        """The adapter command an operator can run once the lock is released."""
+        """The adapter command an operator can run once the lock is released.
+
+        This is the only place the run journal records a formatted adapter
+        command rather than the adapter's configured key. It is deliberate and
+        documented in `docs/deterministic-run-orchestration.md`: a failed
+        post-release settlement is the one record whose whole purpose is to
+        tell an operator what to type. Command templates take only `{task_id}`
+        and `{run_id}`, so no secret is interpolated.
+        """
 
         park = intent == "park" and bool(self.task_source_config.park_command)
         template = (
@@ -3964,6 +3980,14 @@ class TaskSourceSettler:
 
     def _probe_for_settlement(self) -> Task | None:
         return self.source.probe(self.task_id)
+
+    def _error_diagnostics(self, error: BaseException) -> dict[str, object]:
+        metadata = getattr(self.task_lock, "metadata", None)
+        return task_source_error_diagnostics(
+            error,
+            fencing_token_value(self.runtime_context.get("VIBE_LOOP_FENCING_TOKEN")),
+            metadata if isinstance(metadata, Mapping) else None,
+        )
 
     def _probe_after_failure(self) -> Task | None:
         try:
