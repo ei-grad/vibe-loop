@@ -4183,6 +4183,9 @@ class ProvisionedWorkspace:
     dirty_at_adoption: bool = False
     dirty_snapshot: tuple[str, ...] = ()
     dirty_fingerprint: str = ""
+    # Pre-refresh HEAD when a provably disposable stale workspace was
+    # fast-forwarded onto the selected base during adoption; empty otherwise.
+    refreshed_from: str = ""
 
     def to_record_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -4195,6 +4198,8 @@ class ProvisionedWorkspace:
         }
         if self.owner_run_id:
             payload["owner_run_id"] = self.owner_run_id
+        if self.refreshed_from:
+            payload["refreshed_from"] = self.refreshed_from
         return payload
 
 
@@ -4692,6 +4697,7 @@ class WorkspaceProvisioner:
                     "selected_base": base_commit,
                 },
             )
+        refreshed_from = ""
         if (
             self._git_returncode_at(
                 worktree,
@@ -4702,14 +4708,13 @@ class WorkspaceProvisioner:
             )
             != 0
         ):
-            raise WorkspaceProvisionError(
-                "workspace_stale_current_base",
-                "existing workspace does not contain the selected current base",
-                details={
-                    "selected_base": base_commit,
-                    "workspace_base": owner_base,
-                    "head_commit": head,
-                },
+            refreshed_from = head
+            head = self._refresh_stale_workspace(
+                worktree=worktree,
+                base_commit=base_commit,
+                owner_base=owner_base,
+                head=head,
+                recovery_run_id=recovery_run_id,
             )
         dirty, dirty_fingerprint = git_dirty_snapshot(
             worktree,
@@ -4754,7 +4759,101 @@ class WorkspaceProvisioner:
             dirty_at_adoption=bool(dirty),
             dirty_snapshot=tuple(dirty),
             dirty_fingerprint=dirty_fingerprint,
+            refreshed_from=refreshed_from,
         )
+
+    def _refresh_stale_workspace(
+        self,
+        *,
+        worktree: Path,
+        base_commit: str,
+        owner_base: str,
+        head: str,
+        recovery_run_id: str,
+    ) -> str:
+        """Fast-forward a provably disposable stale workspace onto the base.
+
+        Returns the refreshed HEAD, or raises the ordinary
+        ``workspace_stale_current_base`` deferral when refresh cannot be
+        *proven* safe. Every unprovable input -- a failed git invocation, an
+        unreadable worktree, a HEAD that moved under the check -- takes the
+        deferral path, so the automatic repair only ever runs on a workspace
+        that demonstrably holds nothing the refresh could lose.
+        """
+
+        from vibe_loop.workers import git_dirty_snapshot
+
+        def defer(refusal: str, **evidence: object) -> WorkspaceProvisionError:
+            return WorkspaceProvisionError(
+                "workspace_stale_current_base",
+                "existing workspace does not contain the selected current base",
+                details={
+                    "selected_base": base_commit,
+                    "workspace_base": owner_base,
+                    "head_commit": head,
+                    "refresh_refused": refusal,
+                    **evidence,
+                },
+            )
+
+        if recovery_run_id:
+            # A recovery adoption resumes against a durable pending intent that
+            # records this worktree's exact head and dirt. Moving HEAD out from
+            # under that record is a separate decision from repairing an
+            # ordinary stale workspace, so recovery keeps deferring.
+            raise defer("recovery_adoption")
+        # Re-read HEAD rather than trusting the caller's earlier read, so every
+        # condition below is evaluated against one observation of the worktree.
+        head_now = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
+        if head_now.returncode != 0 or head_now.stdout.strip() != head:
+            raise defer("head_unreadable_or_moved")
+        unique = self._git_result_at(
+            worktree,
+            "rev-list",
+            "--count",
+            f"{base_commit}..{head}",
+        )
+        if unique.returncode != 0:
+            raise defer("unique_commits_unreadable")
+        if unique.stdout.strip() != "0":
+            # Positive proof of disposability: a commit reachable only from this
+            # worktree counts as unique even when its content landed elsewhere,
+            # because reachability is what a refresh would drop.
+            raise defer("unique_commits", unique_commits=unique.stdout.strip())
+        dirty, _fingerprint = git_dirty_snapshot(
+            worktree,
+            ignored_dirty_paths=self.ignored_dirty_paths,
+        )
+        if dirty:
+            raise defer("dirty_workspace", dirty_summary=list(dirty)[:20])
+        # git_dirty_snapshot excludes .vibe-loop and any configured ignored
+        # paths, so on its own it is silent about them. Untracked files there
+        # count as clean, because a fast-forward never deletes an untracked file
+        # (and refuses outright when one is in its way). A *tracked*
+        # modification behind an exclusion does not: the fast-forward would
+        # rewrite that file whenever the base touches it. Since the snapshot
+        # above is already empty, every remaining status entry comes from an
+        # excluded path, so requiring them all to be untracked is exactly that
+        # distinction.
+        status = self._git_result_at(worktree, "status", "--short")
+        if status.returncode != 0:
+            raise defer("status_unreadable")
+        for line in status.stdout.splitlines():
+            if line.strip() and not line.startswith("??"):
+                raise defer("tracked_modification_behind_ignored_path")
+        # The act re-checks both conditions itself: --ff-only refuses when HEAD
+        # is not an ancestor of the base, and merge refuses when local tracked
+        # or untracked changes would be overwritten. That leaves no window in
+        # which this call can destroy work the checks above did not see, which a
+        # `reset --hard` could not offer. It is exactly equivalent to a reset
+        # here, since zero unique commits makes the base a descendant of HEAD.
+        merged = self._git_result_at(worktree, "merge", "--ff-only", base_commit)
+        if merged.returncode != 0:
+            raise defer("fast_forward_refused")
+        refreshed = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
+        if refreshed.returncode != 0 or refreshed.stdout.strip() != base_commit:
+            raise defer("refresh_did_not_reach_base")
+        return base_commit
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context

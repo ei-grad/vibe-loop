@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
@@ -49,6 +50,7 @@ from vibe_loop.orchestration import (
     ReviewWaitIncomplete,
     STAGE_FAILURES,
     IllegalStageTransitionError,
+    ProvisionedWorkspace,
     RunContractProposal,
     RunContractResolver,
     RunLifecycleStateMachine,
@@ -4217,6 +4219,335 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                         )
 
                     self.assertEqual(raised.exception.code, expected_code)
+
+    @staticmethod
+    def _stale_workspace(
+        directory: str,
+        *,
+        ignored_dirty_paths: tuple[Path, ...] | None = None,
+        seed: Callable[[Path], None] | None = None,
+    ) -> tuple[Path, object, ProvisionedWorkspace, str, str]:
+        """Build a task worktree left behind at an older main.
+
+        ``seed`` runs in the repo before the worktree is created; the returned
+        tuple is (repo, run store, workspace, stale base, advanced base).
+        """
+
+        repo = Path(directory) / "repo"
+        init_git_repo(repo)
+        if seed is not None:
+            seed(repo)
+        manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+        stale_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        first = WorkspaceProvisioner(
+            repo=repo,
+            main_branch="main",
+            lock_manager=manager,
+            run_store=store,
+            ignored_dirty_paths=ignored_dirty_paths or (),
+        ).provision(
+            task_id="TASK-01",
+            run_id="run-1",
+            base_commit=stale_base,
+            fencing_token=token,
+        )
+        manager.release(manager.current_lock("TASK-01"))
+        (repo / "main-change.txt").write_text("advanced\n", encoding="utf-8")
+        git(repo, "add", "main-change.txt")
+        git(repo, "commit", "-m", "advance main")
+        current_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        return repo, store, first, stale_base, current_base
+
+    @staticmethod
+    def _adopt_stale(
+        repo: Path,
+        store: object,
+        current_base: str,
+        *,
+        ignored_dirty_paths: tuple[Path, ...] | None = None,
+    ) -> ProvisionedWorkspace:
+        manager, _, token = acquire_run(repo, "TASK-01", "run-2", store=store)
+        return WorkspaceProvisioner(
+            repo=repo,
+            main_branch="main",
+            lock_manager=manager,
+            run_store=store,
+            ignored_dirty_paths=ignored_dirty_paths or (),
+        ).provision(
+            task_id="TASK-01",
+            run_id="run-2",
+            base_commit=current_base,
+            fencing_token=token,
+        )
+
+    def test_clean_stale_workspace_is_refreshed_and_adopted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+            )
+            self.assertFalse((first.worktree / "main-change.txt").exists())
+
+            adopted = self._adopt_stale(repo, store, current_base)
+
+            # The refresh, not merely a successful adoption: HEAD moved onto the
+            # advanced base and the commit's content is materially present.
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), current_base
+            )
+            self.assertTrue((first.worktree / "main-change.txt").exists())
+            self.assertEqual(adopted.refreshed_from, stale_base)
+            self.assertEqual(adopted.head_commit, current_base)
+            self.assertEqual(adopted.base_commit, current_base)
+            self.assertEqual(adopted.mode, "adopted")
+            self.assertEqual(adopted.worktree, first.worktree)
+            provisioned = [
+                record
+                for record in store.read_records()
+                if record.get("record_type") == "workspace_provisioned"
+            ]
+            self.assertEqual(provisioned[-1]["refreshed_from"], stale_base)
+            preflight = [
+                record
+                for record in store.read_records()
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("run_id") == "run-2"
+            ]
+            self.assertEqual(preflight[-1]["decision"], "reusable")
+            self.assertTrue(preflight[-1]["worker_launch_allowed"])
+
+    def test_stale_workspace_refresh_refusals_leave_the_worktree_untouched(
+        self,
+    ) -> None:
+        def commit_unique(worktree: Path) -> None:
+            (worktree / "candidate.txt").write_text("unique\n", encoding="utf-8")
+            git(worktree, "add", "candidate.txt")
+            git(worktree, "commit", "-m", "interrupted candidate")
+
+        def leave_untracked(worktree: Path) -> None:
+            (worktree / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+        def modify_tracked(worktree: Path) -> None:
+            (worktree / "README.md").write_text("modified\n", encoding="utf-8")
+
+        cases: tuple[tuple[str, Callable[[Path], None], str], ...] = (
+            ("unique_commits", commit_unique, "unique_commits"),
+            ("untracked_dirt", leave_untracked, "dirty_workspace"),
+            ("tracked_dirt", modify_tracked, "dirty_workspace"),
+        )
+        for name, disturb, expected_refusal in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                repo, store, first, stale_base, current_base = self._stale_workspace(
+                    directory
+                )
+                disturb(first.worktree)
+                head_before = git(
+                    first.worktree, "rev-parse", "HEAD"
+                ).stdout.strip()
+                status_before = git(
+                    first.worktree, "status", "--short"
+                ).stdout
+
+                with self.assertRaises(WorkspaceProvisionError) as raised:
+                    self._adopt_stale(repo, store, current_base)
+
+                self.assertEqual(
+                    raised.exception.code, "workspace_stale_current_base"
+                )
+                self.assertEqual(
+                    raised.exception.retry_disposition,
+                    "defer_until_workspace_changes",
+                )
+                self.assertEqual(
+                    raised.exception.details["refresh_refused"], expected_refusal
+                )
+                # The half that matters: a guard that refuses after refreshing
+                # is worse than no guard.
+                self.assertEqual(
+                    git(first.worktree, "rev-parse", "HEAD").stdout.strip(),
+                    head_before,
+                )
+                self.assertEqual(
+                    git(first.worktree, "status", "--short").stdout, status_before
+                )
+                self.assertFalse((first.worktree / "main-change.txt").exists())
+                self.assertTrue(first.worktree.exists())
+                if name == "unique_commits":
+                    self.assertNotEqual(head_before, stale_base)
+
+    def test_stale_workspace_refresh_fails_closed_on_unreadable_git_state(
+        self,
+    ) -> None:
+        real = WorkspaceProvisioner._git_result_at
+        # (matched git args, which matching call to disturb, replacement stdout
+        # or None for a hard failure, expected refusal). The HEAD read is
+        # matched twice -- once by the ordinary adoption path and once by the
+        # refresh guard's own re-read -- so only the second is disturbed.
+        cases: tuple[tuple[tuple[str, ...], int, str | None, str], ...] = (
+            (("rev-parse", "--verify", "HEAD"), 2, None, "head_unreadable_or_moved"),
+            (
+                ("rev-parse", "--verify", "HEAD"),
+                2,
+                "0" * 40,
+                "head_unreadable_or_moved",
+            ),
+            (("rev-list",), 1, None, "unique_commits_unreadable"),
+            (("status", "--short"), 1, None, "status_unreadable"),
+            (("merge", "--ff-only"), 1, None, "fast_forward_refused"),
+        )
+        for matched, ordinal, replacement, expected_refusal in cases:
+            with (
+                self.subTest(git_args=matched, ordinal=ordinal, stdout=replacement),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repo, store, first, stale_base, current_base = self._stale_workspace(
+                    directory
+                )
+                worktree = first.worktree
+                seen = 0
+
+                def break_git(
+                    cwd: Path,
+                    *args: str,
+                    _matched: tuple[str, ...] = matched,
+                    _ordinal: int = ordinal,
+                    _replacement: str | None = replacement,
+                    _worktree: Path = worktree,
+                ) -> subprocess.CompletedProcess[str]:
+                    nonlocal seen
+                    if Path(cwd) == _worktree and args[: len(_matched)] == _matched:
+                        seen += 1
+                        if seen == _ordinal:
+                            if _replacement is None:
+                                return subprocess.CompletedProcess(
+                                    ["git", *args], 128, "", "simulated git failure"
+                                )
+                            return subprocess.CompletedProcess(
+                                ["git", *args], 0, _replacement, ""
+                            )
+                    return real(cwd, *args)
+
+                with patch.object(
+                    WorkspaceProvisioner,
+                    "_git_result_at",
+                    staticmethod(break_git),
+                ):
+                    with self.assertRaises(WorkspaceProvisionError) as raised:
+                        self._adopt_stale(repo, store, current_base)
+
+                self.assertEqual(
+                    raised.exception.details["refresh_refused"], expected_refusal
+                )
+                self.assertEqual(
+                    git(worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+                )
+                self.assertFalse((worktree / "main-change.txt").exists())
+
+    def test_stale_workspace_refresh_rejects_head_that_did_not_reach_the_base(
+        self,
+    ) -> None:
+        real = WorkspaceProvisioner._git_result_at
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, _stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            worktree = first.worktree
+            seen = 0
+
+            def break_git(
+                cwd: Path, *args: str
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal seen
+                if Path(cwd) == worktree and args[:3] == (
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                ):
+                    seen += 1
+                    if seen == 3:
+                        return subprocess.CompletedProcess(
+                            ["git", *args], 0, "0" * 40, ""
+                        )
+                return real(cwd, *args)
+
+            with patch.object(
+                WorkspaceProvisioner, "_git_result_at", staticmethod(break_git)
+            ):
+                with self.assertRaises(WorkspaceProvisionError) as raised:
+                    self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(
+                raised.exception.details["refresh_refused"],
+                "refresh_did_not_reach_base",
+            )
+            # The fast-forward itself did land; only the post-condition read
+            # disagreed. Deferring is still the fail-closed answer, and the next
+            # dispatch finds a workspace that is no longer stale.
+            self.assertEqual(
+                git(worktree, "rev-parse", "HEAD").stdout.strip(), current_base
+            )
+
+    def test_stale_workspace_refresh_refuses_tracked_dirt_behind_ignored_path(
+        self,
+    ) -> None:
+        def seed(repo: Path) -> None:
+            vendor = repo / "vendor"
+            vendor.mkdir()
+            (vendor / "pinned.txt").write_text("pinned\n", encoding="utf-8")
+            git(repo, "add", "vendor/pinned.txt")
+            git(repo, "commit", "-m", "vendor")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory,
+                seed=seed,
+            )
+            ignored = (first.worktree / "vendor",)
+            (first.worktree / "vendor" / "pinned.txt").write_text(
+                "locally rewritten\n", encoding="utf-8"
+            )
+            # The exclusion hides the modification from the dirty snapshot, so
+            # only the tracked/untracked distinction can catch it.
+            self.assertEqual(
+                git_dirty_snapshot(first.worktree, ignored_dirty_paths=ignored)[0],
+                [],
+            )
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                self._adopt_stale(
+                    repo, store, current_base, ignored_dirty_paths=ignored
+                )
+
+            self.assertEqual(
+                raised.exception.details["refresh_refused"],
+                "tracked_modification_behind_ignored_path",
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+            )
+            self.assertEqual(
+                (first.worktree / "vendor" / "pinned.txt").read_text(encoding="utf-8"),
+                "locally rewritten\n",
+            )
+
+    def test_stale_workspace_refresh_tolerates_untracked_ignored_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            state = first.worktree / ".vibe-loop"
+            state.mkdir()
+            (state / "scratch.json").write_text("{}\n", encoding="utf-8")
+
+            adopted = self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(adopted.refreshed_from, stale_base)
+            # A fast-forward never deletes an untracked file, which is why an
+            # untracked state directory may count as clean.
+            self.assertTrue((state / "scratch.json").exists())
+            self.assertTrue((first.worktree / "main-change.txt").exists())
 
     def test_recovery_rejects_workspace_that_does_not_contain_current_base(
         self,
