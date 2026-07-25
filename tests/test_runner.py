@@ -39,6 +39,7 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     SettledOutcomeNotPersisted,
+    TaskLock,
 )
 from vibe_loop.processes import read_process_node
 from vibe_loop.orchestration import (
@@ -77,6 +78,8 @@ from vibe_loop.runner import (
     command_supports_session_resume,
     deterministic_task_batch,
     format_agent_command,
+    implementer_session_from_records,
+    reviewer_session_from_records,
     build_resume_continuation_prompt,
     classify_post_report_activity,
     classify_post_report_event,
@@ -9123,6 +9126,412 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         self.assertEqual(delta.model_id_source, "native:stdout:json.model")
         self.assertEqual(merged.model_id, "gpt-5.6-sol")
         self.assertEqual(merged.model_id_source, "native:stdout:json.model")
+
+
+class TaskSourceSessionExportTests(unittest.TestCase):
+    """The task-source environment must carry who implemented and who reviewed.
+
+    A backend attributes a status transition to those sessions, and refuses to
+    close a task whose reviewer is absent, so the runtime exports a value only
+    when the run actually recorded an attributable session for that role.
+    """
+
+    RUN_ID = "run-session-export"
+    TASK_ID = "TASK-SESSION"
+
+    def _runner(self, directory: str) -> VibeRunner:
+        return VibeRunner(VibeConfig(repo=Path(directory)))
+
+    def _lock(self, directory: str, **metadata: object) -> TaskLock:
+        return TaskLock(
+            task_id=self.TASK_ID,
+            path=Path(directory) / "task.lock",
+            metadata=dict(metadata),
+        )
+
+    def _record_session_observed(
+        self,
+        runner: VibeRunner,
+        *,
+        session_id: str,
+        session_id_source: str,
+        run_id: str = RUN_ID,
+        task_id: str = TASK_ID,
+    ) -> None:
+        runner.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task_id,
+                from_state="started",
+                to_state="session_observed",
+                reason=session_id_source,
+                payload={
+                    "session_id": session_id,
+                    "session_id_source": session_id_source,
+                },
+            )
+        )
+
+    def _record_review_verdict(
+        self,
+        runner: VibeRunner,
+        *,
+        verdict: str,
+        session_id: str,
+        session_id_source: str = "runtime_injected",
+        pass_kind: str = "initial",
+        run_id: str = RUN_ID,
+        task_id: str = TASK_ID,
+    ) -> None:
+        runner.run_store.append_lifecycle_event(
+            RunLifecycleEvent.review_verdict(
+                run_id=run_id,
+                task_id=task_id,
+                payload={
+                    "pass_kind": pass_kind,
+                    "verdict": verdict,
+                    "session_id": session_id,
+                    "session_id_source": session_id_source,
+                },
+            )
+        )
+
+    def _context(
+        self,
+        runner: VibeRunner,
+        task_lock: TaskLock,
+        runtime_context: dict[str, str] | None = None,
+    ) -> dict[str, str]:
+        return runner.task_source_runtime_context(
+            task_id=self.TASK_ID,
+            run_id=self.RUN_ID,
+            task_lock=task_lock,
+            runtime_context=runtime_context,
+        )
+
+    def test_reviewed_run_exports_both_recorded_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context["VIBE_LOOP_IMPLEMENTER_SESSION"],
+            "worker-session-a",
+        )
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-a",
+        )
+
+    def test_last_approving_pass_supplies_the_reviewer_session(self) -> None:
+        # An approval that still leaves open findings sends the candidate back
+        # through remediation, so only the final approving pass reviewed what
+        # integration merged.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-initial",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="findings",
+                session_id="reviewer-session-closure-1",
+                pass_kind="closure:1",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-closure-2",
+                session_id_source="runtime_resumed",
+                pass_kind="closure:2",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-closure-2",
+        )
+
+    def test_reviewer_session_absent_when_the_approval_is_unattributable(
+        self,
+    ) -> None:
+        # An earlier attributable approval must not stand in for the pass that
+        # actually approved the integrated candidate.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-initial",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-closure-1",
+                session_id_source="unavailable",
+                pass_kind="closure:1",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertEqual(
+            context["VIBE_LOOP_IMPLEMENTER_SESSION"],
+            "worker-session-a",
+        )
+
+    def test_approval_without_a_recorded_session_id_is_unattributable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_reviewer_session_absent_when_review_never_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="findings",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_implementer_session_absent_when_never_observed(self) -> None:
+        # The runtime falls back to the run id when it never saw a session;
+        # that names the run, not a session, so it attributes nothing.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id=self.RUN_ID,
+                session_id_source="fallback:run_id",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-a",
+        )
+
+    def test_no_records_export_neither_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_inherited_session_values_are_dropped_not_passed_through(self) -> None:
+        # An ambient value would attribute the transition to a session that did
+        # no work here, and the consumer cannot tell it from a derived one.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(
+                runner,
+                self._lock(directory),
+                {
+                    "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-implementer",
+                    "VIBE_LOOP_REVIEWER_SESSION": "ambient-reviewer",
+                },
+            )
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_another_run_and_task_never_supply_this_run_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="other-run-worker",
+                session_id_source="observed",
+                run_id="run-other",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="other-task-reviewer",
+                task_id="TASK-OTHER",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_session_ids_outside_the_identifier_alphabet_are_omitted(self) -> None:
+        # Reviewer-reported ids are agent-influenced text; a value the runtime
+        # cannot attest as an identifier is omitted rather than exported for
+        # the consumer to reject as malformed.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker session with spaces",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer\nsession",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_session_export_keeps_the_existing_context_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(
+                runner,
+                self._lock(directory, fencing_token="generation-9"),
+                {
+                    "VIBE_LOOP_REPO": "/claimed/worktree",
+                    "VIBE_LOOP_WORKTREE": "/claimed/worktree",
+                    "VIBE_LOOP_BRANCH": "vibe/claimed",
+                    "PROJECT_SELECTOR": "configured",
+                },
+            )
+
+        self.assertNotIn("VIBE_LOOP_REPO", context)
+        self.assertNotIn("VIBE_LOOP_WORKTREE", context)
+        self.assertNotIn("VIBE_LOOP_BRANCH", context)
+        self.assertEqual(context["VIBE_LOOP_FENCING_TOKEN"], "generation-9")
+        self.assertEqual(context["PROJECT_SELECTOR"], "configured")
+        self.assertEqual(context["VIBE_LOOP_TASK_ID"], self.TASK_ID)
+        self.assertEqual(context["VIBE_LOOP_RUN_ID"], self.RUN_ID)
+        self.assertEqual(context["VIBE_LOOP_PRIMARY_REPO"], str(runner.config.repo))
+
+    def test_unfenced_lock_still_omits_the_fencing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(
+                runner,
+                self._lock(directory),
+                {"VIBE_LOOP_FENCING_TOKEN": "stale-generation"},
+            )
+
+        self.assertNotIn("VIBE_LOOP_FENCING_TOKEN", context)
+
+    def test_derivation_reads_records_rather_than_reconstructing(self) -> None:
+        records = [
+            {
+                "record_type": "run_state_transition",
+                "run_id": self.RUN_ID,
+                "task_id": self.TASK_ID,
+                "to_state": "session_observed",
+                "session_id": "worker-session-a",
+                "session_id_source": "native:stdout",
+            },
+            {
+                "record_type": "review_verdict",
+                "run_id": self.RUN_ID,
+                "task_id": self.TASK_ID,
+                "verdict": "approve",
+                "session_id": "reviewer-session-a",
+                "session_id_source": "runtime_launch",
+            },
+        ]
+
+        self.assertEqual(
+            implementer_session_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ),
+            "worker-session-a",
+        )
+        self.assertEqual(
+            reviewer_session_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ),
+            "reviewer-session-a",
+        )
+
+    def test_a_non_session_state_transition_is_not_an_observation(self) -> None:
+        records = [
+            {
+                "record_type": "run_state_transition",
+                "run_id": self.RUN_ID,
+                "task_id": self.TASK_ID,
+                "to_state": "classified",
+                "session_id": "worker-session-a",
+                "session_id_source": "observed",
+            }
+        ]
+
+        self.assertEqual(
+            implementer_session_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ),
+            "",
+        )
 
 
 if __name__ == "__main__":

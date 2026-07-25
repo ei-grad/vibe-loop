@@ -116,6 +116,8 @@ from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
+    REVIEW_VERDICT_RECORD_TYPE,
+    RUN_STATE_TRANSITION_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
@@ -172,6 +174,25 @@ SESSION_ID_RE = re.compile(
     re.IGNORECASE,
 )
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+# Env names a task-source adapter reads to attribute a status transition to the
+# sessions that produced it. Absent means "the runtime cannot attest this"; the
+# consumer fails closed on a missing reviewer rather than inventing one, so the
+# runtime must never export a placeholder, an empty value, or the run id.
+IMPLEMENTER_SESSION_ENV = "VIBE_LOOP_IMPLEMENTER_SESSION"
+REVIEWER_SESSION_ENV = "VIBE_LOOP_REVIEWER_SESSION"
+# The runtime stamps this source when it never saw a session and fell back to
+# the run id. That value identifies the run, not a session, so it attributes
+# nothing.
+SESSION_ID_FALLBACK_SOURCE = "fallback:run_id"
+# A continuation reconstructed from a start record with no recorded source.
+SESSION_ID_UNAVAILABLE_SOURCE = "unavailable"
+# Session ids reach the runtime from provider output and from reviewer-reported
+# JSON, so an exported value is agent-influenced text. Accept only the bounded
+# identifier alphabet the session observers already produce; anything else is
+# unattributable and is omitted rather than exported for the consumer to reject.
+EXPORTABLE_SESSION_ID_RE = re.compile(
+    r"\A[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]{0,254}[A-Za-z0-9])?\Z"
+)
 # A bare top-level string `model` value is only a model identity inside these
 # structured lifecycle events. Any other JSON object carrying a `model` key
 # (tool payloads, task records, nested agent envelopes) is generic data.
@@ -1777,7 +1798,7 @@ class VibeRunner:
         exit_code = 1
         message = ""
         session_id = run_id
-        session_id_source = "fallback:run_id"
+        session_id_source = SESSION_ID_FALLBACK_SOURCE
         injected_session_id: str | None = None
         effective_template = command_template
         resume_session_id = (
@@ -2531,7 +2552,7 @@ class VibeRunner:
                 else:
                     session_id = stream_result.session_id or run_id
                     session_id_source = (
-                        stream_result.session_id_source or "fallback:run_id"
+                        stream_result.session_id_source or SESSION_ID_FALLBACK_SOURCE
                     )
                 final_runtime_context = command_context.prefer(
                     stream_result.runtime_context
@@ -3427,7 +3448,7 @@ class VibeRunner:
         resumable_session_id = (
             implementation_session_id
             if implementation_session_id
-            and implementation_session_id_source != "fallback:run_id"
+            and implementation_session_id_source != SESSION_ID_FALLBACK_SOURCE
             else ""
         )
         continuation = plan_session_continuation(
@@ -3735,6 +3756,28 @@ class VibeRunner:
             context["VIBE_LOOP_FENCING_TOKEN"] = fencing_token
         else:
             context.pop("VIBE_LOOP_FENCING_TOKEN", None)
+        # Session attribution is derived from what this run recorded, never
+        # inherited: an ambient or stale value in the caller's environment would
+        # attribute the transition to a session that did not do the work, and
+        # the consumer cannot tell that apart from a derived one. Unknown must
+        # reach the adapter as an absent variable, so drop before setting.
+        records = self.run_store.read_records()
+        context.pop(IMPLEMENTER_SESSION_ENV, None)
+        context.pop(REVIEWER_SESSION_ENV, None)
+        implementer_session = implementer_session_from_records(
+            records,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if implementer_session:
+            context[IMPLEMENTER_SESSION_ENV] = implementer_session
+        reviewer_session = reviewer_session_from_records(
+            records,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if reviewer_session:
+            context[REVIEWER_SESSION_ENV] = reviewer_session
         return context
 
     def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
@@ -7272,6 +7315,83 @@ def observe_worker_session_id(line: str) -> str | None:
         if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?", value):
             return value
     return None
+
+
+def exportable_session_id(record: Mapping[str, object]) -> str:
+    """Return the attributable session id a lifecycle record carries, else "".
+
+    A record attributes a session only when it names both the id and where the
+    id came from. A missing id, a missing or unattributable source, or an id
+    outside the identifier alphabet all mean "unknown", which the caller must
+    express by omitting the variable rather than exporting the value.
+    """
+
+    session_id = record.get("session_id")
+    session_id_source = record.get("session_id_source")
+    if not isinstance(session_id, str) or not isinstance(session_id_source, str):
+        return ""
+    if session_id_source in {
+        "",
+        SESSION_ID_FALLBACK_SOURCE,
+        SESSION_ID_UNAVAILABLE_SOURCE,
+    }:
+        return ""
+    if EXPORTABLE_SESSION_ID_RE.fullmatch(session_id) is None:
+        return ""
+    return session_id
+
+
+def implementer_session_from_records(
+    records: Sequence[Mapping[str, object]],
+    *,
+    run_id: str,
+    task_id: str,
+) -> str:
+    """Session id of the worker that produced this run's candidate, else "".
+
+    The run records its worker identity once, when the session is observed, so
+    the observation is read back rather than recomputed from worker output.
+    """
+
+    session_id = ""
+    for record in records:
+        if record.get("record_type") != RUN_STATE_TRANSITION_RECORD_TYPE:
+            continue
+        if record.get("run_id") != run_id or record.get("task_id") != task_id:
+            continue
+        if record.get("to_state") != "session_observed":
+            continue
+        session_id = exportable_session_id(record)
+    return session_id
+
+
+def reviewer_session_from_records(
+    records: Sequence[Mapping[str, object]],
+    *,
+    run_id: str,
+    task_id: str,
+) -> str:
+    """Session id behind the approval integration relied on, else "".
+
+    A run can approve more than once: an initial approval that still leaves
+    open findings sends the candidate back through remediation and another
+    pass, and continuation may or may not resume the same reviewer session.
+    The review loop only exits into integration on the *last* approving pass,
+    so that pass's recorded session is the one that approved what was merged.
+    Reading the last approving verdict record also means an earlier pass never
+    stands in for a later one that recorded no attributable session.
+    """
+
+    session_id = ""
+    for record in records:
+        if record.get("record_type") != REVIEW_VERDICT_RECORD_TYPE:
+            continue
+        if record.get("run_id") != run_id or record.get("task_id") != task_id:
+            continue
+        if record.get("verdict") != "approve":
+            continue
+        session_id = exportable_session_id(record)
+    return session_id
 
 
 def write_log_header(

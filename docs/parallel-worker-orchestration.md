@@ -123,6 +123,17 @@ results are missing or ambiguous.
   separate `VIBE_LOOP_PRIMARY_REPO` context; that primary path is not exported
   to the worker command. Worker report and integration-lock helpers resolve
   shared primary control state internally from the task worktree.
+- Runtime task-source adapters also receive `VIBE_LOOP_IMPLEMENTER_SESSION` and
+  `VIBE_LOOP_REVIEWER_SESSION` so a backend can attribute a status transition to
+  the session that produced the candidate and the session that approved it. Both
+  are derived from the run's own records: the run's observed worker session, and
+  the session recorded for the last approving review pass, which is the pass the
+  review loop exits into integration on. Either variable is absent when the
+  runtime has nothing attributable -- no observation, no approval, a fallback
+  source that names the run rather than a session, or an id outside the
+  identifier alphabet. Absent is the fail-closed signal; the runtime never
+  exports an empty value, a placeholder, or a value inherited from the ambient
+  environment.
 - `workers --json` and `doctor --json` cross-check claimed workspace metadata
   against `git worktree list`, the current claimed worktree status, and branch
   containment in `main` or `origin/main`. They emit diagnostic codes and manual
