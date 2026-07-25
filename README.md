@@ -1586,7 +1586,9 @@ explicit evidence links the contract to completed work.
 
 This repository uses a three-level planning model: `PROMPT.md` (philosophy,
 architecture boundaries, PRD-writing rules) → `docs/prd/` (stable `PRD-*`
-contracts) → `PLAN.md` (runnable slices with permanent task IDs).
+contracts) → the loopyard `vibe-loop` project (runnable slices with permanent
+task IDs). The runtime consumes that board through the repository's configured
+command-backed task adapter.
 
 ## Relationship to ralphex
 
@@ -1618,8 +1620,8 @@ additions stay below the authoring layer:
 - read-only spec coverage and drift checks;
 - opt-in execution gates requiring approved, current spec artifacts;
 - spec-aware worker prompt context;
-- completion evidence mapping requirements to plan rows, reports, trailers,
-  tests, and reviews.
+- completion evidence mapping requirements to task-source entries, reports,
+  trailers, tests, and reviews.
 
 ## Development
 

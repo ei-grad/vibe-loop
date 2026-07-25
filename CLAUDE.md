@@ -18,26 +18,12 @@ discover on Python 3.11 and 3.14 (minimum supported and latest).
 `PROMPT.md` is a design document, not a task to execute. Read it for
 architecture decisions, boundaries, and constraints before making design
 choices or adding features. Read `docs/prd/` for component contracts and
-`PLAN.md` for implementation slices.
+the loopyard `vibe-loop` project for implementation slices.
 
 ## Repository Task Status Authority
 
-The loopyard `vibe-loop` project is authoritative for task dispatch and current
-status. `PLAN.md` remains the implementation specification and history mirrored
-by the loopyard project setting `source = "PLAN.md ## Task Plan"`.
-
-For stable task IDs present in both sources, status presentation maps as
-follows:
-
-| PLAN.md | Loopyard stored status |
-| --- | --- |
-| `Done` | `done` |
-| `Planned` | `ready` |
-| `Blocked` | `on-hold` |
-
-`Blocked` is a PLAN presentation label. Loopyard derives `blocked` from task
-relationships and does not store it as a workflow status. Ad-hoc loopyard-only
-findings do not require matching PLAN rows.
-
-Run `uv run python tools/check_plan_board_drift.py` to compare the shared stable
-IDs without changing either source.
+The loopyard `vibe-loop` project is authoritative for implementation task
+bodies, dispatch, dependencies, and current status. `.vibe-loop.toml` binds the
+runtime to that command-backed task source. Do not create a repository-local
+mirror of the board; use loopyard task bodies for acceptance text and loopyard
+workflow states for task status.

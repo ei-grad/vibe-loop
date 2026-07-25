@@ -540,7 +540,7 @@ REFERENCE_GUARD_EXEMPT_FILES = frozenset(
 class RepoAgnosticGuardTests(unittest.TestCase):
     def test_shipped_artifacts_have_no_downstream_references(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        targets = [root / "README.md", root / "PLAN.md", root / "PROMPT.md"]
+        targets = [root / "README.md", root / "PROMPT.md"]
         for directory in SCANNED_REFERENCE_ROOTS:
             for path in (root / directory).rglob("*"):
                 if not path.is_file():
