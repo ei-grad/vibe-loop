@@ -269,6 +269,21 @@ class CliTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 2)
         self.assertIn("unrecognized arguments: TASK-02", stderr.getvalue())
 
+    def test_run_refusal_exits_nonzero_and_names_the_requested_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run", "TASK-99", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("vibe-loop: unknown task 'TASK-99'", stderr.getvalue())
+
     def test_version_flag_prints_package_version_without_loading_config(self) -> None:
         stdout = StringIO()
         stderr = StringIO()
