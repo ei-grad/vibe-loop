@@ -5,23 +5,18 @@ and flags. Start with the [README](../README.md) for installation, task
 inspection, and routine diagnostics. Configuration options live in the
 [configuration reference](configuration.md).
 
-## Authority Map
+## Document Boundaries
 
-This reference owns invocation syntax only. The linked documents remain
-authoritative for behavior:
+This reference owns command syntax, flag meanings, defaults, and immediate
+output conventions. The linked PRDs remain authoritative for lifecycle and
+product behavior:
 
 | Commands | Behavioral authority | Why |
 | --- | --- | --- |
 | `run-next`, `run-until-done` | [Run orchestration PRD](prd/run-orchestration.md#prd-orc-009-scheduler-and-runtime-separation) | The PRD owns scheduling, selection, conflict-domain, lifecycle, and budget contracts. |
 | `report`, `worker`, `main-integration` | [Worker supervision PRD](prd/worker-supervision.md#prd-wrk-003-worker-reports) | The PRD owns worker reports, workspace claims, candidate declarations, settlement, and integration locking. |
-| `eval` | [Skill evaluation strategy](skill-evaluation-strategy.md) | The strategy owns trial design, grading, artifact interpretation, and release-readiness policy. |
+| `eval` | [Evals and release PRD](prd/evals-release.md) | The PRD owns evaluation behavior, artifact contracts, external adapters, and release policy; the [evaluation strategy](skill-evaluation-strategy.md) provides methodology and rationale. |
 | Session linkage, recovery, and usage telemetry | [Autopilot PRD](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage) | PRD-AUT-013, PRD-AUT-014, and PRD-AUT-016 own these run-provenance contracts. |
-
-The former README accounts were reconciled into those owners rather than copied.
-The PRDs were authoritative where they reflected current implementation and
-tests. PRD-AUT-013 and PRD-AUT-014 were corrected where the README and current
-implementation had advanced beyond their stale Codex-session and report-less
-recovery wording.
 
 ## Run Commands
 
@@ -34,9 +29,7 @@ vibe-loop run-next --repo . --ask-agent
 ```
 
 - `--repo PATH` selects the repository. It defaults to the current directory.
-- `--ask-agent` lets the configured analysis agent choose from the mechanically
-  safe candidate set. The runtime validates the answer and falls back to
-  deterministic ready order.
+- `--ask-agent` requests configured agent-assisted selection.
 
 Result JSON remains on stdout. Progress and mirrored agent output go to stderr,
 and the complete streams are written to `.vibe-loop/runs/<run-id>.log`. The
@@ -55,8 +48,7 @@ vibe-loop run-until-done --repo . --ask-agent --jobs 2 \
 - `--ask-agent` enables validated agent-assisted selection.
 - `--jobs N` keeps up to `N` workers active. The default is `1`.
 - `--max-slices N` caps dispatched attempts, regardless of outcome.
-- `--max-tasks N` caps completed tasks. Parallel dispatch does not exceed the
-  remaining completion budget.
+- `--max-tasks N` caps completed tasks.
 - `--continue-on-failure` continues after an individual failed result.
 
 `0` means unlimited for both stop limits. Whichever nonzero limit is reached
@@ -65,17 +57,10 @@ conventions as `run-next`.
 
 The scheduler and runtime-owned lifecycle contract is
 [PRD-ORC-009](prd/run-orchestration.md#prd-orc-009-scheduler-and-runtime-separation).
-Session and transcript linkage is
-[PRD-AUT-013](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage);
-provider usage is
-[PRD-AUT-016](prd/autopilot.md#prd-aut-016-provider-usage-run-telemetry); and
-compatibility recovery is
+For session linkage, provider usage, and compatibility recovery, see
+[PRD-AUT-013](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage),
+[PRD-AUT-016](prd/autopilot.md#prd-aut-016-provider-usage-run-telemetry), and
 [PRD-AUT-014](prd/autopilot.md#prd-aut-014-unknown-run-recovery-and-continuation).
-Recognized Claude worker commands request
-`--output-format stream-json --verbose`; a command that already supplies
-`--session-id` keeps that id. If the provider is invoked with
-`--no-session-persistence`, the best-effort transcript path may not exist.
-Recognized Codex workers use `codex exec --json`.
 
 ### `vibe-loop runs summary`
 
@@ -89,10 +74,8 @@ vibe-loop runs summary --repo . --hours 24 --json
 - `--hours NUMBER` sets a positive lookback window; the default is `24`.
 - `--json` emits structured output.
 
-The summary groups durable run provenance by project, provider, model, and
-phase. It reports launch, completion, failure, restart, worker-time, token,
-cache, cost, productivity, quota, and typed budget evidence without inferring
-missing provider data or switching providers.
+Provider usage and quota behavior is defined by
+[PRD-AUT-016](prd/autopilot.md#prd-aut-016-provider-usage-run-telemetry).
 
 To copy normalized run records into an existing Loopyard project, use Loopyard's
 own command:
@@ -126,10 +109,9 @@ vibe-loop attempt-circuit reset TASK-ID --repo . --json
 
 ## Worker Lifecycle Commands
 
-These commands are intended for active worker runs. Fencing tokens are internal
-lock capabilities: do not place them in command arguments, logs, reports, or
-diagnostics. The runtime supplies the capability through the worker environment
-where required.
+These commands are intended for active worker runs. Internal fencing-token
+options are omitted from operator examples; their contract is in the
+[worker supervision PRD](prd/worker-supervision.md).
 
 ### `vibe-loop report`
 
@@ -146,13 +128,10 @@ vibe-loop report --repo "$VIBE_LOOP_REPO" \
 - `--status STATUS` accepts `completed`, `blocked`, `failed`, or `unknown`.
 - `--commit REF` records the relevant commit.
 - `--message TEXT` records a concise human-readable result.
-- `--metadata-json OBJECT` records structured metadata. Known workflows can use
-  allowlisted values such as `phase` and `work_kind`; arbitrary metadata is not
-  promoted into usage telemetry.
+- `--metadata-json OBJECT` records structured metadata.
 
-A report classifies a run; it does not mutate the task source or mark a task
-done. Runtime-owned implementation workers report only that a candidate is
-ready for runtime gates and review.
+Report classification and task-source semantics are defined by
+[PRD-WRK-003](prd/worker-supervision.md#prd-wrk-003-worker-reports).
 
 ### `vibe-loop worker claim-workspace`
 
@@ -169,9 +148,8 @@ vibe-loop worker claim-workspace --repo "$VIBE_LOOP_REPO" \
 - `--base-commit REF` can record an explicit base.
 - `--json` emits structured output.
 
-Normal supervised launches are already claimed by the runtime. This compatibility
-command verifies and records ownership; it never creates, deletes, resets,
-merges, or cleans branches or worktrees.
+Workspace-claim behavior and safety boundaries are defined by
+[PRD-WRK-006](prd/worker-supervision.md#prd-wrk-006-workspace-claims).
 
 ### `vibe-loop worker candidate`
 
@@ -184,13 +162,13 @@ vibe-loop worker candidate --repo "$VIBE_LOOP_REPO" \
 ```
 
 - `--repo PATH`, `--run-id ID`, and `--task-id ID` identify the claimed run.
-- `--head REF` is required and must match the clean tracked workspace.
+- `--head REF` is required.
 - `--base-main REF` can supply the recorded base.
 - `--changed-path PATH` can be repeated to declare changed paths.
 - `--json` emits structured output.
 
-The command validates the candidate against the active claim and records
-identity only. Runtime-owned gates consume that declaration.
+Candidate validation and runtime-gate behavior are defined by
+[PRD-ORC-004](prd/run-orchestration.md#prd-orc-004-runtime-gates-and-candidate-stabilization).
 
 ### `vibe-loop main-integration acquire`
 
@@ -204,7 +182,7 @@ vibe-loop main-integration acquire --repo "$VIBE_LOOP_REPO" \
 
 - `--repo PATH`, `--run-id ID`, and `--task-id ID` identify the active run.
 - `--pid PID` supplies the worker process id when it cannot be derived.
-- `--wait` waits while the current holder is live or unknown.
+- `--wait` enables waiting for the lock.
 - `--timeout SECONDS` bounds that wait.
 - `--poll-interval SECONDS` controls lock polling; the default is `1`.
 - `--json` emits structured output.
@@ -234,9 +212,10 @@ vibe-loop main-integration status --repo . --json
 
 ## Evaluation Commands
 
-Evaluation behavior and evidence interpretation are owned by the
-[skill evaluation strategy](skill-evaluation-strategy.md). The commands below
-are invocation entry points.
+Evaluation behavior and release policy are defined by the
+[evals and release PRD](prd/evals-release.md). The
+[skill evaluation strategy](skill-evaluation-strategy.md) explains methodology
+and evidence interpretation.
 
 ### `vibe-loop eval local-demo`
 
@@ -260,8 +239,9 @@ Common flags are:
   `--reasoning-effort EFFORT`
 - `--json`
 
-The command materializes fresh fixtures and writes `aggregate.json` and
-`aggregate.md`, including the `skill_quality` comparison.
+Artifact and aggregate behavior is defined by
+[PRD-EVL-002](prd/evals-release.md#prd-evl-002-artifact-schema) and
+[PRD-EVL-004](prd/evals-release.md#prd-evl-004-aggregate-skill-quality-reporting).
 
 ### `vibe-loop eval release-gate`
 
@@ -279,15 +259,14 @@ release-gate accepts:
 - `--eval-output PATH`
 - `--record-output PATH`
 - `--dry-run`
-- `--minimum-trials N`
+- `--minimum-trials N` (default `1`)
 - repeatable `--parked-regression REGRESSION_ID=TASK_ID`
 - repeatable `--parked-workflow-regression TASK_ID`
 - repeatable `--external-benchmark-json PATH`
 - `--json`
 
-Without `--aggregate` or `--dry-run`, the command runs the bundled release
-matrix. Unresolved workflow-contract regressions block readiness unless parked
-under an explicit task id.
+Release-readiness behavior is defined by
+[PRD-EVL-005](prd/evals-release.md#prd-evl-005-release-readiness-gate).
 
 ### `vibe-loop eval benchmark`
 
@@ -305,5 +284,5 @@ vibe-loop eval benchmark --repo . --output path/to/results \
   `--condition NAME` select execution.
 - `--trials N` and `--timeout SECONDS` set repetition and timeout.
 
-External benchmark evidence is optional context and does not replace the local
-release gate.
+External-adapter behavior is defined by
+[PRD-EVL-006](prd/evals-release.md#prd-evl-006-external-benchmark-adapters).

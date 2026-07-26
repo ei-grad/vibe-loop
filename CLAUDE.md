@@ -42,7 +42,9 @@ adding another account.
 This PRD authority does not override a narrower owner for material outside the
 Level 2 product contract. `src/vibe_loop/skills/**/SKILL.md` owns exact shipped
 skill instructions, [the configuration reference](docs/configuration.md) owns
-the operator-facing option index, and
+the operator-facing option index, the
+[CLI reference](docs/cli-reference.md) owns command syntax, flag meanings,
+defaults, and immediate output conventions, and
 [the skill eval schema](docs/skill-eval-schema.md) owns its local artifact
 format. Design and implementation references may explain rationale or mechanics,
 but must link to the PRD instead of restating its product contract.

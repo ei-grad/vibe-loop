@@ -760,11 +760,12 @@ commands use their native structured result streams while the wrapper log keeps
 the complete provider stream.
 
 For Claude, the supervisor injects a known `--session-id <uuid>` unless the
-configured command already pins one, requests the native stream-json format,
-and resolves the transcript by locating the unique session id below
-`$CLAUDE_HOME/projects/` (default `~/.claude`). The initial `run_started` record
-may carry a predicted path before the file exists; the final run context carries
-the resolved path. A provider may persist no transcript, so the path is
+configured command already pins one, requests
+`--output-format stream-json --verbose`, and resolves the transcript by locating
+the unique session id below `$CLAUDE_HOME/projects/` (default `~/.claude`). The
+initial `run_started` record may carry a predicted path before the file exists;
+the final run context carries the resolved path. A provider invoked with
+`--no-session-persistence` may persist no transcript, so the path is
 best-effort.
 
 For Codex, `thread.started` supplies the native session id from
