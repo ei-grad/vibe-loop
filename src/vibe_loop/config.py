@@ -1410,7 +1410,7 @@ def load_config(
         data, config_digest = read_config_file_snapshot(config_path)
     else:
         data = {}
-        config_digest = "sha256:" + hashlib.sha256(b"").hexdigest()
+        config_digest = ""
     config_key_fingerprints = fingerprint_config_keys(data)
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)

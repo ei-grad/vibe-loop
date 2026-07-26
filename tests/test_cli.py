@@ -9915,9 +9915,10 @@ class AutopilotCliTests(unittest.TestCase):
             )
             config = load_config(repo)
             doctor_payload = None
+            status_text = ""
 
             def launcher(command, *, cwd, log_path, on_start=None):
-                nonlocal doctor_payload
+                nonlocal doctor_payload, status_text
                 config_path.write_text(
                     config_path.read_text(encoding="utf-8").replace(
                         "jobs = 1", "jobs = 2"
@@ -9929,6 +9930,11 @@ class AutopilotCliTests(unittest.TestCase):
                     exit_code = main(["doctor", "--repo", str(repo), "--json"])
                 self.assertEqual(exit_code, 0)
                 doctor_payload = json.loads(stdout.getvalue())
+                stdout = StringIO()
+                with redirect_stdout(stdout):
+                    exit_code = main(["autopilot", "status", "--repo", str(repo)])
+                self.assertEqual(exit_code, 0)
+                status_text = stdout.getvalue()
                 return 0
 
             run_autopilot(config, once=True, launcher=launcher)
@@ -9948,6 +9954,10 @@ class AutopilotCliTests(unittest.TestCase):
             doctor_payload["advisories"][0]["code"],
             "supervisor_config_stale",
         )
+        self.assertIn("supervisor config: start=sha256:", status_text)
+        self.assertIn("per-cycle=sha256:", status_text)
+        self.assertIn("advisories:", status_text)
+        self.assertIn("supervisor_config_stale: autopilot.jobs", status_text)
 
     def test_run_once_honors_config_min_ready_without_launching(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

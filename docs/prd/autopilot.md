@@ -77,10 +77,18 @@ The supervisor has three explicit configuration lifetimes:
 
 The `autopilot_supervisor_started` record must include the loaded configuration
 fingerprint and load time. `autopilot status --json` reports those values and
-the current file fingerprint. While that supervisor is running, a mismatch
-produces a typed `supervisor_config_stale` advisory naming changed keys and
-separating per-cycle keys from restart-required keys. The per-key comparison
-material is internal journal data and must not appear in status output.
+the current file fingerprint. Supervisor-start keys are compared with that
+start snapshot; per-cycle keys are compared with the latest successfully
+applied cycle snapshot. A mismatch produces a typed
+`supervisor_config_stale` advisory naming changed keys and separating
+per-cycle keys from restart-required keys. Once a per-cycle change is applied,
+it no longer appears stale. The per-key comparison material is internal
+journal data and must not appear in status output.
+
+An unreadable or invalid file at a cycle boundary does not terminate the
+supervisor or advance the applied snapshot. The cycle retains the last valid
+configuration, withholds dispatch, records `autopilot_config_reload_failed`,
+and reports that the file must be corrected before dispatch resumes.
 
 `vibe-loop doctor` always describes the configuration file as it would be
 loaded at command invocation. When it differs from a running supervisor,

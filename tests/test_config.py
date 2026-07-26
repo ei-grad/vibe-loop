@@ -51,6 +51,7 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(Path(directory), runtime_context=dict(context))
         self.assertEqual(config.runtime_environment, dict(context))
+        self.assertEqual(config.config_digest, "")
         self.assertNotIn("runtime_context", config.config_report())
 
     def test_registry_runtime_context_rejects_malformed_and_dangerous_values(

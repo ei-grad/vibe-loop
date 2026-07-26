@@ -25,6 +25,7 @@ from vibe_loop.autopilot import (
     collect_project_status,
     collect_registry_status,
     collect_supervisor_status,
+    config_snapshot_fingerprint,
     cycle_schedule_deadline,
     load_registry_entry_config,
     default_registry_path,
@@ -1128,7 +1129,7 @@ def dispatch(args: argparse.Namespace) -> int:
         config_report = config.config_report()
         config_report.update(
             {
-                "fingerprint": config.config_digest,
+                "fingerprint": config_snapshot_fingerprint(config),
                 "perspective": "file_as_loaded_now",
             }
         )
@@ -1663,8 +1664,10 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if supervisor.config:
         lines.append(
             "supervisor config: "
-            f"{supervisor.config['loaded_fingerprint']} "
-            f"loaded {supervisor.config['loaded_at']}"
+            f"start={supervisor.config['loaded_fingerprint']} "
+            f"loaded={supervisor.config['loaded_at']} "
+            f"per-cycle={supervisor.config['per_cycle_fingerprint']} "
+            f"loaded={supervisor.config['per_cycle_loaded_at']}"
         )
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
     if supervisor.log is not None:

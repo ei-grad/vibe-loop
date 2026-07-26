@@ -847,8 +847,19 @@ def collect_supervisor_status(
                     state = "active_cycle"
                 elif phase_record.get("next_wake"):
                     state = "sleeping"
+            applied_record = next(
+                (
+                    record
+                    for record in reversed(records)
+                    if record.get("record_type") == AUTOPILOT_CYCLE_STARTED_RECORD_TYPE
+                    and str(record.get("run_id") or "") == lock_run_id
+                    and record.get("config_reload_status") == "loaded"
+                ),
+                None,
+            )
             config_report, advisories = supervisor_config_staleness(
                 config_record,
+                applied_record=applied_record,
                 current_config=current_config,
                 running=supervisor_lock.state == "held",
             )
@@ -1002,6 +1013,7 @@ def supervisor_status_from_record(
 def supervisor_config_staleness(
     record: Mapping[str, Any] | None,
     *,
+    applied_record: Mapping[str, Any] | None = None,
     current_config: VibeConfig | None,
     running: bool,
 ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
@@ -1011,17 +1023,32 @@ def supervisor_config_staleness(
     loaded_at = str(record.get("config_loaded_at") or "")
     if not loaded_fingerprint or not loaded_at:
         return {}, ()
-    current_fingerprint = current_config.config_digest
+    current_fingerprint = config_snapshot_fingerprint(current_config)
     loaded_keys = {
         str(key): str(value)
         for key, value in dict(record.get("config_key_fingerprints") or {}).items()
     }
+    applied_keys = (
+        {
+            str(key): str(value)
+            for key, value in dict(
+                applied_record.get("config_key_fingerprints") or {}
+            ).items()
+        }
+        if applied_record is not None
+        else loaded_keys
+    )
     current_keys = dict(current_config.config_key_fingerprints)
     changed_keys = tuple(
         sorted(
             key
-            for key in loaded_keys.keys() | current_keys.keys()
-            if loaded_keys.get(key) != current_keys.get(key)
+            for key in loaded_keys.keys() | applied_keys.keys() | current_keys.keys()
+            if (
+                applied_keys.get(key)
+                if config_key_lifetime(key) == "per_cycle"
+                else loaded_keys.get(key)
+            )
+            != current_keys.get(key)
         )
     )
     stale = running and bool(changed_keys)
@@ -1034,6 +1061,16 @@ def supervisor_config_staleness(
     report: dict[str, object] = {
         "loaded_fingerprint": loaded_fingerprint,
         "loaded_at": loaded_at,
+        "per_cycle_fingerprint": (
+            str(applied_record.get("config_fingerprint") or "")
+            if applied_record is not None
+            else loaded_fingerprint
+        ),
+        "per_cycle_loaded_at": (
+            str(applied_record.get("config_loaded_at") or "")
+            if applied_record is not None
+            else loaded_at
+        ),
         "current_fingerprint": current_fingerprint,
         "current_path": (
             str(current_config.config_path) if current_config.config_path else ""
@@ -1045,19 +1082,41 @@ def supervisor_config_staleness(
     }
     if not stale:
         return report, ()
+    if per_cycle_keys and restart_required_keys:
+        message = (
+            "the running supervisor uses a different configuration; per-cycle "
+            "keys apply on the next cycle, while supervisor-start keys require "
+            "a restart"
+        )
+    elif per_cycle_keys:
+        message = (
+            "the running supervisor uses a different configuration; the changed "
+            "per-cycle keys apply on the next cycle"
+        )
+    else:
+        message = (
+            "the running supervisor uses a different configuration; the changed "
+            "supervisor-start keys require a restart"
+        )
     advisory = {
         "code": "supervisor_config_stale",
         "severity": "warning",
         "changed_keys": list(changed_keys),
         "per_cycle_keys": list(per_cycle_keys),
         "restart_required_keys": list(restart_required_keys),
-        "message": (
-            "the running supervisor loaded a different configuration; per-cycle "
-            "keys apply on the next cycle, while supervisor-start keys require "
-            "a restart"
-        ),
+        "message": message,
     }
     return report, (advisory,)
+
+
+def config_snapshot_fingerprint(config: VibeConfig) -> str:
+    if config.config_digest:
+        return config.config_digest
+    encoded = json.dumps(
+        config.config_key_fingerprints,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def config_key_lifetime(key: str) -> str:
@@ -5327,6 +5386,7 @@ def execute_autopilot_cycle(
     native_planning_runner: NativePlanningRunner = run_native_planning,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
+    supervisor_blockers: tuple[str, ...] = (),
 ) -> AutopilotCycleResult:
     min_ready = require_positive_min_ready(min_ready)
     cycle_started_at = utc_now_iso()
@@ -5428,6 +5488,7 @@ def execute_autopilot_cycle(
     actions.append(cycle_summary.action)
 
     blocker_list = list(status.blockers)
+    blocker_list.extend(supervisor_blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
         blocker_list.remove("repo_dirty")
         actions.append("repo_dirty_ignored")
@@ -6333,6 +6394,7 @@ def run_autopilot(
         lease_seconds=int_value(lock.metadata.get("lease_seconds")),
     )
     cycles: list[AutopilotCycleResult] = []
+    active_cycle_config = config
     termination_signal: int | None = None
     try:
         enable_termination_signals()
@@ -6348,7 +6410,7 @@ def run_autopilot(
                 "pid": os.getpid(),
                 "log": str(supervisor_log),
                 "worktree_disposition_policy": (config.autopilot.worktree_disposition),
-                "config_fingerprint": config.config_digest,
+                "config_fingerprint": config_snapshot_fingerprint(config),
                 "config_loaded_at": config_loaded_at,
                 "config_path": str(config.config_path) if config.config_path else "",
                 "config_key_fingerprints": dict(config.config_key_fingerprints),
@@ -6359,23 +6421,45 @@ def run_autopilot(
             if should_stop is not None and should_stop():
                 break
             cycle_number += 1
-            cycle_config = reload_autopilot_cycle_config(config)
+            config_reload_error = ""
+            config_loaded_at = ""
+            try:
+                active_cycle_config = reload_autopilot_cycle_config(config)
+                config_loaded_at = utc_now_iso()
+            except (OSError, UnicodeError, ValueError) as exc:
+                config_reload_error = type(exc).__name__
+                print(
+                    "[vibe-loop] autopilot config reload failed "
+                    f"({config_reload_error}); retaining the last valid cycle "
+                    "configuration and withholding dispatch until the file is "
+                    "valid; run vibe-loop doctor after correcting the file",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            cycle_config = active_cycle_config
             cycle_jobs = jobs
             if reload_config_jobs:
                 cycle_jobs = cycle_config.autopilot.jobs or 1
             bounded_last = once or (max_cycles > 0 and cycle_number >= max_cycles)
             cycle_id = f"{supervisor_run_id}-c{cycle_number}"
-            run_store.append_record(
-                {
-                    "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
-                    "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
-                    "occurred_at": utc_now_iso(),
-                    "repo": str(config.repo),
-                    "run_id": supervisor_run_id,
-                    "cycle_id": cycle_id,
-                    "config_fingerprint": cycle_config.config_digest,
-                }
-            )
+            cycle_started_record: dict[str, object] = {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": supervisor_run_id,
+                "cycle_id": cycle_id,
+                "config_fingerprint": config_snapshot_fingerprint(cycle_config),
+                "config_reload_status": ("failed" if config_reload_error else "loaded"),
+            }
+            if config_reload_error:
+                cycle_started_record["config_reload_error"] = config_reload_error
+            else:
+                cycle_started_record["config_loaded_at"] = config_loaded_at
+                cycle_started_record["config_key_fingerprints"] = dict(
+                    cycle_config.config_key_fingerprints
+                )
+            run_store.append_record(cycle_started_record)
             result = execute_autopilot_cycle(
                 cycle_config,
                 cycle_id=cycle_id,
@@ -6394,7 +6478,18 @@ def run_autopilot(
                 disk_health_runner=disk_health_runner,
                 cycle_summary_runner=cycle_summary_runner,
                 native_planning_runner=native_planning_runner,
+                supervisor_blockers=(
+                    ("autopilot_config_reload_failed",) if config_reload_error else ()
+                ),
             )
+            if config_reload_error:
+                result = dataclasses.replace(
+                    result,
+                    actions=(
+                        *result.actions,
+                        f"config_reload_failed:{config_reload_error}",
+                    ),
+                )
             idle_wait_seconds = interval
             if (
                 not bounded_last

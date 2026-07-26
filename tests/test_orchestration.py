@@ -410,6 +410,29 @@ class RunContractResolverTests(unittest.TestCase):
             "sha256:" + hashlib.sha256(original.encode("utf-8")).hexdigest(),
         )
 
+    def test_missing_config_uses_derived_run_contract_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+            config = dataclasses.replace(
+                config,
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
+            )
+            contract = RunContractResolver(config).resolve(
+                AgentSelection(config.agent, "", "default")
+            )
+
+        source = contract.payload["source"]
+        assert isinstance(source, dict)
+        self.assertEqual(config.config_digest, "")
+        self.assertEqual(source["id"], "defaults")
+        self.assertNotEqual(
+            source["digest"],
+            "sha256:" + hashlib.sha256(b"").hexdigest(),
+        )
+
     def test_proposal_digest_accepts_non_dict_mapping(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
         config = VibeConfig(
