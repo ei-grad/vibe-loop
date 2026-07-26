@@ -217,10 +217,13 @@ gates before fast-forwarding. A content conflict remains under the same lock
 and receives one bounded continuation of the implementing session with the
 exact conflicted paths and integration-base commit. The runtime accepts only a
 clean two-parent merge-resolution commit, reruns the integration gates, and
-then continues the same run. If that continuation cannot produce a valid
-resolution, the terminal run evidence must name the preserved approved
-candidate branch and commit; a generic conflict reason alone is insufficient.
-The runtime never performs semantic conflict resolution itself.
+then continues the same run. A conflicted path whose approved-candidate content
+differs from the integration base cannot resolve to the base unchanged; that
+would discard the approved side rather than resolve it. If the continuation
+cannot produce a valid resolution, the terminal run evidence must name the
+preserved approved candidate branch and commit; a generic conflict reason alone
+is insufficient. The runtime never performs semantic conflict resolution
+itself.
 
 The runtime-owned contract must declare a completion path and contract
 validation fails closed

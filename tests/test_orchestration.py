@@ -2243,6 +2243,146 @@ class RuntimeIntegrationTests(unittest.TestCase):
             ["README.md"],
         )
 
+    def test_conflict_resolution_cannot_take_main_and_discard_candidate(
+        self,
+    ) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate conflict\n", encoding="utf-8"
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate conflict")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        (self.repo / "README.md").write_text("main conflict\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main conflict")
+        main_before = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        def discard_candidate(
+            _paths: tuple[str, ...],
+            _integration_base: str,
+        ) -> None:
+            git(self.worktree, "checkout", "--theirs", "--", "README.md")
+            git(self.worktree, "add", "README.md")
+            git(self.worktree, "update-index", "--chmod=+x", "README.md")
+            git(self.worktree, "commit", "-m", "discard candidate conflict")
+
+        result = self.integrator(conflict_resolver=discard_candidate).run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "merge_conflict")
+        self.assertFalse(result.diagnostics["resolution_commit_valid"])
+        self.assertEqual(
+            result.diagnostics["discarded_candidate_paths"],
+            ["README.md"],
+        )
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(),
+            main_before,
+        )
+
+    def test_already_merged_candidate_does_not_bypass_unresolved_merge(
+        self,
+    ) -> None:
+        git(self.repo, "checkout", "-b", "conflicting-side", self.base)
+        (self.repo / "candidate.txt").write_text("side conflict\n", encoding="utf-8")
+        git(self.repo, "add", "candidate.txt")
+        git(self.repo, "commit", "-m", "add conflicting side")
+        git(self.repo, "checkout", "main")
+        git(self.repo, "merge", "--ff-only", self.candidate_head)
+        conflict = git(
+            self.worktree,
+            "merge",
+            "--no-edit",
+            "conflicting-side",
+            check=False,
+        )
+        self.assertNotEqual(conflict.returncode, 0)
+        resolver_calls = 0
+
+        def unexpected_resolver(_paths: tuple[str, ...], _base: str) -> None:
+            nonlocal resolver_calls
+            resolver_calls += 1
+
+        result = self.integrator(conflict_resolver=unexpected_resolver).run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "merge_conflict")
+        self.assertEqual(resolver_calls, 0)
+        self.assertEqual(
+            git(
+                self.worktree,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+            ).stdout.strip(),
+            "candidate.txt",
+        )
+
+    def test_conflict_resolver_errors_keep_their_runtime_classification(
+        self,
+    ) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate conflict\n", encoding="utf-8"
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate conflict")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        (self.repo / "README.md").write_text("main conflict\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main conflict")
+
+        errors = (
+            (
+                ReviewBudgetExhausted("integration_conflict_resolution", 0),
+                "review budget exhausted for integration_conflict_resolution",
+            ),
+            (ReviewStageResultError("timeout"), "typed timeout error verdict"),
+            (
+                ReviewExecutionError("implementer exited with code 7"),
+                "implementer exited with code 7",
+            ),
+            (
+                TaskSourceCompletionError(
+                    "worker_task_source_mutation",
+                    "task source changed during conflict resolution",
+                ),
+                "task source changed during conflict resolution",
+            ),
+        )
+        for expected, original_message in errors:
+            with self.subTest(error=type(expected).__name__):
+
+                def raise_error(
+                    _paths: tuple[str, ...],
+                    _base: str,
+                    error: RuntimeError = expected,
+                ) -> None:
+                    raise error
+
+                with self.assertRaises(type(expected)) as raised:
+                    self.integrator(conflict_resolver=raise_error).run()
+
+                self.assertIn(original_message, str(raised.exception))
+                self.assertIn("approved candidate preserved", str(raised.exception))
+                self.assertNotIn("continuation attempted", str(raised.exception))
+                if isinstance(expected, ReviewBudgetExhausted):
+                    self.assertEqual(raised.exception.pass_kind, expected.pass_kind)
+                if isinstance(expected, ReviewStageResultError):
+                    self.assertEqual(
+                        raised.exception.retry_classification,
+                        expected.retry_classification,
+                    )
+                if isinstance(expected, TaskSourceCompletionError):
+                    self.assertEqual(raised.exception.code, expected.code)
+
+        self.assertFalse(self.manager.main_integration_status().locked)
+        self.assertFalse(
+            any(
+                record.get("record_type") == "integration_result"
+                for record in self.store.read_records()
+            )
+        )
+
     def test_recovery_classifies_preserved_conflict_and_releases_stale_lock(
         self,
     ) -> None:

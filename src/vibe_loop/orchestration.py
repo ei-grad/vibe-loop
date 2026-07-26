@@ -3515,6 +3515,33 @@ class Integrator:
                 diagnostics={"code": "candidate_not_ancestor_of_branch"},
                 recovered=recovered_lock,
             )
+        resolution_diagnostics: dict[str, object] = {}
+        conflicts = tuple(self._unmerged_paths())
+        if conflicts:
+            if not self._is_current_integration_conflict(branch_head, main_before):
+                return self._record_failure(
+                    "merge_conflict",
+                    status="blocked",
+                    main_before=main_before,
+                    refreshed_head=branch_head,
+                    diagnostics={
+                        "approved_candidate": True,
+                        "conflict_resolution_attempted": False,
+                        "conflicted_paths": list(conflicts),
+                        "preserved_branch": self.candidate.branch,
+                        "preserved_candidate_head": self.candidate.head_commit,
+                        "code": "unrecognized_in_progress_merge",
+                    },
+                    recovered=recovered_lock,
+                )
+            resolved = self._resolve_conflict(
+                conflicts=conflicts,
+                main_before=main_before,
+                recovered_lock=recovered_lock,
+            )
+            if isinstance(resolved, IntegrationResult):
+                return resolved
+            branch_head, resolution_diagnostics = resolved
         if self._is_ancestor(self.candidate.head_commit, main_before):
             if branch_head not in {self.candidate.head_commit, main_before}:
                 self.run_store.record_integration_provenance_refusal(
@@ -3583,18 +3610,7 @@ class Integrator:
                 provenance_outcome="settled-by-reconciliation",
             )
 
-        resolution_diagnostics: dict[str, object] = {}
-        conflicts = tuple(self._unmerged_paths())
-        if conflicts:
-            resolved = self._resolve_conflict(
-                conflicts=conflicts,
-                main_before=main_before,
-                recovered_lock=recovered_lock,
-            )
-            if isinstance(resolved, IntegrationResult):
-                return resolved
-            branch_head, resolution_diagnostics = resolved
-        elif branch_head == self.candidate.head_commit:
+        if not resolution_diagnostics and branch_head == self.candidate.head_commit:
             merge = self._git(
                 self.candidate.worktree, "merge", "--no-edit", self.main_branch
             )
@@ -3632,7 +3648,9 @@ class Integrator:
                         diagnostics={"code": "refresh_result_not_reviewed_candidate"},
                         recovered=recovered_lock,
                     )
-        elif not self._is_recoverable_refresh(branch_head):
+        elif not resolution_diagnostics and not self._is_recoverable_refresh(
+            branch_head
+        ):
             return self._record_failure(
                 "workspace_preflight_failed",
                 status="blocked",
@@ -3725,7 +3743,7 @@ class Integrator:
     ) -> tuple[str, dict[str, object]] | IntegrationResult:
         diagnostics: dict[str, object] = {
             "approved_candidate": True,
-            "conflict_resolution_attempted": self.conflict_resolver is not None,
+            "conflict_resolution_attempted": False,
             "conflicted_paths": list(conflicts),
             "preserved_branch": self.candidate.branch,
             "preserved_candidate_head": self.candidate.head_commit,
@@ -3741,16 +3759,19 @@ class Integrator:
             )
         try:
             self.conflict_resolver(conflicts, main_before)
-        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-            diagnostics["resolution_error"] = type(exc).__name__
-            return self._record_failure(
-                "merge_conflict",
-                status="blocked",
-                main_before=main_before,
-                refreshed_head=self._rev_parse(self.candidate.worktree, "HEAD"),
-                diagnostics=diagnostics,
-                recovered=recovered_lock,
+        except RuntimeError as exc:
+            exc.args = (
+                f"{exc}; approved candidate preserved on branch "
+                f"{self.candidate.branch} at {self.candidate.head_commit}",
             )
+            raise
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "integration conflict-resolution continuation failed; "
+                f"approved candidate preserved on branch {self.candidate.branch} "
+                f"at {self.candidate.head_commit}: {exc}"
+            ) from exc
+        diagnostics["conflict_resolution_attempted"] = True
 
         refreshed_head = self._rev_parse(self.candidate.worktree, "HEAD")
         remaining_conflicts = self._unmerged_paths()
@@ -3760,12 +3781,21 @@ class Integrator:
             "--porcelain=v1",
             "--untracked-files=no",
         ).stdout.strip()
+        discarded_paths, comparison_failed_paths = self._discarded_candidate_paths(
+            refreshed_head,
+            main_before,
+            conflicts,
+        )
         if (
             remaining_conflicts
             or tracked_status
             or not self._is_worker_resolved_refresh(refreshed_head, main_before)
+            or discarded_paths
+            or comparison_failed_paths
         ):
             diagnostics["remaining_conflicted_paths"] = remaining_conflicts
+            diagnostics["discarded_candidate_paths"] = list(discarded_paths)
+            diagnostics["comparison_failed_paths"] = list(comparison_failed_paths)
             diagnostics["resolution_commit_valid"] = False
             return self._record_failure(
                 "merge_conflict",
@@ -3778,6 +3808,62 @@ class Integrator:
         diagnostics["resolution_commit_valid"] = True
         diagnostics["resolved_head"] = refreshed_head
         return refreshed_head, diagnostics
+
+    def _is_current_integration_conflict(
+        self,
+        branch_head: str,
+        main_before: str,
+    ) -> bool:
+        merge_head = self._git(
+            self.candidate.worktree,
+            "rev-parse",
+            "--verify",
+            "MERGE_HEAD",
+        )
+        return bool(
+            branch_head == self.candidate.head_commit
+            and merge_head.returncode == 0
+            and merge_head.stdout.strip().splitlines() == [main_before]
+        )
+
+    def _discarded_candidate_paths(
+        self,
+        resolved_head: str,
+        main_before: str,
+        conflicts: Sequence[str],
+    ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        discarded: list[str] = []
+        comparison_failed: list[str] = []
+        for path in conflicts:
+            candidate_ok, candidate_object = self._path_object_id(
+                self.candidate.head_commit,
+                path,
+            )
+            main_ok, main_object = self._path_object_id(main_before, path)
+            resolved_ok, resolved_object = self._path_object_id(resolved_head, path)
+            if not candidate_ok or not main_ok or not resolved_ok:
+                comparison_failed.append(path)
+            elif candidate_object != main_object and resolved_object == main_object:
+                discarded.append(path)
+        return tuple(discarded), tuple(comparison_failed)
+
+    def _path_object_id(self, commit: str, path: str) -> tuple[bool, str]:
+        result = self._git(
+            self.candidate.worktree,
+            "ls-tree",
+            "-z",
+            commit,
+            "--",
+            f":(literal){path}",
+        )
+        if result.returncode != 0:
+            return False, ""
+        if not result.stdout:
+            return True, "<absent>"
+        metadata = result.stdout.rstrip("\0").split("\t", 1)[0].split()
+        if len(metadata) != 3:
+            return False, ""
+        return True, metadata[2]
 
     def _workspace_preflight(self) -> dict[str, object] | None:
         from vibe_loop.workers import build_worker_views
