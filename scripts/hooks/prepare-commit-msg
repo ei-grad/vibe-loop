@@ -1,0 +1,30 @@
+#!/bin/sh
+
+message_file=${1:-}
+source_kind=${2:-}
+
+case "$source_kind" in
+    merge | squash)
+        exit 0
+        ;;
+esac
+
+if [ -z "$message_file" ] || [ -z "${VIBE_LOOP_TASK_ID:-}" ]; then
+    exit 0
+fi
+
+if grep -qiE '^Plan-Item:' "$message_file" 2>/dev/null; then
+    exit 0
+fi
+
+set -- --trailer "Plan-Item: ${VIBE_LOOP_TASK_ID}"
+if [ -n "${VIBE_LOOP_RUN_ID:-}" ]; then
+    set -- "$@" --trailer "Run-Id: ${VIBE_LOOP_RUN_ID}"
+fi
+if [ -n "${VIBE_LOOP_AGENT_KIND:-}" ]; then
+    set -- "$@" --trailer "Agent-Kind: ${VIBE_LOOP_AGENT_KIND}"
+fi
+
+# Provenance is best-effort and must not make an otherwise valid commit fail.
+git interpret-trailers --in-place "$@" "$message_file" 2>/dev/null || true
+exit 0

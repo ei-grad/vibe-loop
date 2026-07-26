@@ -34,7 +34,7 @@ release-gate:
 install-hooks:
 	@hooks_dir="$$(git rev-parse --git-common-dir)/hooks"; \
 	mkdir -p "$$hooks_dir"; \
-	for hook in pre-commit pre-push; do \
+	for hook in prepare-commit-msg pre-commit pre-push; do \
 	  if [ -f "$$hooks_dir/$$hook" ] && ! grep -q "scripts/hooks/$$hook" "$$hooks_dir/$$hook"; then \
 	    echo "$$hooks_dir/$$hook already exists and is not managed by this repo" >&2; \
 	    exit 1; \
