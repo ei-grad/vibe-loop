@@ -3112,6 +3112,12 @@ class VibeRunner:
                     and classification.detail
                 ):
                     message = classification.detail
+            if (
+                runtime_owned
+                and classification.status != "completed"
+                and classification.detail
+            ):
+                message = classification.detail
             end_main = git_rev_parse(self.config.repo, "HEAD")
             if runtime_owned and classification.status == "completed":
                 stage_machine = RunLifecycleStateMachine.from_records(
@@ -3715,6 +3721,37 @@ class VibeRunner:
                 "runtime_integration_disabled",
                 "runtime-owned lifecycle requires runtime integration",
             )
+
+        conflict_resolution_round = stage_machine.ordinal_for(RunStage.REMEDIATION) + 1
+
+        def resolve_integration_conflict(
+            conflicted_paths: tuple[str, ...],
+            integration_base: str,
+        ) -> None:
+            if conflict_resolution_round > max_remediation_rounds:
+                raise ReviewBudgetExhausted(
+                    "integration_conflict_resolution",
+                    max_remediation_rounds,
+                )
+            self._launch_runtime_remediation(
+                task=task,
+                run_id=run_id,
+                workspace=provisioned_workspace,
+                agent=agent,
+                agent_profile=agent_profile,
+                command_env=command_env,
+                implementation_session_id=implementation_session_id,
+                implementation_session_id_source=implementation_session_id_source,
+                round_number=conflict_resolution_round,
+                conflicted_paths=conflicted_paths,
+                integration_base=integration_base,
+            )
+            self._require_runtime_task_source_unchanged(
+                run_id=run_id,
+                expected_task=task,
+                candidate=gate_summary.candidate,
+            )
+
         integration_result = Integrator(
             repo=self.config.repo,
             main_branch=self.config.main_branch,
@@ -3739,12 +3776,25 @@ class VibeRunner:
             ),
             max_lock_attempts=2,
             stage_machine=stage_machine,
+            conflict_resolver=resolve_integration_conflict,
         ).run()
         if not integration_result.completed:
+            resolution_attempted = bool(
+                integration_result.diagnostics.get("conflict_resolution_attempted")
+            )
+            detail = (
+                f"{integration_result.reason}; approved candidate preserved "
+                f"on branch {integration_result.branch} at "
+                f"{integration_result.candidate_head}"
+            )
+            if integration_result.reason == "merge_conflict":
+                detail += "; implementation conflict-resolution continuation " + (
+                    "attempted" if resolution_attempted else "not available"
+                )
             return ClassificationResult(
                 integration_result.status,
                 integration_result.reason,
-                detail=integration_result.reason,
+                detail=detail,
             )
         return ClassificationResult("completed", "runtime_lifecycle")
 
@@ -3762,6 +3812,8 @@ class VibeRunner:
         round_number: int,
         failed_gates: Sequence[str] = (),
         findings: Sequence[ReviewFinding] = (),
+        conflicted_paths: Sequence[str] = (),
+        integration_base: str = "",
     ) -> None:
         provider = agent_command_provider(
             agent.command or "",
@@ -3800,15 +3852,29 @@ class VibeRunner:
             role="implementer",
             continuation=continuation,
         )
+        instruction = (
+            "Resolve the existing integration merge conflict in the listed paths, "
+            "preserve the approved candidate and current integration-base changes, "
+            "and commit the merge resolution."
+            if conflicted_paths
+            else "Remediate the listed gate failures or review findings and commit "
+            "the remediation."
+        )
         prompt = (
-            f"Resume implementation for task {task.task_id}. The runtime owns the "
-            "lifecycle; modify only the claimed workspace, commit the remediation, "
+            f"Resume implementation for task {task.task_id}. {instruction} "
+            "The runtime owns the lifecycle; modify only the claimed workspace "
             "and return control without launching review or integration.\n"
             + json.dumps(
                 {
-                    "stage": f"remediation:{round_number}",
+                    "stage": (
+                        f"integration_conflict_resolution:{round_number}"
+                        if conflicted_paths
+                        else f"remediation:{round_number}"
+                    ),
                     "failed_gates": list(failed_gates),
                     "findings": [finding.to_payload() for finding in findings],
+                    "conflicted_paths": list(conflicted_paths),
+                    "integration_base": integration_base,
                 },
                 sort_keys=True,
             )

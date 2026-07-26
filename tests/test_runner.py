@@ -9363,6 +9363,120 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             record_types.index("task_provenance_committed"),
         )
 
+    def test_runtime_owned_conflict_returns_to_implementer_in_same_run(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            reviewer = runner.config.repo / "reviewer.py"
+            reviewer.write_text(
+                "import json\n"
+                "import subprocess\n"
+                "from pathlib import Path\n"
+                f"repo = Path({str(runner.config.repo)!r})\n"
+                "(repo / 'README.md').write_text('main advance\\n', "
+                "encoding='utf-8')\n"
+                "subprocess.run(['git', 'add', 'README.md'], cwd=repo, check=True)\n"
+                "subprocess.run(['git', 'commit', '-m', 'advance main during "
+                "review'], cwd=repo, check=True, capture_output=True, text=True)\n"
+                "print(json.dumps({\n"
+                "    'verdict': 'approve', 'findings': [],\n"
+                "    'session_id': '', 'session_id_source': '',\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "reviewer.py"],
+                cwd=runner.config.repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "add conflict reviewer fixture"],
+                cwd=runner.config.repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            source = self._enable_runtime_owned_task_source(runner, task)
+            review_agent = AgentConfig(
+                command=f"{sys.executable} {reviewer} {{prompt}}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner.config = dataclasses.replace(
+                runner.config,
+                completion=CompletionConfig(commands=("true",)),
+                agent_profiles={
+                    **runner.config.agent_profiles,
+                    "review": review_agent,
+                },
+                orchestration=OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    gates=("completion.commands[0]",),
+                    verify_on_main=("completion.commands[0]",),
+                    task_provenance_mode="adapter",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "gates",
+                            "verify_on_main",
+                            "task_provenance_mode",
+                        }
+                    ),
+                ),
+            )
+            worker_calls = 0
+
+            def implementing_worker(command, cwd, log, **kwargs):
+                nonlocal worker_calls
+                worker_calls += 1
+                if "on_start" in kwargs:
+                    kwargs["on_start"](os.getpid())
+                    content = "approved candidate\n"
+                    message = "implement approved candidate"
+                else:
+                    self.assertIn("integration_conflict_resolution", command)
+                    self.assertIn("README.md", command)
+                    content = "resolved approved candidate and main\n"
+                    message = "resolve integration conflict"
+                (cwd / "README.md").write_text(content, encoding="utf-8")
+                subprocess.run(["git", "add", "README.md"], cwd=cwd, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", message],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            result = self._run_task(runner, task, implementing_worker)
+            records = runner.run_store.read_records()
+            integration = next(
+                record
+                for record in records
+                if record.get("record_type") == "integration_result"
+                and record.get("status") == "completed"
+            )
+            main_text = (runner.config.repo / "README.md").read_text(
+                encoding="utf-8"
+            )
+
+        self.assertEqual(result.classification, "completed")
+        self.assertEqual(source.status, "done")
+        self.assertEqual(worker_calls, 2)
+        self.assertEqual(main_text, "resolved approved candidate and main\n")
+        self.assertTrue(integration["diagnostics"]["approved_candidate"])
+        self.assertTrue(integration["diagnostics"]["resolution_commit_valid"])
+        self.assertEqual(
+            sum(record.get("record_type") == "review_started" for record in records),
+            1,
+        )
+
     def test_runtime_owned_lifecycle_continues_after_verified_post_report_teardown(
         self,
     ) -> None:

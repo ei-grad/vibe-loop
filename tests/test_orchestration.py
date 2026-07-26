@@ -1937,6 +1937,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         timeout_seconds: float = 0,
         max_lock_attempts: int = 1,
         stage_machine: RunLifecycleStateMachine | None = None,
+        conflict_resolver=None,
     ) -> Integrator:
         return Integrator(
             repo=self.repo,
@@ -1962,6 +1963,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             max_lock_attempts=max_lock_attempts,
             executor=executor,
             stage_machine=stage_machine,
+            conflict_resolver=conflict_resolver,
         )
 
     def advance_main(self, *, content: str = "main\n") -> str:
@@ -2164,6 +2166,82 @@ class RuntimeIntegrationTests(unittest.TestCase):
             ).stdout.strip()
         )
         self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_merge_conflict_returns_to_implementer_and_integrates_resolution(
+        self,
+    ) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate conflict\n", encoding="utf-8"
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate conflict")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        (self.repo / "README.md").write_text("main conflict\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main conflict")
+        main_before = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        resolver_calls: list[tuple[tuple[str, ...], str]] = []
+
+        def resolve_conflict(paths: tuple[str, ...], integration_base: str) -> None:
+            resolver_calls.append((paths, integration_base))
+            self.assertTrue(self.manager.main_integration_status().locked)
+            (self.worktree / "README.md").write_text(
+                "resolved candidate and main\n",
+                encoding="utf-8",
+            )
+            git(self.worktree, "add", "README.md")
+            git(self.worktree, "commit", "-m", "resolve integration conflict")
+
+        result = self.integrator(conflict_resolver=resolve_conflict).run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(resolver_calls, [(("README.md",), main_before)])
+        self.assertEqual(
+            (self.repo / "README.md").read_text(encoding="utf-8"),
+            "resolved candidate and main\n",
+        )
+        self.assertTrue(result.diagnostics["approved_candidate"])
+        self.assertTrue(result.diagnostics["conflict_resolution_attempted"])
+        self.assertTrue(result.diagnostics["resolution_commit_valid"])
+        self.assertEqual(result.diagnostics["preserved_branch"], "worker/TASK-01")
+        self.assertEqual(
+            result.diagnostics["preserved_candidate_head"],
+            self.candidate_head,
+        )
+        self.assertEqual(
+            [check.phase for check in result.verification],
+            ["integration", "main"],
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_failed_conflict_resolution_names_preserved_approved_candidate(
+        self,
+    ) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate conflict\n", encoding="utf-8"
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate conflict")
+        self.candidate_head = git(self.worktree, "rev-parse", "HEAD").stdout.strip()
+        (self.repo / "README.md").write_text("main conflict\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "main conflict")
+
+        result = self.integrator(conflict_resolver=lambda _paths, _base: None).run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason, "merge_conflict")
+        self.assertTrue(result.diagnostics["approved_candidate"])
+        self.assertTrue(result.diagnostics["conflict_resolution_attempted"])
+        self.assertFalse(result.diagnostics["resolution_commit_valid"])
+        self.assertEqual(
+            result.diagnostics["preserved_candidate_head"],
+            self.candidate_head,
+        )
+        self.assertEqual(
+            result.diagnostics["remaining_conflicted_paths"],
+            ["README.md"],
+        )
 
     def test_recovery_classifies_preserved_conflict_and_releases_stale_lock(
         self,

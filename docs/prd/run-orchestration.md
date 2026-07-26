@@ -212,7 +212,18 @@ The final refresh, verification, fast-forward merge, and main verification
 must be executed by the runtime inside the advisory main-integration lock
 window, honoring the existing `PRD-WRK-007` lock semantics and the
 no-commit `branch_already_merged` no-op case. In runtime-owned mode the
-contract must declare a completion path and contract validation fails closed
+runtime resolves a clean mainline advance itself and reruns the configured
+gates before fast-forwarding. A content conflict remains under the same lock
+and receives one bounded continuation of the implementing session with the
+exact conflicted paths and integration-base commit. The runtime accepts only a
+clean two-parent merge-resolution commit, reruns the integration gates, and
+then continues the same run. If that continuation cannot produce a valid
+resolution, the terminal run evidence must name the preserved approved
+candidate branch and commit; a generic conflict reason alone is insufficient.
+The runtime never performs semantic conflict resolution itself.
+
+The runtime-owned contract must declare a completion path and contract
+validation fails closed
 before any mutation when none is available: either the runtime performs the
 transition through an explicit `task_source.complete` adapter under the held
 lock, or the contract declares external-confirmed completion with an explicit

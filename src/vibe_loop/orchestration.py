@@ -3377,6 +3377,7 @@ class Integrator:
         max_lock_attempts: int = 1,
         executor: GateExecutor = subprocess.run,
         stage_machine: RunLifecycleStateMachine | None = None,
+        conflict_resolver: Callable[[tuple[str, ...], str], None] | None = None,
     ) -> None:
         if max_lock_attempts < 1:
             raise ValueError("max_lock_attempts must be positive")
@@ -3397,6 +3398,7 @@ class Integrator:
         self.max_lock_attempts = max_lock_attempts
         self.executor = executor
         self.stage_machine = stage_machine
+        self.conflict_resolver = conflict_resolver
 
     def run(self) -> IntegrationResult:
         prior = self._prior_result()
@@ -3410,7 +3412,7 @@ class Integrator:
             return prior
 
         preflight = self._workspace_preflight()
-        if preflight is not None:
+        if preflight is not None and not self._can_resume_conflict(preflight):
             return self._record_preflight_failure(preflight)
 
         lock_attempt = 0
@@ -3468,7 +3470,9 @@ class Integrator:
                     )
                 return concurrent_result
             post_acquire_preflight = self._workspace_preflight()
-            if post_acquire_preflight is not None:
+            if post_acquire_preflight is not None and not self._can_resume_conflict(
+                post_acquire_preflight
+            ):
                 return self._record_preflight_failure(post_acquire_preflight)
             return self._run_locked(recovered_lock=recovered_lock)
         finally:
@@ -3579,34 +3583,55 @@ class Integrator:
                 provenance_outcome="settled-by-reconciliation",
             )
 
-        if branch_head == self.candidate.head_commit:
+        resolution_diagnostics: dict[str, object] = {}
+        conflicts = tuple(self._unmerged_paths())
+        if conflicts:
+            resolved = self._resolve_conflict(
+                conflicts=conflicts,
+                main_before=main_before,
+                recovered_lock=recovered_lock,
+            )
+            if isinstance(resolved, IntegrationResult):
+                return resolved
+            branch_head, resolution_diagnostics = resolved
+        elif branch_head == self.candidate.head_commit:
             merge = self._git(
                 self.candidate.worktree, "merge", "--no-edit", self.main_branch
             )
             if merge.returncode != 0:
-                conflicts = self._unmerged_paths()
+                conflicts = tuple(self._unmerged_paths())
                 reason = "merge_conflict" if conflicts else "merge_failed"
-                return self._record_failure(
-                    reason,
-                    status="blocked",
-                    main_before=main_before,
-                    refreshed_head=self._rev_parse(self.candidate.worktree, "HEAD"),
-                    diagnostics={
-                        "conflicted_paths": conflicts,
-                        "git_output": self._bounded_git_output(merge),
-                    },
-                    recovered=recovered_lock,
-                )
-            branch_head = self._rev_parse(self.candidate.worktree, "HEAD")
-            if not self._refresh_is_valid(branch_head):
-                return self._record_failure(
-                    "workspace_preflight_failed",
-                    status="blocked",
-                    main_before=main_before,
-                    refreshed_head=branch_head,
-                    diagnostics={"code": "refresh_result_not_reviewed_candidate"},
-                    recovered=recovered_lock,
-                )
+                if conflicts:
+                    resolved = self._resolve_conflict(
+                        conflicts=conflicts,
+                        main_before=main_before,
+                        recovered_lock=recovered_lock,
+                    )
+                    if isinstance(resolved, IntegrationResult):
+                        return resolved
+                    branch_head, resolution_diagnostics = resolved
+                else:
+                    return self._record_failure(
+                        reason,
+                        status="blocked",
+                        main_before=main_before,
+                        refreshed_head=self._rev_parse(self.candidate.worktree, "HEAD"),
+                        diagnostics={
+                            "git_output": self._bounded_git_output(merge),
+                        },
+                        recovered=recovered_lock,
+                    )
+            else:
+                branch_head = self._rev_parse(self.candidate.worktree, "HEAD")
+                if not self._refresh_is_valid(branch_head):
+                    return self._record_failure(
+                        "workspace_preflight_failed",
+                        status="blocked",
+                        main_before=main_before,
+                        refreshed_head=branch_head,
+                        diagnostics={"code": "refresh_result_not_reviewed_candidate"},
+                        recovered=recovered_lock,
+                    )
         elif not self._is_recoverable_refresh(branch_head):
             return self._record_failure(
                 "workspace_preflight_failed",
@@ -3680,8 +3705,79 @@ class Integrator:
                 main_after=main_after,
                 verification=checks,
                 recovered=recovered_lock,
+                diagnostics=resolution_diagnostics,
             )
         )
+
+    def _can_resume_conflict(self, preflight: Mapping[str, object]) -> bool:
+        return bool(
+            self.conflict_resolver is not None
+            and preflight.get("code") == "merge_conflict"
+            and preflight.get("conflicted_paths")
+        )
+
+    def _resolve_conflict(
+        self,
+        *,
+        conflicts: tuple[str, ...],
+        main_before: str,
+        recovered_lock: bool,
+    ) -> tuple[str, dict[str, object]] | IntegrationResult:
+        diagnostics: dict[str, object] = {
+            "approved_candidate": True,
+            "conflict_resolution_attempted": self.conflict_resolver is not None,
+            "conflicted_paths": list(conflicts),
+            "preserved_branch": self.candidate.branch,
+            "preserved_candidate_head": self.candidate.head_commit,
+        }
+        if self.conflict_resolver is None:
+            return self._record_failure(
+                "merge_conflict",
+                status="blocked",
+                main_before=main_before,
+                refreshed_head=self._rev_parse(self.candidate.worktree, "HEAD"),
+                diagnostics=diagnostics,
+                recovered=recovered_lock,
+            )
+        try:
+            self.conflict_resolver(conflicts, main_before)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            diagnostics["resolution_error"] = type(exc).__name__
+            return self._record_failure(
+                "merge_conflict",
+                status="blocked",
+                main_before=main_before,
+                refreshed_head=self._rev_parse(self.candidate.worktree, "HEAD"),
+                diagnostics=diagnostics,
+                recovered=recovered_lock,
+            )
+
+        refreshed_head = self._rev_parse(self.candidate.worktree, "HEAD")
+        remaining_conflicts = self._unmerged_paths()
+        tracked_status = self._git(
+            self.candidate.worktree,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ).stdout.strip()
+        if (
+            remaining_conflicts
+            or tracked_status
+            or not self._is_worker_resolved_refresh(refreshed_head, main_before)
+        ):
+            diagnostics["remaining_conflicted_paths"] = remaining_conflicts
+            diagnostics["resolution_commit_valid"] = False
+            return self._record_failure(
+                "merge_conflict",
+                status="blocked",
+                main_before=main_before,
+                refreshed_head=refreshed_head,
+                diagnostics=diagnostics,
+                recovered=recovered_lock,
+            )
+        diagnostics["resolution_commit_valid"] = True
+        diagnostics["resolved_head"] = refreshed_head
+        return refreshed_head, diagnostics
 
     def _workspace_preflight(self) -> dict[str, object] | None:
         from vibe_loop.workers import build_worker_views
@@ -4029,6 +4125,20 @@ class Integrator:
             actual_tree.returncode == 0
             and expected_tree.stdout.splitlines()[0].strip()
             == actual_tree.stdout.strip()
+        )
+
+    def _is_worker_resolved_refresh(self, head: str, main_before: str) -> bool:
+        parents = self._git(
+            self.candidate.worktree,
+            "show",
+            "-s",
+            "--format=%P",
+            head,
+        )
+        return bool(
+            parents.returncode == 0
+            and parents.stdout.strip().split()
+            == [self.candidate.head_commit, main_before]
         )
 
     def _refresh_is_valid(self, head: str) -> bool:
