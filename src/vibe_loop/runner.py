@@ -1993,6 +1993,10 @@ class VibeRunner:
             restart_count=restart_count,
             max_restarts=max_restarts,
         )
+        active_state = dataclasses.replace(
+            active_state,
+            worker_launch_publication_guarded=sys.platform == "linux",
+        )
         start_context_payload = build_run_context_payload(
             task_id=task.task_id,
             run_id=run_id,
@@ -2564,6 +2568,7 @@ class VibeRunner:
                             identity.process_birth_id if identity else ""
                         ),
                     )
+                    update_active_task_lock()
                     self.run_store.append_lifecycle_event(
                         RunLifecycleEvent.worker_process_started(
                             run_id=run_id,
@@ -2594,7 +2599,6 @@ class VibeRunner:
                             ),
                         )
                     )
-                    update_active_task_lock()
                     report_status(
                         "worker process started "
                         f"task={task.task_id} run_id={run_id} pid={worker_pid}",
@@ -8337,28 +8341,59 @@ def run_streaming_command(
     provider: str = "unknown",
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
+    launch_gate_read_fd: int | None = None
+    launch_gate_write_fd: int | None = None
     popen_kwargs: dict[str, object] = {}
+    if sys.platform == "linux":
+        # The child cannot invoke even a shell wrapper until `on_start`
+        # durably publishes its PID. Supervisor death closes the write end, so
+        # an unrecorded child observes EOF and exits without running the command.
+        launch_gate_read_fd, launch_gate_write_fd = os.pipe()
+        guarded_command = [str(item) for item in cmd] if not use_shell else [str(cmd)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "vibe_loop.worker_guard",
+            str(os.getpid()),
+            str(launch_gate_read_fd),
+            "shell" if use_shell else "exec",
+            "--",
+            *guarded_command,
+        ]
+        use_shell = False
+        popen_kwargs["pass_fds"] = (launch_gate_read_fd,)
     if os.name != "nt":
         # Own session/process group so a worker that hangs after reporting can
         # be reaped as a unit, including any orphaned background grandchildren
         # that keep its stdout/stderr pipes open.
         popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        shell=use_shell,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        env=env,
-        **popen_kwargs,
-    )
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            shell=use_shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            **popen_kwargs,
+        )
+    except BaseException:
+        if launch_gate_read_fd is not None:
+            os.close(launch_gate_read_fd)
+        if launch_gate_write_fd is not None:
+            os.close(launch_gate_write_fd)
+        raise
+    if launch_gate_read_fd is not None:
+        os.close(launch_gate_read_fd)
     try:
         if on_start is not None:
             on_start(process.pid)
+        if launch_gate_write_fd is not None:
+            os.write(launch_gate_write_fd, b"\0")
     # Startup callbacks persist ownership evidence. Every failure, including
     # interruption, must reap the new group before that evidence can be lost.
     except BaseException:
@@ -8382,6 +8417,8 @@ def run_streaming_command(
         except OSError:
             pass
         finally:
+            if launch_gate_write_fd is not None:
+                os.close(launch_gate_write_fd)
             for pipe in (process.stdout, process.stderr):
                 if pipe is None:
                     continue
@@ -8390,6 +8427,8 @@ def run_streaming_command(
                 except OSError:
                     pass
         raise
+    if launch_gate_write_fd is not None:
+        os.close(launch_gate_write_fd)
     assert process.stdout is not None
     assert process.stderr is not None
     # Captured immediately after Popen while the PID is still ours, so a later

@@ -2926,6 +2926,86 @@ class RunnerTests(unittest.TestCase):
         self.assertGreater(started_pids[0], 0)
 
     @unittest.skipUnless(
+        sys.platform == "linux", "launch publication barrier requires Linux"
+    )
+    def test_streaming_command_waits_for_pid_publication_before_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker_path = root / "worker-ran"
+            script = root / "cmd.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker_path)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            log_path = root / "run.log"
+
+            def publish_pid(worker_pid: int) -> None:
+                self.assertGreater(worker_pid, 0)
+                self.assertFalse(marker_path.exists())
+                time.sleep(0.2)
+                self.assertFalse(marker_path.exists())
+
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    root,
+                    log,
+                    on_start=publish_pid,
+                )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(marker_path.exists())
+
+    @unittest.skipUnless(
+        sys.platform == "linux", "launch publication barrier requires Linux"
+    )
+    def test_worker_guard_blocks_shell_until_pid_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid_path = root / "child.pid"
+            marker_path = root / "worker-ran"
+            worker_code = (
+                "import time\n"
+                "from pathlib import Path\n"
+                "time.sleep(0.5)\n"
+                f"Path({str(marker_path)!r}).write_text('ran', encoding='utf-8')\n"
+            )
+            parent_code = (
+                "import os\n"
+                "import subprocess\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"worker_code = {worker_code!r}\n"
+                "gate_read, gate_write = os.pipe()\n"
+                "child = subprocess.Popen([\n"
+                "    sys.executable, '-m', 'vibe_loop.worker_guard',\n"
+                "    str(os.getpid()), str(gate_read), 'shell', '--',\n"
+                "    f'{sys.executable} -c {repr(worker_code)}',\n"
+                "], pass_fds=(gate_read,))\n"
+                "os.close(gate_read)\n"
+                f"Path({str(child_pid_path)!r}).write_text("
+                "str(child.pid), encoding='utf-8')\n"
+            )
+
+            subprocess.run(
+                [sys.executable, "-c", parent_code],
+                cwd=root,
+                check=True,
+            )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                node = read_process_node(child_pid)
+                if node is None or node.state == "Z":
+                    break
+                time.sleep(0.01)
+
+            self.assertFalse(marker_path.exists())
+            node = read_process_node(child_pid)
+            self.assertTrue(node is None or node.state == "Z", node)
+
+    @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"
     )
     def test_streaming_command_reaps_group_when_start_recording_fails(self) -> None:
@@ -2958,11 +3038,8 @@ class RunnerTests(unittest.TestCase):
 
             def fail_to_record(worker_pid: int) -> None:
                 started_pids.append(worker_pid)
-                deadline = time.monotonic() + 2.0
-                while not child_ready_path.is_file() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(child_path.is_file())
-                self.assertTrue(child_ready_path.is_file())
+                self.assertFalse(child_path.is_file())
+                self.assertFalse(child_ready_path.is_file())
                 raise OSError("worker identity record store unavailable")
 
             try:
@@ -2974,8 +3051,7 @@ class RunnerTests(unittest.TestCase):
                             log,
                             on_start=fail_to_record,
                         )
-                child_pid = int(child_path.read_text(encoding="utf-8"))
-                process_pids = (*started_pids, child_pid)
+                process_pids = tuple(started_pids)
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
                     if all(read_process_node(pid) is None for pid in process_pids):
@@ -2985,6 +3061,8 @@ class RunnerTests(unittest.TestCase):
                     all(read_process_node(pid) is None for pid in process_pids),
                     process_pids,
                 )
+                self.assertFalse(child_path.exists())
+                self.assertFalse(child_ready_path.exists())
             finally:
                 if started_pids:
                     try:

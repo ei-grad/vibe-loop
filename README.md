@@ -714,14 +714,26 @@ exists in either the lock or the local records, recovery fails closed with
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch
-decision it cleans only stale worker locks whose recorded worker process is
-missing — the same validated, audited path as `vibe-loop workers clean --force`
-(it emits `lock_expired` records and never deletes worktrees, resets branches,
-steals live locks, or removes a lock that has not yet observed a worker PID).
-Each cycle then runs a native worktree-disposition step and gathers per-worktree
-evidence mechanically. The default `report-only` policy journals eligible
-candidates without invoking the analysis agent, removing a worktree, or deleting
-a branch. Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
+decision it cleans only stale worker locks whose recorded process identity is
+proven absent — the same validated, audited path as
+`vibe-loop workers clean --force`. On Linux, the worker launcher blocks on an
+inherited publication pipe before it invokes the configured command, including
+commands routed through `/bin/sh`. The supervisor releases that barrier only
+after the worker PID is written to the lock and its redundant durable start
+event. Before PID publication, recovery therefore requires the recorded launch
+barrier plus an absent or birth-mismatched supervisor identity; supervisor
+death closes the pipe without letting any worker or shell command execute. Once
+the barrier opens, either durable PID source makes only the worker identity
+authoritative. A live, foreign-host, or identity-ambiguous process fails closed.
+Legacy and non-Linux pre-worker locks without the publication-barrier proof
+remain unsupported, and
+`autopilot status` names the offending task and that limitation. Cleanup emits
+`lock_expired` records and never deletes worktrees, resets branches, or steals
+live locks. Each cycle then runs a native worktree-disposition step and gathers
+per-worktree evidence mechanically. The default `report-only` policy journals
+eligible candidates without invoking the analysis agent, removing a worktree,
+or deleting a branch.
+Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
 `--worktree-disposition reap` CLI override opts in to automatic disposition.
 Under that policy, the read-only analysis agent must return a reasoned reap
 decision and the executor still limits removal (`git worktree remove` plus

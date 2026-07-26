@@ -86,6 +86,8 @@ class WorkerStateTests(unittest.TestCase):
                 run_id="run-1",
                 worker_pid=1234,
                 supervisor_pid=5678,
+                supervisor_process_birth_id="boot-id:42",
+                worker_launch_publication_guarded=True,
                 host="test-host",
                 started_at="2026-05-09T00:00:00+00:00",
                 log_path=log_path,
@@ -145,6 +147,8 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].pid_source, "popen")
         self.assertEqual(loaded[0].pid_scope, "configured_command_process")
         self.assertEqual(loaded[0].supervisor_pid, 5678)
+        self.assertEqual(loaded[0].supervisor_process_birth_id, "boot-id:42")
+        self.assertTrue(loaded[0].worker_launch_publication_guarded)
         self.assertEqual(loaded[0].host, "test-host")
         self.assertEqual(loaded[0].started_at, "2026-05-09T00:00:00+00:00")
         self.assertEqual(loaded[0].log_path, log_path)
@@ -809,6 +813,73 @@ class WorkerStateTests(unittest.TestCase):
             "running",
         )
 
+    def test_supervisor_identity_proves_pre_worker_process_liveness(self) -> None:
+        state = ActiveRunState(
+            task_id="PAR-02",
+            run_id="run-1",
+            worker_pid=None,
+            supervisor_pid=100,
+            supervisor_process_birth_id="boot-id:500",
+            worker_launch_publication_guarded=True,
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-02",
+        )
+
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: True,
+                birth_identity_lookup=lambda pid: "boot-id:500",
+            ),
+            "running",
+        )
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: False,
+                birth_identity_lookup=lambda pid: "boot-id:500",
+            ),
+            "missing",
+        )
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: True,
+                birth_identity_lookup=lambda pid: "boot-id:900",
+            ),
+            "missing",
+        )
+
+    def test_pre_worker_identity_lookup_failure_remains_unproven(self) -> None:
+        state = ActiveRunState(
+            task_id="PAR-02",
+            run_id="run-1",
+            supervisor_pid=100,
+            supervisor_process_birth_id="boot-id:500",
+            worker_launch_publication_guarded=True,
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-02",
+        )
+
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: True,
+                birth_identity_lookup=lambda pid: "",
+            ),
+            "unknown_pid",
+        )
+
     def test_worker_view_reports_birth_identity_presence_not_its_value(self) -> None:
         state = ActiveRunState(
             task_id="PAR-02",
@@ -895,6 +966,35 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(restored.worker_session_id, 320)
         self.assertEqual(restored.worker_process_birth_id, "boot-id:777")
         self.assertTrue(views[0].to_json()["worker_process_birth_id_known"])
+
+    def test_worker_view_restores_pid_published_only_in_start_record(self) -> None:
+        active = dataclasses.replace(
+            ActiveRunState.new(
+                task_id="PAR-03",
+                run_id="run-2",
+                log_path=Path("run.log"),
+                base_main="abc123",
+                command="agent PAR-03",
+            ),
+            worker_pid=None,
+        )
+        record = RunLifecycleEvent.worker_process_started(
+            run_id="run-2",
+            task_id="PAR-03",
+            worker_pid=321,
+            supervisor_pid=active.supervisor_pid or 1,
+            process_group_id=321,
+            session_id=320,
+            process_birth_id="boot-id:777",
+            host=active.host,
+        ).to_record()
+
+        restored = restore_projected_worker_process_identity(active, [record])
+
+        self.assertEqual(restored.worker_pid, 321)
+        self.assertEqual(restored.worker_process_group_id, 321)
+        self.assertEqual(restored.worker_session_id, 320)
+        self.assertEqual(restored.worker_process_birth_id, "boot-id:777")
 
     def test_worker_identity_record_requires_exact_projected_owner(self) -> None:
         active = dataclasses.replace(
@@ -2042,12 +2142,103 @@ class StaleLockTests(unittest.TestCase):
             self.assertEqual(result.recovered, [])
             self.assertEqual(source.reset_calls, 0)
             self.assertEqual(source.status, "active")
-            self.assertIn("not proven dead", result.errors[0][1])
+            self.assertIn("no supported command", result.errors[0][1])
             self.assertTrue(manager.is_locked("TASK-01"))
             self.assertNotIn(
                 "task_source_settled",
                 [record["record_type"] for record in run_store.read_records()],
             )
+
+    def test_recovery_settles_a_run_that_died_before_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=None,
+                supervisor_pid=100,
+                supervisor_process_birth_id="boot-id:500",
+                worker_launch_publication_guarded=True,
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    contract={"mode": "runtime-owned"},
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    transition=StageTransition(
+                        from_stage=None,
+                        to_stage=RunStage.ACTIVATION,
+                        reason="run_contract_resolved",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            source = _RecoverySource("active", settled_status="ready")
+            recovery = TaskSourceSettlementRecovery(lambda: (source, _RecoveryConfig()))
+
+            result = clean_stale_locks(
+                stale,
+                manager,
+                settlement_recovery=recovery,
+                run_store=run_store,
+                force=True,
+            )
+
+            self.assertEqual(len(stale), 1)
+            self.assertEqual(stale[0].process_state, "missing")
+            self.assertTrue(stale[0].process_proven_dead)
+            self.assertTrue(stale[0].recovery_supported)
+            self.assertEqual([lock.task_id for lock in result.cleaned], ["TASK-01"])
+            self.assertEqual(result.errors, [])
+            self.assertGreaterEqual(source.reset_calls, 1)
+            self.assertFalse(manager.is_locked("TASK-01"))
+
+    def test_only_identity_ambiguous_settlement_locks_are_unrecoverable(
+        self,
+    ) -> None:
+        base = StaleLock(
+            task_id="TASK-01",
+            run_id="run-1",
+            lock_path=Path("task.lock"),
+            stale_reason="result_recorded",
+            kind="task",
+            recovery_command="vibe-loop workers clean --force",
+            settlement_pending=True,
+        )
+
+        self.assertFalse(
+            dataclasses.replace(base, process_state="unknown_pid").recovery_supported
+        )
+        self.assertTrue(
+            dataclasses.replace(base, process_state="running").recovery_supported
+        )
+        self.assertTrue(
+            dataclasses.replace(base, process_state="foreign_host").recovery_supported
+        )
+        self.assertTrue(
+            dataclasses.replace(base, process_state="missing").recovery_supported
+        )
 
     def test_fenced_recovery_settles_under_the_held_lock_and_releases(self) -> None:
         # The designed path, previously implemented but never called from

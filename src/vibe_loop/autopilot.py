@@ -1073,6 +1073,14 @@ def project_blockers(
         blockers.append(f"agent_unavailable: {diagnostic}")
     if stale_locks:
         blockers.append("stale_locks_present")
+        blockers.extend(
+            "unrecoverable_stale_lock: "
+            f"task={lock.task_id} process_state={lock.process_state or 'unknown'}; "
+            "no supported command can clear it without proof that its process "
+            "is gone"
+            for lock in stale_locks
+            if not lock.recovery_supported
+        )
     if any(
         diagnostic.get("severity") == "stale" for diagnostic in workspace_diagnostics
     ):
