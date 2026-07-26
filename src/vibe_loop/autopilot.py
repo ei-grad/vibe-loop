@@ -1444,7 +1444,7 @@ class AutopilotReloadResult:
 
     @property
     def exit_code(self) -> int:
-        return 0 if self.reloaded else 2
+        return 0 if self.reloaded or self.state == "pending" else 2
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1609,6 +1609,7 @@ def detached_autopilot_command(
         str(min_ready),
         "--worktree-disposition",
         config.autopilot.worktree_disposition,
+        "--detached-reload-signal",
     ]
     if reload_config_jobs:
         command.append("--reload-config-jobs")
@@ -2899,7 +2900,6 @@ def reload_detached_autopilot(
         pid=pid,
         request_id=request_id,
         changed_keys=changed_keys,
-        blocker="autopilot_reload_timeout",
     )
 
 
@@ -6384,6 +6384,7 @@ def wait_for_idle_change(
     max_poll_seconds: float,
     sleeper: Sleep,
     should_stop: Callable[[], bool] | None = None,
+    should_reload: Callable[[], bool] | None = None,
     runnable_probe: IdleRunnableProbe | None = None,
     min_ready: int = 1,
     wake_adapter: IdleWakeAdapter | None = None,
@@ -6417,6 +6418,18 @@ def wait_for_idle_change(
     adapter_errors: list[str] = []
 
     while remaining_budget > _RECHECK_EPSILON:
+        if should_reload is not None and should_reload():
+            return IdleWaitResult(
+                cycle_id=cycle_id,
+                wake_reason="reload",
+                deadline=deadline,
+                poll_count=polls,
+                adapter_calls=adapter_calls,
+                source_error_count=source_error_count,
+                adapter_error_count=adapter_error_count,
+                source_errors=tuple(source_errors),
+                adapter_errors=tuple(adapter_errors),
+            )
         remaining = min(remaining_budget, max(deadline_at - clock(), 0.0))
         if remaining <= _RECHECK_EPSILON:
             break
@@ -6449,6 +6462,18 @@ def wait_for_idle_change(
         if sleep_for > _RECHECK_EPSILON:
             sleeper(sleep_for)
         remaining_budget -= wait_budget
+        if should_reload is not None and should_reload():
+            return IdleWaitResult(
+                cycle_id=cycle_id,
+                wake_reason="reload",
+                deadline=deadline,
+                poll_count=polls,
+                adapter_calls=adapter_calls,
+                source_error_count=source_error_count,
+                adapter_error_count=adapter_error_count,
+                source_errors=tuple(source_errors),
+                adapter_errors=tuple(adapter_errors),
+            )
         if should_stop is not None and should_stop():
             return IdleWaitResult(
                 cycle_id=cycle_id,
@@ -6576,7 +6601,11 @@ def autopilot_termination_signals(
     reload_signal = getattr(signal, "SIGHUP", None)
     installed_signal_numbers = (
         *handled_signals,
-        *((reload_signal,) if reload_signal is not None else ()),
+        *(
+            (reload_signal,)
+            if reload_signal is not None and on_reload is not None
+            else ()
+        ),
     )
     previous_handlers = {
         signal_number: signal.getsignal(signal_number)
@@ -6609,7 +6638,7 @@ def autopilot_termination_signals(
         for stop_signal in handled_signals:
             signal.signal(stop_signal, request_stop)
             installed_signals.append(stop_signal)
-        if reload_signal is not None:
+        if reload_signal is not None and on_reload is not None:
             signal.signal(reload_signal, request_reload)
             installed_signals.append(reload_signal)
 
@@ -6670,7 +6699,7 @@ def apply_autopilot_reload_request(
     run_store: RunStore,
     run_id: str,
     request: Mapping[str, Any],
-) -> tuple[VibeConfig, str]:
+) -> tuple[VibeConfig, str, str]:
     request_id = str(request.get("request_id") or "")
     try:
         current = load_config(
@@ -6692,7 +6721,7 @@ def apply_autopilot_reload_request(
                 "blocker": blocker,
             }
         )
-        return active_config, blocker
+        return active_config, "failed", blocker
 
     changed_from_start = changed_config_keys(
         config.config_key_fingerprints,
@@ -6721,7 +6750,7 @@ def apply_autopilot_reload_request(
                 "blocker": blocker,
             }
         )
-        return active_config, blocker
+        return active_config, "refused", blocker
 
     loaded = autopilot_cycle_config_from_current(config, current)
     changed_keys = changed_config_keys(
@@ -6744,7 +6773,7 @@ def apply_autopilot_reload_request(
             "changed_keys": list(changed_keys),
         }
     )
-    return loaded, ""
+    return loaded, ("loaded" if changed_keys else "unchanged"), ""
 
 
 def run_autopilot(
@@ -6774,6 +6803,7 @@ def run_autopilot(
     ),
     should_stop: Callable[[], bool] | None = None,
     install_signal_handlers: bool = True,
+    install_reload_signal: bool = False,
 ) -> AutopilotRunSummary:
     """Supervise ``run-until-done`` as a foreground persistent loop.
 
@@ -6797,7 +6827,8 @@ def run_autopilot(
 
     process_checker = process_exists if process_exists is not None else pid_exists
     reload_requested = threading.Event()
-    sleeper = sleep if sleep is not None else reload_requested.wait
+    sleeper = sleep if sleep is not None else time_module.sleep
+    reload_sleeper = sleep if sleep is not None else reload_requested.wait
     if launcher is None:
 
         def launch(
@@ -6833,7 +6864,9 @@ def run_autopilot(
 
     if install_signal_handlers:
         enable_termination_signals = signal_stack.enter_context(
-            autopilot_termination_signals(on_reload=reload_requested.set)
+            autopilot_termination_signals(
+                on_reload=reload_requested.set if install_reload_signal else None
+            )
         )
     try:
         existing = lock_manager.autopilot_status(process_exists=process_checker)
@@ -6925,6 +6958,7 @@ def run_autopilot(
             cycle_number += 1
             config_reload_error = ""
             config_loaded_at = ""
+            explicit_reload_status = ""
             explicit_reload_handled = False
             if reload_requested.is_set():
                 reload_requested.clear()
@@ -6933,7 +6967,7 @@ def run_autopilot(
                     run_id=supervisor_run_id,
                 )
                 for request in requests:
-                    active_cycle_config, _reload_blocker = (
+                    active_cycle_config, reload_status, reload_blocker = (
                         apply_autopilot_reload_request(
                             config,
                             active_cycle_config,
@@ -6943,9 +6977,16 @@ def run_autopilot(
                             request=request,
                         )
                     )
+                    explicit_reload_status = reload_status
+                    if reload_status == "failed":
+                        config_reload_error = reload_blocker.rpartition(":")[2]
                 if requests:
                     explicit_reload_handled = True
-                    config_loaded_at = utc_now_iso()
+                    if not config_reload_error and explicit_reload_status in {
+                        "loaded",
+                        "unchanged",
+                    }:
+                        config_loaded_at = utc_now_iso()
             if not explicit_reload_handled:
                 try:
                     active_cycle_config = reload_autopilot_cycle_config(config)
@@ -6966,6 +7007,13 @@ def run_autopilot(
                 cycle_jobs = cycle_config.autopilot.jobs or 1
             bounded_last = once or (max_cycles > 0 and cycle_number >= max_cycles)
             cycle_id = f"{supervisor_run_id}-c{cycle_number}"
+            cycle_reload_status = (
+                "failed"
+                if config_reload_error
+                else "refused"
+                if explicit_reload_status == "refused"
+                else "loaded"
+            )
             cycle_started_record: dict[str, object] = {
                 "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
                 "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
@@ -6974,11 +7022,11 @@ def run_autopilot(
                 "run_id": supervisor_run_id,
                 "cycle_id": cycle_id,
                 "config_fingerprint": config_snapshot_fingerprint(cycle_config),
-                "config_reload_status": ("failed" if config_reload_error else "loaded"),
+                "config_reload_status": cycle_reload_status,
             }
             if config_reload_error:
                 cycle_started_record["config_reload_error"] = config_reload_error
-            else:
+            elif cycle_reload_status == "loaded":
                 cycle_started_record["config_loaded_at"] = config_loaded_at
                 cycle_started_record["config_key_fingerprints"] = dict(
                     cycle_config.config_key_fingerprints
@@ -7149,11 +7197,9 @@ def run_autopilot(
                             config.autopilot.planning_recheck_seconds
                         ),
                         max_poll_seconds=config.autopilot.idle_poll_max_seconds,
-                        sleeper=sleeper,
-                        should_stop=lambda: (
-                            reload_requested.is_set()
-                            or (should_stop is not None and should_stop())
-                        ),
+                        sleeper=reload_sleeper,
+                        should_stop=should_stop,
+                        should_reload=reload_requested.is_set,
                         min_ready=min_ready,
                         wake_adapter=wake_adapter_callback,
                         active_runs=tuple(
@@ -7178,6 +7224,12 @@ def run_autopilot(
                             "starting next cycle early",
                             flush=True,
                         )
+                    elif wait_result.wake_reason == "reload":
+                        print(
+                            "[vibe-loop] autopilot idle wake: reload requested, "
+                            "starting next cycle early",
+                            flush=True,
+                        )
                 elif post_cycle_planning_delay is not None:
                     print(
                         "[vibe-loop] autopilot post-dispatch recheck: queue "
@@ -7185,9 +7237,9 @@ def run_autopilot(
                         f"{post_cycle_planning_delay:.0f}s",
                         flush=True,
                     )
-                    sleeper(scheduled_wait_seconds)
+                    reload_sleeper(scheduled_wait_seconds)
                 else:
-                    sleeper(scheduled_wait_seconds)
+                    reload_sleeper(scheduled_wait_seconds)
                 continue
             # Drain mode (no interval): continue only while cycles can still make
             # progress; an idle or blocked cycle cannot advance without waiting or

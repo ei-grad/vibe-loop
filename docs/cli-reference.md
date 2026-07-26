@@ -76,11 +76,14 @@ vibe-loop autopilot reload --repo . --timeout 10 --json
 
 - `--repo PATH` selects the repository.
 - `--timeout SECONDS` bounds the wait for supervisor acknowledgement; the
-  default is `10`.
+  default is `10`. A value of `0` submits the request without waiting.
 - `--json` emits the reload state, supervisor identity, request ID, changed
   keys, load time, resulting fingerprint, and any refusal reason.
 
-The command exits successfully only for a loaded or unchanged configuration.
+The command exits successfully for a loaded, unchanged, or queued request. If
+the acknowledgement wait expires, output state is `pending`: the request
+remains queued and the supervisor will still process it at its next cycle
+boundary. Refused, invalid, or unverifiable requests exit nonzero.
 Reload-safe settings and atomic refusal behavior are defined by
 [Supervisor Configuration Lifetime](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime).
 

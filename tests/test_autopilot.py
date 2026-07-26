@@ -22,6 +22,7 @@ from vibe_loop.autopilot import (
     DISK_HEALTH_CRITICAL,
     DISK_HEALTH_OK,
     AutopilotCycleResult,
+    AutopilotReloadResult,
     CYCLE_SUMMARY_BOOTSTRAP,
     CYCLE_SUMMARY_LANDED,
     CYCLE_SUMMARY_UNAVAILABLE,
@@ -119,7 +120,10 @@ from vibe_loop.locks import (
 )
 from vibe_loop.runs import (
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
+    AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE,
+    AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
+    AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
     AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
     AUTOPILOT_DISK_HEALTH_RECORD_TYPE,
     AUTOPILOT_IDLE_WAIT_RECORD_TYPE,
@@ -1131,6 +1135,17 @@ class ExternalRunSupervisorTests(unittest.TestCase):
 
 
 class AutopilotRunTests(unittest.TestCase):
+    def test_pending_reload_request_is_accepted(self) -> None:
+        result = AutopilotReloadResult(
+            repo=Path("/repo"),
+            reloaded=False,
+            state="pending",
+            request_id="reload-pending",
+        )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.blocker, "")
+
     def _recording_launcher(self):
         calls: list[dict[str, object]] = []
 
@@ -1350,7 +1365,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
             run_store = RunStore(config.state_path / "runs.jsonl")
 
-            active, blocker = apply_autopilot_reload_request(
+            active, state, blocker = apply_autopilot_reload_request(
                 config,
                 config,
                 reload_config_jobs=True,
@@ -1364,6 +1379,7 @@ class AutopilotRunTests(unittest.TestCase):
             record = run_store.read_records()[-1]
 
         self.assertIs(active, config)
+        self.assertEqual(state, "refused")
         self.assertEqual(
             blocker,
             "autopilot_reload_requires_restart:autopilot.interval_seconds",
@@ -1393,7 +1409,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
             run_store = RunStore(config.state_path / "runs.jsonl")
 
-            active, blocker = apply_autopilot_reload_request(
+            active, state, blocker = apply_autopilot_reload_request(
                 config,
                 config,
                 reload_config_jobs=True,
@@ -1407,6 +1423,7 @@ class AutopilotRunTests(unittest.TestCase):
             record = run_store.read_records()[-1]
 
         self.assertEqual(blocker, "")
+        self.assertEqual(state, "loaded")
         self.assertEqual(active.autopilot.jobs, 3)
         self.assertEqual(record["state"], "loaded")
         self.assertEqual(record["changed_keys"], ["autopilot.jobs"])
@@ -1464,6 +1481,82 @@ class AutopilotRunTests(unittest.TestCase):
                 for record in failed_reloads
             )
         )
+
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "reload signal requires SIGHUP")
+    def test_explicit_invalid_reload_withholds_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            def request_invalid_reload(command, **kwargs):
+                result = launcher(command, **kwargs)
+                supervisor = next(
+                    record
+                    for record in reversed(run_store.read_records())
+                    if record.get("record_type")
+                    == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
+                )
+                config_path = repo / ".vibe-loop.toml"
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8") + "broken = [",
+                    encoding="utf-8",
+                )
+                run_store.append_record(
+                    {
+                        "schema_version": 1,
+                        "record_type": AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE,
+                        "occurred_at": "2026-07-26T18:30:00+00:00",
+                        "repo": str(repo),
+                        "run_id": supervisor["run_id"],
+                        "request_id": "reload-invalid",
+                        "changed_keys": [],
+                    }
+                )
+                os.kill(os.getpid(), signal.SIGHUP)
+                return result
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=60,
+                launcher=request_invalid_reload,
+                sleep=lambda _seconds: None,
+                install_reload_signal=True,
+            )
+            records = run_store.read_records()
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [cycle.status for cycle in summary.cycles],
+            ["completed", "blocked"],
+        )
+        self.assertIn(
+            "autopilot_config_reload_failed",
+            summary.cycles[1].blockers,
+        )
+        cycle_starts = [
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_CYCLE_STARTED_RECORD_TYPE
+        ]
+        self.assertEqual(cycle_starts[-1]["config_reload_status"], "failed")
+        self.assertEqual(
+            cycle_starts[-1]["config_reload_error"],
+            "TOMLDecodeError",
+        )
+        reload_result = next(
+            record
+            for record in reversed(records)
+            if record.get("record_type") == AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE
+        )
+        self.assertEqual(reload_result["state"], "failed")
 
     def test_status_separates_restart_required_config_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1722,6 +1815,15 @@ class AutopilotRunTests(unittest.TestCase):
             os.kill(os.getpid(), signal.SIGHUP)
 
         self.assertTrue(requested.is_set())
+
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "reload signal requires SIGHUP")
+    def test_foreground_signal_context_leaves_sighup_unchanged(self) -> None:
+        with mock.patch("vibe_loop.autopilot.signal.signal") as install:
+            with autopilot_termination_signals() as enable_signals:
+                enable_signals()
+
+        installed_numbers = {call.args[0] for call in install.call_args_list}
+        self.assertNotIn(signal.SIGHUP, installed_numbers)
 
     @unittest.skipUnless(
         hasattr(signal, "pthread_sigmask"),
@@ -4455,6 +4557,62 @@ class LimitWallPauseTests(unittest.TestCase):
         occurred = datetime.datetime.fromisoformat(summary.cycles[0].occurred_at)
         self.assertGreater((wake - occurred).total_seconds(), 40.0)
 
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "reload signal requires SIGHUP")
+    def test_reload_does_not_cancel_limit_wall_pause(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[supervision]\nlimit_wall_backoff_seconds = 0.2\n",
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            launches = 0
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal launches
+                launches += 1
+                if on_start is not None:
+                    on_start(4242)
+                run_store.append_result(self._limit_wall_result(Path(cwd)))
+                if launches == 1:
+                    supervisor = next(
+                        record
+                        for record in reversed(run_store.read_records())
+                        if record.get("record_type")
+                        == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
+                    )
+                    run_store.append_record(
+                        {
+                            "schema_version": 1,
+                            "record_type": (
+                                AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE
+                            ),
+                            "occurred_at": "2026-07-26T18:30:00+00:00",
+                            "repo": str(repo),
+                            "run_id": supervisor["run_id"],
+                            "request_id": "reload-during-wall",
+                            "changed_keys": [],
+                        }
+                    )
+                    os.kill(os.getpid(), signal.SIGHUP)
+                return 0
+
+            started = time.monotonic()
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=0.0,
+                launcher=launcher,
+                install_reload_signal=True,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertTrue(summary.started)
+        self.assertGreaterEqual(elapsed, 0.15)
+        self.assertEqual(launches, 2)
+
 
 class AutopilotRecheckTests(unittest.TestCase):
     def _recording_launcher(self):
@@ -5236,6 +5394,27 @@ class SleepUntilStopTests(unittest.TestCase):
 
 
 class AutopilotIdleWaitTests(unittest.TestCase):
+    def test_reload_wake_has_distinct_reason(self) -> None:
+        requested = False
+
+        def sleeper(_seconds: float) -> None:
+            nonlocal requested
+            requested = True
+
+        result = wait_for_idle_change(
+            mock.Mock(),
+            cycle_id="cycle-reload",
+            deadline="2026-07-26T19:00:00+00:00",
+            interval=60,
+            initial_poll_seconds=60,
+            max_poll_seconds=60,
+            sleeper=sleeper,
+            should_reload=lambda: requested,
+            runnable_probe=lambda _config, _timeout: 0,
+        )
+
+        self.assertEqual(result.wake_reason, "reload")
+
     def test_default_thirty_minute_wait_uses_five_fallback_listings(self) -> None:
         sleeps: list[float] = []
 

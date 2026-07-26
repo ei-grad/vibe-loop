@@ -912,6 +912,11 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
         help=argparse.SUPPRESS,
     )
     parser.add_argument(
+        "--detached-reload-signal",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--interval",
         type=autopilot_interval,
         default=None,
@@ -1600,6 +1605,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             max_slices=getattr(args, "max_slices", 0),
             max_tasks=getattr(args, "max_tasks", 0),
             min_ready=min_ready,
+            install_reload_signal=bool(getattr(args, "detached_reload_signal", False)),
         )
         print(json.dumps(summary.to_json(), indent=2, default=list))
         return summary.exit_code
@@ -1670,6 +1676,14 @@ def render_autopilot_stop(result) -> str:
 
 
 def render_autopilot_reload(result) -> str:
+    if result.state == "pending":
+        changed = ", ".join(result.changed_keys) if result.changed_keys else "none"
+        return (
+            f"autopilot reload queued pid={result.pid} run_id={result.run_id} "
+            f"request_id={result.request_id} changed={changed}; "
+            "acknowledgement wait expired, but the supervisor will process the "
+            "request at its next cycle boundary"
+        )
     if not result.reloaded:
         message = f"autopilot not reloaded: {result.blocker or result.state}"
         if result.pid is not None:

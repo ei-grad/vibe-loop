@@ -8866,6 +8866,47 @@ class AutopilotCliTests(unittest.TestCase):
         )
         self.assertEqual(reload_autopilot.call_args.kwargs["timeout"], 4.0)
 
+    def test_reload_timeout_reports_queued_request_as_success(self) -> None:
+        result = Mock(
+            reloaded=False,
+            state="pending",
+            pid=4321,
+            run_id="autopilot-run",
+            request_id="reload-pending",
+            changed_keys=("autopilot.jobs",),
+            loaded_at="",
+            blocker="",
+            exit_code=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            with (
+                patch.object(
+                    cli_module,
+                    "reload_detached_autopilot",
+                    return_value=result,
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(StringIO()),
+            ):
+                exit_code = main(
+                    [
+                        "autopilot",
+                        "reload",
+                        "--repo",
+                        str(repo),
+                        "--timeout",
+                        "0",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("autopilot reload queued", stdout.getvalue())
+        self.assertIn("request_id=reload-pending", stdout.getvalue())
+        self.assertIn("next cycle boundary", stdout.getvalue())
+
     def test_status_text_reports_repo_queue_and_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             # Resolved so the assertion matches the CLI's resolved repo path
