@@ -8827,9 +8827,11 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             records = runner.run_store.read_records()
             self.assertFalse(lock_manager.is_locked("T-1"))
-            self.assertNotIn(
-                "task_source_settlement_attempted",
-                [record.get("record_type") for record in records],
+            self.assertEqual(source.status, "ready")
+            record_types = [record.get("record_type") for record in records]
+            self.assertLess(
+                record_types.index("lock_released"),
+                record_types.index("task_source_settled"),
             )
             stale = collect_stale_locks(
                 lock_manager,
@@ -9028,8 +9030,70 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
 
             self.assertIsNone(result)
             launch.assert_not_called()
+            records = runner.run_store.read_records()
+            record_types = [record.get("record_type") for record in records]
+            settlement = next(
+                record
+                for record in records
+                if record.get("record_type") == "task_source_settled"
+            )
+            self.assertEqual(source.status, "ready")
+            self.assertFalse(lock_manager.is_locked(task.task_id))
+            self.assertEqual(settlement["intent"], "requeue")
+            self.assertEqual(settlement["confirmed_status"], "ready")
+            self.assertTrue(settlement["recovered"])
+            self.assertLess(
+                record_types.index("lock_released"),
+                record_types.index("task_source_settled"),
+            )
+
+    def test_prelaunch_requeue_failure_still_releases_task_lock(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def failing_reset(*args, **kwargs) -> bool:
+                raise OSError("task source reset unavailable")
+
+            source.reset = failing_reset  # type: ignore[method-assign]
+            recovery = RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log=str(runner.config.repo / "prior-run.log"),
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=False,
+            )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    WorkspaceProvisioner,
+                    "provision",
+                    side_effect=WorkspaceProvisionError(
+                        "workspace_stale_current_base",
+                        "existing workspace does not contain the selected current base",
+                    ),
+                ):
+                    result = runner.resume_pending_recovery(recovery)
+
+            attempted = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "task_source_settlement_attempted"
+            )
+            self.assertIsNone(result)
             self.assertEqual(source.status, "active")
             self.assertFalse(lock_manager.is_locked(task.task_id))
+            self.assertEqual(attempted["intent"], "requeue")
+            self.assertEqual(attempted["phase"], "post_release")
+            self.assertTrue(attempted["settlement_pending"])
+            self.assertTrue(attempted["recovery_command"])
 
     def test_runtime_owned_requeue_reset_receives_live_fencing_context(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")

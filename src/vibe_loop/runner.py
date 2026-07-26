@@ -2094,6 +2094,14 @@ class VibeRunner:
                     },
                 )
             )
+            if activated_runtime_owned and not task_source_terminal_confirmed:
+                self.settle_task_source_after_release(
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    task_lock=task_lock,
+                    intent="requeue",
+                    report_status=report_status,
+                )
 
         try:
             run_contract = RunContractResolver(self.config).resolve(agent_selection)
