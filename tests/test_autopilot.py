@@ -812,6 +812,23 @@ class AutopilotStatusTests(unittest.TestCase):
             )
         )
 
+    def test_task_source_error_blocks_dispatch_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            init_repo(repo)
+            write_plan(repo, [("TASK-01", "Done", "", "finished slice")])
+            (repo / ".vibe-loop.toml").write_text(
+                '[orchestration]\nmode = "worker-owned"\n'
+                '[task_source]\ntype = "command"\nlist = "false"\n',
+                encoding="utf-8",
+            )
+            commit_all(repo)
+            payload = collect_project_status(load_config(repo)).to_json()
+
+        self.assertTrue(payload["queue"]["source_error"])
+        self.assertEqual(payload["queue"]["runnable"], 0)
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "blocked")
+
     def test_supervisor_status_skips_command_result_records(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             run_store = RunStore(Path(directory) / "runs.jsonl")

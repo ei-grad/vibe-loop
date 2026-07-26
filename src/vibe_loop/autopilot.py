@@ -582,9 +582,9 @@ def collect_project_status(
         supervisor,
         dispatch_state=(
             "blocked"
-            if contract_blockers
+            if contract_blockers or queue_status.source_error
             else "idle"
-            if not queue_status.source_error and queue_status.runnable == 0
+            if queue_status.runnable == 0
             else "available"
         ),
     )

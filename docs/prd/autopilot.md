@@ -68,8 +68,9 @@ preflight and reporting do not relax worker launch checks.
 
 Supervisor process state and dispatch readiness are separate. `state` continues
 to report process lifecycle such as `active_cycle`, `sleeping`, `stale`, or
-`inconsistent`; `dispatch_state` reports `blocked` when configuration prevents
-launch, `idle` when the queue has no runnable work, and `available` otherwise.
+`inconsistent`; `dispatch_state` reports `blocked` when configuration or an
+unreachable task source prevents launch, `idle` when the queue has no runnable
+work, and `available` otherwise.
 This preserves liveness evidence while preventing a permanently undispatchable
 supervisor from looking like an empty queue.
 

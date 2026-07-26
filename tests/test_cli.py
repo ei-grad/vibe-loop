@@ -10059,6 +10059,9 @@ class AutopilotCliTests(unittest.TestCase):
                 'command = "codex review {prompt}"\n'
                 'model = "gpt-5.6-terra"\n'
                 'effort = "xhigh"\n'
+                "[[agent.routing]]\n"
+                'profile = "review"\n'
+                'match_task_id_regex = "^sec-"\n'
                 "[task_source]\n"
                 'type = "command"\n'
                 'list = "false"\n'
@@ -10111,11 +10114,34 @@ class AutopilotCliTests(unittest.TestCase):
                     exit_codes[surface] = main(command)
                 self.assertEqual(stderr.getvalue(), "")
                 payloads[surface] = json.loads(stdout.getvalue())
+            human_output: dict[str, str] = {}
+            for surface, command in {
+                "status": ["autopilot", "status", "--repo", str(repo)],
+                "start": [
+                    "autopilot",
+                    "start",
+                    "--repo",
+                    str(repo),
+                    "--interval",
+                    "60",
+                ],
+            }.items():
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_code = main(command)
+                self.assertEqual(exit_code, 0 if surface == "status" else 2)
+                self.assertEqual(stderr.getvalue(), "")
+                human_output[surface] = stdout.getvalue()
 
         expected = [
             {
                 "code": "config_contract_reviewer_route_invalid",
                 "key": "agent.profiles.review.command",
+            },
+            {
+                "code": "config_contract_reviewer_not_independent",
+                "key": "agent.routing[0].profile",
             },
             {
                 "code": "config_contract_task_reset_missing",
@@ -10139,6 +10165,14 @@ class AutopilotCliTests(unittest.TestCase):
             "blocked",
         )
         self.assertFalse(payloads["start"]["started"])
+        self.assertIn("supervisor: idle dispatch=blocked", human_output["status"])
+        for surface in ("status", "start"):
+            self.assertIn("config contract blockers:", human_output[surface])
+            self.assertIn(
+                "config_contract_reviewer_route_invalid: agent.profiles.review.command",
+                human_output[surface],
+            )
+            self.assertIn("remedy:", human_output[surface])
 
     def test_status_distinguishes_idle_no_work_from_contract_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

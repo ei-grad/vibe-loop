@@ -21,6 +21,7 @@ import vibe_loop.runner as runner_module
 import vibe_loop.workers as workers_module
 from vibe_loop.config import (
     AgentConfig,
+    AgentRoutingRule,
     AgentResolutionError,
     AgentSelection,
     CompletionConfig,
@@ -686,6 +687,45 @@ class RunContractResolverTests(unittest.TestCase):
                 )
                 with self.assertRaisesRegex(ValueError, diagnostic):
                     RunContractResolver(config).resolve(selection)
+
+    def test_preflight_reports_reviewer_collision_in_static_routing(self) -> None:
+        implementer = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=implementer,
+            agent_profiles={"review": reviewer},
+            agent_routing=(
+                AgentRoutingRule(
+                    profile="review",
+                    match_task_id_regex="^sec-",
+                ),
+            ),
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="review",
+                task_provenance_mode="external-confirmed",
+                external_completion_actor="operator",
+                explicit_keys=frozenset(
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
+                ),
+            ),
+            task_source=TaskSourceConfig(type="markdown-plan"),
+        )
+
+        blockers = config_contract_blockers(config)
+
+        self.assertEqual(
+            [blocker.code for blocker in blockers],
+            ["config_contract_reviewer_not_independent"],
+        )
+        self.assertEqual(blockers[0].key, "agent.routing[0].profile")
+        self.assertIn("agent.routing[0].profile", blockers[0].remedy)
 
     def test_runtime_owned_contract_records_allowlisted_source_adapters(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")

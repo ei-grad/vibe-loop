@@ -5085,7 +5085,6 @@ def config_contract_blockers(
     orchestration: OrchestrationConfig | None = None,
 ) -> tuple[ConfigContractBlocker, ...]:
     effective = orchestration or config.orchestration
-    selection = agent_selection or AgentSelection(config.agent, "", "default")
     blockers: list[ConfigContractBlocker] = []
 
     def add(code: str, key: str, message: str, remedy: str) -> None:
@@ -5154,16 +5153,35 @@ def config_contract_blockers(
                 "Set orchestration.reviewer_profile to a configured independent "
                 "agent.profiles entry.",
             )
-        if (
-            configured_reviewer_profile is not None
-            and configured_reviewer_profile == selection.profile
-        ):
+        implementer_routes = (
+            ((agent_selection.profile, agent_selection.source),)
+            if agent_selection is not None
+            else tuple(
+                (rule.profile, f"agent.routing[{index}]")
+                for index, rule in enumerate(config.agent_routing)
+            )
+        )
+        for implementer_profile, source in implementer_routes:
+            if configured_reviewer_profile != implementer_profile:
+                continue
+            key = (
+                f"{source}.profile"
+                if source.startswith("agent.routing[")
+                else "task.agent"
+                if source == "task.agent"
+                else "orchestration.reviewer_profile"
+            )
             add(
                 "config_contract_reviewer_not_independent",
-                "orchestration.reviewer_profile",
+                key,
                 "runtime-owned orchestration reviewer_profile must differ from "
                 "the implementer profile",
-                "Select a reviewer profile different from the implementer profile.",
+                (
+                    "Select a reviewer profile different from the implementer profile."
+                    if key == "orchestration.reviewer_profile"
+                    else f"Route {key} to a profile different from "
+                    "orchestration.reviewer_profile."
+                ),
             )
         if "task_provenance_mode" not in effective.explicit_keys:
             add(
@@ -5305,24 +5323,6 @@ class RunContractResolver:
             if first.code.startswith("config_contract_reviewer_"):
                 raise AgentResolutionError(first.message)
             raise ValueError(first.message)
-        reviewer_command = reviewer_agent.command
-        if configured_reviewer_profile is not None:
-            reviewer_command = (
-                reviewer_agent.require_reviewer_command()
-                if effective.mode == "runtime-owned"
-                else reviewer_agent.require_command()
-            )
-        if configured_reviewer_profile is not None and not command_template_uses_field(
-            reviewer_command or "", "prompt"
-        ):
-            command_key = (
-                f"agent.profiles.{reviewer_profile}.command"
-                if reviewer_profile
-                else "agent.command"
-            )
-            raise AgentResolutionError(
-                f"{command_key} must include {{prompt}} for reviewer request delivery"
-            )
 
         probe_capability = task_source_probe_capability(self.config.task_source)
         completion_capability = task_source_completion_capability(
