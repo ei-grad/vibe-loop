@@ -121,6 +121,7 @@ from vibe_loop.workers import (
     pid_exists,
     record_expired_locks,
     restore_projected_worker_process_identity,
+    worker_view_is_live,
     worktree_branch_delete_revalidation_guardrails,
 )
 
@@ -1111,9 +1112,7 @@ def active_conflict_worker_count(workers: tuple[WorkerView, ...]) -> int:
 
 
 def worker_holds_active_conflict(worker: WorkerView) -> bool:
-    if worker.state == "running":
-        return True
-    return worker.state == "unknown" and worker.process_state == "foreign_host"
+    return worker_view_is_live(worker)
 
 
 def string_tuple(value: object) -> tuple[str, ...]:

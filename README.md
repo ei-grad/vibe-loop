@@ -731,11 +731,15 @@ that barrier only after the worker PID is written to the lock and its redundant
 durable start event. Before PID publication, recovery therefore requires the
 recorded launch barrier plus an absent or birth-mismatched supervisor identity;
 supervisor death closes the pipe without letting any worker or shell command
-execute. Once
-the barrier opens, either durable PID source identifies the worker during
-implementation, while the exact supervisor identity owns later runtime stages.
-A live, foreign-host, or identity-ambiguous run owner fails closed.
-Legacy and non-Linux pre-worker locks without the publication-barrier proof
+execute. Once the barrier opens, either durable PID source identifies the
+worker during implementation, while the exact supervisor identity owns later
+runtime stages. A live or identity-ambiguous local run owner fails closed. On
+platforms without process-birth identities, a present supervisor PID remains
+ambiguous and an absent PID proves abandonment, so post-worker locks remain
+recoverable after the supervisor exits. A legacy lockless run is reconstructed
+only when its worker-start record falls within one uninterrupted journaled
+supervisor generation; a later exit or start for that PID rejects the
+association. Legacy pre-worker locks without the publication-barrier proof
 remain unsupported, and
 `autopilot status` names the offending task and that limitation. Cleanup emits
 `lock_expired` records and never deletes worktrees, resets branches, or steals

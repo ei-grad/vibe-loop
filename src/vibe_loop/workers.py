@@ -1560,6 +1560,12 @@ def build_worker_views(
         elif lock_lease_expired(active.to_lock_metadata()):
             state = "stale"
             stale_reason = "lease_expired"
+        elif lifecycle_progress.stage in RUNTIME_OWNED_STAGES and run_state in {
+            "foreign_host",
+            "unknown",
+        }:
+            state = "unknown"
+            stale_reason = run_state
         elif process_state == "missing":
             state = "stale"
             stale_reason = "missing_process"
@@ -1667,7 +1673,7 @@ def live_unlocked_run_views(
         supervisor_pid = optional_int(worker_started.get("supervisor_pid"))
         supervisor_birth_id = optional_string(
             worker_started.get("supervisor_process_birth_id")
-        ) or supervisor_birth_id_from_records(records, supervisor_pid)
+        ) or supervisor_birth_id_for_worker_record(records, worker_started)
         if supervisor_pid is None or not supervisor_birth_id:
             continue
         host = optional_string(worker_started.get("host")) or ""
@@ -1748,21 +1754,41 @@ def live_unlocked_run_views(
     return views
 
 
-def supervisor_birth_id_from_records(
+def supervisor_birth_id_for_worker_record(
     records: Sequence[dict[str, Any]],
-    supervisor_pid: int | None,
+    worker_started: dict[str, Any],
 ) -> str:
+    supervisor_pid = optional_int(worker_started.get("supervisor_pid"))
     if supervisor_pid is None:
         return ""
-    for record in reversed(records):
+    worker_index = next(
+        (index for index, record in enumerate(records) if record is worker_started),
+        None,
+    )
+    if worker_index is None:
+        return ""
+    birth_id = ""
+    for record in records[:worker_index]:
         if optional_int(record.get("pid")) != supervisor_pid:
             continue
         record_type = record.get("record_type")
-        if record_type == RUN_SUPERVISOR_EXITED_RECORD_TYPE:
-            return ""
         if record_type == RUN_SUPERVISOR_STARTED_RECORD_TYPE:
-            return optional_string(record.get("process_birth_id")) or ""
-    return ""
+            birth_id = optional_string(record.get("process_birth_id")) or ""
+        elif record_type == RUN_SUPERVISOR_EXITED_RECORD_TYPE:
+            birth_id = ""
+    if not birth_id:
+        return ""
+    if any(
+        optional_int(record.get("pid")) == supervisor_pid
+        and record.get("record_type")
+        in {
+            RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+            RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+        }
+        for record in records[worker_index + 1 :]
+    ):
+        return ""
+    return birth_id
 
 
 def latest_workspace_claim(
@@ -1961,11 +1987,13 @@ def classify_run(
         return process_state
     if active.host and active.host != current_host:
         return "foreign_host"
-    if active.supervisor_pid is None or not active.supervisor_process_birth_id:
+    if active.supervisor_pid is None:
         return "unknown"
     process_checker = process_exists if process_exists is not None else pid_exists
     if not process_checker(active.supervisor_pid):
         return "missing"
+    if not active.supervisor_process_birth_id:
+        return "unknown"
     current_birth_id = process_birth_identity(active.supervisor_pid)
     if not current_birth_id:
         return "unknown"
@@ -1984,9 +2012,9 @@ def active_run_is_live(
 ) -> bool:
     """Whether an active-run lock still represents a run that may make progress.
 
-    Compatibility helper for callers without lifecycle records. Runtime-owned
-    callers must use ``build_worker_views`` so post-worker stages are classified
-    from the supervisor identity rather than the worker process.
+    Lock-only callers conservatively retain ownership when either the worker or
+    the recorded runtime supervisor may still be alive. Exact birth identity is
+    used when available; platforms without it fail closed while the PID exists.
     """
     if not active.run_id:
         return False
@@ -1994,7 +2022,21 @@ def active_run_is_live(
         return False
     host = current_host if current_host is not None else socket.gethostname()
     process_state = classify_process(active, host, process_exists)
-    return process_state not in {"missing", "unknown_pid"}
+    if process_state not in {"missing", "unknown_pid"}:
+        return True
+    if active.host and active.host != host:
+        return True
+    if active.supervisor_pid is None:
+        return False
+    process_checker = process_exists if process_exists is not None else pid_exists
+    if not process_checker(active.supervisor_pid):
+        return False
+    if not active.supervisor_process_birth_id:
+        return True
+    current_birth_id = process_birth_identity(active.supervisor_pid)
+    return not current_birth_id or current_birth_id == (
+        active.supervisor_process_birth_id
+    )
 
 
 def worker_view_is_live(view: WorkerView) -> bool:
@@ -2104,12 +2146,25 @@ class StaleLock:
         return self.stale_reason == "result_recorded" or self.process_state == "missing"
 
     @property
+    def force_recovery_supported(self) -> bool:
+        return (
+            self.kind == "task"
+            and not self.settlement_pending
+            and self.stale_reason == "lease_expired"
+            and self.run_state == "foreign_host"
+        )
+
+    @property
     def process_proven_dead(self) -> bool:
         return self.process_state == "missing"
 
     @property
     def recovery_supported(self) -> bool:
-        return self.kind != "task" or self.run_proven_finished
+        return (
+            self.kind != "task"
+            or self.run_proven_finished
+            or self.force_recovery_supported
+        )
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -2470,7 +2525,22 @@ def clean_stale_locks(
     for lock in stale_locks:
         if lock_manager is None and not lock.lock_path.exists():
             continue
-        if lock.kind == "task" and not lock.run_proven_finished:
+        if lock.force_recovery_supported and not force:
+            errors.append(
+                (
+                    lock,
+                    "foreign-host task lock lease expired; run "
+                    "`vibe-loop workers clean --force` to accept the lease as "
+                    "the explicit recovery boundary and release it",
+                )
+            )
+            continue
+        forced_foreign_lease = force and lock.force_recovery_supported
+        if (
+            lock.kind == "task"
+            and not lock.run_proven_finished
+            and not forced_foreign_lease
+        ):
             errors.append(
                 (
                     lock,
@@ -2660,7 +2730,7 @@ class WorktreeDispositionEvidence:
     ``parse_git_worktree_list`` (via ``build_workspace_git_context``) for
     enumeration, ``merged_branch_targets`` for the merged predicate,
     ``git_status_lines`` for dirty state, and ``build_worker_views`` plus
-    ``active_run_is_live`` for the claiming run and its liveness.
+    ``worker_view_is_live`` for the claiming run and its liveness.
     """
 
     path: Path

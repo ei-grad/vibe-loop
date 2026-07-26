@@ -2000,6 +2000,177 @@ class StaleLockTests(unittest.TestCase):
         self.assertEqual(views[0].stale_reason, "missing_lock")
         self.assertIsNone(views[0].active.lock_path)
 
+    def test_reused_supervisor_pid_does_not_resurrect_unlocked_legacy_run(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "run_supervisor_started",
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                    "pid": os.getpid(),
+                    "process_birth_id": "old-generation",
+                }
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_started(
+                    run_id="run-old",
+                    task_id="TASK-OLD",
+                    payload={
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-old.log"),
+                        "base_main": "abc123",
+                        "resources": ["db"],
+                        "paths": [],
+                        "conflict_domains_known": True,
+                    },
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.worker_process_started(
+                    run_id="run-old",
+                    task_id="TASK-OLD",
+                    worker_pid=999999999,
+                    supervisor_pid=os.getpid(),
+                    process_group_id=999999999,
+                    session_id=999999999,
+                    process_birth_id="missing-worker",
+                    host="test-host",
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-old",
+                    task_id="TASK-OLD",
+                    transition=StageTransition(
+                        from_stage=RunStage.GATES,
+                        to_stage=RunStage.REVIEW,
+                        reason="review_started",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+            run_store.append_report(
+                WorkerReport(
+                    run_id="run-old",
+                    task_id="TASK-OLD",
+                    status="completed",
+                )
+            )
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "run_supervisor_exited",
+                    "occurred_at": "2026-05-09T01:00:00+00:00",
+                    "pid": os.getpid(),
+                }
+            )
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "run_supervisor_started",
+                    "occurred_at": "2026-05-09T02:00:00+00:00",
+                    "pid": os.getpid(),
+                    "process_birth_id": process_birth_identity(os.getpid()),
+                }
+            )
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: pid == os.getpid(),
+            )
+
+        self.assertEqual(views, [])
+
+    def test_post_worker_run_without_birth_id_recovers_after_supervisor_exit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                supervisor_pid=100,
+                supervisor_process_birth_id="",
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+            self._append_live_review_run(run_store, repo=repo)
+
+            live_views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: pid == 100,
+            )
+            live_stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: pid == 100,
+            )
+            exited_stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: False,
+            )
+            result = clean_stale_locks(exited_stale, manager, force=True)
+
+            self.assertEqual(live_views[0].state, "unknown")
+            self.assertEqual(live_views[0].run_state, "unknown")
+            self.assertEqual(live_stale, [])
+            self.assertEqual(exited_stale[0].run_state, "missing")
+            self.assertEqual([lock.task_id for lock in result.cleaned], ["TASK-01"])
+            self.assertFalse(manager.is_locked("TASK-01"))
+
+    def test_force_recovers_expired_foreign_host_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=100,
+                host="other-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                heartbeat_at="2000-01-01T00:00:00+00:00",
+                lease_seconds=1,
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            manager.acquire("TASK-01", "run-1", metadata=state.to_lock_metadata())
+
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+            )
+            dry_run = clean_stale_locks(stale, manager)
+            forced = clean_stale_locks(stale, manager, force=True)
+
+            self.assertEqual(stale[0].stale_reason, "lease_expired")
+            self.assertEqual(stale[0].run_state, "foreign_host")
+            self.assertTrue(stale[0].force_recovery_supported)
+            self.assertEqual(dry_run.cleaned, [])
+            self.assertEqual([lock.task_id for lock in forced.cleaned], ["TASK-01"])
+            self.assertFalse(manager.is_locked("TASK-01"))
+
     def test_collect_stale_task_lock_with_missing_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -2401,6 +2572,14 @@ class StaleLockTests(unittest.TestCase):
         )
         self.assertFalse(
             dataclasses.replace(base, run_state="foreign_host").recovery_supported
+        )
+        self.assertTrue(
+            dataclasses.replace(
+                base,
+                settlement_pending=False,
+                stale_reason="lease_expired",
+                run_state="foreign_host",
+            ).recovery_supported
         )
         self.assertTrue(
             dataclasses.replace(base, run_state="missing").recovery_supported
