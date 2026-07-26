@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -66,6 +67,7 @@ from vibe_loop.autopilot import (
     ProjectEntry,
     ProjectRegistry,
     TaskQueueStatus,
+    apply_autopilot_reload_request,
     autopilot_child_command,
     autopilot_termination_signals,
     build_native_planning_decision_prompt,
@@ -84,6 +86,7 @@ from vibe_loop.autopilot import (
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
+    reload_detached_autopilot,
     reload_autopilot_cycle_config,
     run_autopilot,
     run_maintenance_command,
@@ -1283,11 +1286,18 @@ class AutopilotRunTests(unittest.TestCase):
             def reconfiguring_launcher(command, **kwargs):
                 nonlocal observed_after_reload
                 result = launcher(command, **kwargs)
+                config_path = repo / ".vibe-loop.toml"
                 if len(calls) == 1:
-                    config_path = repo / ".vibe-loop.toml"
                     config_path.write_text(
                         config_path.read_text(encoding="utf-8").replace(
                             "jobs = 1", "jobs = 3"
+                        ),
+                        encoding="utf-8",
+                    )
+                elif len(calls) == 2:
+                    config_path.write_text(
+                        config_path.read_text(encoding="utf-8").replace(
+                            "jobs = 3", "jobs = 1"
                         ),
                         encoding="utf-8",
                     )
@@ -1297,21 +1307,109 @@ class AutopilotRunTests(unittest.TestCase):
 
             run_autopilot(
                 config,
-                max_cycles=2,
+                max_cycles=3,
                 interval=60,
                 reload_config_jobs=True,
                 launcher=reconfiguring_launcher,
                 sleep=lambda _seconds: None,
             )
 
-        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(calls), 3)
         first = calls[0]["command"]
         second = calls[1]["command"]
+        third = calls[2]["command"]
         self.assertEqual(first[first.index("--jobs") + 1], "1")
         self.assertEqual(second[second.index("--jobs") + 1], "3")
+        self.assertEqual(third[third.index("--jobs") + 1], "1")
         self.assertIsNotNone(observed_after_reload)
         self.assertFalse(observed_after_reload.supervisor.config["stale"])
         self.assertEqual(observed_after_reload.supervisor.advisories, ())
+
+    def test_explicit_reload_refuses_mixed_safe_and_restart_required_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "jobs = 1\n"
+                    "interval_seconds = 60\n"
+                    "require_clean_repo = false\n"
+                ),
+            )
+            config = load_config(repo)
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8")
+                .replace("jobs = 1", "jobs = 2")
+                .replace("interval_seconds = 60", "interval_seconds = 120"),
+                encoding="utf-8",
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            active, blocker = apply_autopilot_reload_request(
+                config,
+                config,
+                reload_config_jobs=True,
+                run_store=run_store,
+                run_id="autopilot-test",
+                request={
+                    "request_id": "reload-test",
+                    "changed_keys": ["autopilot.jobs", "autopilot.interval_seconds"],
+                },
+            )
+            record = run_store.read_records()[-1]
+
+        self.assertIs(active, config)
+        self.assertEqual(
+            blocker,
+            "autopilot_reload_requires_restart:autopilot.interval_seconds",
+        )
+        self.assertEqual(record["state"], "refused")
+        self.assertEqual(
+            record["changed_keys"],
+            ["autopilot.interval_seconds", "autopilot.jobs"],
+        )
+
+    def test_explicit_reload_applies_file_backed_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    "jobs = 1",
+                    "jobs = 3",
+                ),
+                encoding="utf-8",
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+
+            active, blocker = apply_autopilot_reload_request(
+                config,
+                config,
+                reload_config_jobs=True,
+                run_store=run_store,
+                run_id="autopilot-test",
+                request={
+                    "request_id": "reload-test",
+                    "changed_keys": ["autopilot.jobs"],
+                },
+            )
+            record = run_store.read_records()[-1]
+
+        self.assertEqual(blocker, "")
+        self.assertEqual(active.autopilot.jobs, 3)
+        self.assertEqual(record["state"], "loaded")
+        self.assertEqual(record["changed_keys"], ["autopilot.jobs"])
 
     def test_invalid_cycle_config_withholds_dispatch_without_exiting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1615,6 +1713,16 @@ class AutopilotRunTests(unittest.TestCase):
 
         self.assertEqual(caught.exception.signal_number, signal.SIGTERM)
 
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "reload signal requires SIGHUP")
+    def test_sighup_requests_reload_without_terminating(self) -> None:
+        requested = threading.Event()
+
+        with autopilot_termination_signals(on_reload=requested.set) as enable_signals:
+            enable_signals()
+            os.kill(os.getpid(), signal.SIGHUP)
+
+        self.assertTrue(requested.is_set())
+
     @unittest.skipUnless(
         hasattr(signal, "pthread_sigmask"),
         "atomic signal setup requires POSIX signal masking",
@@ -1664,6 +1772,126 @@ class AutopilotRunTests(unittest.TestCase):
                     )
 
         terminate.assert_called_once_with(process)
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "setsid"),
+        "verified detached reload requires Linux",
+    )
+    def test_detached_reload_preserves_in_flight_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "jobs = 1\n"
+                    "interval_seconds = 60\n"
+                    "require_clean_repo = false\n"
+                ),
+            )
+            agent = repo / "agent.py"
+            agent.write_text(
+                "import os, subprocess, time\n"
+                "from pathlib import Path\n"
+                "repo = Path(os.environ['VIBE_LOOP_REPO'])\n"
+                "state = Path(os.environ['VIBE_LOOP_STATE_DIR'])\n"
+                "(state / 'worker.pid').write_text(str(os.getpid()))\n"
+                "while not (state / 'release-worker').exists():\n"
+                "    time.sleep(0.02)\n"
+                "plan = repo / 'PLAN.md'\n"
+                "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Active |', '| TASK-01 | P0 | Done |'))\n"
+                "listing = subprocess.run(['git', 'worktree', 'list', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True).stdout\n"
+                "primary = Path(listing.splitlines()[0].removeprefix('worktree '))\n"
+                "branch = subprocess.run(['git', 'branch', '--show-current'], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()\n"
+                "subprocess.run(['git', 'add', 'PLAN.md'], cwd=repo, check=True)\n"
+                "subprocess.run(['git', 'commit', '-m', 'complete task'], cwd=repo, check=True, capture_output=True)\n"
+                "subprocess.run(['git', 'merge', '--ff-only', branch], cwd=primary, check=True, capture_output=True)\n",
+                encoding="utf-8",
+            )
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    'command = "codex exec {prompt}"',
+                    f"command = {json.dumps(f'{sys.executable} agent.py')}",
+                ),
+                encoding="utf-8",
+            )
+            run(repo, "git", "add", "agent.py", ".vibe-loop.toml")
+            run(repo, "git", "commit", "-m", "add blocking agent")
+            config = load_config(repo)
+            launch = start_detached_autopilot(
+                config,
+                jobs=1,
+                reload_config_jobs=True,
+                interval=60,
+                max_tasks=1,
+            )
+            reload_result = None
+            refused_result = None
+            stop_result = None
+            try:
+                worker_pid_path = config.state_path / "worker.pid"
+                deadline = time.monotonic() + 15.0
+                while time.monotonic() < deadline and not worker_pid_path.exists():
+                    time.sleep(0.05)
+                self.assertTrue(launch.started, launch.blocker)
+                self.assertTrue(worker_pid_path.exists())
+                worker_pid = int(worker_pid_path.read_text(encoding="utf-8"))
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace(
+                        "jobs = 1",
+                        "jobs = 2",
+                    ),
+                    encoding="utf-8",
+                )
+
+                outcome: dict[str, object] = {}
+
+                def request_reload() -> None:
+                    outcome["result"] = reload_detached_autopilot(
+                        load_config(repo),
+                        timeout=20,
+                    )
+
+                reload_thread = threading.Thread(target=request_reload)
+                reload_thread.start()
+                time.sleep(0.2)
+                self.assertTrue(reload_thread.is_alive())
+                os.kill(worker_pid, 0)
+                (config.state_path / "release-worker").touch()
+                reload_thread.join(20)
+                self.assertFalse(reload_thread.is_alive())
+                reload_result = outcome["result"]
+                reload_status = collect_project_status(load_config(repo))
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace(
+                        "interval_seconds = 60",
+                        "interval_seconds = 120",
+                    ),
+                    encoding="utf-8",
+                )
+                refused_result = reload_detached_autopilot(load_config(repo))
+                refused_status = collect_project_status(load_config(repo))
+                stop_result = stop_detached_autopilot(load_config(repo))
+            finally:
+                if stop_result is None or not stop_result.stopped:
+                    stop_test_process_group(launch.pid, launch.process_group_id)
+
+        self.assertTrue(reload_result.reloaded, reload_result.blocker)
+        self.assertEqual(reload_result.changed_keys, ("autopilot.jobs",))
+        self.assertEqual(
+            reload_status.supervisor.config["last_reload"]["changed_keys"],
+            ["autopilot.jobs"],
+        )
+        self.assertFalse(refused_result.reloaded)
+        self.assertEqual(refused_result.state, "refused")
+        self.assertIn("autopilot.interval_seconds", refused_result.blocker)
+        self.assertEqual(
+            refused_status.supervisor.config["last_reload"]["state"],
+            "refused",
+        )
+        self.assertTrue(stop_result.stopped, stop_result.blocker)
 
     @unittest.skipUnless(
         os.name == "posix" and hasattr(os, "setsid"),

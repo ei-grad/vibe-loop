@@ -74,6 +74,8 @@ from vibe_loop.runner import (
 from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
     AUTOPILOT_COMMAND_RESULT_RECORD_TYPE,
+    AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE,
+    AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
     AUTOPILOT_CYCLE_RECORD_TYPE,
     AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
     AUTOPILOT_CYCLE_SUMMARY_RECORD_TYPE,
@@ -864,6 +866,12 @@ def collect_supervisor_status(
                 current_config=current_config,
                 running=supervisor_lock.state == "held",
             )
+            last_reload = latest_autopilot_reload_result(
+                records,
+                run_id=lock_run_id,
+            )
+            if last_reload:
+                config_report["last_reload"] = last_reload
             return SupervisorStatus(
                 state=state,
                 pid=lock_pid,
@@ -1128,6 +1136,71 @@ def config_key_lifetime(key: str) -> str:
     return "supervisor_start"
 
 
+def config_key_reload_safe(key: str, *, reload_config_jobs: bool) -> bool:
+    if config_key_lifetime(key) != "per_cycle":
+        return False
+    return key != "autopilot.jobs" or reload_config_jobs
+
+
+def changed_config_keys(
+    previous: Mapping[str, str] | Sequence[tuple[str, str]],
+    current: Mapping[str, str] | Sequence[tuple[str, str]],
+) -> tuple[str, ...]:
+    previous_keys = dict(previous)
+    current_keys = dict(current)
+    return tuple(
+        sorted(
+            key
+            for key in previous_keys.keys() | current_keys.keys()
+            if previous_keys.get(key) != current_keys.get(key)
+        )
+    )
+
+
+def latest_autopilot_reload_result(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    run_id: str,
+) -> dict[str, object]:
+    for record in reversed(records):
+        if (
+            record.get("record_type") == AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE
+            and str(record.get("run_id") or "") == run_id
+        ):
+            return {
+                "state": str(record.get("state") or ""),
+                "loaded_at": str(record.get("loaded_at") or ""),
+                "fingerprint": str(record.get("config_fingerprint") or ""),
+                "changed_keys": [
+                    str(key) for key in record.get("changed_keys", []) if str(key)
+                ],
+                "blocker": str(record.get("blocker") or ""),
+            }
+    return {}
+
+
+def pending_autopilot_reload_requests(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    run_id: str,
+) -> tuple[Mapping[str, Any], ...]:
+    completed = {
+        str(record.get("request_id") or "")
+        for record in records
+        if record.get("record_type") == AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE
+        and str(record.get("run_id") or "") == run_id
+    }
+    return tuple(
+        record
+        for record in records
+        if (
+            record.get("record_type") == AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE
+            and str(record.get("run_id") or "") == run_id
+            and str(record.get("request_id") or "") not in completed
+        )
+    )
+
+
 def collect_external_run_supervisor(
     run_store: RunStore,
     *,
@@ -1354,6 +1427,38 @@ class DetachedAutopilotIdentity:
     session_id: int
     process_birth_id: str
     record: dict[str, Any]
+
+
+@dataclasses.dataclass(frozen=True)
+class AutopilotReloadResult:
+    repo: Path
+    reloaded: bool
+    state: str
+    run_id: str = ""
+    pid: int | None = None
+    request_id: str = ""
+    changed_keys: tuple[str, ...] = ()
+    loaded_at: str = ""
+    fingerprint: str = ""
+    blocker: str = ""
+
+    @property
+    def exit_code(self) -> int:
+        return 0 if self.reloaded else 2
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "repo": str(self.repo),
+            "reloaded": self.reloaded,
+            "state": self.state,
+            "run_id": self.run_id,
+            "pid": self.pid,
+            "request_id": self.request_id,
+            "changed_keys": list(self.changed_keys),
+            "loaded_at": self.loaded_at,
+            "fingerprint": self.fingerprint,
+            "blocker": self.blocker,
+        }
 
 
 OWNED_PROCESS_ROLE_SUPERVISOR = "supervisor"
@@ -2502,6 +2607,300 @@ def append_autopilot_stopped_record(
     if signal_number is not None:
         record["signal"] = signal.Signals(signal_number).name
     run_store.append_record(record)
+
+
+def reload_detached_autopilot(
+    config: VibeConfig,
+    *,
+    timeout: float = 10.0,
+    process_exists: ProcessExists | None = None,
+    process_group_lookup: Callable[[int], int] | None = None,
+    session_lookup: Callable[[int], int] | None = None,
+    birth_identity_lookup: Callable[[int], str] | None = None,
+    pidfd_open: Callable[[int], int] | None = None,
+    pidfd_signal: Callable[[int, int], None] | None = None,
+    close_fd: Callable[[int], None] | None = None,
+    sleep: Sleep | None = None,
+    monotonic: Callable[[], float] | None = None,
+) -> AutopilotReloadResult:
+    """Request and verify a configuration reload from the detached supervisor."""
+
+    binding = resolve_project_binding(config)
+    if binding.blocker is not None:
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            blocker=binding.blocker,
+        )
+    if sys.platform != "linux" or not hasattr(signal, "SIGHUP"):
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            blocker=f"autopilot_reload_unsupported_platform:{sys.platform}",
+        )
+
+    checker = process_exists if process_exists is not None else pid_exists
+    get_process_group = (
+        process_group_lookup if process_group_lookup is not None else os.getpgid
+    )
+    get_session = session_lookup if session_lookup is not None else os.getsid
+    get_birth_identity = (
+        birth_identity_lookup
+        if birth_identity_lookup is not None
+        else process_birth_identity
+    )
+    open_pidfd = pidfd_open if pidfd_open is not None else open_process_pidfd
+    send_pidfd_signal = (
+        pidfd_signal if pidfd_signal is not None else send_process_pidfd_signal
+    )
+    close_process_fd = close_fd if close_fd is not None else os.close
+    sleeper = sleep if sleep is not None else time_module.sleep
+    clock = monotonic if monotonic is not None else time_module.monotonic
+    deadline = clock() + max(0.0, timeout)
+    lock_manager = build_lock_manager(
+        config.repo,
+        config.state_path / "locks",
+        config.locks,
+        runtime_context=config.runtime_environment,
+    )
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    try:
+        status = lock_manager.autopilot_status(process_exists=checker)
+    except (LockBackendError, OSError):
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            blocker="autopilot_reload_backend_status_failed",
+        )
+    owner_run_id = str(status.metadata.get("run_id") or "")
+    pid = int_value(status.metadata.get("pid"))
+    if not status.locked:
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="not_running",
+            blocker="autopilot_supervisor_not_running",
+        )
+    if status.state != "held" or status.process_state == "foreign_host":
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker=(
+                "autopilot_reload_identity_unverified:"
+                + (
+                    "foreign_host"
+                    if status.process_state == "foreign_host"
+                    else status.state
+                )
+            ),
+        )
+    if not owner_run_id or pid is None:
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_reload_identity_unverified:missing_lock_identity",
+        )
+    identity = detached_autopilot_identity(
+        run_store,
+        run_id=owner_run_id,
+        pid=pid,
+    )
+    if identity is None:
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_reload_identity_unverified:missing_detached_record",
+        )
+    started_record = next(
+        (
+            record
+            for record in reversed(run_store.read_records())
+            if record.get("record_type") == AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE
+            and str(record.get("run_id") or "") == owner_run_id
+        ),
+        None,
+    )
+    if started_record is None:
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_reload_missing_start_config",
+        )
+
+    start_keys = {
+        str(key): str(value)
+        for key, value in dict(
+            started_record.get("config_key_fingerprints") or {}
+        ).items()
+    }
+    changed_keys = changed_config_keys(start_keys, config.config_key_fingerprints)
+    reload_config_jobs = bool(started_record.get("reload_config_jobs"))
+    refused_keys = tuple(
+        key
+        for key in changed_keys
+        if not config_key_reload_safe(
+            key,
+            reload_config_jobs=reload_config_jobs,
+        )
+    )
+    request_id = new_run_id("autopilot-reload")
+    if refused_keys:
+        requested_at = utc_now_iso()
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE,
+                "occurred_at": requested_at,
+                "repo": str(config.repo),
+                "run_id": owner_run_id,
+                "pid": pid,
+                "request_id": request_id,
+                "requested_fingerprint": config_snapshot_fingerprint(config),
+                "changed_keys": list(changed_keys),
+            }
+        )
+        blocker = "autopilot_reload_requires_restart:" + ",".join(refused_keys)
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": owner_run_id,
+                "request_id": request_id,
+                "state": "refused",
+                "changed_keys": list(changed_keys),
+                "blocker": blocker,
+            }
+        )
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="refused",
+            run_id=owner_run_id,
+            pid=pid,
+            request_id=request_id,
+            changed_keys=changed_keys,
+            blocker=blocker,
+        )
+
+    try:
+        process_fd = open_pidfd(identity.pid)
+    except (OSError, ProcessLookupError):
+        return AutopilotReloadResult(
+            repo=config.repo,
+            reloaded=False,
+            state="blocked",
+            run_id=owner_run_id,
+            pid=pid,
+            blocker="autopilot_reload_identity_unverified:pidfd_unavailable",
+        )
+    try:
+        try:
+            actual_process_group = get_process_group(identity.pid)
+            actual_session = get_session(identity.pid)
+            actual_birth_id = get_birth_identity(identity.pid)
+        except OSError:
+            return AutopilotReloadResult(
+                repo=config.repo,
+                reloaded=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                blocker="autopilot_reload_identity_unverified:missing_process",
+            )
+        if (
+            identity.process_group_id != identity.pid
+            or identity.session_id != identity.pid
+            or actual_process_group != identity.process_group_id
+            or actual_session != identity.session_id
+            or not actual_birth_id
+            or actual_birth_id != identity.process_birth_id
+        ):
+            return AutopilotReloadResult(
+                repo=config.repo,
+                reloaded=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                blocker="autopilot_reload_identity_unverified:identity_changed",
+            )
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CONFIG_RELOAD_REQUESTED_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": owner_run_id,
+                "pid": pid,
+                "request_id": request_id,
+                "requested_fingerprint": config_snapshot_fingerprint(config),
+                "changed_keys": list(changed_keys),
+            }
+        )
+        try:
+            send_pidfd_signal(process_fd, signal.SIGHUP)
+        except (OSError, ProcessLookupError):
+            return AutopilotReloadResult(
+                repo=config.repo,
+                reloaded=False,
+                state="blocked",
+                run_id=owner_run_id,
+                pid=pid,
+                request_id=request_id,
+                changed_keys=changed_keys,
+                blocker="autopilot_reload_signal_failed",
+            )
+        while clock() < deadline:
+            for record in reversed(run_store.read_records()):
+                if (
+                    record.get("record_type")
+                    == AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE
+                    and str(record.get("request_id") or "") == request_id
+                ):
+                    state = str(record.get("state") or "")
+                    return AutopilotReloadResult(
+                        repo=config.repo,
+                        reloaded=state in {"loaded", "unchanged"},
+                        state=state,
+                        run_id=owner_run_id,
+                        pid=pid,
+                        request_id=request_id,
+                        changed_keys=tuple(
+                            str(key) for key in record.get("changed_keys", [])
+                        ),
+                        loaded_at=str(record.get("loaded_at") or ""),
+                        fingerprint=str(record.get("config_fingerprint") or ""),
+                        blocker=str(record.get("blocker") or ""),
+                    )
+            sleeper(min(0.05, max(0.0, deadline - clock())))
+    finally:
+        close_process_fd(process_fd)
+    return AutopilotReloadResult(
+        repo=config.repo,
+        reloaded=False,
+        state="pending",
+        run_id=owner_run_id,
+        pid=pid,
+        request_id=request_id,
+        changed_keys=changed_keys,
+        blocker="autopilot_reload_timeout",
+    )
 
 
 def stop_detached_autopilot(
@@ -6159,7 +6558,10 @@ class AutopilotTerminationRequested(KeyboardInterrupt):
 
 
 @contextmanager
-def autopilot_termination_signals() -> Iterator[Callable[[], None]]:
+def autopilot_termination_signals(
+    *,
+    on_reload: Callable[[], None] | None = None,
+) -> Iterator[Callable[[], None]]:
     def enable_immediately() -> None:
         return
 
@@ -6171,8 +6573,14 @@ def autopilot_termination_signals() -> Iterator[Callable[[], None]]:
         for stop_signal in (getattr(signal, "SIGINT", None), signal.SIGTERM)
         if stop_signal is not None
     )
+    reload_signal = getattr(signal, "SIGHUP", None)
+    installed_signal_numbers = (
+        *handled_signals,
+        *((reload_signal,) if reload_signal is not None else ()),
+    )
     previous_handlers = {
-        stop_signal: signal.getsignal(stop_signal) for stop_signal in handled_signals
+        signal_number: signal.getsignal(signal_number)
+        for signal_number in installed_signal_numbers
     }
     previous_mask: set[signal.Signals] | None = None
     signals_enabled = False
@@ -6192,11 +6600,18 @@ def autopilot_termination_signals() -> Iterator[Callable[[], None]]:
             return
         raise AutopilotTerminationRequested(signal_number)
 
+    def request_reload(_signal_number: int, _frame: object) -> None:
+        if on_reload is not None:
+            on_reload()
+
     installed_signals: list[signal.Signals] = []
     try:
         for stop_signal in handled_signals:
             signal.signal(stop_signal, request_stop)
             installed_signals.append(stop_signal)
+        if reload_signal is not None:
+            signal.signal(reload_signal, request_reload)
+            installed_signals.append(reload_signal)
 
         def enable_signals() -> None:
             nonlocal signals_enabled
@@ -6223,6 +6638,13 @@ def reload_autopilot_cycle_config(config: VibeConfig) -> VibeConfig:
         config.repo,
         runtime_context=dict(config.runtime_context),
     )
+    return autopilot_cycle_config_from_current(config, current)
+
+
+def autopilot_cycle_config_from_current(
+    config: VibeConfig,
+    current: VibeConfig,
+) -> VibeConfig:
     return dataclasses.replace(
         config,
         agent=current.agent,
@@ -6238,6 +6660,91 @@ def reload_autopilot_cycle_config(config: VibeConfig) -> VibeConfig:
         config_digest=current.config_digest,
         config_key_fingerprints=current.config_key_fingerprints,
     )
+
+
+def apply_autopilot_reload_request(
+    config: VibeConfig,
+    active_config: VibeConfig,
+    *,
+    reload_config_jobs: bool,
+    run_store: RunStore,
+    run_id: str,
+    request: Mapping[str, Any],
+) -> tuple[VibeConfig, str]:
+    request_id = str(request.get("request_id") or "")
+    try:
+        current = load_config(
+            config.repo,
+            runtime_context=dict(config.runtime_context),
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        blocker = f"autopilot_reload_invalid_config:{type(exc).__name__}"
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": run_id,
+                "request_id": request_id,
+                "state": "failed",
+                "changed_keys": list(request.get("changed_keys", [])),
+                "blocker": blocker,
+            }
+        )
+        return active_config, blocker
+
+    changed_from_start = changed_config_keys(
+        config.config_key_fingerprints,
+        current.config_key_fingerprints,
+    )
+    refused_keys = tuple(
+        key
+        for key in changed_from_start
+        if not config_key_reload_safe(
+            key,
+            reload_config_jobs=reload_config_jobs,
+        )
+    )
+    if refused_keys:
+        blocker = "autopilot_reload_requires_restart:" + ",".join(refused_keys)
+        run_store.append_record(
+            {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": run_id,
+                "request_id": request_id,
+                "state": "refused",
+                "changed_keys": list(changed_from_start),
+                "blocker": blocker,
+            }
+        )
+        return active_config, blocker
+
+    loaded = autopilot_cycle_config_from_current(config, current)
+    changed_keys = changed_config_keys(
+        active_config.config_key_fingerprints,
+        loaded.config_key_fingerprints,
+    )
+    loaded_at = utc_now_iso()
+    run_store.append_record(
+        {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_CONFIG_RELOAD_RESULT_RECORD_TYPE,
+            "occurred_at": loaded_at,
+            "repo": str(config.repo),
+            "run_id": run_id,
+            "request_id": request_id,
+            "state": "loaded" if changed_keys else "unchanged",
+            "loaded_at": loaded_at,
+            "config_fingerprint": config_snapshot_fingerprint(loaded),
+            "config_key_fingerprints": dict(loaded.config_key_fingerprints),
+            "changed_keys": list(changed_keys),
+        }
+    )
+    return loaded, ""
 
 
 def run_autopilot(
@@ -6289,7 +6796,8 @@ def run_autopilot(
         )
 
     process_checker = process_exists if process_exists is not None else pid_exists
-    sleeper = sleep if sleep is not None else time_module.sleep
+    reload_requested = threading.Event()
+    sleeper = sleep if sleep is not None else reload_requested.wait
     if launcher is None:
 
         def launch(
@@ -6325,7 +6833,7 @@ def run_autopilot(
 
     if install_signal_handlers:
         enable_termination_signals = signal_stack.enter_context(
-            autopilot_termination_signals()
+            autopilot_termination_signals(on_reload=reload_requested.set)
         )
     try:
         existing = lock_manager.autopilot_status(process_exists=process_checker)
@@ -6407,6 +6915,7 @@ def run_autopilot(
                 "config_loaded_at": config_loaded_at,
                 "config_path": str(config.config_path) if config.config_path else "",
                 "config_key_fingerprints": dict(config.config_key_fingerprints),
+                "reload_config_jobs": reload_config_jobs,
             }
         )
         cycle_number = 0
@@ -6416,19 +6925,41 @@ def run_autopilot(
             cycle_number += 1
             config_reload_error = ""
             config_loaded_at = ""
-            try:
-                active_cycle_config = reload_autopilot_cycle_config(config)
-                config_loaded_at = utc_now_iso()
-            except (OSError, UnicodeError, ValueError) as exc:
-                config_reload_error = type(exc).__name__
-                print(
-                    "[vibe-loop] autopilot config reload failed "
-                    f"({config_reload_error}); retaining the last valid cycle "
-                    "configuration and withholding dispatch until the file is "
-                    "valid; run vibe-loop doctor after correcting the file",
-                    file=sys.stderr,
-                    flush=True,
+            explicit_reload_handled = False
+            if reload_requested.is_set():
+                reload_requested.clear()
+                requests = pending_autopilot_reload_requests(
+                    run_store.read_records(),
+                    run_id=supervisor_run_id,
                 )
+                for request in requests:
+                    active_cycle_config, _reload_blocker = (
+                        apply_autopilot_reload_request(
+                            config,
+                            active_cycle_config,
+                            reload_config_jobs=reload_config_jobs,
+                            run_store=run_store,
+                            run_id=supervisor_run_id,
+                            request=request,
+                        )
+                    )
+                if requests:
+                    explicit_reload_handled = True
+                    config_loaded_at = utc_now_iso()
+            if not explicit_reload_handled:
+                try:
+                    active_cycle_config = reload_autopilot_cycle_config(config)
+                    config_loaded_at = utc_now_iso()
+                except (OSError, UnicodeError, ValueError) as exc:
+                    config_reload_error = type(exc).__name__
+                    print(
+                        "[vibe-loop] autopilot config reload failed "
+                        f"({config_reload_error}); retaining the last valid cycle "
+                        "configuration and withholding dispatch until the file is "
+                        "valid; run vibe-loop doctor after correcting the file",
+                        file=sys.stderr,
+                        flush=True,
+                    )
             cycle_config = active_cycle_config
             cycle_jobs = jobs
             if reload_config_jobs:
@@ -6619,7 +7150,10 @@ def run_autopilot(
                         ),
                         max_poll_seconds=config.autopilot.idle_poll_max_seconds,
                         sleeper=sleeper,
-                        should_stop=should_stop,
+                        should_stop=lambda: (
+                            reload_requested.is_set()
+                            or (should_stop is not None and should_stop())
+                        ),
                         min_ready=min_ready,
                         wake_adapter=wake_adapter_callback,
                         active_runs=tuple(

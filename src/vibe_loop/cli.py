@@ -33,6 +33,7 @@ from vibe_loop.autopilot import (
     poll_wait_message_command,
     redact_runtime_context_payload,
     redact_runtime_context_text,
+    reload_detached_autopilot,
     run_autopilot,
     start_detached_autopilot,
     stop_detached_autopilot,
@@ -400,6 +401,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exact recorded supervisor run ID required by --recover-stale",
     )
     autopilot_stop.add_argument("--json", action="store_true")
+    autopilot_reload = autopilot_subparsers.add_parser(
+        "reload",
+        help="Reload safe configuration in a verified detached supervisor",
+    )
+    add_repo_argument(autopilot_reload)
+    autopilot_reload.add_argument(
+        "--timeout",
+        type=nonnegative_float,
+        default=10.0,
+        help="Seconds to wait for the supervisor to acknowledge the reload",
+    )
+    autopilot_reload.add_argument("--json", action="store_true")
     autopilot_projects = autopilot_subparsers.add_parser(
         "projects",
         help="Manage the optional multi-project autopilot registry",
@@ -1526,6 +1539,16 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         else:
             print(render_autopilot_stop(result))
         return result.exit_code
+    if command == "reload":
+        result = reload_detached_autopilot(
+            config,
+            timeout=args.timeout,
+        )
+        if args.json:
+            print(json.dumps(result.to_json(), indent=2))
+        else:
+            print(render_autopilot_reload(result))
+        return result.exit_code
     if command in (None, "run", "start"):
         ap = config.autopilot
         jobs_from_config = getattr(args, "jobs", None) is None
@@ -1646,6 +1669,21 @@ def render_autopilot_stop(result) -> str:
     return "\n".join(lines)
 
 
+def render_autopilot_reload(result) -> str:
+    if not result.reloaded:
+        message = f"autopilot not reloaded: {result.blocker or result.state}"
+        if result.pid is not None:
+            message += f" pid={result.pid}"
+        if result.run_id:
+            message += f" run_id={result.run_id}"
+        return message
+    changed = ", ".join(result.changed_keys) if result.changed_keys else "none"
+    return (
+        f"autopilot config {result.state} pid={result.pid} "
+        f"run_id={result.run_id} changed={changed} loaded={result.loaded_at}"
+    )
+
+
 def render_autopilot_status(status: ProjectStatus) -> str:
     lines = [f"repo: {status.display_name} ({status.repo})"]
     queue = status.queue
@@ -1669,6 +1707,20 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             f"per-cycle={supervisor.config['per_cycle_fingerprint']} "
             f"loaded={supervisor.config['per_cycle_loaded_at']}"
         )
+        last_reload = supervisor.config.get("last_reload")
+        if isinstance(last_reload, Mapping):
+            changed = ", ".join(last_reload.get("changed_keys", [])) or "none"
+            lines.append(
+                "supervisor reload: "
+                f"{last_reload.get('state') or 'unknown'} "
+                f"loaded={last_reload.get('loaded_at') or ''} "
+                f"changed={changed}"
+                + (
+                    f" blocker={last_reload['blocker']}"
+                    if last_reload.get("blocker")
+                    else ""
+                )
+            )
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
     if supervisor.log is not None:
         lines.append(f"log: {supervisor.log}")

@@ -47,7 +47,8 @@ task prompts, commands, credentials, or fencing values.
 
 The CLI must expose autopilot through a subcommand group:
 `vibe-loop autopilot run`, `vibe-loop autopilot start`,
-`vibe-loop autopilot stop`, and `vibe-loop autopilot status`. The bare
+`vibe-loop autopilot stop`, `vibe-loop autopilot reload`, and
+`vibe-loop autopilot status`. The bare
 `vibe-loop autopilot` command may remain as a shorthand for `run`, but command
 semantics must be explicit in help and tests.
 
@@ -90,6 +91,25 @@ supervisor or advance the applied snapshot. The cycle retains the last valid
 configuration, withholds dispatch, records `autopilot_config_reload_failed`,
 and reports that the file must be corrected before dispatch resumes.
 
+`vibe-loop autopilot reload` is the explicit control for applying the
+per-cycle settings to a detached supervisor without stopping it. The command
+verifies the exact detached supervisor identity, records the requested reload,
+and signals only that supervisor. An active `run-until-done` child and its
+workers are not signalled: already-dispatched runs keep their cycle
+configuration, and the reloaded settings govern the next cycle. Raising
+file-backed `autopilot.jobs` fills the additional slots on that cycle; lowering
+it does not terminate surplus workers and takes effect as those workers finish.
+
+The reload is atomic across the edited file. If any changed key has
+supervisor-start lifetime, or if file-backed `autopilot.jobs` is overridden by
+an explicit CLI value, the reload is refused without applying any part of the
+request. The result names every changed key and the restart-required keys. An
+invalid file is likewise refused while the supervisor retains its last valid
+configuration. Each request and result is append-recorded with its time,
+changed keys, resulting fingerprint when loaded, and refusal reason when
+applicable. `autopilot status` exposes the latest result alongside the
+configuration staleness report.
+
 `vibe-loop doctor` always describes the configuration file as it would be
 loaded at command invocation. When it differs from a running supervisor,
 doctor must include the same advisory and the running supervisor's load
@@ -98,7 +118,10 @@ metadata so the two perspectives cannot be confused.
 Acceptance must cover a file change under a running supervisor, status and
 doctor advisories naming the changed keys, redaction of internal comparison
 data, file-backed jobs taking effect on the next cycle, and explicit CLI jobs
-remaining pinned.
+remaining pinned. It must also cover an explicit reload while a detached worker
+is active, mixed safe and restart-required edits being refused atomically,
+capacity increases on the following cycle, and capacity decreases draining
+without worker termination.
 
 ## PRD-AUT-003 Append-Only Cycle Records
 

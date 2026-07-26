@@ -13,6 +13,7 @@ product behavior:
 
 | Commands | Behavioral authority | Why |
 | --- | --- | --- |
+| `autopilot` | [Autopilot PRD](prd/autopilot.md#prd-aut-002-command-surface) | The PRD owns supervisor lifecycle, configuration lifetime, reload safety, and process identity. |
 | `run-next`, `run-until-done` | [Run orchestration PRD](prd/run-orchestration.md#prd-orc-009-scheduler-and-runtime-separation) | The PRD owns scheduling, selection, conflict-domain, lifecycle, and budget contracts. |
 | `report`, `worker`, `main-integration` | [Worker supervision PRD](prd/worker-supervision.md#prd-wrk-003-worker-reports) | The PRD owns worker reports, workspace claims, candidate declarations, settlement, and integration locking. |
 | `eval` | [Evals and release PRD](prd/evals-release.md) | The PRD owns evaluation behavior, artifact contracts, external adapters, and release policy; the [evaluation strategy](skill-evaluation-strategy.md) provides methodology and rationale. |
@@ -61,6 +62,27 @@ For session linkage, provider usage, and compatibility recovery, see
 [PRD-AUT-013](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage),
 [PRD-AUT-016](prd/autopilot.md#prd-aut-016-provider-usage-run-telemetry), and
 [PRD-AUT-014](prd/autopilot.md#prd-aut-014-unknown-run-recovery-and-continuation).
+
+## Autopilot Commands
+
+### `vibe-loop autopilot reload`
+
+Request an acknowledged configuration reload from the running detached
+supervisor:
+
+```bash
+vibe-loop autopilot reload --repo . --timeout 10 --json
+```
+
+- `--repo PATH` selects the repository.
+- `--timeout SECONDS` bounds the wait for supervisor acknowledgement; the
+  default is `10`.
+- `--json` emits the reload state, supervisor identity, request ID, changed
+  keys, load time, resulting fingerprint, and any refusal reason.
+
+The command exits successfully only for a loaded or unchanged configuration.
+Reload-safe settings and atomic refusal behavior are defined by
+[Supervisor Configuration Lifetime](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime).
 
 ### `vibe-loop runs summary`
 

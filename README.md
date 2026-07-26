@@ -228,6 +228,7 @@ vibe-loop autopilot run --repo . --once
 vibe-loop autopilot run --repo . --once --worktree-disposition reap
 vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 vibe-loop autopilot start --repo . --interval 60 --jobs 2 --json
+vibe-loop autopilot reload --repo . --json
 vibe-loop autopilot stop --repo . --json
 vibe-loop autopilot projects register --repo . --name my-project
 vibe-loop autopilot projects register --repo . --name tasks \

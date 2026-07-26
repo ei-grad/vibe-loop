@@ -18,7 +18,7 @@ import warnings
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import vibe_loop.cli as cli_module
 from vibe_loop.autopilot import (
@@ -8818,6 +8818,53 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIn("singleton lock to be", stdout.getvalue())
         self.assertIn("absent", stdout.getvalue())
         self.assertNotIn("fencing-token", stdout.getvalue())
+
+    def test_reload_dispatches_and_reports_changed_keys(self) -> None:
+        result = Mock(
+            reloaded=True,
+            state="loaded",
+            pid=4321,
+            run_id="autopilot-run",
+            changed_keys=("autopilot.jobs",),
+            loaded_at="2026-07-26T18:00:00+00:00",
+            exit_code=0,
+        )
+        result.to_json.return_value = {
+            "reloaded": True,
+            "state": "loaded",
+            "changed_keys": ["autopilot.jobs"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            stdout = StringIO()
+            with (
+                patch.object(
+                    cli_module,
+                    "reload_detached_autopilot",
+                    return_value=result,
+                ) as reload_autopilot,
+                redirect_stdout(stdout),
+                redirect_stderr(StringIO()),
+            ):
+                exit_code = main(
+                    [
+                        "autopilot",
+                        "reload",
+                        "--repo",
+                        str(repo),
+                        "--timeout",
+                        "4",
+                        "--json",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            json.loads(stdout.getvalue())["changed_keys"],
+            ["autopilot.jobs"],
+        )
+        self.assertEqual(reload_autopilot.call_args.kwargs["timeout"], 4.0)
 
     def test_status_text_reports_repo_queue_and_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
