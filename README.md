@@ -61,12 +61,14 @@ vibe-loop tasks configure --repo . --dry-run --json   # review candidate
 vibe-loop tasks configure --repo . --json             # activate
 ```
 
-Inspect runnable work, then run one selected task with the configured agent:
+Inspect work, then run either the named task or one selected task with the
+configured agent:
 
 ```bash
 vibe-loop tasks list --repo .
 vibe-loop tasks tree --repo .
 vibe-loop next --repo .
+vibe-loop run TASK-01 --repo .
 vibe-loop run-next --repo .
 ```
 
@@ -188,9 +190,13 @@ vibe-loop next --repo .
 ### Run
 
 ```bash
+vibe-loop run TASK-01 --repo .
 vibe-loop run-next --repo . --ask-agent
 vibe-loop run-until-done --repo . --ask-agent --jobs 2
 ```
+
+The authoritative explicit-dispatch and selection contract is
+[Task Selection Semantics](docs/prd/task-discovery.md#prd-tsk-007-task-selection-semantics).
 
 `--ask-agent` hands the agent the mechanically safe candidate list plus recent
 `.vibe-loop/runs.jsonl` entries and log tails. The CLI validates returned IDs

@@ -739,6 +739,10 @@ class TaskActivationError(RuntimeError):
     """A command task source could not confirm its pre-launch claim."""
 
 
+class ExplicitTaskDispatchError(RuntimeError):
+    """A named task cannot enter the standard run lifecycle."""
+
+
 class AgentLimitWallError(RuntimeError):
     """An agent subprocess refused work because an account limit was reached.
 
@@ -4194,6 +4198,61 @@ class VibeRunner:
                 exclude=excluded,
                 restart_counts=restart_counts,
             )
+
+    def run_task_id(self, task_id: str) -> RunResult:
+        require_project_binding(self.config)
+        tasks = self.source.list_tasks()
+        task = next((task for task in tasks if task.task_id == task_id), None)
+        if task is None:
+            raise ExplicitTaskDispatchError(f"unknown task {task_id!r}")
+
+        if self.lock_manager.is_locked(task_id):
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} has an existing task lock"
+            )
+
+        active_domains = active_lock_conflict_domains(self.lock_manager)
+        if resource_conflicts_enabled([task], active_domains) and (
+            task_conflicts_with_domains(task, active_domains)
+        ):
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is excluded by a conflict domain held by "
+                "an active run"
+            )
+
+        if task.done:
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is already complete with status {task.status!r}"
+            )
+
+        done_task_ids = {candidate.task_id for candidate in tasks if candidate.done}
+        unresolved_dependencies = tuple(
+            dependency
+            for dependency in task.dependencies
+            if dependency not in done_task_ids
+        )
+        if unresolved_dependencies:
+            dependencies = ", ".join(unresolved_dependencies)
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is dependency-blocked by: {dependencies}"
+            )
+
+        runnable_statuses = self.source_resolution.task_source.runnable_statuses
+        if task.status not in runnable_statuses:
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is not runnable with status {task.status!r}"
+            )
+
+        self.ensure_spec_execution_gate()
+        self.require_worker_launch_config()
+        try:
+            return self.run_task_with_supervision(task)
+        except LockBusy as exc:
+            if exc.metadata.get("reason") == "resource_conflict":
+                reason = "is excluded by a conflict domain held by an active run"
+            else:
+                reason = "has an existing task lock"
+            raise ExplicitTaskDispatchError(f"task {task_id!r} {reason}") from exc
 
     def run_until_done(
         self,
