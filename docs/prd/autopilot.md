@@ -149,11 +149,12 @@ available, actions, blockers, child pid/log path when relevant, and next wake.
 Cycle and supervisor records also carry the configured worktree-disposition
 policy. Worktree-disposition records carry that policy plus candidate counts,
 evidence, reasons, and outcomes. Existing run readers must keep tolerating
-unknown record types. Idle-wait records carry the originating cycle id, outer
-deadline, wake reason, runnable count, task-source poll count, wake-adapter call
-count, and bounded source/adapter error categories. This provenance must
-distinguish a task change, deadline, operator message, and a failing source
-without persisting operator-message content.
+unknown record types. Adaptive-wait records (`autopilot_idle_wait`) cover idle
+and restartable waits and carry the originating cycle id, outer deadline, wake
+reason, runnable count, task-source poll count, wake-adapter call count, and
+bounded source/adapter error categories. This provenance must distinguish a
+task change, deadline, operator message, and a failing source without persisting
+operator-message content.
 
 Related implementation IDs: `AUTO-01`, `AUTO-03`, `AUTO-04`.
 
@@ -168,16 +169,18 @@ Acceptance must cover child command construction, log redirection under the
 configured state directory, pid/log observation, no duplicate supervisor
 launch, one-cycle mode, bounded cycle counts, foreground interval sleeping,
 signal behavior, and classification of clean drain versus restartable exit
-versus blocked state. Idle foreground waits use an adaptive full-list fallback
-whose delays grow to a configured cap while preserving the outer interval
-deadline; repeated task-source or wake-adapter failures must not spin. With the
-default settings, a 30-minute empty interval performs substantially fewer than
-30 task-source listings. Each logical fallback poll performs one task-source
-listing, derives runnable work from that snapshot, and bounds a command-backed
-listing by the remaining absolute monotonic deadline. Candidate filtering uses
-the cycle's active-run/conflict snapshot so the fallback does not introduce an
-independently timed lock-backend query; a lock-only change is observed through
-the trusted wake adapter or at the outer deadline.
+versus blocked state. Idle foreground and ordinary restartable-backoff waits use
+an adaptive full-list fallback whose delays grow to a configured cap while
+preserving the outer interval deadline; repeated task-source failures must not
+spin. Idle waits may additionally use the trusted wake adapter, whose failures
+also remain bounded. With the default settings, a 30-minute interval performs
+substantially fewer than 30 task-source listings. Each logical fallback poll
+performs one task-source listing and bounds a command-backed listing by the
+remaining absolute monotonic deadline. Idle candidate filtering derives
+runnable work from that snapshot and uses the cycle's active-run/conflict
+snapshot so the fallback does not introduce an independently timed lock-backend
+query; a lock-only change is observed through the trusted wake adapter or at the
+outer deadline.
 
 `autopilot run` remains the foreground supervisor contract. On POSIX systems,
 `autopilot start` must provide the supported detached lifecycle by starting
@@ -713,6 +716,16 @@ record is appended, then `sleeping` while a non-empty `next_wake` is being
 honoured. Bounded and already-stopping paths record no next wake. A drain-mode
 cycle records and honours a positive limit-wall deadline, but records no
 ordinary interval wake.
+
+An ordinary restartable-backoff wait captures a complete task-source snapshot
+after the failed child and compares subsequent snapshots with that post-child
+fingerprint. A same-cardinality replacement or content/source edit can wake the
+next cycle early. Lifecycle-status or counter-only churn, an unchanged runnable
+task, and idle-wake-adapter events do not wake restartable backoff: those inputs
+must not reset the child-local retry budget or collapse exhausted-retry
+protection into a dispatch loop. A zero-second limit-wall result falls back to
+the ordinary interval and therefore still captures the post-child baseline.
+Positive limit-wall pauses retain their dedicated stop-responsive wait.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 

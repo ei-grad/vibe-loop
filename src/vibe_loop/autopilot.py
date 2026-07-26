@@ -7243,29 +7243,32 @@ def run_autopilot(
                 not bounded_last
                 and interval > 0
                 and "launched_run_until_done" in result.actions
-                and result.limit_wall_pause_seconds is None
+                and (
+                    result.limit_wall_pause_seconds is None
+                    or (
+                        result.status == "restartable"
+                        and result.limit_wall_pause_seconds <= 0
+                    )
+                )
             ):
                 post_cycle_queue = collect_task_queue_status(config)
-                post_cycle_runnable = (
-                    0 if post_cycle_queue.source_error else post_cycle_queue.runnable
-                )
-                threshold = min_ready
-                post_cycle_action = (
-                    f"post_cycle_runnable:{post_cycle_runnable}/{threshold}"
-                )
-                if post_cycle_runnable < threshold:
-                    post_cycle_planning_delay = min(
-                        interval,
-                        config.autopilot.planning_recheck_seconds,
+                if result.limit_wall_pause_seconds is None:
+                    post_cycle_runnable = (
+                        0
+                        if post_cycle_queue.source_error
+                        else post_cycle_queue.runnable
                     )
-                    result = dataclasses.replace(
-                        result,
-                        actions=(*result.actions, post_cycle_action),
+                    threshold = min_ready
+                    post_cycle_action = (
+                        f"post_cycle_runnable:{post_cycle_runnable}/{threshold}"
                     )
-                else:
+                    if post_cycle_runnable < threshold:
+                        post_cycle_planning_delay = min(
+                            interval,
+                            config.autopilot.planning_recheck_seconds,
+                        )
                     result = dataclasses.replace(
-                        result,
-                        actions=(*result.actions, post_cycle_action),
+                        result, actions=(*result.actions, post_cycle_action)
                     )
             stop_pending = should_stop is not None and should_stop()
             scheduled_wait_seconds: float | None = None
@@ -7328,7 +7331,7 @@ def run_autopilot(
                 if poll_during_wait:
                     wake_adapter_callback: IdleWakeAdapter | None = None
                     idle_wake_command = config.autopilot.idle_wake_command
-                    if idle_wake_command is not None:
+                    if cycle_should_recheck(result) and idle_wake_command is not None:
 
                         def _wake_adapter(
                             timeout: float,
@@ -7386,22 +7389,27 @@ def run_autopilot(
                         wake_on_runnable=cycle_should_recheck(result),
                     )
                     run_store.append_record(wait_result.to_record(config.repo))
+                    wait_name = (
+                        "idle"
+                        if cycle_should_recheck(result)
+                        else "restartable backoff"
+                    )
                     if wait_result.wake_reason == "task_change":
                         print(
-                            "[vibe-loop] autopilot idle wake: task source changed, "
-                            "starting next cycle early",
+                            f"[vibe-loop] autopilot {wait_name} wake: task source "
+                            "changed, starting next cycle early",
                             flush=True,
                         )
                     elif wait_result.wake_reason == "operator_message":
                         print(
-                            "[vibe-loop] autopilot idle wake: operator message, "
-                            "starting next cycle early",
+                            f"[vibe-loop] autopilot {wait_name} wake: operator "
+                            "message, starting next cycle early",
                             flush=True,
                         )
                     elif wait_result.wake_reason == "reload":
                         print(
-                            "[vibe-loop] autopilot idle wake: reload requested, "
-                            "starting next cycle early",
+                            f"[vibe-loop] autopilot {wait_name} wake: reload "
+                            "requested, starting next cycle early",
                             flush=True,
                         )
                 elif post_cycle_planning_delay is not None:

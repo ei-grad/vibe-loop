@@ -5168,11 +5168,16 @@ class AutopilotRecheckTests(unittest.TestCase):
             configured_repo(
                 repo,
                 [("TASK-01", "Next", "", "unchanged route")],
-                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    'idle_wake_command = "unused-adapter"\n'
+                ),
             )
             config = load_config(repo)
             launcher_calls = 0
             sleeps: list[float] = []
+            adapter_calls: list[float] = []
 
             def launcher(command, *, cwd, log_path, on_start=None):
                 nonlocal launcher_calls
@@ -5187,14 +5192,57 @@ class AutopilotRecheckTests(unittest.TestCase):
                 interval=100.0,
                 launcher=launcher,
                 sleep=sleeps.append,
+                idle_wake_command_runner=lambda *args, **kwargs: (
+                    adapter_calls.append(kwargs["timeout"]) or {"kind": "task_change"}
+                ),
             )
 
         self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
+        self.assertEqual(adapter_calls, [])
         self.assertEqual(launcher_calls, 2)
         self.assertEqual(
             [cycle.status for cycle in summary.cycles],
             ["restartable", "restartable"],
         )
+
+    def test_zero_limit_wall_uses_post_child_restartable_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "pre-child route")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "require_clean_repo = false\n"
+                ),
+            )
+            config = load_config(repo)
+            sleeps: list[float] = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                if on_start is not None:
+                    on_start(4242)
+                write_plan(
+                    repo,
+                    [("TASK-01", "Next", "", "post-child settled route")],
+                )
+                return 1
+
+            with mock.patch(
+                "vibe_loop.autopilot.limit_wall_pause_seconds",
+                return_value=0.0,
+            ):
+                summary = run_autopilot(
+                    config,
+                    max_cycles=2,
+                    interval=100.0,
+                    launcher=launcher,
+                    sleep=sleeps.append,
+                )
+
+        self.assertEqual(summary.cycles[0].status, "restartable")
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
 
     def test_stop_interrupts_restartable_polling_and_releases_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5250,30 +5298,41 @@ class AutopilotRecheckTests(unittest.TestCase):
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
             config = load_config(repo)
-            wait_started: list[datetime.datetime] = []
+            elapsed_seconds = 0.0
+            deadline_anchors: list[float] = []
+            epoch = datetime.datetime(2026, 7, 20, tzinfo=datetime.UTC)
 
             def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal elapsed_seconds
                 if on_start is not None:
                     on_start(4242)
-                time.sleep(0.05)
+                elapsed_seconds += 120.0
                 return 1
 
-            def sleeper(_seconds: float) -> None:
-                wait_started.append(datetime.datetime.now(datetime.UTC))
+            def iso_after_elapsed(seconds: float) -> str:
+                deadline_anchors.append(elapsed_seconds)
+                return (
+                    epoch + datetime.timedelta(seconds=elapsed_seconds + seconds)
+                ).isoformat()
 
-            summary = run_autopilot(
-                config,
-                max_cycles=2,
-                interval=60.0,
-                launcher=launcher,
-                sleep=sleeper,
-            )
+            with mock.patch(
+                "vibe_loop.autopilot.iso_after",
+                side_effect=iso_after_elapsed,
+            ):
+                summary = run_autopilot(
+                    config,
+                    max_cycles=2,
+                    interval=60.0,
+                    launcher=launcher,
+                    sleep=lambda _seconds: None,
+                )
 
         first = summary.cycles[0]
         self.assertEqual(first.status, "restartable")
-        self.assertGreater(
+        self.assertEqual(deadline_anchors, [120.0])
+        self.assertEqual(
             datetime.datetime.fromisoformat(first.next_wake),
-            wait_started[0] + datetime.timedelta(seconds=59.0),
+            epoch + datetime.timedelta(seconds=180.0),
         )
 
     def test_idle_planning_cycle_rechecks_and_wakes_early(self) -> None:
