@@ -2637,6 +2637,9 @@ class VibeRunner:
                             task_id=task.task_id,
                             worker_pid=worker_pid,
                             supervisor_pid=active_state.supervisor_pid or os.getpid(),
+                            supervisor_process_birth_id=(
+                                active_state.supervisor_process_birth_id
+                            ),
                             process_group_id=(
                                 identity.process_group_id if identity else None
                             ),

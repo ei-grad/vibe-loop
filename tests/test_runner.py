@@ -44,7 +44,7 @@ from vibe_loop.locks import (
     SettledOutcomeNotPersisted,
     TaskLock,
 )
-from vibe_loop.processes import ProcessNode, read_process_node
+from vibe_loop.processes import ProcessNode, process_birth_identity, read_process_node
 from vibe_loop.orchestration import (
     CandidateRecord,
     CandidateReanchorRetryExhausted,
@@ -5324,6 +5324,33 @@ class ActiveLockConflictDomainLivenessTests(unittest.TestCase):
             )
             self.assertIn("Makefile", domains[0].paths)
             self.assertIn("resource:system-monitoring", domains[0].resources)
+
+    def test_live_supervisor_holds_domains_after_worker_teardown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            state = dataclasses.replace(
+                _active_run_state(
+                    task_id="POST-WORKER",
+                    run_id="run-post-worker",
+                    worker_pid=999999999,
+                    host=socket.gethostname(),
+                    repo=repo,
+                    resources=("db",),
+                ),
+                supervisor_pid=os.getpid(),
+                supervisor_process_birth_id=process_birth_identity(os.getpid()),
+            )
+            manager.acquire(
+                "POST-WORKER",
+                "run-post-worker",
+                metadata=state.to_lock_metadata(),
+            )
+
+            domains = active_lock_conflict_domains(manager)
+
+        self.assertEqual(len(domains), 1)
+        self.assertIn("db", domains[0].resources)
 
 
 class StaleLockSelectionDrainingTests(unittest.TestCase):

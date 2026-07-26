@@ -2621,7 +2621,8 @@ def render_workers(workers: list[WorkerView]) -> str:
             )
         lines.append(
             f"{payload['task_id']}\t{payload['run_id']}\t{payload['state']}"
-            f"\tprocess={payload['process_state']}\tpid={pid}"
+            f"\trun={payload['run_state'] or 'unknown'}"
+            f"\tworker_process={payload['process_state']}\tpid={pid}"
             f"\tstarted={payload['started_at']}\tlog={payload['log']}"
             f"\tcommand={payload['command']}{workspace}{lifecycle}{result}"
             f"{stage}{restarts}{diagnostics}{stale}"

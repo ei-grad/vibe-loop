@@ -312,7 +312,9 @@ Acceptance must cover unsafe workspace diagnostics, dirty repo state, missing
 task source, unavailable agent command, no runnable work, and child launch
 failure as explicit blockers or observations rather than destructive cleanup
 triggers; stale locks with a still-live or PID-unobserved owner remain blocking,
-while stale locks with a missing worker process are recovered and audited; and
+while stale locks whose run has a terminal result or a verified-dead
+runtime supervisor are recovered and audited; a missing worker during
+post-worker runtime stages remains live; and
 default worktree disposition reports eligible candidates without deletion, and
 explicit `reap` disposition removes only clean remnants with unambiguous
 released ownership, a matching completed worker report, and containment in
