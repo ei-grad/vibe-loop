@@ -143,6 +143,11 @@ from vibe_loop.runs import (
     settled_run_outcome,
     utc_now_iso,
 )
+from vibe_loop.skill_deployment import (
+    SkillDeploymentError,
+    render_verification_reports,
+    verify_worker_skill_deployments,
+)
 from vibe_loop.spec_diagnostics import ensure_spec_execution_gate
 from vibe_loop.telemetry import (
     ATTRIBUTION_DIAGNOSTIC_LIMIT,
@@ -1785,6 +1790,8 @@ class VibeRunner:
         try:
             try:
                 return self.run_task(task)
+            except SkillDeploymentError as exc:
+                return self.record_skill_verification_failure(task, exc)
             except AgentResolutionError as exc:
                 explicit_agent = (task.agent or "").strip()
                 if not explicit_agent or explicit_agent in self.config.agent_profiles:
@@ -1798,6 +1805,43 @@ class VibeRunner:
                     pass
             else:
                 self._restart_context.value = previous
+
+    def record_skill_verification_failure(
+        self,
+        task: Task,
+        error: SkillDeploymentError,
+    ) -> RunResult:
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        run_id = new_run_id(task.task_id)
+        log_path = self.runs_dir / f"{run_id}.log"
+        started_at = utc_now_iso()
+        start_main = git_rev_parse(self.config.repo, "HEAD")
+        diagnostics = "\n".join(error.diagnostics)
+        message = str(error)
+        if diagnostics:
+            message = f"{message}\n{diagnostics}"
+        with log_path.open("w", encoding="utf-8") as log:
+            report_status(
+                f"worker skill preflight blocked {task.task_id}: {message}",
+                log,
+            )
+        result = RunResult(
+            run_id=run_id,
+            task_id=task.task_id,
+            classification="blocked",
+            exit_code=1,
+            log_path=log_path,
+            start_main=start_main,
+            end_main=git_rev_parse(self.config.repo, "HEAD"),
+            message=message,
+            started_at=started_at,
+            classification_source="skill_verification",
+            restart_count=self.current_restart_count(task.task_id),
+            max_restarts=self.config.supervision.max_restarts,
+        )
+        self.record_result(result)
+        report_status(f"recorded blocked result for {task.task_id}: {log_path}")
+        return result
 
     def record_agent_resolution_failure(
         self,
@@ -1848,6 +1892,13 @@ class VibeRunner:
         *,
         recovery: RecoveryContext | None = None,
     ) -> RunResult:
+        skill_reports = verify_worker_skill_deployments(Path.home())
+        blocking_reports = tuple(report for report in skill_reports if report.blocking)
+        if blocking_reports:
+            raise SkillDeploymentError(
+                "installed skills failed provenance verification",
+                diagnostics=render_verification_reports(blocking_reports),
+            )
         self.ensure_spec_execution_gate()
         agent_selection = resolve_task_agent(self.config, task)
         agent = agent_selection.config
@@ -5076,6 +5127,8 @@ class VibeRunner:
         )
         try:
             result = self.run_task(task, recovery=recovery)
+        except SkillDeploymentError as exc:
+            result = self.record_skill_verification_failure(task, exc)
         except AttemptCircuitOpen as exc:
             report_status(str(exc))
             self.record_recovery_phase(
