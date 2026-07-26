@@ -227,7 +227,15 @@ this installation's recorded acquire generation; else refuse, naming
 then settles the source. The autopilot cycle runs the first two rungs (never
 `--force`), and its cleanup candidates include settlement-pending locks, whose
 `result_recorded` staleness would otherwise put them out of reach of every
-automatic recovery while they block the whole queue. The task source is
+automatic recovery while they block the whole queue. Every rung first requires
+proof that the run finished: either a terminal `run_result`, or, after the
+worker-owned stage, an absent or birth-mismatched runtime supervisor. Platforms
+without process-birth identities fail closed while the supervisor PID exists
+and recover after it is absent. A missing worker alone is not proof because
+runtime-owned gates, review, remediation, integration, and closure normally run
+after worker teardown. The explicit exception is an expired foreign-host lease:
+only operator-requested `--force` may accept that lease as the recovery boundary;
+automatic cleanup and ordinary cleanup still refuse it. The task source is
 authoritative for dispatch, so a released lock over an unsettled (still
 in-progress) source blocks nothing and dispatches nothing.
 

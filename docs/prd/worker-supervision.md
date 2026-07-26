@@ -218,6 +218,10 @@ settled or leaves the lock held and recoverable; it can never finalize it as
 
 Related implementation IDs: `PAR-03`, `PAR-05`.
 
+Exact `report`, `worker`, and `main-integration` command invocations are in the
+[CLI reference](../cli-reference.md#worker-lifecycle-commands). This PRD remains
+authoritative for their supervision and settlement contracts.
+
 ## PRD-WRK-004 Parallel Supervision
 
 `run-until-done --jobs N` must supervise multiple independent finite workers

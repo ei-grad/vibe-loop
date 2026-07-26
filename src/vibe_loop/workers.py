@@ -35,6 +35,8 @@ from vibe_loop.runs import (
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
     RUN_RECORD_TYPE,
+    RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+    RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
@@ -54,6 +56,19 @@ ACTIVE_RUN_RECORD_TYPE = "active_run"
 WORKSPACE_CLAIM_SCHEMA_VERSION = 1
 WORKSPACE_DIAGNOSTIC_SCHEMA_VERSION = 1
 DIRTY_SUMMARY_LIMIT = 200
+RUNTIME_OWNED_STAGES = frozenset(
+    {
+        "candidate",
+        "gates",
+        "review",
+        "remediation",
+        "closure",
+        "integration",
+        "provenance",
+        "classification",
+        "finalization",
+    }
+)
 
 
 class WorkspaceClaimError(RuntimeError):
@@ -591,6 +606,7 @@ class WorkerView:
     active: ActiveRunState
     state: str
     process_state: str
+    run_state: str = ""
     stale_reason: str | None = None
     result_status: str | None = None
     result_finished_at: str | None = None
@@ -609,6 +625,7 @@ class WorkerView:
             "run_id": self.active.run_id,
             "state": self.state,
             "process_state": self.process_state,
+            "run_state": self.run_state,
             "stale_reason": self.stale_reason,
             "pid": self.active.worker_pid,
             "worker_pid": self.active.worker_pid,
@@ -1518,17 +1535,37 @@ def build_worker_views(
         )
         result_record_type = result_value(result, "record_type")
         result_metadata = result_metadata_value(result)
+        lifecycle_progress = worker_lifecycle_progress(active, records)
+        run_state = classify_run(
+            active,
+            lifecycle_progress,
+            result_status=result_status,
+            result_record_type=result_record_type,
+            current_host=host,
+            process_state=process_state,
+            process_exists=process_checker,
+        )
         state = "running"
         stale_reason = None
         if not active.run_id:
             state = "stale"
             stale_reason = "missing_run_id"
-        elif lock_lease_expired(active.to_lock_metadata()):
-            state = "stale"
-            stale_reason = "lease_expired"
         elif result_status and result_record_type != WORKER_REPORT_RECORD_TYPE:
             state = "stale"
             stale_reason = "result_recorded"
+        elif (
+            run_state == "running" and lifecycle_progress.stage in RUNTIME_OWNED_STAGES
+        ):
+            pass
+        elif lock_lease_expired(active.to_lock_metadata()):
+            state = "stale"
+            stale_reason = "lease_expired"
+        elif lifecycle_progress.stage in RUNTIME_OWNED_STAGES and run_state in {
+            "foreign_host",
+            "unknown",
+        }:
+            state = "unknown"
+            stale_reason = run_state
         elif process_state == "missing":
             state = "stale"
             stale_reason = "missing_process"
@@ -1551,12 +1588,13 @@ def build_worker_views(
                 active=active,
                 state=state,
                 process_state=process_state,
+                run_state=run_state,
                 stale_reason=stale_reason,
                 result_status=result_status,
                 result_finished_at=result_finished_at,
                 result_record_type=result_record_type,
                 result_metadata=result_metadata,
-                lifecycle_progress=worker_lifecycle_progress(active, records),
+                lifecycle_progress=lifecycle_progress,
                 activity=summarize_activity_records(
                     [
                         record
@@ -1572,7 +1610,199 @@ def build_worker_views(
                 workspace_diagnostics=workspace_diagnostics,
             )
         )
+    views.extend(
+        live_unlocked_run_views(
+            records,
+            locked_run_ids={view.active.run_id for view in views},
+            current_host=host,
+            process_exists=process_checker,
+            workspace_context=workspace_context,
+        )
+    )
     return views
+
+
+def live_unlocked_run_views(
+    records: list[dict[str, Any]],
+    *,
+    locked_run_ids: set[str],
+    current_host: str,
+    process_exists: ProcessExists,
+    workspace_context: WorkspaceGitContext | None,
+) -> list[WorkerView]:
+    """Recover operator visibility for live runtime stages after lock loss."""
+
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for record in records:
+        run_id = optional_string(record.get("run_id"))
+        task_id = optional_string(record.get("task_id"))
+        if run_id and task_id:
+            grouped.setdefault((run_id, task_id), []).append(record)
+
+    views: list[WorkerView] = []
+    for (run_id, task_id), run_records in grouped.items():
+        if run_id in locked_run_ids:
+            continue
+        lifecycle = derive_run_lifecycle(run_records)
+        if lifecycle.stage not in RUNTIME_OWNED_STAGES:
+            continue
+        latest_status = latest_worker_status_by_run_id(run_records).get(run_id)
+        if (
+            latest_status is not None
+            and latest_status.get("record_type") != WORKER_REPORT_RECORD_TYPE
+        ):
+            continue
+        started = next(
+            (
+                record
+                for record in reversed(run_records)
+                if record.get("record_type") == "run_started"
+            ),
+            None,
+        )
+        worker_started = next(
+            (
+                record
+                for record in reversed(run_records)
+                if record.get("record_type") == WORKER_PROCESS_STARTED_RECORD_TYPE
+            ),
+            None,
+        )
+        if started is None or worker_started is None:
+            continue
+        supervisor_pid = optional_int(worker_started.get("supervisor_pid"))
+        supervisor_birth_id = optional_string(
+            worker_started.get("supervisor_process_birth_id")
+        ) or supervisor_birth_id_for_worker_record(records, worker_started)
+        if supervisor_pid is None or not supervisor_birth_id:
+            continue
+        host = optional_string(worker_started.get("host")) or ""
+        active = ActiveRunState(
+            task_id=task_id,
+            run_id=run_id,
+            log_path=optional_path(started.get("log")) or Path(),
+            started_at=(
+                optional_string(started.get("occurred_at"))
+                or optional_string(started.get("started_at"))
+                or ""
+            ),
+            base_main=optional_string(started.get("base_main")) or "",
+            command="",
+            resources=optional_string_tuple(started.get("resources")),
+            paths=optional_string_tuple(started.get("paths")),
+            conflict_domains_known=optional_bool(started.get("conflict_domains_known")),
+            worker_pid=optional_int(worker_started.get("worker_pid")),
+            worker_process_group_id=optional_int(
+                worker_started.get("worker_process_group_id")
+            ),
+            worker_session_id=optional_int(worker_started.get("worker_session_id")),
+            worker_process_birth_id=(
+                optional_string(worker_started.get("worker_process_birth_id")) or ""
+            ),
+            supervisor_pid=supervisor_pid,
+            supervisor_process_birth_id=supervisor_birth_id,
+            host=host,
+            workspace=latest_workspace_claim(run_records, task_id, run_id),
+        )
+        process_state = classify_process(active, current_host, process_exists)
+        run_state = classify_run(
+            active,
+            lifecycle,
+            result_status=(
+                result_value(latest_status, "status")
+                or result_value(latest_status, "classification")
+            ),
+            result_record_type=result_value(latest_status, "record_type"),
+            current_host=current_host,
+            process_state=process_state,
+            process_exists=process_exists,
+        )
+        if run_state != "running":
+            continue
+        workspace_git_state = (
+            inspect_workspace_git_state(active, workspace_context)
+            if workspace_context is not None and active.workspace is not None
+            else None
+        )
+        views.append(
+            WorkerView(
+                active=active,
+                state="running",
+                process_state=process_state,
+                run_state=run_state,
+                stale_reason="missing_lock",
+                result_status=(
+                    result_value(latest_status, "status")
+                    or result_value(latest_status, "classification")
+                ),
+                result_finished_at=(
+                    result_value(latest_status, "finished_at")
+                    or result_value(latest_status, "reported_at")
+                ),
+                result_record_type=result_value(latest_status, "record_type"),
+                result_metadata=result_metadata_value(latest_status),
+                lifecycle_progress=lifecycle,
+                activity=summarize_activity_records(run_records),
+                workspace_git_state=workspace_git_state,
+                workspace_diagnostics=(
+                    workspace_git_state.diagnostics
+                    if workspace_git_state is not None
+                    else ()
+                ),
+            )
+        )
+    return views
+
+
+def supervisor_birth_id_for_worker_record(
+    records: Sequence[dict[str, Any]],
+    worker_started: dict[str, Any],
+) -> str:
+    supervisor_pid = optional_int(worker_started.get("supervisor_pid"))
+    if supervisor_pid is None:
+        return ""
+    worker_index = next(
+        (index for index, record in enumerate(records) if record is worker_started),
+        None,
+    )
+    if worker_index is None:
+        return ""
+    birth_id = ""
+    for record in records[:worker_index]:
+        if optional_int(record.get("pid")) != supervisor_pid:
+            continue
+        record_type = record.get("record_type")
+        if record_type == RUN_SUPERVISOR_STARTED_RECORD_TYPE:
+            birth_id = optional_string(record.get("process_birth_id")) or ""
+        elif record_type == RUN_SUPERVISOR_EXITED_RECORD_TYPE:
+            birth_id = ""
+    if not birth_id:
+        return ""
+    if any(
+        optional_int(record.get("pid")) == supervisor_pid
+        and record.get("record_type")
+        in {
+            RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+            RUN_SUPERVISOR_EXITED_RECORD_TYPE,
+        }
+        for record in records[worker_index + 1 :]
+    ):
+        return ""
+    return birth_id
+
+
+def latest_workspace_claim(
+    records: Sequence[dict[str, Any]],
+    task_id: str,
+    run_id: str,
+) -> WorkspaceClaim | None:
+    for record in reversed(records):
+        if record.get("record_type") != WORKSPACE_CLAIM_RECORD_TYPE:
+            continue
+        claim = WorkspaceClaim.from_json(record)
+        if claim is not None and claim.task_id == task_id and claim.run_id == run_id:
+            return claim
+    return None
 
 
 def restore_projected_worker_process_identity(
@@ -1733,6 +1963,47 @@ def classify_process(
     )
 
 
+def classify_run(
+    active: ActiveRunState,
+    lifecycle: RunLifecycleProgress,
+    *,
+    result_status: str | None,
+    result_record_type: str | None,
+    current_host: str,
+    process_state: str,
+    process_exists: ProcessExists | None = None,
+) -> str:
+    """Classify the run owner instead of assuming its worker owns all stages.
+
+    Once a runtime-owned run reaches candidate collection, its worker may be
+    deliberately gone while the supervisor executes gates, review, remediation,
+    integration, and finalization. The supervisor's PID is accepted only with
+    its process-birth identity, so PID reuse cannot make an abandoned run live.
+    """
+
+    if result_status and result_record_type != WORKER_REPORT_RECORD_TYPE:
+        return "finished"
+    if lifecycle.stage not in RUNTIME_OWNED_STAGES:
+        return process_state
+    if active.host and active.host != current_host:
+        return "foreign_host"
+    if active.supervisor_pid is None:
+        return "unknown"
+    process_checker = process_exists if process_exists is not None else pid_exists
+    if not process_checker(active.supervisor_pid):
+        return "missing"
+    if not active.supervisor_process_birth_id:
+        return "unknown"
+    current_birth_id = process_birth_identity(active.supervisor_pid)
+    if not current_birth_id:
+        return "unknown"
+    return (
+        "running"
+        if current_birth_id == active.supervisor_process_birth_id
+        else "missing"
+    )
+
+
 def active_run_is_live(
     active: ActiveRunState,
     *,
@@ -1741,11 +2012,9 @@ def active_run_is_live(
 ) -> bool:
     """Whether an active-run lock still represents a run that may make progress.
 
-    Mirrors the staleness rules in ``build_worker_views``: a run whose owning
-    process is gone (missing pid / no recorded pid), whose lease expired, or
-    whose run_id is missing is not live and must not keep holding its
-    conflict-domain leases. A run on another host is treated as live (uncertain
-    rather than provably dead) so cross-host work still serializes.
+    Lock-only callers conservatively retain ownership when either the worker or
+    the recorded runtime supervisor may still be alive. Exact birth identity is
+    used when available; platforms without it fail closed while the PID exists.
     """
     if not active.run_id:
         return False
@@ -1753,7 +2022,29 @@ def active_run_is_live(
         return False
     host = current_host if current_host is not None else socket.gethostname()
     process_state = classify_process(active, host, process_exists)
-    return process_state not in {"missing", "unknown_pid"}
+    if process_state not in {"missing", "unknown_pid"}:
+        return True
+    if active.host and active.host != host:
+        return True
+    if active.supervisor_pid is None:
+        return False
+    process_checker = process_exists if process_exists is not None else pid_exists
+    if not process_checker(active.supervisor_pid):
+        return False
+    if not active.supervisor_process_birth_id:
+        return True
+    current_birth_id = process_birth_identity(active.supervisor_pid)
+    return not current_birth_id or current_birth_id == (
+        active.supervisor_process_birth_id
+    )
+
+
+def worker_view_is_live(view: WorkerView) -> bool:
+    """Whether a worker view must continue to reserve runtime ownership."""
+
+    return view.state == "running" or (
+        view.state == "unknown" and view.run_state in {"foreign_host", "unknown"}
+    )
 
 
 def latest_worker_status_by_run_id(
@@ -1842,13 +2133,26 @@ class StaleLock:
     settled_outcome: str = ""
     settled_classification: str = ""
     settlement_pending: bool = False
-    # Live-process disposition from `classify_process`. "missing" is positive
-    # evidence that the run is over, including a generation-aware supervisor
-    # identity before worker launch. Legacy "unknown_pid" locks and
-    # "foreign_host" locks remain unproven. Settlement recovery mutates the
-    # authoritative task source, so it must act on identity evidence rather
-    # than on staleness alone.
+    # Keep worker-process state separate from the run-level disposition.
+    # Runtime-owned post-worker stages use the exact supervisor birth identity;
+    # a terminal run result is the other positive proof that recovery is safe.
     process_state: str = ""
+    run_state: str = ""
+
+    @property
+    def run_proven_finished(self) -> bool:
+        if self.run_state:
+            return self.run_state in {"finished", "missing"}
+        return self.stale_reason == "result_recorded" or self.process_state == "missing"
+
+    @property
+    def force_recovery_supported(self) -> bool:
+        return (
+            self.kind == "task"
+            and not self.settlement_pending
+            and self.stale_reason == "lease_expired"
+            and self.run_state == "foreign_host"
+        )
 
     @property
     def process_proven_dead(self) -> bool:
@@ -1856,7 +2160,11 @@ class StaleLock:
 
     @property
     def recovery_supported(self) -> bool:
-        return not self.settlement_pending or self.process_state != "unknown_pid"
+        return (
+            self.kind != "task"
+            or self.run_proven_finished
+            or self.force_recovery_supported
+        )
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1869,6 +2177,7 @@ class StaleLock:
             "started_at": self.started_at,
             "settlement_pending": self.settlement_pending,
             "process_state": self.process_state,
+            "run_state": self.run_state,
             "recovery_supported": self.recovery_supported,
         }
 
@@ -1918,6 +2227,7 @@ def collect_stale_locks(
                 settled_classification=settlement[1],
                 settlement_pending=view.active.run_id in source_settlement_pending,
                 process_state=view.process_state,
+                run_state=view.run_state,
             )
         )
 
@@ -2213,36 +2523,37 @@ def clean_stale_locks(
     recovered: list[StaleLock] = []
     forced_unsettled: list[StaleLock] = []
     for lock in stale_locks:
-        if lock.settlement_pending:
-            if not lock.process_proven_dead:
-                # `settlement_pending` latches at the activation stage of every
-                # runtime-owned run, so it marks live runs too - a run is in it
-                # from activation until it settles. Recovery here settles the
-                # authoritative source and releases the lock, so acting on the
-                # latch alone would requeue a running task mid-run and pull the
-                # lock out from under its own worker. Staleness is not death;
-                # only a missing process is.
-                if lock.process_state == "unknown_pid":
-                    detail = (
-                        "the lock records neither a worker pid nor a "
-                        "generation-aware supervisor identity; no supported "
-                        "command can prove that its process is gone or clear "
-                        "the lock"
-                    )
-                else:
-                    detail = (
-                        "its recorded process is not proven dead "
-                        f"(process_state={lock.process_state or 'unknown'}); "
-                        "recovery applies once that process is proven gone"
-                    )
-                errors.append(
-                    (
-                        lock,
-                        "task-source settlement pending; refusing to settle or "
-                        f"release it because {detail}",
-                    )
+        if lock_manager is None and not lock.lock_path.exists():
+            continue
+        if lock.force_recovery_supported and not force:
+            errors.append(
+                (
+                    lock,
+                    "foreign-host task lock lease expired; run "
+                    "`vibe-loop workers clean --force` to accept the lease as "
+                    "the explicit recovery boundary and release it",
                 )
-                continue
+            )
+            continue
+        forced_foreign_lease = force and lock.force_recovery_supported
+        if (
+            lock.kind == "task"
+            and not lock.run_proven_finished
+            and not forced_foreign_lease
+        ):
+            errors.append(
+                (
+                    lock,
+                    "refusing to release the task lock because its run is not "
+                    "proven finished "
+                    f"(run_state={lock.run_state or 'unknown'}, "
+                    f"worker_process_state={lock.process_state or 'unknown'}); "
+                    "no supported command can clear it until a terminal run "
+                    "result or verified runtime-supervisor exit",
+                )
+            )
+            continue
+        if lock.settlement_pending:
             settled = settlement_recovery is not None and settlement_recovery.settled(
                 lock.task_id
             )
@@ -2419,7 +2730,7 @@ class WorktreeDispositionEvidence:
     ``parse_git_worktree_list`` (via ``build_workspace_git_context``) for
     enumeration, ``merged_branch_targets`` for the merged predicate,
     ``git_status_lines`` for dirty state, and ``build_worker_views`` plus
-    ``active_run_is_live`` for the claiming run and its liveness.
+    ``worker_view_is_live`` for the claiming run and its liveness.
     """
 
     path: Path
@@ -2638,11 +2949,7 @@ def worktree_claims_by_path(
                 branch=claim.branch,
                 worktree=claim.worktree.resolve(),
                 state=view.state,
-                is_live=active_run_is_live(
-                    view.active,
-                    current_host=current_host,
-                    process_exists=process_exists,
-                ),
+                is_live=worker_view_is_live(view),
                 terminal_status=report.status if report is not None else "",
                 terminal_commit=report.commit if report is not None else "",
             )

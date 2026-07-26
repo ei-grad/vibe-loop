@@ -121,6 +121,7 @@ from vibe_loop.workers import (
     pid_exists,
     record_expired_locks,
     restore_projected_worker_process_identity,
+    worker_view_is_live,
     worktree_branch_delete_revalidation_guardrails,
 )
 
@@ -1229,9 +1230,10 @@ def project_blockers(
         blockers.append("stale_locks_present")
         blockers.extend(
             "unrecoverable_stale_lock: "
-            f"task={lock.task_id} process_state={lock.process_state or 'unknown'}; "
-            "no supported command can clear it without proof that its process "
-            "is gone"
+            f"task={lock.task_id} run_state={lock.run_state or 'unknown'} "
+            f"worker_process_state={lock.process_state or 'unknown'}; "
+            "no supported command can clear it without proof that its run "
+            "finished"
             for lock in stale_locks
             if not lock.recovery_supported
         )
@@ -1264,9 +1266,7 @@ def active_conflict_worker_count(workers: tuple[WorkerView, ...]) -> int:
 
 
 def worker_holds_active_conflict(worker: WorkerView) -> bool:
-    if worker.state == "running":
-        return True
-    return worker.state == "unknown" and worker.process_state == "foreign_host"
+    return worker_view_is_live(worker)
 
 
 def string_tuple(value: object) -> tuple[str, ...]:
@@ -5399,23 +5399,16 @@ def execute_autopilot_cycle(
     planning_limit_wall_pause: float | None = None
     planning_backoff_pause: float | None = None
 
-    # A post-result strand is classified `result_recorded`, which wins over
-    # `missing_process` in the staleness chain, so filtering on the latter
-    # alone left exactly the locks that block the whole queue unreachable by
-    # any automatic recovery. The added class is that one reason and nothing
-    # broader: `settlement_pending` alone latches from the activation stage of
-    # every runtime-owned run, and a live run in its activation window has no
-    # worker pid yet (`missing_worker_pid`), so admitting the latch would feed
-    # running tasks to a recovery that settles their source and releases their
-    # lock. The proven-dead requirement is the same one cleanup enforces.
+    # Missing worker processes are normal after a runtime-owned terminal report.
+    # Cleanup is eligible only when the run itself is durably terminal or its
+    # exact runtime supervisor identity is verified gone.
     cleanup_candidates = tuple(
         lock
         for lock in status.stale_locks
-        if lock.stale_reason == "missing_process"
-        or (
-            lock.stale_reason == "result_recorded"
-            and lock.settlement_pending
-            and lock.process_proven_dead
+        if lock.run_proven_finished
+        and (
+            lock.stale_reason == "missing_process"
+            or (lock.stale_reason == "result_recorded" and lock.settlement_pending)
         )
     )
     if cleanup_candidates:

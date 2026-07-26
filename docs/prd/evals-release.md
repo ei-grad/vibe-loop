@@ -2,6 +2,9 @@
 
 This PRD owns Level 2 contracts for bundled skill evaluation, artifact records,
 aggregate reporting, external benchmark adapters, and release-readiness gates.
+The [skill evaluation strategy](../skill-evaluation-strategy.md) explains the
+methodology and research rationale; it defers to this PRD for product behavior
+and release policy.
 
 ## PRD-EVL-001 Paired Skill Evaluation
 
@@ -66,6 +69,12 @@ trial pass/fail blocking, dry-run over existing aggregates, release-readiness
 records, parked regression flags, optional external benchmark summaries, and
 release-note references to evidence. The full local-demo suite must still
 support paired `no_skill` comparisons for broader analysis.
+
+The shipped matrix currently contains 20 cases and 22 required case/condition
+pairs. The default minimum is one trial per pair. It covers table and generated
+discovery, explicit-list and spec-driven profiles, command-backed task and lock
+adapters, runtime-owned orchestration, review remediation, worktree safety, and
+integration failure paths.
 
 Related implementation IDs: `EVAL-06`.
 

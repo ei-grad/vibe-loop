@@ -353,7 +353,9 @@ Acceptance must cover unsafe workspace diagnostics, dirty repo state, missing
 task source, unavailable agent command, no runnable work, and child launch
 failure as explicit blockers or observations rather than destructive cleanup
 triggers; stale locks with a still-live or PID-unobserved owner remain blocking,
-while stale locks with a missing worker process are recovered and audited; and
+while stale locks whose run has a terminal result or a verified-dead
+runtime supervisor are recovered and audited; a missing worker during
+post-worker runtime stages remains live; and
 default worktree disposition reports eligible candidates without deletion, and
 explicit `reap` disposition removes only clean remnants with unambiguous
 released ownership, a matching completed worker report, and containment in
@@ -794,64 +796,59 @@ Related implementation IDs: `AUTO-12`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
 
 ## PRD-AUT-013 Observed Agent Session Id And Transcript Linkage
 
-A run record must let an operator find the agent's real session transcript.
-Today the worker is launched with `claude -p {prompt}` in default text mode,
-which never emits its session id, so `runs.jsonl` records
-`session_id_source: fallback:run_id` and only the wrapper-log path. The real
-agent session transcript (for Claude,
-`~/.claude/projects/.../<uuid>.jsonl`) is referenced nowhere, so what the agent
-actually did cannot be recovered from a run record.
+A run record must expose the agent's real session id when the provider makes it
+available and must let an operator reach the provider transcript when a stable
+local transcript path can be resolved. Recognized Claude and Codex worker
+commands use their native structured result streams while the wrapper log keeps
+the complete provider stream.
 
-The worker invocation must surface the agent's real session id when the agent
-can provide one, and the run records must persist both that id and the resolved
-transcript path. For Claude the supervisor injects a known `--session-id <uuid>`
-into the worker command (the alternative to `claude -p --output-format json`,
-which would change stdout from streamed text to a JSON envelope and force the
-selection/analysis text-scraping paths to adapt). Injection leaves stdout
-unchanged, so streaming/progress output and the read-only selection/analysis
-paths are untouched; the transcript path is resolved by globbing
-`$CLAUDE_HOME/projects/*/<uuid>.jsonl` after the run, independent of Claude's
-cwd encoding, and is skipped when the command already pins `--session-id`. For
-Codex the CLI was inspected: `codex exec` has no flag to force or print a
-session id without `--json` (which would replace the streamed human-readable
-output the wrapper log and selection/analysis parsing rely on), so Codex worker
-runs retain `fallback:run_id` and this limitation is documented in the README
-rather than silently faked.
+For Claude, the supervisor injects a known `--session-id <uuid>` unless the
+configured command already pins one, requests
+`--output-format stream-json --verbose`, and resolves the transcript by locating
+the unique session id below `$CLAUDE_HOME/projects/` (default `~/.claude`). The
+initial `run_started` record may carry a predicted path before the file exists;
+the final run context carries the resolved path. A provider invoked with
+`--no-session-persistence` may persist no transcript, so the path is
+best-effort.
 
-Acceptance must cover: a real `session_id` recorded with
-`session_id_source: observed` (distinct from `fallback:run_id`) whenever the
-agent surfaces one; the resolved transcript file path recorded on the
-`run_started` and `run_result`/run context records; `fallback:run_id` retained
-only when the agent genuinely surfaces no session id; preserved
-streaming/progress behavior (the chosen `--session-id` injection leaves stdout
-unchanged); and a documented path from a run record to the agent's transcript
-file. This contract is independent of recovery and may land on its own.
+For Codex, `thread.started` supplies the native session id from
+`codex exec --json`. Codex has no forced-session option and vibe-loop does not
+persist a resolved Codex transcript path. After observing the id, the supervisor
+may inspect the matching local rollout for the numeric usage and quota evidence
+owned by `PRD-AUT-016`; neither the rollout path nor its raw records are
+persisted. Custom worker commands retain their configured output mode and fall
+back to the run id when they expose no native session id.
+
+Acceptance must cover: observed Claude and Codex session ids distinct from
+`fallback:run_id`; resolved Claude transcript paths in run context records;
+missing-transcript behavior; commands that already pin a Claude session id;
+Codex operation without a persisted transcript path; preserved provider-stream
+logging; and fallback identity only when the provider exposes no session id.
+This contract is independent of recovery and may land on its own.
 
 Related implementation IDs: `AUTO-20`.
 
 ## PRD-AUT-014 Unknown-Run Recovery And Continuation
 
-When a worker run ends without a clear terminal report — classified `unknown`,
-or committed on its claimed branch but neither merged nor reported — the work is
-orphaned: the supervisor stops or re-attempts from scratch and the
-committed-but-unmerged-unreported work is left behind. The observed failure mode
-is a worker that did real work, committed to its branch, then *parked* on a
-billable external/authorization gate ("I'll continue when the monitor fires")
-and exited; because `claude -p` is one-shot, the process exit left the run
-`unknown`, never merged and never reported.
+When a worker run ends without a clear terminal report, the classification
+rules in `PRD-WRK-003` apply. A clean Claude compatibility-mode exit without a
+matching report is `failed` with reason `worker_report_missing`; a run is
+`unknown` only when the runtime could not observe enough state, such as a failed
+task-source probe. Both that specific compatibility failure and genuinely
+unknown runs are recovery-eligible. Committed work on the claimed branch that
+is neither merged nor reported must likewise be preserved rather than orphaned
+or re-attempted from scratch. Runtime-owned orchestration instead preserves a
+derived candidate after a clean report-less implementation exit under
+`PRD-ORC-004`.
 
 `run-until-done` must deterministically launch a bounded continuation worker for
-such runs. The supervisor's deterministic control flow decides *when* to
-recover; the agent does the *work*. Recovery must launch a continuation
-read-write worker agent (the existing worker command path, not the read-only
-analysis agent of `PRD-AUT-009`) with a recovery prompt that conveys the task
-id, the prior `run_id`, the claimed branch and worktree (from the
-`workspace_claim` record), the prior agent transcript path (from
-`PRD-AUT-013`) and the wrapper log, and the instruction: the previous session
-ended `unknown`; investigate what went wrong, finish the work and/or emit a
-proper status (`completed`/`blocked`/`failed`); if blocked on an
-external/authorization gate, report `blocked` with the precise reason — do not
-park.
+recovery-eligible compatibility runs. The supervisor's deterministic control
+flow decides *when* to recover; the agent does the *work*. Recovery launches a
+continuation read-write worker through the existing worker command path, not the
+read-only analysis agent of `PRD-AUT-009`. Its prompt conveys the task id, prior
+run id, claimed branch and worktree, prior transcript path when available, and
+wrapper log, and requires a proper terminal status rather than another parked
+progress summary.
 
 Recovery must be bounded: cap recovery attempts per task by reusing or extending
 the existing `task_restart` counter/record so an `unknown → recover → unknown`
@@ -866,13 +863,14 @@ committed work; it neither reclassifies live work nor force-removes workspaces.
 It depends on `PRD-AUT-013` because the recovery prompt must point the
 continuation worker at the prior agent transcript.
 
-Acceptance must cover: deterministic detection of `unknown` (and
-committed-but-unmerged-unreported) runs in `run-until-done`; launch of a
-read-write continuation worker with the recovery prompt context above; a
-per-task recovery attempt cap built on the `task_restart` counter; a clear
-terminal `blocked`/`failed` record once the cap is reached; append-only
-journaling of each recovery launch and outcome; and no destructive action on
-the claimed workspace.
+Acceptance must cover: deterministic detection of `unknown`,
+`worker_report_missing`, and committed-but-unmerged-unreported compatibility
+runs in `run-until-done`; exclusion of runtime-owned derived candidates from
+compatibility recovery; launch of a read-write continuation worker with the
+recovery prompt context above; a per-task recovery attempt cap built on the
+`task_restart` counter; a clear terminal `failed` record once the cap is
+reached; append-only journaling of each recovery launch and outcome; and no
+destructive action on the claimed workspace.
 
 Related implementation IDs: `AUTO-21`.
 
