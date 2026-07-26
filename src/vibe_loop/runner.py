@@ -1905,11 +1905,16 @@ class VibeRunner:
         agent_profile = agent_selection.profile
         command_template = agent.require_command()
         agent_kind = agent.executable_kind or agent.agent_kind
+        if agent_kind == "auto":
+            inferred_kind = agent_command_provider(command_template, None)
+            if inferred_kind in {"codex", "claude"}:
+                agent_kind = inferred_kind
         agent_kind_source = (
             agent.command_source
-            if agent.agent_kind == "auto" and agent.executable_kind
+            if agent.agent_kind == "auto" and agent_kind != "auto"
             else agent.agent_kind_source
         )
+        runtime_owned_mode = self.config.orchestration.mode == "runtime-owned"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
         log_path = self.runs_dir / f"{run_id}.log"
@@ -1952,9 +1957,10 @@ class VibeRunner:
             )
             session_id = injected_session_id
             session_id_source = SESSION_OBSERVED_SOURCE
-        effective_template = inject_claude_implementer_tool_denial(
-            effective_template, agent_kind
-        )
+        if runtime_owned_mode:
+            effective_template = inject_claude_implementer_tool_denial(
+                effective_template, agent_kind
+            )
         effective_template = inject_structured_usage_output(
             effective_template, agent_kind
         )
@@ -1983,6 +1989,7 @@ class VibeRunner:
             log_path=log_path,
             agent_kind=agent_kind,
             agent_profile=agent_profile,
+            disable_background_tasks=runtime_owned_mode and agent_kind == "claude",
         )
         claude_home: Path | None = None
         codex_home: Path | None = None
@@ -3257,7 +3264,7 @@ class VibeRunner:
                 ),
             )
             if (
-                result.classification == "unknown"
+                run_requires_recovery(result)
                 and self.config.supervision.recover_unknown_runs
             ):
                 recovery_attempt = 1 if recovery is None else recovery.attempt + 1
@@ -4416,7 +4423,7 @@ class VibeRunner:
                     continue
                 recovery_attempts[pending.task_id] = pending.attempt
                 results.append(result)
-                if result.classification == "unknown":
+                if run_requires_recovery(result):
                     result = self.drive_unknown_recovery(
                         result,
                         attempts=recovery_attempts,
@@ -4491,7 +4498,7 @@ class VibeRunner:
                 report_status(
                     f"transient retries exhausted for {result.task_id}, skipping"
                 )
-            if result.classification == "unknown":
+            if run_requires_recovery(result):
                 result = self.drive_unknown_recovery(
                     result,
                     attempts=recovery_attempts,
@@ -4546,7 +4553,7 @@ class VibeRunner:
                 continue
             recovery_attempts[recovery.task_id] = recovery.attempt
             results.append(result)
-            if result.classification == "unknown":
+            if run_requires_recovery(result):
                 result = self.drive_unknown_recovery(
                     result,
                     attempts=recovery_attempts,
@@ -4765,7 +4772,7 @@ class VibeRunner:
                             f"transient retries exhausted for {result.task_id}, "
                             "skipping"
                         )
-                    if result.classification == "unknown":
+                    if run_requires_recovery(result):
                         # Recovery runs synchronously in the supervisor thread,
                         # by design: only this drain loop mutates results/
                         # counters, so a continuation worker cannot race the
@@ -4877,13 +4884,14 @@ class VibeRunner:
     ) -> bool:
         """Report whether this run is the one that exhausts the budget.
 
-        The condition mirrors ``drive_unknown_recovery`` exactly: only a run
-        that classifies ``unknown`` re-enters recovery, so any other
-        unknown-settling classification - ``timed_out``, ``limit_wall`` - is
-        terminal as itself and must not be published as failed.
+        The condition mirrors ``drive_unknown_recovery`` exactly: an
+        ``unknown`` run or a ``worker_report_missing`` failure re-enters
+        recovery. Other unknown-settling classifications such as ``timed_out``
+        and ``limit_wall`` are terminal as themselves and must not be published
+        as failed.
         """
 
-        if recovery is None or result.classification != "unknown":
+        if recovery is None or not run_requires_recovery(result):
             return False
         if not self.config.supervision.recover_unknown_runs:
             return False
@@ -4924,7 +4932,7 @@ class VibeRunner:
         attempts: dict[str, int],
         results: list[RunResult],
     ) -> RunResult:
-        """Deterministically recover a run that classified `unknown`.
+        """Recover an unknown run or a report-less Claude failure.
 
         Launches bounded read-write continuation workers against the prior
         claimed workspace until the run reaches a clear terminal status or the
@@ -4938,7 +4946,7 @@ class VibeRunner:
         if max_attempts <= 0:
             return result
         current = result
-        while current.classification == "unknown":
+        while run_requires_recovery(current):
             attempt = attempts.get(current.task_id, 0) + 1
             if attempt > max_attempts:
                 # The exhausting run recorded this verdict before releasing its
@@ -5484,10 +5492,10 @@ def build_batch_selection_prompt(
 
 @dataclasses.dataclass(frozen=True)
 class RecoveryContext:
-    """Bounded context handed to a continuation worker recovering an
-    `unknown` run. Identifies the prior run, its claimed workspace, and the
-    artifacts the continuation worker should inspect before finishing the work
-    or emitting a proper terminal status."""
+    """Bounded context handed to a continuation worker recovering an unknown
+    run or a report-less Claude failure. Identifies the prior run, its claimed
+    workspace, and the artifacts the continuation worker should inspect before
+    finishing the work or emitting a proper terminal status."""
 
     task_id: str
     prior_run_id: str
@@ -5732,7 +5740,7 @@ def build_recovery_prompt_section(recovery: RecoveryContext) -> str:
         "worker report protocol.\n"
         "4. If the work is blocked on an external or authorization gate, report "
         "`blocked` with the precise reason — do NOT park and exit silently, "
-        "which would leave the run `unknown` again.\n"
+        "which would require another recovery attempt.\n"
     )
 
 
@@ -7270,7 +7278,7 @@ def inject_claude_implementer_tool_denial(command: str, agent_kind: str) -> str:
     A one-shot ``claude -p`` process has no later turn in which to receive an
     Agent/Task completion notification. Denying those asynchronous launch
     surfaces keeps the implementation lifecycle in the supervised process.
-    Existing tool denials are preserved and consolidated into one option.
+    Existing tool denials and shell syntax are preserved byte-for-byte.
     """
     if agent_kind not in {"auto", "claude"}:
         return command
@@ -7281,38 +7289,16 @@ def inject_claude_implementer_tool_denial(command: str, agent_kind: str) -> str:
     if command_executable_name(argv) != "claude":
         return command
 
-    existing_denials: list[str] = []
-    stripped: list[str] = []
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token.startswith(("--disallowedTools=", "--disallowed-tools=")):
-            _, _, values = token.partition("=")
-            if values:
-                existing_denials.append(values)
-            index += 1
-            continue
-        if token not in {"--disallowedTools", "--disallowed-tools"}:
-            stripped.append(token)
-            index += 1
-            continue
-        index += 1
-        while index < len(argv):
-            value = argv[index]
-            if value == "{prompt}" or value.startswith("-"):
-                break
-            existing_denials.append(value)
-            index += 1
+    equals_option = re.compile(r"(?<!\S)(--disallowedTools|--disallowed-tools)=")
+    if equals_option.search(command):
+        return equals_option.sub(r"\1=Agent,Task,", command, count=1)
 
-    denied = ["Agent,Task"]
-    denied.extend(
-        value
-        for value in existing_denials
-        if value and value not in {"Agent", "Task", "Agent,Task"}
-    )
-    stripped.extend(("--disallowedTools", *denied))
-    prepared = shlex.join(stripped)
-    return prepared.replace(shlex.quote("{prompt}"), "{prompt}")
+    separate_option = re.compile(r"(?<!\S)(--disallowedTools|--disallowed-tools)(?=\s)")
+    if separate_option.search(command):
+        return separate_option.sub(r"\1 Agent,Task", command, count=1)
+
+    executable = re.compile(r"(?<!\S)((?:[^\s]*/)?claude)(?=\s)")
+    return executable.sub(r"\1 --disallowedTools Agent,Task", command, count=1)
 
 
 def worker_usage_provenance(worker_report: WorkerReport | None) -> tuple[str, str]:
@@ -8701,6 +8687,7 @@ def worker_command_env(
     log_path: Path,
     agent_kind: str,
     agent_profile: str,
+    disable_background_tasks: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("VIBE_LOOP_PRIMARY_REPO", None)
@@ -8714,7 +8701,7 @@ def worker_command_env(
             "VIBE_LOOP_AGENT_PROFILE": agent_profile,
         }
     )
-    if agent_kind == "claude":
+    if disable_background_tasks:
         env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     return env
 
@@ -8942,6 +8929,13 @@ def _analysis_retry_callback(attempt: int, delay: float, reason: str) -> None:
 
 
 LOG_TAIL_LINES_FOR_TRANSIENT_CHECK = 50
+
+
+def run_requires_recovery(result: RunResult) -> bool:
+    return result.classification == "unknown" or (
+        result.classification == "failed"
+        and result.classification_source == "worker_report_missing"
+    )
 
 
 def is_transient_worker_failure(

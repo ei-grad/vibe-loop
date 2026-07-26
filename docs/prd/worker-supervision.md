@@ -119,8 +119,11 @@ contract failure, not an unknown runtime outcome. If task probing cannot prove a
 terminal task state and compatibility-mode fallback reaches that condition, the
 run records `failed` with reason `worker_report_missing`. `unknown` remains for
 cases where the runtime itself could not observe enough state, such as a failed
-task-source probe. Runtime-owned orchestration may still derive and validate a
-candidate after a clean report-less exit, preserving the candidate, workspace,
+task-source probe. The specific compatibility-mode failure remains eligible for
+the bounded recovery configured by `recover_unknown_runs`, so a continuation can
+resume the Claude session and preserved workspace instead of abandoning
+committed work. Runtime-owned orchestration may derive and validate a candidate
+directly after a clean report-less exit, preserving the candidate, workspace,
 and gate evidence it records during the runtime stages.
 
 Headless Claude implementers cannot safely park on asynchronous work:
@@ -128,8 +131,11 @@ Headless Claude implementers cannot safely park on asynchronous work:
 turn in which to receive a background Bash, Agent, or Task completion
 notification. The launch policy therefore sets
 `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` and denies Agent and Task tools for
-Claude implementation workers while preserving any repository-configured tool
-denials. Provider limit-wall exits are separate: they exit nonzero and retain
+runtime-owned Claude implementation workers while preserving the configured
+shell template and any existing tool denials. Worker-owned Claude runs retain
+Agent and Task access because their contract requires in-process independent
+review; their prompt instead requires collecting all asynchronous work before
+returning. Provider limit-wall exits are separate: they exit nonzero and retain
 the existing `limit_wall` classification and reset evidence.
 
 The 2026-07-24 historical measurement supports this mechanism rather than a
@@ -194,9 +200,10 @@ Four ordering rules keep the two stores in agreement:
 - A recovery attempt that exhausts the unknown-run recovery budget settles as
   `failed`, not `unknown`. That run records the terminal `failed` result
   itself, before releasing its lock, and the recovery driver reuses it, so the
-  external outcome is never published ahead of the durable local one. Only a
-  run classified `unknown` re-enters recovery, so a `timed_out` or
-  `limit_wall` run is terminal as itself and stays `unknown` externally.
+  external outcome is never published ahead of the durable local one. Runs
+  classified `unknown` and failures specifically sourced from
+  `worker_report_missing` re-enter recovery; a `timed_out` or `limit_wall` run
+  is terminal as itself and stays `unknown` externally.
 
 The gate would be worthless if stale recovery could undo it. A lock retained by
 a failed settlement still stores `unknown` while the run's `run_result` is

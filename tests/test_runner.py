@@ -4114,6 +4114,53 @@ class TransientWorkerFailureTests(unittest.TestCase):
         ]
         self.assertEqual(len(restart_records), 1)
 
+    def test_serial_loop_recovers_reportless_claude_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            log_path = repo / "run.log"
+            log_path.write_text("Claude exited before reporting\n", encoding="utf-8")
+            source = MutableTaskSource(
+                [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
+            )
+            runner._source = source
+            calls: list[RecoveryContext | None] = []
+
+            def run_task(task: Task, *, recovery: RecoveryContext | None = None):
+                calls.append(recovery)
+                if recovery is None:
+                    return RunResult(
+                        run_id="run-1",
+                        task_id=task.task_id,
+                        classification="failed",
+                        classification_source="worker_report_missing",
+                        exit_code=0,
+                        log_path=log_path,
+                        start_main="aaa",
+                        end_main="aaa",
+                    )
+                source.mark_done(task.task_id)
+                return RunResult(
+                    run_id="run-2",
+                    task_id=task.task_id,
+                    classification="completed",
+                    exit_code=0,
+                    log_path=log_path,
+                    start_main="aaa",
+                    end_main="bbb",
+                )
+
+            runner.run_task = run_task
+            results = runner.run_until_done_serial()
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(results[-1].classification, "completed")
+        self.assertIsNotNone(calls[1])
+        assert calls[1] is not None
+        self.assertEqual(calls[1].prior_classification, "failed")
+
     def test_serial_loop_recovery_budget_exhausted(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -7077,7 +7124,7 @@ class SessionIdInjectionTests(unittest.TestCase):
 
         argv = shlex.split(prepared)
         denied = argv.index("--disallowedTools")
-        self.assertEqual(argv[denied + 1 :], ["Agent,Task"])
+        self.assertEqual(argv[denied + 1], "Agent,Task")
         self.assertIn("{prompt}", argv)
 
     def test_claude_implementer_preserves_existing_tool_denials(self) -> None:
@@ -7089,6 +7136,48 @@ class SessionIdInjectionTests(unittest.TestCase):
         self.assertEqual(argv.count("--disallowedTools"), 1)
         denied = argv.index("--disallowedTools")
         self.assertEqual(argv[denied + 1 :], ["Agent,Task", "Edit", "Write"])
+
+    def test_claude_implementer_preserves_shell_template_syntax(self) -> None:
+        command = "claude -p {prompt} >> $VIBE_LOOP_LOG 2>&1"
+
+        prepared = inject_claude_implementer_tool_denial(command, "claude")
+
+        self.assertEqual(
+            prepared,
+            "claude --disallowedTools Agent,Task -p {prompt} >> $VIBE_LOOP_LOG 2>&1",
+        )
+        self.assertEqual(
+            inject_claude_implementer_tool_denial(
+                "claude -p {prompt} --add-dir ~/shared",
+                "claude",
+            ),
+            "claude --disallowedTools Agent,Task -p {prompt} --add-dir ~/shared",
+        )
+
+    def test_claude_implementer_preserves_embedded_prompt_after_denials(self) -> None:
+        command = 'claude -p --disallowedTools Edit "Task: {prompt}"'
+
+        prepared = inject_claude_implementer_tool_denial(command, "claude")
+
+        self.assertEqual(
+            prepared,
+            'claude -p --disallowedTools Agent,Task Edit "Task: {prompt}"',
+        )
+
+    def test_claude_launch_injections_keep_quoted_prompt_as_one_argument(self) -> None:
+        command = inject_claude_session_id(
+            'claude -p "Task: {prompt}"',
+            "12345678-1234-1234-1234-123456789abc",
+        )
+        command = inject_claude_implementer_tool_denial(command, "claude")
+        command = inject_structured_usage_output(command, "claude")
+        command = format_agent_command(command, prompt="hello world", model=None)
+
+        argv = shlex.split(command)
+
+        prompt_arguments = [value for value in argv if "hello" in value]
+        self.assertEqual(len(prompt_arguments), 1)
+        self.assertTrue(prompt_arguments[0].startswith("Task: "))
 
     def test_claude_implementer_policy_does_not_change_codex_path(self) -> None:
         command = "codex exec {prompt}"
@@ -7111,6 +7200,7 @@ class SessionIdInjectionTests(unittest.TestCase):
                 log_path=Path("/tmp/run.log"),
                 agent_kind="claude",
                 agent_profile="claude-opus",
+                disable_background_tasks=True,
             )
             codex_env = worker_command_env(
                 run_id="run-2",
@@ -7122,6 +7212,21 @@ class SessionIdInjectionTests(unittest.TestCase):
 
         self.assertEqual(claude_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
         self.assertEqual(codex_env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "0")
+
+    def test_worker_owned_claude_keeps_background_tasks_available(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"},
+        ):
+            environment = worker_command_env(
+                run_id="run-1",
+                task_id="TASK-01",
+                log_path=Path("/tmp/run.log"),
+                agent_kind="claude",
+                agent_profile="claude-opus",
+            )
+
+        self.assertEqual(environment["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "0")
 
     def test_worker_usage_provenance_is_allowlisted(self) -> None:
         report = WorkerReport(
@@ -7903,7 +8008,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 directory, [task], {"T-1": active}
             )
             claude = AgentConfig(
-                agent_kind="claude",
+                agent_kind="auto",
                 command="claude -p {prompt}",
                 prompt_dialect="claude",
                 skill_ref_prefix="/",
@@ -7914,16 +8019,27 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 agent_profiles={"worker": claude},
             )
 
+            worker = self._reporting_worker(runner, "", report=False)
+
+            def reportless_worker(command, cwd, log, **kwargs):
+                self.assertNotIn("--disallowedTools", command)
+                self.assertEqual(
+                    kwargs["env"].get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+                    os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+                )
+                return worker(command, cwd, log, **kwargs)
+
             result = self._run_task(
                 runner,
                 task,
-                self._reporting_worker(runner, "", report=False),
+                reportless_worker,
             )
 
             self.assertEqual(result.classification, "failed")
             self.assertEqual(result.classification_source, "worker_report_missing")
             self.assertIn("terminal worker report", result.message)
             self.assertIsNone(result.worker_report)
+            self.assertIsNotNone(result.recovery_intent)
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "failed")
 
     def test_runtime_owned_claude_exit_without_report_continues_to_candidate(
@@ -7934,7 +8050,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             runner, lock_manager, _source = self._build_runner(directory, [task], {})
             self._enable_runtime_owned_task_source(runner, task)
             claude = AgentConfig(
-                agent_kind="claude",
+                agent_kind="auto",
                 command="claude -p {prompt}",
                 prompt_dialect="claude",
                 skill_ref_prefix="/",
@@ -7959,6 +8075,16 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                     "runtime_lifecycle",
                 )
 
+            worker = self._reporting_worker(runner, "", report=False)
+
+            def reportless_worker(command, cwd, log, **kwargs):
+                self.assertIn("--disallowedTools Agent,Task", command)
+                self.assertEqual(
+                    kwargs["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"],
+                    "1",
+                )
+                return worker(command, cwd, log, **kwargs)
+
             with patch.object(
                 runner,
                 "execute_runtime_owned_lifecycle",
@@ -7967,7 +8093,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 result = self._run_task(
                     runner,
                     task,
-                    self._reporting_worker(runner, "", report=False),
+                    reportless_worker,
                 )
 
             lifecycle.assert_called_once()
