@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,7 @@ from vibe_loop.cli import render_autopilot_stop
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
+    process_birth_identity,
     read_process_node,
     read_process_table,
 )
@@ -444,6 +446,83 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["queue"]["runnable"], 0)
         self.assertIn("waiting_for_active_workers:1", payload["observations"])
         self.assertNotIn("no_runnable_work", payload["observations"])
+
+    def test_status_shows_live_review_run_after_its_lock_is_lost(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Active", "", "active slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            supervisor_birth_id = process_birth_identity(os.getpid())
+            self.assertTrue(supervisor_birth_id)
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "run_supervisor_started",
+                    "occurred_at": "2026-05-09T00:00:00+00:00",
+                    "pid": os.getpid(),
+                    "process_birth_id": supervisor_birth_id,
+                }
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_started(
+                    run_id="run-review",
+                    task_id="TASK-01",
+                    payload={
+                        "log": str(config.state_path / "runs" / "run-review.log"),
+                        "base_main": git_text(repo, "rev-parse", "HEAD"),
+                        "resources": [],
+                        "paths": [],
+                        "conflict_domains_known": False,
+                    },
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.worker_process_started(
+                    run_id="run-review",
+                    task_id="TASK-01",
+                    worker_pid=999999999,
+                    supervisor_pid=os.getpid(),
+                    process_group_id=999999999,
+                    session_id=999999999,
+                    process_birth_id="missing-worker",
+                    host=socket.gethostname(),
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-review",
+                    task_id="TASK-01",
+                    transition=StageTransition(
+                        from_stage=RunStage.GATES,
+                        to_stage=RunStage.REVIEW,
+                        reason="review_started",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+            run_store.append_report(
+                WorkerReport(
+                    run_id="run-review",
+                    task_id="TASK-01",
+                    status="completed",
+                    commit="def456",
+                    message="implementation candidate ready",
+                )
+            )
+
+            payload = collect_project_status(
+                config,
+                process_exists=lambda pid: pid == os.getpid(),
+            ).to_json()
+
+        self.assertEqual(len(payload["workers"]), 1)
+        self.assertEqual(payload["workers"][0]["run_id"], "run-review")
+        self.assertEqual(payload["workers"][0]["state"], "running")
+        self.assertEqual(payload["workers"][0]["run_state"], "running")
+        self.assertEqual(payload["workers"][0]["process_state"], "missing")
+        self.assertEqual(payload["workers"][0]["stale_reason"], "missing_lock")
 
     def test_status_names_a_legacy_pre_worker_lock_without_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

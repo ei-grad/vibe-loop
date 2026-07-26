@@ -175,6 +175,7 @@ from vibe_loop.workers import (
     active_run_is_live,
     build_worker_views,
     git_dirty_snapshot,
+    worker_view_is_live,
     workspace_state_fingerprint,
 )
 
@@ -1523,7 +1524,10 @@ class VibeRunner:
             self.source_resolution.task_source.respect_source_order,
         )
         if active_runs is None:
-            active_domains = active_lock_conflict_domains(self.lock_manager)
+            active_domains = active_lock_conflict_domains(
+                self.lock_manager,
+                self.run_store,
+            )
             locked_task_ids: set[str] | None = None
         else:
             active_domains = tuple(
@@ -2637,6 +2641,9 @@ class VibeRunner:
                             task_id=task.task_id,
                             worker_pid=worker_pid,
                             supervisor_pid=active_state.supervisor_pid or os.getpid(),
+                            supervisor_process_birth_id=(
+                                active_state.supervisor_process_birth_id
+                            ),
                             process_group_id=(
                                 identity.process_group_id if identity else None
                             ),
@@ -3398,7 +3405,10 @@ class VibeRunner:
             task.task_id,
         )
         try:
-            active_domains = active_lock_conflict_domains(self.lock_manager)
+            active_domains = active_lock_conflict_domains(
+                self.lock_manager,
+                self.run_store,
+            )
             if resource_conflicts_enabled([task], active_domains) and (
                 task_conflicts_with_domains(task, active_domains)
             ):
@@ -6940,8 +6950,15 @@ def resource_conflicts_enabled(
 
 def active_lock_conflict_domains(
     lock_manager: LockManager,
+    run_store: RunStore | None = None,
 ) -> tuple[ConflictDomains, ...]:
     domains: list[ConflictDomains] = []
+    if run_store is not None:
+        return tuple(
+            conflict_domains_from_task_like(view.active)
+            for view in build_worker_views(lock_manager, run_store)
+            if worker_view_is_live(view)
+        )
     for metadata in lock_manager.list_locks():
         active = ActiveRunState.from_lock_metadata(metadata)
         if active is None:

@@ -8013,7 +8013,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload[1]["lifecycle_state"], "")
         text_output = text_stdout.getvalue()
         self.assertIn(
-            "TASK-01\trun-1\trunning\tprocess=running"
+            "TASK-01\trun-1\trunning\trun=running\tworker_process=running"
             f"\tpid={os.getpid()}"
             "\tstarted=2026-05-09T00:00:00+00:00"
             f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-1.log'}"
@@ -8021,7 +8021,7 @@ class CliTests(unittest.TestCase):
             text_output,
         )
         self.assertIn(
-            "TASK-02\trun-2\tstale\tprocess=missing"
+            "TASK-02\trun-2\tstale\trun=missing\tworker_process=missing"
             "\tpid=999999999"
             "\tstarted=2026-05-09T00:01:00+00:00"
             f"\tlog={repo / '.vibe-loop' / 'runs' / 'run-2.log'}"

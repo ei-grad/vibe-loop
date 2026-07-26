@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -18,6 +19,7 @@ from vibe_loop.locks import (
     build_lock_manager,
 )
 from vibe_loop.orchestration import RunStage, StageTransition
+from vibe_loop.processes import process_birth_identity
 from vibe_loop.tasks import Task
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
@@ -1834,6 +1836,170 @@ class _RecoverySource:
 
 
 class StaleLockTests(unittest.TestCase):
+    def _append_live_review_run(
+        self,
+        run_store: RunStore,
+        *,
+        repo: Path,
+        task_id: str = "TASK-01",
+        run_id: str = "run-1",
+    ) -> None:
+        supervisor_birth_id = process_birth_identity(os.getpid())
+        self.assertTrue(supervisor_birth_id)
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_started(
+                run_id=run_id,
+                task_id=task_id,
+                payload={
+                    "log": str(repo / ".vibe-loop" / "runs" / f"{run_id}.log"),
+                    "base_main": "abc123",
+                    "resources": [],
+                    "paths": [],
+                    "conflict_domains_known": False,
+                },
+            )
+        )
+        run_store.append_lifecycle_event(
+            RunLifecycleEvent.worker_process_started(
+                run_id=run_id,
+                task_id=task_id,
+                worker_pid=999999999,
+                supervisor_pid=os.getpid(),
+                supervisor_process_birth_id=supervisor_birth_id,
+                process_group_id=999999999,
+                session_id=999999999,
+                process_birth_id="missing-worker",
+                host="test-host",
+            )
+        )
+        transitions = (
+            (None, RunStage.ACTIVATION),
+            (RunStage.ACTIVATION, RunStage.WORKSPACE),
+            (RunStage.WORKSPACE, RunStage.IMPLEMENTING),
+            (RunStage.IMPLEMENTING, RunStage.CANDIDATE),
+            (RunStage.CANDIDATE, RunStage.GATES),
+            (RunStage.GATES, RunStage.REVIEW),
+        )
+        for from_stage, to_stage in transitions:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id=run_id,
+                    task_id=task_id,
+                    transition=StageTransition(
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        reason="test_progress",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+        run_store.append_report(
+            WorkerReport(
+                run_id=run_id,
+                task_id=task_id,
+                status="completed",
+                commit="def456",
+                message="implementation candidate ready",
+            )
+        )
+
+    def test_live_review_run_with_missing_worker_is_not_stale_or_force_cleaned(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            state = ActiveRunState(
+                task_id="TASK-01",
+                run_id="run-1",
+                worker_pid=999999999,
+                worker_process_birth_id="missing-worker",
+                supervisor_pid=os.getpid(),
+                supervisor_process_birth_id=process_birth_identity(os.getpid()),
+                host="test-host",
+                started_at="2026-05-09T00:00:00+00:00",
+                log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                base_main="abc123",
+                command="agent TASK-01",
+            )
+            task_lock = manager.acquire(
+                "TASK-01",
+                "run-1",
+                metadata=state.to_lock_metadata(),
+            )
+            self._append_live_review_run(run_store, repo=repo)
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: pid == os.getpid(),
+            )
+            stale = collect_stale_locks(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: pid == os.getpid(),
+            )
+            source = _RecoverySource("active", settled_status="ready")
+            forced = clean_stale_locks(
+                [
+                    StaleLock(
+                        task_id="TASK-01",
+                        run_id="run-1",
+                        lock_path=task_lock.path,
+                        stale_reason="missing_process",
+                        kind="task",
+                        recovery_command="vibe-loop workers clean --force",
+                        settlement_pending=True,
+                        process_state="missing",
+                        run_state="running",
+                    )
+                ],
+                manager,
+                settlement_recovery=TaskSourceSettlementRecovery(
+                    lambda: (source, _RecoveryConfig())
+                ),
+                run_store=run_store,
+                force=True,
+            )
+
+            self.assertEqual(len(views), 1)
+            self.assertEqual(views[0].state, "running")
+            self.assertEqual(views[0].process_state, "missing")
+            self.assertEqual(views[0].run_state, "running")
+            self.assertEqual(views[0].lifecycle_progress.stage, "review")
+            self.assertEqual(stale, [])
+            self.assertEqual(forced.cleaned, [])
+            self.assertIn("run is not proven finished", forced.errors[0][1])
+            self.assertEqual(source.reset_calls, 0)
+            self.assertEqual(source.status, "active")
+            self.assertTrue(manager.is_locked("TASK-01"))
+
+    def test_live_review_run_without_lock_remains_visible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            self._append_live_review_run(run_store, repo=repo)
+
+            views = build_worker_views(
+                manager,
+                run_store,
+                current_host="test-host",
+                process_exists=lambda pid: pid == os.getpid(),
+            )
+
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].active.task_id, "TASK-01")
+        self.assertEqual(views[0].state, "running")
+        self.assertEqual(views[0].run_state, "running")
+        self.assertEqual(views[0].process_state, "missing")
+        self.assertEqual(views[0].stale_reason, "missing_lock")
+        self.assertIsNone(views[0].active.lock_path)
+
     def test_collect_stale_task_lock_with_missing_process(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -2214,30 +2380,33 @@ class StaleLockTests(unittest.TestCase):
             self.assertGreaterEqual(source.reset_calls, 1)
             self.assertFalse(manager.is_locked("TASK-01"))
 
-    def test_only_identity_ambiguous_settlement_locks_are_unrecoverable(
+    def test_only_runs_proven_finished_support_settlement_recovery(
         self,
     ) -> None:
         base = StaleLock(
             task_id="TASK-01",
             run_id="run-1",
             lock_path=Path("task.lock"),
-            stale_reason="result_recorded",
+            stale_reason="missing_process",
             kind="task",
             recovery_command="vibe-loop workers clean --force",
             settlement_pending=True,
         )
 
         self.assertFalse(
-            dataclasses.replace(base, process_state="unknown_pid").recovery_supported
+            dataclasses.replace(base, run_state="unknown").recovery_supported
+        )
+        self.assertFalse(
+            dataclasses.replace(base, run_state="running").recovery_supported
+        )
+        self.assertFalse(
+            dataclasses.replace(base, run_state="foreign_host").recovery_supported
         )
         self.assertTrue(
-            dataclasses.replace(base, process_state="running").recovery_supported
+            dataclasses.replace(base, run_state="missing").recovery_supported
         )
         self.assertTrue(
-            dataclasses.replace(base, process_state="foreign_host").recovery_supported
-        )
-        self.assertTrue(
-            dataclasses.replace(base, process_state="missing").recovery_supported
+            dataclasses.replace(base, run_state="finished").recovery_supported
         )
 
     def test_fenced_recovery_settles_under_the_held_lock_and_releases(self) -> None:

@@ -1033,12 +1033,14 @@ class RunLifecycleEvent:
         session_id: int | None,
         process_birth_id: str,
         host: str,
+        supervisor_process_birth_id: str = "",
         activity_source_generation: str = "",
         recovery_payload: Mapping[str, Any] | None = None,
     ) -> RunLifecycleEvent:
         payload: dict[str, Any] = {
             "worker_pid": worker_pid,
             "supervisor_pid": supervisor_pid,
+            "supervisor_process_birth_id": supervisor_process_birth_id,
             "worker_process_group_id": process_group_id,
             "worker_session_id": session_id,
             "worker_process_birth_id": process_birth_id,
