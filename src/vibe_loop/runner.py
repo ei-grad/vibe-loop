@@ -1993,6 +1993,10 @@ class VibeRunner:
             restart_count=restart_count,
             max_restarts=max_restarts,
         )
+        active_state = dataclasses.replace(
+            active_state,
+            worker_parent_death_guarded=sys.platform == "linux",
+        )
         start_context_payload = build_run_context_payload(
             task_id=task.task_id,
             run_id=run_id,
@@ -2564,6 +2568,7 @@ class VibeRunner:
                             identity.process_birth_id if identity else ""
                         ),
                     )
+                    update_active_task_lock()
                     self.run_store.append_lifecycle_event(
                         RunLifecycleEvent.worker_process_started(
                             run_id=run_id,
@@ -2594,7 +2599,6 @@ class VibeRunner:
                             ),
                         )
                     )
-                    update_active_task_lock()
                     report_status(
                         "worker process started "
                         f"task={task.task_id} run_id={run_id} pid={worker_pid}",
@@ -8337,6 +8341,18 @@ def run_streaming_command(
     provider: str = "unknown",
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
+    if sys.platform == "linux":
+        guarded_command = [str(item) for item in cmd] if not use_shell else [str(cmd)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "vibe_loop.worker_guard",
+            str(os.getpid()),
+            "shell" if use_shell else "exec",
+            "--",
+            *guarded_command,
+        ]
+        use_shell = False
     popen_kwargs: dict[str, object] = {}
     if os.name != "nt":
         # Own session/process group so a worker that hangs after reporting can

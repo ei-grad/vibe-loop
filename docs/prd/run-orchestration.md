@@ -245,16 +245,20 @@ attempted adapter call. A failed or unconfirmed attempt is journaled as
 `task_source_settlement_attempted` and satisfies neither the settlement
 step, the durable-outcome settlement gate, nor fenced lock release: the run
 remains `settlement_pending`, retains the task lock, and retries with
-bounded backoff. Before worker launch, the task lock records the supervisor PID
-and kernel process-birth identity; recovery may treat the run as dead only when
-that exact identity is absent or has been replaced. Once the worker identity is
-published, only that identity is authoritative. After process death,
-stage-aware fenced recovery must use the run's exact private lock identity,
-confirm the authoritative task source non-in-progress, append
-`task_source_settled`, and only then release; generic stale-lock cleanup must
-not release a settlement-pending lock without that process-death proof.
-Leaving a task in-progress after lock release is never a legal settlement
-outcome.
+bounded backoff. On Linux, the task lock records the supervisor PID, kernel
+process-birth identity, and the worker launcher's parent-death guarantee.
+Recovery may treat a pre-worker run as dead only when that guarantee is present
+and the exact supervisor identity is absent or has been replaced. The launcher
+cannot execute the worker without first arming the kernel signal, so supervisor
+death cannot orphan an unrecorded worker. Once the worker identity is published
+to either the lock or its durable start event, only that identity is
+authoritative. Other platforms and legacy locks stay identity-ambiguous and
+fail closed. After process death, stage-aware fenced recovery must use the
+run's exact private lock identity, confirm the authoritative task source
+non-in-progress, append `task_source_settled`, and only then release; generic
+stale-lock cleanup must not release a settlement-pending lock without that
+process-death proof. Leaving a task in-progress after lock release is never a
+legal settlement outcome.
 
 Acceptance must cover the integration window and verification steps, conflict
 and verification-failure transitions, the no-op case, adapter-configured and

@@ -174,6 +174,7 @@ class ActiveRunState:
     pid_scope: str = "configured_command_process"
     supervisor_pid: int | None = None
     supervisor_process_birth_id: str = ""
+    worker_parent_death_guarded: bool = False
     host: str = dataclasses.field(default_factory=socket.gethostname)
     lock_path: Path | None = None
     workspace: WorkspaceClaim | None = None
@@ -351,6 +352,9 @@ class ActiveRunState:
             supervisor_process_birth_id=(
                 optional_string(metadata.get("supervisor_process_birth_id")) or ""
             ),
+            worker_parent_death_guarded=optional_bool(
+                metadata.get("worker_parent_death_guarded")
+            ),
             host=optional_string(metadata.get("host")) or "",
             lock_path=optional_path(metadata.get("path")),
             workspace=WorkspaceClaim.from_json(metadata.get("workspace")),
@@ -447,6 +451,7 @@ class ActiveRunState:
             "pid_scope": self.pid_scope,
             "supervisor_pid": self.supervisor_pid,
             "supervisor_process_birth_id": self.supervisor_process_birth_id,
+            "worker_parent_death_guarded": self.worker_parent_death_guarded,
             "host": self.host,
             "started_at": self.started_at,
             "log": str(self.log_path),
@@ -1575,14 +1580,14 @@ def restore_projected_worker_process_identity(
     """Restore identity fields omitted by a command lock's public projection.
 
     The local start record is independent evidence captured from the exact
-    ``Popen`` child. It is usable only for the same task, run, PID, host, and
-    supervisor. Existing projected values are never replaced, so conflicting
-    backend identity still reaches the normal fail-closed mismatch checks.
+    ``Popen`` child. It is usable only for the same task, run, host, and
+    supervisor, plus the same PID when the lock already projects one. Existing
+    projected values are never replaced, so conflicting backend identity still
+    reaches the normal fail-closed mismatch checks.
     """
 
     if (
-        active.worker_pid is None
-        or not active.run_id
+        not active.run_id
         or not active.task_id
         or not active.host
         or active.supervisor_pid is None
@@ -1595,7 +1600,10 @@ def restore_projected_worker_process_identity(
             continue
         if optional_string(record.get("task_id")) != active.task_id:
             continue
-        if optional_int(record.get("worker_pid")) != active.worker_pid:
+        record_worker_pid = optional_int(record.get("worker_pid"))
+        if record_worker_pid is None:
+            continue
+        if active.worker_pid is not None and record_worker_pid != active.worker_pid:
             continue
         record_host = optional_string(record.get("host"))
         if not record_host:
@@ -1609,6 +1617,7 @@ def restore_projected_worker_process_identity(
             continue
         return dataclasses.replace(
             active,
+            worker_pid=active.worker_pid or record_worker_pid,
             worker_process_group_id=(
                 active.worker_process_group_id
                 if active.worker_process_group_id is not None
@@ -1693,7 +1702,11 @@ def classify_process(
     if active.host and active.host != current_host:
         return "foreign_host"
     if active.worker_pid is None:
-        if active.supervisor_pid is None or not active.supervisor_process_birth_id:
+        if (
+            active.supervisor_pid is None
+            or not active.supervisor_process_birth_id
+            or not active.worker_parent_death_guarded
+        ):
             return "unknown_pid"
         if not process_checker(active.supervisor_pid):
             return "missing"
@@ -1840,7 +1853,7 @@ class StaleLock:
 
     @property
     def recovery_supported(self) -> bool:
-        return not self.settlement_pending or self.process_proven_dead
+        return not self.settlement_pending or self.process_state != "unknown_pid"
 
     def to_json(self) -> dict[str, object]:
         return {

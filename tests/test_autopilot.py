@@ -1750,6 +1750,7 @@ class AutopilotRunTests(unittest.TestCase):
         ]
         self.assertEqual(cycle_records[-1]["actions"][0], "cleaned_stale_locks:1")
 
+    @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
     def test_does_not_clean_worker_lock_before_pid_is_observed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1759,12 +1760,15 @@ class AutopilotRunTests(unittest.TestCase):
                 config.repo, config.state_path / "locks", config.locks
             )
             run_store = RunStore(config.state_path / "runs.jsonl")
-            active = ActiveRunState.new(
-                task_id="STARTING-01",
-                run_id="run-starting",
-                log_path=config.state_path / "runs" / "run-starting.log",
-                base_main=git_text(repo, "rev-parse", "HEAD"),
-                command="codex",
+            active = dataclasses.replace(
+                ActiveRunState.new(
+                    task_id="STARTING-01",
+                    run_id="run-starting",
+                    log_path=config.state_path / "runs" / "run-starting.log",
+                    base_main=git_text(repo, "rev-parse", "HEAD"),
+                    command="codex",
+                ),
+                worker_parent_death_guarded=True,
             )
             manager.acquire(
                 "STARTING-01",
@@ -1794,6 +1798,7 @@ class AutopilotRunTests(unittest.TestCase):
             any(record.get("record_type") == "lock_expired" for record in records)
         )
 
+    @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
     def test_does_not_settle_a_live_run_still_in_its_activation_window(self) -> None:
         # `settlement_pending` latches at the activation stage of every
         # runtime-owned run, and a run that has not launched its worker yet has
@@ -1807,12 +1812,15 @@ class AutopilotRunTests(unittest.TestCase):
                 config.repo, config.state_path / "locks", config.locks
             )
             run_store = RunStore(config.state_path / "runs.jsonl")
-            active = ActiveRunState.new(
-                task_id="ACTIVATING-01",
-                run_id="run-activating",
-                log_path=config.state_path / "runs" / "run-activating.log",
-                base_main=git_text(repo, "rev-parse", "HEAD"),
-                command="codex",
+            active = dataclasses.replace(
+                ActiveRunState.new(
+                    task_id="ACTIVATING-01",
+                    run_id="run-activating",
+                    log_path=config.state_path / "runs" / "run-activating.log",
+                    base_main=git_text(repo, "rev-parse", "HEAD"),
+                    command="codex",
+                ),
+                worker_parent_death_guarded=True,
             )
             manager.acquire(
                 "ACTIVATING-01",

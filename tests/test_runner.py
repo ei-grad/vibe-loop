@@ -2925,6 +2925,50 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(started_pids), 1)
         self.assertGreater(started_pids[0], 0)
 
+    @unittest.skipUnless(sys.platform == "linux", "parent-death signals require Linux")
+    def test_worker_guard_prevents_an_orphan_before_pid_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid_path = root / "child.pid"
+            marker_path = root / "worker-ran"
+            worker_code = (
+                "import time\n"
+                "from pathlib import Path\n"
+                "time.sleep(0.5)\n"
+                f"Path({str(marker_path)!r}).write_text('ran', encoding='utf-8')\n"
+            )
+            parent_code = (
+                "import os\n"
+                "import subprocess\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"worker_code = {worker_code!r}\n"
+                "child = subprocess.Popen([\n"
+                "    sys.executable, '-m', 'vibe_loop.worker_guard',\n"
+                "    str(os.getpid()), 'exec', '--',\n"
+                "    sys.executable, '-c', worker_code,\n"
+                "])\n"
+                f"Path({str(child_pid_path)!r}).write_text("
+                "str(child.pid), encoding='utf-8')\n"
+            )
+
+            subprocess.run(
+                [sys.executable, "-c", parent_code],
+                cwd=root,
+                check=True,
+            )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                node = read_process_node(child_pid)
+                if node is None or node.state == "Z":
+                    break
+                time.sleep(0.01)
+
+            self.assertFalse(marker_path.exists())
+            node = read_process_node(child_pid)
+            self.assertTrue(node is None or node.state == "Z", node)
+
     @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"
     )
