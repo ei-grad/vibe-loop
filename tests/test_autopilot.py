@@ -2091,7 +2091,7 @@ class AutopilotRunTests(unittest.TestCase):
                 "while not (state / 'release-worker').exists():\n"
                 "    time.sleep(0.02)\n"
                 "plan = repo / 'PLAN.md'\n"
-                "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Active |', '| TASK-01 | P0 | Done |'))\n"
+                "plan.write_text(plan.read_text().replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'))\n"
                 "listing = subprocess.run(['git', 'worktree', 'list', '--porcelain'], cwd=repo, check=True, capture_output=True, text=True).stdout\n"
                 "primary = Path(listing.splitlines()[0].removeprefix('worktree '))\n"
                 "branch = subprocess.run(['git', 'branch', '--show-current'], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()\n"
