@@ -53,6 +53,10 @@ from vibe_loop.locks import (
     build_lock_manager,
     redact_fencing_token_payload,
 )
+from vibe_loop.orchestration import (
+    ConfigContractBlocker,
+    config_contract_blockers,
+)
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
@@ -220,6 +224,7 @@ class TaskQueueStatus:
 @dataclasses.dataclass(frozen=True)
 class SupervisorStatus:
     state: str = "idle"
+    dispatch_state: str = "idle"
     pid: int | None = None
     log: Path | None = None
     run_id: str = ""
@@ -235,6 +240,7 @@ class SupervisorStatus:
         record.pop("config_key_fingerprints", None)
         payload = {
             "state": self.state,
+            "dispatch_state": self.dispatch_state,
             "pid": self.pid,
             "log": str(self.log) if self.log is not None else "",
             "run_id": self.run_id,
@@ -378,6 +384,7 @@ class ProjectStatus:
     project_binding: ResolvedProjectBinding = dataclasses.field(
         default_factory=ResolvedProjectBinding
     )
+    config_contract_blockers: tuple[ConfigContractBlocker, ...] = ()
 
     @property
     def alarms(self) -> tuple[str, ...]:
@@ -414,6 +421,9 @@ class ProjectStatus:
             "next_wake": self.next_wake,
             "attempt_circuit_breakers": [
                 dict(breaker) for breaker in self.attempt_circuit_breakers
+            ],
+            "config_contract_blockers": [
+                blocker.to_json() for blocker in self.config_contract_blockers
             ],
         }
         redacted = redact_runtime_context_payload(payload, self.runtime_context)
@@ -480,6 +490,7 @@ def collect_project_status(
     process_exists: ProcessExists | None = None,
 ) -> ProjectStatus:
     project_binding = resolve_project_binding(config)
+    contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
     non_closure = summarize_non_closures(run_store)
     if project_binding.blocker is not None:
@@ -507,13 +518,18 @@ def collect_project_status(
             # fact; the run journal below is local and stays accurate.
             supervisor=SupervisorStatus(
                 state="unknown",
+                dispatch_state="blocked",
                 blocker=project_binding.blocker,
             ),
             last_cycle=latest_cycle_summary(run_store),
             non_closure=non_closure,
-            blockers=tuple(item.code for item in project_binding.diagnostics),
+            blockers=(
+                *(item.code for item in project_binding.diagnostics),
+                *(item.code for item in contract_blockers),
+            ),
             runtime_context=config.runtime_context,
             project_binding=project_binding,
+            config_contract_blockers=contract_blockers,
         )
     lock_manager = build_lock_manager(
         config.repo,
@@ -562,6 +578,16 @@ def collect_project_status(
         process_exists=process_exists,
         current_config=config,
     )
+    supervisor = dataclasses.replace(
+        supervisor,
+        dispatch_state=(
+            "blocked"
+            if contract_blockers
+            else "idle"
+            if not queue_status.source_error and queue_status.runnable == 0
+            else "available"
+        ),
+    )
     workspace_diagnostics = tuple(
         diagnostic.to_json()
         for worker in workers
@@ -576,6 +602,7 @@ def collect_project_status(
         integration_lock=integration_lock,
         agent_diagnostics=agent_blockers,
         supervisor=supervisor,
+        config_contract_blockers=contract_blockers,
     )
     observations = tuple(
         project_observations(queue_status=queue_status, workers=workers)
@@ -612,6 +639,7 @@ def collect_project_status(
         attempt_circuit_breakers=attempt_circuit_breakers,
         runtime_context=config.runtime_context,
         project_binding=project_binding,
+        config_contract_blockers=contract_blockers,
     )
 
 
@@ -1427,12 +1455,18 @@ def project_blockers(
     agent_diagnostics: tuple[str, ...] = (),
     supervisor: SupervisorStatus | None = None,
     project_binding: ResolvedProjectBinding | None = None,
+    config_contract_blockers: tuple[ConfigContractBlocker, ...] = (),
 ) -> list[str]:
     blockers: list[str] = []
     if project_binding is not None:
         blockers.extend(item.code for item in project_binding.diagnostics)
     if supervisor is not None and supervisor.blocker:
         blockers.append(supervisor.blocker)
+    blockers.extend(
+        blocker.code
+        for blocker in config_contract_blockers
+        if blocker.code not in blockers
+    )
     if not git_status.available:
         blockers.append(f"git_state_unavailable: {git_status.error}")
     if git_status.dirty:
@@ -1543,6 +1577,7 @@ class DetachedAutopilotLaunch:
     session_id: int | None = None
     log: Path | None = None
     blocker: str = ""
+    config_contract_blockers: tuple[ConfigContractBlocker, ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -1558,6 +1593,9 @@ class DetachedAutopilotLaunch:
             "session_id": self.session_id,
             "log": str(self.log) if self.log is not None else "",
             "blocker": self.blocker,
+            "config_contract_blockers": [
+                blocker.to_json() for blocker in self.config_contract_blockers
+            ],
         }
 
 
@@ -1789,6 +1827,14 @@ def start_detached_autopilot(
     """Start and verify a detached POSIX autopilot supervisor."""
 
     interval = require_autopilot_interval(interval)
+    contract_blockers = config_contract_blockers(config)
+    if contract_blockers:
+        return DetachedAutopilotLaunch(
+            repo=config.repo,
+            started=False,
+            blocker=contract_blockers[0].code,
+            config_contract_blockers=contract_blockers,
+        )
     if os.name != "posix" or not hasattr(os, "setsid"):
         return DetachedAutopilotLaunch(
             repo=config.repo,

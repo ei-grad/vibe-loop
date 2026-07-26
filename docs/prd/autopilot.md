@@ -58,6 +58,21 @@ Acceptance must cover `--repo`, `--jobs`, `--interval`, `--once`,
 scriptable output is promised. Human cycle output should be compact by default:
 repo, queue, supervisor state, blockers or actions, log path, and next wake.
 
+`autopilot start` validates the launch-time orchestration contract before
+creating a supervisor process. It refuses a contract that cannot dispatch a
+worker and returns every violation in one pass as a typed blocker containing a
+stable code, the exact configuration key, a diagnostic message, and a suggested
+remedy. `autopilot status --json` and `vibe-loop doctor` derive the same blocker
+set from the same validation boundary. Contract validation remains fail-closed;
+preflight and reporting do not relax worker launch checks.
+
+Supervisor process state and dispatch readiness are separate. `state` continues
+to report process lifecycle such as `active_cycle`, `sleeping`, `stale`, or
+`inconsistent`; `dispatch_state` reports `blocked` when configuration prevents
+launch, `idle` when the queue has no runnable work, and `available` otherwise.
+This preserves liveness evidence while preventing a permanently undispatchable
+supervisor from looking like an empty queue.
+
 Status must also derive a bounded recent non-closure summary from the runtime
 journal. A non-closure is a terminal run that recorded an approving review
 verdict but did not record task-source completion. The summary reports the

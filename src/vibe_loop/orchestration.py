@@ -1932,9 +1932,7 @@ class ReviewRouter:
             ) from exc
         except ReviewExecutionError:
             duration = max(0.0, time.monotonic() - started)
-            self._reconcile_review_budget(
-                budget_reservation, None, phase=request.phase
-            )
+            self._reconcile_review_budget(budget_reservation, None, phase=request.phase)
             self._record_error(
                 request,
                 route,
@@ -1950,9 +1948,7 @@ class ReviewRouter:
             self._fail_stage_for_result("fatal")
             raise
         except subprocess.TimeoutExpired as exc:
-            self._reconcile_review_budget(
-                budget_reservation, None, phase=request.phase
-            )
+            self._reconcile_review_budget(budget_reservation, None, phase=request.phase)
             self._record_wait_incomplete(
                 request, pass_ordinal, attempt_ordinal, continuation
             )
@@ -5066,6 +5062,181 @@ class ResolvedRunContract:
         return {**self.payload, "contract_digest": self.digest}
 
 
+@dataclasses.dataclass(frozen=True)
+class ConfigContractBlocker:
+    code: str
+    key: str
+    message: str
+    remedy: str
+
+    def to_json(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "key": self.key,
+            "message": self.message,
+            "remedy": self.remedy,
+        }
+
+
+def config_contract_blockers(
+    config: VibeConfig,
+    agent_selection: AgentSelection | None = None,
+    *,
+    orchestration: OrchestrationConfig | None = None,
+) -> tuple[ConfigContractBlocker, ...]:
+    effective = orchestration or config.orchestration
+    selection = agent_selection or AgentSelection(config.agent, "", "default")
+    blockers: list[ConfigContractBlocker] = []
+
+    def add(code: str, key: str, message: str, remedy: str) -> None:
+        blockers.append(
+            ConfigContractBlocker(
+                code=code,
+                key=key,
+                message=message,
+                remedy=remedy,
+            )
+        )
+
+    configured_reviewer_profile = effective.reviewer_profile
+    reviewer_agent = (
+        config.agent_profiles.get(configured_reviewer_profile)
+        if configured_reviewer_profile is not None
+        else None
+    )
+    if configured_reviewer_profile is not None and reviewer_agent is not None:
+        command_key = f"agent.profiles.{configured_reviewer_profile}.command"
+        try:
+            reviewer_command = (
+                reviewer_agent.require_reviewer_command()
+                if effective.mode == "runtime-owned"
+                else reviewer_agent.require_command()
+            )
+        except AgentResolutionError as exc:
+            add(
+                "config_contract_reviewer_route_invalid",
+                command_key,
+                str(exc),
+                "Configure a reviewer command that can deliver its declared "
+                "model and effort, or remove those route settings.",
+            )
+        else:
+            if not command_template_uses_field(reviewer_command, "prompt"):
+                add(
+                    "config_contract_reviewer_prompt_missing",
+                    command_key,
+                    f"{command_key} must include {{prompt}} for reviewer request "
+                    "delivery",
+                    f"Add {{prompt}} to {command_key}.",
+                )
+
+    probe_capability = task_source_probe_capability(config.task_source)
+    completion_capability = task_source_completion_capability(config.task_source)
+    if (
+        effective.mode != "runtime-owned"
+        and "external_completion_actor" in effective.explicit_keys
+    ):
+        add(
+            "config_contract_external_actor_without_runtime",
+            "orchestration.external_completion_actor",
+            "orchestration.external_completion_actor is only valid with "
+            'mode = "runtime-owned"',
+            "Remove orchestration.external_completion_actor or set "
+            'orchestration.mode = "runtime-owned".',
+        )
+    if effective.mode == "runtime-owned":
+        if configured_reviewer_profile is None:
+            add(
+                "config_contract_reviewer_profile_missing",
+                "orchestration.reviewer_profile",
+                "runtime-owned orchestration requires an explicit independent "
+                "orchestration.reviewer_profile",
+                "Set orchestration.reviewer_profile to a configured independent "
+                "agent.profiles entry.",
+            )
+        if (
+            configured_reviewer_profile is not None
+            and configured_reviewer_profile == selection.profile
+        ):
+            add(
+                "config_contract_reviewer_not_independent",
+                "orchestration.reviewer_profile",
+                "runtime-owned orchestration reviewer_profile must differ from "
+                "the implementer profile",
+                "Select a reviewer profile different from the implementer profile.",
+            )
+        if "task_provenance_mode" not in effective.explicit_keys:
+            add(
+                "config_contract_task_provenance_missing",
+                "orchestration.task_provenance_mode",
+                "runtime-owned orchestration requires an explicit "
+                "orchestration.task_provenance_mode completion path",
+                "Set orchestration.task_provenance_mode to adapter or "
+                "external-confirmed.",
+            )
+        if effective.task_provenance_mode == "adapter":
+            if "external_completion_actor" in effective.explicit_keys:
+                add(
+                    "config_contract_external_actor_with_adapter",
+                    "orchestration.external_completion_actor",
+                    "orchestration.external_completion_actor is only valid with "
+                    'task_provenance_mode = "external-confirmed"',
+                    "Remove orchestration.external_completion_actor or use "
+                    'task_provenance_mode = "external-confirmed".',
+                )
+            if completion_capability is None:
+                add(
+                    "config_contract_task_complete_missing",
+                    "task_source.complete",
+                    "runtime-owned adapter completion requires "
+                    "task_source.complete on a command task source with "
+                    "task_source.list",
+                    "Configure task_source.list and task_source.complete on the "
+                    "command task source.",
+                )
+        else:
+            if "external_completion_actor" not in effective.explicit_keys:
+                add(
+                    "config_contract_external_actor_missing",
+                    "orchestration.external_completion_actor",
+                    "runtime-owned external-confirmed completion requires an "
+                    "explicit orchestration.external_completion_actor",
+                    "Set orchestration.external_completion_actor to operator or "
+                    "external-system.",
+                )
+            if effective.external_completion_actor == "worker":
+                add(
+                    "config_contract_worker_completion_forbidden",
+                    "orchestration.external_completion_actor",
+                    "runtime-owned workers are forbidden from transitioning the "
+                    "authoritative task source",
+                    'Use task_provenance_mode = "adapter" with '
+                    "task_source.complete, or select operator or external-system.",
+                )
+            if probe_capability is None:
+                add(
+                    "config_contract_task_probe_missing",
+                    "task_source.list",
+                    "runtime-owned external-confirmed completion requires a task "
+                    "source with probe capability; command sources require "
+                    "task_source.list",
+                    "Configure task_source.list so completion can be confirmed.",
+                )
+        if (
+            config.task_source.activate_command is not None
+            and config.task_source.reset_command is None
+        ):
+            add(
+                "config_contract_task_reset_missing",
+                "task_source.reset",
+                "runtime-owned activation-capable task source requires "
+                "task_source.reset",
+                "Configure task_source.reset to requeue an activated task after "
+                "a pre-launch or runtime failure.",
+            )
+    return tuple(blockers)
+
+
 class RunContractResolver:
     def __init__(self, config: VibeConfig) -> None:
         self.config = config
@@ -5124,6 +5295,16 @@ class RunContractResolver:
             reviewer_profile = agent_selection.profile
         else:
             reviewer_agent = self.config.agent_profiles[reviewer_profile]
+        blockers = config_contract_blockers(
+            self.config,
+            agent_selection,
+            orchestration=effective,
+        )
+        if blockers:
+            first = blockers[0]
+            if first.code.startswith("config_contract_reviewer_"):
+                raise AgentResolutionError(first.message)
+            raise ValueError(first.message)
         reviewer_command = reviewer_agent.command
         if configured_reviewer_profile is not None:
             reviewer_command = (
@@ -5147,69 +5328,6 @@ class RunContractResolver:
         completion_capability = task_source_completion_capability(
             self.config.task_source
         )
-        if (
-            effective.mode != "runtime-owned"
-            and "external_completion_actor" in effective.explicit_keys
-        ):
-            raise ValueError(
-                "orchestration.external_completion_actor is only valid with "
-                'mode = "runtime-owned"'
-            )
-        if effective.mode == "runtime-owned":
-            if configured_reviewer_profile is None:
-                raise ValueError(
-                    "runtime-owned orchestration requires an explicit independent "
-                    "orchestration.reviewer_profile"
-                )
-            if configured_reviewer_profile == agent_selection.profile:
-                raise ValueError(
-                    "runtime-owned orchestration reviewer_profile must differ "
-                    "from the implementer profile"
-                )
-            if "task_provenance_mode" not in effective.explicit_keys:
-                raise ValueError(
-                    "runtime-owned orchestration requires an explicit "
-                    "orchestration.task_provenance_mode completion path"
-                )
-            if effective.task_provenance_mode == "adapter":
-                if "external_completion_actor" in effective.explicit_keys:
-                    raise ValueError(
-                        "orchestration.external_completion_actor is only valid "
-                        'with task_provenance_mode = "external-confirmed"'
-                    )
-                if completion_capability is None:
-                    raise ValueError(
-                        "runtime-owned adapter completion requires "
-                        "task_source.complete on a command task source with "
-                        "task_source.list"
-                    )
-            else:
-                if "external_completion_actor" not in effective.explicit_keys:
-                    raise ValueError(
-                        "runtime-owned external-confirmed completion requires an "
-                        "explicit orchestration.external_completion_actor"
-                    )
-                if effective.external_completion_actor == "worker":
-                    raise ValueError(
-                        "runtime-owned workers are forbidden from transitioning "
-                        "the authoritative task source; configure task_source.complete "
-                        'with task_provenance_mode = "adapter", or name an operator '
-                        "or external-system completion actor"
-                    )
-                if probe_capability is None:
-                    raise ValueError(
-                        "runtime-owned external-confirmed completion requires "
-                        "a task source with probe capability; command sources "
-                        "require task_source.list"
-                    )
-            if (
-                self.config.task_source.activate_command is not None
-                and self.config.task_source.reset_command is None
-            ):
-                raise ValueError(
-                    "runtime-owned activation-capable task source requires "
-                    "task_source.reset"
-                )
 
         task_provenance_payload: dict[str, object] = {
             "mode": effective.task_provenance_mode,

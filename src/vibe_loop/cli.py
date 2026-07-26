@@ -91,7 +91,11 @@ from vibe_loop.budget import (
     resolve_budget_project,
 )
 from vibe_loop.locks import integration_lock_waitable
-from vibe_loop.orchestration import CandidateCollectionError, CandidateCollector
+from vibe_loop.orchestration import (
+    CandidateCollectionError,
+    CandidateCollector,
+    config_contract_blockers,
+)
 from vibe_loop.runner import VibeRunner
 from vibe_loop.runtime_events import (
     RuntimeEventAdapterError,
@@ -1126,6 +1130,7 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_wait_helper(args)
 
     if args.command == "doctor":
+        contract_blockers = config_contract_blockers(config)
         task_source_runtime = runtime_task_source_report(config)
         runner = VibeRunner(config)
         workers = build_worker_views(
@@ -1190,6 +1195,9 @@ def dispatch(args: argparse.Namespace) -> int:
                     "stale_locks": stale_report,
                     "concurrency_diagnostics": concurrency_diagnostics_report(workers),
                     "workspace_diagnostics": workspace_diagnostics_report(workers),
+                    "config_contract_blockers": [
+                        blocker.to_json() for blocker in contract_blockers
+                    ],
                 },
                 indent=2,
                 default=list,
@@ -1635,6 +1643,13 @@ def render_detached_autopilot_launch(launch) -> str:
             message += f" pid={launch.pid}"
         if launch.log is not None:
             message += f" log={launch.log}"
+        if launch.config_contract_blockers:
+            details = "\n".join(
+                f"  - {blocker.code}: {blocker.key}: {blocker.message}; "
+                f"remedy: {blocker.remedy}"
+                for blocker in launch.config_contract_blockers
+            )
+            message += f"\nconfig contract blockers:\n{details}"
         return message
     return (
         f"autopilot started pid={launch.pid} "
@@ -1736,7 +1751,9 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         lines.append("alarms:")
         lines.extend(f"  - {alarm}" for alarm in status.alarms)
     supervisor = status.supervisor
-    supervisor_line = f"supervisor: {supervisor.state}"
+    supervisor_line = (
+        f"supervisor: {supervisor.state} dispatch={supervisor.dispatch_state}"
+    )
     if supervisor.pid:
         supervisor_line += f" pid={supervisor.pid}"
     lines.append(supervisor_line)
@@ -1778,6 +1795,13 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         lines.extend(f"  - {observation}" for observation in status.observations)
     else:
         lines.append("blockers: none")
+    if status.config_contract_blockers:
+        lines.append("config contract blockers:")
+        lines.extend(
+            f"  - {blocker.code}: {blocker.key}: {blocker.message}; "
+            f"remedy: {blocker.remedy}"
+            for blocker in status.config_contract_blockers
+        )
     if status.advisories:
         lines.append("advisories:")
         for advisory in status.advisories:

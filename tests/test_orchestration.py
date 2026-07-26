@@ -60,6 +60,7 @@ from vibe_loop.orchestration import (
     ProvisionedWorkspace,
     RunContractProposal,
     RunContractResolver,
+    config_contract_blockers,
     RunLifecycleStateMachine,
     RunStage,
     StageFailure,
@@ -260,6 +261,16 @@ class RunContractResolverTests(unittest.TestCase):
             task_source=TaskSourceConfig(type="markdown-plan"),
         )
 
+        blockers = config_contract_blockers(
+            config,
+            AgentSelection(implementer, "impl", "profile"),
+        )
+        self.assertEqual(
+            blockers[0].code,
+            "config_contract_reviewer_route_invalid",
+        )
+        self.assertEqual(blockers[0].key, "agent.profiles.review.command")
+        self.assertTrue(blockers[0].remedy)
         with self.assertRaisesRegex(
             AgentResolutionError,
             "cannot safely receive.*no supported effective-route metadata",
@@ -490,6 +501,7 @@ class RunContractResolverTests(unittest.TestCase):
                 ),
                 TaskSourceConfig(),
                 "explicit.*task_provenance_mode",
+                "config_contract_task_provenance_missing",
             ),
             (
                 OrchestrationConfig(
@@ -502,6 +514,7 @@ class RunContractResolverTests(unittest.TestCase):
                 ),
                 TaskSourceConfig(),
                 "requires task_source.complete",
+                "config_contract_task_complete_missing",
             ),
             (
                 OrchestrationConfig(
@@ -517,6 +530,7 @@ class RunContractResolverTests(unittest.TestCase):
                     complete_command="complete {task_id}",
                 ),
                 "task_source.complete on a command task source",
+                "config_contract_task_complete_missing",
             ),
             (
                 OrchestrationConfig(
@@ -535,6 +549,7 @@ class RunContractResolverTests(unittest.TestCase):
                 ),
                 TaskSourceConfig(complete_command="complete {task_id}"),
                 "external_completion_actor is only valid",
+                "config_contract_external_actor_with_adapter",
             ),
             (
                 OrchestrationConfig(
@@ -558,6 +573,7 @@ class RunContractResolverTests(unittest.TestCase):
                     activate_command="activate {task_id}",
                 ),
                 "requires task_source.reset",
+                "config_contract_task_reset_missing",
             ),
             (
                 OrchestrationConfig(
@@ -570,6 +586,7 @@ class RunContractResolverTests(unittest.TestCase):
                 ),
                 TaskSourceConfig(type="markdown-plan"),
                 "requires an explicit.*external_completion_actor",
+                "config_contract_external_actor_missing",
             ),
             (
                 OrchestrationConfig(
@@ -588,6 +605,7 @@ class RunContractResolverTests(unittest.TestCase):
                 ),
                 TaskSourceConfig(type="command"),
                 "requires a task source with probe capability",
+                "config_contract_task_probe_missing",
             ),
             (
                 OrchestrationConfig(
@@ -606,9 +624,10 @@ class RunContractResolverTests(unittest.TestCase):
                 ),
                 TaskSourceConfig(type="markdown-plan"),
                 "workers are forbidden from transitioning",
+                "config_contract_worker_completion_forbidden",
             ),
         )
-        for orchestration, task_source, diagnostic in cases:
+        for orchestration, task_source, diagnostic, blocker_code in cases:
             with self.subTest(diagnostic=diagnostic):
                 config = VibeConfig(
                     repo=Path("/repo"),
@@ -617,6 +636,13 @@ class RunContractResolverTests(unittest.TestCase):
                     orchestration=orchestration,
                     task_source=task_source,
                 )
+                blockers = config_contract_blockers(
+                    config,
+                    AgentSelection(agent, "", "default"),
+                )
+                self.assertEqual(blockers[0].code, blocker_code)
+                self.assertTrue(blockers[0].key)
+                self.assertTrue(blockers[0].remedy)
                 with self.assertRaisesRegex(ValueError, diagnostic):
                     RunContractResolver(config).resolve(
                         AgentSelection(agent, "", "default")
@@ -3412,8 +3438,7 @@ class TaskSourceProvenanceTests(unittest.TestCase):
                 4,
                 "probe",
                 stderr=(
-                    f"{diagnostic}: "
-                    "postgres://probe-user:probe-password@database/app\n"
+                    f"{diagnostic}: postgres://probe-user:probe-password@database/app\n"
                 ),
             )
 
@@ -6191,19 +6216,13 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                     directory
                 )
                 disturb(first.worktree)
-                head_before = git(
-                    first.worktree, "rev-parse", "HEAD"
-                ).stdout.strip()
-                status_before = git(
-                    first.worktree, "status", "--short"
-                ).stdout
+                head_before = git(first.worktree, "rev-parse", "HEAD").stdout.strip()
+                status_before = git(first.worktree, "status", "--short").stdout
 
                 with self.assertRaises(WorkspaceProvisionError) as raised:
                     self._adopt_stale(repo, store, current_base)
 
-                self.assertEqual(
-                    raised.exception.code, "workspace_stale_current_base"
-                )
+                self.assertEqual(raised.exception.code, "workspace_stale_current_base")
                 self.assertEqual(
                     raised.exception.retry_disposition,
                     "defer_until_workspace_changes",
@@ -6315,9 +6334,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             )
             worktree = first.worktree
 
-            def break_diff(
-                path: Path, *args: str
-            ) -> subprocess.CompletedProcess[str]:
+            def break_diff(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
                 if Path(path) == worktree and args[:1] == ("diff",):
                     return subprocess.CompletedProcess(
                         ["git", *args], 128, "", "simulated git failure"
@@ -6359,9 +6376,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             worktree = first.worktree
             seen = 0
 
-            def break_git(
-                cwd: Path, *args: str
-            ) -> subprocess.CompletedProcess[str]:
+            def break_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
                 nonlocal seen
                 if Path(cwd) == worktree and args[:3] == (
                     "rev-parse",

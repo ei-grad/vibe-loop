@@ -9426,7 +9426,8 @@ class AutopilotCliTests(unittest.TestCase):
             )
             command, state_path = write_command_lock_adapter(repo)
             (repo / ".vibe-loop.toml").write_text(
-                command_lock_toml(command), encoding="utf-8"
+                command_lock_toml(command) + '[orchestration]\nmode = "worker-owned"\n',
+                encoding="utf-8",
             )
             launched: list[tuple[int, int]] = []
 
@@ -10048,6 +10049,112 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertNotIn("secret-health", raw)
         self.assertNotIn("secret-wake", raw)
 
+    def test_config_contract_blockers_match_status_doctor_and_start(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN)
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\ncommand = "codex exec {prompt}"\n'
+                "[agent.profiles.review]\n"
+                'command = "codex review {prompt}"\n'
+                'model = "gpt-5.6-terra"\n'
+                'effort = "xhigh"\n'
+                "[task_source]\n"
+                'type = "command"\n'
+                'list = "false"\n'
+                'activate = "false"\n'
+                "[orchestration]\n"
+                'mode = "runtime-owned"\n'
+                'reviewer_profile = "review"\n'
+                'task_provenance_mode = "external-confirmed"\n'
+                'external_completion_actor = "operator"\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", ".vibe-loop.toml"],
+                cwd=repo,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "configure blocked runtime"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+
+            payloads: dict[str, dict[str, object]] = {}
+            commands = {
+                "status": [
+                    "autopilot",
+                    "status",
+                    "--repo",
+                    str(repo),
+                    "--json",
+                ],
+                "doctor": ["doctor", "--repo", str(repo), "--json"],
+                "start": [
+                    "autopilot",
+                    "start",
+                    "--repo",
+                    str(repo),
+                    "--interval",
+                    "60",
+                    "--json",
+                ],
+            }
+            exit_codes: dict[str, int] = {}
+            for surface, command in commands.items():
+                stdout = StringIO()
+                stderr = StringIO()
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    exit_codes[surface] = main(command)
+                self.assertEqual(stderr.getvalue(), "")
+                payloads[surface] = json.loads(stdout.getvalue())
+
+        expected = [
+            {
+                "code": "config_contract_reviewer_route_invalid",
+                "key": "agent.profiles.review.command",
+            },
+            {
+                "code": "config_contract_task_reset_missing",
+                "key": "task_source.reset",
+            },
+        ]
+        for surface, payload in payloads.items():
+            with self.subTest(surface=surface):
+                blockers = payload["config_contract_blockers"]
+                self.assertEqual(
+                    [
+                        {"code": blocker["code"], "key": blocker["key"]}
+                        for blocker in blockers
+                    ],
+                    expected,
+                )
+                self.assertTrue(all(blocker["remedy"] for blocker in blockers))
+        self.assertEqual(exit_codes, {"status": 0, "doctor": 0, "start": 2})
+        self.assertEqual(
+            payloads["status"]["supervisor"]["dispatch_state"],
+            "blocked",
+        )
+        self.assertFalse(payloads["start"]["started"])
+
+    def test_status_distinguishes_idle_no_work_from_contract_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, PLAN.replace("| Next |", "| Done |"))
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = main(["autopilot", "status", "--repo", str(repo), "--json"])
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["supervisor"]["state"], "idle")
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "idle")
+        self.assertEqual(payload["config_contract_blockers"], [])
+        self.assertIn("no_runnable_work", payload["observations"])
+
     def test_doctor_distinguishes_file_config_from_running_supervisor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
@@ -10055,6 +10162,7 @@ class AutopilotCliTests(unittest.TestCase):
             config_path = repo / ".vibe-loop.toml"
             config_path.write_text(
                 '[agent]\ncommand = "codex exec {prompt}"\n'
+                '[orchestration]\nmode = "worker-owned"\n'
                 "[autopilot]\njobs = 1\nrequire_clean_repo = false\n",
                 encoding="utf-8",
             )
@@ -10109,7 +10217,9 @@ class AutopilotCliTests(unittest.TestCase):
             repo = Path(directory) / "project"
             init_planning_repo(repo, PLAN)
             (repo / ".vibe-loop.toml").write_text(
-                '[agent]\ncommand = "codex exec {prompt}"\n[autopilot]\nmin_ready = 5\n',
+                '[agent]\ncommand = "codex exec {prompt}"\n'
+                '[orchestration]\nmode = "worker-owned"\n'
+                "[autopilot]\nmin_ready = 5\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
