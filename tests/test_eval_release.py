@@ -538,6 +538,30 @@ REFERENCE_GUARD_EXEMPT_FILES = frozenset(
 
 
 class RepoAgnosticGuardTests(unittest.TestCase):
+    def test_seed_prompt_keeps_the_task_layer_backend_agnostic(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        prompt = (root / "PROMPT.md").read_text(encoding="utf-8")
+        normalized_prompt = " ".join(prompt.split())
+
+        self.assertNotIn("loopyard", prompt.casefold())
+        self.assertIn(
+            "external, adapter-bound surface rather than a repository-prescribed "
+            "backend or file format",
+            normalized_prompt,
+        )
+        self.assertNotIn("skills, planning analytics", prompt)
+
+    def test_prd_density_budget_matches_the_seed_policy(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        prompt = (root / "PROMPT.md").read_text(encoding="utf-8")
+        prd_index = (root / "docs" / "prd" / "README.md").read_text(encoding="utf-8")
+
+        for document in (prompt, prd_index):
+            normalized_document = " ".join(document.split())
+            self.assertIn("above four times", normalized_document)
+            self.assertIn("over budget", normalized_document)
+        self.assertIn("An over-budget PRD has no growth allowance.", prd_index)
+
     def test_shipped_artifacts_have_no_downstream_references(self) -> None:
         root = Path(__file__).resolve().parents[1]
         targets = [root / "README.md", root / "PROMPT.md"]
