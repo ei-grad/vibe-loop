@@ -2025,6 +2025,14 @@ class CliTests(unittest.TestCase):
                 "finally:\n"
                 "    lock.rmdir()\n"
                 "(done / safe_id).write_text(local_id, encoding='utf-8')\n"
+                "if wave == 'wave1':\n"
+                "    deadline = time.monotonic() + 15\n"
+                "    while not expected_wave1.issubset(\n"
+                "        {path.name for path in done.iterdir()}\n"
+                "    ):\n"
+                "        if time.monotonic() > deadline:\n"
+                "            raise SystemExit(f'{wave} completion barrier timed out for {task_id}')\n"
+                "        time.sleep(0.02)\n"
                 "raise SystemExit(\n"
                 "    main(\n"
                 "        [\n"
@@ -2100,6 +2108,12 @@ class CliTests(unittest.TestCase):
         )
         self.assertIn(
             "001-checkout__T002", observed["001-checkout:T004"]["done_at_start"]
+        )
+        self.assertIn(
+            "001-checkout__T001", observed["001-checkout:T003"]["done_at_start"]
+        )
+        self.assertIn(
+            "001-checkout__T002", observed["001-checkout:T003"]["done_at_start"]
         )
         self.assertIn("- [x] T004 Add checkout migration", final_tasks)
         self.assertIn("[vibe-loop] parallel supervisor jobs=2", stderr.getvalue())
