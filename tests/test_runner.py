@@ -6515,33 +6515,39 @@ class RunStreamingPostReportTests(unittest.TestCase):
                     sentinel.kill()
                 sentinel.wait(timeout=5)
 
-    def test_unsupported_identity_platform_keeps_clean_exit_fallback(self):
-        closure_checks = 0
+    def test_unavailable_birth_identity_keeps_clean_exit_fallback(self):
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                closure_checks = 0
 
-        def accepted_closure() -> str:
-            nonlocal closure_checks
-            closure_checks += 1
-            return "accepted_completed_candidate"
+                def accepted_closure() -> str:
+                    nonlocal closure_checks
+                    closure_checks += 1
+                    return "accepted_completed_candidate"
 
-        with (
-            patch.object(runner_module.sys, "platform", "darwin"),
-            patch.object(runner_module, "read_process_node", return_value=None),
-        ):
-            result = self._run(
-                "import time\ntime.sleep(0.05)\n",
-                reap_check=lambda: True,
-                reap_grace_seconds=60.0,
-                reap_poll_seconds=0.01,
-                post_report_closure_check=accepted_closure,
-                provider="anthropic",
-            )
+                with (
+                    patch.object(runner_module.sys, "platform", platform),
+                    patch.object(
+                        runner_module,
+                        "read_process_node",
+                        return_value=None,
+                    ),
+                ):
+                    result = self._run(
+                        "import time\ntime.sleep(0.05)\n",
+                        reap_check=lambda: True,
+                        reap_grace_seconds=60.0,
+                        reap_poll_seconds=0.01,
+                        post_report_closure_check=accepted_closure,
+                        provider="anthropic",
+                    )
 
-        self.assertEqual(result.exit_code, 0)
-        self.assertFalse(result.timed_out)
-        self.assertEqual(closure_checks, 0)
-        self.assertIsNotNone(result.post_report)
-        self.assertEqual(result.post_report.teardown_reason, "")
-        self.assertFalse(result.post_report.enforced_stop)
+                self.assertEqual(result.exit_code, 0)
+                self.assertFalse(result.timed_out)
+                self.assertEqual(closure_checks, 0)
+                self.assertIsNotNone(result.post_report)
+                self.assertEqual(result.post_report.teardown_reason, "")
+                self.assertFalse(result.post_report.enforced_stop)
 
     def test_tool_activity_before_a_poll_is_still_recorded(self):
         # F1: a worker that reports, invokes a tool, and exits within a single

@@ -8473,7 +8473,7 @@ def run_streaming_command(
         post_report_activity_grace_seconds=post_report_activity_grace_seconds,
         report_boundary_wall=report_persistence_epoch,
         post_report_closure_check=(
-            post_report_closure_check if sys.platform == "linux" else None
+            post_report_closure_check if expected_birth_id else None
         ),
         post_report_teardown=lambda: terminate_verified_worker_process_group(
             process,
