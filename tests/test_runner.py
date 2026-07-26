@@ -20,10 +20,12 @@ from unittest.mock import patch
 
 import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
+from vibe_loop.budget import BudgetDecision
 from vibe_loop.config import (
     AgentConfig,
     AgentRoutingRule,
     AgentResolutionError,
+    BudgetConfig,
     CompletionConfig,
     OrchestrationConfig,
     SpecDiagnosticsConfig,
@@ -56,6 +58,7 @@ from vibe_loop.orchestration import (
     RunStage,
     TaskSourceCompletionError,
     WorkspaceProvisionError,
+    WorkspaceProvisioner,
 )
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
@@ -114,6 +117,7 @@ from vibe_loop.runner import (
     worker_usage_provenance,
 )
 from vibe_loop.runs import (
+    AttemptCircuitState,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     SETTLED_RUN_OUTCOMES,
     WORKER_REPORT_STATUSES,
@@ -129,6 +133,7 @@ from vibe_loop.workers import (
     StaleLock,
     clean_stale_locks,
     collect_stale_locks,
+    git_dirty_snapshot,
     WorkspaceClaim,
 )
 
@@ -8799,7 +8804,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertNotIn("gate_result", record_types)
         self.assertNotIn("review_started", record_types)
 
-    def test_runtime_owned_activation_crash_retains_lock_before_first_attempt(
+    def test_runtime_owned_activation_crash_releases_lock_before_first_attempt(
         self,
     ) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
@@ -8821,7 +8826,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 )
 
             records = runner.run_store.read_records()
-            self.assertTrue(lock_manager.is_locked("T-1"))
+            self.assertFalse(lock_manager.is_locked("T-1"))
             self.assertNotIn(
                 "task_source_settlement_attempted",
                 [record.get("record_type") for record in records],
@@ -8833,10 +8838,198 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 process_exists=lambda pid: False,
             )
             clean_result = clean_stale_locks(stale, lock_manager)
-            self.assertEqual(len(stale), 1)
-            self.assertTrue(stale[0].settlement_pending)
+            self.assertEqual(stale, [])
             self.assertEqual(clean_result.cleaned, [])
-            self.assertTrue(lock_manager.is_locked("T-1"))
+            self.assertFalse(lock_manager.is_locked("T-1"))
+
+    def test_recovery_prelaunch_exits_leave_no_task_lock(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+
+        def recovery_context(repo: Path) -> RecoveryContext:
+            return RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log=str(repo / "prior-run.log"),
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=False,
+            )
+
+        for exit_path in (
+            "probe_failure",
+            "task_absent",
+            "attempt_circuit_open",
+            "budget_denial",
+        ):
+            with (
+                self.subTest(exit_path=exit_path),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner, lock_manager, _ = self._build_runner(directory, [task], {})
+                source = self._enable_runtime_owned_task_source(runner, task)
+                recovery = recovery_context(Path(directory))
+
+                if exit_path == "probe_failure":
+
+                    def failing_probe(task_id: str) -> Task:
+                        raise OSError("task source unavailable")
+
+                    source.probe = failing_probe  # type: ignore[method-assign]
+                    result = runner.resume_pending_recovery(recovery)
+                elif exit_path == "task_absent":
+                    runner._source = StubTaskSource([], {})
+                    result = runner.resume_pending_recovery(recovery)
+                elif exit_path == "attempt_circuit_open":
+
+                    def open_circuit(*, inputs, threshold, **kwargs):
+                        return AttemptCircuitState(
+                            task_id=inputs.task_id,
+                            inputs=inputs,
+                            threshold=threshold,
+                            attempt_count=threshold,
+                        )
+
+                    with patch.object(
+                        runner.run_store,
+                        "reserve_attempt_circuit",
+                        side_effect=open_circuit,
+                    ):
+                        result = runner.resume_pending_recovery(recovery)
+                else:
+                    runner.config = dataclasses.replace(
+                        runner.config,
+                        budget=BudgetConfig(enabled=True),
+                    )
+                    denial = BudgetDecision(
+                        admitted=False,
+                        decision="block",
+                        phase="implementation",
+                        binding=(
+                            {
+                                "selector": {},
+                                "remaining": 0.0,
+                                "declared": 1.0,
+                            },
+                        ),
+                    )
+                    with patch.object(
+                        runner.budget_store,
+                        "reserve",
+                        return_value=denial,
+                    ):
+                        result = runner.resume_pending_recovery(recovery)
+
+                self.assertIsNone(result)
+                self.assertFalse(lock_manager.is_locked(task.task_id))
+
+    def test_runtime_owned_recovery_stale_workspace_releases_task_lock(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            repo = runner.config.repo
+            old_base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            prior_lock = lock_manager.acquire(
+                task.task_id,
+                "prior-run",
+                metadata={
+                    "task_id": task.task_id,
+                    "run_id": "prior-run",
+                    "base_main": old_base,
+                    "started_at": "2026-07-26T00:00:00+00:00",
+                },
+            )
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=lock_manager,
+                run_store=runner.run_store,
+            ).provision(
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=old_base,
+                fencing_token=str(prior_lock.metadata["fencing_token"]),
+            )
+            (workspace.worktree / "candidate.txt").write_text(
+                "interrupted candidate\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "candidate.txt"],
+                cwd=workspace.worktree,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "interrupted candidate"],
+                cwd=workspace.worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stale_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=workspace.worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            lock_manager.release(lock_manager.current_lock(task.task_id))
+            (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "current-base.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "advance main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            dirty_snapshot, dirty_fingerprint = git_dirty_snapshot(workspace.worktree)
+            git_common_dir = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=workspace.worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            recovery = RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch=workspace.branch,
+                worktree=str(workspace.worktree),
+                head_commit=stale_head,
+                transcript_path="",
+                wrapper_log=str(repo / "prior-run.log"),
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=True,
+                base_commit=old_base,
+                git_common_dir=str((workspace.worktree / git_common_dir).resolve()),
+                dirty_snapshot=tuple(dirty_snapshot),
+                dirty_fingerprint=dirty_fingerprint,
+            )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.run_streaming_command") as launch:
+                    result = runner.resume_pending_recovery(recovery)
+
+            self.assertIsNone(result)
+            launch.assert_not_called()
+            self.assertEqual(source.status, "active")
+            self.assertFalse(lock_manager.is_locked(task.task_id))
 
     def test_runtime_owned_requeue_reset_receives_live_fencing_context(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")

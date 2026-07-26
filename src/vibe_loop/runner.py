@@ -2080,13 +2080,6 @@ class VibeRunner:
                     RunStage.FINALIZATION,
                     reason="pre_launch_failure",
                 )
-            if activated_runtime_owned and not task_source_terminal_confirmed:
-                report_status(
-                    "retained task lock after runtime-owned activation failure "
-                    f"for stage-aware task-source settlement: {task.task_id} "
-                    f"run_id={run_id}"
-                )
-                return
             self.lock_manager.release(task_lock)
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
