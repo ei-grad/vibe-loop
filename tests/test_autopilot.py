@@ -141,7 +141,7 @@ from vibe_loop.runs import (
     WorkerReport,
     autopilot_child_started_record,
 )
-from vibe_loop.cli import render_autopilot_stop
+from vibe_loop.cli import render_autopilot_status, render_autopilot_stop
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
@@ -186,6 +186,177 @@ def stop_test_process_group(pid: int, process_group_id: int) -> None:
 
 
 class AutopilotStatusTests(unittest.TestCase):
+    @staticmethod
+    def _record_approved_outcome(
+        run_store: RunStore,
+        *,
+        run_id: str,
+        task_id: str,
+        classification: str,
+        reason: str,
+        reached_done: bool = False,
+        approved: bool = True,
+    ) -> None:
+        if approved:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.review_verdict(
+                    run_id=run_id,
+                    task_id=task_id,
+                    payload={"verdict": "approve", "pass_kind": "initial"},
+                )
+            )
+        if reached_done:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.task_provenance_committed(
+                    run_id=run_id,
+                    task_id=task_id,
+                    payload={"confirmed_status": "Done"},
+                )
+            )
+        run_store.append_result(
+            RunResult(
+                run_id=run_id,
+                task_id=task_id,
+                classification=classification,
+                classification_source=reason,
+                exit_code=0,
+                log_path=run_store.path.parent / "runs" / f"{run_id}.log",
+                start_main="base",
+                end_main="head",
+            )
+        )
+
+    def test_status_alarms_on_six_approved_candidates_with_zero_closures(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            reasons = (
+                "completion_adapter_failed",
+                "merge_conflict",
+                "lock_timeout",
+                "main_verification_failed",
+                "merge_conflict",
+                "main_verification_failed",
+            )
+            for ordinal, reason in enumerate(reasons, start=1):
+                self._record_approved_outcome(
+                    run_store,
+                    run_id=f"run-{ordinal}",
+                    task_id=f"TASK-{ordinal:02d}",
+                    classification="blocked",
+                    reason=reason,
+                )
+
+            status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(
+            payload["non_closure"],
+            {
+                "window_runs": 20,
+                "observed_runs": 6,
+                "approved_candidates": 6,
+                "count": 6,
+                "rate": 1.0,
+                "consecutive": 6,
+                "alarm_threshold": 2,
+                "alarmed": True,
+                "reasons": {
+                    "main_verification_failed": 2,
+                    "merge_conflict": 2,
+                    "completion_adapter_failed": 1,
+                    "lock_timeout": 1,
+                },
+            },
+        )
+        self.assertEqual(
+            payload["alarms"],
+            ["non_closure_alarm:6_consecutive_approved_candidates_not_done"],
+        )
+        self.assertNotIn(
+            "non_closure_alarm:6_consecutive_approved_candidates_not_done",
+            payload["blockers"],
+        )
+        self.assertIn("non-closure: 6/6 approved candidates", rendered)
+        self.assertIn("consecutive=6/2 ALARM", rendered)
+        self.assertIn("merge_conflict=2", rendered)
+        self.assertIn("alarms:", rendered)
+        self.assertIn("blockers: none", rendered)
+
+    def test_healthy_approved_closures_do_not_raise_non_closure_alarm(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            for ordinal in range(1, 3):
+                self._record_approved_outcome(
+                    run_store,
+                    run_id=f"run-{ordinal}",
+                    task_id=f"TASK-{ordinal:02d}",
+                    classification="completed",
+                    reason="runtime_lifecycle",
+                    reached_done=True,
+                )
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["non_closure"]["approved_candidates"], 2)
+        self.assertEqual(payload["non_closure"]["count"], 0)
+        self.assertEqual(payload["non_closure"]["rate"], 0.0)
+        self.assertEqual(payload["non_closure"]["consecutive"], 0)
+        self.assertFalse(payload["non_closure"]["alarmed"])
+        self.assertEqual(payload["alarms"], [])
+        self.assertFalse(
+            any(
+                blocker.startswith("non_closure_alarm:")
+                for blocker in payload["blockers"]
+            )
+        )
+
+    def test_unapproved_run_does_not_reset_approved_non_closure_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_approved_outcome(
+                run_store,
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="blocked",
+                reason="merge_conflict",
+            )
+            self._record_approved_outcome(
+                run_store,
+                run_id="run-2",
+                task_id="TASK-02",
+                classification="failed",
+                reason="gate_failed",
+                approved=False,
+            )
+            self._record_approved_outcome(
+                run_store,
+                run_id="run-3",
+                task_id="TASK-03",
+                classification="blocked",
+                reason="completion_adapter_failed",
+            )
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["non_closure"]["observed_runs"], 3)
+        self.assertEqual(payload["non_closure"]["approved_candidates"], 2)
+        self.assertEqual(payload["non_closure"]["count"], 2)
+        self.assertEqual(payload["non_closure"]["rate"], 1.0)
+        self.assertEqual(payload["non_closure"]["consecutive"], 2)
+        self.assertTrue(payload["non_closure"]["alarmed"])
+
     def test_collect_project_status_summarizes_repo_queue_workers_and_cycle(
         self,
     ) -> None:

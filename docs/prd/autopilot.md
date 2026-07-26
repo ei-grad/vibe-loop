@@ -58,6 +58,17 @@ Acceptance must cover `--repo`, `--jobs`, `--interval`, `--once`,
 scriptable output is promised. Human cycle output should be compact by default:
 repo, queue, supervisor state, blockers or actions, log path, and next wake.
 
+Status must also derive a bounded recent non-closure summary from the runtime
+journal. A non-closure is a terminal run that recorded an approving review
+verdict but did not record task-source completion. The summary reports the
+approved-candidate denominator, non-closure count and rate, consecutive
+non-closure streak, and distinct terminal classification reasons. Two
+consecutive non-closures raise a dedicated visible alarm that does not become a
+dispatch blocker. Terminal runs without an approving verdict are neutral to the
+approved-candidate streak; task-source completion of an approved candidate
+resets it. This is an outcome signal and must not depend on an allowlist of
+known failure reasons.
+
 Related implementation IDs: `AUTO-02`, `AUTO-03`.
 
 ## PRD-AUT-002b Supervisor Configuration Lifetime

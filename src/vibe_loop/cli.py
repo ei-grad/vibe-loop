@@ -1717,6 +1717,24 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             f"queue: {queue.runnable} runnable / {queue.total} total "
             f"({queue.active} active, {queue.done} done, {queue.blocked} blocked)"
         )
+    non_closure = status.non_closure
+    rate = f"{non_closure.rate:.0%}" if non_closure.rate is not None else "n/a"
+    reasons = (
+        ", ".join(f"{reason}={count}" for reason, count in non_closure.reasons.items())
+        or "none"
+    )
+    alarm = " ALARM" if non_closure.alarmed else ""
+    lines.append(
+        "non-closure: "
+        f"{non_closure.count}/{non_closure.approved_candidates} approved "
+        f"candidates in last {non_closure.observed_runs}/"
+        f"{non_closure.window_runs} runs ({rate}); "
+        f"consecutive={non_closure.consecutive}/"
+        f"{non_closure.alarm_threshold}{alarm}; reasons: {reasons}"
+    )
+    if status.alarms:
+        lines.append("alarms:")
+        lines.extend(f"  - {alarm}" for alarm in status.alarms)
     supervisor = status.supervisor
     supervisor_line = f"supervisor: {supervisor.state}"
     if supervisor.pid:
@@ -2065,10 +2083,18 @@ def render_aggregate_status(results) -> str:
         blockers = (
             f"; blockers: {', '.join(status.blockers)}" if status.blockers else ""
         )
+        non_closure = status.non_closure
+        non_closure_text = (
+            f"; non-closure {non_closure.count}/"
+            f"{non_closure.approved_candidates}, "
+            f"consecutive {non_closure.consecutive}"
+            + (" ALARM" if non_closure.alarmed else "")
+        )
         lines.append(
             redact_runtime_context_text(
                 f"{result.name} ({result.repo}): {queue_text}; "
-                f"supervisor {status.supervisor.state}{blockers}",
+                f"supervisor {status.supervisor.state}"
+                f"{non_closure_text}{blockers}",
                 result.runtime_context,
             )
         )
