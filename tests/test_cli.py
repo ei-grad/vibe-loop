@@ -228,6 +228,63 @@ class DirectUrlDistribution:
 
 
 class CliTests(unittest.TestCase):
+    def test_run_dispatches_the_explicit_task_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            result = RunResult(
+                run_id="run-task-02",
+                task_id="TASK-02",
+                classification="completed",
+                exit_code=0,
+                log_path=repo / "run.log",
+                start_main="aaa",
+                end_main="bbb",
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with (
+                patch(
+                    "vibe_loop.cli.load_config",
+                    return_value=load_config(repo),
+                ),
+                patch("vibe_loop.cli.VibeRunner") as runner_type,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                runner_type.return_value.run_task_id.return_value = result
+                exit_code = main(["run", "TASK-02", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["task_id"], "TASK-02")
+        self.assertEqual(stderr.getvalue(), "")
+        runner_type.return_value.run_task_id.assert_called_once_with("TASK-02")
+        runner_type.return_value.run_next.assert_not_called()
+
+    def test_run_next_does_not_accept_a_task_id(self) -> None:
+        stderr = StringIO()
+
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as raised:
+            main(["run-next", "TASK-02"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("unrecognized arguments: TASK-02", stderr.getvalue())
+
+    def test_run_refusal_exits_nonzero_and_names_the_requested_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "docs").mkdir()
+            (repo / "docs" / "PLAN.md").write_text(PLAN, encoding="utf-8")
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["run", "TASK-99", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("vibe-loop: unknown task 'TASK-99'", stderr.getvalue())
+
     def test_version_flag_prints_package_version_without_loading_config(self) -> None:
         stdout = StringIO()
         stderr = StringIO()

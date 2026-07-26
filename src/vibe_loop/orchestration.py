@@ -3372,11 +3372,14 @@ class Integrator:
         task_id: str,
         log_dir: Path,
         wait: bool = True,
-        timeout_seconds: float | None = 300,
+        timeout_seconds: float | None = 900,
         poll_interval_seconds: float = 1,
+        max_lock_attempts: int = 1,
         executor: GateExecutor = subprocess.run,
         stage_machine: RunLifecycleStateMachine | None = None,
     ) -> None:
+        if max_lock_attempts < 1:
+            raise ValueError("max_lock_attempts must be positive")
         self.repo = repo.resolve()
         self.main_branch = main_branch
         self.candidate = candidate
@@ -3391,12 +3394,13 @@ class Integrator:
         self.wait = wait
         self.timeout_seconds = timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
+        self.max_lock_attempts = max_lock_attempts
         self.executor = executor
         self.stage_machine = stage_machine
 
     def run(self) -> IntegrationResult:
         prior = self._prior_result()
-        if prior is not None and self._prior_result_is_consistent(prior):
+        if prior is not None and self._prior_result_is_reusable(prior):
             if prior.completed:
                 self._record_result(
                     prior,
@@ -3409,14 +3413,37 @@ class Integrator:
         if preflight is not None:
             return self._record_preflight_failure(preflight)
 
-        acquired, recovered_lock, lock_status = self._acquire_lock()
-        if not acquired:
+        lock_attempt = 0
+        while lock_attempt < self.max_lock_attempts:
+            lock_attempt += 1
+            acquired, recovered_lock, lock_status = self._acquire_lock()
+            if acquired:
+                break
             reason = "lock_timeout" if lock_status.timed_out else "lock_unavailable"
-            return self._record_failure(
+            metadata = lock_status.status.metadata
+            retry_exhausted = (
+                reason == "lock_timeout" and lock_attempt >= self.max_lock_attempts
+            )
+            diagnostics = {
+                "lock_state": lock_status.status.state,
+                "lock_attempt": lock_attempt,
+                "max_lock_attempts": self.max_lock_attempts,
+                "retry_exhausted": retry_exhausted,
+            }
+            holder_task_id = metadata.get("owner_task_id")
+            holder_run_id = metadata.get("run_id")
+            if isinstance(holder_task_id, str) and holder_task_id:
+                diagnostics["holder_task_id"] = holder_task_id
+            if isinstance(holder_run_id, str) and holder_run_id:
+                diagnostics["holder_run_id"] = holder_run_id
+            result = self._record_failure(
                 reason,
                 status="blocked",
-                diagnostics={"lock_state": lock_status.status.state},
+                diagnostics=diagnostics,
+                finalize_stage=reason != "lock_timeout" or retry_exhausted,
             )
+            if reason != "lock_timeout" or retry_exhausted:
+                return result
 
         self._record_lock_event("lock_acquired", lock_status.status.path)
         if (
@@ -3429,7 +3456,7 @@ class Integrator:
             )
         try:
             concurrent_result = self._prior_result()
-            if concurrent_result is not None and self._prior_result_is_consistent(
+            if concurrent_result is not None and self._prior_result_is_reusable(
                 concurrent_result
             ):
                 if concurrent_result.completed:
@@ -3843,6 +3870,11 @@ class Integrator:
             self._rev_parse(self.repo, self.main_branch),
         )
 
+    def _prior_result_is_reusable(self, result: IntegrationResult) -> bool:
+        return result.reason != "lock_timeout" and self._prior_result_is_consistent(
+            result
+        )
+
     def _release_recovered_lock(self) -> None:
         status = self.lock_manager.main_integration_status()
         if (
@@ -3897,6 +3929,7 @@ class Integrator:
         verification: Sequence[IntegrationCheckResult] = (),
         recovered: bool = False,
         diagnostics: Mapping[str, object] | None = None,
+        finalize_stage: bool = True,
     ) -> IntegrationResult:
         result = self._record_result(
             IntegrationResult(
@@ -3913,7 +3946,7 @@ class Integrator:
                 diagnostics=dict(diagnostics or {}),
             )
         )
-        if self.stage_machine is not None:
+        if self.stage_machine is not None and finalize_stage:
             self.stage_machine.fail(
                 StageFailure.BLOCKED
                 if status == "blocked"
@@ -5043,6 +5076,7 @@ class RunContractResolver:
             "integration": {
                 "enabled": effective.integration_enabled,
                 "verify_on_main": list(effective.verify_on_main),
+                "lock_timeout_seconds": (effective.integration_lock_timeout_seconds),
             },
             "task_provenance": task_provenance_payload,
             "candidate_stabilization": {

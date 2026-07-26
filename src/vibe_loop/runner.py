@@ -739,6 +739,10 @@ class TaskActivationError(RuntimeError):
     """A command task source could not confirm its pre-launch claim."""
 
 
+class ExplicitTaskDispatchError(RuntimeError):
+    """A named task cannot enter the standard run lifecycle."""
+
+
 class AgentLimitWallError(RuntimeError):
     """An agent subprocess refused work because an account limit was reached.
 
@@ -1450,6 +1454,7 @@ class VibeRunner:
         self.phase_budget = PhaseBudget(self.budget_store, self.budget_project)
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
+        self._conflict_enforcement_context = threading.local()
         self.last_analysis_usage = unavailable_usage(
             "unknown", "provider_usage_not_reported"
         )
@@ -1784,9 +1789,19 @@ class VibeRunner:
         task: Task,
         *,
         restart_count: int = 0,
+        enforce_resource_conflicts: bool = False,
     ) -> RunResult:
-        previous = getattr(self._restart_context, "value", None)
+        previous_restart = getattr(self._restart_context, "value", None)
+        previous_conflicts = getattr(
+            self._conflict_enforcement_context,
+            "value",
+            None,
+        )
         self._restart_context.value = (task.task_id, restart_count)
+        self._conflict_enforcement_context.value = (
+            task.task_id,
+            enforce_resource_conflicts,
+        )
         try:
             try:
                 return self.run_task(task)
@@ -1798,13 +1813,20 @@ class VibeRunner:
                     raise
                 return self.record_agent_resolution_failure(task, exc)
         finally:
-            if previous is None:
+            if previous_restart is None:
                 try:
                     del self._restart_context.value
                 except AttributeError:
                     pass
             else:
-                self._restart_context.value = previous
+                self._restart_context.value = previous_restart
+            if previous_conflicts is None:
+                try:
+                    del self._conflict_enforcement_context.value
+                except AttributeError:
+                    pass
+            else:
+                self._conflict_enforcement_context.value = previous_conflicts
 
     def record_skill_verification_failure(
         self,
@@ -1885,6 +1907,13 @@ class VibeRunner:
         if context_task_id != task_id or not isinstance(restart_count, int):
             return 0
         return max(0, restart_count)
+
+    def current_resource_conflict_enforcement(self, task_id: str) -> bool:
+        value = getattr(self._conflict_enforcement_context, "value", None)
+        if not isinstance(value, tuple) or len(value) != 2:
+            return False
+        context_task_id, enforce = value
+        return context_task_id == task_id and enforce is True
 
     def run_task(
         self,
@@ -2090,6 +2119,9 @@ class VibeRunner:
             task,
             run_id,
             active_state,
+            enforce_resource_conflicts=self.current_resource_conflict_enforcement(
+                task.task_id
+            ),
         )
         fencing_token = fencing_token_value(task_lock.metadata.get("fencing_token"))
         if fencing_token:
@@ -3395,6 +3427,8 @@ class VibeRunner:
         task: Task,
         run_id: str,
         active_state: ActiveRunState,
+        *,
+        enforce_resource_conflicts: bool = False,
     ) -> TaskLock:
         scheduler_lock = self.acquire_scheduler_lock(
             run_id,
@@ -3402,8 +3436,12 @@ class VibeRunner:
         )
         try:
             active_domains = active_lock_conflict_domains(self.lock_manager)
-            if resource_conflicts_enabled([task], active_domains) and (
-                task_conflicts_with_domains(task, active_domains)
+            conflict_policy_enabled = enforce_resource_conflicts or (
+                resource_conflicts_enabled([task], active_domains)
+            )
+            if conflict_policy_enabled and task_conflicts_with_domains(
+                task,
+                active_domains,
             ):
                 raise LockBusy(
                     scheduler_lock.path,
@@ -3693,6 +3731,13 @@ class VibeRunner:
             run_id=run_id,
             task_id=task.task_id,
             log_dir=self.runs_dir / f"{run_id}-integration",
+            timeout_seconds=float(
+                integration.get(
+                    "lock_timeout_seconds",
+                    self.config.orchestration.integration_lock_timeout_seconds,
+                )
+            ),
+            max_lock_attempts=2,
             stage_machine=stage_machine,
         ).run()
         if not integration_result.completed:
@@ -4160,6 +4205,12 @@ class VibeRunner:
         task = self.select_from_candidates(candidates, ask_agent=ask_agent)
         try:
             restart_count = (restart_counts or {}).get(task.task_id, 0)
+            if resource_conflicts_enabled(candidates, ()):
+                return self.run_task_with_supervision(
+                    task,
+                    restart_count=restart_count,
+                    enforce_resource_conflicts=True,
+                )
             return self.run_task_with_supervision(
                 task,
                 restart_count=restart_count,
@@ -4194,6 +4245,75 @@ class VibeRunner:
                 exclude=excluded,
                 restart_counts=restart_counts,
             )
+
+    def run_task_id(self, task_id: str) -> RunResult:
+        require_project_binding(self.config)
+        tasks = self.source.list_tasks()
+        task = next((task for task in tasks if task.task_id == task_id), None)
+        if task is None:
+            raise ExplicitTaskDispatchError(f"unknown task {task_id!r}")
+
+        runnable_scope = runnable_tasks_from_snapshot(
+            tasks,
+            self.source_resolution.task_source.runnable_statuses,
+            self.source_resolution.task_source.respect_source_order,
+        )
+        if self.lock_manager.is_locked(task_id):
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} has an existing task lock"
+            )
+
+        active_domains = active_lock_conflict_domains(self.lock_manager)
+        enforce_resource_conflicts = resource_conflicts_enabled(
+            runnable_scope,
+            active_domains,
+        )
+        if enforce_resource_conflicts and (
+            task_conflicts_with_domains(task, active_domains)
+        ):
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is excluded by a conflict domain held by "
+                "an active run"
+            )
+
+        if task.done:
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is already complete with status {task.status!r}"
+            )
+
+        done_task_ids = {candidate.task_id for candidate in tasks if candidate.done}
+        unresolved_dependencies = tuple(
+            dependency
+            for dependency in task.dependencies
+            if dependency not in done_task_ids
+        )
+        if unresolved_dependencies:
+            dependencies = ", ".join(unresolved_dependencies)
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is dependency-blocked by: {dependencies}"
+            )
+
+        runnable_statuses = self.source_resolution.task_source.runnable_statuses
+        if task.status not in runnable_statuses:
+            raise ExplicitTaskDispatchError(
+                f"task {task_id!r} is not runnable with status {task.status!r}"
+            )
+
+        self.ensure_spec_execution_gate()
+        self.require_worker_launch_config()
+        try:
+            if enforce_resource_conflicts:
+                return self.run_task_with_supervision(
+                    task,
+                    enforce_resource_conflicts=True,
+                )
+            return self.run_task_with_supervision(task)
+        except LockBusy as exc:
+            if exc.metadata.get("reason") == "resource_conflict":
+                reason = "is excluded by a conflict domain held by an active run"
+            else:
+                reason = "has an existing task lock"
+            raise ExplicitTaskDispatchError(f"task {task_id!r} {reason}") from exc
 
     def run_until_done(
         self,
@@ -4627,14 +4747,23 @@ class VibeRunner:
                     if not announced:
                         report_status(f"parallel supervisor jobs={jobs}")
                         announced = True
+                    enforce_resource_conflicts = resource_conflicts_enabled(
+                        candidates,
+                        (),
+                    )
                     for task in tasks:
                         scheduled[task.task_id] = task
                         report_status(f"queueing {task.task_id}: {task.title}")
+                        supervision_kwargs = {
+                            "restart_count": transient_retries.get(task.task_id, 0)
+                        }
+                        if enforce_resource_conflicts:
+                            supervision_kwargs["enforce_resource_conflicts"] = True
                         in_flight[
                             executor.submit(
                                 self.run_task_with_supervision,
                                 task,
-                                restart_count=transient_retries.get(task.task_id, 0),
+                                **supervision_kwargs,
                             )
                         ] = task.task_id
                     if ask_agent and len(candidates) > 1 and len(tasks) < open_slots:

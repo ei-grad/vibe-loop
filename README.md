@@ -61,12 +61,14 @@ vibe-loop tasks configure --repo . --dry-run --json   # review candidate
 vibe-loop tasks configure --repo . --json             # activate
 ```
 
-Inspect runnable work, then run one selected task with the configured agent:
+Inspect work, then run either the named task or one selected task with the
+configured agent:
 
 ```bash
 vibe-loop tasks list --repo .
 vibe-loop tasks tree --repo .
 vibe-loop next --repo .
+vibe-loop run TASK-01 --repo .
 vibe-loop run-next --repo .
 ```
 
