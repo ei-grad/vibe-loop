@@ -25,7 +25,8 @@ kind = "auto"
 # effort = "high"
 command = "codex exec {prompt}"
 selection_command = "codex exec {prompt}"
-# analysis_command is read-only and separate from the implementation worker.
+# analysis_command is read-only and separate from the implementation worker;
+# overrides must also use a read-only invocation.
 # analysis_command = "codex exec --sandbox read-only {prompt}"
 forward_stderr = false
 
@@ -58,8 +59,12 @@ mode = "runtime-owned"
 max_restarts = 3
 cooldown_seconds = 30.0
 recover_unknown_runs = true
+# Wall-clock worker cap; the process group is killed and the task becomes
+# runnable at the deadline. Set 0 for no timeout.
 worker_timeout_seconds = 10800.0
+# Low-change/high-token diagnostic threshold; set 0 to disable.
 slice_token_threshold = 100000
+# Unchanged non-completed attempts before autopilot withholds launches.
 cross_run_attempt_threshold = 3
 
 [locks]
@@ -85,12 +90,12 @@ type = "directory"
 [autopilot]
 # jobs = 2
 # interval_seconds = 60.0
-# min_ready = 1
-# planning_recheck_seconds = 60.0
-# idle_poll_max_seconds = 600.0
-# planning_backoff_seconds = 21600.0
-# planning_max_launches_per_day = 4
-# planning_unproductive_threshold = 2
+# min_ready = 1                       # positive integer; zero is invalid
+# planning_recheck_seconds = 60.0     # initial idle delay; minimum 5s
+# idle_poll_max_seconds = 600.0       # idle fallback cap; minimum 5s
+# planning_backoff_seconds = 21600.0  # set 0 to disable planning backoff
+# planning_max_launches_per_day = 4   # set 0 to disable the rolling-day limit
+# planning_unproductive_threshold = 2 # launches before backoff engages
 require_clean_repo = true
 worktree_disposition = "report-only"
 # health_command = "scripts/health.sh"
@@ -111,6 +116,11 @@ provider-specific flags to inferred commands. Explicit `command`,
 bundled skill. `worker_prompt_extra` is repository-wide policy appended only to
 worker prompts. `forward_stderr` mirrors worker stderr in addition to retaining
 it in the run log.
+
+Inferred `analysis_command` forms are read-only by construction: Codex uses its
+read-only sandbox, while Claude disallows `Edit`, `Write`, and `NotebookEdit`.
+An explicit override remains authoritative, so operators must supply another
+read-only invocation rather than a general implementation command.
 
 The authoritative template, dialect, environment, and read-only-analysis
 contracts are in [PRD-CLI-004 and PRD-CLI-005](prd/cli-runtime.md).
@@ -251,6 +261,11 @@ source. Setting any of them disables generated cache as the active source.
 `runnable_statuses` is a non-source override and can replace generated runnable
 statuses without disabling a generated parser.
 
+The generated `markdown-profile` source type is emitted by `tasks configure
+--promotion-toml`; see
+[Generated Task Discovery](generated-task-discovery.md#profile-status) for the
+explicit-promotion path.
+
 The default runnable statuses are `Active`, `Next`, and `Planned`. Semantic
 completion, rank, and blocked-family checks are case-insensitive; an explicitly
 configured runnable-status allowlist matches source wire values exactly.
@@ -283,6 +298,13 @@ poll/backoff limits, repository cleanliness, worktree disposition, disk reserve,
 and optional maintenance commands. Generated profiles cannot introduce those
 commands.
 
+`[project_binding]` and `[project_binding.context]` bind command adapters to an
+explicit project namespace; their operator contract remains in
+[Command backend project binding](../README.md#command-backend-project-binding).
+`[autopilot.disk_reserve]` overrides the native byte, inode, and proportional
+capacity floors; its validation and disablement rules remain in the
+[Autopilot reference](../README.md#autopilot).
+
 `[specs]` controls approval, fingerprint, requirement-coverage, and completion
 evidence gates plus allowed approval states and operator-owned override commands.
 
@@ -304,6 +326,8 @@ configuration section now lives.
 | `locks.type`, `acquire_command`, `release_command`, `status_command`, `list_command`, `lease_seconds` | [PRD-WRK-011 and PRD-WRK-012](prd/worker-supervision.md#prd-wrk-011-pluggable-lock-backends). |
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |
 | `autopilot.jobs`, `interval_seconds`, `min_ready`, `planning_recheck_seconds`, `idle_poll_max_seconds`, `planning_backoff_seconds`, `planning_max_launches_per_day`, `planning_unproductive_threshold`, `require_clean_repo`, `worktree_disposition`, `health_command`, `summary_command`, `troubleshoot_command`, `planning_command`, `idle_wake_command` | Annotated and other groups above. |
+| `project_binding.require`, `project_binding.context.*` | [Command backend project binding](../README.md#command-backend-project-binding). |
+| `autopilot.disk_reserve.min_free_bytes`, `min_free_fraction`, `min_free_inodes`, `min_free_inode_fraction` | [Autopilot disk-reserve reference](../README.md#autopilot). |
 | `specs.require_approved`, `require_current_fingerprints`, `require_requirement_coverage`, `require_completion_evidence`, `approved_states`, `override_commands` | [Task Discovery PRD](prd/task-discovery.md) and other groups above. |
 
 ## Reconciliation record

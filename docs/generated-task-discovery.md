@@ -107,6 +107,12 @@ evidence, diagnostics mark the cache stale and point back to `tasks configure`.
 `tasks configure --force-refresh` regenerates the cache even when the current
 profile is still fresh.
 
+`tasks configure --promotion-toml` prints the validated profile as
+non-executable, committable TOML with `task_source.type = "markdown-profile"`.
+Adding that snippet to `.vibe-loop.toml` makes the generated parser profile an
+explicit source, so subsequent task discovery no longer depends on the cache
+remaining active.
+
 ## Repo-Specific Task Discovery Configuration
 
 This repository's built-in Markdown fallback recognizes a specific table shape:
