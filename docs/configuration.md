@@ -54,8 +54,6 @@ mode = "runtime-owned"
 # max_closure_review_passes = 2
 # reviewer_concurrency_budget = 1
 # max_candidate_reanchors = 2
-# Main verification on this repository has measured 328 seconds. The 900-second
-# default leaves time for refresh, merge, provenance, and normal runtime variance.
 # integration_lock_timeout_seconds = 900.0
 
 [supervision]

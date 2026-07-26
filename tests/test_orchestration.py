@@ -1935,7 +1935,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         main_keys: tuple[str, ...] = ("completion.commands[1]",),
         executor=subprocess.run,
         timeout_seconds: float = 0,
-        retry_lock_timeouts: bool = False,
+        max_lock_attempts: int = 1,
         stage_machine: RunLifecycleStateMachine | None = None,
     ) -> Integrator:
         return Integrator(
@@ -1959,7 +1959,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             log_dir=self.repo / ".vibe-loop" / "integration",
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=0.01,
-            retry_lock_timeouts=retry_lock_timeouts,
+            max_lock_attempts=max_lock_attempts,
             executor=executor,
             stage_machine=stage_machine,
         )
@@ -2303,7 +2303,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         ):
             result = self.integrator(
                 executor=count_success,
-                retry_lock_timeouts=True,
+                max_lock_attempts=2,
             ).run()
 
         self.assertTrue(result.completed)
@@ -2326,6 +2326,83 @@ class RuntimeIntegrationTests(unittest.TestCase):
             records[0]["diagnostics"]["holder_run_id"],
             "run-other",
         )
+
+    def test_lock_timeout_retry_budget_exhaustion_is_terminal(self) -> None:
+        transitions = []
+        machine = RunLifecycleStateMachine(transitions.append)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REVIEW,
+        ):
+            machine.transition(stage, reason="setup")
+        holder = self.manager.acquire_main_integration(
+            task_id="TASK-OTHER",
+            run_id="run-other",
+            metadata={"pid": os.getpid()},
+        )
+        self.addCleanup(self.manager.release, holder)
+
+        result = self.integrator(
+            max_lock_attempts=2,
+            stage_machine=machine,
+        ).run()
+
+        self.assertEqual(result.reason, "lock_timeout")
+        self.assertEqual(result.diagnostics["lock_attempt"], 2)
+        self.assertEqual(result.diagnostics["max_lock_attempts"], 2)
+        self.assertTrue(result.diagnostics["retry_exhausted"])
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
+        records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "integration_result"
+        ]
+        self.assertEqual(len(records), 2)
+
+    def test_lock_unavailable_does_not_retry(self) -> None:
+        transitions = []
+        machine = RunLifecycleStateMachine(transitions.append)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REVIEW,
+        ):
+            machine.transition(stage, reason="setup")
+        holder = self.manager.acquire_main_integration(
+            task_id="TASK-OTHER",
+            run_id="run-other",
+            metadata={"pid": 999_999_999},
+        )
+        self.addCleanup(self.manager.release, holder)
+        original_wait = self.manager.acquire_main_integration_with_wait
+        attempts = 0
+
+        def count_attempts(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            return original_wait(**kwargs)
+
+        with patch.object(
+            self.manager,
+            "acquire_main_integration_with_wait",
+            side_effect=count_attempts,
+        ):
+            result = self.integrator(
+                max_lock_attempts=2,
+                stage_machine=machine,
+            ).run()
+
+        self.assertEqual(result.reason, "lock_unavailable")
+        self.assertEqual(attempts, 1)
+        self.assertFalse(result.diagnostics["retry_exhausted"])
+        self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
 
     def test_two_same_run_recoveries_atomically_claim_one_stale_window(self) -> None:
         self.advance_main()

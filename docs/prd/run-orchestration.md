@@ -243,7 +243,9 @@ when `task_source.reset` is absent.
 Integration-lock contention does not consume a second implementation or review
 pass. The runtime records each expired acquisition attempt against the approved
 candidate, including the holder task and run identities, then retries the
-serialized integration window. The wait per attempt is configurable as
+serialized integration window once. If the retry also expires, the runtime
+records retry exhaustion and returns a blocked result instead of waiting
+indefinitely. The wait per attempt is configurable as
 `orchestration.integration_lock_timeout_seconds`; its 900-second default exceeds
 this repository's measured 328-second verify-on-main duration and leaves time
 for refresh, merge, provenance, and routine variance.

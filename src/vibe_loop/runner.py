@@ -3699,7 +3699,7 @@ class VibeRunner:
                     self.config.orchestration.integration_lock_timeout_seconds,
                 )
             ),
-            retry_lock_timeouts=True,
+            max_lock_attempts=2,
             stage_machine=stage_machine,
         ).run()
         if not integration_result.completed:

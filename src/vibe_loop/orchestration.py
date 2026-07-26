@@ -3374,10 +3374,12 @@ class Integrator:
         wait: bool = True,
         timeout_seconds: float | None = 900,
         poll_interval_seconds: float = 1,
-        retry_lock_timeouts: bool = False,
+        max_lock_attempts: int = 1,
         executor: GateExecutor = subprocess.run,
         stage_machine: RunLifecycleStateMachine | None = None,
     ) -> None:
+        if max_lock_attempts < 1:
+            raise ValueError("max_lock_attempts must be positive")
         self.repo = repo.resolve()
         self.main_branch = main_branch
         self.candidate = candidate
@@ -3392,7 +3394,7 @@ class Integrator:
         self.wait = wait
         self.timeout_seconds = timeout_seconds
         self.poll_interval_seconds = poll_interval_seconds
-        self.retry_lock_timeouts = retry_lock_timeouts
+        self.max_lock_attempts = max_lock_attempts
         self.executor = executor
         self.stage_machine = stage_machine
 
@@ -3411,13 +3413,23 @@ class Integrator:
         if preflight is not None:
             return self._record_preflight_failure(preflight)
 
-        while True:
+        lock_attempt = 0
+        while lock_attempt < self.max_lock_attempts:
+            lock_attempt += 1
             acquired, recovered_lock, lock_status = self._acquire_lock()
             if acquired:
                 break
             reason = "lock_timeout" if lock_status.timed_out else "lock_unavailable"
             metadata = lock_status.status.metadata
-            diagnostics = {"lock_state": lock_status.status.state}
+            retry_exhausted = (
+                reason == "lock_timeout" and lock_attempt >= self.max_lock_attempts
+            )
+            diagnostics = {
+                "lock_state": lock_status.status.state,
+                "lock_attempt": lock_attempt,
+                "max_lock_attempts": self.max_lock_attempts,
+                "retry_exhausted": retry_exhausted,
+            }
             holder_task_id = metadata.get("owner_task_id")
             holder_run_id = metadata.get("run_id")
             if isinstance(holder_task_id, str) and holder_task_id:
@@ -3428,11 +3440,9 @@ class Integrator:
                 reason,
                 status="blocked",
                 diagnostics=diagnostics,
-                finalize_stage=not (
-                    self.retry_lock_timeouts and reason == "lock_timeout"
-                ),
+                finalize_stage=reason != "lock_timeout" or retry_exhausted,
             )
-            if not self.retry_lock_timeouts or reason != "lock_timeout":
+            if reason != "lock_timeout" or retry_exhausted:
                 return result
 
         self._record_lock_event("lock_acquired", lock_status.status.path)
