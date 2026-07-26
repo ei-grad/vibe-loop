@@ -360,6 +360,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "reviewer_profile",
         "gates",
         "verify_on_main",
+        "integration_lock_timeout_seconds",
         "max_initial_review_passes",
         "max_closure_review_passes",
         "reviewer_concurrency_budget",
@@ -379,12 +380,14 @@ ORCHESTRATION_EXTERNAL_COMPLETION_ACTORS = (
     "operator",
     "external-system",
 )
+ORCHESTRATION_DEFAULT_INTEGRATION_LOCK_TIMEOUT_SECONDS = 900.0
 ORCHESTRATION_CONFIG_KEYS = frozenset(
     {
         "mode",
         "reviewer_profile",
         "gates",
         "verify_on_main",
+        "integration_lock_timeout_seconds",
         "max_initial_review_passes",
         "max_closure_review_passes",
         "reviewer_concurrency_budget",
@@ -848,6 +851,9 @@ class OrchestrationConfig:
     reviewer_profile: str | None = None
     gates: tuple[str, ...] = ()
     verify_on_main: tuple[str, ...] = ()
+    integration_lock_timeout_seconds: float = (
+        ORCHESTRATION_DEFAULT_INTEGRATION_LOCK_TIMEOUT_SECONDS
+    )
     max_initial_review_passes: int = 1
     max_closure_review_passes: int = 2
     reviewer_concurrency_budget: int = 1
@@ -867,6 +873,7 @@ class OrchestrationConfig:
             "reviewer_profile": self.reviewer_profile,
             "gates": list(self.gates),
             "verify_on_main": list(self.verify_on_main),
+            "integration_lock_timeout_seconds": (self.integration_lock_timeout_seconds),
             "max_initial_review_passes": self.max_initial_review_passes,
             "max_closure_review_passes": self.max_closure_review_passes,
             "reviewer_concurrency_budget": self.reviewer_concurrency_budget,
@@ -2512,6 +2519,11 @@ def parse_orchestration(
         reviewer_profile=reviewer_profile,
         gates=gates,
         verify_on_main=verify_on_main,
+        integration_lock_timeout_seconds=positive_float(
+            table.get("integration_lock_timeout_seconds"),
+            ORCHESTRATION_DEFAULT_INTEGRATION_LOCK_TIMEOUT_SECONDS,
+            "orchestration.integration_lock_timeout_seconds",
+        ),
         max_initial_review_passes=positive_int(
             table.get("max_initial_review_passes"),
             1,

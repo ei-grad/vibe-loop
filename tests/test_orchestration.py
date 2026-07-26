@@ -95,6 +95,10 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.mode, "runtime-owned")
         self.assertEqual(config.orchestration.gates, ())
         self.assertEqual(config.orchestration.verify_on_main, ())
+        self.assertEqual(
+            config.orchestration.integration_lock_timeout_seconds,
+            900.0,
+        )
         self.assertEqual(config.orchestration.max_candidate_reanchors, 2)
         self.assertTrue(config.orchestration.integration_enabled)
         self.assertEqual(
@@ -117,6 +121,7 @@ class OrchestrationConfigTests(unittest.TestCase):
                 'reviewer_profile = "review"\n'
                 'gates = ["completion.commands[0]"]\n'
                 'verify_on_main = ["completion.commands[1]"]\n'
+                "integration_lock_timeout_seconds = 1200\n"
                 "max_initial_review_passes = 2\n"
                 "max_closure_review_passes = 3\n"
                 "reviewer_concurrency_budget = 2\n"
@@ -135,6 +140,10 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(
             config.orchestration.verify_on_main,
             ("completion.commands[1]",),
+        )
+        self.assertEqual(
+            config.orchestration.integration_lock_timeout_seconds,
+            1200.0,
         )
         self.assertEqual(config.orchestration.max_initial_review_passes, 2)
         self.assertEqual(config.orchestration.max_closure_review_passes, 3)
@@ -173,6 +182,14 @@ class OrchestrationConfigTests(unittest.TestCase):
             (
                 'gates = ["completion.commands[9]"]\n',
                 "references unconfigured command key",
+            ),
+            (
+                "integration_lock_timeout_seconds = 0\n",
+                "orchestration.integration_lock_timeout_seconds",
+            ),
+            (
+                'integration_lock_timeout_seconds = "slow"\n',
+                "orchestration.integration_lock_timeout_seconds",
             ),
             (
                 'task_provenance_mode = ""\n',
@@ -1918,6 +1935,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         main_keys: tuple[str, ...] = ("completion.commands[1]",),
         executor=subprocess.run,
         timeout_seconds: float = 0,
+        retry_lock_timeouts: bool = False,
         stage_machine: RunLifecycleStateMachine | None = None,
     ) -> Integrator:
         return Integrator(
@@ -1941,6 +1959,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             log_dir=self.repo / ".vibe-loop" / "integration",
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=0.01,
+            retry_lock_timeouts=retry_lock_timeouts,
             executor=executor,
             stage_machine=stage_machine,
         )
@@ -2221,6 +2240,8 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.status, "blocked")
         self.assertEqual(result.reason, "lock_timeout")
+        self.assertEqual(result.diagnostics["holder_task_id"], "TASK-OTHER")
+        self.assertEqual(result.diagnostics["holder_run_id"], "run-other")
         status = self.manager.main_integration_status()
         self.assertTrue(status.locked)
         self.assertEqual(status.metadata["owner_task_id"], "TASK-OTHER")
@@ -2249,6 +2270,62 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.reason, "lock_timeout")
         self.assertEqual(machine.stage, RunStage.CLASSIFICATION)
         self.assertEqual(transitions[-1].failure, StageFailure.BLOCKED)
+
+    def test_lock_timeout_retries_approved_candidate_without_repeating_checks(
+        self,
+    ) -> None:
+        holder = self.manager.acquire_main_integration(
+            task_id="TASK-OTHER",
+            run_id="run-other",
+            metadata={"pid": os.getpid()},
+        )
+        original_wait = self.manager.acquire_main_integration_with_wait
+        attempts = 0
+        checks = 0
+
+        def release_after_timeout(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            result = original_wait(**kwargs)
+            if attempts == 1:
+                self.manager.release(holder)
+            return result
+
+        def count_success(command, **kwargs):
+            nonlocal checks
+            checks += 1
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch.object(
+            self.manager,
+            "acquire_main_integration_with_wait",
+            side_effect=release_after_timeout,
+        ):
+            result = self.integrator(
+                executor=count_success,
+                retry_lock_timeouts=True,
+            ).run()
+
+        self.assertTrue(result.completed)
+        self.assertEqual(attempts, 2)
+        self.assertEqual(checks, 2)
+        records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "integration_result"
+        ]
+        self.assertEqual(
+            [record["reason"] for record in records],
+            ["lock_timeout", ""],
+        )
+        self.assertEqual(
+            records[0]["diagnostics"]["holder_task_id"],
+            "TASK-OTHER",
+        )
+        self.assertEqual(
+            records[0]["diagnostics"]["holder_run_id"],
+            "run-other",
+        )
 
     def test_two_same_run_recoveries_atomically_claim_one_stale_window(self) -> None:
         self.advance_main()

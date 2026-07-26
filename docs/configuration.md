@@ -54,6 +54,9 @@ mode = "runtime-owned"
 # max_closure_review_passes = 2
 # reviewer_concurrency_budget = 1
 # max_candidate_reanchors = 2
+# Main verification on this repository has measured 328 seconds. The 900-second
+# default leaves time for refresh, merge, provenance, and normal runtime variance.
+# integration_lock_timeout_seconds = 900.0
 
 [supervision]
 max_restarts = 3
@@ -322,7 +325,7 @@ configuration section now lives.
 | `task_source.type`, `plan_path`, `plan_paths`, `profile`, `runnable_statuses`, `list`, `next`, `probe`, `activate`, `complete`, `reset`, `park` | [Generated Task Discovery](generated-task-discovery.md) and [Task Discovery PRD](prd/task-discovery.md). |
 | Profile fields `resources`, `paths`, `column`, `none_values`; ralphex conflict surfaces; `spec-kit`, `kiro`, `openspec` | [Generated Task Discovery](generated-task-discovery.md) and the [ralphex example](examples/ralphex-markdown-plan.md). |
 | `completion.commands` | Other configuration groups above and [PRD-CLI-003](prd/cli-runtime.md#prd-cli-003-completion-checks). |
-| `orchestration.mode`, `reviewer_profile`, `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors` | [Runtime-owned reviewer route](skill-work-modes.md#runtime-owned-reviewer-route). |
+| `orchestration.mode`, `reviewer_profile`, `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds` | [Runtime-owned reviewer route](skill-work-modes.md#runtime-owned-reviewer-route) and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |
 | `supervision.max_restarts`, `cooldown_seconds`, `recover_unknown_runs`, `worker_timeout_seconds`, `slice_token_threshold`, `cross_run_attempt_threshold` | Annotated and other groups above; supervision contracts in [Worker Supervision PRD](prd/worker-supervision.md). |
 | `locks.type`, `acquire_command`, `release_command`, `status_command`, `list_command`, `lease_seconds` | [PRD-WRK-011 and PRD-WRK-012](prd/worker-supervision.md#prd-wrk-011-pluggable-lock-backends). |
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |

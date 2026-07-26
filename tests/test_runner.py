@@ -8913,7 +8913,11 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 ),
             )
 
+            worker_calls = 0
+
             def implementing_worker(command, cwd, log, **kwargs):
+                nonlocal worker_calls
+                worker_calls += 1
                 kwargs["on_start"](os.getpid())
                 (cwd / "candidate.txt").write_text("candidate\n", encoding="utf-8")
                 subprocess.run(["git", "add", "candidate.txt"], cwd=cwd, check=True)
@@ -8926,7 +8930,30 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 )
                 return runner_module.StreamingCommandResult(exit_code=0)
 
-            result = self._run_task(runner, task, implementing_worker)
+            holder = runner.lock_manager.acquire_main_integration(
+                task_id="T-2",
+                run_id="run-holder",
+                metadata={"pid": os.getpid()},
+            )
+            original_wait = runner.lock_manager.acquire_main_integration_with_wait
+            integration_lock_attempts = 0
+
+            def release_after_timeout(**kwargs):
+                nonlocal integration_lock_attempts
+                integration_lock_attempts += 1
+                if integration_lock_attempts == 1:
+                    kwargs["timeout_seconds"] = 0
+                    lock_result = original_wait(**kwargs)
+                    runner.lock_manager.release(holder)
+                    return lock_result
+                return original_wait(**kwargs)
+
+            with patch.object(
+                runner.lock_manager,
+                "acquire_main_integration_with_wait",
+                side_effect=release_after_timeout,
+            ):
+                result = self._run_task(runner, task, implementing_worker)
             records = runner.run_store.read_records()
             record_types = [record.get("record_type") for record in records]
             candidate_text = (runner.config.repo / "candidate.txt").read_text(
@@ -8948,6 +8975,26 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertEqual(candidate_text, "candidate\n")
         self.assertEqual(task_recovery_records, [])
         self.assertEqual(len(provenance_records), 1)
+        self.assertEqual(worker_calls, 1)
+        self.assertEqual(integration_lock_attempts, 2)
+        self.assertEqual(
+            sum(record.get("record_type") == "review_started" for record in records),
+            1,
+        )
+        timeout_record = next(
+            record
+            for record in records
+            if record.get("record_type") == "integration_result"
+            and record.get("reason") == "lock_timeout"
+        )
+        self.assertEqual(
+            timeout_record["diagnostics"]["holder_task_id"],
+            "T-2",
+        )
+        self.assertEqual(
+            timeout_record["diagnostics"]["holder_run_id"],
+            "run-holder",
+        )
         self.assertEqual(provenance_records[0]["mode"], "adapter")
         self.assertEqual(provenance_records[0]["confirmed_status"], "done")
         for required in (

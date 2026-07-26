@@ -3693,6 +3693,13 @@ class VibeRunner:
             run_id=run_id,
             task_id=task.task_id,
             log_dir=self.runs_dir / f"{run_id}-integration",
+            timeout_seconds=float(
+                integration.get(
+                    "lock_timeout_seconds",
+                    self.config.orchestration.integration_lock_timeout_seconds,
+                )
+            ),
+            retry_lock_timeouts=True,
             stage_machine=stage_machine,
         ).run()
         if not integration_result.completed:

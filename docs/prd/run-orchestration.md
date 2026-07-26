@@ -240,6 +240,14 @@ the fenced lock release. On an activation-capable task source the contract must
 include a settlement path; contract validation fails closed before any mutation
 when `task_source.reset` is absent.
 
+Integration-lock contention does not consume a second implementation or review
+pass. The runtime records each expired acquisition attempt against the approved
+candidate, including the holder task and run identities, then retries the
+serialized integration window. The wait per attempt is configurable as
+`orchestration.integration_lock_timeout_seconds`; its 900-second default exceeds
+this repository's measured 328-second verify-on-main duration and leaves time
+for refresh, merge, provenance, and routine variance.
+
 A failure before worker launch must not retain its task lock. If activation may
 already have succeeded, pre-launch finalization releases the lock and
 immediately attempts an unfenced `requeue`; the attempt is journaled as
