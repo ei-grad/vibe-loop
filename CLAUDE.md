@@ -20,6 +20,22 @@ architecture decisions, boundaries, and constraints before making design
 choices or adding features. Read `docs/prd/` for component contracts and
 the loopyard `vibe-loop` project for implementation slices.
 
+## One Authority Per Behavior
+
+For any behavior, contract, or interface, exactly one file is authoritative.
+Every other mention is a link, not a paraphrase. When two files describe the
+same thing, name the authoritative file in both and reduce the other account to
+a pointer.
+
+Move, do not copy. A change that adds a section under `docs/` without deleting
+the corresponding account elsewhere must state which file is authoritative.
+An unanswered "both" is a review finding.
+
+For contract and behavior material, `docs/prd/*.md` is authoritative.
+`README.md` is not authoritative for anything it links to. A PRD may be stale:
+when behavior and prose disagree, use the code to determine the correct account
+and correct the PRD rather than bypassing it or adding another account.
+
 ## Repository Task Status Authority
 
 The loopyard `vibe-loop` project is authoritative for implementation task
