@@ -74,7 +74,27 @@ worktree as its working directory. A clean primary worktree remains on the
 configured main branch and byte-for-byte unchanged from worker launch through
 candidate integration. Existing task worktrees may be adopted only after
 ownership, branch, cleanliness, base, and liveness checks; dirty or ambiguous
-existing work is preserved fail-closed, never reset or deleted. Provisioning
+existing work is preserved fail-closed, never reset or deleted. Adoption also
+requires the recorded current main base to be an ancestor of the workspace
+HEAD; an older workspace base appearing in current main history is not
+sufficient. An ordinary adoption whose workspace fails that requirement is
+refreshed automatically, but only when the workspace provably holds nothing to
+lose: no commit reachable only from it, no tracked modification, and a
+fast-forward onto the current base that Git itself accepts. Any condition that
+cannot be proven -- an unreadable Git state, a HEAD that moved under the check,
+a recovery adoption resuming against a recorded workspace state -- falls back to
+deferral. The preflight records a bounded typed decision, retry disposition, and
+-- when a refresh was declined -- the closed-vocabulary reason it was declined,
+before any implementation process starts, so a stale or diverged workspace that
+cannot be refreshed defers until its state changes without consuming a model
+launch, and an operator can tell a preserved workspace from an unreadable one. The durable claim must still match the validated branch, current base,
+`HEAD`, and content-sensitive dirty snapshot; a change between preflight and
+claim fails closed. Deferred recovery persists only a bounded state fingerprint and remains
+suppressed in serial and parallel dispatch until the relevant base, branch,
+`HEAD`, Git identity, or dirty state changes. Suppressed checks do not consume
+restart, recovery, or attempt budget. The same durable state gate applies to a
+normal dispatch rejected before launch, preventing ordinary task selection from
+bypassing the deferral on later supervisor cycles. Provisioning
 failures unwind without leaking task locks or half-created workspaces.
 Parallel jobs receive distinct worktrees and can never claim the primary
 worktree. Recovery reuses a preserved worker-owned workspace for the same task
@@ -96,6 +116,18 @@ command or derived by the runtime from the claimed branch; gate results are
 recorded as typed evidence referencing the gate's configuration key, exit
 class, duration, and log. Gate failure routes to bounded remediation, not to
 silent completion; gate evidence is part of the review request.
+
+The candidate's base is the commit its workspace was provisioned from, which
+for an adopted workspace is legitimately older than `main` at run start. When
+that base is behind the integration branch, the runtime may re-anchor the
+candidate only through a conflict-free rebase whose aggregate binary diff and
+changed paths are unchanged. Every attempt records a typed base-anchor outcome
+and the rewritten candidate receives fresh gate evidence. Re-anchoring is an
+optimization over the merge integration already performs, so a conflict or a
+content divergence refuses and preserves the candidate rather than failing the
+run before review. Repeated base drift past the bound resolved in the run
+contract is the one case that parks the run, because such a run cannot produce
+gate evidence against a settled base at all.
 
 Acceptance must cover gate execution and evidence records, candidate
 declaration and derivation, remediation budget enforcement on gate failure,
@@ -183,10 +215,15 @@ no-commit `branch_already_merged` no-op case. In runtime-owned mode the
 contract must declare a completion path and contract validation fails closed
 before any mutation when none is available: either the runtime performs the
 transition through an explicit `task_source.complete` adapter under the held
-lock, or the contract declares external-confirmed completion and the runtime
-confirms the authoritative done state by probing the task source before
-recording provenance and reporting completed — a probe still showing the task
-in progress parks the run blocked with the integrated candidate preserved.
+lock, or the contract declares external-confirmed completion with an explicit
+operator or external-system transition actor and the runtime confirms the
+authoritative done state through the selected task source's native or
+command-backed probe capability before recording provenance and reporting
+completed — a probe still showing the task in progress parks the run blocked
+with the integrated candidate preserved. A
+runtime-owned contract that names the implementation worker as the transition
+actor is rejected because that worker is forbidden from changing the
+authoritative task source.
 Completion is never silently delegated back to prose. Ordering is invariant
 and recoverable: review verdict before
 integration, integration before provenance, provenance before the completed
@@ -208,12 +245,21 @@ attempted adapter call. A failed or unconfirmed attempt is journaled as
 `task_source_settlement_attempted` and satisfies neither the settlement
 step, the durable-outcome settlement gate, nor fenced lock release: the run
 remains `settlement_pending`, retains the task lock, and retries with
-bounded backoff. After process death, stage-aware fenced recovery must use
-the run's exact private lock identity, confirm the authoritative task
-source non-in-progress, append `task_source_settled`, and only then
-release; generic stale-lock cleanup must not release a settlement-pending
-lock. Leaving a task in-progress after lock release is never a legal
-settlement outcome.
+bounded backoff. On Linux, the task lock records the supervisor PID, kernel
+process-birth identity, and the worker launcher's publication-barrier guarantee.
+The launcher blocks on an inherited pipe before invoking either a direct worker
+or `/bin/sh`; the supervisor opens the barrier only after the worker PID is
+durable in the lock and start journal. Recovery may therefore treat a
+pre-worker run as dead only when that guarantee is present and the exact
+supervisor identity is absent or has been replaced: supervisor death closes the
+pipe before any configured command can execute. Once the barrier opens, only
+the published worker identity is authoritative. Other platforms and legacy
+locks stay identity-ambiguous and fail closed. After process death, stage-aware
+fenced recovery must use the run's exact private lock identity, confirm the
+authoritative task source non-in-progress, append `task_source_settled`, and
+only then release; generic stale-lock cleanup must not release a
+settlement-pending lock without that process-death proof. Leaving a task
+in-progress after lock release is never a legal settlement outcome.
 
 Acceptance must cover the integration window and verification steps, conflict
 and verification-failure transitions, the no-op case, adapter-configured and

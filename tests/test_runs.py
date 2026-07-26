@@ -34,6 +34,7 @@ from vibe_loop.runs import (
     WORKSPACE_CLAIM_RECORD_TYPE,
     WORKSPACE_CLAIMED_EVENT_TYPE,
     WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+    WORKSPACE_PREFLIGHT_RECORD_TYPE,
     WORKER_REPORT_RECORD_TYPE,
     WORKER_REPORT_SCHEMA_VERSION,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
@@ -43,10 +44,22 @@ from vibe_loop.runs import (
     RunStore,
     WorkerReport,
     derive_run_lifecycle,
+    record_status,
 )
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_integration_provenance_status_exposes_outcome(self) -> None:
+        record = RunLifecycleEvent.integration_provenance(
+            run_id="run-1",
+            task_id="TASK-01",
+            outcome="refused-unprovable",
+            candidate_commit="a" * 40,
+            target_commit="b" * 40,
+        ).to_record()
+
+        self.assertEqual(record_status(record), "refused-unprovable")
+
     def test_cross_run_attempt_circuit_opens_and_records_avoided_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = RunStore(Path(directory) / "runs.jsonl")
@@ -752,6 +765,69 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(event["pid_source"], "popen")
         self.assertIn(WORKER_PROCESS_STARTED_RECORD_TYPE, KNOWN_RECORD_TYPES)
 
+    def test_workspace_preflight_event_has_closed_retry_vocabulary(self) -> None:
+        event = RunLifecycleEvent.workspace_preflight(
+            run_id="run-1",
+            task_id="TASK-01",
+            decision="rejected",
+            reason="workspace_stale_current_base",
+            retry_disposition="defer_until_workspace_changes",
+            worker_launch_allowed=False,
+            branch="vibe/TASK-01",
+            worktree=Path("/workspace/TASK-01"),
+            selected_base="a" * 40,
+            workspace_base="b" * 40,
+            head_commit="c" * 40,
+            workspace_state_fingerprint="d" * 64,
+            refresh_refused="unique_commits",
+        ).to_record()
+
+        self.assertEqual(event["record_type"], WORKSPACE_PREFLIGHT_RECORD_TYPE)
+        self.assertEqual(event["decision"], "rejected")
+        self.assertEqual(event["retry_disposition"], "defer_until_workspace_changes")
+        self.assertFalse(event["worker_launch_allowed"])
+        self.assertEqual(event["workspace_state_fingerprint"], "d" * 64)
+        self.assertEqual(event["refresh_refused"], "unique_commits")
+        self.assertIn(WORKSPACE_PREFLIGHT_RECORD_TYPE, KNOWN_RECORD_TYPES)
+        omitted = RunLifecycleEvent.workspace_preflight(
+            run_id="run-1b",
+            task_id="TASK-01",
+            decision="rejected",
+            reason="workspace_stale_current_base",
+            retry_disposition="defer_until_workspace_changes",
+            worker_launch_allowed=False,
+        ).to_record()
+        self.assertNotIn("refresh_refused", omitted)
+        with self.assertRaisesRegex(ValueError, "retry disposition"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-2",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="retry_immediately",
+                worker_launch_allowed=False,
+            )
+        with self.assertRaisesRegex(ValueError, "state fingerprint"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-3",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="defer_until_workspace_changes",
+                worker_launch_allowed=False,
+                workspace_state_fingerprint="not-a-fingerprint",
+            )
+        with self.assertRaisesRegex(ValueError, "refresh refusal"):
+            RunLifecycleEvent.workspace_preflight(
+                run_id="run-4",
+                task_id="TASK-01",
+                decision="rejected",
+                reason="workspace_stale_current_base",
+                retry_disposition="defer_until_workspace_changes",
+                worker_launch_allowed=False,
+                refresh_refused="because_i_said_so",
+            )
+
     def test_post_report_activity_event_records_violation_and_teardown(
         self,
     ) -> None:
@@ -813,6 +889,34 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(records[0]["record_type"], POST_REPORT_ACTIVITY_RECORD_TYPE)
         self.assertIsNone(records[0]["worker_pid"])
         self.assertFalse(records[0]["terminated"])
+
+    def test_post_report_closure_records_bounded_teardown_evidence(self) -> None:
+        event = RunLifecycleEvent.post_report_closure(
+            run_id="run-1",
+            task_id="TASK-01",
+            post_report_seconds=0.4,
+            teardown_seconds=0.03,
+            worker_pid=101,
+            process_group_id=101,
+            process_count=2,
+            identity_verified=True,
+            descendants_verified=True,
+            terminated=True,
+            report_status="completed",
+            teardown_reason="accepted_report_runtime_closure",
+            runtime_lifecycle_decision="continue",
+            runtime_lifecycle_reason=("verified_accepted_report_runtime_closure"),
+        ).to_record()
+
+        self.assertEqual(event["record_type"], "post_report_closure")
+        self.assertEqual(event["policy"], "accepted_report_runtime_closure")
+        self.assertEqual(event["teardown_process_count"], 2)
+        self.assertTrue(event["identity_verified"])
+        self.assertTrue(event["descendants_verified"])
+        self.assertTrue(event["terminated"])
+        encoded = json.dumps(event)
+        self.assertNotIn("prompt", encoded)
+        self.assertNotIn("tool_payload", encoded)
 
     def test_lifecycle_event_rejects_unknown_type(self) -> None:
         with self.assertRaises(ValueError):

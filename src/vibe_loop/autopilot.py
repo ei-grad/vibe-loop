@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import select
 import shutil
@@ -21,6 +22,7 @@ from typing import Any, BinaryIO
 
 from vibe_loop.config import (
     AgentResolutionError,
+    AUTOPILOT_MIN_INTERVAL_SECONDS,
     DISK_RESERVE_DEFAULT_MIN_FREE_BYTES,
     DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION,
     DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION,
@@ -135,6 +137,21 @@ AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
 )
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
 BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
+
+
+def require_autopilot_interval(interval: float) -> float:
+    if (
+        isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(interval)
+        or interval < 0
+        or 0 < interval < AUTOPILOT_MIN_INTERVAL_SECONDS
+    ):
+        raise ValueError(
+            "autopilot interval must be zero for drain mode or at least "
+            f"{AUTOPILOT_MIN_INTERVAL_SECONDS:.0f} seconds"
+        )
+    return float(interval)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1056,6 +1073,14 @@ def project_blockers(
         blockers.append(f"agent_unavailable: {diagnostic}")
     if stale_locks:
         blockers.append("stale_locks_present")
+        blockers.extend(
+            "unrecoverable_stale_lock: "
+            f"task={lock.task_id} process_state={lock.process_state or 'unknown'}; "
+            "no supported command can clear it without proof that its process "
+            "is gone"
+            for lock in stale_locks
+            if not lock.recovery_supported
+        )
     if any(
         diagnostic.get("severity") == "stale" for diagnostic in workspace_diagnostics
     ):
@@ -1357,6 +1382,7 @@ def start_detached_autopilot(
 ) -> DetachedAutopilotLaunch:
     """Start and verify a detached POSIX autopilot supervisor."""
 
+    interval = require_autopilot_interval(interval)
     if os.name != "posix" or not hasattr(os, "setsid"):
         return DetachedAutopilotLaunch(
             repo=config.repo,
@@ -6072,6 +6098,7 @@ def run_autopilot(
     is reported without being stolen. Each cycle is append-recorded; launch is
     blocked, never force-recovered, when preflight diagnostics are unsafe.
     """
+    interval = require_autopilot_interval(interval)
     min_ready = require_positive_min_ready(min_ready)
 
     supervisor_run_id = new_run_id("autopilot")
@@ -6632,6 +6659,21 @@ class AggregateProjectStatus:
         return redacted
 
 
+def load_registry_entry_config(entry: ProjectEntry) -> VibeConfig:
+    """Load the config for a target the command enumerated from the registry.
+
+    The entry named this target and supplies its own selector context, so the
+    caller's ambient environment is not a competing claim about it. Every
+    registry-driven read must go through here, because the binding is
+    re-resolved from the config by each downstream gate.
+    """
+
+    return dataclasses.replace(
+        load_config(entry.repo, runtime_context=dict(entry.runtime_context)),
+        ambient_selects_target=False,
+    )
+
+
 def collect_registry_status(
     registry: ProjectRegistry,
     *,
@@ -6640,10 +6682,7 @@ def collect_registry_status(
     results: list[AggregateProjectStatus] = []
     for entry in registry.entries:
         try:
-            config = load_config(
-                entry.repo,
-                runtime_context=dict(entry.runtime_context),
-            )
+            config = load_registry_entry_config(entry)
             status = collect_project_status(config, process_exists=process_exists)
             results.append(
                 AggregateProjectStatus(

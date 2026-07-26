@@ -11,11 +11,14 @@ from vibe_loop.retry import (
     DEFAULT_JITTER,
     DEFAULT_MAX_DELAY,
     LIMIT_WALL_DEFAULT_BACKOFF_SECONDS,
+    LIMIT_WALL_TAIL_WINDOW_CHARS,
     QUOTA_RESET_MARGIN_SECONDS,
     QUOTA_RESET_MAX_DELAY_SECONDS,
     LimitWallSignal,
     backoff_delay,
+    classify_limit_wall_result,
     detect_limit_wall,
+    detect_provider_limit_wall,
     is_transient_oserror,
     is_transient_stderr,
     is_transient_subprocess_result,
@@ -32,6 +35,28 @@ OBSERVED_USAGE_WALL = (
     "You've hit your usage limit. Your limit will reset and you can "
     "try again at Jul 25th, 2026 3:24 AM."
 )
+
+# Verbatim from run
+# 20260725T192937Z-autopilot-config-contract-blocked-cycle-resilience-58298d25-remediation-1:
+# the classifier test cases an agent was authoring, which the detector matched
+# twice and paused the loop 1800s for. The run exited 0; no provider refused
+# anything.
+AGENT_AUTHORED_FIXTURE_SOURCE = (
+    '        ("Error 429: Too Many Requests. usage limit exceeded, '
+    'retry after 30s", True),\n'
+    '        ("503: weekly limit reached, service temporarily unavailable", True),\n'
+)
+
+# The envelopes the providers actually emit when they refuse further work,
+# matching tests/fixtures/provider_usage/*-limit-wall.json. The phrase alone is
+# what over-matches, so a wall must stay detectable in its real shape.
+CLAUDE_WALL_ENVELOPE = (
+    '{"type":"result","subtype":"error_max_turns","is_error":true,'
+    '"result":"usage limit reached","usage":{"input_tokens":10,'
+    '"output_tokens":2,"cache_read_input_tokens":0,'
+    '"cache_creation_input_tokens":0}}'
+)
+CODEX_WALL_ENVELOPE = '{"type":"turn.failed","error":{"message":"usage limit reached"}}'
 
 
 class QuotaResetDelayTests(unittest.TestCase):
@@ -218,6 +243,118 @@ class LimitWallDetectionTests(unittest.TestCase):
         now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=UTC)
         delay = parse_limit_wall_reset_delay("reset at 11:59pm", now=now)
         self.assertEqual(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
+
+
+class ProviderLimitWallGateTests(unittest.TestCase):
+    """detect_provider_limit_wall separates provider refusals from agent text."""
+
+    def test_agent_authored_fixtures_in_a_successful_run_are_not_a_wall(self) -> None:
+        # The observed false positive: a worker authoring classifier test cases
+        # printed both phrases and exited 0. The bare phrase matcher fires on it.
+        self.assertIsNotNone(detect_limit_wall(AGENT_AUTHORED_FIXTURE_SOURCE))
+        self.assertIsNone(
+            detect_provider_limit_wall(AGENT_AUTHORED_FIXTURE_SOURCE, exit_code=0)
+        )
+
+    def test_agent_authored_fixtures_are_not_a_wall_even_when_the_run_fails(
+        self,
+    ) -> None:
+        # A run can fail for its own reasons (a gate, a crash) long after it
+        # quoted the phrases. The refusal would be at the end; this is not.
+        transcript = (
+            AGENT_AUTHORED_FIXTURE_SOURCE
+            + "x" * (LIMIT_WALL_TAIL_WINDOW_CHARS + 1)
+            + "\nFAILED tests/test_retry.py::test_classifier\n"
+        )
+        self.assertIsNone(detect_provider_limit_wall(transcript, exit_code=1))
+
+    def test_real_provider_envelope_on_a_failed_run_is_a_wall(self) -> None:
+        for name, envelope in (
+            ("claude", CLAUDE_WALL_ENVELOPE),
+            ("codex", CODEX_WALL_ENVELOPE),
+        ):
+            with self.subTest(provider=name):
+                signal = detect_provider_limit_wall(envelope, exit_code=1)
+                self.assertIsNotNone(signal)
+                assert signal is not None
+                self.assertEqual(signal.marker.lower(), "usage limit reached")
+
+    def test_wall_survives_a_long_transcript_that_precedes_it(self) -> None:
+        # The real shape: the reviewer worked for a while (quoting fixtures on a
+        # limit-wall slice), then the provider refused and the run stopped.
+        transcript = (
+            AGENT_AUTHORED_FIXTURE_SOURCE
+            + "reading src/vibe_loop/retry.py\n" * 500
+            + CLAUDE_WALL_ENVELOPE
+        )
+        signal = detect_provider_limit_wall(transcript, exit_code=1)
+        self.assertIsNotNone(signal)
+        assert signal is not None
+        self.assertEqual(signal.marker.lower(), "usage limit reached")
+
+    def test_evidence_names_both_qualifying_conditions(self) -> None:
+        # An operator reading a recorded pause must be able to tell a detected
+        # wall from the phrase appearing in a transcript: the signal carries the
+        # exit status and how much of the output was in scope.
+        signal = detect_provider_limit_wall(CLAUDE_WALL_ENVELOPE, exit_code=1)
+        assert signal is not None
+        self.assertEqual(
+            signal.evidence, f"exit=1; scanned all {len(CLAUDE_WALL_ENVELOPE)} chars"
+        )
+        long_transcript = "n" * (LIMIT_WALL_TAIL_WINDOW_CHARS * 2) + OBSERVED_USAGE_WALL
+        windowed = detect_provider_limit_wall(long_transcript, exit_code=2)
+        assert windowed is not None
+        self.assertEqual(
+            windowed.evidence,
+            f"exit=2; scanned last {LIMIT_WALL_TAIL_WINDOW_CHARS} "
+            f"of {len(long_transcript)} chars",
+        )
+
+    def test_bare_phrase_matcher_keeps_no_evidence(self) -> None:
+        signal = detect_limit_wall(OBSERVED_USAGE_WALL)
+        assert signal is not None
+        self.assertEqual(signal.evidence, "")
+
+    def test_advertised_reset_survives_the_gate(self) -> None:
+        now = datetime.datetime(2026, 7, 20, 10, 19, tzinfo=UTC)
+        signal = detect_provider_limit_wall(OBSERVED_USAGE_WALL, exit_code=1, now=now)
+        assert signal is not None
+        self.assertIn("Jul 25th", signal.reset_text)
+        self.assertIsNotNone(signal.reset_delay)
+
+    def test_classify_result_gate_matches_the_detector(self) -> None:
+        authored = subprocess.CompletedProcess(
+            "agent", 0, stdout=AGENT_AUTHORED_FIXTURE_SOURCE, stderr=""
+        )
+        self.assertEqual(classify_limit_wall_result(authored), (None, False))
+        # A live reset keeps the wall terminal; an elapsed one would fall through
+        # to the pre-existing transient-collision branch instead.
+        now = datetime.datetime(2026, 7, 20, 10, 19, tzinfo=UTC)
+        refused = subprocess.CompletedProcess(
+            "agent", 1, stdout="", stderr=OBSERVED_USAGE_WALL
+        )
+        wall, retry_as_transient = classify_limit_wall_result(refused, now=now)
+        self.assertIsNotNone(wall)
+        self.assertFalse(retry_as_transient)
+
+    def test_successful_run_quoting_fixtures_never_reaches_on_limit_wall(self) -> None:
+        # End to end through the retry driver: the callback the supervisor uses
+        # to pause dispatch must not fire for a worker that merely wrote the
+        # phrases and finished.
+        walls: list[LimitWallSignal] = []
+        completed = subprocess.CompletedProcess(
+            "agent", 0, stdout=AGENT_AUTHORED_FIXTURE_SOURCE, stderr=""
+        )
+        with patch("subprocess.run", return_value=completed):
+            result = retry_subprocess_run(
+                "agent",
+                max_retries=1,
+                sleep=lambda _: None,
+                detect_limit_walls=True,
+                on_limit_wall=walls.append,
+            )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(walls, [])
 
 
 class LimitWallBackoffTests(unittest.TestCase):

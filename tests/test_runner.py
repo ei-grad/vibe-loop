@@ -40,13 +40,19 @@ from vibe_loop.locks import (
     LockManager,
     LockOwnerMismatch,
     SettledOutcomeNotPersisted,
+    TaskLock,
 )
-from vibe_loop.processes import read_process_node
+from vibe_loop.processes import ProcessNode, read_process_node
 from vibe_loop.orchestration import (
     CandidateRecord,
+    CandidateReanchorRetryExhausted,
+    GateResult,
+    GateRunSummary,
     IntegrationResult,
     ProvisionedWorkspace,
+    ReviewConcurrencyBudget,
     ReviewOutputMalformed,
+    ReviewRouter,
     RunLifecycleStateMachine,
     RunStage,
     TaskSourceCompletionError,
@@ -77,6 +83,8 @@ from vibe_loop.runner import (
     command_supports_session_resume,
     deterministic_task_batch,
     format_agent_command,
+    implementer_session_from_records,
+    reviewer_session_from_records,
     build_resume_continuation_prompt,
     classify_post_report_activity,
     classify_post_report_event,
@@ -99,6 +107,7 @@ from vibe_loop.runner import (
     resolve_codex_home,
     resolve_codex_rollout,
     run_streaming_command,
+    terminate_verified_worker_process_group,
     terminate_worker_process_group,
     validate_analysis_prompt_delivery,
     validate_selected_task_batch,
@@ -117,7 +126,7 @@ from vibe_loop.runs import (
     settled_run_outcome,
 )
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
-from vibe_loop.tasks import Task
+from vibe_loop.tasks import Task, run_json_command
 from vibe_loop.workers import (
     ActiveRunState,
     StaleLock,
@@ -2965,6 +2974,86 @@ class RunnerTests(unittest.TestCase):
         self.assertGreater(started_pids[0], 0)
 
     @unittest.skipUnless(
+        sys.platform == "linux", "launch publication barrier requires Linux"
+    )
+    def test_streaming_command_waits_for_pid_publication_before_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker_path = root / "worker-ran"
+            script = root / "cmd.py"
+            script.write_text(
+                "from pathlib import Path\n"
+                f"Path({str(marker_path)!r}).write_text('ran', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            log_path = root / "run.log"
+
+            def publish_pid(worker_pid: int) -> None:
+                self.assertGreater(worker_pid, 0)
+                self.assertFalse(marker_path.exists())
+                time.sleep(0.2)
+                self.assertFalse(marker_path.exists())
+
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    root,
+                    log,
+                    on_start=publish_pid,
+                )
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertTrue(marker_path.exists())
+
+    @unittest.skipUnless(
+        sys.platform == "linux", "launch publication barrier requires Linux"
+    )
+    def test_worker_guard_blocks_shell_until_pid_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            child_pid_path = root / "child.pid"
+            marker_path = root / "worker-ran"
+            worker_code = (
+                "import time\n"
+                "from pathlib import Path\n"
+                "time.sleep(0.5)\n"
+                f"Path({str(marker_path)!r}).write_text('ran', encoding='utf-8')\n"
+            )
+            parent_code = (
+                "import os\n"
+                "import subprocess\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"worker_code = {worker_code!r}\n"
+                "gate_read, gate_write = os.pipe()\n"
+                "child = subprocess.Popen([\n"
+                "    sys.executable, '-m', 'vibe_loop.worker_guard',\n"
+                "    str(os.getpid()), str(gate_read), 'shell', '--',\n"
+                "    f'{sys.executable} -c {repr(worker_code)}',\n"
+                "], pass_fds=(gate_read,))\n"
+                "os.close(gate_read)\n"
+                f"Path({str(child_pid_path)!r}).write_text("
+                "str(child.pid), encoding='utf-8')\n"
+            )
+
+            subprocess.run(
+                [sys.executable, "-c", parent_code],
+                cwd=root,
+                check=True,
+            )
+            child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                node = read_process_node(child_pid)
+                if node is None or node.state == "Z":
+                    break
+                time.sleep(0.01)
+
+            self.assertFalse(marker_path.exists())
+            node = read_process_node(child_pid)
+            self.assertTrue(node is None or node.state == "Z", node)
+
+    @unittest.skipUnless(
         hasattr(os, "killpg"), "detached process groups are POSIX-only"
     )
     def test_streaming_command_reaps_group_when_start_recording_fails(self) -> None:
@@ -2997,11 +3086,8 @@ class RunnerTests(unittest.TestCase):
 
             def fail_to_record(worker_pid: int) -> None:
                 started_pids.append(worker_pid)
-                deadline = time.monotonic() + 2.0
-                while not child_ready_path.is_file() and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                self.assertTrue(child_path.is_file())
-                self.assertTrue(child_ready_path.is_file())
+                self.assertFalse(child_path.is_file())
+                self.assertFalse(child_ready_path.is_file())
                 raise OSError("worker identity record store unavailable")
 
             try:
@@ -3013,8 +3099,7 @@ class RunnerTests(unittest.TestCase):
                             log,
                             on_start=fail_to_record,
                         )
-                child_pid = int(child_path.read_text(encoding="utf-8"))
-                process_pids = (*started_pids, child_pid)
+                process_pids = tuple(started_pids)
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
                     if all(read_process_node(pid) is None for pid in process_pids):
@@ -3024,6 +3109,8 @@ class RunnerTests(unittest.TestCase):
                     all(read_process_node(pid) is None for pid in process_pids),
                     process_pids,
                 )
+                self.assertFalse(child_path.exists())
+                self.assertFalse(child_ready_path.exists())
             finally:
                 if started_pids:
                     try:
@@ -3289,6 +3376,288 @@ class LimitWallLoopTests(unittest.TestCase):
 
 
 class TransientWorkerFailureTests(unittest.TestCase):
+    def test_normal_workspace_deferral_waits_across_cycles_for_state_change(
+        self,
+    ) -> None:
+        for mode in ("serial", "parallel"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory) / "repo"
+                repo.mkdir()
+                subprocess.run(
+                    ["git", "init", "-b", "main"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "test@example.com"],
+                    cwd=repo,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Test"],
+                    cwd=repo,
+                    check=True,
+                )
+                (repo / "README.md").write_text("base\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "base"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                base = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                runner = VibeRunner(
+                    VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                )
+                source = MutableTaskSource(
+                    [Task(task_id="TASK-01", title="Task", status="Next", order=1)]
+                )
+                runner._source = source
+                dispatch_calls = 0
+
+                def reject_dispatch(task: Task, restart_count: int = 0) -> RunResult:
+                    nonlocal dispatch_calls
+                    dispatch_calls += 1
+                    fingerprint = runner_module.workspace_state_fingerprint(
+                        repo=repo,
+                        main_branch="main",
+                        branch="main",
+                        worktree=repo,
+                        expected_base=base,
+                    )
+                    runner.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.workspace_preflight(
+                            run_id="run-1",
+                            task_id=task.task_id,
+                            decision="rejected",
+                            reason="workspace_stale_current_base",
+                            retry_disposition="defer_until_workspace_changes",
+                            worker_launch_allowed=False,
+                            branch="main",
+                            worktree=repo,
+                            selected_base=base,
+                            workspace_state_fingerprint=fingerprint,
+                        )
+                    )
+                    raise WorkspaceProvisionError(
+                        "workspace_stale_current_base",
+                        "workspace does not contain current base",
+                    )
+
+                runner.run_task_with_supervision = reject_dispatch
+
+                def run_cycle() -> list[RunResult]:
+                    if mode == "serial":
+                        return runner.run_until_done_serial(max_slices=1)
+                    return runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    )
+
+                with patch.object(runner, "ensure_spec_execution_gate"):
+                    self.assertEqual(run_cycle(), [])
+                    records_after_rejection = runner.run_store.read_records()
+                    budget_records_after_rejection = [
+                        record
+                        for record in records_after_rejection
+                        if record.get("record_type")
+                        in {
+                            "attempt_circuit_attempt",
+                            "task_recovery",
+                            "task_restart",
+                            "worker_process_started",
+                        }
+                    ]
+                    self.assertEqual(run_cycle(), [])
+                    self.assertEqual(run_cycle(), [])
+
+                    self.assertEqual(dispatch_calls, 1)
+                    self.assertEqual(
+                        [
+                            record
+                            for record in runner.run_store.read_records()
+                            if record.get("record_type")
+                            in {
+                                "attempt_circuit_attempt",
+                                "task_recovery",
+                                "task_restart",
+                                "worker_process_started",
+                            }
+                        ],
+                        budget_records_after_rejection,
+                    )
+
+                    (repo / "changed.txt").write_text("wake\n", encoding="utf-8")
+
+                    def complete_dispatch(
+                        task: Task,
+                        restart_count: int = 0,
+                    ) -> RunResult:
+                        nonlocal dispatch_calls
+                        dispatch_calls += 1
+                        source.mark_done(task.task_id)
+                        return RunResult(
+                            run_id="run-2",
+                            task_id=task.task_id,
+                            classification="completed",
+                            exit_code=0,
+                            log_path=repo / "run-2.log",
+                            start_main=base,
+                            end_main=base,
+                        )
+
+                    runner.run_task_with_supervision = complete_dispatch
+                    changed = run_cycle()
+
+                self.assertEqual(
+                    [result.classification for result in changed], ["completed"]
+                )
+                self.assertEqual(dispatch_calls, 2)
+
+    def test_deferred_workspace_recovery_waits_for_state_change(self) -> None:
+        for mode in ("serial", "parallel"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory) / "repo"
+                repo.mkdir()
+                subprocess.run(
+                    ["git", "init", "-b", "main"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.email", "test@example.com"],
+                    cwd=repo,
+                    check=True,
+                )
+                subprocess.run(
+                    ["git", "config", "user.name", "Test"],
+                    cwd=repo,
+                    check=True,
+                )
+                (repo / "README.md").write_text("base\n", encoding="utf-8")
+                subprocess.run(["git", "add", "."], cwd=repo, check=True)
+                subprocess.run(
+                    ["git", "commit", "-m", "base"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+                base = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                dirty, dirty_fingerprint = runner_module.git_dirty_snapshot(repo)
+                recovery = RecoveryContext(
+                    task_id="TASK-01",
+                    prior_run_id="run-1",
+                    prior_classification="unknown",
+                    branch="main",
+                    worktree=str(repo),
+                    head_commit=base,
+                    transcript_path="",
+                    wrapper_log="",
+                    attempt=1,
+                    max_attempts=3,
+                    workspace_claimed=True,
+                    base_commit=base,
+                    git_common_dir=str((repo / ".git").resolve()),
+                    dirty_snapshot=tuple(dirty),
+                    dirty_fingerprint=dirty_fingerprint,
+                )
+                runner = VibeRunner(
+                    VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+                )
+                source = MutableTaskSource(
+                    [Task(task_id="TASK-01", title="Task", status="Next", order=1)]
+                )
+                runner._source = source
+                fingerprint = runner_module.workspace_retry_state_fingerprint(
+                    repo=repo,
+                    main_branch="main",
+                    recovery=recovery,
+                )
+                runner.record_recovery_phase(
+                    recovery,
+                    phase="deferred",
+                    blocker="workspace_stale_current_base",
+                    retry_disposition="defer_until_workspace_changes",
+                    workspace_state_fingerprint=fingerprint,
+                )
+                launches: list[RecoveryContext] = []
+
+                def complete_after_wake(
+                    task: Task,
+                    *,
+                    recovery: RecoveryContext | None = None,
+                ) -> RunResult:
+                    assert recovery is not None
+                    launches.append(recovery)
+                    source.mark_done(task.task_id)
+                    return RunResult(
+                        run_id="run-2",
+                        task_id=task.task_id,
+                        classification="completed",
+                        exit_code=0,
+                        log_path=repo / "run-2.log",
+                        start_main=base,
+                        end_main=base,
+                    )
+
+                runner.run_task = complete_after_wake
+                if mode == "serial":
+                    unchanged = runner.run_until_done_serial(max_slices=1)
+                else:
+                    unchanged = runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    )
+
+                self.assertEqual(unchanged, [])
+                self.assertEqual(launches, [])
+                records = runner.run_store.read_records()
+                self.assertFalse(
+                    any(
+                        record.get("record_type") == "task_restart"
+                        for record in records
+                    )
+                )
+                deferred = runner.run_store.pending_recovery_records()[0]
+                self.assertEqual(deferred["attempt"], 1)
+                self.assertEqual(deferred["workspace_state_fingerprint"], fingerprint)
+
+                (repo / "changed.txt").write_text("wake\n", encoding="utf-8")
+                if mode == "serial":
+                    changed = runner.run_until_done_serial(max_slices=1)
+                else:
+                    changed = runner.run_until_done_parallel(
+                        ask_agent=False,
+                        max_slices=1,
+                        continue_on_failure=False,
+                        jobs=2,
+                    )
+
+                self.assertEqual(
+                    [result.classification for result in changed], ["completed"]
+                )
+                self.assertEqual(len(launches), 1)
+                self.assertEqual(launches[0].attempt, 1)
+
     def test_is_transient_worker_failure_detects_quota_in_log(self) -> None:
         from vibe_loop.runner import is_transient_worker_failure
 
@@ -4058,6 +4427,13 @@ class TransientWorkerFailureTests(unittest.TestCase):
             )
             records_after_block = first.run_store.read_records()
             self.assertEqual(len(first.run_store.pending_recovery_records()), 1)
+            deferred = [
+                record
+                for record in records_after_block
+                if record.get("record_type") == "task_recovery"
+                and record.get("phase") == "deferred"
+            ]
+            self.assertEqual(deferred[0]["retry_disposition"], "retry_later")
             self.assertFalse(
                 any(
                     record.get("record_type") == "task_restart"
@@ -5057,6 +5433,238 @@ class WaitWithReapWatchdogTests(unittest.TestCase):
     @unittest.skipUnless(
         hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
     )
+    def test_accepted_report_teardown_refuses_descendant_outside_worker_group(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        escaped = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=proc.pid,
+            process_group_id=proc.pid + 1,
+            session_id=proc.pid + 1,
+            process_birth_id="boot:child",
+        )
+        nodes = {root.pid: root, escaped.pid: escaped}
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = terminate_verified_worker_process_group(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                process_table=lambda: nodes,
+                process_node=nodes.get,
+            )
+
+        self.assertFalse(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertFalse(result.descendants_verified)
+        self.assertEqual(result.reason, "descendant_outside_worker_process_group")
+        self.assertEqual(killed, [])
+
+    def test_accepted_report_teardown_owns_reparented_same_group_child(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000)
+        root = ProcessNode(
+            pid=proc.pid,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:root",
+        )
+        orphan = ProcessNode(
+            pid=proc.pid + 1,
+            parent_pid=1,
+            process_group_id=proc.pid,
+            session_id=proc.pid,
+            process_birth_id="boot:orphan",
+        )
+        nodes = {root.pid: root, orphan.pid: orphan}
+
+        def terminated_group(*args, **kwargs) -> None:
+            nodes.clear()
+
+        with patch.object(
+            runner_module,
+            "terminate_worker_process_group",
+            side_effect=terminated_group,
+        ):
+            result = terminate_verified_worker_process_group(
+                proc,
+                StringIO(),
+                expected_birth_id=root.process_birth_id,
+                process_table=lambda: nodes.copy(),
+                process_node=nodes.get,
+            )
+
+        self.assertTrue(result.terminated)
+        self.assertTrue(result.identity_verified)
+        self.assertTrue(result.descendants_verified)
+        self.assertEqual(result.reason, "accepted_report_runtime_closure")
+        self.assertEqual(result.process_count, 2)
+
+    def test_accepted_completed_candidate_uses_immediate_closure_path(self):
+        proc = FakeWatchdogProcess(alive_polls=10_000, returncode=-signal.SIGTERM)
+        monitor = FakePostReportMonitor(violates=False)
+        teardown_calls = 0
+
+        def teardown() -> runner_module.VerifiedWorkerTeardown:
+            nonlocal teardown_calls
+            teardown_calls += 1
+            return runner_module.VerifiedWorkerTeardown(
+                True,
+                True,
+                True,
+                "accepted_report_runtime_closure",
+                2,
+            )
+
+        result = wait_with_reap_watchdog(
+            proc,
+            StringIO(),
+            reap_check=lambda: True,
+            grace_seconds=120.0,
+            poll_seconds=0.001,
+            post_report_monitor=monitor,
+            post_report_closure_check=lambda: "accepted_completed_candidate",
+            post_report_teardown=teardown,
+        )
+
+        self.assertEqual(teardown_calls, 1)
+        self.assertTrue(result.post_report_enforced)
+        self.assertFalse(result.timed_out)
+        self.assertEqual(
+            result.post_report_teardown_reason,
+            "accepted_report_runtime_closure",
+        )
+        self.assertTrue(result.post_report_identity_verified)
+        self.assertTrue(result.post_report_descendants_verified)
+        self.assertEqual(result.post_report_teardown_process_count, 2)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_activity_enforcement_preserves_failed_closure_evidence(self):
+        proc = FakeWatchdogProcess(
+            alive_polls=10_000,
+            returncode=-signal.SIGTERM,
+        )
+        monitor = FakePostReportMonitor(violates=True)
+        failed = runner_module.VerifiedWorkerTeardown(
+            False,
+            True,
+            False,
+            "process_group_contains_unowned_member",
+            3,
+        )
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                post_report_monitor=monitor,
+                identity_verified_ok=lambda: True,
+                post_report_activity_grace_seconds=0.0,
+                post_report_closure_check=lambda: "accepted_completed_candidate",
+                post_report_teardown=lambda: failed,
+            )
+
+        self.assertTrue(result.post_report_enforced)
+        self.assertEqual(
+            result.post_report_teardown_reason,
+            "process_group_contains_unowned_member",
+        )
+        self.assertTrue(result.post_report_identity_verified)
+        self.assertFalse(result.post_report_descendants_verified)
+        self.assertEqual(result.post_report_teardown_process_count, 3)
+        self.assertTrue(killed)
+        activity = runner_module.PostReportActivity(
+            reported=True,
+            seconds=0.1,
+            activity_kind="tool_call",
+            activity_count=1,
+            enforced_stop=result.post_report_enforced,
+            identity_verified=result.post_report_identity_verified,
+            usage=runner_module.unavailable_usage("anthropic", "test_fixture"),
+            teardown_reason=result.post_report_teardown_reason,
+            descendants_verified=result.post_report_descendants_verified,
+            teardown_process_count=result.post_report_teardown_process_count,
+        )
+        completed = WorkerReport(
+            run_id="run-1",
+            task_id="T-1",
+            status="completed",
+        )
+        self.assertEqual(
+            runner_module.post_report_runtime_lifecycle_decision(
+                runtime_owned=True,
+                exit_code=result.exit_code,
+                timed_out=False,
+                worker_report=completed,
+                activity=activity,
+            ),
+            ("refuse", "process_group_contains_unowned_member"),
+        )
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
+    def test_timeout_preserves_failed_closure_evidence(self):
+        proc = FakeWatchdogProcess(
+            alive_polls=10_000,
+            returncode=-signal.SIGKILL,
+        )
+        monitor = FakePostReportMonitor(violates=False)
+        failed = runner_module.VerifiedWorkerTeardown(
+            False,
+            True,
+            False,
+            "process_group_contains_unowned_member",
+            3,
+        )
+        clock = FakeMonotonicClock(([0.0] * 7) + [2.0])
+        killed: list[tuple[int, int]] = []
+        with patch.object(
+            runner_module.os, "killpg", lambda pid, sig: killed.append((pid, sig))
+        ):
+            result = wait_with_reap_watchdog(
+                proc,
+                StringIO(),
+                reap_check=lambda: True,
+                grace_seconds=120.0,
+                poll_seconds=0.001,
+                timeout_seconds=1.0,
+                monotonic=clock,
+                post_report_monitor=monitor,
+                identity_verified_ok=lambda: True,
+                post_report_closure_check=lambda: "accepted_completed_candidate",
+                post_report_teardown=lambda: failed,
+            )
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.post_report_enforced)
+        self.assertEqual(
+            result.post_report_teardown_reason,
+            "process_group_contains_unowned_member",
+        )
+        self.assertTrue(result.post_report_identity_verified)
+        self.assertFalse(result.post_report_descendants_verified)
+        self.assertEqual(result.post_report_teardown_process_count, 3)
+        self.assertTrue(killed)
+
+    @unittest.skipUnless(
+        hasattr(os, "killpg"), "patches os.killpg; POSIX process groups only"
+    )
     def test_wall_clock_timeout_kills_process_group_and_flags_timed_out(self):
         # A worker that never becomes reap-eligible but overruns the wall-clock
         # deadline must be force-killed via its process GROUP (it is launched
@@ -5926,6 +6534,146 @@ class RunStreamingPostReportTests(unittest.TestCase):
         # dispatch can overlap an unfinalized process.
         self.assertTrue(pids)
         self.assertIsNone(read_process_node(pids[0]))
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and hasattr(os, "killpg"),
+        "verified process-tree teardown requires Linux",
+    )
+    def test_accepted_report_immediately_drains_lingering_process_tree(self):
+        sentinel = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        sentinel_node = read_process_node(sentinel.pid)
+        self.assertIsNotNone(sentinel_node)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                child_pid_path = root / "child.pid"
+                orphan_ready_path = root / "orphan.ready"
+                report_path = root / "reported"
+                spawner = root / "spawn_child.py"
+                spawner.write_text(
+                    "import pathlib, subprocess, sys\n"
+                    "child = subprocess.Popen([sys.executable, '-c', "
+                    '"import os, pathlib, time; '
+                    "deadline = time.monotonic() + 10; "
+                    "\\nwhile os.getppid() != 1 and time.monotonic() < deadline: "
+                    "time.sleep(0.01); "
+                    "\\npathlib.Path('orphan.ready').write_text('ready'); "
+                    'time.sleep(60)"])\n'
+                    "pathlib.Path('child.pid').write_text(str(child.pid))\n",
+                    encoding="utf-8",
+                )
+                script = root / "cmd.py"
+                script.write_text(
+                    "import pathlib, subprocess, sys, time\n"
+                    "intermediate = subprocess.Popen("
+                    "[sys.executable, 'spawn_child.py'])\n"
+                    "intermediate.wait()\n"
+                    "deadline = time.monotonic() + 10\n"
+                    "while not pathlib.Path('orphan.ready').exists():\n"
+                    "    if time.monotonic() >= deadline:\n"
+                    "        raise RuntimeError('child was not reparented')\n"
+                    "    time.sleep(0.01)\n"
+                    "pathlib.Path('reported').write_text('completed')\n"
+                    "time.sleep(60)\n",
+                    encoding="utf-8",
+                )
+                log_path = root / "run.log"
+                started = time.monotonic()
+                with log_path.open("w", encoding="utf-8") as log:
+                    result = run_streaming_command(
+                        f"{sys.executable} cmd.py",
+                        root,
+                        log,
+                        reap_check=report_path.exists,
+                        reap_grace_seconds=120.0,
+                        reap_poll_seconds=0.02,
+                        post_report_closure_check=(
+                            lambda: "accepted_completed_candidate"
+                        ),
+                        provider="anthropic",
+                    )
+                elapsed = time.monotonic() - started
+                child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                self.assertTrue(orphan_ready_path.exists())
+
+                self.assertLess(elapsed, 5.0)
+                self.assertNotEqual(result.exit_code, 0)
+                self.assertFalse(result.timed_out)
+                self.assertIsNotNone(result.post_report)
+                self.assertTrue(result.post_report.enforced_stop)
+                self.assertTrue(result.post_report.identity_verified)
+                self.assertTrue(result.post_report.descendants_verified)
+                self.assertEqual(
+                    result.post_report.teardown_reason,
+                    "accepted_report_runtime_closure",
+                )
+                self.assertGreaterEqual(result.post_report.teardown_process_count, 2)
+                child = read_process_node(child_pid)
+                self.assertTrue(
+                    child is None or child.state in {"Z", "X", "x"},
+                    "lingering worker child survived verified teardown",
+                )
+                surviving_sentinel = read_process_node(sentinel.pid)
+                self.assertIsNotNone(surviving_sentinel)
+                self.assertEqual(
+                    surviving_sentinel.process_birth_id,
+                    sentinel_node.process_birth_id,
+                )
+        finally:
+            current = read_process_node(sentinel.pid)
+            if (
+                current is not None
+                and current.process_birth_id == sentinel_node.process_birth_id
+            ):
+                sentinel.terminate()
+            try:
+                sentinel.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                current = read_process_node(sentinel.pid)
+                if (
+                    current is not None
+                    and current.process_birth_id == sentinel_node.process_birth_id
+                ):
+                    sentinel.kill()
+                sentinel.wait(timeout=5)
+
+    def test_unavailable_birth_identity_keeps_clean_exit_fallback(self):
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                closure_checks = 0
+
+                def accepted_closure() -> str:
+                    nonlocal closure_checks
+                    closure_checks += 1
+                    return "accepted_completed_candidate"
+
+                with (
+                    patch.object(runner_module.sys, "platform", platform),
+                    patch.object(
+                        runner_module,
+                        "read_process_node",
+                        return_value=None,
+                    ),
+                ):
+                    result = self._run(
+                        "import time\ntime.sleep(0.05)\n",
+                        reap_check=lambda: True,
+                        reap_grace_seconds=60.0,
+                        reap_poll_seconds=0.01,
+                        post_report_closure_check=accepted_closure,
+                        provider="anthropic",
+                    )
+
+                self.assertEqual(result.exit_code, 0)
+                self.assertFalse(result.timed_out)
+                self.assertEqual(closure_checks, 0)
+                self.assertIsNotNone(result.post_report)
+                self.assertEqual(result.post_report.teardown_reason, "")
+                self.assertFalse(result.post_report.enforced_stop)
 
     def test_tool_activity_before_a_poll_is_still_recorded(self):
         # F1: a worker that reports, invokes a tool, and exits within a single
@@ -7444,13 +8192,27 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             runner, _, _ = self._build_runner(directory, [task], {})
             source = self._enable_runtime_owned_task_source(runner, task)
 
+            def completed_without_integration(**kwargs):
+                stage_machine = kwargs["stage_machine"]
+                for stage in (
+                    RunStage.CANDIDATE,
+                    RunStage.GATES,
+                    RunStage.REVIEW,
+                    RunStage.INTEGRATION,
+                ):
+                    stage_machine.transition(
+                        stage,
+                        reason="test_missing_integration_result",
+                    )
+                return runner_module.ClassificationResult(
+                    "completed",
+                    "runtime_lifecycle",
+                )
+
             with patch.object(
                 runner,
                 "execute_runtime_owned_lifecycle",
-                return_value=runner_module.ClassificationResult(
-                    "completed",
-                    "runtime_lifecycle",
-                ),
+                side_effect=completed_without_integration,
             ):
                 result = self._run_task(
                     runner,
@@ -7469,6 +8231,197 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 record_types.index("run_result"),
             )
             self.assertEqual(source.status, "on-hold")
+
+    def test_runtime_integration_recovery_rejects_identityless_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [], {})
+            runner.run_store.append_lifecycle_event(
+                RunLifecycleEvent.integration_result(
+                    run_id="run-1",
+                    task_id="T-1",
+                    payload=IntegrationResult(
+                        outcome="branch_already_merged",
+                        status="completed",
+                        reason="legacy",
+                        branch="worker/T-1",
+                        candidate_head="",
+                        refreshed_head="",
+                        main_before="",
+                        main_after="",
+                    ).to_payload(),
+                )
+            )
+
+            result = runner._runtime_integration_result(
+                run_id="run-1",
+                task_id="T-1",
+            )
+
+        self.assertIsNone(result)
+
+    def test_candidate_reanchor_retry_bound_parks_as_blocked(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=CandidateReanchorRetryExhausted(
+                    attempts=2,
+                    candidate_base="a" * 40,
+                    observed_base="b" * 40,
+                ),
+            ):
+                result = self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(
+            result.classification_source,
+            "candidate_reanchor_retry_bound",
+        )
+        self.assertEqual(source.status, "on-hold")
+
+    def test_adopted_workspace_older_than_main_reanchors_before_gates(self) -> None:
+        """An adopted workspace base is older than `main` by design.
+
+        The provisioner only requires the workspace base to be an ancestor of
+        the selected base, so the candidate must reach the re-anchorer instead
+        of being rejected during collection for not descending from run-start
+        `main`.
+        """
+
+        class GatesReached(RuntimeError):
+            pass
+
+        def git_at(cwd: Path, *args: str) -> str:
+            return subprocess.run(
+                ["git", *args],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        observed_candidates: list[CandidateRecord] = []
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            source.status = "active"
+            repo = runner.config.repo
+            workspace_base = git_at(repo, "rev-parse", "HEAD")
+            with tempfile.TemporaryDirectory() as workspace_directory:
+                worktree = Path(workspace_directory) / "T-1"
+                git_at(
+                    repo,
+                    "worktree",
+                    "add",
+                    "-b",
+                    "vibe-loop/T-1",
+                    str(worktree),
+                    workspace_base,
+                )
+                (worktree / "candidate.txt").write_text(
+                    "candidate\n",
+                    encoding="utf-8",
+                )
+                git_at(worktree, "add", "candidate.txt")
+                git_at(worktree, "commit", "-m", "candidate")
+                candidate_head = git_at(worktree, "rev-parse", "HEAD")
+                (repo / "main.txt").write_text("advanced\n", encoding="utf-8")
+                git_at(repo, "add", "main.txt")
+                git_at(repo, "commit", "-m", "advance main")
+                advanced_main = git_at(repo, "rev-parse", "HEAD")
+
+                workspace = ProvisionedWorkspace(
+                    mode="adopted",
+                    branch="vibe-loop/T-1",
+                    worktree=worktree,
+                    base_commit=workspace_base,
+                    head_commit=candidate_head,
+                    owner_run_id="run-0",
+                )
+                stage_machine = RunLifecycleStateMachine(lambda transition: None)
+                stage_machine.transition(RunStage.ACTIVATION, reason="test")
+                stage_machine.transition(RunStage.WORKSPACE, reason="test")
+                stage_machine.transition(RunStage.IMPLEMENTING, reason="test")
+                log_path = repo / "worker.log"
+                log_path.write_text("", encoding="utf-8")
+
+                class StubGateController:
+                    def __init__(self, **kwargs: object) -> None:
+                        self.kwargs = kwargs
+
+                    def run(
+                        self,
+                        candidate: CandidateRecord | None = None,
+                    ) -> None:
+                        observed_candidates.append(candidate)
+                        raise GatesReached("gates reached")
+
+                with patch.object(
+                    runner_module,
+                    "RuntimeGateController",
+                    StubGateController,
+                ):
+                    with self.assertRaises(GatesReached):
+                        runner.execute_runtime_owned_lifecycle(
+                            task=task,
+                            run_id="run-1",
+                            provisioned_workspace=workspace,
+                            stage_machine=stage_machine,
+                            contract={
+                                "candidate_stabilization": {"max_reanchors": 2},
+                                "gates": (),
+                                "remediation": {"max_rounds": 0},
+                                "reviewer": {"profile": "review"},
+                                "integration": {"enabled": True},
+                            },
+                            agent=runner.config.agent,
+                            agent_profile="worker",
+                            command_env={},
+                            implementation_session_id="session-1",
+                            implementation_session_id_source="fallback:run_id",
+                            output_log_path=log_path,
+                        )
+
+                anchors = [
+                    record
+                    for record in runner.run_store.read_records()
+                    if record.get("record_type") == "candidate_base_anchor"
+                ]
+                self.assertEqual(
+                    [record["outcome"] for record in anchors],
+                    ["re-anchored-clean"],
+                )
+                self.assertEqual(len(observed_candidates), 1)
+                stabilized = observed_candidates[0]
+                self.assertIsNotNone(stabilized)
+                assert stabilized is not None
+                self.assertEqual(stabilized.base_main, advanced_main)
+                self.assertNotEqual(stabilized.head_commit, candidate_head)
+                self.assertEqual(stabilized.changed_paths, ("candidate.txt",))
+                self.assertEqual(
+                    subprocess.run(
+                        [
+                            "git",
+                            "merge-base",
+                            "--is-ancestor",
+                            advanced_main,
+                            stabilized.head_commit,
+                        ],
+                        cwd=worktree,
+                        capture_output=True,
+                        text=True,
+                    ).returncode,
+                    0,
+                )
 
     def test_runtime_owned_worker_output_cannot_inject_lifecycle_records(
         self,
@@ -7694,11 +8647,19 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 for record in records
                 if record.get("record_type") == "task_recovery"
             ]
+            provenance_records = [
+                record
+                for record in records
+                if record.get("record_type") == "task_provenance_committed"
+            ]
 
         self.assertEqual(result.classification, "completed")
         self.assertEqual(source.status, "done")
         self.assertEqual(candidate_text, "candidate\n")
         self.assertEqual(task_recovery_records, [])
+        self.assertEqual(len(provenance_records), 1)
+        self.assertEqual(provenance_records[0]["mode"], "adapter")
+        self.assertEqual(provenance_records[0]["confirmed_status"], "done")
         for required in (
             "candidate_recorded",
             "gate_result",
@@ -7783,6 +8744,111 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertEqual(
             activity["runtime_lifecycle_reason"],
             "verified_runtime_enforced_teardown",
+        )
+
+    def test_runtime_owned_accepts_reported_candidate_for_immediate_closure(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            self._enable_runtime_owned_task_source(runner, task)
+
+            def closed_worker(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                head = subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                branch = subprocess.run(
+                    ["git", "branch", "--show-current"],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                candidate = CandidateRecord(
+                    branch=branch,
+                    worktree=cwd,
+                    base_main=head,
+                    head_commit=head,
+                    changed_paths=(),
+                    source="worker_command",
+                )
+                runner.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.candidate_recorded(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        payload=candidate.to_payload(),
+                    )
+                )
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="completed",
+                        commit=head,
+                    )
+                )
+                self.assertTrue(kwargs["reap_check"]())
+                self.assertEqual(
+                    kwargs["post_report_closure_check"](),
+                    "accepted_completed_candidate",
+                )
+                kwargs["on_start"](os.getpid())
+                return runner_module.StreamingCommandResult(
+                    exit_code=-signal.SIGTERM,
+                    post_report=runner_module.PostReportActivity(
+                        reported=True,
+                        seconds=0.1,
+                        activity_kind="",
+                        activity_count=0,
+                        enforced_stop=True,
+                        identity_verified=True,
+                        usage=runner_module.unavailable_usage(
+                            "anthropic", "test_fixture"
+                        ),
+                        teardown_reason="accepted_report_runtime_closure",
+                        descendants_verified=True,
+                        teardown_process_count=2,
+                        teardown_seconds=0.02,
+                    ),
+                )
+
+            def complete_lifecycle(**kwargs):
+                self._record_runtime_integration(
+                    runner,
+                    kwargs["run_id"],
+                    kwargs["task"].task_id,
+                )
+                return runner_module.ClassificationResult(
+                    "completed", "runtime_lifecycle"
+                )
+
+            with patch.object(
+                runner,
+                "execute_runtime_owned_lifecycle",
+                side_effect=complete_lifecycle,
+            ) as lifecycle:
+                result = self._run_task(runner, task, closed_worker)
+            closure = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "post_report_closure"
+            )
+
+        self.assertEqual(result.classification, "completed")
+        lifecycle.assert_called_once()
+        self.assertTrue(closure["terminated"])
+        self.assertTrue(closure["identity_verified"])
+        self.assertTrue(closure["descendants_verified"])
+        self.assertEqual(closure["teardown_process_count"], 2)
+        self.assertEqual(
+            closure["runtime_lifecycle_reason"],
+            "verified_accepted_report_runtime_closure",
         )
 
     def test_runtime_owned_lifecycle_refuses_unverified_post_report_exit(
@@ -9139,6 +10205,698 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         self.assertEqual(delta.model_id_source, "native:stdout:json.model")
         self.assertEqual(merged.model_id, "gpt-5.6-sol")
         self.assertEqual(merged.model_id_source, "native:stdout:json.model")
+
+
+class TaskSourceSessionExportTests(unittest.TestCase):
+    """The task-source environment must carry who implemented and who reviewed.
+
+    A backend attributes a status transition to those sessions, and refuses to
+    close a task whose reviewer is absent, so the runtime exports a value only
+    when the run actually recorded a usable session for that role. How strongly
+    the id is attested depends on the provider -- see
+    `runner.RECOGNIZED_SESSION_ID_SOURCES`; these tests cover what is exported,
+    not how much it is worth.
+    """
+
+    RUN_ID = "run-session-export"
+    TASK_ID = "TASK-SESSION"
+
+    def _runner(self, directory: str) -> VibeRunner:
+        return VibeRunner(VibeConfig(repo=Path(directory)))
+
+    def _lock(self, directory: str, **metadata: object) -> TaskLock:
+        return TaskLock(
+            task_id=self.TASK_ID,
+            path=Path(directory) / "task.lock",
+            metadata=dict(metadata),
+        )
+
+    def _record_session_observed(
+        self,
+        runner: VibeRunner,
+        *,
+        session_id: str,
+        session_id_source: str,
+        run_id: str = RUN_ID,
+        task_id: str = TASK_ID,
+    ) -> None:
+        runner.run_store.append_lifecycle_event(
+            RunLifecycleEvent.run_state_transition(
+                run_id=run_id,
+                task_id=task_id,
+                from_state="started",
+                to_state="session_observed",
+                reason=session_id_source,
+                payload={
+                    "session_id": session_id,
+                    "session_id_source": session_id_source,
+                },
+            )
+        )
+
+    def _record_review_verdict(
+        self,
+        runner: VibeRunner,
+        *,
+        verdict: str,
+        session_id: str,
+        session_id_source: str = "runtime_injected",
+        pass_kind: str = "initial",
+        run_id: str = RUN_ID,
+        task_id: str = TASK_ID,
+    ) -> None:
+        runner.run_store.append_lifecycle_event(
+            RunLifecycleEvent.review_verdict(
+                run_id=run_id,
+                task_id=task_id,
+                payload={
+                    "pass_kind": pass_kind,
+                    "verdict": verdict,
+                    "session_id": session_id,
+                    "session_id_source": session_id_source,
+                },
+            )
+        )
+
+    def _context(
+        self,
+        runner: VibeRunner,
+        task_lock: TaskLock,
+        runtime_context: dict[str, str] | None = None,
+        *,
+        include_reviewer_session: bool = True,
+    ) -> dict[str, str]:
+        # Most cases exercise the completion path, the only transition that
+        # carries the reviewer.
+        return runner.task_source_runtime_context(
+            task_id=self.TASK_ID,
+            run_id=self.RUN_ID,
+            task_lock=task_lock,
+            runtime_context=runtime_context,
+            include_reviewer_session=include_reviewer_session,
+        )
+
+    def test_reviewed_run_exports_both_recorded_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context["VIBE_LOOP_IMPLEMENTER_SESSION"],
+            "worker-session-a",
+        )
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-a",
+        )
+
+    def test_last_approving_pass_supplies_the_reviewer_session(self) -> None:
+        # Guard, not a reachable production state: the review output parser
+        # refuses an approve that carries findings or leaves a prior finding
+        # open, so the approve that exits the loop is the only one a run
+        # records today. This pins "last, never first" so a future change that
+        # makes a second approving pass reachable cannot silently attribute the
+        # merge to a superseded reviewer.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-initial",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="findings",
+                session_id="reviewer-session-closure-1",
+                pass_kind="closure:1",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-closure-2",
+                session_id_source="runtime_resumed",
+                pass_kind="closure:2",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-closure-2",
+        )
+
+    def test_reviewer_session_absent_when_the_approval_is_unattributable(
+        self,
+    ) -> None:
+        # An earlier attributable approval must not stand in for the pass that
+        # actually approved the integrated candidate.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-initial",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-closure-1",
+                session_id_source="unavailable",
+                pass_kind="closure:1",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertEqual(
+            context["VIBE_LOOP_IMPLEMENTER_SESSION"],
+            "worker-session-a",
+        )
+
+    def test_a_source_outside_the_runtime_vocabulary_is_not_exported(self) -> None:
+        # Only the label is checked here. On the `runtime_launch` path the agent
+        # supplies both fields, so a recognized label does not make the id
+        # runtime-bound -- it only keeps the vocabulary closed.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+                session_id_source="x",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_the_run_id_is_never_exported_as_a_session(self) -> None:
+        # The value the design most wants withheld, whatever source is claimed.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id=self.RUN_ID,
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id=self.RUN_ID,
+                session_id_source="runtime_launch",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_settlement_and_reset_transitions_omit_the_reviewer(self) -> None:
+        # A settled run merged nothing, so the approver of an unmerged
+        # candidate must not be attributed to its failure or requeue.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(
+                runner,
+                self._lock(directory),
+                include_reviewer_session=False,
+            )
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertEqual(
+            context["VIBE_LOOP_IMPLEMENTER_SESSION"],
+            "worker-session-a",
+        )
+
+    def test_approval_without_a_recorded_session_id_is_unattributable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_reviewer_session_absent_when_review_never_approved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="findings",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_implementer_session_absent_when_never_observed(self) -> None:
+        # The runtime falls back to the run id when it never saw a session;
+        # that names the run, not a session, so it attributes nothing.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id=self.RUN_ID,
+                session_id_source="fallback:run_id",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-a",
+        )
+
+    def test_no_records_export_neither_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_inherited_session_values_are_dropped_not_passed_through(self) -> None:
+        # An ambient value would attribute the transition to a session that did
+        # no work here, and the consumer cannot tell it from a derived one.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(
+                runner,
+                self._lock(directory),
+                {
+                    "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-implementer",
+                    "VIBE_LOOP_REVIEWER_SESSION": "ambient-reviewer",
+                },
+            )
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_another_run_and_task_never_supply_this_run_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="other-run-worker",
+                session_id_source="observed",
+                run_id="run-other",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="other-task-reviewer",
+                task_id="TASK-OTHER",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_session_ids_outside_the_identifier_alphabet_are_omitted(self) -> None:
+        # Reviewer-reported ids are agent-influenced text; a value the runtime
+        # cannot attest as an identifier is omitted rather than exported for
+        # the consumer to reject as malformed.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker session with spaces",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer\nsession",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
+        self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_session_export_keeps_the_existing_context_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+
+            context = self._context(
+                runner,
+                self._lock(directory, fencing_token="generation-9"),
+                {
+                    "VIBE_LOOP_REPO": "/claimed/worktree",
+                    "VIBE_LOOP_WORKTREE": "/claimed/worktree",
+                    "VIBE_LOOP_BRANCH": "vibe/claimed",
+                    "PROJECT_SELECTOR": "configured",
+                },
+            )
+
+        self.assertNotIn("VIBE_LOOP_REPO", context)
+        self.assertNotIn("VIBE_LOOP_WORKTREE", context)
+        self.assertNotIn("VIBE_LOOP_BRANCH", context)
+        self.assertEqual(context["VIBE_LOOP_FENCING_TOKEN"], "generation-9")
+        self.assertEqual(context["PROJECT_SELECTOR"], "configured")
+        self.assertEqual(context["VIBE_LOOP_TASK_ID"], self.TASK_ID)
+        self.assertEqual(context["VIBE_LOOP_RUN_ID"], self.RUN_ID)
+        self.assertEqual(context["VIBE_LOOP_PRIMARY_REPO"], str(runner.config.repo))
+
+    def test_unfenced_lock_still_omits_the_fencing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(
+                runner,
+                self._lock(directory),
+                {"VIBE_LOOP_FENCING_TOKEN": "stale-generation"},
+            )
+
+        self.assertNotIn("VIBE_LOOP_FENCING_TOKEN", context)
+
+    def test_derivation_reads_records_rather_than_reconstructing(self) -> None:
+        records = [
+            {
+                "record_type": "run_state_transition",
+                "run_id": self.RUN_ID,
+                "task_id": self.TASK_ID,
+                "to_state": "session_observed",
+                "session_id": "worker-session-a",
+                "session_id_source": "native:stdout",
+            },
+            {
+                "record_type": "review_verdict",
+                "run_id": self.RUN_ID,
+                "task_id": self.TASK_ID,
+                "verdict": "approve",
+                "session_id": "reviewer-session-a",
+                "session_id_source": "runtime_launch",
+            },
+        ]
+
+        self.assertEqual(
+            implementer_session_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ),
+            "worker-session-a",
+        )
+        self.assertEqual(
+            reviewer_session_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ),
+            "reviewer-session-a",
+        )
+
+    def test_a_non_session_state_transition_is_not_an_observation(self) -> None:
+        records = [
+            {
+                "record_type": "run_state_transition",
+                "run_id": self.RUN_ID,
+                "task_id": self.TASK_ID,
+                "to_state": "classified",
+                "session_id": "worker-session-a",
+                "session_id_source": "observed",
+            }
+        ]
+
+        self.assertEqual(
+            implementer_session_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ),
+            "",
+        )
+
+    def _adapter_report_command(self, directory: str) -> str:
+        # Reports, as JSON on stdout, which of the two names the adapter
+        # process actually observes in its own environment.
+        script = Path(directory) / "report_env.py"
+        script.write_text(
+            "import json\n"
+            "import os\n"
+            "print(\n"
+            "    json.dumps(\n"
+            "        {\n"
+            '            "implementer": os.environ.get(\n'
+            '                "VIBE_LOOP_IMPLEMENTER_SESSION", "<absent>"\n'
+            "            ),\n"
+            '            "reviewer": os.environ.get(\n'
+            '                "VIBE_LOOP_REVIEWER_SESSION", "<absent>"\n'
+            "            ),\n"
+            "        }\n"
+            "    )\n"
+            ")\n",
+            encoding="utf-8",
+        )
+        return f"{shell_quote(sys.executable)} report_env.py"
+
+    def test_an_unattributed_run_leaves_the_adapter_process_without_the_names(
+        self,
+    ) -> None:
+        # The contract is absence in the adapter's *environment*, not in a
+        # Python dict. `os.environ.copy()` plus `update` cannot express a
+        # removal, so the ambient value must be withheld at the boundary.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            command = self._adapter_report_command(directory)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-stale-implementer",
+                    "VIBE_LOOP_REVIEWER_SESSION": "ambient-stale-reviewer",
+                },
+            ):
+                context = self._context(runner, self._lock(directory))
+                payload = run_json_command(
+                    Path(directory),
+                    command,
+                    runtime_context=context,
+                )
+
+        self.assertEqual(
+            payload,
+            {"implementer": "<absent>", "reviewer": "<absent>"},
+        )
+
+    def test_derived_sessions_reach_the_adapter_process(self) -> None:
+        # The same crossing in the positive direction: a derived value must
+        # win over the ambient one rather than merely not being deleted.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_session_observed(
+                runner,
+                session_id="worker-session-a",
+                session_id_source="observed",
+            )
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+            )
+            command = self._adapter_report_command(directory)
+
+            with patch.dict(
+                os.environ,
+                {
+                    "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-stale-implementer",
+                    "VIBE_LOOP_REVIEWER_SESSION": "ambient-stale-reviewer",
+                },
+            ):
+                context = self._context(runner, self._lock(directory))
+                payload = run_json_command(
+                    Path(directory),
+                    command,
+                    runtime_context=context,
+                )
+
+        self.assertEqual(
+            payload,
+            {
+                "implementer": "worker-session-a",
+                "reviewer": "reviewer-session-a",
+            },
+        )
+
+    def test_reader_reads_the_real_session_observation_producer(self) -> None:
+        # Couples the reader's key expectations to `build_run_context_payload`.
+        # A producer that renames or nests `session_id` must fail here rather
+        # than silently emptying the export forever.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            payload = build_run_context_payload(
+                task_id=self.TASK_ID,
+                run_id=self.RUN_ID,
+                started_at="2026-01-01T00:00:00Z",
+                session_id="worker-session-a",
+                session_id_source="observed",
+                agent_kind="claude",
+                agent_kind_source="explicit",
+                agent_prompt_dialect="claude",
+                agent_prompt_dialect_source="explicit",
+                agent_skill_ref_prefix="/",
+                agent_skill_ref_prefix_source="explicit",
+                runtime_context=AgentRuntimeContext(),
+            )
+            runner.run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_state_transition(
+                    run_id=self.RUN_ID,
+                    task_id=self.TASK_ID,
+                    from_state="started",
+                    to_state="session_observed",
+                    reason="observed",
+                    payload=payload,
+                )
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context["VIBE_LOOP_IMPLEMENTER_SESSION"],
+            "worker-session-a",
+        )
+
+    def test_reader_reads_the_real_review_verdict_producer(self) -> None:
+        # Couples the reader to `ReviewRouter`: the router writes the verdict
+        # record itself, and the exported reviewer must equal the identity the
+        # router reports for that pass.
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            candidate = CandidateRecord(
+                branch=f"vibe-loop/{self.TASK_ID}",
+                worktree=Path(directory),
+                base_main="a" * 40,
+                head_commit="b" * 40,
+                changed_paths=("src/example.py",),
+                source="derived",
+            )
+            gates = GateRunSummary(
+                candidate=candidate,
+                results=(
+                    GateResult(
+                        config_key="completion.commands[0]",
+                        exit_class="passed",
+                        exit_code=0,
+                        duration_seconds=0.5,
+                        log_reference=str(Path(directory) / "gate.log"),
+                        evidence_digest="sha256:" + "c" * 64,
+                        candidate_fingerprint=candidate.fingerprint,
+                    ),
+                ),
+                candidate_recorded=True,
+            )
+
+            def execute(command: str, **kwargs: object):
+                verdict = {
+                    "verdict": "approve",
+                    "findings": [],
+                    "session_id": "reviewer-reported-session",
+                    "session_id_source": "runtime_launch",
+                    "continuation_ordinal": 0,
+                }
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(verdict),
+                )
+
+            router = ReviewRouter(
+                reviewer=AgentConfig(
+                    command=("codex review --model {model} --effort {effort} {prompt}"),
+                    command_source="explicit",
+                    model="review-model",
+                    model_source="explicit",
+                    effort="high",
+                    effort_source="explicit",
+                    agent_kind="codex",
+                    agent_kind_source="explicit",
+                    executable_kind="codex",
+                    profile_name="review",
+                ),
+                reviewer_profile="review",
+                run_store=runner.run_store,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+                worktree=Path(directory),
+                policy_references=("REVIEW.md",),
+                max_initial_passes=1,
+                max_closure_passes=2,
+                concurrency=ReviewConcurrencyBudget(1),
+                executor=execute,
+                continuation_availability=lambda *_args: "",
+                session_id_factory=lambda: "runtime-placeholder",
+            )
+
+            result = router.review(gates)
+            context = self._context(runner, self._lock(directory))
+
+        self.assertTrue(result.approved)
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            result.session_id,
+        )
 
 
 if __name__ == "__main__":

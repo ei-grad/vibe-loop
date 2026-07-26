@@ -21,6 +21,15 @@ from pathlib import Path, PurePosixPath
 from typing import BinaryIO, TextIO
 
 from vibe_loop.activity import ActivityEmission, AgentActivityTracker
+from vibe_loop.budget import (
+    BudgetReservationDenied,
+    BudgetRunOutcome,
+    BudgetStore,
+    PhaseBudget,
+    process_alive_locally,
+    resolve_budget_ledger_path,
+    resolve_budget_project,
+)
 from vibe_loop.config import (
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
@@ -63,9 +72,11 @@ from vibe_loop.locks import (
     redact_fencing_token_text,
 )
 from vibe_loop.orchestration import (
+    CandidateBaseReanchorer,
     CandidateCollectionError,
     CandidateCollector,
     CandidateRecord,
+    CandidateReanchorRetryExhausted,
     GateExecutionError,
     GateRunner,
     GateRunSummary,
@@ -98,10 +109,15 @@ from vibe_loop.orchestration import (
     run_configured_command,
     settlement_intent,
 )
-from vibe_loop.processes import read_process_node
+from vibe_loop.processes import (
+    ProcessNode,
+    collect_owned_descendants,
+    read_process_node,
+    read_process_table,
+)
 from vibe_loop.retry import (
     LimitWallSignal,
-    detect_limit_wall,
+    detect_provider_limit_wall,
     is_transient_stderr,
     limit_wall_backoff_seconds,
     parse_quota_reset_delay,
@@ -114,8 +130,11 @@ from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
+    REVIEW_VERDICT_RECORD_TYPE,
+    RUN_STATE_TRANSITION_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+    WORKSPACE_PREFLIGHT_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
@@ -151,6 +170,7 @@ from vibe_loop.workers import (
     active_run_is_live,
     build_worker_views,
     git_dirty_snapshot,
+    workspace_state_fingerprint,
 )
 
 try:
@@ -170,6 +190,51 @@ SESSION_ID_RE = re.compile(
     re.IGNORECASE,
 )
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+# Env names a task-source adapter reads to attribute a status transition to the
+# sessions that produced it. Absent means "the runtime cannot attest this"; the
+# consumer fails closed on a missing reviewer rather than inventing one, so the
+# runtime must never export a placeholder, an empty value, or the run id.
+IMPLEMENTER_SESSION_ENV = "VIBE_LOOP_IMPLEMENTER_SESSION"
+REVIEWER_SESSION_ENV = "VIBE_LOOP_REVIEWER_SESSION"
+# The runtime stamps this source when it never saw a session and fell back to
+# the run id. That value identifies the run, not a session, so it attributes
+# nothing.
+SESSION_ID_FALLBACK_SOURCE = "fallback:run_id"
+# The source vocabulary the runtime itself uses: a session it observed in
+# provider output (`observed`, `native:<stream>`), one it generated and
+# injected, one it resumed, or a launch it planned. A label outside this set was
+# invented by an agent and names no provenance the runtime recognizes, so it
+# attributes nothing.
+#
+# Recognizing the label is not the same as attesting the id, and this list does
+# not make it so. How strong the attestation is depends on the provider:
+#
+# - `session_injection` providers (claude, both roles): the runtime generates
+#   the id, injects it, and records `runtime_injected` -- or resumes a prior id
+#   and records `runtime_resumed`. `orchestration._parse_result` then rejects a
+#   reported id that differs from the injected one, so the id is runtime-bound.
+# - Providers without session injection (codex reviewer, and any unknown
+#   provider, which defaults to no injection): the runtime cannot tell the
+#   agent which session to be, records `runtime_launch`, and
+#   `orchestration._parse_result` takes BOTH the id and the source from the
+#   agent's own JSON. An agent on this path can therefore report any id it
+#   likes under any label in this set. The value is self-reported, not attested.
+#
+# What this list does buy on that path is bounded vocabulary; the run-id refusal
+# in `exportable_session_id` covers the one value that must never escape. Making
+# the distinction visible to the backend needs the export to carry attestation
+# quality, which is separate work.
+RECOGNIZED_SESSION_ID_SOURCES = frozenset(
+    {"observed", "runtime_injected", "runtime_launch", "runtime_resumed"}
+)
+RECOGNIZED_SESSION_ID_SOURCE_PREFIXES = ("native:",)
+# Session ids reach the runtime from provider output and from reviewer-reported
+# JSON, so an exported value is agent-influenced text. Accept only the bounded
+# identifier alphabet the session observers already produce; anything else is
+# unattributable and is omitted rather than exported for the consumer to reject.
+EXPORTABLE_SESSION_ID_RE = re.compile(
+    r"\A[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]{0,254}[A-Za-z0-9])?\Z"
+)
 # A bare top-level string `model` value is only a model identity inside these
 # structured lifecycle events. Any other JSON object carrying a `model` key
 # (tool payloads, task records, nested agent envelopes) is generic data.
@@ -684,7 +749,8 @@ class AgentLimitWallError(RuntimeError):
         self.signal = signal
         self.pause_seconds = limit_wall_backoff_seconds(signal, default_backoff)
         detail = f" ({signal.reset_text})" if signal.reset_text else ""
-        super().__init__(f"agent limit wall: {signal.marker}{detail}")
+        evidence = f" [{signal.evidence}]" if signal.evidence else ""
+        super().__init__(f"agent limit wall: {signal.marker}{detail}{evidence}")
 
 
 class AgentOutputObserver:
@@ -862,6 +928,27 @@ def _string_id(value: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+def _contract_nonnegative_int(value: object, default: int = 0) -> int:
+    """Read a bounded count from a resolved contract without trusting its type.
+
+    A recovered contract is replayed from a durable record, so a malformed
+    value must degrade to the default rather than raise a ``TypeError`` that no
+    lifecycle handler classifies.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return default
+    try:
+        parsed = int(value)
+    except (ValueError, OverflowError):
+        # OverflowError covers the infinities: ``json.loads`` parses a literal
+        # ``Infinity`` into ``float('inf')``, so a corrupted durable record
+        # would otherwise raise the exact unclassified failure this helper
+        # exists to prevent.
+        return default
+    return parsed if parsed >= 0 else default
+
+
 def _first_block_of_type(content: object, kinds: frozenset[str]) -> Mapping | None:
     if not isinstance(content, list):
         return None
@@ -1008,6 +1095,10 @@ class PostReportActivity:
     enforced_stop: bool
     identity_verified: bool
     usage: ProviderUsage
+    teardown_reason: str = ""
+    descendants_verified: bool = False
+    teardown_process_count: int = 0
+    teardown_seconds: float = 0.0
 
     @property
     def violation(self) -> bool:
@@ -1022,7 +1113,7 @@ def post_report_runtime_lifecycle_decision(
     worker_report: WorkerReport | None,
     activity: PostReportActivity,
 ) -> tuple[str, str]:
-    """Decide whether runtime orchestration may advance after a violation."""
+    """Decide whether runtime orchestration may advance after worker closure."""
     if not runtime_owned:
         return "refuse", "runtime_owned_orchestration_disabled"
     if timed_out:
@@ -1031,6 +1122,16 @@ def post_report_runtime_lifecycle_decision(
         return "refuse", "accepted_report_missing"
     if worker_report.status != "completed":
         return "refuse", "accepted_report_not_completed"
+    if activity.teardown_reason:
+        if activity.teardown_reason != "accepted_report_runtime_closure":
+            return "refuse", activity.teardown_reason
+        if not activity.enforced_stop:
+            return "refuse", "teardown_not_runtime_enforced"
+        if not activity.identity_verified:
+            return "refuse", "worker_identity_not_verified"
+        if not activity.descendants_verified:
+            return "refuse", "worker_descendants_not_verified"
+        return "continue", "verified_accepted_report_runtime_closure"
     if exit_code == 0:
         return "continue", "clean_exit_candidate_revalidation_required"
     if not activity.enforced_stop:
@@ -1335,6 +1436,13 @@ class VibeRunner:
         self._lock_manager: LockManager | None = None
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
+        # One shared ledger and canonical project identity per repository, so
+        # concurrent linked worktrees admit against the same durable budget.
+        self.budget_store = BudgetStore(
+            resolve_budget_ledger_path(config), config.budget
+        )
+        self.budget_project = resolve_budget_project(config)
+        self.phase_budget = PhaseBudget(self.budget_store, self.budget_project)
         self._record_lock = threading.Lock()
         self._restart_context = threading.local()
         self.last_analysis_usage = unavailable_usage(
@@ -1346,6 +1454,13 @@ class VibeRunner:
         # driver so the verdict is written exactly once.
         self._exhausted_recovery_results: dict[str, RunResult] = {}
         self._durably_exhausted_recovery_tasks: set[str] = set()
+        self._workspace_deferred_recovery_tasks: set[str] = set()
+        # Workspace-state fingerprints only suppress redundant dispatch while
+        # the provisioner that records one and every site that recomputes it
+        # exclude exactly the same paths; any divergence makes the recorded and
+        # recomputed digests permanently unequal and silently disables
+        # suppression. This is the single source both sides read.
+        self.workspace_ignored_dirty_paths: tuple[Path, ...] = ()
         self._review_concurrency = ReviewConcurrencyBudget(
             config.orchestration.reviewer_concurrency_budget
         )
@@ -1754,7 +1869,7 @@ class VibeRunner:
         exit_code = 1
         message = ""
         session_id = run_id
-        session_id_source = "fallback:run_id"
+        session_id_source = SESSION_ID_FALLBACK_SOURCE
         injected_session_id: str | None = None
         effective_template = command_template
         resume_session_id = (
@@ -1851,6 +1966,10 @@ class VibeRunner:
         task_source_terminal_confirmed = True
         durable_run_result_recorded = False
         post_release_settlement_intent = ""
+        # Set once a conservative budget allowance is reserved for this launch;
+        # released again if the run fails before the worker process starts, so a
+        # denied-then-abandoned pre-launch failure never leaves a phantom charge.
+        budget_reservation_id = ""
         active_state = ActiveRunState.new(
             task_id=task.task_id,
             run_id=run_id,
@@ -1876,6 +1995,10 @@ class VibeRunner:
             reasoning_effort_source=command_context.reasoning_effort_source,
             restart_count=restart_count,
             max_restarts=max_restarts,
+        )
+        active_state = dataclasses.replace(
+            active_state,
+            worker_launch_publication_guarded=sys.platform == "linux",
         )
         start_context_payload = build_run_context_payload(
             task_id=task.task_id,
@@ -1943,6 +2066,14 @@ class VibeRunner:
         pre_launch_failure_reason = "run_contract_resolution_failed"
 
         def finalize_pre_launch_failure(failure: StageFailure) -> None:
+            if budget_reservation_id:
+                # No worker process launched, so the reserved allowance must be
+                # given back rather than reconciled as consumed usage.
+                self.budget_store.release(
+                    reservation_id=budget_reservation_id,
+                    run_id=run_id,
+                    reason=pre_launch_failure_reason,
+                )
             if stage_machine.stage is not None:
                 stage_machine.fail(
                     failure,
@@ -2003,6 +2134,26 @@ class VibeRunner:
             )
             if circuit_state.open:
                 raise AttemptCircuitOpen(circuit_state)
+            if self.config.budget.enabled:
+                budget_decision = self.budget_store.reserve(
+                    reservation_id=run_id,
+                    run_id=run_id,
+                    project=self.budget_project,
+                    provider=command_context.model_provider,
+                    phase="implementation",
+                    model=command_context.model_id,
+                    effort=command_context.reasoning_effort,
+                )
+                if not budget_decision.admitted:
+                    # Denial is durable evidence in the budget journal; no worker
+                    # process is launched and no task activation is attempted.
+                    raise BudgetReservationDenied(budget_decision)
+                budget_reservation_id = run_id
+                if budget_decision.warnings:
+                    report_status(
+                        f"budget warning for {task.task_id} implementation "
+                        f"launch: {len(budget_decision.warnings)} cap(s) near limit"
+                    )
             pre_launch_failure_reason = "task_activation_failed"
             activated_runtime_owned = (
                 runtime_owned
@@ -2064,6 +2215,7 @@ class VibeRunner:
             main_branch=self.config.main_branch,
             lock_manager=self.lock_manager,
             run_store=self.run_store,
+            ignored_dirty_paths=self.workspace_ignored_dirty_paths,
         )
 
         def compensate_unstarted_workspace() -> None:
@@ -2419,6 +2571,7 @@ class VibeRunner:
                             identity.process_birth_id if identity else ""
                         ),
                     )
+                    update_active_task_lock()
                     self.run_store.append_lifecycle_event(
                         RunLifecycleEvent.worker_process_started(
                             run_id=run_id,
@@ -2449,7 +2602,6 @@ class VibeRunner:
                             ),
                         )
                     )
-                    update_active_task_lock()
                     report_status(
                         "worker process started "
                         f"task={task.task_id} run_id={run_id} pid={worker_pid}",
@@ -2475,6 +2627,40 @@ class VibeRunner:
                     # monitor attributes only activity emitted after it.
                     return worker_report_persistence_epoch(first_accepted_report)
 
+                closure_decision = ""
+
+                def accepted_report_runtime_closure() -> str:
+                    nonlocal closure_decision
+                    if closure_decision:
+                        return closure_decision
+                    report = first_accepted_report
+                    if report is None:
+                        return ""
+                    if report.status != "completed":
+                        closure_decision = "accepted_report_not_completed"
+                        return closure_decision
+                    if not report.commit:
+                        closure_decision = "accepted_report_commit_missing"
+                        return closure_decision
+                    collector = CandidateCollector(
+                        worktree=provisioned_workspace.worktree,
+                        branch=provisioned_workspace.branch,
+                        base_main=provisioned_workspace.base_commit,
+                        run_store=self.run_store,
+                        run_id=run_id,
+                        task_id=task.task_id,
+                    )
+                    candidate = collector.latest_recorded()
+                    if candidate is None:
+                        return ""
+                    elif candidate.head_commit != report.commit:
+                        closure_decision = "accepted_report_candidate_mismatch"
+                    elif not collector.matches(candidate):
+                        closure_decision = "accepted_candidate_initially_changed"
+                    else:
+                        closure_decision = "accepted_completed_candidate"
+                    return closure_decision
+
                 stage_machine.transition(
                     RunStage.IMPLEMENTING,
                     reason="worker_process_launch",
@@ -2489,6 +2675,9 @@ class VibeRunner:
                     on_observation=record_agent_observation,
                     reap_check=worker_filed_terminal_report,
                     report_persistence_epoch=report_persistence_epoch,
+                    post_report_closure_check=(
+                        accepted_report_runtime_closure if runtime_owned else None
+                    ),
                     timeout_seconds=self.config.supervision.worker_timeout_seconds,
                     provider=(
                         command_context.model_provider
@@ -2511,7 +2700,7 @@ class VibeRunner:
                 else:
                     session_id = stream_result.session_id or run_id
                     session_id_source = (
-                        stream_result.session_id_source or "fallback:run_id"
+                        stream_result.session_id_source or SESSION_ID_FALLBACK_SOURCE
                     )
                 final_runtime_context = command_context.prefer(
                     stream_result.runtime_context
@@ -2632,7 +2821,10 @@ class VibeRunner:
                     message = self.run_completion_checks(log)
                 post_report_activity = stream_result.post_report
                 post_report_lifecycle_decision = ""
-                if post_report_activity is not None and post_report_activity.violation:
+                if post_report_activity is not None and (
+                    post_report_activity.violation
+                    or post_report_activity.teardown_reason
+                ):
                     (
                         post_report_lifecycle_decision,
                         post_report_lifecycle_reason,
@@ -2643,6 +2835,7 @@ class VibeRunner:
                         worker_report=worker_report,
                         activity=post_report_activity,
                     )
+                if post_report_activity is not None and post_report_activity.violation:
                     report_status(
                         f"post-report policy violation for {task.task_id}: "
                         f"worker emitted {post_report_activity.activity_kind} "
@@ -2674,6 +2867,32 @@ class VibeRunner:
                             runtime_lifecycle_reason=post_report_lifecycle_reason,
                         )
                     )
+                if (
+                    post_report_activity is not None
+                    and post_report_activity.teardown_reason
+                ):
+                    self.run_store.append_lifecycle_event(
+                        RunLifecycleEvent.post_report_closure(
+                            run_id=run_id,
+                            task_id=task.task_id,
+                            post_report_seconds=post_report_activity.seconds,
+                            teardown_seconds=post_report_activity.teardown_seconds,
+                            worker_pid=worker_pid_value,
+                            process_group_id=worker_process_group_id,
+                            process_count=(post_report_activity.teardown_process_count),
+                            identity_verified=(post_report_activity.identity_verified),
+                            descendants_verified=(
+                                post_report_activity.descendants_verified
+                            ),
+                            terminated=post_report_activity.enforced_stop,
+                            report_status=(
+                                worker_report.status if worker_report else ""
+                            ),
+                            teardown_reason=post_report_activity.teardown_reason,
+                            runtime_lifecycle_decision=(post_report_lifecycle_decision),
+                            runtime_lifecycle_reason=post_report_lifecycle_reason,
+                        )
+                    )
             try:
                 output_tail = _read_log_tail(
                     log_path, LOG_TAIL_LINES_FOR_TRANSIENT_CHECK
@@ -2683,16 +2902,28 @@ class VibeRunner:
             implementation_ready = bool(
                 runtime_owned
                 and (exit_code == 0 or post_report_lifecycle_decision == "continue")
+                and post_report_lifecycle_decision != "refuse"
                 and not worker_timed_out
                 and (worker_report is None or worker_report.status == "completed")
             )
-            if implementation_ready:
+            if (
+                runtime_owned
+                and worker_report is not None
+                and worker_report.status == "completed"
+                and post_report_lifecycle_decision == "refuse"
+            ):
+                classification = ClassificationResult(
+                    "blocked",
+                    "post_report_closure_refused",
+                    detail=post_report_lifecycle_reason,
+                )
+                message = post_report_lifecycle_reason
+            elif implementation_ready:
                 try:
                     classification = self.execute_runtime_owned_lifecycle(
                         task=task,
                         run_id=run_id,
                         provisioned_workspace=provisioned_workspace,
-                        base_main=base_main,
                         stage_machine=stage_machine,
                         contract=run_contract.payload,
                         agent=agent,
@@ -2702,6 +2933,16 @@ class VibeRunner:
                         implementation_session_id_source=session_id_source,
                         output_log_path=log_path,
                     )
+                except BudgetReservationDenied as exc:
+                    # A review or remediation launch was refused: no reviewer or
+                    # remediation process started, and the run ends blocked so it
+                    # is re-dispatched once budget frees rather than left dangling.
+                    classification = ClassificationResult(
+                        "blocked",
+                        f"budget_{exc.decision.phase}_denied",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
                 except ReviewBudgetExhausted as exc:
                     classification = ClassificationResult(
                         "blocked",
@@ -2735,6 +2976,13 @@ class VibeRunner:
                     )
                     message = str(exc)
                 except TaskSourceCompletionError as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        exc.code,
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except CandidateReanchorRetryExhausted as exc:
                     classification = ClassificationResult(
                         "blocked",
                         exc.code,
@@ -2879,6 +3127,13 @@ class VibeRunner:
                     "enforced_stop": pr.enforced_stop,
                     "activity_count": pr.activity_count,
                 }
+                if pr.teardown_reason:
+                    post_report_stats["teardown_reason"] = pr.teardown_reason
+                    post_report_stats["descendants_verified"] = pr.descendants_verified
+                    post_report_stats["teardown_process_count"] = (
+                        pr.teardown_process_count
+                    )
+                    post_report_stats["teardown_seconds"] = pr.teardown_seconds
                 if pr.activity_kind:
                     post_report_stats["activity_kind"] = pr.activity_kind
                 if pr.usage.available:
@@ -3174,7 +3429,6 @@ class VibeRunner:
         task: Task,
         run_id: str,
         provisioned_workspace: ProvisionedWorkspace,
-        base_main: str,
         stage_machine: RunLifecycleStateMachine,
         contract: Mapping[str, object],
         agent: AgentConfig,
@@ -3195,10 +3449,15 @@ class VibeRunner:
         )
         if prior_integration is not None:
             return ClassificationResult("completed", "runtime_integration_recovered")
+        # The candidate's base is the commit its own workspace was provisioned
+        # from, not `main` at run start: an adopted workspace legitimately sits
+        # on an older base that is still in the main history, and seeding the
+        # collector with run-start `main` rejected exactly those candidates
+        # before the re-anchorer below could advance them.
         candidate_collector = CandidateCollector(
             worktree=provisioned_workspace.worktree,
             branch=provisioned_workspace.branch,
-            base_main=base_main,
+            base_main=provisioned_workspace.base_commit,
             run_store=self.run_store,
             run_id=run_id,
             task_id=task.task_id,
@@ -3215,6 +3474,17 @@ class VibeRunner:
         # accepted terminal report. Re-snapshot after the process has exited,
         # including after an enforced teardown, before any gate can execute.
         candidate_collector.ensure_recorded(candidate)
+        candidate_stabilization = contract.get("candidate_stabilization")
+        max_candidate_reanchors = (
+            _contract_nonnegative_int(candidate_stabilization.get("max_reanchors"))
+            if isinstance(candidate_stabilization, Mapping)
+            else 0
+        )
+        candidate = CandidateBaseReanchorer(
+            candidate_collector=candidate_collector,
+            main_branch=self.config.main_branch,
+            max_attempts=max_candidate_reanchors,
+        ).stabilize(candidate)
         self._require_runtime_task_source_unchanged(
             run_id=run_id,
             expected_task=task,
@@ -3295,6 +3565,7 @@ class VibeRunner:
             concurrency=self._review_concurrency,
             stage_machine=stage_machine,
             limit_wall_patterns=self.config.supervision.limit_wall_patterns or None,
+            budget=self.phase_budget,
         )
         review_result = router.review(gate_summary)
         closure_ordinal = 0
@@ -3389,10 +3660,24 @@ class VibeRunner:
             agent.command or "",
             agent.executable_kind or agent.agent_kind,
         )
+        usage_provider = {"codex": "openai", "claude": "anthropic"}.get(
+            provider, "unknown"
+        )
+        # Reserve the remediation phase budget before building or launching the
+        # implementer; a denial raises BudgetReservationDenied and starts no
+        # process, which the lifecycle records as blocked.
+        budget_reservation = self.phase_budget.admit(
+            reservation_id=f"{run_id}:remediation:{round_number}:{uuid.uuid4().hex}",
+            run_id=run_id,
+            provider=usage_provider,
+            phase="remediation",
+            model=agent.model or "",
+            effort=agent.effort or "",
+        )
         resumable_session_id = (
             implementation_session_id
             if implementation_session_id
-            and implementation_session_id_source != "fallback:run_id"
+            and implementation_session_id_source != SESSION_ID_FALLBACK_SOURCE
             else ""
         )
         continuation = plan_session_continuation(
@@ -3441,19 +3726,34 @@ class VibeRunner:
                 reason=f"round:{round_number}",
             )
         )
-        with log_path.open("w", encoding="utf-8") as log:
-            result = run_streaming_command(
-                command,
-                workspace.worktree,
-                log,
-                env=dict(command_env),
-                forward_stderr=agent.forward_stderr,
-                timeout_seconds=self.config.supervision.worker_timeout_seconds,
-                provider={"codex": "openai", "claude": "anthropic"}.get(
-                    provider,
-                    "unknown",
-                ),
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    command,
+                    workspace.worktree,
+                    log,
+                    env=dict(command_env),
+                    forward_stderr=agent.forward_stderr,
+                    timeout_seconds=self.config.supervision.worker_timeout_seconds,
+                    provider=usage_provider,
+                )
+        except BaseException:
+            # The implementer process never produced a result, so return the
+            # reserved allowance rather than charging a launch that did not run.
+            self.phase_budget.release(
+                reservation_id=budget_reservation,
+                run_id=run_id,
+                reason="remediation_launch_failed",
             )
+            raise
+        # A launched remediation implementer is reconciled exactly once against
+        # its own usage; unavailable usage is charged fail-safe, never zero.
+        self.phase_budget.reconcile(
+            reservation_id=budget_reservation,
+            run_id=run_id,
+            stats=result.usage.to_stats(phase="remediation"),
+            provider=usage_provider,
+        )
         if result.timed_out:
             raise ReviewStageResultError("timeout")
         if result.exit_code != 0:
@@ -3478,7 +3778,12 @@ class VibeRunner:
         for record in self.run_store.read_records():
             if record.get("run_id") == run_id and record.get("task_id") == task_id:
                 candidate = IntegrationResult.from_record(record)
-                if candidate is not None and candidate.completed:
+                if (
+                    candidate is not None
+                    and candidate.completed
+                    and candidate.candidate_head
+                    and candidate.main_after
+                ):
                     result = candidate
         return result
 
@@ -3593,6 +3898,8 @@ class VibeRunner:
             lock_manager=self.lock_manager,
             task_lock=task_lock,
             run_store=self.run_store,
+            repo=self.config.repo,
+            main_branch=self.config.main_branch,
             run_id=run_id,
             task_id=task_id,
             runtime_context=self.task_source_runtime_context(
@@ -3600,6 +3907,7 @@ class VibeRunner:
                 run_id=run_id,
                 task_lock=task_lock,
                 runtime_context=runtime_context,
+                include_reviewer_session=True,
             ),
             stage_machine=stage_machine,
         ).complete()
@@ -3683,6 +3991,7 @@ class VibeRunner:
         run_id: str,
         task_lock: TaskLock,
         runtime_context: Mapping[str, str] | None = None,
+        include_reviewer_session: bool = False,
     ) -> dict[str, str]:
         context = dict(runtime_context or {})
         context.update(
@@ -3700,6 +4009,37 @@ class VibeRunner:
             context["VIBE_LOOP_FENCING_TOKEN"] = fencing_token
         else:
             context.pop("VIBE_LOOP_FENCING_TOKEN", None)
+        # Session attribution is derived from what this run recorded, never
+        # inherited: an ambient or stale value in the caller's environment would
+        # attribute the transition to a session that did not do the work, and
+        # the consumer cannot tell that apart from a derived one. Unknown must
+        # reach the adapter as an absent variable, so drop before setting.
+        # `tasks.WITHHELD_ADAPTER_ENV` carries the same removal across the
+        # process boundary, which `dict.update` on `os.environ` cannot.
+        records = self.run_store.read_records()
+        context.pop(IMPLEMENTER_SESSION_ENV, None)
+        context.pop(REVIEWER_SESSION_ENV, None)
+        implementer_session = implementer_session_from_records(
+            records,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if implementer_session:
+            context[IMPLEMENTER_SESSION_ENV] = implementer_session
+        # The reviewer variable answers "who approved what was merged", so only
+        # the completion path may carry it. A settlement or reset transition
+        # merged nothing -- integration can fail after an approval -- and
+        # exporting the approver there would let a backend attribute a failure
+        # to the session that approved a candidate no one shipped.
+        if not include_reviewer_session:
+            return context
+        reviewer_session = reviewer_session_from_records(
+            records,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if reviewer_session:
+            context[REVIEWER_SESSION_ENV] = reviewer_session
         return context
 
     def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
@@ -3762,7 +4102,7 @@ class VibeRunner:
                 task,
                 restart_count=restart_count,
             )
-        except AttemptCircuitOpen as exc:
+        except (AttemptCircuitOpen, BudgetReservationDenied) as exc:
             report_status(str(exc))
             excluded = set(exclude or set())
             excluded.add(task.task_id)
@@ -3773,6 +4113,18 @@ class VibeRunner:
             )
         except LockBusy:
             report_status(f"task locked during acquire, retrying: {task.task_id}")
+            excluded = set(exclude or set())
+            excluded.add(task.task_id)
+            return self.run_next(
+                ask_agent=ask_agent,
+                exclude=excluded,
+                restart_counts=restart_counts,
+            )
+        except WorkspaceProvisionError as exc:
+            report_status(
+                "workspace dispatch deferred before worker launch: "
+                f"{task.task_id}: {exc.diagnostic}"
+            )
             excluded = set(exclude or set())
             excluded.add(task.task_id)
             return self.run_next(
@@ -3815,6 +4167,7 @@ class VibeRunner:
                 "jobs": jobs,
             }
         )
+        self.recover_abandoned_budget()
         try:
             if jobs == 1:
                 return self.run_until_done_serial(
@@ -3844,6 +4197,7 @@ class VibeRunner:
 
     def pending_recovery_contexts(self) -> list[RecoveryContext]:
         contexts: list[RecoveryContext] = []
+        self._workspace_deferred_recovery_tasks.clear()
         for record in self.run_store.pending_recovery_records():
             if record.get("charged_attempt_exhausted") is True:
                 task_id = str(record.get("task_id") or "")
@@ -3914,8 +4268,63 @@ class VibeRunner:
                     "is required"
                 )
                 continue
+            if context.workspace_state_fingerprint:
+                current_fingerprint = workspace_retry_state_fingerprint(
+                    repo=self.config.repo,
+                    main_branch=self.config.main_branch,
+                    recovery=context,
+                    ignored_dirty_paths=self.workspace_ignored_dirty_paths,
+                )
+                if current_fingerprint == context.workspace_state_fingerprint:
+                    self._workspace_deferred_recovery_tasks.add(context.task_id)
+                    continue
             contexts.append(context)
         return contexts
+
+    def unchanged_workspace_dispatch_deferrals(self) -> set[str]:
+        latest: dict[str, dict[str, object]] = {}
+        for record in self.run_store.read_records():
+            if record.get("record_type") != WORKSPACE_PREFLIGHT_RECORD_TYPE:
+                continue
+            task_id = record.get("task_id")
+            if not isinstance(task_id, str) or not task_id:
+                continue
+            if (
+                record.get("decision") == "rejected"
+                and record.get("retry_disposition") == "defer_until_workspace_changes"
+                and isinstance(record.get("workspace_state_fingerprint"), str)
+            ):
+                latest[task_id] = record
+            else:
+                latest.pop(task_id, None)
+
+        unchanged: set[str] = set()
+        for task_id, record in latest.items():
+            recorded_fingerprint = str(record["workspace_state_fingerprint"])
+            if not SHA256_HEX_RE.fullmatch(recorded_fingerprint):
+                continue
+            branch = record.get("branch")
+            worktree_text = record.get("worktree")
+            worktree = None
+            if isinstance(worktree_text, str) and worktree_text:
+                worktree = Path(worktree_text)
+                if not worktree.is_absolute():
+                    worktree = self.config.repo / worktree
+            current_fingerprint = workspace_state_fingerprint(
+                repo=self.config.repo,
+                main_branch=self.config.main_branch,
+                branch=branch if isinstance(branch, str) else "",
+                worktree=worktree,
+                expected_base=(
+                    str(record.get("selected_base"))
+                    if isinstance(record.get("selected_base"), str)
+                    else ""
+                ),
+                ignored_dirty_paths=self.workspace_ignored_dirty_paths,
+            )
+            if current_fingerprint == recorded_fingerprint:
+                unchanged.add(task_id)
+        return unchanged
 
     def run_until_done_serial(
         self,
@@ -3936,8 +4345,10 @@ class VibeRunner:
         recovery_attempts: dict[str, int] = {}
         completed_count = 0
         while max_slices <= 0 or len(results) < max_slices:
+            skipped.update(self.unchanged_workspace_dispatch_deferrals())
             pending_contexts = self.pending_recovery_contexts()
             skipped.update(self._durably_exhausted_recovery_tasks)
+            skipped.update(self._workspace_deferred_recovery_tasks)
             pending = next(
                 (
                     recovery
@@ -4072,6 +4483,8 @@ class VibeRunner:
 
         pending_contexts = self.pending_recovery_contexts()
         skipped.update(self._durably_exhausted_recovery_tasks)
+        skipped.update(self._workspace_deferred_recovery_tasks)
+        skipped.update(self.unchanged_workspace_dispatch_deferrals())
         for recovery in pending_contexts:
             if max_slices > 0 and len(results) >= max_slices:
                 break
@@ -4231,13 +4644,20 @@ class VibeRunner:
                         )
                         skipped.add(task_id)
                         continue
-                    except AttemptCircuitOpen as exc:
+                    except (AttemptCircuitOpen, BudgetReservationDenied) as exc:
                         report_status(str(exc))
                         skipped.add(task_id)
                         continue
                     except LockBusy:
                         report_status(
                             f"task locked during acquire, skipping: {task_id}"
+                        )
+                        skipped.add(task_id)
+                        continue
+                    except WorkspaceProvisionError as exc:
+                        report_status(
+                            "workspace dispatch deferred before worker launch: "
+                            f"{task_id}: {exc.diagnostic}"
                         )
                         skipped.add(task_id)
                         continue
@@ -4504,6 +4924,8 @@ class VibeRunner:
         recovery_run_id: str = "",
         outcome: str = "",
         blocker: str = "",
+        retry_disposition: str = "",
+        workspace_state_fingerprint: str = "",
     ) -> None:
         self.run_store.append_lifecycle_event(
             RunLifecycleEvent.task_recovery(
@@ -4522,6 +4944,8 @@ class VibeRunner:
                     **recovery_context_payload(recovery),
                     "recovery_run_id": recovery_run_id,
                     "blocker": blocker,
+                    "retry_disposition": retry_disposition,
+                    "workspace_state_fingerprint": workspace_state_fingerprint,
                 },
             )
         )
@@ -4668,6 +5092,14 @@ class VibeRunner:
                 blocker="attempt_circuit_open",
             )
             return None
+        except BudgetReservationDenied as exc:
+            report_status(str(exc))
+            self.record_recovery_phase(
+                recovery,
+                phase="deferred",
+                blocker="budget_reservation_denied",
+            )
+            return None
         except LockBusy:
             report_status(
                 "unknown-run recovery deferred: task locked during acquire: "
@@ -4682,12 +5114,22 @@ class VibeRunner:
         except WorkspaceProvisionError as exc:
             report_status(
                 "unknown-run recovery deferred before worker launch: "
-                f"{recovery.task_id}: {exc.code}"
+                f"{recovery.task_id}: {exc.diagnostic}"
             )
+            workspace_state_fingerprint = ""
+            if exc.retry_disposition == "defer_until_workspace_changes":
+                workspace_state_fingerprint = workspace_retry_state_fingerprint(
+                    repo=self.config.repo,
+                    main_branch=self.config.main_branch,
+                    recovery=recovery,
+                    ignored_dirty_paths=self.workspace_ignored_dirty_paths,
+                )
             self.record_recovery_phase(
                 recovery,
                 phase="deferred",
                 blocker=exc.code,
+                retry_disposition=exc.retry_disposition,
+                workspace_state_fingerprint=workspace_state_fingerprint,
             )
             return None
         except (OSError, subprocess.SubprocessError) as exc:
@@ -4753,17 +5195,14 @@ class VibeRunner:
         # A provider limit wall exits nonzero, so it must be caught before the
         # exit_code branch downgrades it to "failed" and burns restart budget.
         # A worker that filed a terminal report above already made progress, so
-        # only wall-detect a report-less death. The exit_code != 0 gate keeps a
-        # successful run whose output merely quotes a limit phrase (e.g. a worker
-        # implementing limit handling) on the normal completion path.
-        if (
-            self.config.supervision.limit_wall_detection
-            and exit_code != 0
-            and output_tail
-        ):
-            signal = detect_limit_wall(
+        # only wall-detect a report-less death. detect_provider_limit_wall keeps
+        # a successful run whose output merely quotes a limit phrase (e.g. a
+        # worker implementing limit handling) on the normal completion path.
+        if self.config.supervision.limit_wall_detection and output_tail:
+            signal = detect_provider_limit_wall(
                 output_tail,
                 self.config.supervision.limit_wall_patterns or None,
+                exit_code=exit_code,
             )
             if signal is not None:
                 return ClassificationResult(
@@ -4813,6 +5252,44 @@ class VibeRunner:
                 result,
                 threshold=self.config.supervision.cross_run_attempt_threshold,
             )
+            if self.config.budget.enabled:
+                # Charge this run's live reservation(s) exactly once against the
+                # terminal provider usage; unknown usage is charged fail-safe,
+                # never zero. A run without a live reservation is a no-op.
+                self.budget_store.reconcile_run(
+                    run_id=result.run_id,
+                    stats=result.stats,
+                    provider=result.model_provider,
+                )
+
+    def recover_abandoned_budget(self) -> int:
+        """Reconcile budget reservations orphaned by a crashed prior supervisor.
+
+        A reservation whose owner run has a durable terminal result reconciles
+        from that result's authoritative-or-unknown usage; one whose owner is
+        provably dead with no result is charged fail-safe. The exactly-once
+        guard makes this safe to call at every dispatch start.
+        """
+
+        if not self.config.budget.enabled:
+            return 0
+        terminal: dict[str, BudgetRunOutcome] = {}
+        for record in self.run_store.read_records():
+            if record.get("record_type") not in {None, "run_result"}:
+                continue
+            run_id = record.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                continue
+            stats = record.get("stats")
+            provider = record.get("model_provider")
+            terminal[run_id] = BudgetRunOutcome(
+                stats=stats if isinstance(stats, dict) else {},
+                provider=provider if isinstance(provider, str) else "",
+            )
+        return self.budget_store.recover_abandoned(
+            resolve=terminal.get,
+            process_alive=process_alive_locally,
+        )
 
     def _report_limit_wall_pause(self, result: RunResult) -> None:
         detail = (result.message or "").strip()
@@ -4978,6 +5455,7 @@ class RecoveryContext:
     git_common_dir: str = ""
     dirty_snapshot: tuple[str, ...] = ()
     dirty_fingerprint: str = ""
+    workspace_state_fingerprint: str = ""
 
 
 def capture_recovery_workspace_snapshot(
@@ -5026,6 +5504,23 @@ def capture_recovery_workspace_snapshot(
     )
 
 
+def workspace_retry_state_fingerprint(
+    *,
+    repo: Path,
+    main_branch: str,
+    recovery: RecoveryContext,
+    ignored_dirty_paths: Sequence[Path] = (),
+) -> str:
+    return workspace_state_fingerprint(
+        repo=repo,
+        main_branch=main_branch,
+        branch=recovery.branch,
+        worktree=Path(recovery.worktree) if recovery.worktree else None,
+        expected_base=recovery.base_commit,
+        ignored_dirty_paths=ignored_dirty_paths,
+    )
+
+
 def recovery_context_payload(recovery: RecoveryContext) -> dict[str, object]:
     return {
         "task_id": recovery.task_id,
@@ -5042,6 +5537,7 @@ def recovery_context_payload(recovery: RecoveryContext) -> dict[str, object]:
         "git_common_dir": recovery.git_common_dir,
         "dirty_snapshot": list(recovery.dirty_snapshot),
         "dirty_fingerprint": recovery.dirty_fingerprint,
+        "workspace_state_fingerprint": recovery.workspace_state_fingerprint,
         "transcript_path": recovery.transcript_path,
         "wrapper_log": recovery.wrapper_log,
         "attempt": recovery.attempt,
@@ -5077,6 +5573,11 @@ def recovery_context_from_record(
         value = record.get(key)
         return value if isinstance(value, str) else ""
 
+    workspace_state_fingerprint = text_value("workspace_state_fingerprint")
+    if workspace_state_fingerprint and not SHA256_HEX_RE.fullmatch(
+        workspace_state_fingerprint
+    ):
+        return None
     return RecoveryContext(
         task_id=str(required_strings["task_id"]),
         prior_run_id=str(required_strings["prior_run_id"]),
@@ -5094,6 +5595,7 @@ def recovery_context_from_record(
         git_common_dir=text_value("git_common_dir"),
         dirty_snapshot=tuple(dirty),
         dirty_fingerprint=text_value("dirty_fingerprint"),
+        workspace_state_fingerprint=workspace_state_fingerprint,
     )
 
 
@@ -7297,6 +7799,94 @@ def observe_worker_session_id(line: str) -> str | None:
     return None
 
 
+def exportable_session_id(record: Mapping[str, object], *, run_id: str) -> str:
+    """Return the exportable session id a lifecycle record carries, else "".
+
+    A record names a session only when it carries both the id and a source from
+    the runtime's own vocabulary. A missing id, an unrecognized source, an id
+    outside the identifier alphabet, or an id equal to the run id all mean
+    "unknown", which the caller must express by omitting the variable rather
+    than exporting the value. The run id is refused whatever the source says: it
+    names the run rather than a session, and on the `runtime_launch` path the id
+    is reported by the agent, which could otherwise report it back as its own.
+
+    How much the returned id is worth depends on the provider -- see
+    `RECOGNIZED_SESSION_ID_SOURCES`. On an injecting provider it is bound to the
+    id the runtime issued; on a non-injecting one the agent supplied it. This
+    function cannot tell a caller which, because the record does not distinguish
+    them; the export carries no attestation-quality signal today.
+    """
+
+    session_id = record.get("session_id")
+    session_id_source = record.get("session_id_source")
+    if not isinstance(session_id, str) or not isinstance(session_id_source, str):
+        return ""
+    if session_id_source not in RECOGNIZED_SESSION_ID_SOURCES and not any(
+        session_id_source.startswith(prefix)
+        for prefix in RECOGNIZED_SESSION_ID_SOURCE_PREFIXES
+    ):
+        return ""
+    if EXPORTABLE_SESSION_ID_RE.fullmatch(session_id) is None:
+        return ""
+    if session_id == run_id:
+        return ""
+    return session_id
+
+
+def implementer_session_from_records(
+    records: Sequence[Mapping[str, object]],
+    *,
+    run_id: str,
+    task_id: str,
+) -> str:
+    """Session id of the worker that produced this run's candidate, else "".
+
+    The run records its worker identity once, when the session is observed, so
+    the observation is read back rather than recomputed from worker output.
+    """
+
+    session_id = ""
+    for record in records:
+        if record.get("record_type") != RUN_STATE_TRANSITION_RECORD_TYPE:
+            continue
+        if record.get("run_id") != run_id or record.get("task_id") != task_id:
+            continue
+        if record.get("to_state") != "session_observed":
+            continue
+        session_id = exportable_session_id(record, run_id=run_id)
+    return session_id
+
+
+def reviewer_session_from_records(
+    records: Sequence[Mapping[str, object]],
+    *,
+    run_id: str,
+    task_id: str,
+) -> str:
+    """Session id behind the approval integration relied on, else "".
+
+    The review loop exits into integration only on an approving pass, and the
+    output parser refuses an `approve` that carries findings or that leaves any
+    prior finding open, so the approve that ends the loop is by construction the
+    last one a run records. Reading the last approving verdict is therefore the
+    exit pass today, and stays correct rather than merely lucky if a later
+    change ever makes a second approving pass reachable: an earlier pass never
+    stands in for a later one, including when the later one recorded no
+    exportable session.
+    """
+
+    session_id = ""
+    for record in records:
+        if record.get("record_type") != REVIEW_VERDICT_RECORD_TYPE:
+            continue
+        if record.get("run_id") != run_id or record.get("task_id") != task_id:
+            continue
+        if record.get("verdict") != "approve":
+            continue
+        session_id = exportable_session_id(record, run_id=run_id)
+    return session_id
+
+
 def write_log_header(
     log,
     task: Task,
@@ -7386,15 +7976,152 @@ def terminate_worker_process_group(
 
 
 @dataclasses.dataclass(frozen=True)
+class VerifiedWorkerTeardown:
+    terminated: bool
+    identity_verified: bool
+    descendants_verified: bool
+    reason: str
+    process_count: int = 0
+
+
+def terminate_verified_worker_process_group(
+    process: subprocess.Popen,
+    log: TextIO,
+    *,
+    expected_birth_id: str,
+    sigkill_after_seconds: float = 2.0,
+    process_table: Callable[[], dict[int, ProcessNode]] = read_process_table,
+    process_node: Callable[[int], ProcessNode | None] = read_process_node,
+) -> VerifiedWorkerTeardown:
+    """Stop only the verified worker group and prove its captured tree exited."""
+    if not expected_birth_id:
+        return VerifiedWorkerTeardown(
+            False, False, False, "worker_identity_unavailable"
+        )
+    table = process_table()
+    root = table.get(process.pid)
+    if (
+        root is None
+        or root.process_birth_id != expected_birth_id
+        or root.process_group_id != process.pid
+        or root.session_id != process.pid
+    ):
+        return VerifiedWorkerTeardown(False, False, False, "worker_identity_mismatch")
+
+    descendants = collect_owned_descendants(table, {process.pid: expected_birth_id})
+    group = [node for node in table.values() if node.process_group_id == process.pid]
+    if any(node.session_id != process.pid for node in group):
+        return VerifiedWorkerTeardown(
+            False, True, False, "process_group_contains_unowned_member"
+        )
+    if any(node.process_group_id != process.pid for node in descendants):
+        return VerifiedWorkerTeardown(
+            False, True, False, "descendant_outside_worker_process_group"
+        )
+    owned = {node.pid: node for node in group}
+    owned.update((node.pid, node) for node in descendants)
+    for node in owned.values():
+        current = process_node(node.pid)
+        if current is None:
+            if node.pid == process.pid:
+                return VerifiedWorkerTeardown(
+                    False,
+                    False,
+                    False,
+                    "worker_identity_unavailable",
+                    len(owned),
+                )
+            continue
+        if (
+            current.process_birth_id != node.process_birth_id
+            or current.parent_pid != node.parent_pid
+            or current.process_group_id != node.process_group_id
+            or current.session_id != node.session_id
+        ):
+            return VerifiedWorkerTeardown(
+                False,
+                True,
+                False,
+                "descendant_identity_unverified",
+                len(owned),
+            )
+
+    terminate_worker_process_group(
+        process,
+        log,
+        sigkill_after_seconds=sigkill_after_seconds,
+    )
+    deadline = time.monotonic() + sigkill_after_seconds
+    remaining = list(owned.values())
+    while remaining and time.monotonic() < deadline:
+        remaining = [
+            node
+            for node in remaining
+            if (
+                (current := process_node(node.pid)) is not None
+                and current.process_birth_id == node.process_birth_id
+                and current.state not in {"Z", "X", "x"}
+            )
+        ]
+        if remaining:
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    if remaining:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except (PermissionError, OSError):
+            return VerifiedWorkerTeardown(
+                False,
+                True,
+                True,
+                "verified_processes_remain",
+                len(owned),
+            )
+        deadline = time.monotonic() + sigkill_after_seconds
+        while remaining and time.monotonic() < deadline:
+            remaining = [
+                node
+                for node in remaining
+                if (
+                    (current := process_node(node.pid)) is not None
+                    and current.process_birth_id == node.process_birth_id
+                    and current.state not in {"Z", "X", "x"}
+                )
+            ]
+            if remaining:
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+    if remaining:
+        return VerifiedWorkerTeardown(
+            False,
+            True,
+            True,
+            "verified_processes_remain",
+            len(owned),
+        )
+    return VerifiedWorkerTeardown(
+        True,
+        True,
+        True,
+        "accepted_report_runtime_closure",
+        len(owned),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
 class WaitOutcome:
     exit_code: int
     # True when the wall-clock deadline fired and the process group was killed.
     timed_out: bool = False
-    # True when the worker's verified process group was stopped because it kept
-    # performing structured activity after filing its terminal report. Distinct
-    # from timed_out so the accepted report stays authoritative for
-    # classification and the run is never turned into a retry.
+    # True when the worker's verified process group was stopped at a post-report
+    # boundary, either for structured activity or accepted runtime closure.
+    # Distinct from timed_out so an accepted report remains authoritative.
     post_report_enforced: bool = False
+    post_report_teardown_reason: str = ""
+    post_report_identity_verified: bool = False
+    post_report_descendants_verified: bool = False
+    post_report_teardown_process_count: int = 0
+    post_report_teardown_seconds: float = 0.0
 
 
 def wait_with_reap_watchdog(
@@ -7411,10 +8138,12 @@ def wait_with_reap_watchdog(
     identity_verified_ok: Callable[[], bool] | None = None,
     post_report_activity_grace_seconds: float = 0.0,
     report_boundary_wall: Callable[[], float | None] | None = None,
+    post_report_closure_check: Callable[[], str] | None = None,
+    post_report_teardown: Callable[[], VerifiedWorkerTeardown] | None = None,
 ) -> WaitOutcome:
     """Wait for a worker, reaping it if it hangs or overruns its report.
 
-    Three independent reap conditions apply:
+    Four independent reap conditions apply:
 
     * Wall-clock deadline (``timeout_seconds``): an absolute upper bound on the
       run regardless of whether the worker ever filed a report. When it fires
@@ -7434,6 +8163,11 @@ def wait_with_reap_watchdog(
       after ``post_report_activity_grace_seconds`` with ``post_report_enforced``
       set. This bounds the quota a worker burns by continuing to act past its
       accepted terminal report while leaving that report authoritative.
+    * Accepted-report closure (``post_report_closure_check``): runtime-owned
+      workers whose completed report and recorded candidate pass initial
+      acceptance are stopped immediately through ``post_report_teardown``.
+      This is a normal runtime stage boundary, not a timeout or activity
+      violation.
 
     Identity gating is fail-closed on every reap path (hang, timeout, and
     post-report enforcement): the group is signalled only on a positive
@@ -7497,6 +8231,23 @@ def wait_with_reap_watchdog(
         if eligible_now:
             _mark_boundary()
 
+    reap_eligible_since: float | None = None
+    activity_eligible_since: float | None = None
+    closure_checked = False
+    closure_teardown = VerifiedWorkerTeardown(False, False, False, "")
+    closure_teardown_seconds = 0.0
+
+    def _wait_outcome(exit_code: int) -> WaitOutcome:
+        return WaitOutcome(
+            exit_code,
+            post_report_enforced=closure_teardown.terminated,
+            post_report_teardown_reason=closure_teardown.reason,
+            post_report_identity_verified=closure_teardown.identity_verified,
+            post_report_descendants_verified=closure_teardown.descendants_verified,
+            post_report_teardown_process_count=closure_teardown.process_count,
+            post_report_teardown_seconds=closure_teardown_seconds,
+        )
+
     def _reap_for_timeout() -> WaitOutcome:
         report_status(
             f"worker pid={process.pid} exceeded its "
@@ -7506,10 +8257,12 @@ def wait_with_reap_watchdog(
         )
         if _identity_verified():
             terminate_worker_process_group(process, log)
-        return WaitOutcome(process.wait(), timed_out=True)
+        return dataclasses.replace(
+            _wait_outcome(process.wait()),
+            timed_out=True,
+            post_report_enforced=False,
+        )
 
-    reap_eligible_since: float | None = None
-    activity_eligible_since: float | None = None
     while True:
         wait_for = poll_seconds
         if deadline is not None:
@@ -7523,7 +8276,7 @@ def wait_with_reap_watchdog(
             pass
         else:
             _reconcile_boundary_on_exit()
-            return WaitOutcome(exit_code)
+            return _wait_outcome(exit_code)
         if deadline is not None and monotonic() - deadline >= 0:
             return _reap_for_timeout()
         eligible = False
@@ -7536,6 +8289,64 @@ def wait_with_reap_watchdog(
                 eligible = False
         if eligible and not report_marked:
             _mark_boundary()
+        if (
+            report_marked
+            and not closure_checked
+            and post_report_closure_check is not None
+        ):
+            try:
+                closure_reason = post_report_closure_check()
+            # The acceptance callback combines journal reads and Git
+            # subprocesses; any unexpected failure must refuse closure without
+            # crashing supervision or signalling the worker.
+            except Exception:
+                closure_reason = "closure_acceptance_check_failed"
+            if closure_reason:
+                closure_checked = True
+                if closure_reason == "accepted_completed_candidate":
+                    started = monotonic()
+                    if post_report_teardown is None:
+                        closure_teardown = VerifiedWorkerTeardown(
+                            False,
+                            False,
+                            False,
+                            "teardown_handler_unavailable",
+                        )
+                    else:
+                        try:
+                            closure_teardown = post_report_teardown()
+                        # Teardown combines process snapshots, identity reads,
+                        # waits, and signals. Any unexpected failure is a
+                        # fail-closed result, never permission to continue.
+                        except Exception:
+                            closure_teardown = VerifiedWorkerTeardown(
+                                False,
+                                False,
+                                False,
+                                "teardown_handler_failed",
+                            )
+                    closure_teardown_seconds = max(0.0, monotonic() - started)
+                    if closure_teardown.terminated:
+                        report_status(
+                            f"worker pid={process.pid} accepted completed report "
+                            "and candidate; verified runtime closure stopped its "
+                            "process group",
+                            log,
+                        )
+                        return _wait_outcome(process.wait())
+                    report_status(
+                        f"worker pid={process.pid} accepted completed report but "
+                        "verified runtime closure failed: "
+                        f"{closure_teardown.reason}",
+                        log,
+                    )
+                else:
+                    closure_teardown = VerifiedWorkerTeardown(
+                        False,
+                        False,
+                        False,
+                        closure_reason,
+                    )
         if (
             post_report_monitor is not None
             and report_marked
@@ -7553,7 +8364,11 @@ def wait_with_reap_watchdog(
                 )
                 if _identity_verified():
                     terminate_worker_process_group(process, log)
-                    return WaitOutcome(process.wait(), post_report_enforced=True)
+                    return dataclasses.replace(
+                        _wait_outcome(process.wait()),
+                        post_report_enforced=True,
+                        post_report_identity_verified=True,
+                    )
                 # Identity could not be positively verified: the live PID may be
                 # a recycled, unrelated group, so enforcement stands down. The
                 # accepted report is already authoritative.
@@ -7562,7 +8377,7 @@ def wait_with_reap_watchdog(
                     "not signalling post-report teardown",
                     log,
                 )
-                return WaitOutcome(process.wait())
+                return _wait_outcome(process.wait())
         if not eligible:
             continue
         now = monotonic()
@@ -7578,7 +8393,7 @@ def wait_with_reap_watchdog(
             )
             if _identity_verified():
                 terminate_worker_process_group(process, log)
-            return WaitOutcome(process.wait())
+            return _wait_outcome(process.wait())
 
 
 def run_streaming_command(
@@ -7595,32 +8410,64 @@ def run_streaming_command(
     reap_poll_seconds: float = 10.0,
     post_report_activity_grace_seconds: float = 0.0,
     report_persistence_epoch: Callable[[], float | None] | None = None,
+    post_report_closure_check: Callable[[], str] | None = None,
     timeout_seconds: float | None = None,
     provider: str = "unknown",
 ) -> StreamingCommandResult:
     cmd, use_shell = prepare_shell_command(command)
+    launch_gate_read_fd: int | None = None
+    launch_gate_write_fd: int | None = None
     popen_kwargs: dict[str, object] = {}
+    if sys.platform == "linux":
+        # The child cannot invoke even a shell wrapper until `on_start`
+        # durably publishes its PID. Supervisor death closes the write end, so
+        # an unrecorded child observes EOF and exits without running the command.
+        launch_gate_read_fd, launch_gate_write_fd = os.pipe()
+        guarded_command = [str(item) for item in cmd] if not use_shell else [str(cmd)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "vibe_loop.worker_guard",
+            str(os.getpid()),
+            str(launch_gate_read_fd),
+            "shell" if use_shell else "exec",
+            "--",
+            *guarded_command,
+        ]
+        use_shell = False
+        popen_kwargs["pass_fds"] = (launch_gate_read_fd,)
     if os.name != "nt":
         # Own session/process group so a worker that hangs after reporting can
         # be reaped as a unit, including any orphaned background grandchildren
         # that keep its stdout/stderr pipes open.
         popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen(
-        cmd,
-        cwd=cwd,
-        shell=use_shell,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        env=env,
-        **popen_kwargs,
-    )
+    try:
+        process = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            shell=use_shell,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            **popen_kwargs,
+        )
+    except BaseException:
+        if launch_gate_read_fd is not None:
+            os.close(launch_gate_read_fd)
+        if launch_gate_write_fd is not None:
+            os.close(launch_gate_write_fd)
+        raise
+    if launch_gate_read_fd is not None:
+        os.close(launch_gate_read_fd)
     try:
         if on_start is not None:
             on_start(process.pid)
+        if launch_gate_write_fd is not None:
+            os.write(launch_gate_write_fd, b"\0")
     # Startup callbacks persist ownership evidence. Every failure, including
     # interruption, must reap the new group before that evidence can be lost.
     except BaseException:
@@ -7644,6 +8491,8 @@ def run_streaming_command(
         except OSError:
             pass
         finally:
+            if launch_gate_write_fd is not None:
+                os.close(launch_gate_write_fd)
             for pipe in (process.stdout, process.stderr):
                 if pipe is None:
                     continue
@@ -7652,6 +8501,8 @@ def run_streaming_command(
                 except OSError:
                     pass
         raise
+    if launch_gate_write_fd is not None:
+        os.close(launch_gate_write_fd)
     assert process.stdout is not None
     assert process.stderr is not None
     # Captured immediately after Popen while the PID is still ours, so a later
@@ -7732,6 +8583,14 @@ def run_streaming_command(
         identity_verified_ok=identity_verified,
         post_report_activity_grace_seconds=post_report_activity_grace_seconds,
         report_boundary_wall=report_persistence_epoch,
+        post_report_closure_check=(
+            post_report_closure_check if expected_birth_id else None
+        ),
+        post_report_teardown=lambda: terminate_verified_worker_process_group(
+            process,
+            log,
+            expected_birth_id=expected_birth_id,
+        ),
     )
     stdout_thread.join()
     stderr_thread.join()
@@ -7741,7 +8600,15 @@ def run_streaming_command(
     observation = output_observer.observation
     post_report = post_report_monitor.snapshot(
         enforced_stop=wait_outcome.post_report_enforced,
-        identity_verified=wait_outcome.post_report_enforced and bool(expected_birth_id),
+        identity_verified=wait_outcome.post_report_identity_verified
+        or (wait_outcome.post_report_enforced and bool(expected_birth_id)),
+    )
+    post_report = dataclasses.replace(
+        post_report,
+        teardown_reason=wait_outcome.post_report_teardown_reason,
+        descendants_verified=wait_outcome.post_report_descendants_verified,
+        teardown_process_count=wait_outcome.post_report_teardown_process_count,
+        teardown_seconds=wait_outcome.post_report_teardown_seconds,
     )
     return StreamingCommandResult(
         exit_code=wait_outcome.exit_code,

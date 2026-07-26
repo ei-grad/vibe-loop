@@ -34,7 +34,7 @@ requirement IDs, spec paths, design references, approval state, and source
 fingerprints.
 
 Acceptance must cover JSON output, command-backed task sources, Markdown
-profiles, generated profiles, planning analytics, and backward compatibility
+profiles, generated profiles, bounded run context, and backward compatibility
 for task sources that do not expose traceability fields.
 
 Related implementation IDs: `GANTT-01`, `GANTT-02`, `SDD-02`, `DOC-04`.
@@ -82,9 +82,9 @@ Related implementation IDs: `AGENT-06`, `PAR-03`, `PAR-07`, `SDD-04`.
 slice satisfied and which commits, reports, tests, or reviews support that
 claim.
 
-Acceptance must cover commit trailers or worker-report metadata, planning
-analytics ingestion, spec coverage reports, unmapped commit warnings, and
-distinguishing attempted work from accepted completion evidence.
+Acceptance must cover commit trailers or worker-report metadata, spec coverage
+reports, unmapped commit warnings, and distinguishing attempted work from
+accepted completion evidence.
 
 `runs.jsonl` should expose enough bounded run context for repository-specific
 tools to create those durable mappings outside one host's state directory. That

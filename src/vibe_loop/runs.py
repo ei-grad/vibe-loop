@@ -54,7 +54,27 @@ LOCK_FINALIZATION_FAILED_RECORD_TYPE = "lock_finalization_failed"
 RUN_STARTED_RECORD_TYPE = "run_started"
 RUN_CONTRACT_RESOLVED_RECORD_TYPE = "run_contract_resolved"
 WORKSPACE_PROVISIONED_RECORD_TYPE = "workspace_provisioned"
+WORKSPACE_PREFLIGHT_RECORD_TYPE = "workspace_preflight"
+# Why an automatic refresh of a stale workspace was declined. Closed so the
+# journal stays a bounded vocabulary, and recorded because the deferral reason
+# alone cannot tell an operator whether real work is being preserved, whether
+# git could not be read, or whether a refresh was never attempted.
+WORKSPACE_REFRESH_REFUSALS = frozenset(
+    {
+        "dirty_snapshot_unreadable",
+        "dirty_workspace",
+        "fast_forward_refused",
+        "head_unreadable_or_moved",
+        "recovery_adoption",
+        "refresh_did_not_reach_base",
+        "status_unreadable",
+        "tracked_modification_behind_ignored_path",
+        "unique_commits",
+        "unique_commits_unreadable",
+    }
+)
 CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"
+CANDIDATE_BASE_ANCHOR_RECORD_TYPE = "candidate_base_anchor"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 REVIEW_STARTED_RECORD_TYPE = "review_started"
 REVIEW_VERDICT_RECORD_TYPE = "review_verdict"
@@ -63,11 +83,20 @@ REVIEW_BUDGET_RECORD_TYPE = "review_budget"
 CONTINUATION_FALLBACK_RECORD_TYPE = "continuation_fallback"
 FINDING_RECORDED_RECORD_TYPE = "finding_recorded"
 INTEGRATION_RESULT_RECORD_TYPE = "integration_result"
+INTEGRATION_PROVENANCE_RECORD_TYPE = "integration_provenance"
+INTEGRATION_PROVENANCE_OUTCOMES = frozenset(
+    {
+        "settled-directly",
+        "settled-by-reconciliation",
+        "refused-unprovable",
+    }
+)
 TASK_PROVENANCE_COMMITTED_RECORD_TYPE = "task_provenance_committed"
 TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE = "task_source_settlement_attempted"
 TASK_SOURCE_SETTLED_RECORD_TYPE = "task_source_settled"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
 POST_REPORT_ACTIVITY_RECORD_TYPE = "post_report_activity"
+POST_REPORT_CLOSURE_RECORD_TYPE = "post_report_closure"
 AGENT_CONTEXT_OBSERVED_RECORD_TYPE = "agent_context_observed"
 WORKSPACE_CLAIM_RECORD_TYPE = "workspace_claim"
 WORKSPACE_CLAIMED_EVENT_TYPE = "workspace_claimed"
@@ -125,7 +154,9 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         RUN_STARTED_RECORD_TYPE,
         RUN_CONTRACT_RESOLVED_RECORD_TYPE,
         WORKSPACE_PROVISIONED_RECORD_TYPE,
+        WORKSPACE_PREFLIGHT_RECORD_TYPE,
         CANDIDATE_RECORDED_RECORD_TYPE,
+        CANDIDATE_BASE_ANCHOR_RECORD_TYPE,
         GATE_RESULT_RECORD_TYPE,
         REVIEW_STARTED_RECORD_TYPE,
         REVIEW_VERDICT_RECORD_TYPE,
@@ -134,11 +165,13 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         CONTINUATION_FALLBACK_RECORD_TYPE,
         FINDING_RECORDED_RECORD_TYPE,
         INTEGRATION_RESULT_RECORD_TYPE,
+        INTEGRATION_PROVENANCE_RECORD_TYPE,
         TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
         TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE,
         TASK_SOURCE_SETTLED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
         POST_REPORT_ACTIVITY_RECORD_TYPE,
+        POST_REPORT_CLOSURE_RECORD_TYPE,
         AGENT_CONTEXT_OBSERVED_RECORD_TYPE,
         AGENT_STARTED_RECORD_TYPE,
         ACTIVITY_CHECKPOINT_RECORD_TYPE,
@@ -688,6 +721,70 @@ class RunLifecycleEvent:
         )
 
     @classmethod
+    def workspace_preflight(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        decision: str,
+        reason: str,
+        retry_disposition: str,
+        worker_launch_allowed: bool,
+        branch: str = "",
+        worktree: Path | None = None,
+        selected_base: str = "",
+        workspace_base: str = "",
+        head_commit: str = "",
+        workspace_state_fingerprint: str = "",
+        refresh_refused: str = "",
+    ) -> RunLifecycleEvent:
+        if decision not in {"created", "reusable", "rejected"}:
+            raise ValueError("workspace preflight decision is invalid")
+        if retry_disposition not in {
+            "not_needed",
+            "defer_until_workspace_changes",
+            "retry_later",
+        }:
+            raise ValueError("workspace preflight retry disposition is invalid")
+        if not reason or len(reason.encode("utf-8", "replace")) > 128:
+            raise ValueError("workspace preflight reason is invalid")
+        if refresh_refused and refresh_refused not in WORKSPACE_REFRESH_REFUSALS:
+            raise ValueError("workspace preflight refresh refusal is invalid")
+        payload: dict[str, Any] = {
+            "task_id": task_id,
+            "decision": decision,
+            "reason": reason,
+            "retry_disposition": retry_disposition,
+            "worker_launch_allowed": worker_launch_allowed,
+        }
+        if branch and len(branch.encode("utf-8", "replace")) <= 1024:
+            payload["branch"] = branch
+        worktree_text = str(worktree) if worktree is not None else ""
+        if worktree_text and len(worktree_text.encode("utf-8", "replace")) <= 4096:
+            payload["worktree"] = worktree_text
+        if selected_base and len(selected_base.encode("utf-8", "replace")) <= 128:
+            payload["selected_base"] = selected_base
+        if workspace_base and len(workspace_base.encode("utf-8", "replace")) <= 128:
+            payload["workspace_base"] = workspace_base
+        if head_commit and len(head_commit.encode("utf-8", "replace")) <= 128:
+            payload["head_commit"] = head_commit
+        if workspace_state_fingerprint:
+            if len(workspace_state_fingerprint) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in workspace_state_fingerprint
+            ):
+                raise ValueError("workspace state fingerprint is invalid")
+            payload["workspace_state_fingerprint"] = workspace_state_fingerprint
+        if refresh_refused:
+            payload["refresh_refused"] = refresh_refused
+        return cls(
+            record_type=WORKSPACE_PREFLIGHT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
     def candidate_recorded(
         cls,
         *,
@@ -697,6 +794,21 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=CANDIDATE_RECORDED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def candidate_base_anchor(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=CANDIDATE_BASE_ANCHOR_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,
@@ -842,6 +954,29 @@ class RunLifecycleEvent:
         )
 
     @classmethod
+    def integration_provenance(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        outcome: str,
+        candidate_commit: str,
+        target_commit: str,
+    ) -> RunLifecycleEvent:
+        if outcome not in INTEGRATION_PROVENANCE_OUTCOMES:
+            raise ValueError(f"unsupported integration provenance outcome: {outcome}")
+        return cls(
+            record_type=INTEGRATION_PROVENANCE_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "outcome": outcome,
+                "candidate_commit": candidate_commit,
+                "target_commit": target_commit,
+            },
+        )
+
+    @classmethod
     def task_provenance_committed(
         cls,
         *,
@@ -965,6 +1100,66 @@ class RunLifecycleEvent:
                 "identity_verified": identity_verified,
                 "terminated": terminated,
                 "report_status": report_status,
+                "runtime_lifecycle_decision": runtime_lifecycle_decision,
+                "runtime_lifecycle_reason": runtime_lifecycle_reason,
+            },
+        )
+
+    @classmethod
+    def post_report_closure(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        post_report_seconds: float,
+        teardown_seconds: float,
+        worker_pid: int | None,
+        process_group_id: int | None,
+        process_count: int,
+        identity_verified: bool,
+        descendants_verified: bool,
+        terminated: bool,
+        report_status: str,
+        teardown_reason: str,
+        runtime_lifecycle_decision: str,
+        runtime_lifecycle_reason: str,
+    ) -> RunLifecycleEvent:
+        allowed_reasons = {
+            "accepted_candidate_initially_changed",
+            "accepted_candidate_missing",
+            "accepted_report_candidate_mismatch",
+            "accepted_report_commit_missing",
+            "accepted_report_not_completed",
+            "accepted_report_runtime_closure",
+            "closure_acceptance_check_failed",
+            "descendant_identity_unverified",
+            "descendant_outside_worker_process_group",
+            "process_group_contains_unowned_member",
+            "teardown_handler_failed",
+            "teardown_handler_unavailable",
+            "verified_processes_remain",
+            "worker_identity_mismatch",
+            "worker_identity_unavailable",
+        }
+        if teardown_reason not in allowed_reasons:
+            raise ValueError("post-report closure reason is invalid")
+        return cls(
+            record_type=POST_REPORT_CLOSURE_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "task_id": task_id,
+                "policy": "accepted_report_runtime_closure",
+                "post_report_seconds": max(0.0, post_report_seconds),
+                "teardown_seconds": max(0.0, teardown_seconds),
+                "worker_pid": worker_pid,
+                "worker_process_group_id": process_group_id,
+                "teardown_process_count": max(0, process_count),
+                "identity_verified": identity_verified,
+                "descendants_verified": descendants_verified,
+                "terminated": terminated,
+                "report_status": report_status,
+                "teardown_reason": teardown_reason,
                 "runtime_lifecycle_decision": runtime_lifecycle_decision,
                 "runtime_lifecycle_reason": runtime_lifecycle_reason,
             },
@@ -1593,6 +1788,130 @@ class RunStore:
     def append_result(self, result: RunResult) -> None:
         self.append_record(result.to_record())
 
+    def record_completed_integration(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        integration: RunLifecycleEvent,
+        provenance_outcome: str,
+    ) -> str:
+        """Atomically record one completed integration and its provenance."""
+
+        if provenance_outcome not in {
+            "settled-directly",
+            "settled-by-reconciliation",
+        }:
+            raise ValueError(
+                "completed integration provenance must describe a settlement"
+            )
+        integration_record = integration.to_record()
+        if (
+            integration_record.get("record_type") != INTEGRATION_RESULT_RECORD_TYPE
+            or integration_record.get("run_id") != run_id
+            or integration_record.get("task_id") != task_id
+            or integration_record.get("status") != "completed"
+        ):
+            raise ValueError("integration must be a completed result")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                prior_settlement = next(
+                    (
+                        record
+                        for record in reversed(records)
+                        if record.get("record_type")
+                        == INTEGRATION_PROVENANCE_RECORD_TYPE
+                        and record.get("run_id") == run_id
+                        and record.get("task_id") == task_id
+                        and record.get("outcome")
+                        in {
+                            "settled-directly",
+                            "settled-by-reconciliation",
+                        }
+                    ),
+                    None,
+                )
+                if prior_settlement is not None:
+                    return string_value(prior_settlement.get("outcome"))
+
+                durable_integration = next(
+                    (
+                        record
+                        for record in reversed(records)
+                        if record.get("record_type") == INTEGRATION_RESULT_RECORD_TYPE
+                        and record.get("run_id") == run_id
+                        and record.get("task_id") == task_id
+                        and record.get("status") == "completed"
+                        and record.get("outcome") in {"merged", "branch_already_merged"}
+                        and isinstance(record.get("candidate_head"), str)
+                        and bool(record.get("candidate_head"))
+                        and isinstance(record.get("main_after"), str)
+                        and bool(record.get("main_after"))
+                    ),
+                    None,
+                )
+                if durable_integration is None:
+                    self._append_record_unlocked(integration_record)
+                    durable_integration = integration_record
+                self._append_record_unlocked(
+                    RunLifecycleEvent.integration_provenance(
+                        run_id=run_id,
+                        task_id=task_id,
+                        outcome=provenance_outcome,
+                        candidate_commit=string_value(
+                            durable_integration.get("candidate_head")
+                        ),
+                        target_commit=string_value(
+                            durable_integration.get("main_after")
+                        ),
+                    ).to_record()
+                )
+                return provenance_outcome
+
+    def record_integration_provenance_refusal(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        candidate_commit: str,
+        target_commit: str,
+    ) -> None:
+        """Record one refusal for an exact candidate and target identity."""
+
+        event = RunLifecycleEvent.integration_provenance(
+            run_id=run_id,
+            task_id=task_id,
+            outcome="refused-unprovable",
+            candidate_commit=candidate_commit,
+            target_commit=target_commit,
+        ).to_record()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                already_recorded = any(
+                    record.get("record_type") == INTEGRATION_PROVENANCE_RECORD_TYPE
+                    and record.get("run_id") == run_id
+                    and record.get("task_id") == task_id
+                    and (
+                        record.get("outcome")
+                        in {
+                            "settled-directly",
+                            "settled-by-reconciliation",
+                        }
+                        or (
+                            record.get("outcome") == "refused-unprovable"
+                            and record.get("candidate_commit") == candidate_commit
+                            and record.get("target_commit") == target_commit
+                        )
+                    )
+                    for record in records
+                )
+                if not already_recorded:
+                    self._append_record_unlocked(event)
+
     def claim_review_attempt(
         self,
         *,
@@ -2109,6 +2428,8 @@ def record_status(record: dict[str, Any]) -> str:
         return f"{phase}:{outcome}" if outcome else phase
     if record_type == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
         return string_value(record.get("confirmed_status")) or "committed"
+    if record_type == INTEGRATION_PROVENANCE_RECORD_TYPE:
+        return string_value(record.get("outcome"))
     if record_type == TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE:
         return "settlement_pending"
     if record_type == TASK_SOURCE_SETTLED_RECORD_TYPE:

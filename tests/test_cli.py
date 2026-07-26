@@ -40,6 +40,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
+    RunResult,
     RunStore,
     utc_now_iso,
 )
@@ -611,6 +612,128 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("--cycle-schedule 1800", autopilot_text)
         self.assertNotIn("vibe-loop autopilot run", autopilot_text)
         self.assertNotRegex(autopilot_text, r"\bnohup\s+vibe-loop\b")
+        self.assertIn("Recovering the agent inventory", orchestrated_text)
+        self.assertIn("agent-<registry-key>.meta.json", orchestrated_text)
+        self.assertIn("transcript_mtime_ns", orchestrated_text)
+        self.assertIn("Never spawn an unnamed", orchestrated_text)
+        self.assertIn("`TaskOutput`", orchestrated_text)
+        self.assertIn("`TaskStop`", orchestrated_text)
+
+    def test_installed_orchestrated_skill_inventory_recipe(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("documented inventory recipe requires bash")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                exit_code = main(["install-skills", "--codex", "--home", str(home)])
+            self.assertEqual(exit_code, 0)
+
+            skill_path = (
+                home / ".codex" / "skills" / "orchestrated-vibe-loop" / "SKILL.md"
+            )
+            skill_text = skill_path.read_text(encoding="utf-8")
+            section_start = skill_text.index("### Recovering the agent inventory")
+            block_start = skill_text.index("```bash\n", section_start) + len(
+                "```bash\n"
+            )
+            block_end = skill_text.index("\n```", block_start)
+            recipe = skill_text[block_start:block_end]
+            self.assertTrue(recipe.startswith('python3 - "$subagents_dir"'))
+
+            subagents = root / "subagents"
+            subagents.mkdir()
+            agent_meta = subagents / "agent-a1234567890abcdef.meta.json"
+            agent_meta.write_text(
+                json.dumps(
+                    {
+                        "agentType": "general-purpose",
+                        "description": "Implement the inventory",
+                        "name": "inventory-impl",
+                        "toolUseId": "toolu_agent",
+                        "spawnDepth": 1,
+                        "worktreePath": "/tmp/inventory-worktree",
+                        "worktreeBranch": "worktree-inventory",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            teammate_meta = subagents / "agent-aui-inventory-6bf12353a5b0a8dc.meta.json"
+            teammate_meta.write_text(
+                json.dumps(
+                    {
+                        "agentType": "ui-inventory",
+                        "description": "Review the inventory UI",
+                        "name": "ui-inventory",
+                        "taskKind": "in_process_teammate",
+                        "teamName": "session-056f8296",
+                        "model": "opus",
+                        "permissionMode": "bypassPermissions",
+                        "spawnDepth": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent_transcript = agent_meta.with_name("agent-a1234567890abcdef.jsonl")
+            agent_transcript.write_text("not valid transcript JSON", encoding="utf-8")
+            os.utime(agent_transcript, ns=(1_234_567_890, 1_234_567_890))
+
+            result = subprocess.run(
+                [bash, "-c", recipe],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "subagents_dir": str(subagents),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            records = {
+                record["registry_key"]: record
+                for record in map(json.loads, result.stdout.splitlines())
+            }
+
+        self.assertEqual(
+            records["a1234567890abcdef"],
+            {
+                "agent_type": "general-purpose",
+                "assignment": "Implement the inventory",
+                "model": None,
+                "name": "inventory-impl",
+                "permission_mode": None,
+                "registry_key": "a1234567890abcdef",
+                "spawn_depth": 1,
+                "stop_address": "inventory-impl",
+                "task_output_id": "a1234567890abcdef",
+                "team_name": None,
+                "tool_use_id": "toolu_agent",
+                "transcript_mtime_ns": 1_234_567_890,
+                "worktree_branch": "worktree-inventory",
+                "worktree_path": "/tmp/inventory-worktree",
+            },
+        )
+        self.assertEqual(
+            records["aui-inventory-6bf12353a5b0a8dc"],
+            {
+                "agent_type": "ui-inventory",
+                "assignment": "Review the inventory UI",
+                "model": "opus",
+                "name": "ui-inventory",
+                "permission_mode": "bypassPermissions",
+                "registry_key": "aui-inventory-6bf12353a5b0a8dc",
+                "spawn_depth": 0,
+                "stop_address": "ui-inventory@session-056f8296",
+                "task_output_id": None,
+                "team_name": "session-056f8296",
+                "tool_use_id": None,
+                "transcript_mtime_ns": None,
+                "worktree_branch": None,
+                "worktree_path": None,
+            },
+        )
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
@@ -8538,6 +8661,41 @@ class CliTests(unittest.TestCase):
             "\tupdated=2026-05-09T00:01:00+00:00\n",
         )
 
+    def test_run_inspection_history_renders_integration_provenance_outcome(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.integration_provenance(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    outcome="refused-unprovable",
+                    candidate_commit="a" * 40,
+                    target_commit="b" * 40,
+                )
+            )
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="blocked",
+                    exit_code=1,
+                    log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                    start_main="a" * 40,
+                    end_main="b" * 40,
+                )
+            )
+
+            rendered = cli_module.render_run_inspection(store.inspect_run("run-1"))
+
+        self.assertIn("status: blocked", rendered)
+        self.assertIn(
+            "- integration_provenance\tstatus=refused-unprovable\tupdated=",
+            rendered,
+        )
+
     def test_runs_json_redacts_legacy_fencing_token_fields(self) -> None:
         expected_token = "legacy-expected-fencing-canary"
         actual_token = "legacy-actual-fencing-canary"
@@ -8791,6 +8949,46 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIn("--min-ready", stderr.getvalue())
         self.assertIn("must be a positive integer", stderr.getvalue())
 
+    def test_run_rejects_interval_below_one_minute(self) -> None:
+        stderr = StringIO()
+        with self.assertRaises(SystemExit) as caught:
+            with redirect_stdout(StringIO()), redirect_stderr(stderr):
+                main(["autopilot", "run", "--interval", "59.9"])
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("--interval", stderr.getvalue())
+        self.assertIn(
+            "must be zero for drain mode or at least 60 seconds",
+            stderr.getvalue(),
+        )
+
+    def test_run_accepts_zero_interval_for_drain_mode(self) -> None:
+        class Summary:
+            exit_code = 0
+
+            def to_json(self):
+                return {"cycles": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            with patch.object(
+                cli_module, "run_autopilot", return_value=Summary()
+            ) as run:
+                exit_code = main(
+                    [
+                        "autopilot",
+                        "run",
+                        "--repo",
+                        str(repo),
+                        "--interval",
+                        "0",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run.call_args.kwargs["interval"], 0.0)
+
     def test_bare_autopilot_routes_to_run_and_terminates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
@@ -8877,7 +9075,7 @@ class AutopilotCliTests(unittest.TestCase):
                     "--repo",
                     str(repo),
                     "--interval",
-                    "30",
+                    "60",
                     "--json",
                 ],
                 cwd=repo,
@@ -8934,7 +9132,7 @@ class AutopilotCliTests(unittest.TestCase):
                         "--repo",
                         str(repo),
                         "--interval",
-                        "30",
+                        "60",
                         "--json",
                     ],
                     cwd=repo,
@@ -9009,7 +9207,7 @@ class AutopilotCliTests(unittest.TestCase):
                         "--repo",
                         str(repo),
                         "--interval",
-                        "30",
+                        "60",
                         "--json",
                     ],
                     cwd=repo,
@@ -9076,7 +9274,7 @@ class AutopilotCliTests(unittest.TestCase):
                     text=True,
                 )
 
-            start = run_cli("start", "--repo", str(repo), "--interval", "30", "--json")
+            start = run_cli("start", "--repo", str(repo), "--interval", "60", "--json")
             self.assertEqual(start.returncode, 0, start.stderr)
             launch = json.loads(start.stdout)
             pid = launch["pid"]
@@ -9099,7 +9297,7 @@ class AutopilotCliTests(unittest.TestCase):
                 self.assertNotIn(AUTOPILOT_LOCK_NAME, command_lock_state(state_path))
 
                 restart = run_cli(
-                    "start", "--repo", str(repo), "--interval", "30", "--json"
+                    "start", "--repo", str(repo), "--interval", "60", "--json"
                 )
                 self.assertEqual(restart.returncode, 0, restart.stderr)
                 restarted = json.loads(restart.stdout)
@@ -9175,7 +9373,7 @@ class AutopilotCliTests(unittest.TestCase):
                     text=True,
                 )
 
-            start = run_cli("start", "--repo", str(repo), "--interval", "30", "--json")
+            start = run_cli("start", "--repo", str(repo), "--interval", "60", "--json")
             self.assertEqual(start.returncode, 0, start.stderr)
             launch = json.loads(start.stdout)
             supervisor_pid = launch["pid"]

@@ -37,6 +37,104 @@ Maintain a compact ledger during the run:
 Update the ledger after exploration, implementation, review, remediation,
 integration, blockers, and final summary.
 
+### Recovering the agent inventory
+
+Do not rely on conversation context as the only record of spawned agents. Before
+dispatching, give every agent a unique, task-scoped name and record the returned
+agent id, name, assignment, and workspace in the ledger. Never spawn an unnamed
+agent: some harnesses can address an agent by id for output but require its name
+to stop it.
+
+After a context compaction, use the harness's native agent-inventory operation
+when one exists. Do not confuse a todo-list operation such as `TaskList` or
+`TaskGet` with an agent inventory.
+
+Claude Code records a durable fallback inventory under the coordinator's exact
+session directory:
+
+```text
+~/.claude/projects/<project-slug>/<session-id>/subagents/
+  agent-<registry-key>.meta.json
+  agent-<registry-key>.jsonl
+```
+
+The small `.meta.json` sidecar supplies the assignment in `description` and the
+agent kind in `agentType`. Other fields vary by launch mode: `name`, `model`,
+`permissionMode`, `toolUseId`, `spawnDepth`, `teamName`, `worktreePath`, and
+`worktreeBranch` may be absent. The filename always supplies a registry key,
+including for a legacy unnamed agent, but that key is not always an
+addressable harness id. The sibling `.jsonl` is the full transcript: never
+read, `cat`, or `tail` it merely to build an inventory.
+
+Given the exact `subagents` directory, this read-only recipe emits one JSON
+record per agent while only statting transcripts:
+
+```bash
+python3 - "$subagents_dir" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for meta_path in sorted(root.glob("agent-*.meta.json")):
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    registry_key = meta_path.name.removeprefix("agent-").removesuffix(".meta.json")
+    is_teammate = metadata.get("taskKind") == "in_process_teammate"
+    task_output_id = (
+        registry_key
+        if not is_teammate and re.fullmatch(r"a[0-9a-f]{16}", registry_key)
+        else None
+    )
+    name = metadata.get("name")
+    team_name = metadata.get("teamName")
+    stop_address = (
+        f"{name}@{team_name}" if is_teammate and name and team_name else name
+    )
+    transcript = meta_path.with_name(
+        meta_path.name.removesuffix(".meta.json") + ".jsonl"
+    )
+    transcript_stat = transcript.stat() if transcript.is_file() else None
+    print(json.dumps({
+        "registry_key": registry_key,
+        "task_output_id": task_output_id,
+        "stop_address": stop_address,
+        "name": name,
+        "assignment": metadata.get("description"),
+        "model": metadata.get("model"),
+        "agent_type": metadata.get("agentType"),
+        "permission_mode": metadata.get("permissionMode"),
+        "tool_use_id": metadata.get("toolUseId"),
+        "spawn_depth": metadata.get("spawnDepth"),
+        "team_name": team_name,
+        "worktree_path": metadata.get("worktreePath"),
+        "worktree_branch": metadata.get("worktreeBranch"),
+        "transcript_mtime_ns": (
+            transcript_stat.st_mtime_ns if transcript_stat is not None else None
+        ),
+    }, sort_keys=True))
+PY
+```
+
+Use the exact coordinator session directory; do not combine every session under
+the same project slug. If the session id itself was lost, run the metadata
+recipe separately for candidate session directories and match the `name` values
+inside the sidecars against the unique task-scoped agent names. Names appear in
+filenames only for some launch modes, so do not search paths alone. Treat the
+matching shared parent session directory as a candidate. Ambiguous matches are
+a blocker: do not dispatch replacements until ownership is resolved.
+
+Sidecar existence proves only that an agent was spawned. It has no status field.
+`registry_key` is inventory identity, not an unconditional harness address. For
+an Agent-tool record, pass a non-null `task_output_id` to `TaskOutput`. For a
+named teammate, use `stop_address` with `TaskStop`; do not pass its
+name-and-hash registry key to `TaskOutput`. When no native status operation is
+available, compare `transcript_mtime_ns` across two inventory observations:
+advancement is the named fallback signal for ongoing agent activity; an
+unchanged or recent timestamp is not proof that the agent is still working.
+Preserve that distinction in the ledger and final status, along with recovered
+worktree ownership.
+
 ## Agent Roles
 
 Use explorer agents for read-only investigation. Assign concrete questions:

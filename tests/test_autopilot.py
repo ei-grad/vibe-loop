@@ -445,6 +445,70 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("waiting_for_active_workers:1", payload["observations"])
         self.assertNotIn("no_runnable_work", payload["observations"])
 
+    def test_status_names_a_legacy_pre_worker_lock_without_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            state = dataclasses.replace(
+                ActiveRunState.new(
+                    task_id="STRANDED-01",
+                    run_id="run-stranded",
+                    log_path=config.state_path / "runs" / "run-stranded.log",
+                    base_main=git_text(repo, "rev-parse", "HEAD"),
+                    command="codex",
+                ),
+                supervisor_pid=None,
+                supervisor_process_birth_id="",
+                started_at="2026-05-09T00:00:00+00:00",
+            )
+            manager.acquire(
+                "STRANDED-01",
+                "run-stranded",
+                metadata=state.to_lock_metadata(),
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id="run-stranded",
+                    task_id="STRANDED-01",
+                    contract={"mode": "runtime-owned"},
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-stranded",
+                    task_id="STRANDED-01",
+                    transition=StageTransition(
+                        from_stage=None,
+                        to_stage=RunStage.ACTIVATION,
+                        reason="run_contract_resolved",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+
+            payload = collect_project_status(
+                config,
+                process_exists=lambda pid: False,
+            ).to_json()
+
+        self.assertIn("stale_locks_present", payload["blockers"])
+        blocker = next(
+            item
+            for item in payload["blockers"]
+            if item.startswith("unrecoverable_stale_lock:")
+        )
+        self.assertIn("task=STRANDED-01", blocker)
+        self.assertIn("no supported command can clear it", blocker)
+        self.assertFalse(payload["stale_locks"][0]["recovery_supported"])
+
     def test_collect_project_status_counts_lowercase_queue_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1305,7 +1369,7 @@ class AutopilotRunTests(unittest.TestCase):
                 return real_status(manager, process_exists=process_exists)
 
             with mock.patch.object(LockManager, "autopilot_status", flaky_status):
-                launch = start_detached_autopilot(config, interval=30)
+                launch = start_detached_autopilot(config, interval=60)
 
             self.assertFalse(launch.started)
             self.assertIn("verification_failed:LockBackendError", launch.blocker)
@@ -1333,7 +1397,7 @@ class AutopilotRunTests(unittest.TestCase):
                 "append_record",
                 side_effect=OSError("injected journal failure"),
             ):
-                launch = start_detached_autopilot(config, interval=30)
+                launch = start_detached_autopilot(config, interval=60)
 
             self.assertFalse(launch.started)
             self.assertIn("verification_failed:OSError", launch.blocker)
@@ -1540,7 +1604,7 @@ class AutopilotRunTests(unittest.TestCase):
                 repo,
                 runtime_context={"PROJECT_SELECTOR": selector},
             )
-            launch = start_detached_autopilot(config, interval=30)
+            launch = start_detached_autopilot(config, interval=60)
             stop_result = None
             try:
                 deadline = time.monotonic() + 10.0
@@ -1603,7 +1667,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
             config = load_config(repo, runtime_context=dict(runtime_context))
 
-            launch = start_detached_autopilot(config, interval=30)
+            launch = start_detached_autopilot(config, interval=60)
             try:
                 self.assertTrue(launch.started, launch.blocker)
                 status = collect_project_status(config)
@@ -1686,6 +1750,7 @@ class AutopilotRunTests(unittest.TestCase):
         ]
         self.assertEqual(cycle_records[-1]["actions"][0], "cleaned_stale_locks:1")
 
+    @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
     def test_does_not_clean_worker_lock_before_pid_is_observed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1695,12 +1760,15 @@ class AutopilotRunTests(unittest.TestCase):
                 config.repo, config.state_path / "locks", config.locks
             )
             run_store = RunStore(config.state_path / "runs.jsonl")
-            active = ActiveRunState.new(
-                task_id="STARTING-01",
-                run_id="run-starting",
-                log_path=config.state_path / "runs" / "run-starting.log",
-                base_main=git_text(repo, "rev-parse", "HEAD"),
-                command="codex",
+            active = dataclasses.replace(
+                ActiveRunState.new(
+                    task_id="STARTING-01",
+                    run_id="run-starting",
+                    log_path=config.state_path / "runs" / "run-starting.log",
+                    base_main=git_text(repo, "rev-parse", "HEAD"),
+                    command="codex",
+                ),
+                worker_launch_publication_guarded=True,
             )
             manager.acquire(
                 "STARTING-01",
@@ -1713,23 +1781,24 @@ class AutopilotRunTests(unittest.TestCase):
                 config,
                 once=True,
                 launcher=launcher,
-                process_exists=lambda pid: False,
+                process_exists=lambda pid: pid == active.supervisor_pid,
             )
             starting_lock = manager.status("STARTING-01")
             records = run_store.read_records()
 
         self.assertTrue(summary.started)
-        self.assertEqual(summary.exit_code, 1)
-        self.assertEqual(len(calls), 0)
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(len(calls), 1)
         self.assertIsNotNone(starting_lock)
         cycle = summary.cycles[0]
-        self.assertEqual(cycle.status, "blocked")
-        self.assertIn("stale_locks_present", cycle.blockers)
+        self.assertEqual(cycle.status, "completed")
+        self.assertNotIn("stale_locks_present", cycle.blockers)
         self.assertNotIn("cleaned_stale_locks:1", cycle.actions)
         self.assertFalse(
             any(record.get("record_type") == "lock_expired" for record in records)
         )
 
+    @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
     def test_does_not_settle_a_live_run_still_in_its_activation_window(self) -> None:
         # `settlement_pending` latches at the activation stage of every
         # runtime-owned run, and a run that has not launched its worker yet has
@@ -1743,12 +1812,15 @@ class AutopilotRunTests(unittest.TestCase):
                 config.repo, config.state_path / "locks", config.locks
             )
             run_store = RunStore(config.state_path / "runs.jsonl")
-            active = ActiveRunState.new(
-                task_id="ACTIVATING-01",
-                run_id="run-activating",
-                log_path=config.state_path / "runs" / "run-activating.log",
-                base_main=git_text(repo, "rev-parse", "HEAD"),
-                command="codex",
+            active = dataclasses.replace(
+                ActiveRunState.new(
+                    task_id="ACTIVATING-01",
+                    run_id="run-activating",
+                    log_path=config.state_path / "runs" / "run-activating.log",
+                    base_main=git_text(repo, "rev-parse", "HEAD"),
+                    command="codex",
+                ),
+                worker_launch_publication_guarded=True,
             )
             manager.acquire(
                 "ACTIVATING-01",
@@ -1781,14 +1853,14 @@ class AutopilotRunTests(unittest.TestCase):
                 config,
                 once=True,
                 launcher=launcher,
-                process_exists=lambda pid: False,
+                process_exists=lambda pid: pid == active.supervisor_pid,
             )
             live_lock = manager.status("ACTIVATING-01")
             records = run_store.read_records()
 
         self.assertIsNotNone(live_lock)
         cycle = summary.cycles[0]
-        self.assertIn("stale_locks_present", cycle.blockers)
+        self.assertNotIn("stale_locks_present", cycle.blockers)
         self.assertNotIn("stale_lock_cleanup_failed", cycle.blockers)
         self.assertFalse(
             [action for action in cycle.actions if action.startswith("cleaned_stale")]
@@ -1971,7 +2043,7 @@ class AutopilotRunTests(unittest.TestCase):
             summary = run_autopilot(
                 config,
                 max_cycles=3,
-                interval=5.0,
+                interval=60.0,
                 launcher=launcher,
                 sleep=sleeps.append,
             )
@@ -1979,7 +2051,40 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertTrue(summary.started)
         self.assertEqual(len(summary.cycles), 3)
         self.assertEqual(len(calls), 3)
-        self.assertEqual(sleeps, [5.0, 5.0])
+        self.assertEqual(sleeps, [60.0, 60.0])
+
+    def test_rejects_interval_below_one_minute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "autopilot interval must be zero for drain mode or at least 60 seconds",
+            ):
+                run_autopilot(
+                    config,
+                    max_cycles=2,
+                    interval=59.9,
+                    launcher=launcher,
+                    sleep=lambda _seconds: None,
+                )
+
+        self.assertEqual(calls, [])
+
+    def test_detached_start_rejects_interval_below_one_minute(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "autopilot interval must be zero for drain mode or at least 60 seconds",
+            ):
+                start_detached_autopilot(config, interval=59.9)
 
     def test_child_command_includes_configured_flags(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4253,7 +4358,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             summary = run_autopilot(
                 config,
                 max_cycles=2,
-                interval=0.02,
+                interval=60.0,
                 launcher=launcher,
                 sleep=sleeper,
             )
@@ -4261,7 +4366,7 @@ class AutopilotRecheckTests(unittest.TestCase):
         first = summary.cycles[0]
         self.assertEqual(active_statuses[0].supervisor.state, "active_cycle")
         self.assertEqual(active_statuses[0].next_wake, "")
-        self.assertEqual(sleeping_statuses[0][0], 0.02)
+        self.assertEqual(sleeping_statuses[0][0], 60.0)
         sleeping_status = sleeping_statuses[0][1]
         self.assertEqual(sleeping_status.supervisor.state, "sleeping")
         self.assertEqual(sleeping_status.next_wake, first.next_wake)

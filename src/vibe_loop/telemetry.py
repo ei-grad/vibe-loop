@@ -420,6 +420,33 @@ def _sanitize_post_report_stats(value: object) -> dict[str, object]:
         result["duration_seconds"] = duration
     if isinstance(value.get("enforced_stop"), bool):
         result["enforced_stop"] = value["enforced_stop"]
+    teardown_reason = value.get("teardown_reason")
+    if isinstance(teardown_reason, str) and teardown_reason in {
+        "accepted_candidate_initially_changed",
+        "accepted_candidate_missing",
+        "accepted_report_candidate_mismatch",
+        "accepted_report_commit_missing",
+        "accepted_report_not_completed",
+        "accepted_report_runtime_closure",
+        "closure_acceptance_check_failed",
+        "descendant_identity_unverified",
+        "descendant_outside_worker_process_group",
+        "process_group_contains_unowned_member",
+        "teardown_handler_failed",
+        "teardown_handler_unavailable",
+        "verified_processes_remain",
+        "worker_identity_mismatch",
+        "worker_identity_unavailable",
+    }:
+        result["teardown_reason"] = teardown_reason
+    if isinstance(value.get("descendants_verified"), bool):
+        result["descendants_verified"] = value["descendants_verified"]
+    teardown_process_count = _integer(value.get("teardown_process_count"))
+    if teardown_process_count is not None and teardown_process_count >= 0:
+        result["teardown_process_count"] = teardown_process_count
+    teardown_seconds = _number(value.get("teardown_seconds"))
+    if teardown_seconds is not None and teardown_seconds >= 0:
+        result["teardown_seconds"] = teardown_seconds
     activity_kind = value.get("activity_kind")
     if isinstance(activity_kind, str) and activity_kind in POST_REPORT_ACTIVITY_KINDS:
         result["activity_kind"] = activity_kind

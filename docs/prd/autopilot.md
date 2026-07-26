@@ -374,12 +374,28 @@ selector resolves from exactly two explicit sources: the per-project registry
 present only in the ambient process environment does not resolve it. Explicit
 selector values must contain at least one non-whitespace character.
 
+An ambient selector that disagrees with the resolved value must be refused, not
+ignored. The repository selector (`--repo` or the working directory) and the
+project selector are different questions, so a disagreement between them is an
+ambiguous request, and silently preferring the binding answers it with this
+repository's queue, locks, and supervisor state reported under the project name
+the caller actually asked for.
+
+That comparison is scoped to targets the caller selected. Where a command
+enumerates its targets from the project registry, each entry names its own
+project and supplies its own context, so one ambient value is not a claim about
+any particular entry and refusing would remove most of the aggregate's content —
+the failure the comparison exists to prevent, in a different form. An ambient
+value that is empty or whitespace-only names no project and must be treated as
+absent, since setting a variable empty is a common way to unset it and is the
+remedy the diagnostic recommends.
+
 Resolution must fail closed before any observable effect. Supervisor run,
 start, stop, and stale-recovery operations; task selection; worker inspection
 and cleanup; integration locking; and fenced reporting refuse a missing,
 ambient-only, or conflicting binding before invoking a command adapter.
 Diagnostics name the variable and the failure reason (`unset`, `ambient_only`,
-`conflict`) and never echo the ambient or configured value.
+`conflict`, `ambient_conflict`) and never echo the ambient or configured value.
 
 Structured status reports the resolved binding so operators can verify routing
 without reading configuration: each required selector appears with its resolved
@@ -873,7 +889,9 @@ safe `runtime_event_adapter_error` category. PID and deadline checks retain
 their existing precedence, and no runtime adapter is invoked when either is
 already satisfied.
 
-Related implementation IDs: `AUTO-22`.
+Related implementation evidence: commit
+`79bf01f3b42c71a7724d405ded06deedc2d81cc9` for the direct-message adapter and
+task `wait-helper-actionable-runtime-event-wake` for typed runtime events.
 
 Autopilot may also use an explicit trusted `[autopilot] idle_wake_command`
 between adaptive task-source fallback listings. The command receives the

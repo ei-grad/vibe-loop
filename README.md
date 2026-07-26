@@ -140,6 +140,11 @@ Install them into Codex and/or Claude:
 vibe-loop install-skills --codex --claude
 ```
 
+Run that from a clean checkout of the main branch. The runtime skill directories
+are global to the machine, so installing from a task branch or a dirty tree
+makes that branch's instructions live for every agent on the host, including
+agents working on unrelated projects.
+
 The worker skills do not require the CLI; you can invoke them directly for manual
 bounded or unattended work. The `autopilot` operator skill does drive the CLI.
 The CLI exists when a repository already has a task source and you want
@@ -530,13 +535,32 @@ this repo in the project registry. A value present only in the ambient
 environment does not resolve it — that is the ambiguity this table closes.
 Explicit values must contain at least one non-whitespace character.
 
+An ambient value that *disagrees* with the resolved one is refused rather than
+ignored. `--repo` selects the repository; the binding selects the project. A
+caller who exports `LOOPYARD_PROJECT=other` and runs a command against a
+repository bound to `vibe-loop` is asking two different questions at once, and
+answering from the binding alone would return this repository's queue, locks,
+and supervisor state under the other project's name with nothing in the output
+to contradict it. Unset the variable, or point `--repo` at the repository that
+variable selects — the diagnostic says so wherever it is reported, including
+`autopilot status`, which reports it rather than failing.
+
+The comparison applies only where the caller chose the target. Commands that
+enumerate targets from the project registry — `autopilot projects status` and
+`autopilot projects inspect` — do not compare it: each entry supplies its own
+selector context, one ambient value cannot be a claim about several entries at
+once, and refusing per entry would blank most of the aggregate. An ambient value
+that is empty or whitespace-only names no project and is treated as absent, so
+`LOOPYARD_PROJECT= vibe-loop …` is a way to apply the remedy rather than another
+way to trip it.
+
 Supervisor run, start, stop, and stale-recovery operations; task selection;
 worker inspection and cleanup; integration locking; and fenced reporting refuse
 an unresolved binding *before* invoking a command adapter. The diagnostic names
 the variable and the reason (`project_binding_unset:…`,
-`project_binding_ambient_only:…`, `project_binding_conflict:…`) and never echoes
-the value. `autopilot status` reports the same diagnostics as blockers rather
-than failing.
+`project_binding_ambient_only:…`, `project_binding_conflict:…`,
+`project_binding_ambient_conflict:…`) and never echoes the value.
+`autopilot status` reports the same diagnostics as blockers rather than failing.
 
 `autopilot status --json` includes a `project_binding` block reporting each
 required selector's resolved value and whether it came from `config` or
@@ -690,14 +714,26 @@ exists in either the lock or the local records, recovery fails closed with
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch
-decision it cleans only stale worker locks whose recorded worker process is
-missing — the same validated, audited path as `vibe-loop workers clean --force`
-(it emits `lock_expired` records and never deletes worktrees, resets branches,
-steals live locks, or removes a lock that has not yet observed a worker PID).
-Each cycle then runs a native worktree-disposition step and gathers per-worktree
-evidence mechanically. The default `report-only` policy journals eligible
-candidates without invoking the analysis agent, removing a worktree, or deleting
-a branch. Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
+decision it cleans only stale worker locks whose recorded process identity is
+proven absent — the same validated, audited path as
+`vibe-loop workers clean --force`. On Linux, the worker launcher blocks on an
+inherited publication pipe before it invokes the configured command, including
+commands routed through `/bin/sh`. The supervisor releases that barrier only
+after the worker PID is written to the lock and its redundant durable start
+event. Before PID publication, recovery therefore requires the recorded launch
+barrier plus an absent or birth-mismatched supervisor identity; supervisor
+death closes the pipe without letting any worker or shell command execute. Once
+the barrier opens, either durable PID source makes only the worker identity
+authoritative. A live, foreign-host, or identity-ambiguous process fails closed.
+Legacy and non-Linux pre-worker locks without the publication-barrier proof
+remain unsupported, and
+`autopilot status` names the offending task and that limitation. Cleanup emits
+`lock_expired` records and never deletes worktrees, resets branches, or steals
+live locks. Each cycle then runs a native worktree-disposition step and gathers
+per-worktree evidence mechanically. The default `report-only` policy journals
+eligible candidates without invoking the analysis agent, removing a worktree,
+or deleting a branch.
+Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
 `--worktree-disposition reap` CLI override opts in to automatic disposition.
 Under that policy, the read-only analysis agent must return a reasoned reap
 decision and the executor still limits removal (`git worktree remove` plus
@@ -760,12 +796,15 @@ configured `summary_command` still runs alongside this native summary.
 
 A cycle is still blocked (never force-recovered) when preflight diagnostics are
 unsafe: dirty repo, remaining stale locks, unsafe workspace diagnostics, missing
-task source, an unavailable agent command, or exhausted disk/inode capacity. `--once` runs one cycle. Without `--interval`, it drains runnable
-work and exits when a cycle is idle or blocked; with `--interval N` it stays
-resident until `--max-cycles` or an interrupt. Idle cycles use bounded adaptive
-task-source rechecks: the first listing follows `planning_recheck_seconds`
-(60s by default), delays double up to `idle_poll_max_seconds` (600s by default),
-and the last delay is shortened to preserve the outer interval deadline. A
+task source, an unavailable agent command, or exhausted disk/inode capacity.
+`--once` runs one cycle. Without `--interval`, or with an interval of zero, it
+drains runnable work and exits when a cycle is idle or blocked; with a positive
+`--interval N` (minimum 60 seconds) it stays resident until `--max-cycles` or an
+interrupt. Idle cycles use bounded adaptive task-source rechecks: the first
+listing follows
+`planning_recheck_seconds` (60s by default), delays double up to
+`idle_poll_max_seconds` (600s by default), and the last delay is shortened to
+preserve the outer interval deadline. A
 default 30-minute empty interval therefore performs five fallback listings, not
 roughly 30; each poll derives its runnable set from that single task snapshot.
 Task-source command timeouts are shortened to the remaining interval budget so
@@ -953,9 +992,11 @@ commands = [
 mode = "runtime-owned"
 # reviewer_profile = "review"
 # task_provenance_mode = "external-confirmed"
+# external_completion_actor = "external-system"  # source must support probe()
 # max_initial_review_passes = 1
 # max_closure_review_passes = 2
 # reviewer_concurrency_budget = 1
+# max_candidate_reanchors = 2
 
 [supervision]
 max_restarts = 3
@@ -968,6 +1009,24 @@ cross_run_attempt_threshold = 3   # unchanged non-completed attempts before auto
 [locks]
 type = "directory"
 # lease_seconds = 300   # locks go stale after this many seconds without a heartbeat
+
+# Usage budgets are disabled by default; the whole [budget] block is optional and
+# omitting it leaves launch behavior unchanged. See "Usage budgets and
+# reservations" below.
+# [budget]
+# enabled = true
+# metric = "total_tokens"        # dimension every cap/allowance is denominated in
+# fail_safe = "reserved"         # charge unknown usage at the reserved allowance
+# default_declared = 150000      # conservative per-launch reservation
+# [budget.declared]
+# implementation = 200000
+# review = 150000
+# [[budget.limits]]
+# provider = "anthropic"
+# phase = "implementation"
+# limit = 5000000
+# warn_at = 0.8
+# window_hours = 24
 
 [autopilot]
 # Defaults for `autopilot run` and `autopilot start`; explicit CLI flags override
@@ -1003,6 +1062,105 @@ When `--repo` points at a Git linked worktree without its own `.vibe-loop.toml`,
 `vibe-loop` falls back to the main worktree's config (warning on stderr).
 Runtime state, locks, logs, and caches still live under the invoked `--repo`
 worktree.
+
+### Usage budgets and reservations
+
+`[budget]` gates model launches on a configurable usage budget. It is disabled
+by default; when `enabled = false` (or the block is absent) admission is a no-op
+and behavior is unchanged. When enabled, every launch first *reserves* a
+conservative declared allowance against each matching cap, atomically, in a
+durable append-only ledger (`.vibe-loop/budget.jsonl`) that survives process
+restart. Concurrent jobs and runs therefore cannot oversubscribe a cap: a
+reservation that would exceed the remaining budget is refused before any model
+process starts (`on_insufficient = "block"` or `"defer"`), and the refusal is
+durable evidence in the ledger.
+
+Every runtime-owned model launch is gated, not only worker-owned
+implementation: the initial and full review passes and the targeted
+remediation/closure launches each reserve under their own phase
+(`initial_review`, `targeted_closure`, `remediation`) using the actual reviewer
+or remediation route, and each reconciles its own usage against its own
+reservation. A denial launches no reviewer or remediation process and records
+the run as blocked. A run's aggregate terminal usage reconciles only its
+implementation reservation, so usage is never double-counted across phase
+boundaries or during recovery.
+
+The ledger is one shared file per repository, keyed on the repository-common
+root so all linked Git worktrees admit against the same durable budget and OS
+lock, while unrelated repositories stay isolated. Ordinary repositories and
+disabled/unconfigured budgets keep their prior per-repo path and do no Git work.
+
+Attribution is by **project, provider route, worker phase, model, and effort**.
+A `[[budget.limits]]` entry caps one scope; omit a selector to match any value on
+that axis. The `project` axis names the **repository** the ledger is keyed on —
+the basename of the repository-common root, shared by all its linked worktrees.
+It is deliberately not the task-backend project from `[project_binding]`, which
+scopes dispatch rather than spend; the two need not agree, and renaming a
+checkout changes which caps a `project` selector matches. A launch must satisfy every limit it matches (route cardinality is
+bounded and an over-large config is rejected). `metric` is the single
+dimension caps, declared allowances, and fail-safe charges are denominated in
+(one of `input_tokens`, `output_tokens`, `total_tokens`,
+`non_cached_input_tokens`, `cache_read_input_tokens`,
+`cache_creation_input_tokens`, `cost_usd`). The reconciliation ledger still
+records the full input/output/cache/gross/fresh/cost breakdown plus an
+authoritative/unknown marker for evidence.
+
+When a run reaches an authoritative terminal provider-usage figure, its
+reservation is reconciled **exactly once** against that figure. Usage a provider
+never reported (or reported malformed) is charged through the **fail-safe**
+policy — never as zero:
+
+- `fail_safe = "reserved"` (default) keeps the conservatively reserved declared
+  allowance as the charge.
+- `fail_safe = "fixed"` charges an explicit `fail_safe_amount` (validated
+  positive).
+
+Reservations orphaned by a crashed supervisor are recovered without
+double-spend: a reservation whose owner run has a durable terminal result
+reconciles from that result; one whose owner is provably dead with no result is
+charged fail-safe. Recovery runs at each dispatch start and is guarded by the
+same exactly-once check.
+Local ownership persists the kernel process-birth identity as well as PID and
+host. Recovery therefore distinguishes a still-running owner from an unrelated
+process that reused its PID; an unavailable birth identity remains reserved
+conservatively rather than being silently released.
+
+The durable ledger enforces a strict terminal-record schema and identity
+contract: a reconciliation or release must match its reservation's id, owner
+run, and generation and carry valid typed usage fields. Malformed, mismatched,
+duplicate, orphaned, or torn rows never close a live reservation at zero; they
+are counted as bounded, content-free integrity diagnostics and the reservation
+stays live (conservatively charged) until a valid terminal arrives or recovery
+charges it fail-safe.
+
+These checks detect **corruption**, not tampering. The journal header, the
+checkpoint, and its unkeyed SHA-256 digest live in the same state directory
+under the same permissions, so anything that can write one can write a
+consistent pair. The ledger trusts every writer of the state directory; it
+defends against torn writes, stale or rolled-back checkpoints, and partial
+compaction, and it is not an integrity control against an adversary with write
+access there.
+
+To keep replay, admission, and inspect work bounded, the ledger is compacted
+under the same OS lock: closed, out-of-window reservations and aged-out decision
+rows fold into a crash-safe durable checkpoint that preserves cumulative
+consumption and audit counters, while live reservations and recent activity stay
+in the active journal. A torn or stale-generation checkpoint is ignored and the
+journal is replayed in full, so partial compaction never double-counts or loses
+spend.
+
+`vibe-loop runs summary --json` includes a `budget` projection: per-limit
+consumed/reserved/remaining/utilization with warning and exceeded flags, and a
+per-provider (and per-provider-phase) route breakdown reported **separately and
+never summed across providers**, so Claude-versus-Codex route balancing has
+evidence without any cross-provider token equivalence. Projection lists are
+deterministically truncated with a dropped-count rather than emitted unbounded,
+and integrity/compaction counters accompany the report.
+
+Admission bounds **subsequent launches**, not token production inside an
+already-running model process: the provider CLIs enforce no hard per-invocation
+cap, so a running worker can exceed its declared allowance and the overage is
+reconciled after the fact. `vibe-loop` does not claim a hard per-invocation cap.
 
 ### Agent command and prompt dialect
 
@@ -1190,9 +1348,11 @@ command = "codex review {prompt}"
 mode = "runtime-owned"
 reviewer_profile = "review"
 task_provenance_mode = "external-confirmed"
+external_completion_actor = "external-system"
 max_initial_review_passes = 1
 max_closure_review_passes = 2
 reviewer_concurrency_budget = 1
+max_candidate_reanchors = 2
 ```
 
 The reviewer command must accept `{prompt}` so the runtime can deliver the
@@ -1256,6 +1416,16 @@ in the runtime.
 Runtime-owned command task sources that configure activation must also
 configure reset, and adapter completion requires `task_source.complete`; the
 resolved contract fails closed before activation when these paths are absent.
+Before gates, a candidate based on an older `main` — including the adopted
+workspace of a continued task, whose base is older by design — is rebased only
+when Git reports no conflict and the aggregate binary diff remains
+byte-identical. The runtime reruns gates for the rewritten candidate. A
+conflict or a changed diff refuses the re-anchor and keeps the original
+candidate, leaving the advance to the merge integration performs after review;
+setting `max_candidate_reanchors = 0` refuses the same way. Only a base that
+keeps advancing past `max_candidate_reanchors` successful re-anchors stops
+blocked. The bound applies per run, so a continued task starts each run with a
+fresh budget.
 
 Repositories that still require agent-owned verification, review, integration,
 and task-source mutation must opt into compatibility mode explicitly:
@@ -1380,8 +1550,15 @@ shell-quoted `{task_id}` and `{run_id}` values and return one normalized task
 JSON object. `complete` must confirm a terminal done status after integration;
 `park` must confirm the source's non-runnable held status for terminal failure
 settlement. Runtime-owned adapter completion fails contract validation without
-`complete`, and any runtime-owned activation-capable source fails validation
-without `reset`. A missing `park` uses a recorded reset/requeue fallback.
+`complete` on a command source with `list`. Runtime-owned external-confirmed
+completion requires a task source with probe capability and an explicit
+`orchestration.external_completion_actor` of `operator` or `external-system`.
+Markdown, Ralphex, and spec-tool sources provide native probes; command sources
+probe through their required `list` command or an optional dedicated `probe`
+command. `worker` is rejected in runtime-owned mode because the supervised
+implementation contract forbids workers from changing the authoritative task
+source. Any runtime-owned activation-capable source fails validation without
+`reset`. A missing `park` uses a recorded reset/requeue fallback.
 Completion and failure settlement run while the exact task lock remains held;
 an unconfirmed settlement retains that lock for stage-aware fenced recovery.
 
@@ -1547,7 +1724,9 @@ explicit evidence links the contract to completed work.
 
 This repository uses a three-level planning model: `PROMPT.md` (philosophy,
 architecture boundaries, PRD-writing rules) → `docs/prd/` (stable `PRD-*`
-contracts) → `PLAN.md` (runnable slices with permanent task IDs).
+contracts) → the loopyard `vibe-loop` project (runnable slices with permanent
+task IDs). The runtime consumes that board through the repository's configured
+command-backed task adapter.
 
 ## Relationship to ralphex
 
@@ -1579,8 +1758,8 @@ additions stay below the authoring layer:
 - read-only spec coverage and drift checks;
 - opt-in execution gates requiring approved, current spec artifacts;
 - spec-aware worker prompt context;
-- completion evidence mapping requirements to plan rows, reports, trailers,
-  tests, and reviews.
+- completion evidence mapping requirements to task-source entries, reports,
+  trailers, tests, and reviews.
 
 ## Development
 

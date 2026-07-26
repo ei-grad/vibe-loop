@@ -80,6 +80,7 @@ class WorkspaceClaim:
     current_branch: str
     dirty: bool
     dirty_summary: tuple[str, ...]
+    dirty_fingerprint: str = ""
     started_at: str = ""
     claimed_at: str = dataclasses.field(default_factory=utc_now_iso)
 
@@ -103,6 +104,7 @@ class WorkspaceClaim:
             current_branch=optional_string(payload.get("current_branch")) or "",
             dirty=optional_bool(payload.get("dirty")),
             dirty_summary=optional_string_tuple(payload.get("dirty_summary")),
+            dirty_fingerprint=(optional_string(payload.get("dirty_fingerprint")) or ""),
             started_at=optional_string(payload.get("started_at")) or "",
             claimed_at=(
                 optional_string(payload.get("claimed_at"))
@@ -126,6 +128,7 @@ class WorkspaceClaim:
             "current_branch": self.current_branch,
             "dirty": self.dirty,
             "dirty_summary": list(self.dirty_summary),
+            "dirty_fingerprint": self.dirty_fingerprint,
             "started_at": self.started_at,
             "claimed_at": self.claimed_at,
         }
@@ -170,6 +173,8 @@ class ActiveRunState:
     pid_source: str = "popen"
     pid_scope: str = "configured_command_process"
     supervisor_pid: int | None = None
+    supervisor_process_birth_id: str = ""
+    worker_launch_publication_guarded: bool = False
     host: str = dataclasses.field(default_factory=socket.gethostname)
     lock_path: Path | None = None
     workspace: WorkspaceClaim | None = None
@@ -242,6 +247,7 @@ class ActiveRunState:
             restart_count=restart_count,
             max_restarts=max_restarts,
             supervisor_pid=os.getpid(),
+            supervisor_process_birth_id=process_birth_identity(os.getpid()),
         )
 
     @classmethod
@@ -343,6 +349,12 @@ class ActiveRunState:
                 or "configured_command_process"
             ),
             supervisor_pid=optional_int(metadata.get("supervisor_pid")),
+            supervisor_process_birth_id=(
+                optional_string(metadata.get("supervisor_process_birth_id")) or ""
+            ),
+            worker_launch_publication_guarded=optional_bool(
+                metadata.get("worker_launch_publication_guarded")
+            ),
             host=optional_string(metadata.get("host")) or "",
             lock_path=optional_path(metadata.get("path")),
             workspace=WorkspaceClaim.from_json(metadata.get("workspace")),
@@ -438,6 +450,10 @@ class ActiveRunState:
             "pid_source": self.pid_source,
             "pid_scope": self.pid_scope,
             "supervisor_pid": self.supervisor_pid,
+            "supervisor_process_birth_id": self.supervisor_process_birth_id,
+            "worker_launch_publication_guarded": (
+                self.worker_launch_publication_guarded
+            ),
             "host": self.host,
             "started_at": self.started_at,
             "log": str(self.log_path),
@@ -687,6 +703,9 @@ def claim_worker_workspace(
     base_commit: str = "",
     fencing_token: str | None = None,
     ignored_dirty_paths: Iterable[Path] = (),
+    expected_head_commit: str = "",
+    expected_dirty_fingerprint: str | None = None,
+    required_ancestor_base: str = "",
 ) -> WorkspaceClaim:
     if not branch:
         raise WorkspaceClaimError(
@@ -711,6 +730,40 @@ def claim_worker_workspace(
         started_at=optional_string(lock.metadata.get("started_at")) or "",
         ignored_dirty_paths=ignored_dirty_paths,
     )
+    if expected_head_commit and claim.head_commit != expected_head_commit:
+        raise WorkspaceClaimError(
+            "workspace_snapshot_changed",
+            "workspace claim refused: HEAD changed after workspace preflight",
+            details={
+                "expected_head_commit": expected_head_commit,
+                "actual_head_commit": claim.head_commit,
+            },
+        )
+    if (
+        expected_dirty_fingerprint is not None
+        and claim.dirty_fingerprint != expected_dirty_fingerprint
+    ):
+        raise WorkspaceClaimError(
+            "workspace_snapshot_changed",
+            "workspace claim refused: dirty state changed after workspace preflight",
+        )
+    if required_ancestor_base:
+        ancestry = run_git(
+            claim.worktree,
+            "merge-base",
+            "--is-ancestor",
+            required_ancestor_base,
+            claim.head_commit,
+        )
+        if ancestry.returncode != 0:
+            raise WorkspaceClaimError(
+                "workspace_snapshot_changed",
+                "workspace claim refused: HEAD does not contain the selected base",
+                details={
+                    "selected_base": required_ancestor_base,
+                    "head_commit": claim.head_commit,
+                },
+            )
     updated_metadata = dict(lock.metadata)
     updated_metadata["workspace"] = claim.to_json()
     lock_manager.update(lock, updated_metadata)
@@ -799,7 +852,10 @@ def inspect_workspace_claim(
             },
         )
     head_commit = git_text(worktree, "rev-parse", "--verify", "HEAD")
-    status_lines = git_status_lines(worktree, ignored_dirty_paths=ignored_dirty_paths)
+    status_lines, dirty_fingerprint = git_dirty_snapshot(
+        worktree,
+        ignored_dirty_paths=ignored_dirty_paths,
+    )
     return WorkspaceClaim(
         task_id=task_id,
         run_id=run_id,
@@ -810,6 +866,7 @@ def inspect_workspace_claim(
         current_branch=current_branch,
         dirty=bool(status_lines),
         dirty_summary=tuple(status_lines[:DIRTY_SUMMARY_LIMIT]),
+        dirty_fingerprint=dirty_fingerprint,
         started_at=started_at,
     )
 
@@ -893,6 +950,68 @@ def git_dirty_snapshot(
         )
     digest = hashlib.sha256("\0".join(evidence).encode()).hexdigest()
     return status, digest
+
+
+def workspace_state_fingerprint(
+    *,
+    repo: Path,
+    main_branch: str,
+    branch: str = "",
+    worktree: Path | None = None,
+    expected_base: str = "",
+    ignored_dirty_paths: Iterable[Path] = (),
+) -> str:
+    repo = repo.resolve()
+    worktree = worktree.resolve() if worktree is not None else None
+
+    def git_observation(cwd: Path, *args: str) -> str:
+        result = run_git_result(cwd, *args)
+        if result is None or result.returncode != 0:
+            return "unavailable"
+        return result.stdout.strip()
+
+    topology = git_observation(repo, "worktree", "list", "--porcelain")
+    state: dict[str, object] = {
+        "schema_version": 1,
+        "selected_base": git_observation(repo, "rev-parse", "--verify", main_branch),
+        "expected_base": expected_base,
+        "expected_branch": branch,
+        "branch_head": (
+            git_observation(repo, "rev-parse", "--verify", f"refs/heads/{branch}")
+            if branch
+            else ""
+        ),
+        "worktree": str(worktree) if worktree is not None else "",
+        "worktree_topology": topology,
+    }
+    if worktree is None or not worktree.is_dir():
+        state["workspace_state"] = "missing"
+    else:
+        state.update(
+            {
+                "workspace_state": "present",
+                "branch": git_observation(worktree, "branch", "--show-current"),
+                "head": git_observation(worktree, "rev-parse", "--verify", "HEAD"),
+                "git_common_dir": git_observation(
+                    worktree, "rev-parse", "--git-common-dir"
+                ),
+            }
+        )
+        try:
+            _dirty, dirty_fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=ignored_dirty_paths,
+            )
+        except WorkspaceClaimError:
+            dirty_fingerprint = "unavailable"
+        state["dirty_fingerprint"] = dirty_fingerprint
+    encoded = json.dumps(
+        state,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def git_status_args(repo: Path, ignored_dirty_paths: Iterable[Path]) -> tuple[str, ...]:
@@ -1463,14 +1582,14 @@ def restore_projected_worker_process_identity(
     """Restore identity fields omitted by a command lock's public projection.
 
     The local start record is independent evidence captured from the exact
-    ``Popen`` child. It is usable only for the same task, run, PID, host, and
-    supervisor. Existing projected values are never replaced, so conflicting
-    backend identity still reaches the normal fail-closed mismatch checks.
+    ``Popen`` child. It is usable only for the same task, run, host, and
+    supervisor, plus the same PID when the lock already projects one. Existing
+    projected values are never replaced, so conflicting backend identity still
+    reaches the normal fail-closed mismatch checks.
     """
 
     if (
-        active.worker_pid is None
-        or not active.run_id
+        not active.run_id
         or not active.task_id
         or not active.host
         or active.supervisor_pid is None
@@ -1483,7 +1602,10 @@ def restore_projected_worker_process_identity(
             continue
         if optional_string(record.get("task_id")) != active.task_id:
             continue
-        if optional_int(record.get("worker_pid")) != active.worker_pid:
+        record_worker_pid = optional_int(record.get("worker_pid"))
+        if record_worker_pid is None:
+            continue
+        if active.worker_pid is not None and record_worker_pid != active.worker_pid:
             continue
         record_host = optional_string(record.get("host"))
         if not record_host:
@@ -1497,6 +1619,7 @@ def restore_projected_worker_process_identity(
             continue
         return dataclasses.replace(
             active,
+            worker_pid=active.worker_pid or record_worker_pid,
             worker_process_group_id=(
                 active.worker_process_group_id
                 if active.worker_process_group_id is not None
@@ -1564,11 +1687,13 @@ def classify_process(
 ) -> str:
     """Live-process disposition for one active-run lock.
 
-    When the run recorded a worker birth ID, a live PID alone is not enough:
-    the kernel may have recycled that PID for an unrelated process. Comparing
-    the recorded birth ID keeps a recycled PID from reading as this worker
-    still running. Runs recorded before birth IDs existed keep the plain
-    existence check rather than degrading to "missing".
+    Before worker launch, the publication barrier plus the exact supervisor
+    birth identity proves whether activation may still be in flight. After the
+    barrier opens, the worker identity is authoritative and the supervisor no
+    longer affects classification. A live PID alone is insufficient when a
+    birth ID was recorded because the kernel may have recycled it for an
+    unrelated process. Legacy worker records keep the plain existence check;
+    legacy pre-worker records stay unproven.
     """
 
     process_checker = process_exists if process_exists is not None else pid_exists
@@ -1580,7 +1705,22 @@ def classify_process(
     if active.host and active.host != current_host:
         return "foreign_host"
     if active.worker_pid is None:
-        return "unknown_pid"
+        if (
+            active.supervisor_pid is None
+            or not active.supervisor_process_birth_id
+            or not active.worker_launch_publication_guarded
+        ):
+            return "unknown_pid"
+        if not process_checker(active.supervisor_pid):
+            return "missing"
+        current_birth_id = get_birth_identity(active.supervisor_pid)
+        if not current_birth_id:
+            return "unknown_pid"
+        return (
+            "running"
+            if current_birth_id == active.supervisor_process_birth_id
+            else "missing"
+        )
     if not process_checker(active.worker_pid):
         return "missing"
     if not active.worker_process_birth_id:
@@ -1702,17 +1842,21 @@ class StaleLock:
     settled_outcome: str = ""
     settled_classification: str = ""
     settlement_pending: bool = False
-    # Live-process disposition from `classify_process`. Only "missing" is
-    # positive evidence that the run is over: "unknown_pid" is the ordinary
-    # state of a live run between lock acquisition and worker launch, and
-    # "foreign_host" says nothing about a process this host cannot see.
-    # Settlement recovery mutates the authoritative task source, so it must
-    # act on that evidence rather than on staleness alone.
+    # Live-process disposition from `classify_process`. "missing" is positive
+    # evidence that the run is over, including a generation-aware supervisor
+    # identity before worker launch. Legacy "unknown_pid" locks and
+    # "foreign_host" locks remain unproven. Settlement recovery mutates the
+    # authoritative task source, so it must act on identity evidence rather
+    # than on staleness alone.
     process_state: str = ""
 
     @property
     def process_proven_dead(self) -> bool:
         return self.process_state == "missing"
+
+    @property
+    def recovery_supported(self) -> bool:
+        return not self.settlement_pending or self.process_state != "unknown_pid"
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1725,6 +1869,7 @@ class StaleLock:
             "started_at": self.started_at,
             "settlement_pending": self.settlement_pending,
             "process_state": self.process_state,
+            "recovery_supported": self.recovery_supported,
         }
 
 
@@ -2077,14 +2222,24 @@ def clean_stale_locks(
                 # latch alone would requeue a running task mid-run and pull the
                 # lock out from under its own worker. Staleness is not death;
                 # only a missing process is.
+                if lock.process_state == "unknown_pid":
+                    detail = (
+                        "the lock records neither a worker pid nor a "
+                        "generation-aware supervisor identity; no supported "
+                        "command can prove that its process is gone or clear "
+                        "the lock"
+                    )
+                else:
+                    detail = (
+                        "its recorded process is not proven dead "
+                        f"(process_state={lock.process_state or 'unknown'}); "
+                        "recovery applies once that process is proven gone"
+                    )
                 errors.append(
                     (
                         lock,
-                        "task-source settlement pending for a run whose process "
-                        f"is not proven dead (process_state="
-                        f"{lock.process_state or 'unknown'}); refusing to settle "
-                        "or release it. Recovery applies once the process is "
-                        "gone",
+                        "task-source settlement pending; refusing to settle or "
+                        f"release it because {detail}",
                     )
                 )
                 continue

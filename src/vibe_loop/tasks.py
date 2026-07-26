@@ -26,6 +26,30 @@ from vibe_loop.locks import (
 
 TASK_SOURCE_ERROR_STREAM_LIMIT = 2000
 TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
+# Names whose *absence* from an adapter invocation is an assertion the runtime
+# makes, not an accident. The session pair says "this run recorded no such
+# session"; the fencing token says "this invocation is unfenced"; the workspace
+# triple says "an adapter may not assume a worktree" and is popped for that
+# reason. `os.environ.copy()` would re-supply any of them from whatever
+# environment the supervisor happens to be running in -- including a worker's --
+# and `dict.update` cannot express a removal, so the assertion has to be made
+# here, at the process boundary, or it is not made at all.
+#
+# Names the runtime merely *supplies* (`VIBE_LOOP_TASK_ID`, `VIBE_LOOP_RUN_ID`,
+# `VIBE_LOOP_PRIMARY_REPO`, `VIBE_LOOP_LOG`) are deliberately not listed: no
+# contract rests on their absence. `VIBE_LOOP_STATE_DIR` is likewise inherited
+# on purpose -- it locates shared control state for a nested `vibe-loop` call
+# and is not per-invocation context.
+WITHHELD_ADAPTER_ENV = frozenset(
+    {
+        "VIBE_LOOP_BRANCH",
+        "VIBE_LOOP_FENCING_TOKEN",
+        "VIBE_LOOP_IMPLEMENTER_SESSION",
+        "VIBE_LOOP_REPO",
+        "VIBE_LOOP_REVIEWER_SESSION",
+        "VIBE_LOOP_WORKTREE",
+    }
+)
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
@@ -292,18 +316,44 @@ class TaskSource(Protocol):
         ...
 
 
+def task_source_uses_command_backend(config: TaskSourceConfig) -> bool:
+    return bool(
+        config.type == "command"
+        or config.list_command
+        or config.next_command
+        or config.probe_command
+    )
+
+
+def task_source_probe_capability(config: TaskSourceConfig) -> str | None:
+    if task_source_uses_command_backend(config):
+        return "task_source.probe" if config.list_command else None
+    if (
+        config.type in {"markdown-plan", "markdown-profile"}
+        or config.type in {"ralphex-markdown", "ralphex-plan"}
+        or config.type in SPEC_TOOL_TASK_SOURCE_TYPES
+    ):
+        return "task_source.probe"
+    return None
+
+
+def task_source_completion_capability(config: TaskSourceConfig) -> str | None:
+    if (
+        task_source_uses_command_backend(config)
+        and config.list_command
+        and config.complete_command
+    ):
+        return "task_source.complete"
+    return None
+
+
 def build_task_source(
     repo: Path,
     config: TaskSourceConfig,
     *,
     runtime_context: Mapping[str, str] | None = None,
 ) -> TaskSource:
-    if (
-        config.type == "command"
-        or config.list_command
-        or config.next_command
-        or config.probe_command
-    ):
+    if task_source_uses_command_backend(config):
         return CommandTaskSource(repo, config, runtime_context=runtime_context)
     if config.type in {"markdown-plan", "markdown-profile"}:
         if config.profile is not None:
@@ -2386,6 +2436,25 @@ class CommandTaskSource:
         return merged
 
 
+def build_adapter_environment(
+    runtime_context: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Child environment for a task-source adapter command.
+
+    Inherits the supervisor's environment, then removes every withheld name the
+    caller did not supply, so a name the runtime asserts is absent is absent in
+    the adapter process too rather than being satisfied by an ambient value.
+    """
+
+    environment = os.environ.copy()
+    supplied = dict(runtime_context or {})
+    for name in WITHHELD_ADAPTER_ENV:
+        if name not in supplied:
+            environment.pop(name, None)
+    environment.update(supplied)
+    return environment
+
+
 def run_json_command(
     repo: Path,
     command: str,
@@ -2397,8 +2466,7 @@ def run_json_command(
     # Expiry raises subprocess.TimeoutExpired — a SubprocessError, but not a
     # CalledProcessError — so it is not conflated with a JSON parse failure and
     # is handled identically to a nonzero exit by every caller's fail-safe path.
-    environment = os.environ.copy()
-    environment.update(runtime_context or {})
+    environment = build_adapter_environment(runtime_context)
     fencing_token = fencing_token_value(environment.get("VIBE_LOOP_FENCING_TOKEN"))
     try:
         result = subprocess.run(
@@ -2431,8 +2499,7 @@ def run_reset_command(
     # to log non-fatally rather than being parsed as task output. timeout bounds
     # a hung hook the same way; TimeoutExpired is likewise a SubprocessError the
     # caller's non-fatal handler already covers.
-    environment = os.environ.copy()
-    environment.update(runtime_context or {})
+    environment = build_adapter_environment(runtime_context)
     fencing_token = fencing_token_value(environment.get("VIBE_LOOP_FENCING_TOKEN"))
     try:
         subprocess.run(

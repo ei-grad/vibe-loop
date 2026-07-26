@@ -538,9 +538,44 @@ REFERENCE_GUARD_EXEMPT_FILES = frozenset(
 
 
 class RepoAgnosticGuardTests(unittest.TestCase):
+    def test_task_layer_contracts_remain_repository_agnostic(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        prompt = (root / "PROMPT.md").read_text(encoding="utf-8")
+        task_discovery = (root / "docs" / "prd" / "task-discovery.md").read_text(
+            encoding="utf-8"
+        )
+        normalized_prompt = " ".join(prompt.split()).casefold()
+        normalized_task_discovery = " ".join(task_discovery.split()).casefold()
+
+        self.assertNotIn("loopyard", normalized_prompt)
+        self.assertIn(
+            "external, adapter-bound surface rather than a repository-prescribed "
+            "backend or file format",
+            normalized_prompt,
+        )
+        self.assertNotIn("planning analytics", normalized_prompt)
+        self.assertIn(
+            "without requiring a repository to adopt a prescribed task filename "
+            "or layout",
+            normalized_task_discovery,
+        )
+        self.assertNotIn("this repository", normalized_task_discovery)
+        self.assertNotIn("local `plan.md` shape", normalized_task_discovery)
+
+    def test_prd_density_budget_matches_the_seed_policy(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        prompt = (root / "PROMPT.md").read_text(encoding="utf-8")
+        prd_index = (root / "docs" / "prd" / "README.md").read_text(encoding="utf-8")
+
+        for document in (prompt, prd_index):
+            normalized_document = " ".join(document.split())
+            self.assertIn("above four times", normalized_document)
+            self.assertIn("over budget", normalized_document)
+        self.assertIn("An over-budget PRD has no growth allowance.", prd_index)
+
     def test_shipped_artifacts_have_no_downstream_references(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        targets = [root / "README.md", root / "PLAN.md", root / "PROMPT.md"]
+        targets = [root / "README.md", root / "PROMPT.md"]
         for directory in SCANNED_REFERENCE_ROOTS:
             for path in (root / directory).rglob("*"):
                 if not path.is_file():

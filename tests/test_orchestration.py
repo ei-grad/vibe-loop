@@ -12,11 +12,13 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
 import vibe_loop.runner as runner_module
+import vibe_loop.workers as workers_module
 from vibe_loop.config import (
     AgentConfig,
     AgentResolutionError,
@@ -29,9 +31,11 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
 )
 from vibe_loop.orchestration import (
+    CandidateBaseReanchorer,
     CandidateRecord,
     CandidateCollectionError,
     CandidateCollector,
+    CandidateReanchorRetryExhausted,
     GateExecutionError,
     GateRemediationExhausted,
     GateResult,
@@ -53,6 +57,7 @@ from vibe_loop.orchestration import (
     ReviewWaitIncomplete,
     STAGE_FAILURES,
     IllegalStageTransitionError,
+    ProvisionedWorkspace,
     RunContractProposal,
     RunContractResolver,
     RunLifecycleStateMachine,
@@ -78,7 +83,7 @@ from vibe_loop.locks import (
 )
 from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore, WorkerReport
 from vibe_loop import tasks as tasks_module
-from vibe_loop.tasks import CommandTaskSource, Task
+from vibe_loop.tasks import CommandTaskSource, Task, build_task_source
 from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
@@ -90,11 +95,13 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.mode, "runtime-owned")
         self.assertEqual(config.orchestration.gates, ())
         self.assertEqual(config.orchestration.verify_on_main, ())
+        self.assertEqual(config.orchestration.max_candidate_reanchors, 2)
         self.assertTrue(config.orchestration.integration_enabled)
         self.assertEqual(
             config.orchestration.task_provenance_mode,
             "external-confirmed",
         )
+        self.assertIsNone(config.orchestration.external_completion_actor)
 
     def test_parses_typed_allowlisted_contract_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -114,8 +121,10 @@ class OrchestrationConfigTests(unittest.TestCase):
                 "max_closure_review_passes = 3\n"
                 "reviewer_concurrency_budget = 2\n"
                 "max_remediation_rounds = 4\n"
+                "max_candidate_reanchors = 3\n"
                 "integration_enabled = false\n"
-                'task_provenance_mode = "external-confirmed"\n',
+                'task_provenance_mode = "external-confirmed"\n'
+                'external_completion_actor = "operator"\n',
                 encoding="utf-8",
             )
 
@@ -131,7 +140,9 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_closure_review_passes, 3)
         self.assertEqual(config.orchestration.reviewer_concurrency_budget, 2)
         self.assertEqual(config.orchestration.max_remediation_rounds, 4)
+        self.assertEqual(config.orchestration.max_candidate_reanchors, 3)
         self.assertFalse(config.orchestration.integration_enabled)
+        self.assertEqual(config.orchestration.external_completion_actor, "operator")
 
     def test_accepts_runtime_owned_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -166,6 +177,10 @@ class OrchestrationConfigTests(unittest.TestCase):
             (
                 'task_provenance_mode = ""\n',
                 "orchestration.task_provenance_mode must be one of",
+            ),
+            (
+                'external_completion_actor = ""\n',
+                "orchestration.external_completion_actor must be one of",
             ),
         )
         for settings, diagnostic in cases:
@@ -215,10 +230,17 @@ class RunContractResolverTests(unittest.TestCase):
                 mode="runtime-owned",
                 reviewer_profile="review",
                 task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
                 explicit_keys=frozenset(
-                    {"mode", "reviewer_profile", "task_provenance_mode"}
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
                 ),
             ),
+            task_source=TaskSourceConfig(type="markdown-plan"),
         )
 
         with self.assertRaisesRegex(
@@ -315,6 +337,10 @@ class RunContractResolverTests(unittest.TestCase):
         )
 
         self.assertEqual(contract.payload["remediation"], {"max_rounds": 7})
+        self.assertEqual(
+            contract.payload["candidate_stabilization"],
+            {"max_reanchors": 2},
+        )
         reviewer_payload = contract.payload["reviewer"]
         assert isinstance(reviewer_payload, dict)
         self.assertEqual(reviewer_payload["max_closure_passes"], 3)
@@ -441,17 +467,105 @@ class RunContractResolverTests(unittest.TestCase):
                 OrchestrationConfig(
                     mode="runtime-owned",
                     reviewer_profile="review",
-                    task_provenance_mode="external-confirmed",
+                    task_provenance_mode="adapter",
                     explicit_keys=frozenset(
                         {"mode", "reviewer_profile", "task_provenance_mode"}
                     ),
                 ),
                 TaskSourceConfig(
+                    type="markdown-plan",
+                    complete_command="complete {task_id}",
+                ),
+                "task_source.complete on a command task source",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="adapter",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(complete_command="complete {task_id}"),
+                "external_completion_actor is only valid",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(
                     type="command",
                     list_command="list",
+                    probe_command="probe {task_id}",
                     activate_command="activate {task_id}",
                 ),
                 "requires task_source.reset",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
+                ),
+                TaskSourceConfig(type="markdown-plan"),
+                "requires an explicit.*external_completion_actor",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(type="command"),
+                "requires a task source with probe capability",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="worker",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(type="markdown-plan"),
+                "workers are forbidden from transitioning",
             ),
         )
         for orchestration, task_source, diagnostic in cases:
@@ -541,11 +655,148 @@ class RunContractResolverTests(unittest.TestCase):
             {
                 "mode": "adapter",
                 "complete_adapter": "task_source.complete",
+                "confirmation_adapter": "task_source.complete",
+                "transition_actor": "runtime",
                 "settlement": {
                     "requeue_adapter": "task_source.reset",
                     "park_adapter": "task_source.park",
                 },
             },
+        )
+
+    def test_external_confirmation_accepts_native_markdown_probe(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "PLAN.md").write_text(
+                "# Plan\n\n"
+                "| ID | Priority | Status | Dependencies | Scope | Acceptance | "
+                "Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | P1 | Done | none | Native source. | Works. | Test. |\n",
+                encoding="utf-8",
+            )
+            task_source = TaskSourceConfig(type="markdown-plan")
+            config = VibeConfig(
+                repo=repo,
+                agent=agent,
+                agent_profiles={"review": reviewer},
+                orchestration=OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                task_source=task_source,
+            )
+
+            contract = RunContractResolver(config).resolve(
+                AgentSelection(agent, "", "default")
+            )
+            confirmed = build_task_source(repo, task_source).probe("TASK-01")
+
+        self.assertEqual(
+            contract.payload["task_provenance"]["confirmation_adapter"],
+            "task_source.probe",
+        )
+        self.assertIsNotNone(confirmed)
+        assert confirmed is not None
+        self.assertTrue(confirmed.done)
+
+    def test_worker_owned_contract_omits_runtime_confirmation_evidence(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="worker-owned",
+                explicit_keys=frozenset({"mode"}),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                complete_command="complete {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"],
+            {
+                "mode": "external-confirmed",
+                "complete_adapter": "task_source.complete",
+                "settlement": {
+                    "requeue_adapter": None,
+                    "park_adapter": None,
+                },
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "external_completion_actor is only valid.*runtime-owned",
+        ):
+            RunContractResolver(
+                dataclasses.replace(
+                    config,
+                    orchestration=OrchestrationConfig(
+                        mode="worker-owned",
+                        external_completion_actor="worker",
+                        explicit_keys=frozenset({"mode", "external_completion_actor"}),
+                    ),
+                )
+            ).resolve(AgentSelection(agent, "", "default"))
+
+    def test_external_confirmation_preserves_available_complete_adapter(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            agent_profiles={"review": reviewer},
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="review",
+                task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
+                explicit_keys=frozenset(
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
+                ),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                complete_command="complete {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"]["complete_adapter"],
+            "task_source.complete",
+        )
+        self.assertEqual(
+            contract.payload["task_provenance"]["confirmation_adapter"],
+            "task_source.probe",
         )
 
     def test_default_runtime_owned_contract_records_provider_role_matrix(self) -> None:
@@ -578,10 +829,16 @@ class RunContractResolverTests(unittest.TestCase):
                     orchestration=OrchestrationConfig(
                         reviewer_profile="review",
                         task_provenance_mode="external-confirmed",
+                        external_completion_actor="external-system",
                         explicit_keys=frozenset(
-                            {"reviewer_profile", "task_provenance_mode"}
+                            {
+                                "reviewer_profile",
+                                "task_provenance_mode",
+                                "external_completion_actor",
+                            }
                         ),
                     ),
+                    task_source=TaskSourceConfig(type="markdown-plan"),
                 )
 
                 contract = RunContractResolver(config).resolve(
@@ -598,6 +855,14 @@ class RunContractResolverTests(unittest.TestCase):
                 self.assertEqual(
                     contract.payload["task_provenance"]["mode"],
                     "external-confirmed",
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["transition_actor"],
+                    "external-system",
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["confirmation_adapter"],
+                    "task_source.probe",
                 )
 
 
@@ -1300,6 +1565,295 @@ class RuntimeGateTests(unittest.TestCase):
         self.assertTrue(remediation_summaries[0].results[0].resumed)
 
 
+class CandidateBaseReanchorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.repo = Path(self.directory.name) / "repo"
+        init_git_repo(self.repo)
+        self.base = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.worktree = Path(self.directory.name) / "task-worktree"
+        git(
+            self.repo,
+            "worktree",
+            "add",
+            "-b",
+            "worker/TASK-01",
+            str(self.worktree),
+        )
+        self.store = RunStore(self.repo / ".vibe-loop" / "runs.jsonl")
+        self.collector = CandidateCollector(
+            worktree=self.worktree,
+            branch="worker/TASK-01",
+            base_main=self.base,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+        )
+
+    def commit_candidate(self) -> CandidateRecord:
+        (self.worktree / "candidate.txt").write_text(
+            "candidate\n",
+            encoding="utf-8",
+        )
+        git(self.worktree, "add", "candidate.txt")
+        git(self.worktree, "commit", "-m", "candidate")
+        return self.collector.collect_derived()
+
+    def advance_main(self, content: str) -> str:
+        (self.repo / "main.txt").write_text(content, encoding="utf-8")
+        git(self.repo, "add", "main.txt")
+        git(self.repo, "commit", "-m", "advance main")
+        return git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+    def test_clean_advance_reanchors_and_reruns_candidate_gates(self) -> None:
+        candidate = self.commit_candidate()
+        gate_calls: list[str] = []
+
+        def pass_gate(command, **kwargs):
+            gate_calls.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        old_summary = GateRunner(
+            completion_commands=("verify",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(candidate)
+        advanced_base = self.advance_main("advanced\n")
+
+        reanchored = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+        fresh_summary = GateRunner(
+            completion_commands=("verify",),
+            gate_keys=("completion.commands[0]",),
+            candidate_collector=self.collector,
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            log_dir=self.repo / ".vibe-loop" / "gates",
+            executor=pass_gate,
+        ).run(reanchored)
+
+        self.assertTrue(old_summary.passed)
+        self.assertTrue(fresh_summary.passed)
+        self.assertEqual(gate_calls, ["verify", "verify"])
+        self.assertEqual(reanchored.base_main, advanced_base)
+        self.assertNotEqual(reanchored.fingerprint, candidate.fingerprint)
+        self.assertEqual(reanchored.changed_paths, candidate.changed_paths)
+        self.assertEqual(
+            git(
+                self.worktree,
+                "merge-base",
+                "--is-ancestor",
+                advanced_base,
+                reanchored.head_commit,
+            ).returncode,
+            0,
+        )
+        anchor_records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "candidate_base_anchor"
+        ]
+        self.assertEqual(
+            [record["outcome"] for record in anchor_records],
+            ["re-anchored-clean"],
+        )
+
+    def test_unchanged_base_records_typed_noop(self) -> None:
+        candidate = self.commit_candidate()
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "candidate_base_anchor")
+        self.assertEqual(record["outcome"], "base-unchanged")
+        self.assertEqual(record["candidate_base"], self.base)
+        self.assertEqual(record["observed_base"], self.base)
+
+    def test_conflicting_advance_refuses_and_preserves_candidate(self) -> None:
+        (self.worktree / "README.md").write_text(
+            "candidate version\n",
+            encoding="utf-8",
+        )
+        git(self.worktree, "add", "README.md")
+        git(self.worktree, "commit", "-m", "candidate")
+        candidate = self.collector.collect_derived()
+        (self.repo / "README.md").write_text("main version\n", encoding="utf-8")
+        git(self.repo, "add", "README.md")
+        git(self.repo, "commit", "-m", "advance main")
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+
+        # A conflicting advance is not a run failure: integration still merges
+        # main after review and reports the conflicted paths from there.
+        self.assertEqual(stabilized, candidate)
+        self.assertEqual(
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            candidate.head_commit,
+        )
+        self.assertEqual(
+            git(self.worktree, "status", "--porcelain=v1").stdout.strip(),
+            "",
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "candidate_base_anchor")
+        self.assertEqual(record["outcome"], "refused-conflict")
+        self.assertEqual(record["reason"], "merge_conflict")
+
+    def test_advance_containing_the_candidate_patch_refuses_and_preserves(
+        self,
+    ) -> None:
+        candidate = self.commit_candidate()
+        # Main lands an equivalent patch, so the rebase drops the candidate
+        # commit and the re-anchored branch carries a different diff.
+        (self.repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "candidate.txt")
+        git(self.repo, "commit", "-m", "same change upstream")
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        ).stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        self.assertEqual(
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            candidate.head_commit,
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["outcome"], "refused-conflict")
+        self.assertEqual(record["reason"], "content_divergence")
+
+    def test_content_divergence_refuses_and_restores_candidate(self) -> None:
+        candidate = self.commit_candidate()
+        self.advance_main("advanced\n")
+        reanchorer = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        )
+
+        with patch.object(
+            reanchorer,
+            "_candidate_diff",
+            side_effect=(b"original diff", b"diverged diff"),
+        ):
+            stabilized = reanchorer.stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        self.assertEqual(
+            git(self.worktree, "rev-parse", "HEAD").stdout.strip(),
+            candidate.head_commit,
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["outcome"], "refused-conflict")
+        self.assertEqual(record["reason"], "content_divergence")
+
+    def test_failed_restore_records_before_raising(self) -> None:
+        candidate = self.commit_candidate()
+        self.advance_main("advanced\n")
+        reanchorer = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=2,
+        )
+
+        real_git_result = reanchorer._git_result
+
+        def failing_reset(*args: str):
+            if args[:2] == ("reset", "--hard"):
+                return subprocess.CompletedProcess(
+                    ["git", *args],
+                    1,
+                    stdout="",
+                    stderr="fatal: unable to reset\n",
+                )
+            return real_git_result(*args)
+
+        with patch.object(
+            reanchorer,
+            "_candidate_diff",
+            side_effect=(b"original diff", b"diverged diff"),
+        ):
+            with patch.object(reanchorer, "_git_result", side_effect=failing_reset):
+                with self.assertRaises(CandidateCollectionError) as raised:
+                    reanchorer.stabilize(candidate)
+
+        self.assertEqual(
+            raised.exception.code,
+            "candidate_reanchor_restore_failed",
+        )
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["record_type"], "candidate_base_anchor")
+        self.assertEqual(record["outcome"], "refused-restore-failed")
+        self.assertEqual(record["reason"], "reset_failed")
+
+    def test_disabled_reanchoring_refuses_without_parking_the_run(self) -> None:
+        candidate = self.commit_candidate()
+        advanced_base = self.advance_main("advanced\n")
+
+        stabilized = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=0,
+        ).stabilize(candidate)
+
+        self.assertEqual(stabilized, candidate)
+        record = self.store.read_records()[-1]
+        self.assertEqual(record["outcome"], "refused-disabled")
+        self.assertEqual(record["observed_base"], advanced_base)
+
+    def test_retry_bound_reports_concrete_base_drift(self) -> None:
+        candidate = self.commit_candidate()
+        first_advance = self.advance_main("first\n")
+        reanchored = CandidateBaseReanchorer(
+            candidate_collector=self.collector,
+            main_branch="main",
+            max_attempts=1,
+        ).stabilize(candidate)
+        self.advance_main("second\n")
+        second_advance = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        with self.assertRaises(CandidateReanchorRetryExhausted) as raised:
+            CandidateBaseReanchorer(
+                candidate_collector=self.collector,
+                main_branch="main",
+                max_attempts=1,
+            ).stabilize(reanchored)
+
+        self.assertEqual(raised.exception.attempts, 1)
+        self.assertEqual(raised.exception.details["candidate_base"], first_advance)
+        self.assertEqual(raised.exception.details["observed_base"], second_advance)
+        anchor_records = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "candidate_base_anchor"
+        ]
+        self.assertEqual(
+            [record["outcome"] for record in anchor_records],
+            ["re-anchored-clean", "refused-retry-bound"],
+        )
+
+
 class RuntimeIntegrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
@@ -1408,6 +1962,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
             record_types.index("integration_result"),
             record_types.index("lock_released"),
         )
+        provenance = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "integration_provenance"
+        )
+        self.assertEqual(provenance["outcome"], "settled-directly")
+        self.assertEqual(provenance["candidate_commit"], self.candidate_head)
+        self.assertEqual(provenance["target_commit"], result.main_after)
 
     def test_exact_already_merged_branch_is_no_commit_noop(self) -> None:
         git(self.repo, "merge", "--ff-only", "worker/TASK-01")
@@ -1422,6 +1984,114 @@ class RuntimeIntegrationTests(unittest.TestCase):
             git(self.repo, "rev-list", "--count", self.base + "..main").stdout.strip(),
             "1",
         )
+
+    def test_strict_ancestor_candidate_reconciles_with_verification(self) -> None:
+        git(self.repo, "merge", "--ff-only", self.candidate_head)
+        target_head = self.advance_main()
+        commit_count = git(self.repo, "rev-list", "--count", "main").stdout.strip()
+
+        result = self.integrator().run()
+
+        self.assertEqual(result.outcome, "branch_already_merged")
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.candidate_head, self.candidate_head)
+        self.assertEqual(result.main_after, target_head)
+        self.assertNotEqual(result.candidate_head, result.main_after)
+        self.assertEqual(
+            [check.phase for check in result.verification],
+            ["integration", "main"],
+        )
+        self.assertEqual(
+            git(self.repo, "rev-list", "--count", "main").stdout.strip(),
+            commit_count,
+        )
+        records = self.store.read_records()
+        integration = [
+            record
+            for record in records
+            if record["record_type"] == "integration_result"
+        ]
+        provenance = [
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        ]
+        self.assertEqual(len(integration), 1)
+        self.assertEqual(len(provenance), 1)
+        self.assertEqual(provenance[0]["outcome"], "settled-by-reconciliation")
+        self.assertEqual(provenance[0]["candidate_commit"], self.candidate_head)
+        self.assertEqual(provenance[0]["target_commit"], target_head)
+
+    def test_concurrent_strict_ancestor_reconciliation_records_once(self) -> None:
+        git(self.repo, "merge", "--ff-only", self.candidate_head)
+        self.advance_main()
+        calls = 0
+        guard = threading.Lock()
+
+        def count_success(command, **kwargs):
+            nonlocal calls
+            with guard:
+                calls += 1
+            return subprocess.CompletedProcess(command, 0)
+
+        integrators = [
+            self.integrator(executor=count_success, timeout_seconds=2) for _ in range(2)
+        ]
+        results: list[IntegrationResult] = []
+        threads = [
+            threading.Thread(target=lambda item=item: results.append(item.run()))
+            for item in integrators
+        ]
+
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result.completed for result in results))
+        self.assertEqual(calls, 2)
+        records = self.store.read_records()
+        self.assertEqual(
+            sum(record["record_type"] == "integration_result" for record in records),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                record["record_type"] == "integration_provenance" for record in records
+            ),
+            1,
+        )
+
+    def test_merged_candidate_with_advanced_branch_refuses_reconciliation(
+        self,
+    ) -> None:
+        git(self.repo, "merge", "--ff-only", self.candidate_head)
+        target_head = self.advance_main()
+        (self.worktree / "unreviewed.txt").write_text("unreviewed\n", encoding="utf-8")
+        git(self.worktree, "add", "unreviewed.txt")
+        git(self.worktree, "commit", "-m", "unreviewed branch advance")
+
+        result = self.integrator().run()
+
+        self.assertEqual(result.status, "blocked")
+        self.assertFalse(result.completed)
+        records = self.store.read_records()
+        self.assertFalse(
+            any(
+                record["record_type"] == "integration_result"
+                and record.get("status") == "completed"
+                for record in records
+            )
+        )
+        refusal = next(
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        )
+        self.assertEqual(refusal["outcome"], "refused-unprovable")
+        self.assertEqual(refusal["candidate_commit"], self.candidate_head)
+        self.assertEqual(refusal["target_commit"], target_head)
 
     def test_merge_conflict_parks_workspace_and_releases_lock(self) -> None:
         (self.worktree / "README.md").write_text(
@@ -1988,8 +2658,11 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.task_lock = self.manager.current_lock("TASK-01")
 
     def record_integration(self) -> None:
-        self.store.append_lifecycle_event(
-            RunLifecycleEvent.integration_result(
+        self.store.record_completed_integration(
+            run_id="run-1",
+            task_id="TASK-01",
+            provenance_outcome="settled-directly",
+            integration=RunLifecycleEvent.integration_result(
                 run_id="run-1",
                 task_id="TASK-01",
                 payload=IntegrationResult(
@@ -2002,14 +2675,34 @@ class TaskSourceProvenanceTests(unittest.TestCase):
                     main_before="c" * 40,
                     main_after="b" * 40,
                 ).to_payload(),
+            ),
+        )
+
+    def record_candidate(self, head_commit: str) -> str:
+        target = git(self.repo, "rev-parse", "main").stdout.strip()
+        candidate = CandidateRecord(
+            branch="worker/TASK-01",
+            worktree=self.repo,
+            base_main=target,
+            head_commit=head_commit,
+            changed_paths=(),
+            source="derived",
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.candidate_recorded(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload=candidate.to_payload(),
             )
         )
+        return head_commit
 
     def completer(
         self,
         source: MutableTaskSource,
         *,
         mode: str = "adapter",
+        stage_machine: RunLifecycleStateMachine | None = None,
     ) -> TaskSourceCompleter:
         return TaskSourceCompleter(
             source=source,
@@ -2026,8 +2719,11 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             lock_manager=self.manager,
             task_lock=self.task_lock,
             run_store=self.store,
+            repo=self.repo,
+            main_branch="main",
             run_id="run-1",
             task_id="TASK-01",
+            stage_machine=stage_machine,
         )
 
     def settler(
@@ -2069,6 +2765,65 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(source.complete_calls, 0)
         self.assertEqual(self.store.read_records(), [])
 
+    def test_wrong_stage_refuses_before_reconciliation_side_effects(self) -> None:
+        candidate_head = git(self.repo, "rev-parse", "main").stdout.strip()
+        self.record_candidate(candidate_head)
+        transitions = []
+        machine = RunLifecycleStateMachine(transitions.append)
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+            RunStage.REVIEW,
+        ):
+            machine.transition(stage, reason="setup")
+        source = MutableTaskSource()
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "may only follow the integration stage"
+        ):
+            self.completer(source, stage_machine=machine).complete()
+
+        self.assertEqual(source.complete_calls, 0)
+        self.assertEqual(
+            [record["record_type"] for record in self.store.read_records()],
+            ["candidate_recorded"],
+        )
+
+    def test_unmerged_candidate_records_refusal_and_fails_closed(self) -> None:
+        base = git(self.repo, "rev-parse", "main").stdout.strip()
+        git(self.repo, "checkout", "-b", "unmerged-candidate")
+        (self.repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "candidate.txt")
+        git(self.repo, "commit", "-m", "unmerged candidate")
+        candidate_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "main")
+        self.record_candidate(candidate_head)
+        source = MutableTaskSource()
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "durable completed integration_result"
+        ):
+            self.completer(source).complete()
+
+        self.assertEqual(source.complete_calls, 0)
+        records = self.store.read_records()
+        self.assertNotIn(
+            "integration_result",
+            [record["record_type"] for record in records],
+        )
+        refusal = [
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        ]
+        self.assertEqual(len(refusal), 1)
+        self.assertEqual(refusal[0]["outcome"], "refused-unprovable")
+        self.assertEqual(refusal[0]["candidate_commit"], candidate_head)
+        self.assertEqual(refusal[0]["target_commit"], base)
+
     def test_completion_rejects_completed_report_before_provenance(self) -> None:
         self.record_integration()
         self.store.append_result(
@@ -2101,11 +2856,53 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(first.confirmed_status, "done")
         self.assertEqual(first, second)
         self.assertEqual(source.complete_calls, 1)
-        record_types = [record["record_type"] for record in self.store.read_records()]
+        records = self.store.read_records()
+        record_types = [record["record_type"] for record in records]
         self.assertLess(
             record_types.index("integration_result"),
             record_types.index("task_provenance_committed"),
         )
+        settlement = next(
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        )
+        self.assertEqual(settlement["outcome"], "settled-directly")
+        self.assertEqual(settlement["candidate_commit"], "a" * 40)
+        self.assertEqual(settlement["target_commit"], "b" * 40)
+
+    def test_completion_repairs_missing_integration_provenance(self) -> None:
+        integration = IntegrationResult(
+            outcome="merged",
+            status="completed",
+            reason="",
+            branch="worker/TASK-01",
+            candidate_head="a" * 40,
+            refreshed_head="b" * 40,
+            main_before="c" * 40,
+            main_after="b" * 40,
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.integration_result(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload=integration.to_payload(),
+            )
+        )
+
+        self.completer(MutableTaskSource()).complete()
+
+        records = self.store.read_records()
+        self.assertEqual(
+            sum(record["record_type"] == "integration_result" for record in records),
+            1,
+        )
+        provenance = next(
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        )
+        self.assertEqual(provenance["outcome"], "settled-directly")
 
     def test_loopyard_style_adapter_enforces_transition_evidence_end_to_end(
         self,
@@ -2148,6 +2945,8 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             lock_manager=self.manager,
             task_lock=self.task_lock,
             run_store=self.store,
+            repo=self.repo,
+            main_branch="main",
             run_id="run-1",
             task_id="TASK-01",
         )
@@ -3186,6 +3985,75 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertEqual(wall["retry_classification"], "limit_wall")
         self.assertEqual(wall["route"]["provider"], "codex")
+
+    def test_reviewer_that_read_limit_wall_fixtures_is_not_a_wall(self) -> None:
+        # The observed false positive. Reviewing a limit-wall slice means reading
+        # its classifier fixtures, so the reviewer transcript quotes the phrases
+        # verbatim; the reviewer then finished and approved. Text below is
+        # verbatim from run 20260725T192937Z-...-58298d25-remediation-1, which
+        # paused dispatch 1800s and was reported to the operator as an exhausted
+        # provider quota.
+        transcript = "\n".join(
+            (
+                "Reading tests/test_retry.py",
+                '        ("Error 429: Too Many Requests. usage limit exceeded, '
+                'retry after 30s", True),',
+                '        ("503: weekly limit reached, service temporarily '
+                'unavailable", True),',
+                "You've hit your usage limit is the phrase the detector matches.",
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=transcript)
+
+        result = self.router("codex", execute).review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertEqual(
+            [
+                record.get("retry_classification")
+                for record in self.store.read_records()
+                if record.get("record_type") == "review_verdict"
+            ],
+            ["ok"],
+        )
+
+    def test_reviewer_wall_in_a_provider_envelope_still_pauses(self) -> None:
+        # The real thing, in the shape the provider emits it: the reviewer
+        # process failed and its terminal record carries the refusal. Matches
+        # tests/fixtures/provider_usage/claude-limit-wall.json.
+        envelope = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "result": "usage limit reached",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+        )
+        transcript = "\n".join(("reading src/vibe_loop/retry.py", envelope))
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 1, stdout=transcript)
+
+        with self.assertRaises(ReviewLimitWallError) as raised:
+            self.router("codex", execute).review(self.gates)
+
+        message = str(raised.exception)
+        self.assertIn("usage limit reached", message)
+        # The diagnostic must name what qualified the match, so an operator
+        # reading a recorded pause can tell it from a quoted phrase.
+        self.assertIn(f"[exit=1; scanned all {len(transcript)} chars]", message)
 
     def test_missing_prompt_delivery_fails_before_launch(self) -> None:
         router = ReviewRouter(
@@ -4352,7 +5220,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             )
             self.assertEqual(
                 [record["record_type"] for record in records],
-                ["workspace_provisioned", "workspace_claim"],
+                ["workspace_preflight", "workspace_provisioned", "workspace_claim"],
             )
             self.assertEqual(primary_snapshot(repo), primary_before)
             self.assertEqual(
@@ -4401,6 +5269,11 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(adopted.mode, "adopted")
             self.assertEqual(adopted.worktree, first.worktree)
             self.assertEqual(adopted.owner_run_id, "run-1")
+            preflight = store.read_records()[-3]
+            self.assertEqual(preflight["record_type"], "workspace_preflight")
+            self.assertEqual(preflight["decision"], "reusable")
+            self.assertEqual(preflight["retry_disposition"], "not_needed")
+            self.assertTrue(preflight["worker_launch_allowed"])
 
     def test_adopts_legacy_path_with_matching_task_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4693,7 +5566,403 @@ class WorkspaceProvisionerTests(unittest.TestCase):
 
                     self.assertEqual(raised.exception.code, expected_code)
 
-    def test_recovery_allows_main_to_advance_from_recorded_base(self) -> None:
+    @staticmethod
+    def _stale_workspace(
+        directory: str,
+        *,
+        ignored_dirty_paths: tuple[Path, ...] | None = None,
+        seed: Callable[[Path], None] | None = None,
+    ) -> tuple[Path, object, ProvisionedWorkspace, str, str]:
+        """Build a task worktree left behind at an older main.
+
+        ``seed`` runs in the repo before the worktree is created; the returned
+        tuple is (repo, run store, workspace, stale base, advanced base).
+        """
+
+        repo = Path(directory) / "repo"
+        init_git_repo(repo)
+        if seed is not None:
+            seed(repo)
+        manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+        stale_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        first = WorkspaceProvisioner(
+            repo=repo,
+            main_branch="main",
+            lock_manager=manager,
+            run_store=store,
+            ignored_dirty_paths=ignored_dirty_paths or (),
+        ).provision(
+            task_id="TASK-01",
+            run_id="run-1",
+            base_commit=stale_base,
+            fencing_token=token,
+        )
+        manager.release(manager.current_lock("TASK-01"))
+        (repo / "main-change.txt").write_text("advanced\n", encoding="utf-8")
+        git(repo, "add", "main-change.txt")
+        git(repo, "commit", "-m", "advance main")
+        current_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+        return repo, store, first, stale_base, current_base
+
+    @staticmethod
+    def _adopt_stale(
+        repo: Path,
+        store: object,
+        current_base: str,
+        *,
+        ignored_dirty_paths: tuple[Path, ...] | None = None,
+    ) -> ProvisionedWorkspace:
+        manager, _, token = acquire_run(repo, "TASK-01", "run-2", store=store)
+        return WorkspaceProvisioner(
+            repo=repo,
+            main_branch="main",
+            lock_manager=manager,
+            run_store=store,
+            ignored_dirty_paths=ignored_dirty_paths or (),
+        ).provision(
+            task_id="TASK-01",
+            run_id="run-2",
+            base_commit=current_base,
+            fencing_token=token,
+        )
+
+    def _last_rejected_preflight(self, store: object) -> dict[str, object]:
+        rejected = [
+            record
+            for record in store.read_records()
+            if record.get("record_type") == "workspace_preflight"
+            and record.get("decision") == "rejected"
+        ]
+        self.assertTrue(rejected)
+        return rejected[-1]
+
+    def test_clean_stale_workspace_is_refreshed_and_adopted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+            )
+            self.assertFalse((first.worktree / "main-change.txt").exists())
+
+            adopted = self._adopt_stale(repo, store, current_base)
+
+            # The refresh, not merely a successful adoption: HEAD moved onto the
+            # advanced base and the commit's content is materially present.
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), current_base
+            )
+            self.assertTrue((first.worktree / "main-change.txt").exists())
+            self.assertEqual(adopted.refreshed_from, stale_base)
+            self.assertEqual(adopted.head_commit, current_base)
+            self.assertEqual(adopted.base_commit, current_base)
+            self.assertEqual(adopted.mode, "adopted")
+            self.assertEqual(adopted.worktree, first.worktree)
+            provisioned = [
+                record
+                for record in store.read_records()
+                if record.get("record_type") == "workspace_provisioned"
+            ]
+            self.assertEqual(provisioned[-1]["refreshed_from"], stale_base)
+            preflight = [
+                record
+                for record in store.read_records()
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("run_id") == "run-2"
+            ]
+            self.assertEqual(preflight[-1]["decision"], "reusable")
+            self.assertTrue(preflight[-1]["worker_launch_allowed"])
+
+    def test_stale_workspace_refresh_refusals_leave_the_worktree_untouched(
+        self,
+    ) -> None:
+        def commit_unique(worktree: Path) -> None:
+            (worktree / "candidate.txt").write_text("unique\n", encoding="utf-8")
+            git(worktree, "add", "candidate.txt")
+            git(worktree, "commit", "-m", "interrupted candidate")
+
+        def leave_untracked(worktree: Path) -> None:
+            (worktree / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
+
+        def modify_tracked(worktree: Path) -> None:
+            (worktree / "README.md").write_text("modified\n", encoding="utf-8")
+
+        cases: tuple[tuple[str, Callable[[Path], None], str], ...] = (
+            ("unique_commits", commit_unique, "unique_commits"),
+            ("untracked_dirt", leave_untracked, "dirty_workspace"),
+            ("tracked_dirt", modify_tracked, "dirty_workspace"),
+        )
+        for name, disturb, expected_refusal in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                repo, store, first, stale_base, current_base = self._stale_workspace(
+                    directory
+                )
+                disturb(first.worktree)
+                head_before = git(
+                    first.worktree, "rev-parse", "HEAD"
+                ).stdout.strip()
+                status_before = git(
+                    first.worktree, "status", "--short"
+                ).stdout
+
+                with self.assertRaises(WorkspaceProvisionError) as raised:
+                    self._adopt_stale(repo, store, current_base)
+
+                self.assertEqual(
+                    raised.exception.code, "workspace_stale_current_base"
+                )
+                self.assertEqual(
+                    raised.exception.retry_disposition,
+                    "defer_until_workspace_changes",
+                )
+                self.assertEqual(
+                    raised.exception.details["refresh_refused"], expected_refusal
+                )
+                # An operator reads the journal, not the exception.
+                self.assertEqual(
+                    self._last_rejected_preflight(store)["refresh_refused"],
+                    expected_refusal,
+                )
+                # The half that matters: a guard that refuses after refreshing
+                # is worse than no guard.
+                self.assertEqual(
+                    git(first.worktree, "rev-parse", "HEAD").stdout.strip(),
+                    head_before,
+                )
+                self.assertEqual(
+                    git(first.worktree, "status", "--short").stdout, status_before
+                )
+                self.assertFalse((first.worktree / "main-change.txt").exists())
+                self.assertTrue(first.worktree.exists())
+                if name == "unique_commits":
+                    self.assertNotEqual(head_before, stale_base)
+
+    def test_stale_workspace_refresh_fails_closed_on_unreadable_git_state(
+        self,
+    ) -> None:
+        real = WorkspaceProvisioner._git_result_at
+        # (matched git args, which matching call to disturb, replacement stdout
+        # or None for a hard failure, expected refusal). The HEAD read is
+        # matched twice -- once by the ordinary adoption path and once by the
+        # refresh guard's own re-read -- so only the second is disturbed.
+        cases: tuple[tuple[tuple[str, ...], int, str | None, str], ...] = (
+            (("rev-parse", "--verify", "HEAD"), 2, None, "head_unreadable_or_moved"),
+            (
+                ("rev-parse", "--verify", "HEAD"),
+                2,
+                "0" * 40,
+                "head_unreadable_or_moved",
+            ),
+            (("rev-list",), 1, None, "unique_commits_unreadable"),
+            (("status", "--short"), 1, None, "status_unreadable"),
+            (("merge", "--ff-only"), 1, None, "fast_forward_refused"),
+        )
+        for matched, ordinal, replacement, expected_refusal in cases:
+            with (
+                self.subTest(git_args=matched, ordinal=ordinal, stdout=replacement),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repo, store, first, stale_base, current_base = self._stale_workspace(
+                    directory
+                )
+                worktree = first.worktree
+                seen = 0
+
+                def break_git(
+                    cwd: Path,
+                    *args: str,
+                    _matched: tuple[str, ...] = matched,
+                    _ordinal: int = ordinal,
+                    _replacement: str | None = replacement,
+                    _worktree: Path = worktree,
+                ) -> subprocess.CompletedProcess[str]:
+                    nonlocal seen
+                    if Path(cwd) == _worktree and args[: len(_matched)] == _matched:
+                        seen += 1
+                        if seen == _ordinal:
+                            if _replacement is None:
+                                return subprocess.CompletedProcess(
+                                    ["git", *args], 128, "", "simulated git failure"
+                                )
+                            return subprocess.CompletedProcess(
+                                ["git", *args], 0, _replacement, ""
+                            )
+                    return real(cwd, *args)
+
+                with patch.object(
+                    WorkspaceProvisioner,
+                    "_git_result_at",
+                    staticmethod(break_git),
+                ):
+                    with self.assertRaises(WorkspaceProvisionError) as raised:
+                        self._adopt_stale(repo, store, current_base)
+
+                self.assertEqual(
+                    raised.exception.details["refresh_refused"], expected_refusal
+                )
+                self.assertEqual(
+                    self._last_rejected_preflight(store)["refresh_refused"],
+                    expected_refusal,
+                )
+                self.assertEqual(
+                    git(worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+                )
+                self.assertFalse((worktree / "main-change.txt").exists())
+
+    def test_stale_workspace_refresh_defers_when_the_dirty_snapshot_is_unreadable(
+        self,
+    ) -> None:
+        # git_dirty_snapshot reports failure by raising its own error type
+        # rather than a returncode, and it runs through workers.run_git, so the
+        # returncode matrix above cannot reach this path.
+        real_run_git = workers_module.run_git
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            worktree = first.worktree
+
+            def break_diff(
+                path: Path, *args: str
+            ) -> subprocess.CompletedProcess[str]:
+                if Path(path) == worktree and args[:1] == ("diff",):
+                    return subprocess.CompletedProcess(
+                        ["git", *args], 128, "", "simulated git failure"
+                    )
+                return real_run_git(path, *args)
+
+            with patch("vibe_loop.workers.run_git", side_effect=break_diff):
+                with self.assertRaises(WorkspaceProvisionError) as raised:
+                    self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            self.assertEqual(
+                raised.exception.retry_disposition,
+                "defer_until_workspace_changes",
+            )
+            self.assertEqual(
+                raised.exception.details["refresh_refused"],
+                "dirty_snapshot_unreadable",
+            )
+            # The point of the wrap: a recorded deferral, not an untyped escape
+            # past the handler that writes it.
+            self.assertEqual(
+                self._last_rejected_preflight(store)["refresh_refused"],
+                "dirty_snapshot_unreadable",
+            )
+            self.assertEqual(
+                git(worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+            )
+            self.assertFalse((worktree / "main-change.txt").exists())
+
+    def test_stale_workspace_refresh_rejects_head_that_did_not_reach_the_base(
+        self,
+    ) -> None:
+        real = WorkspaceProvisioner._git_result_at
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, _stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            worktree = first.worktree
+            seen = 0
+
+            def break_git(
+                cwd: Path, *args: str
+            ) -> subprocess.CompletedProcess[str]:
+                nonlocal seen
+                if Path(cwd) == worktree and args[:3] == (
+                    "rev-parse",
+                    "--verify",
+                    "HEAD",
+                ):
+                    seen += 1
+                    if seen == 3:
+                        return subprocess.CompletedProcess(
+                            ["git", *args], 0, "0" * 40, ""
+                        )
+                return real(cwd, *args)
+
+            with patch.object(
+                WorkspaceProvisioner, "_git_result_at", staticmethod(break_git)
+            ):
+                with self.assertRaises(WorkspaceProvisionError) as raised:
+                    self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(
+                raised.exception.details["refresh_refused"],
+                "refresh_did_not_reach_base",
+            )
+            # The fast-forward itself did land; only the post-condition read
+            # disagreed. Deferring is still the fail-closed answer, and the next
+            # dispatch finds a workspace that is no longer stale.
+            self.assertEqual(
+                git(worktree, "rev-parse", "HEAD").stdout.strip(), current_base
+            )
+
+    def test_stale_workspace_refresh_refuses_tracked_dirt_behind_ignored_path(
+        self,
+    ) -> None:
+        def seed(repo: Path) -> None:
+            vendor = repo / "vendor"
+            vendor.mkdir()
+            (vendor / "pinned.txt").write_text("pinned\n", encoding="utf-8")
+            git(repo, "add", "vendor/pinned.txt")
+            git(repo, "commit", "-m", "vendor")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory,
+                seed=seed,
+            )
+            ignored = (first.worktree / "vendor",)
+            (first.worktree / "vendor" / "pinned.txt").write_text(
+                "locally rewritten\n", encoding="utf-8"
+            )
+            # The exclusion hides the modification from the dirty snapshot, so
+            # only the tracked/untracked distinction can catch it.
+            self.assertEqual(
+                git_dirty_snapshot(first.worktree, ignored_dirty_paths=ignored)[0],
+                [],
+            )
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                self._adopt_stale(
+                    repo, store, current_base, ignored_dirty_paths=ignored
+                )
+
+            self.assertEqual(
+                raised.exception.details["refresh_refused"],
+                "tracked_modification_behind_ignored_path",
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), stale_base
+            )
+            self.assertEqual(
+                (first.worktree / "vendor" / "pinned.txt").read_text(encoding="utf-8"),
+                "locally rewritten\n",
+            )
+
+    def test_stale_workspace_refresh_tolerates_untracked_ignored_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            state = first.worktree / ".vibe-loop"
+            state.mkdir()
+            (state / "scratch.json").write_text("{}\n", encoding="utf-8")
+
+            adopted = self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(adopted.refreshed_from, stale_base)
+            # A fast-forward never deletes an untracked file, which is why an
+            # untracked state directory may count as clean.
+            self.assertTrue((state / "scratch.json").exists())
+            self.assertTrue((first.worktree / "main-change.txt").exists())
+
+    def test_recovery_rejects_workspace_that_does_not_contain_current_base(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
@@ -4723,48 +5992,276 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 store=store,
             )
 
-            recovered = WorkspaceProvisioner(
-                repo=repo,
-                main_branch="main",
-                lock_manager=manager,
-                run_store=store,
-            ).provision(
-                task_id="TASK-01",
-                run_id="run-2",
-                base_commit=current_base,
-                fencing_token=token,
-                recovery_run_id="run-1",
-                recovery_branch=first.branch,
-                recovery_worktree=first.worktree,
-            )
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                WorkspaceProvisioner(
+                    repo=repo,
+                    main_branch="main",
+                    lock_manager=manager,
+                    run_store=store,
+                ).provision(
+                    task_id="TASK-01",
+                    run_id="run-2",
+                    base_commit=current_base,
+                    fencing_token=token,
+                    recovery_run_id="run-1",
+                    recovery_branch=first.branch,
+                    recovery_worktree=first.worktree,
+                )
 
-            self.assertEqual(recovered.mode, "adopted")
-            self.assertEqual(recovered.base_commit, first_base)
-            manager.release(manager.current_lock("TASK-01"))
-            manager, _, token = acquire_run(
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            self.assertEqual(
+                raised.exception.retry_disposition,
+                "defer_until_workspace_changes",
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), first_base
+            )
+            self.assertTrue(first.worktree.exists())
+            preflight = store.read_records()[-1]
+            self.assertEqual(preflight["record_type"], "workspace_preflight")
+            self.assertEqual(preflight["decision"], "rejected")
+            self.assertEqual(preflight["reason"], "workspace_stale_current_base")
+            self.assertEqual(
+                preflight["retry_disposition"], "defer_until_workspace_changes"
+            )
+            self.assertFalse(preflight["worker_launch_allowed"])
+
+    def test_runner_rejects_stale_adoption_before_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(
+                RunContractJournalTests.worker_owned_config(repo, agent)
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+            manager, store, token = acquire_run(
                 repo,
-                "TASK-01",
-                "run-3",
-                store=store,
+                task.task_id,
+                "prior-run",
+                store=runner.run_store,
             )
-
-            recovered_again = WorkspaceProvisioner(
+            old_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            workspace = WorkspaceProvisioner(
                 repo=repo,
                 main_branch="main",
                 lock_manager=manager,
                 run_store=store,
             ).provision(
-                task_id="TASK-01",
-                run_id="run-3",
-                base_commit=current_base,
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=old_base,
                 fencing_token=token,
-                recovery_run_id="run-2",
-                recovery_branch=first.branch,
-                recovery_worktree=first.worktree,
+            )
+            (workspace.worktree / "candidate.txt").write_text(
+                "interrupted candidate\n", encoding="utf-8"
+            )
+            git(workspace.worktree, "add", "candidate.txt")
+            git(workspace.worktree, "commit", "-m", "interrupted candidate")
+            stale_head = git(workspace.worktree, "rev-parse", "HEAD").stdout.strip()
+            manager.release(manager.current_lock(task.task_id))
+            (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            git(repo, "add", "current-base.txt")
+            git(repo, "commit", "-m", "advance main")
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch("vibe_loop.runner.run_streaming_command") as launch:
+                        with self.assertRaises(WorkspaceProvisionError) as raised:
+                            runner.run_task(task)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            launch.assert_not_called()
+            self.assertTrue(workspace.worktree.exists())
+            self.assertEqual(
+                git(workspace.worktree, "rev-parse", "HEAD").stdout.strip(),
+                stale_head,
+            )
+            self.assertFalse(runner.lock_manager.is_locked(task.task_id))
+            records = runner.run_store.read_records()
+            rejected = [
+                record
+                for record in records
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("decision") == "rejected"
+            ]
+            self.assertEqual(len(rejected), 1)
+            self.assertEqual(
+                rejected[0]["retry_disposition"],
+                "defer_until_workspace_changes",
+            )
+            self.assertNotIn(
+                "worker_process_started",
+                [record.get("record_type") for record in records],
             )
 
-            self.assertEqual(recovered_again.mode, "adopted")
-            self.assertEqual(recovered_again.base_commit, first_base)
+    def test_rejection_suppression_survives_ignored_dirty_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(
+                RunContractJournalTests.worker_owned_config(repo, agent)
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+            manager, store, token = acquire_run(
+                repo,
+                task.task_id,
+                "prior-run",
+                store=runner.run_store,
+            )
+            old_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=old_base,
+                fencing_token=token,
+            )
+            (workspace.worktree / "candidate.txt").write_text(
+                "interrupted candidate\n", encoding="utf-8"
+            )
+            git(workspace.worktree, "add", "candidate.txt")
+            git(workspace.worktree, "commit", "-m", "interrupted candidate")
+            manager.release(manager.current_lock(task.task_id))
+            (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            git(repo, "add", "current-base.txt")
+            git(repo, "commit", "-m", "advance main")
+            scratch = workspace.worktree / "scratch"
+            scratch.mkdir()
+            (scratch / "note.txt").write_text("excluded dirt\n", encoding="utf-8")
+            runner.workspace_ignored_dirty_paths = (scratch,)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch("vibe_loop.runner.run_streaming_command") as launch:
+                        with self.assertRaises(WorkspaceProvisionError) as raised:
+                            runner.run_task(task)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            launch.assert_not_called()
+            rejected = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("decision") == "rejected"
+            ]
+            self.assertEqual(len(rejected), 1)
+            recorded_fingerprint = rejected[0]["workspace_state_fingerprint"]
+            selected_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            # The exclusion has to be load-bearing, or the suppression assertion
+            # below would hold even if the recompute dropped the argument.
+            self.assertNotEqual(
+                recorded_fingerprint,
+                runner_module.workspace_state_fingerprint(
+                    repo=repo,
+                    main_branch="main",
+                    branch=str(rejected[0]["branch"]),
+                    worktree=workspace.worktree,
+                    expected_base=selected_base,
+                ),
+            )
+            self.assertEqual(
+                runner.unchanged_workspace_dispatch_deferrals(),
+                {task.task_id},
+            )
+
+    def test_runner_rejects_head_change_between_preflight_and_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            agent = AgentConfig(
+                command="worker {prompt}",
+                agent_kind="custom",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            runner = VibeRunner(
+                RunContractJournalTests.worker_owned_config(repo, agent)
+            )
+            task = Task(task_id="T-1", title="Task", status="Next")
+            manager, store, token = acquire_run(
+                repo,
+                task.task_id,
+                "prior-run",
+                store=runner.run_store,
+            )
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=base,
+                fencing_token=token,
+            )
+            manager.release(manager.current_lock(task.task_id))
+            original_claim = claim_worker_workspace
+
+            def mutate_then_claim(*args, **kwargs):
+                (workspace.worktree / "raced.txt").write_text(
+                    "preserve raced commit\n", encoding="utf-8"
+                )
+                git(workspace.worktree, "add", "raced.txt")
+                git(workspace.worktree, "commit", "-m", "race workspace claim")
+                return original_claim(*args, **kwargs)
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    runner,
+                    "activate_task_before_launch",
+                    return_value=None,
+                ):
+                    with patch(
+                        "vibe_loop.workers.claim_worker_workspace",
+                        side_effect=mutate_then_claim,
+                    ):
+                        with patch("vibe_loop.runner.run_streaming_command") as launch:
+                            with self.assertRaises(WorkspaceProvisionError) as raised:
+                                runner.run_task(task)
+
+            self.assertEqual(raised.exception.code, "workspace_changed_during_claim")
+            launch.assert_not_called()
+            self.assertTrue((workspace.worktree / "raced.txt").exists())
+            claims = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_claim"
+            ]
+            self.assertEqual([record["run_id"] for record in claims], ["prior-run"])
+            rejected = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "workspace_preflight"
+                and record.get("decision") == "rejected"
+            ]
+            self.assertEqual(rejected[-1]["reason"], "workspace_changed_during_claim")
+            self.assertFalse(rejected[-1]["worker_launch_allowed"])
 
     def test_recovery_rejects_latest_foreign_ownership_record(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

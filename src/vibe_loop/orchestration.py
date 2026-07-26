@@ -30,12 +30,14 @@ from vibe_loop.config import (
 )
 from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
-from vibe_loop.retry import LimitWallSignal, detect_limit_wall
+from vibe_loop.retry import LimitWallSignal, detect_provider_limit_wall
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
     TaskSource,
+    task_source_completion_capability,
     task_source_error_diagnostics,
+    task_source_probe_capability,
 )
 from vibe_loop.telemetry import (
     ProviderUsage,
@@ -49,6 +51,14 @@ RUN_CONTRACT_SOURCE_KINDS = ("config", "profile", "skill-proposal")
 WORKSPACE_BRANCH_PREFIX = "vibe-loop/"
 WORKSPACE_NAME_MAX_LENGTH = 64
 CANDIDATE_RECORD_SOURCE_KINDS = ("worker_command", "derived")
+CANDIDATE_BASE_ANCHOR_OUTCOMES = (
+    "base-unchanged",
+    "re-anchored-clean",
+    "refused-conflict",
+    "refused-disabled",
+    "refused-restore-failed",
+    "refused-retry-bound",
+)
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
@@ -210,6 +220,28 @@ class CandidateCollectionError(RuntimeError):
         super().__init__(message)
 
 
+class CandidateReanchorRetryExhausted(CandidateCollectionError):
+    def __init__(
+        self,
+        *,
+        attempts: int,
+        candidate_base: str,
+        observed_base: str,
+    ) -> None:
+        self.attempts = attempts
+        super().__init__(
+            "candidate_reanchor_retry_bound",
+            "candidate base kept advancing during bounded clean re-anchor: "
+            f"candidate base {candidate_base} vs observed base {observed_base} "
+            f"after {attempts} clean re-anchor(s)",
+            details={
+                "attempts": attempts,
+                "candidate_base": candidate_base,
+                "observed_base": observed_base,
+            },
+        )
+
+
 class GateExecutionError(RuntimeError):
     pass
 
@@ -271,7 +303,10 @@ class ReviewLimitWallError(ReviewExecutionError):
         self.route = route
         self.phase = phase
         detail = f" ({signal.reset_text})" if signal.reset_text else ""
-        super().__init__(f"reviewer limit wall on {route}: {signal.marker}{detail}")
+        evidence = f" [{signal.evidence}]" if signal.evidence else ""
+        super().__init__(
+            f"reviewer limit wall on {route}: {signal.marker}{detail}{evidence}"
+        )
 
 
 class ReviewStageResultError(ReviewExecutionError):
@@ -633,7 +668,12 @@ class CandidateCollector:
             )
         return resolved
 
-    def snapshot(self, *, source: str) -> CandidateRecord:
+    def snapshot(
+        self,
+        *,
+        source: str,
+        base_main: str | None = None,
+    ) -> CandidateRecord:
         observed_branch = self._git_text("branch", "--show-current")
         if observed_branch != self.branch:
             raise CandidateCollectionError(
@@ -642,7 +682,9 @@ class CandidateCollector:
                 details={"expected": self.branch, "observed": observed_branch},
             )
         head_commit = self._git_text("rev-parse", "--verify", "HEAD")
-        resolved_base = self._git_text("rev-parse", "--verify", self.base_main)
+        resolved_base = self._git_text(
+            "rev-parse", "--verify", base_main or self.base_main
+        )
         if (
             self._git_result(
                 "merge-base", "--is-ancestor", resolved_base, head_commit
@@ -689,7 +731,10 @@ class CandidateCollector:
     def matches(self, candidate: CandidateRecord) -> bool:
         try:
             return (
-                self.snapshot(source=candidate.source).fingerprint
+                self.snapshot(
+                    source=candidate.source,
+                    base_main=candidate.base_main,
+                ).fingerprint
                 == candidate.fingerprint
             )
         except CandidateCollectionError:
@@ -752,6 +797,14 @@ class CandidateCollector:
             )
         if not self.is_recorded(candidate):
             self._record(candidate)
+
+    def record(self, candidate: CandidateRecord) -> None:
+        if not self.matches(candidate):
+            raise CandidateCollectionError(
+                "candidate_changed",
+                "candidate no longer matches the claimed workspace",
+            )
+        self._record(candidate)
 
     def latest_recorded(self) -> CandidateRecord | None:
         for record in reversed(self.run_store.read_records()):
@@ -834,6 +887,265 @@ class CandidateCollector:
                 "candidate Git state could not be read",
                 details={"error": str(exc)},
             ) from exc
+
+
+class CandidateBaseReanchorer:
+    def __init__(
+        self,
+        *,
+        candidate_collector: CandidateCollector,
+        main_branch: str,
+        max_attempts: int,
+    ) -> None:
+        if max_attempts < 0:
+            raise ValueError("max_attempts must be non-negative")
+        self.candidate_collector = candidate_collector
+        self.main_branch = main_branch
+        self.max_attempts = max_attempts
+
+    def stabilize(self, candidate: CandidateRecord) -> CandidateRecord:
+        """Advance a candidate onto the live integration base when that is free.
+
+        Re-anchoring is an optimization that keeps gate evidence attached to the
+        base the candidate will actually merge into. When it cannot be performed
+        mechanically the candidate itself is still valid, so a refusal returns
+        the original candidate and leaves the advance to the merge that
+        integration already performs after review. The one exception is a base
+        that keeps advancing past a bounded number of successful re-anchors:
+        that run cannot produce evidence against a settled base at all, so it
+        parks rather than spending gates and a reviewer.
+        """
+
+        attempts = self._prior_attempts(candidate.head_commit)
+        attempted_in_call = False
+        while True:
+            observed_base = self._git_text("rev-parse", "--verify", self.main_branch)
+            if observed_base == candidate.base_main:
+                if not attempted_in_call:
+                    self._record(
+                        "base-unchanged",
+                        candidate_base=candidate.base_main,
+                        observed_base=observed_base,
+                        attempts=attempts,
+                    )
+                return candidate
+            if attempts >= self.max_attempts:
+                if attempts == 0:
+                    self._record(
+                        "refused-disabled",
+                        candidate_base=candidate.base_main,
+                        observed_base=observed_base,
+                        attempts=attempts,
+                        reason="reanchor_disabled",
+                    )
+                    return candidate
+                self._record(
+                    "refused-retry-bound",
+                    candidate_base=candidate.base_main,
+                    observed_base=observed_base,
+                    attempts=attempts,
+                )
+                raise CandidateReanchorRetryExhausted(
+                    attempts=attempts,
+                    candidate_base=candidate.base_main,
+                    observed_base=observed_base,
+                )
+
+            attempts += 1
+            attempted_in_call = True
+            previous = candidate
+            previous_diff = self._candidate_diff(
+                previous.base_main,
+                previous.head_commit,
+            )
+            # Ambient Git config must not decide whether the rebase is clean.
+            # `rerere` in particular can resolve a conflicting advance from a
+            # previously recorded resolution, which is a human judgement this
+            # mechanical check is not entitled to inherit.
+            result = self._git_result(
+                "-c",
+                "rerere.enabled=false",
+                "-c",
+                "commit.gpgsign=false",
+                "rebase",
+                "--no-autostash",
+                "--onto",
+                observed_base,
+                previous.base_main,
+                previous.branch,
+            )
+            if result.returncode != 0:
+                self._abort_rebase(previous.head_commit, observed_base, attempts)
+                refusal_reason = (
+                    "merge_conflict"
+                    if "CONFLICT" in f"{result.stdout}\n{result.stderr}"
+                    else "rebase_failed"
+                )
+                self._record(
+                    "refused-conflict",
+                    candidate_base=previous.base_main,
+                    observed_base=observed_base,
+                    attempts=attempts,
+                    reason=refusal_reason,
+                )
+                return previous
+
+            rebased = self.candidate_collector.snapshot(
+                source=previous.source,
+                base_main=observed_base,
+            )
+            if (
+                rebased.changed_paths != previous.changed_paths
+                or self._candidate_diff(rebased.base_main, rebased.head_commit)
+                != previous_diff
+            ):
+                self._restore_candidate(previous.head_commit, observed_base, attempts)
+                self._record(
+                    "refused-conflict",
+                    candidate_base=previous.base_main,
+                    observed_base=observed_base,
+                    attempts=attempts,
+                    reason="content_divergence",
+                )
+                return previous
+
+            candidate = rebased
+            self.candidate_collector.record(candidate)
+            # The collector's own base is the base later derived snapshots (gate
+            # reruns after remediation) are taken against, so it has to follow
+            # the candidate onto the base it was actually re-anchored to.
+            self.candidate_collector.base_main = candidate.base_main
+            self._record(
+                "re-anchored-clean",
+                candidate_base=previous.base_main,
+                candidate_head=previous.head_commit,
+                observed_base=observed_base,
+                reanchored_head=candidate.head_commit,
+                attempts=attempts,
+            )
+
+    def _prior_attempts(self, candidate_head: str) -> int:
+        attempts = 0
+        expected_head = candidate_head
+        records = self.candidate_collector.run_store.read_records()
+        for record in reversed(records):
+            if (
+                record.get("run_id") != self.candidate_collector.run_id
+                or record.get("task_id") != self.candidate_collector.task_id
+                or record.get("record_type") != "candidate_base_anchor"
+                or record.get("outcome") != "re-anchored-clean"
+                or record.get("reanchored_head") != expected_head
+            ):
+                continue
+            previous_head = record.get("candidate_head")
+            if not isinstance(previous_head, str) or not previous_head:
+                break
+            attempts += 1
+            expected_head = previous_head
+        return attempts
+
+    def _candidate_diff(self, base: str, head: str) -> bytes:
+        return self.candidate_collector._git_bytes(
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-ext-diff",
+            "--no-renames",
+            f"{base}...{head}",
+        )
+
+    def _abort_rebase(
+        self,
+        expected_head: str,
+        observed_base: str,
+        attempts: int,
+    ) -> None:
+        self._git_result("rebase", "--abort")
+        observed_head = self._git_text("rev-parse", "--verify", "HEAD")
+        if observed_head != expected_head:
+            self._fail_restore(
+                "candidate re-anchor conflict could not restore the original head",
+                expected_head=expected_head,
+                observed_head=observed_head,
+                observed_base=observed_base,
+                attempts=attempts,
+                reason="rebase_abort_failed",
+            )
+
+    def _restore_candidate(
+        self,
+        expected_head: str,
+        observed_base: str,
+        attempts: int,
+    ) -> None:
+        result = self._git_result("reset", "--hard", expected_head)
+        observed_head = self._git_text("rev-parse", "--verify", "HEAD")
+        if result.returncode != 0 or observed_head != expected_head:
+            self._fail_restore(
+                "candidate diff divergence could not restore the original head",
+                expected_head=expected_head,
+                observed_head=observed_head,
+                observed_base=observed_base,
+                attempts=attempts,
+                reason="reset_failed",
+            )
+
+    def _fail_restore(
+        self,
+        message: str,
+        *,
+        expected_head: str,
+        observed_head: str,
+        observed_base: str,
+        attempts: int,
+        reason: str,
+    ) -> None:
+        # A workspace left mid-rebase or off its candidate head is the one
+        # outcome nothing downstream can recover from, so it is recorded before
+        # the raise rather than being visible only as a stage failure.
+        self._record(
+            "refused-restore-failed",
+            candidate_head=expected_head,
+            observed_head=observed_head,
+            observed_base=observed_base,
+            attempts=attempts,
+            reason=reason,
+        )
+        raise CandidateCollectionError(
+            "candidate_reanchor_restore_failed",
+            message,
+            details={
+                "reason": reason,
+                "expected_head": expected_head,
+                "observed_head": observed_head,
+            },
+        )
+
+    def _record(self, outcome: str, **payload: object) -> None:
+        if outcome not in CANDIDATE_BASE_ANCHOR_OUTCOMES:
+            raise ValueError(f"unsupported candidate base-anchor outcome: {outcome}")
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.candidate_collector.run_store.append_lifecycle_event(
+            RunLifecycleEvent.candidate_base_anchor(
+                run_id=self.candidate_collector.run_id,
+                task_id=self.candidate_collector.task_id,
+                payload={"outcome": outcome, **payload},
+            )
+        )
+
+    def _git_text(self, *args: str) -> str:
+        result = self._git_result(*args)
+        if result.returncode != 0:
+            raise CandidateCollectionError(
+                "candidate_git_error",
+                "candidate Git state could not be read",
+                details={"git_args": list(args), "stderr": result.stderr.strip()},
+            )
+        return result.stdout.strip()
+
+    def _git_result(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return self.candidate_collector._git_result(*args)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1417,6 +1729,7 @@ class ReviewRouter:
         executor: ReviewExecutor = subprocess.run,
         continuation_availability: ContinuationAvailability | None = None,
         session_id_factory: Callable[[], str] | None = None,
+        budget: object | None = None,
     ) -> None:
         if max_initial_passes <= 0:
             raise ValueError("max_initial_passes must be positive")
@@ -1437,6 +1750,7 @@ class ReviewRouter:
         self.executor = executor
         self.continuation_availability = continuation_availability
         self.session_id_factory = session_id_factory or (lambda: str(uuid.uuid4()))
+        self.budget = budget
         self.ledger = FindingsLedger(run_store, run_id, task_id)
 
     def review(
@@ -1570,13 +1884,20 @@ class ReviewRouter:
             profile=self.reviewer_profile,
         )
         route = self._route_payload()
-        pass_ordinal = self._claim_review_attempt(
-            request,
-            pass_ordinal=pass_ordinal,
-            attempt_ordinal=attempt_ordinal,
-            route=route,
-            continuation=continuation,
-        )
+        # Reserve the phase budget before claiming a review pass, so a denial
+        # launches no reviewer process and consumes no review-budget slot.
+        budget_reservation = self._reserve_review_budget(request, route)
+        try:
+            pass_ordinal = self._claim_review_attempt(
+                request,
+                pass_ordinal=pass_ordinal,
+                attempt_ordinal=attempt_ordinal,
+                route=route,
+                continuation=continuation,
+            )
+        except BaseException:
+            self._release_review_budget(budget_reservation)
+            raise
         started = time.monotonic()
         try:
             with self.concurrency.slot():
@@ -1592,6 +1913,7 @@ class ReviewRouter:
                 )
         except OSError as exc:
             duration = max(0.0, time.monotonic() - started)
+            self._release_review_budget(budget_reservation)
             self._record_error(
                 request,
                 route,
@@ -1610,6 +1932,9 @@ class ReviewRouter:
             ) from exc
         except ReviewExecutionError:
             duration = max(0.0, time.monotonic() - started)
+            self._reconcile_review_budget(
+                budget_reservation, None, phase=request.phase
+            )
             self._record_error(
                 request,
                 route,
@@ -1625,6 +1950,9 @@ class ReviewRouter:
             self._fail_stage_for_result("fatal")
             raise
         except subprocess.TimeoutExpired as exc:
+            self._reconcile_review_budget(
+                budget_reservation, None, phase=request.phase
+            )
             self._record_wait_incomplete(
                 request, pass_ordinal, attempt_ordinal, continuation
             )
@@ -1638,6 +1966,9 @@ class ReviewRouter:
         for line in output.splitlines():
             observer.observe_line(line)
         usage = observer.usage
+        # A launched reviewer is reconciled exactly once against its own usage;
+        # unavailable usage is charged fail-safe, never zero.
+        self._reconcile_review_budget(budget_reservation, usage, phase=request.phase)
         nested_launches, nested_usage = self._nested_launch_evidence(output)
         if nested_launches:
             self._record_error(
@@ -1655,7 +1986,16 @@ class ReviewRouter:
             )
             self._fail_stage_for_result("fatal")
             raise ReviewDelegationPolicyError(nested_launches)
-        wall = detect_limit_wall(output, self.limit_wall_patterns)
+        # A reviewer reads the diff and the files it touches, so on a limit-wall
+        # slice its transcript quotes the wall phrases as ordinary content. Only
+        # a failed reviewer whose trailing output carries the phrase is a wall;
+        # a reviewer that finishes reports one through its typed
+        # retry_classification below, not by mentioning it.
+        wall = detect_provider_limit_wall(
+            output,
+            self.limit_wall_patterns,
+            exit_code=completed.returncode,
+        )
         if wall is not None:
             self._record_error(
                 request,
@@ -1899,6 +2239,21 @@ class ReviewRouter:
                     "Fix exactly that violation. "
                 )
             instruction += "Return only one JSON object. "
+        if request.family == "closure":
+            family_contract = (
+                "This is a closure pass. Return every finding listed in "
+                "prior_findings exactly once, keyed by the same id, and return no "
+                "other finding: the id set of your findings must equal the id set "
+                "of prior_findings. Carry a finding forward by repeating its id "
+                "with an updated state; never drop one you consider resolved and "
+                "never introduce a new one. Use verdict approve when no finding "
+                'remains "open", and verdict findings when at least one does.\n'
+            )
+        else:
+            family_contract = (
+                "This is an initial pass. Every finding you report must have "
+                'state "open".\n'
+            )
         return (
             instruction
             + "Review this candidate directly. Do not launch, delegate to, or "
@@ -1909,7 +2264,11 @@ class ReviewRouter:
             "review budgets; do not propose or reset either. Each finding requires id, "
             "severity (P0-P3), summary, evidence, files, lines, and state. files and "
             "lines are JSON arrays of strings, never a bare string and never numbers: "
-            'use "lines": ["12", "40-52"], not "lines": "12" or "lines": [12].\n'
+            'use "lines": ["12", "40-52"], not "lines": "12" or "lines": [12]. '
+            "state must be exactly one of: "
+            + ", ".join(FINDING_STATES)
+            + ".\n"
+            + family_contract
             + json.dumps(
                 {
                     **request.to_payload(),
@@ -2469,6 +2828,46 @@ class ReviewRouter:
         provider = self._route_payload()["provider"]
         return {"codex": "openai", "claude": "anthropic"}.get(str(provider), "unknown")
 
+    def _reserve_review_budget(
+        self, request: ReviewRequest, route: Mapping[str, object]
+    ) -> str:
+        if self.budget is None or not getattr(self.budget, "enabled", False):
+            return ""
+        reservation_id = f"{self.run_id}:{request.phase}:{uuid.uuid4().hex}"
+        return self.budget.admit(
+            reservation_id=reservation_id,
+            run_id=self.run_id,
+            provider=self._usage_provider(),
+            phase=request.phase,
+            model=str(route.get("model") or ""),
+            effort=str(route.get("effort") or ""),
+        )
+
+    def _reconcile_review_budget(
+        self, reservation_id: str, usage: ProviderUsage | None, *, phase: str
+    ) -> None:
+        if self.budget is None or not reservation_id:
+            return
+        # The stats payload must name the phase the reservation was made under,
+        # not the review family, or a terminal record attributes a
+        # targeted_closure launch to "review".
+        stats = usage.to_stats(phase=phase) if usage is not None else {}
+        self.budget.reconcile(
+            reservation_id=reservation_id,
+            run_id=self.run_id,
+            stats=stats,
+            provider=self._usage_provider(),
+        )
+
+    def _release_review_budget(self, reservation_id: str) -> None:
+        if self.budget is None or not reservation_id:
+            return
+        self.budget.release(
+            reservation_id=reservation_id,
+            run_id=self.run_id,
+            reason="review_launch_failed",
+        )
+
     def _transition_to_review(self, request: ReviewRequest) -> None:
         if self.stage_machine is None:
             return
@@ -2828,6 +3227,7 @@ INTEGRATION_FAILURE_REASONS = (
     "main_worktree_unavailable",
     "main_fast_forward_failed",
     "main_verification_failed",
+    "integration_ancestry_unproven",
 )
 
 
@@ -2944,6 +3344,12 @@ class IntegrationResult:
         )
 
 
+def integration_provenance_outcome(result: IntegrationResult) -> str:
+    if result.outcome == "branch_already_merged":
+        return "settled-by-reconciliation"
+    return "settled-directly"
+
+
 @dataclasses.dataclass(frozen=True)
 class _RecoveredIntegrationLock:
     status: object
@@ -2991,6 +3397,11 @@ class Integrator:
     def run(self) -> IntegrationResult:
         prior = self._prior_result()
         if prior is not None and self._prior_result_is_consistent(prior):
+            if prior.completed:
+                self._record_result(
+                    prior,
+                    provenance_outcome=integration_provenance_outcome(prior),
+                )
             self._release_recovered_lock()
             return prior
 
@@ -3021,6 +3432,13 @@ class Integrator:
             if concurrent_result is not None and self._prior_result_is_consistent(
                 concurrent_result
             ):
+                if concurrent_result.completed:
+                    self._record_result(
+                        concurrent_result,
+                        provenance_outcome=integration_provenance_outcome(
+                            concurrent_result
+                        ),
+                    )
                 return concurrent_result
             post_acquire_preflight = self._workspace_preflight()
             if post_acquire_preflight is not None:
@@ -3066,11 +3484,26 @@ class Integrator:
                 diagnostics={"code": "candidate_not_ancestor_of_branch"},
                 recovered=recovered_lock,
             )
-        if branch_head == main_before:
+        if self._is_ancestor(self.candidate.head_commit, main_before):
+            if branch_head not in {self.candidate.head_commit, main_before}:
+                self.run_store.record_integration_provenance_refusal(
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    candidate_commit=self.candidate.head_commit,
+                    target_commit=main_before,
+                )
+                return self._record_failure(
+                    "integration_ancestry_unproven",
+                    status="blocked",
+                    main_before=main_before,
+                    refreshed_head=branch_head,
+                    diagnostics={"code": "unrecognized_refreshed_candidate"},
+                    recovered=recovered_lock,
+                )
             integration_checks = self._run_checks(
                 phase="integration",
                 keys=self.integration_keys,
-                worktree=self.candidate.worktree,
+                worktree=self.repo,
             )
             if not all(check.passed for check in integration_checks):
                 return self._record_failure(
@@ -3102,15 +3535,21 @@ class Integrator:
                 IntegrationResult(
                     outcome="branch_already_merged",
                     status="completed",
-                    reason="branch_already_merged",
+                    reason="reconciled_merged_candidate",
                     branch=self.candidate.branch,
                     candidate_head=self.candidate.head_commit,
                     refreshed_head=branch_head,
                     main_before=main_before,
                     main_after=main_before,
                     verification=checks,
-                    recovered=recovered_lock,
-                )
+                    recovered=(
+                        recovered_lock or self.candidate.head_commit != main_before
+                    ),
+                    diagnostics={
+                        "provenance_settlement": "settled-by-reconciliation",
+                    },
+                ),
+                provenance_outcome="settled-by-reconciliation",
             )
 
         if branch_head == self.candidate.head_commit:
@@ -3246,7 +3685,7 @@ class Integrator:
             return {"code": "workspace_claim_mismatch", "diagnostics": []}
         if not view.workspace_diagnostics:
             return None
-        if self._is_exact_merged_noop(view):
+        if self._is_provable_merged_noop(view):
             return None
         conflicts = self._unmerged_paths()
         return {
@@ -3257,7 +3696,7 @@ class Integrator:
             "conflicted_paths": conflicts,
         }
 
-    def _is_exact_merged_noop(self, view: object) -> bool:
+    def _is_provable_merged_noop(self, view: object) -> bool:
         diagnostics = view.workspace_diagnostics
         state = view.workspace_git_state
         claim = view.active.workspace
@@ -3271,7 +3710,15 @@ class Integrator:
             and not state.dirty
             and state.current_branch == claim.branch
             and state.head_commit
-            and state.head_commit == self._rev_parse(self.repo, self.main_branch)
+            and state.head_commit
+            in {
+                self.candidate.head_commit,
+                self._rev_parse(self.repo, self.main_branch),
+            }
+            and self._is_ancestor(
+                self.candidate.head_commit,
+                self._rev_parse(self.repo, self.main_branch),
+            )
         )
 
     def _acquire_lock(self) -> tuple[bool, bool, object]:
@@ -3475,16 +3922,28 @@ class Integrator:
             )
         return result
 
-    def _record_result(self, result: IntegrationResult) -> IntegrationResult:
+    def _record_result(
+        self,
+        result: IntegrationResult,
+        *,
+        provenance_outcome: str = "settled-directly",
+    ) -> IntegrationResult:
         from vibe_loop.runs import RunLifecycleEvent
 
-        self.run_store.append_lifecycle_event(
-            RunLifecycleEvent.integration_result(
+        event = RunLifecycleEvent.integration_result(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            payload=result.to_payload(),
+        )
+        if result.completed:
+            self.run_store.record_completed_integration(
                 run_id=self.run_id,
                 task_id=self.task_id,
-                payload=result.to_payload(),
+                integration=event,
+                provenance_outcome=provenance_outcome,
             )
-        )
+        else:
+            self.run_store.append_lifecycle_event(event)
         return result
 
     def _record_lock_event(self, record_type: str, path: Path) -> None:
@@ -3628,6 +4087,8 @@ class TaskSourceCompleter:
         lock_manager: object,
         task_lock: object,
         run_store: object,
+        repo: Path,
+        main_branch: str,
         run_id: str,
         task_id: str,
         runtime_context: Mapping[str, str] | None = None,
@@ -3641,6 +4102,8 @@ class TaskSourceCompleter:
         self.lock_manager = lock_manager
         self.task_lock = task_lock
         self.run_store = run_store
+        self.repo = repo.resolve()
+        self.main_branch = main_branch
         self.run_id = run_id
         self.task_id = task_id
         self.runtime_context = dict(runtime_context or {})
@@ -3656,12 +4119,6 @@ class TaskSourceCompleter:
                 "completed_report_precedes_provenance",
                 "completed run result cannot precede task provenance",
             )
-        integration = self._completed_integration()
-        if integration is None:
-            raise TaskSourceCompletionError(
-                "integration_not_recorded",
-                "task provenance requires a durable completed integration_result",
-            )
         if (
             self.stage_machine is not None
             and self.stage_machine.stage is not RunStage.PROVENANCE
@@ -3671,6 +4128,18 @@ class TaskSourceCompleter:
                     "integration_stage_not_current",
                     "task provenance may only follow the integration stage",
                 )
+        integration = self._completed_integration()
+        if integration is None:
+            self._record_unprovable_integration()
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance requires a durable completed integration_result",
+            )
+        self._ensure_integration_provenance(integration)
+        if (
+            self.stage_machine is not None
+            and self.stage_machine.stage is not RunStage.PROVENANCE
+        ):
             self.stage_machine.transition(
                 RunStage.PROVENANCE,
                 reason="integration_confirmed",
@@ -3762,9 +4231,79 @@ class TaskSourceCompleter:
                 and record.get("task_id") == self.task_id
             ):
                 candidate = IntegrationResult.from_record(record)
-                if candidate is not None and candidate.completed:
+                if (
+                    candidate is not None
+                    and candidate.completed
+                    and candidate.candidate_head
+                    and candidate.main_after
+                ):
                     result = candidate
         return result
+
+    def _record_unprovable_integration(self) -> None:
+        candidate = self._latest_candidate()
+        if candidate is None:
+            return
+        target_commit = self._resolve_commit(self.main_branch)
+        if target_commit is None:
+            return
+        self.run_store.record_integration_provenance_refusal(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            candidate_commit=candidate.head_commit,
+            target_commit=target_commit,
+        )
+
+    def _ensure_integration_provenance(
+        self,
+        integration: IntegrationResult,
+    ) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.record_completed_integration(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            integration=RunLifecycleEvent.integration_result(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=integration.to_payload(),
+            ),
+            provenance_outcome=integration_provenance_outcome(integration),
+        )
+
+    def _latest_candidate(self) -> CandidateRecord | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("run_id") == self.run_id
+                and record.get("task_id") == self.task_id
+                and (candidate := CandidateRecord.from_record(record)) is not None
+            ):
+                return candidate
+        return None
+
+    def _resolve_commit(self, revision: str) -> str | None:
+        result = self._git("rev-parse", "--verify", f"{revision}^{{commit}}")
+        if result.returncode != 0:
+            return None
+        resolved = result.stdout.strip()
+        return resolved or None
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(self.repo), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance could not verify candidate ancestry: "
+                f"{type(exc).__name__}",
+            ) from exc
 
     def _completed_report_exists(self) -> bool:
         return any(
@@ -4343,6 +4882,18 @@ class RunContractResolver:
                 f"{command_key} must include {{prompt}} for reviewer request delivery"
             )
 
+        probe_capability = task_source_probe_capability(self.config.task_source)
+        completion_capability = task_source_completion_capability(
+            self.config.task_source
+        )
+        if (
+            effective.mode != "runtime-owned"
+            and "external_completion_actor" in effective.explicit_keys
+        ):
+            raise ValueError(
+                "orchestration.external_completion_actor is only valid with "
+                'mode = "runtime-owned"'
+            )
         if effective.mode == "runtime-owned":
             if configured_reviewer_profile is None:
                 raise ValueError(
@@ -4359,13 +4910,37 @@ class RunContractResolver:
                     "runtime-owned orchestration requires an explicit "
                     "orchestration.task_provenance_mode completion path"
                 )
-            if (
-                effective.task_provenance_mode == "adapter"
-                and self.config.task_source.complete_command is None
-            ):
-                raise ValueError(
-                    "runtime-owned adapter completion requires task_source.complete"
-                )
+            if effective.task_provenance_mode == "adapter":
+                if "external_completion_actor" in effective.explicit_keys:
+                    raise ValueError(
+                        "orchestration.external_completion_actor is only valid "
+                        'with task_provenance_mode = "external-confirmed"'
+                    )
+                if completion_capability is None:
+                    raise ValueError(
+                        "runtime-owned adapter completion requires "
+                        "task_source.complete on a command task source with "
+                        "task_source.list"
+                    )
+            else:
+                if "external_completion_actor" not in effective.explicit_keys:
+                    raise ValueError(
+                        "runtime-owned external-confirmed completion requires an "
+                        "explicit orchestration.external_completion_actor"
+                    )
+                if effective.external_completion_actor == "worker":
+                    raise ValueError(
+                        "runtime-owned workers are forbidden from transitioning "
+                        "the authoritative task source; configure task_source.complete "
+                        'with task_provenance_mode = "adapter", or name an operator '
+                        "or external-system completion actor"
+                    )
+                if probe_capability is None:
+                    raise ValueError(
+                        "runtime-owned external-confirmed completion requires "
+                        "a task source with probe capability; command sources "
+                        "require task_source.list"
+                    )
             if (
                 self.config.task_source.activate_command is not None
                 and self.config.task_source.reset_command is None
@@ -4374,6 +4949,42 @@ class RunContractResolver:
                     "runtime-owned activation-capable task source requires "
                     "task_source.reset"
                 )
+
+        task_provenance_payload: dict[str, object] = {
+            "mode": effective.task_provenance_mode,
+            "complete_adapter": (
+                "task_source.complete"
+                if self.config.task_source.complete_command is not None
+                else None
+            ),
+            "settlement": {
+                "requeue_adapter": (
+                    "task_source.reset"
+                    if self.config.task_source.reset_command is not None
+                    else None
+                ),
+                "park_adapter": (
+                    "task_source.park"
+                    if self.config.task_source.park_command is not None
+                    else None
+                ),
+            },
+        }
+        if effective.mode == "runtime-owned":
+            task_provenance_payload.update(
+                {
+                    "confirmation_adapter": (
+                        completion_capability
+                        if effective.task_provenance_mode == "adapter"
+                        else probe_capability
+                    ),
+                    "transition_actor": (
+                        "runtime"
+                        if effective.task_provenance_mode == "adapter"
+                        else effective.external_completion_actor
+                    ),
+                }
+            )
 
         payload: dict[str, object] = {
             "contract_version": RUN_CONTRACT_VERSION,
@@ -4401,28 +5012,12 @@ class RunContractResolver:
                 "enabled": effective.integration_enabled,
                 "verify_on_main": list(effective.verify_on_main),
             },
-            "task_provenance": {
-                "mode": effective.task_provenance_mode,
-                "complete_adapter": None,
-                "settlement": {
-                    "requeue_adapter": (
-                        "task_source.reset"
-                        if self.config.task_source.reset_command is not None
-                        else None
-                    ),
-                    "park_adapter": (
-                        "task_source.park"
-                        if self.config.task_source.park_command is not None
-                        else None
-                    ),
-                },
+            "task_provenance": task_provenance_payload,
+            "candidate_stabilization": {
+                "max_reanchors": effective.max_candidate_reanchors,
             },
             "remediation": {"max_rounds": effective.max_remediation_rounds},
         }
-        task_provenance = payload["task_provenance"]
-        assert isinstance(task_provenance, dict)
-        if self.config.task_source.complete_command is not None:
-            task_provenance["complete_adapter"] = "task_source.complete"
         return ResolvedRunContract(payload=payload, digest=sha256_digest(payload))
 
 
@@ -4436,7 +5031,52 @@ class WorkspaceProvisionError(RuntimeError):
     ) -> None:
         self.code = code
         self.details = dict(details or {})
+        self.retry_disposition = workspace_retry_disposition(code)
         super().__init__(message)
+
+    @property
+    def diagnostic(self) -> str:
+        """Operator-facing code, qualified by why a refresh was declined.
+
+        The bare code cannot distinguish a workspace preserved because it holds
+        real work from one deferred because Git could not be read, and that is
+        the distinction that decides whether a human needs to step in.
+        """
+
+        refusal = self.details.get("refresh_refused")
+        if isinstance(refusal, str) and refusal:
+            return f"{self.code} ({refusal})"
+        return self.code
+
+
+WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
+    {
+        "ambiguous_owned_workspaces",
+        "dirty_existing_workspace",
+        "incomplete_recovery_workspace",
+        "primary_workspace_forbidden",
+        "recovery_base_changed",
+        "recovery_dirty_content_changed",
+        "recovery_dirty_snapshot_changed",
+        "recovery_git_common_dir_changed",
+        "recovery_head_changed",
+        "workspace_base_mismatch",
+        "workspace_base_unverified",
+        "workspace_changed_during_claim",
+        "workspace_collision",
+        "workspace_foreign_owner",
+        "workspace_live_owner",
+        "workspace_main_history_mismatch",
+        "workspace_ownership_unverified",
+        "workspace_stale_current_base",
+    }
+)
+
+
+def workspace_retry_disposition(code: str) -> str:
+    if code in WORKSPACE_STATE_CHANGE_REQUIRED:
+        return "defer_until_workspace_changes"
+    return "retry_later"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4448,6 +5088,11 @@ class ProvisionedWorkspace:
     head_commit: str
     owner_run_id: str = ""
     dirty_at_adoption: bool = False
+    dirty_snapshot: tuple[str, ...] = ()
+    dirty_fingerprint: str = ""
+    # Pre-refresh HEAD when a provably disposable stale workspace was
+    # fast-forwarded onto the selected base during adoption; empty otherwise.
+    refreshed_from: str = ""
 
     def to_record_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -4460,6 +5105,8 @@ class ProvisionedWorkspace:
         }
         if self.owner_run_id:
             payload["owner_run_id"] = self.owner_run_id
+        if self.refreshed_from:
+            payload["refreshed_from"] = self.refreshed_from
         return payload
 
 
@@ -4496,28 +5143,91 @@ class WorkspaceProvisioner:
         recovery_dirty_fingerprint: str = "",
     ) -> ProvisionedWorkspace:
         from vibe_loop.runs import RunLifecycleEvent
-        from vibe_loop.workers import claim_worker_workspace
+        from vibe_loop.workers import (
+            WorkspaceClaimError,
+            claim_worker_workspace,
+            workspace_state_fingerprint,
+        )
 
-        self._validate_primary(base_commit)
-        branch, worktree = self._workspace_identity(
-            task_id=task_id,
-            recovery_branch=recovery_branch,
-            recovery_worktree=recovery_worktree,
-        )
-        workspace = self._create_or_adopt(
-            task_id=task_id,
-            run_id=run_id,
-            branch=branch,
-            worktree=worktree,
-            base_commit=base_commit,
-            recovery_run_id=recovery_run_id,
-            recovery_git_common_dir=recovery_git_common_dir,
-            recovery_base_commit=recovery_base_commit,
-            recovery_head_commit=recovery_head_commit,
-            recovery_dirty_snapshot=recovery_dirty_snapshot,
-            recovery_dirty_fingerprint=recovery_dirty_fingerprint,
-        )
+        def current_workspace_state_fingerprint(
+            candidate_branch: str,
+            candidate_worktree: Path | None,
+        ) -> str:
+            return workspace_state_fingerprint(
+                repo=self.repo,
+                main_branch=self.main_branch,
+                branch=candidate_branch,
+                worktree=candidate_worktree,
+                expected_base=base_commit,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+
+        branch = ""
+        worktree: Path | None = None
         try:
+            self._validate_primary(base_commit)
+            branch, worktree = self._workspace_identity(
+                task_id=task_id,
+                recovery_branch=recovery_branch,
+                recovery_worktree=recovery_worktree,
+            )
+            workspace = self._create_or_adopt(
+                task_id=task_id,
+                run_id=run_id,
+                branch=branch,
+                worktree=worktree,
+                base_commit=base_commit,
+                recovery_run_id=recovery_run_id,
+                recovery_git_common_dir=recovery_git_common_dir,
+                recovery_base_commit=recovery_base_commit,
+                recovery_head_commit=recovery_head_commit,
+                recovery_dirty_snapshot=recovery_dirty_snapshot,
+                recovery_dirty_fingerprint=recovery_dirty_fingerprint,
+            )
+        except WorkspaceProvisionError as exc:
+            workspace_base = workspace_commit_evidence(
+                exc.details.get("workspace_base") or exc.details.get("base_commit")
+            )
+            head_commit = workspace_commit_evidence(exc.details.get("head_commit"))
+            refresh_refused = exc.details.get("refresh_refused")
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id=run_id,
+                    task_id=task_id,
+                    decision="rejected",
+                    reason=exc.code,
+                    retry_disposition=exc.retry_disposition,
+                    worker_launch_allowed=False,
+                    branch=branch,
+                    worktree=worktree,
+                    selected_base=base_commit,
+                    workspace_base=workspace_base,
+                    head_commit=head_commit,
+                    workspace_state_fingerprint=current_workspace_state_fingerprint(
+                        branch, worktree
+                    ),
+                    refresh_refused=(
+                        refresh_refused if isinstance(refresh_refused, str) else ""
+                    ),
+                )
+            )
+            raise
+        try:
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id=run_id,
+                    task_id=task_id,
+                    decision=("created" if workspace.mode == "created" else "reusable"),
+                    reason=f"workspace_{workspace.mode}",
+                    retry_disposition="not_needed",
+                    worker_launch_allowed=True,
+                    branch=workspace.branch,
+                    worktree=workspace.worktree,
+                    selected_base=base_commit,
+                    workspace_base=workspace.base_commit,
+                    head_commit=workspace.head_commit,
+                )
+            )
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.workspace_provisioned(
                     run_id=run_id,
@@ -4525,18 +5235,54 @@ class WorkspaceProvisioner:
                     payload=workspace.to_record_payload(),
                 )
             )
-            claim_worker_workspace(
-                self.lock_manager,
-                self.run_store,
-                task_id=task_id,
-                run_id=run_id,
-                branch=workspace.branch,
-                worktree=workspace.worktree,
-                repo=self.repo,
-                base_commit=workspace.base_commit,
-                fencing_token=fencing_token,
-                ignored_dirty_paths=self.ignored_dirty_paths,
-            )
+            try:
+                claim_worker_workspace(
+                    self.lock_manager,
+                    self.run_store,
+                    task_id=task_id,
+                    run_id=run_id,
+                    branch=workspace.branch,
+                    worktree=workspace.worktree,
+                    repo=self.repo,
+                    base_commit=workspace.base_commit,
+                    fencing_token=fencing_token,
+                    ignored_dirty_paths=self.ignored_dirty_paths,
+                    expected_head_commit=workspace.head_commit,
+                    expected_dirty_fingerprint=workspace.dirty_fingerprint,
+                    required_ancestor_base=base_commit,
+                )
+            except WorkspaceClaimError as exc:
+                if exc.code != "workspace_snapshot_changed":
+                    raise
+                failure = WorkspaceProvisionError(
+                    "workspace_changed_during_claim",
+                    "workspace changed after preflight and before durable claim",
+                    details=exc.details,
+                )
+                self.run_store.append_lifecycle_event(
+                    RunLifecycleEvent.workspace_preflight(
+                        run_id=run_id,
+                        task_id=task_id,
+                        decision="rejected",
+                        reason=failure.code,
+                        retry_disposition=failure.retry_disposition,
+                        worker_launch_allowed=False,
+                        branch=workspace.branch,
+                        worktree=workspace.worktree,
+                        selected_base=base_commit,
+                        workspace_base=workspace.base_commit,
+                        head_commit=workspace_commit_evidence(
+                            exc.details.get("actual_head_commit")
+                            or exc.details.get("head_commit")
+                        ),
+                        workspace_state_fingerprint=(
+                            current_workspace_state_fingerprint(
+                                workspace.branch, workspace.worktree
+                            )
+                        ),
+                    )
+                )
+                raise failure from exc
         except KeyboardInterrupt:
             if workspace.mode == "created":
                 self.compensate_created(workspace)
@@ -4744,7 +5490,17 @@ class WorkspaceProvisioner:
                     base_commit=base_commit,
                 )
                 raise
-            return dataclasses.replace(workspace, head_commit=head_commit)
+            dirty, dirty_fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+            return dataclasses.replace(
+                workspace,
+                head_commit=head_commit,
+                dirty_at_adoption=bool(dirty),
+                dirty_snapshot=tuple(dirty),
+                dirty_fingerprint=dirty_fingerprint,
+            )
         if (
             len(branch_entries) != 1
             or len(path_entries) != 1
@@ -4852,6 +5608,25 @@ class WorkspaceProvisioner:
                     "selected_base": base_commit,
                 },
             )
+        refreshed_from = ""
+        if (
+            self._git_returncode_at(
+                worktree,
+                "merge-base",
+                "--is-ancestor",
+                base_commit,
+                head,
+            )
+            != 0
+        ):
+            refreshed_from = head
+            head = self._refresh_stale_workspace(
+                worktree=worktree,
+                base_commit=base_commit,
+                owner_base=owner_base,
+                head=head,
+                recovery_run_id=recovery_run_id,
+            )
         dirty, dirty_fingerprint = git_dirty_snapshot(
             worktree,
             ignored_dirty_paths=self.ignored_dirty_paths,
@@ -4889,11 +5664,114 @@ class WorkspaceProvisioner:
             mode="preserved" if dirty else "adopted",
             branch=branch,
             worktree=worktree.resolve(),
-            base_commit=owner_base,
+            base_commit=base_commit,
             head_commit=head,
             owner_run_id=str(owner.get("run_id") or ""),
             dirty_at_adoption=bool(dirty),
+            dirty_snapshot=tuple(dirty),
+            dirty_fingerprint=dirty_fingerprint,
+            refreshed_from=refreshed_from,
         )
+
+    def _refresh_stale_workspace(
+        self,
+        *,
+        worktree: Path,
+        base_commit: str,
+        owner_base: str,
+        head: str,
+        recovery_run_id: str,
+    ) -> str:
+        """Fast-forward a provably disposable stale workspace onto the base.
+
+        Returns the refreshed HEAD, or raises the ordinary
+        ``workspace_stale_current_base`` deferral when refresh cannot be
+        *proven* safe. Every unprovable input -- a failed git invocation, an
+        unreadable worktree, a HEAD that moved under the check -- takes the
+        deferral path, so the automatic repair only ever runs on a workspace
+        that demonstrably holds nothing the refresh could lose.
+        """
+
+        from vibe_loop.workers import WorkspaceClaimError, git_dirty_snapshot
+
+        def defer(refusal: str, **evidence: object) -> WorkspaceProvisionError:
+            return WorkspaceProvisionError(
+                "workspace_stale_current_base",
+                "existing workspace does not contain the selected current base",
+                details={
+                    "selected_base": base_commit,
+                    "workspace_base": owner_base,
+                    "head_commit": head,
+                    "refresh_refused": refusal,
+                    **evidence,
+                },
+            )
+
+        if recovery_run_id:
+            # A recovery adoption resumes against a durable pending intent that
+            # records this worktree's exact head and dirt. Moving HEAD out from
+            # under that record is a separate decision from repairing an
+            # ordinary stale workspace, so recovery keeps deferring.
+            raise defer("recovery_adoption")
+        # Re-read HEAD rather than trusting the caller's earlier read, so every
+        # condition below is evaluated against one observation of the worktree.
+        head_now = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
+        if head_now.returncode != 0 or head_now.stdout.strip() != head:
+            raise defer("head_unreadable_or_moved")
+        unique = self._git_result_at(
+            worktree,
+            "rev-list",
+            "--count",
+            f"{base_commit}..{head}",
+        )
+        if unique.returncode != 0:
+            raise defer("unique_commits_unreadable")
+        if unique.stdout.strip() != "0":
+            # Positive proof of disposability: a commit reachable only from this
+            # worktree counts as unique even when its content landed elsewhere,
+            # because reachability is what a refresh would drop.
+            raise defer("unique_commits", unique_commits=unique.stdout.strip())
+        try:
+            dirty, _fingerprint = git_dirty_snapshot(
+                worktree,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+        except WorkspaceClaimError as exc:
+            # This is the one unprovable input that does not arrive as a
+            # returncode: git_dirty_snapshot raises its own error type, which is
+            # not a WorkspaceProvisionError and would otherwise escape provision
+            # past the handler that records the deferral.
+            raise defer("dirty_snapshot_unreadable") from exc
+        if dirty:
+            raise defer("dirty_workspace", dirty_summary=list(dirty)[:20])
+        # git_dirty_snapshot excludes .vibe-loop and any configured ignored
+        # paths, so on its own it is silent about them. Untracked files there
+        # count as clean, because a fast-forward never deletes an untracked file
+        # (and refuses outright when one is in its way). A *tracked*
+        # modification behind an exclusion does not: the fast-forward would
+        # rewrite that file whenever the base touches it. Since the snapshot
+        # above is already empty, every remaining status entry comes from an
+        # excluded path, so requiring them all to be untracked is exactly that
+        # distinction.
+        status = self._git_result_at(worktree, "status", "--short")
+        if status.returncode != 0:
+            raise defer("status_unreadable")
+        for line in status.stdout.splitlines():
+            if line.strip() and not line.startswith("??"):
+                raise defer("tracked_modification_behind_ignored_path")
+        # The act re-checks both conditions itself: --ff-only refuses when HEAD
+        # is not an ancestor of the base, and merge refuses when local tracked
+        # or untracked changes would be overwritten. That leaves no window in
+        # which this call can destroy work the checks above did not see, which a
+        # `reset --hard` could not offer. It is exactly equivalent to a reset
+        # here, since zero unique commits makes the base a descendant of HEAD.
+        merged = self._git_result_at(worktree, "merge", "--ff-only", base_commit)
+        if merged.returncode != 0:
+            raise defer("fast_forward_refused")
+        refreshed = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
+        if refreshed.returncode != 0 or refreshed.stdout.strip() != base_commit:
+            raise defer("refresh_did_not_reach_base")
+        return base_commit
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context
@@ -5106,6 +5984,14 @@ def workspace_name(task_id: str) -> str:
     digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:10]
     prefix_limit = WORKSPACE_NAME_MAX_LENGTH - len(digest) - 1
     return f"{normalized[:prefix_limit]}-{digest}"
+
+
+def workspace_commit_evidence(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", value) is None:
+        return ""
+    return value.lower()
 
 
 def overlay_explicit_orchestration(

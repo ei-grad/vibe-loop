@@ -20,9 +20,9 @@ Related implementation IDs: `CORE-02`, `DISC-03`, `DISC-10`, `PAR-08`,
 
 ## PRD-TSK-002 Markdown Task Sources
 
-Markdown task sources must support this repository's table format and
-profile-driven parsing for other Markdown tables, headings, and lists without
-requiring every repository to adopt `vibe-loop`'s local `PLAN.md` shape.
+Markdown task sources must support the built-in table format and profile-driven
+parsing for other Markdown tables, headings, and lists without requiring a
+repository to adopt a prescribed task filename or layout.
 
 Acceptance must cover explicit `plan_path`, discovered plan candidates,
 ambiguous-discovery failures, profile field mappings, required fields,

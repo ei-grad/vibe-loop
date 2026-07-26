@@ -25,6 +25,7 @@ from vibe_loop.autopilot import (
     collect_project_status,
     collect_registry_status,
     cycle_schedule_deadline,
+    load_registry_entry_config,
     default_registry_path,
     parse_wait_deadline,
     poll_wait_message_command,
@@ -39,9 +40,11 @@ from vibe_loop.autopilot import (
 )
 from vibe_loop.config import (
     ProjectBindingError,
+    project_binding_guidance,
     require_project_binding,
     AGENT_DEFAULT_POLICY,
     AGENT_DEFAULT_POLICY_SOURCE,
+    AUTOPILOT_MIN_INTERVAL_SECONDS,
     AUTOPILOT_WORKTREE_DISPOSITION_POLICIES,
     AgentResolutionError,
     git_main_worktree_path,
@@ -79,6 +82,11 @@ from vibe_loop.locks import (
     build_lock_manager,
     redact_fencing_token_payload,
 )
+from vibe_loop.budget import (
+    BudgetStore,
+    resolve_budget_ledger_path,
+    resolve_budget_project,
+)
 from vibe_loop.locks import integration_lock_waitable
 from vibe_loop.orchestration import CandidateCollectionError, CandidateCollector
 from vibe_loop.runner import VibeRunner
@@ -95,10 +103,10 @@ from vibe_loop.runs import (
     RunLifecycleEvent,
     RunResult,
     RunStore,
-    TASK_RECOVERY_RECORD_TYPE,
     TASK_RESTART_RECORD_TYPE,
     WorkerReport,
     WORKER_REPORT_STATUSES,
+    record_status,
     utc_now_iso,
 )
 from vibe_loop.skills import install_skills
@@ -862,11 +870,12 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--interval",
-        type=nonnegative_float,
+        type=autopilot_interval,
         default=None,
         help=(
             "Seconds to sleep between supervision cycles in the persistent loop "
-            "(overrides [autopilot] interval_seconds; default 0)"
+            "(minimum 60; overrides [autopilot] interval_seconds; zero or "
+            "omitted uses drain mode)"
         ),
     )
     parser.add_argument(
@@ -1175,6 +1184,10 @@ def dispatch_runs(args: argparse.Namespace, config) -> int:
             hours=args.hours,
             slice_token_threshold=config.supervision.slice_token_threshold,
         )
+        budget_store = BudgetStore(resolve_budget_ledger_path(config), config.budget)
+        summary["budget"] = budget_store.projection(
+            project=resolve_budget_project(config)
+        )
         if args.json:
             print(json.dumps(summary, indent=2))
         else:
@@ -1445,7 +1458,11 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             )
             config = dataclasses.replace(config, autopilot=ap)
         jobs = _first_set(getattr(args, "jobs", None), ap.jobs, 1)
-        interval = _first_set(getattr(args, "interval", None), ap.interval_seconds, 0.0)
+        interval = _first_set(
+            getattr(args, "interval", None),
+            ap.interval_seconds,
+            0.0,
+        )
         min_ready = _first_set(getattr(args, "min_ready", None), ap.min_ready, 1)
         if command == "start":
             launch = start_detached_autopilot(
@@ -1566,6 +1583,11 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.blockers:
         lines.append("blockers:")
         lines.extend(f"  - {blocker}" for blocker in status.blockers)
+        # `status` reports binding failures rather than raising, so without this
+        # the path the operator actually hits shows a bare diagnostic code.
+        guidance = project_binding_guidance(status.project_binding)
+        if guidance:
+            lines.append(f"  {guidance}")
     elif status.observations:
         lines.append("observations:")
         lines.extend(f"  - {observation}" for observation in status.observations)
@@ -1783,12 +1805,7 @@ def dispatch_autopilot_projects(args: argparse.Namespace) -> int:
         if entry is None:
             print(f"not in registry: {args.project}", file=sys.stderr)
             return 2
-        status = collect_project_status(
-            load_config(
-                entry.repo,
-                runtime_context=dict(entry.runtime_context),
-            )
-        )
+        status = collect_project_status(load_registry_entry_config(entry))
         if use_json:
             status_payload = status.to_json()
             project_binding = status_payload.pop("project_binding", None)
@@ -2769,31 +2786,7 @@ def render_run_inspection(inspection) -> str:
     lines.append("record_history:")
     for record in payload["records"]:
         record_type = record.get("record_type") or "run_result"
-        status = record.get("status") or record.get("classification") or "-"
-        if status == "-":
-            if record_type == "run_state_transition":
-                status = record.get("to_state") or "-"
-            elif record_type == "stage_transition":
-                status = (
-                    "rejected"
-                    if record.get("accepted") is False
-                    else record.get("failure") or record.get("to_stage") or "-"
-                )
-            elif record_type == "workspace_claim":
-                status = record.get("event_type") or "workspace_claimed"
-            elif record_type == "workspace_claim_mismatch":
-                status = record.get("reason") or "mismatch"
-            elif record_type == TASK_RESTART_RECORD_TYPE:
-                if record.get("exhausted") is True:
-                    status = record.get("reason") or "restart_budget_exhausted"
-                else:
-                    status = "restart_scheduled"
-            elif record_type == TASK_RECOVERY_RECORD_TYPE:
-                phase = record.get("phase") or "recovery"
-                outcome = record.get("outcome")
-                status = f"{phase}:{outcome}" if outcome else str(phase)
-            elif isinstance(record_type, str) and record_type.startswith("lock_"):
-                status = record_type.removeprefix("lock_")
+        status = record_status(record) or "-"
         updated = (
             record.get("finished_at")
             or record.get("reported_at")
@@ -2879,6 +2872,9 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
                             lines.append(
                                 "  forecast=" + json.dumps(forecast, sort_keys=True)
                             )
+    budget = summary.get("budget")
+    if isinstance(budget, Mapping):
+        lines.extend(render_budget_projection(budget))
     diagnostics = summary.get("diagnostics")
     if isinstance(diagnostics, list):
         lines.append(f"diagnostics: {len(diagnostics)}")
@@ -2886,6 +2882,49 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
             if isinstance(diagnostic, Mapping):
                 lines.append("- " + json.dumps(diagnostic, sort_keys=True))
     return "\n".join(lines)
+
+
+def render_budget_projection(budget: Mapping[str, object]) -> list[str]:
+    lines = [
+        "budget: "
+        f"enabled={str(bool(budget.get('enabled'))).lower()} "
+        f"metric={budget.get('metric')} "
+        f"fail_safe={budget.get('fail_safe')}"
+    ]
+    limits = budget.get("limits")
+    if isinstance(limits, list):
+        for limit in limits:
+            if not isinstance(limit, Mapping):
+                continue
+            lines.append(
+                f"- limit[{limit.get('limit_index')}] "
+                f"{limit.get('selector') or 'any'}: "
+                f"consumed={limit.get('consumed')} "
+                f"reserved={limit.get('reserved')} "
+                f"remaining={limit.get('remaining')} "
+                f"limit={limit.get('limit')} "
+                f"warning={str(bool(limit.get('warning'))).lower()} "
+                f"exceeded={str(bool(limit.get('exceeded'))).lower()}"
+            )
+    routes = budget.get("routes")
+    if isinstance(routes, list):
+        for route in routes:
+            if not isinstance(route, Mapping):
+                continue
+            lines.append(
+                f"- route {route.get('provider')}: "
+                f"reserved={route.get('reserved')} "
+                f"consumed={route.get('consumed')} "
+                f"authoritative={route.get('authoritative_consumed')} "
+                f"fail_safe={route.get('fail_safe_consumed')}"
+            )
+    decisions = budget.get("decisions")
+    if isinstance(decisions, Mapping):
+        lines.append("  decisions=" + json.dumps(decisions, sort_keys=True))
+    reservations = budget.get("reservations")
+    if isinstance(reservations, Mapping):
+        lines.append("  reservations=" + json.dumps(reservations, sort_keys=True))
+    return lines
 
 
 def worker_identity_from_args(args: argparse.Namespace) -> tuple[str, str]:
@@ -3493,6 +3532,16 @@ def positive_float(value: str) -> float:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def autopilot_interval(value: str) -> float:
+    parsed = nonnegative_float(value)
+    if 0 < parsed < AUTOPILOT_MIN_INTERVAL_SECONDS:
+        raise argparse.ArgumentTypeError(
+            "must be zero for drain mode or at least "
+            f"{AUTOPILOT_MIN_INTERVAL_SECONDS:.0f} seconds"
+        )
     return parsed
 
 
