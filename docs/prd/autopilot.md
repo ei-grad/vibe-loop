@@ -162,6 +162,9 @@ Records include `autopilot_cycle`, `autopilot_cycle_started`,
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
+The record also carries the number of durable `run_started` records appended by
+the child. A child that exits cleanly with zero such records is an idle cycle,
+not a completed dispatch cycle.
 Cycle and supervisor records also carry the configured worktree-disposition
 policy. Worktree-disposition records carry that policy plus candidate counts,
 evidence, reasons, and outcomes. Existing run readers must keep tolerating
@@ -736,11 +739,14 @@ ordinary interval wake.
 An ordinary restartable-backoff wait captures a complete task-source snapshot
 after the failed child and compares subsequent snapshots with that post-child
 fingerprint. A same-cardinality replacement or content/source edit can wake the
-next cycle early. Lifecycle-status or counter-only churn, an unchanged runnable
-task, and idle-wake-adapter events do not wake restartable backoff: those inputs
-must not reset the child-local retry budget or collapse exhausted-retry
-protection into a dispatch loop. A zero-second limit-wall result falls back to
-the ordinary interval and therefore still captures the post-child baseline.
+next cycle early. When the child durably started a run, lifecycle-status or
+counter-only churn, an unchanged runnable task, and idle-wake-adapter events do
+not wake restartable backoff: those inputs must not reset the child-local retry
+budget or collapse exhausted-retry protection into a dispatch loop. A
+restartable child that appended zero `run_started` records while its starting
+queue was runnable instead uses the idle runnable-work recheck; already
+dispatchable work with a free slot must not incur the full interval. A
+zero-second limit-wall result falls back to the applicable ordinary wait.
 Positive limit-wall pauses retain their dedicated stop-responsive wait.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step

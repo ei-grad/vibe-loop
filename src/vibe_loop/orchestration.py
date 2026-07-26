@@ -5448,6 +5448,7 @@ WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
         "workspace_live_owner",
         "workspace_main_history_mismatch",
         "workspace_ownership_unverified",
+        "workspace_refresh_conflict",
         "workspace_stale_current_base",
     }
 )
@@ -5470,8 +5471,8 @@ class ProvisionedWorkspace:
     dirty_at_adoption: bool = False
     dirty_snapshot: tuple[str, ...] = ()
     dirty_fingerprint: str = ""
-    # Pre-refresh HEAD when a provably disposable stale workspace was
-    # fast-forwarded onto the selected base during adoption; empty otherwise.
+    # Pre-refresh HEAD when a clean stale workspace was merged with the selected
+    # base during adoption; empty otherwise.
     refreshed_from: str = ""
 
     def to_record_payload(self) -> dict[str, object]:
@@ -6062,14 +6063,12 @@ class WorkspaceProvisioner:
         head: str,
         recovery_run_id: str,
     ) -> str:
-        """Fast-forward a provably disposable stale workspace onto the base.
+        """Merge the selected base into a clean stale workspace.
 
-        Returns the refreshed HEAD, or raises the ordinary
-        ``workspace_stale_current_base`` deferral when refresh cannot be
-        *proven* safe. Every unprovable input -- a failed git invocation, an
-        unreadable worktree, a HEAD that moved under the check -- takes the
-        deferral path, so the automatic repair only ever runs on a workspace
-        that demonstrably holds nothing the refresh could lose.
+        Returns the refreshed HEAD. A content conflict is aborted and surfaced
+        as ``workspace_refresh_conflict`` so the owned branch remains unchanged
+        for an implementation worker to resolve deliberately. Unreadable or
+        dirty state keeps using the ordinary stale-workspace deferral.
         """
 
         from vibe_loop.workers import WorkspaceClaimError, git_dirty_snapshot
@@ -6098,19 +6097,6 @@ class WorkspaceProvisioner:
         head_now = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
         if head_now.returncode != 0 or head_now.stdout.strip() != head:
             raise defer("head_unreadable_or_moved")
-        unique = self._git_result_at(
-            worktree,
-            "rev-list",
-            "--count",
-            f"{base_commit}..{head}",
-        )
-        if unique.returncode != 0:
-            raise defer("unique_commits_unreadable")
-        if unique.stdout.strip() != "0":
-            # Positive proof of disposability: a commit reachable only from this
-            # worktree counts as unique even when its content landed elsewhere,
-            # because reachability is what a refresh would drop.
-            raise defer("unique_commits", unique_commits=unique.stdout.strip())
         try:
             dirty, _fingerprint = git_dirty_snapshot(
                 worktree,
@@ -6139,19 +6125,64 @@ class WorkspaceProvisioner:
         for line in status.stdout.splitlines():
             if line.strip() and not line.startswith("??"):
                 raise defer("tracked_modification_behind_ignored_path")
-        # The act re-checks both conditions itself: --ff-only refuses when HEAD
-        # is not an ancestor of the base, and merge refuses when local tracked
-        # or untracked changes would be overwritten. That leaves no window in
-        # which this call can destroy work the checks above did not see, which a
-        # `reset --hard` could not offer. It is exactly equivalent to a reset
-        # here, since zero unique commits makes the base a descendant of HEAD.
-        merged = self._git_result_at(worktree, "merge", "--ff-only", base_commit)
+        merged = self._git_result_at(worktree, "merge", "--no-edit", base_commit)
         if merged.returncode != 0:
-            raise defer("fast_forward_refused")
+            conflicts = self._git_result_at(
+                worktree,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+            )
+            if conflicts.returncode == 0 and conflicts.stdout.splitlines():
+                conflict_paths = [
+                    path for path in conflicts.stdout.splitlines() if path.strip()
+                ][:20]
+                aborted = self._git_result_at(worktree, "merge", "--abort")
+                if aborted.returncode != 0:
+                    raise WorkspaceProvisionError(
+                        "workspace_refresh_conflict",
+                        "mainline refresh conflicted and git could not restore "
+                        "the owned branch",
+                        details={
+                            "selected_base": base_commit,
+                            "workspace_base": owner_base,
+                            "head_commit": head,
+                            "conflict_paths": conflict_paths,
+                            "merge_abort_failed": True,
+                        },
+                    )
+                raise WorkspaceProvisionError(
+                    "workspace_refresh_conflict",
+                    "mainline refresh conflicts with the owned task branch",
+                    details={
+                        "selected_base": base_commit,
+                        "workspace_base": owner_base,
+                        "head_commit": head,
+                        "conflict_paths": conflict_paths,
+                    },
+                )
+            raise defer("merge_failed")
         refreshed = self._git_result_at(worktree, "rev-parse", "--verify", "HEAD")
-        if refreshed.returncode != 0 or refreshed.stdout.strip() != base_commit:
+        refreshed_head = refreshed.stdout.strip()
+        if refreshed.returncode != 0 or not refreshed_head:
             raise defer("refresh_did_not_reach_base")
-        return base_commit
+        contains_base = self._git_returncode_at(
+            worktree,
+            "merge-base",
+            "--is-ancestor",
+            base_commit,
+            refreshed_head,
+        )
+        contains_head = self._git_returncode_at(
+            worktree,
+            "merge-base",
+            "--is-ancestor",
+            head,
+            refreshed_head,
+        )
+        if contains_base != 0 or contains_head != 0:
+            raise defer("refresh_did_not_reach_base")
+        return refreshed_head
 
     def _existing_owned_identity(self, task_id: str) -> tuple[str, Path] | None:
         from vibe_loop.workers import build_workspace_git_context

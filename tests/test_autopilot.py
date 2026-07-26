@@ -160,6 +160,15 @@ from vibe_loop.workers import (
 )
 
 
+def record_test_dispatch(repo: Path, ordinal: int = 1) -> None:
+    RunStore(repo / ".vibe-loop" / "runs.jsonl").append_lifecycle_event(
+        RunLifecycleEvent.run_started(
+            run_id=f"test-dispatch-{ordinal}",
+            task_id=f"TASK-{ordinal:02d}",
+        )
+    )
+
+
 def stop_test_process_group(pid: int, process_group_id: int) -> None:
     for stop_signal, timeout in (
         (signal.SIGINT, 5.0),
@@ -1348,6 +1357,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
             if on_start is not None:
                 on_start(4242)
+            record_test_dispatch(Path(cwd), len(calls))
             return 0
 
         return launcher, calls
@@ -4811,6 +4821,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             calls.append(list(command))
             if on_start is not None:
                 on_start(4242)
+            record_test_dispatch(Path(cwd), len(calls))
             return 0
 
         return launcher, calls
@@ -5088,22 +5099,35 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertTrue(status.source_error)
         self.assertEqual(observed_timeouts, [7.5])
 
-    def test_cycle_should_recheck_only_for_idle(self) -> None:
+    def test_cycle_should_recheck_idle_and_zero_dispatch_restartable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
             project_status = collect_project_status(load_config(repo))
 
-        def result(status: str) -> AutopilotCycleResult:
+        def result(
+            status: str,
+            *,
+            dispatched_runs: int = 0,
+            launched: bool = False,
+        ) -> AutopilotCycleResult:
             return AutopilotCycleResult(
                 cycle_id="c1",
                 repo=Path("/tmp"),
                 status=status,
                 occurred_at="",
                 project_status=project_status,
+                actions=("launched_run_until_done",) if launched else (),
+                dispatched_runs=dispatched_runs,
             )
 
         self.assertTrue(cycle_should_recheck(result("idle")))
+        self.assertTrue(cycle_should_recheck(result("restartable", launched=True)))
+        self.assertFalse(
+            cycle_should_recheck(
+                result("restartable", dispatched_runs=1, launched=True)
+            )
+        )
         for status in (
             "completed",
             "restartable",
@@ -5112,6 +5136,73 @@ class AutopilotRecheckTests(unittest.TestCase):
             "blocked",
         ):
             self.assertFalse(cycle_should_recheck(result(status)))
+
+    def test_zero_dispatch_success_is_idle_and_uses_recheck_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+            )
+            config = load_config(repo)
+            sleeps: list[float] = []
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=lambda *args, **kwargs: 0,
+                sleep=sleeps.append,
+                native_planning_runner=native_no_plan,
+            )
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
+
+        first = summary.cycles[0]
+        self.assertEqual(first.status, "idle")
+        self.assertEqual(first.dispatched_runs, 0)
+        self.assertIn("child_completed_without_dispatch", first.actions)
+        self.assertEqual(sleeps, [10.0])
+        cycle_record = next(
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_CYCLE_RECORD_TYPE
+            and record.get("cycle_id") == first.cycle_id
+        )
+        self.assertEqual(cycle_record["status"], "idle")
+        self.assertEqual(cycle_record["dispatched_runs"], 0)
+        idle_wait = next(
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_IDLE_WAIT_RECORD_TYPE
+        )
+        self.assertNotEqual(idle_wait["wake_reason"], "deadline")
+        self.assertGreater(idle_wait["poll_count"], 0)
+
+    def test_zero_dispatch_restartable_wakes_on_already_runnable_work(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready scope")],
+                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+            )
+            config = load_config(repo)
+            sleeps: list[float] = []
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=lambda *args, **kwargs: 1,
+                sleep=sleeps.append,
+            )
+
+        first = summary.cycles[0]
+        self.assertEqual(first.status, "restartable")
+        self.assertEqual(first.dispatched_runs, 0)
+        self.assertTrue(cycle_should_recheck(first))
+        self.assertEqual(sleeps, [10.0])
 
     def test_task_source_polling_includes_restartable_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5154,6 +5245,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                 launcher_calls += 1
                 if on_start is not None:
                     on_start(4242)
+                record_test_dispatch(Path(cwd), launcher_calls)
                 return 1 if launcher_calls == 1 else 0
 
             def sleeper(seconds: float) -> None:
@@ -5201,6 +5293,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                 launcher_calls += 1
                 if on_start is not None:
                     on_start(4242)
+                record_test_dispatch(Path(cwd), launcher_calls)
                 return 1
 
             summary = run_autopilot(
@@ -5240,6 +5333,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             def launcher(command, *, cwd, log_path, on_start=None):
                 if on_start is not None:
                     on_start(4242)
+                record_test_dispatch(Path(cwd))
                 write_plan(
                     repo,
                     [("TASK-01", "Next", "", "post-child settled route")],
@@ -5476,6 +5570,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             def launcher(command, *, cwd, log_path, on_start=None):
                 if on_start is not None:
                     on_start(4242)
+                record_test_dispatch(Path(cwd))
                 active_statuses.append(collect_project_status(config))
                 time.sleep(0.05)
                 return 0
@@ -5563,6 +5658,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                     launcher_calls += 1
                     if on_start is not None:
                         on_start(4242)
+                    record_test_dispatch(Path(cwd), launcher_calls)
                     write_plan(repo, [("TASK-01", "Done", "", "finished scope")])
                     return exit_code
 
@@ -7053,10 +7149,15 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             launched: list[object] = []
             runner, _calls = self._stub_runner({})
 
+            def launcher(command, **kwargs):
+                record_test_dispatch(Path(kwargs["cwd"]))
+                launched.append(command)
+                return 0
+
             summary = run_autopilot(
                 config,
                 once=True,
-                launcher=lambda command, **k: launched.append(command) or 0,
+                launcher=launcher,
                 maintenance_runner=runner,
             )
 
@@ -8666,6 +8767,7 @@ class CycleSummaryCycleTests(unittest.TestCase):
                     (repo / "landed.txt").write_text("done\n", encoding="utf-8")
                     run(repo, "git", "add", "landed.txt")
                     run(repo, "git", "commit", "-m", "land the slice")
+                record_test_dispatch(repo, len(calls))
                 return 0
 
             summary = run_autopilot(
@@ -9281,6 +9383,7 @@ class PlanningBackoffCycleTests(unittest.TestCase):
             calls.append(list(command))
             if on_start is not None:
                 on_start(4242)
+            record_test_dispatch(Path(cwd), len(calls))
             return 0
 
         return launcher, calls

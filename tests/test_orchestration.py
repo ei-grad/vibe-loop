@@ -6234,11 +6234,6 @@ class WorkspaceProvisionerTests(unittest.TestCase):
     def test_stale_workspace_refresh_refusals_leave_the_worktree_untouched(
         self,
     ) -> None:
-        def commit_unique(worktree: Path) -> None:
-            (worktree / "candidate.txt").write_text("unique\n", encoding="utf-8")
-            git(worktree, "add", "candidate.txt")
-            git(worktree, "commit", "-m", "interrupted candidate")
-
         def leave_untracked(worktree: Path) -> None:
             (worktree / "scratch.txt").write_text("uncommitted\n", encoding="utf-8")
 
@@ -6246,7 +6241,6 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             (worktree / "README.md").write_text("modified\n", encoding="utf-8")
 
         cases: tuple[tuple[str, Callable[[Path], None], str], ...] = (
-            ("unique_commits", commit_unique, "unique_commits"),
             ("untracked_dirt", leave_untracked, "dirty_workspace"),
             ("tracked_dirt", modify_tracked, "dirty_workspace"),
         )
@@ -6286,8 +6280,92 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 )
                 self.assertFalse((first.worktree / "main-change.txt").exists())
                 self.assertTrue(first.worktree.exists())
-                if name == "unique_commits":
-                    self.assertNotEqual(head_before, stale_base)
+
+    def test_stale_workspace_with_unique_commits_merges_current_base(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, _stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            (first.worktree / "candidate.txt").write_text(
+                "candidate\n", encoding="utf-8"
+            )
+            git(first.worktree, "add", "candidate.txt")
+            git(first.worktree, "commit", "-m", "candidate")
+            stale_head = git(first.worktree, "rev-parse", "HEAD").stdout.strip()
+
+            adopted = self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(adopted.refreshed_from, stale_head)
+            self.assertNotEqual(adopted.head_commit, stale_head)
+            self.assertNotEqual(adopted.head_commit, current_base)
+            self.assertTrue((first.worktree / "candidate.txt").exists())
+            self.assertTrue((first.worktree / "main-change.txt").exists())
+            self.assertEqual(git(first.worktree, "status", "--short").stdout, "")
+            self.assertEqual(
+                git(
+                    first.worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    stale_head,
+                    adopted.head_commit,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                git(
+                    first.worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    current_base,
+                    adopted.head_commit,
+                    check=False,
+                ).returncode,
+                0,
+            )
+
+    def test_stale_workspace_refresh_conflict_is_named_and_aborted(self) -> None:
+        def seed(repo: Path) -> None:
+            (repo / "shared.txt").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "shared.txt")
+            git(repo, "commit", "-m", "shared base")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, _stale_base, current_base = self._stale_workspace(
+                directory,
+                seed=seed,
+            )
+            (first.worktree / "shared.txt").write_text(
+                "task branch\n", encoding="utf-8"
+            )
+            git(first.worktree, "add", "shared.txt")
+            git(first.worktree, "commit", "-m", "task branch change")
+            stale_head = git(first.worktree, "rev-parse", "HEAD").stdout.strip()
+            (repo / "shared.txt").write_text("mainline\n", encoding="utf-8")
+            git(repo, "add", "shared.txt")
+            git(repo, "commit", "-m", "mainline conflict")
+            current_base = git(repo, "rev-parse", "HEAD").stdout.strip()
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(raised.exception.code, "workspace_refresh_conflict")
+            self.assertEqual(
+                raised.exception.retry_disposition,
+                "defer_until_workspace_changes",
+            )
+            self.assertEqual(raised.exception.details["conflict_paths"], ["shared.txt"])
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), stale_head
+            )
+            self.assertEqual(git(first.worktree, "status", "--short").stdout, "")
+            self.assertEqual(
+                (first.worktree / "shared.txt").read_text(encoding="utf-8"),
+                "task branch\n",
+            )
+            preflight = self._last_rejected_preflight(store)
+            self.assertEqual(preflight["reason"], "workspace_refresh_conflict")
+            self.assertFalse(preflight["worker_launch_allowed"])
 
     def test_stale_workspace_refresh_fails_closed_on_unreadable_git_state(
         self,
@@ -6305,9 +6383,8 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 "0" * 40,
                 "head_unreadable_or_moved",
             ),
-            (("rev-list",), 1, None, "unique_commits_unreadable"),
             (("status", "--short"), 1, None, "status_unreadable"),
-            (("merge", "--ff-only"), 1, None, "fast_forward_refused"),
+            (("merge", "--no-edit"), 1, None, "merge_failed"),
         )
         for matched, ordinal, replacement, expected_refusal in cases:
             with (
@@ -6573,7 +6650,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             )
             self.assertFalse(preflight["worker_launch_allowed"])
 
-    def test_runner_rejects_stale_adoption_before_worker_launch(self) -> None:
+    def test_runner_refreshes_stale_owned_branch_before_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
@@ -6616,37 +6693,55 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             git(repo, "add", "current-base.txt")
             git(repo, "commit", "-m", "advance main")
 
+            def worker(command, cwd, log, **kwargs):
+                self.assertEqual(Path(cwd), workspace.worktree)
+                self.assertTrue((Path(cwd) / "candidate.txt").exists())
+                self.assertTrue((Path(cwd) / "current-base.txt").exists())
+                kwargs["on_start"](12345)
+                env = kwargs["env"]
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=env["VIBE_LOOP_RUN_ID"],
+                        task_id=env["VIBE_LOOP_TASK_ID"],
+                        status="failed",
+                    )
+                )
+                return runner_module.StreamingCommandResult(exit_code=1)
+
             with patch.object(runner, "ensure_spec_execution_gate"):
                 with patch.object(
                     runner,
                     "activate_task_before_launch",
                     return_value=None,
                 ):
-                    with patch("vibe_loop.runner.run_streaming_command") as launch:
-                        with self.assertRaises(WorkspaceProvisionError) as raised:
-                            runner.run_task(task)
+                    with patch("vibe_loop.runner.run_streaming_command", worker):
+                        result = runner.run_task(task)
 
-            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
-            launch.assert_not_called()
-            self.assertTrue(workspace.worktree.exists())
+            self.assertEqual(result.classification, "failed")
+            refreshed_head = git(workspace.worktree, "rev-parse", "HEAD").stdout.strip()
+            self.assertNotEqual(refreshed_head, stale_head)
             self.assertEqual(
-                git(workspace.worktree, "rev-parse", "HEAD").stdout.strip(),
-                stale_head,
+                git(
+                    workspace.worktree,
+                    "merge-base",
+                    "--is-ancestor",
+                    git(repo, "rev-parse", "HEAD").stdout.strip(),
+                    refreshed_head,
+                    check=False,
+                ).returncode,
+                0,
             )
-            self.assertFalse(runner.lock_manager.is_locked(task.task_id))
             records = runner.run_store.read_records()
-            rejected = [
+            reusable = [
                 record
                 for record in records
                 if record.get("record_type") == "workspace_preflight"
-                and record.get("decision") == "rejected"
+                and record.get("decision") == "reusable"
+                and record.get("run_id") == result.run_id
             ]
-            self.assertEqual(len(rejected), 1)
-            self.assertEqual(
-                rejected[0]["retry_disposition"],
-                "defer_until_workspace_changes",
-            )
-            self.assertNotIn(
+            self.assertEqual(len(reusable), 1)
+            self.assertTrue(reusable[0]["worker_launch_allowed"])
+            self.assertIn(
                 "worker_process_started",
                 [record.get("record_type") for record in records],
             )
@@ -6683,14 +6778,16 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 base_commit=old_base,
                 fencing_token=token,
             )
-            (workspace.worktree / "candidate.txt").write_text(
-                "interrupted candidate\n", encoding="utf-8"
+            (workspace.worktree / "shared.txt").write_text(
+                "task branch\n", encoding="utf-8"
             )
-            git(workspace.worktree, "add", "candidate.txt")
-            git(workspace.worktree, "commit", "-m", "interrupted candidate")
+            git(workspace.worktree, "add", "shared.txt")
+            git(workspace.worktree, "commit", "-m", "task branch change")
             manager.release(manager.current_lock(task.task_id))
             (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            (repo / "shared.txt").write_text("mainline\n", encoding="utf-8")
             git(repo, "add", "current-base.txt")
+            git(repo, "add", "shared.txt")
             git(repo, "commit", "-m", "advance main")
             scratch = workspace.worktree / "scratch"
             scratch.mkdir()
@@ -6707,7 +6804,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                         with self.assertRaises(WorkspaceProvisionError) as raised:
                             runner.run_task(task)
 
-            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            self.assertEqual(raised.exception.code, "workspace_refresh_conflict")
             launch.assert_not_called()
             rejected = [
                 record
