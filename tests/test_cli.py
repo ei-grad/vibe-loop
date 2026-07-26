@@ -40,6 +40,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     WORKER_PROCESS_STARTED_RECORD_TYPE,
     RunLifecycleEvent,
+    RunResult,
     RunStore,
     utc_now_iso,
 )
@@ -8658,6 +8659,41 @@ class CliTests(unittest.TestCase):
             "\tupdated=2026-05-09T00:00:45+00:00\n"
             "- run_result\tstatus=completed"
             "\tupdated=2026-05-09T00:01:00+00:00\n",
+        )
+
+    def test_run_inspection_history_renders_integration_provenance_outcome(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            store.append_lifecycle_event(
+                RunLifecycleEvent.integration_provenance(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    outcome="refused-unprovable",
+                    candidate_commit="a" * 40,
+                    target_commit="b" * 40,
+                )
+            )
+            store.append_result(
+                RunResult(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    classification="blocked",
+                    exit_code=1,
+                    log_path=repo / ".vibe-loop" / "runs" / "run-1.log",
+                    start_main="a" * 40,
+                    end_main="b" * 40,
+                )
+            )
+
+            rendered = cli_module.render_run_inspection(store.inspect_run("run-1"))
+
+        self.assertIn("status: blocked", rendered)
+        self.assertIn(
+            "- integration_provenance\tstatus=refused-unprovable\tupdated=",
+            rendered,
         )
 
     def test_runs_json_redacts_legacy_fencing_token_fields(self) -> None:

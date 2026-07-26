@@ -103,10 +103,10 @@ from vibe_loop.runs import (
     RunLifecycleEvent,
     RunResult,
     RunStore,
-    TASK_RECOVERY_RECORD_TYPE,
     TASK_RESTART_RECORD_TYPE,
     WorkerReport,
     WORKER_REPORT_STATUSES,
+    record_status,
     utc_now_iso,
 )
 from vibe_loop.skills import install_skills
@@ -2786,31 +2786,7 @@ def render_run_inspection(inspection) -> str:
     lines.append("record_history:")
     for record in payload["records"]:
         record_type = record.get("record_type") or "run_result"
-        status = record.get("status") or record.get("classification") or "-"
-        if status == "-":
-            if record_type == "run_state_transition":
-                status = record.get("to_state") or "-"
-            elif record_type == "stage_transition":
-                status = (
-                    "rejected"
-                    if record.get("accepted") is False
-                    else record.get("failure") or record.get("to_stage") or "-"
-                )
-            elif record_type == "workspace_claim":
-                status = record.get("event_type") or "workspace_claimed"
-            elif record_type == "workspace_claim_mismatch":
-                status = record.get("reason") or "mismatch"
-            elif record_type == TASK_RESTART_RECORD_TYPE:
-                if record.get("exhausted") is True:
-                    status = record.get("reason") or "restart_budget_exhausted"
-                else:
-                    status = "restart_scheduled"
-            elif record_type == TASK_RECOVERY_RECORD_TYPE:
-                phase = record.get("phase") or "recovery"
-                outcome = record.get("outcome")
-                status = f"{phase}:{outcome}" if outcome else str(phase)
-            elif isinstance(record_type, str) and record_type.startswith("lock_"):
-                status = record_type.removeprefix("lock_")
+        status = record_status(record) or "-"
         updated = (
             record.get("finished_at")
             or record.get("reported_at")
