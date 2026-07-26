@@ -1,0 +1,13 @@
+{
+  "type": "rate_limit_event",
+  "timestamp": "PRIVATE COMMAND sk-secret-canary",
+  "rate_limit_info": {
+    "status": "allowed",
+    "rateLimitType": "five_hour",
+    "resetsAt": "FENCING CANARY",
+    "overageStatus": "rejected",
+    "overageDisabledReason": "RAW TRANSCRIPT"
+  },
+  "prompt": "PROMPT CANARY",
+  "credential": "sk-secret-canary"
+}

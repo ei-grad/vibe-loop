@@ -109,6 +109,32 @@ QUOTA_UNAVAILABLE_REASONS = frozenset(
     }
 )
 QUOTA_RESET_JITTER_TOLERANCE_SECONDS = 1
+ACCOUNT_WALL_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
+ACCOUNT_WALL_WINDOWS = frozenset(
+    {
+        "five_hour",
+        "seven_day",
+        "seven_day_opus",
+        "seven_day_sonnet",
+        "seven_day_overage_included",
+        "overage",
+    }
+)
+ACCOUNT_WALL_OVERAGE_STATUSES = frozenset({"allowed", "allowed_warning", "rejected"})
+ACCOUNT_WALL_DISABLED_REASONS = frozenset(
+    {
+        "group_zero_credit_limit",
+        "member_level_disabled",
+        "member_zero_credit_limit",
+        "org_level_disabled",
+        "org_level_disabled_until",
+        "org_service_level_disabled",
+        "out_of_credits",
+        "seat_tier_level_disabled",
+        "seat_tier_zero_credit_limit",
+    }
+)
+ACCOUNT_WALL_UNKNOWN = "unknown"
 SENSITIVE_METADATA_MARKERS = (
     "credential",
     "fencing",
@@ -209,6 +235,76 @@ class QuotaSnapshot:
             "window_minutes": self.window_minutes,
             "resets_at": self.resets_at,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class AccountWallObservation:
+    provider: str
+    status: str
+    window: str
+    observed_at: str
+    resets_at: int
+    overage_status: str
+    disabled_reason: str
+
+    def to_stats(self) -> dict[str, object]:
+        return {
+            "provider": self.provider,
+            "status": self.status,
+            "window": self.window,
+            "observed_at": self.observed_at,
+            "resets_at": self.resets_at,
+            "overage_status": self.overage_status,
+            "disabled_reason": self.disabled_reason,
+        }
+
+
+def _sanitize_account_wall_observations(
+    value: object,
+) -> list[dict[str, object]]:
+    if not isinstance(value, list | tuple):
+        return []
+    observations: list[dict[str, object]] = []
+    for candidate in value[:8]:
+        if not isinstance(candidate, Mapping):
+            continue
+        provider = candidate.get("provider")
+        status = candidate.get("status")
+        window = candidate.get("window")
+        observed_at = parse_timestamp(candidate.get("observed_at"))
+        resets_at = _integer(candidate.get("resets_at"))
+        overage_status = candidate.get("overage_status")
+        disabled_reason = candidate.get("disabled_reason")
+        if (
+            not isinstance(provider, str)
+            or provider not in CANONICAL_USAGE_PROVIDERS
+            or not isinstance(status, str)
+            or status not in ACCOUNT_WALL_STATUSES
+            or not isinstance(window, str)
+            or window not in {*ACCOUNT_WALL_WINDOWS, ACCOUNT_WALL_UNKNOWN}
+            or observed_at is None
+            or resets_at is None
+            or not 0 < resets_at <= 253402300799
+            or not isinstance(overage_status, str)
+            or overage_status
+            not in {*ACCOUNT_WALL_OVERAGE_STATUSES, ACCOUNT_WALL_UNKNOWN}
+            or not isinstance(disabled_reason, str)
+            or disabled_reason
+            not in {*ACCOUNT_WALL_DISABLED_REASONS, ACCOUNT_WALL_UNKNOWN}
+        ):
+            continue
+        observations.append(
+            {
+                "provider": provider,
+                "status": status,
+                "window": window,
+                "observed_at": observed_at.isoformat(),
+                "resets_at": resets_at,
+                "overage_status": overage_status,
+                "disabled_reason": disabled_reason,
+            }
+        )
+    return observations
 
 
 def _sanitize_quota_snapshots(value: object) -> list[dict[str, object]]:
@@ -340,6 +436,7 @@ class ProviderUsage:
     malformed: bool = False
     quota_snapshots: tuple[QuotaSnapshot, ...] = ()
     quota_unavailable_reason: str = "quota_snapshot_not_reported"
+    account_wall_observations: tuple[AccountWallObservation, ...] = ()
 
     @property
     def available(self) -> bool:
@@ -393,6 +490,10 @@ class ProviderUsage:
             stats["quota_unavailable_reason"] = (
                 self.quota_unavailable_reason or "quota_snapshot_not_reported"
             )
+        if self.account_wall_observations:
+            stats["account_wall_observations"] = [
+                observation.to_stats() for observation in self.account_wall_observations
+            ]
         if candidate_fingerprint:
             stats["candidate_fingerprint"] = candidate_fingerprint[:160]
         if changed_lines is not None and changed_lines >= 0:
@@ -533,12 +634,20 @@ def sanitize_run_stats(value: object) -> dict[str, object]:
             and quota_reason in QUOTA_UNAVAILABLE_REASONS
             else "malformed_quota_snapshot"
         )
+    account_wall_observations = _sanitize_account_wall_observations(
+        value.get("account_wall_observations")
+    )
+    if account_wall_observations:
+        result["account_wall_observations"] = account_wall_observations
     return result
 
 
 def merge_provider_usage(*items: ProviderUsage) -> ProviderUsage:
     available = [item for item in items if item.available]
     quota_snapshots = _merge_quota_snapshots(*(item.quota_snapshots for item in items))
+    account_wall_observations = _merge_account_wall_observations(
+        *(item.account_wall_observations for item in items)
+    )
     if not available:
         if not items:
             return unavailable_usage("unknown", "provider_usage_not_reported")
@@ -548,6 +657,7 @@ def merge_provider_usage(*items: ProviderUsage) -> ProviderUsage:
             quota_unavailable_reason=(
                 "" if quota_snapshots else items[0].quota_unavailable_reason
             ),
+            account_wall_observations=account_wall_observations,
         )
     providers = {item.provider for item in available}
     provider = available[0].provider if len(providers) == 1 else "mixed"
@@ -569,6 +679,7 @@ def merge_provider_usage(*items: ProviderUsage) -> ProviderUsage:
         quota_unavailable_reason=(
             "" if quota_snapshots else "quota_snapshot_not_reported"
         ),
+        account_wall_observations=account_wall_observations,
     )
 
 
@@ -653,6 +764,61 @@ def parse_claude_result(
     )
 
 
+def parse_claude_rate_limit_event(
+    payload: Mapping[str, object], *, observed_at: datetime | None = None
+) -> AccountWallObservation | None:
+    if payload.get("type") != "rate_limit_event":
+        return None
+    info = payload.get("rate_limit_info")
+    if not isinstance(info, Mapping):
+        return None
+    status = info.get("status")
+    resets_at = _integer(info.get("resetsAt"))
+    if (
+        not isinstance(status, str)
+        or status not in ACCOUNT_WALL_STATUSES
+        or resets_at is None
+        or not 0 < resets_at <= 253402300799
+    ):
+        return None
+    timestamp = payload.get("timestamp")
+    if timestamp is not None:
+        observation = parse_timestamp(timestamp)
+        if observation is None:
+            return None
+    else:
+        observation = observed_at or datetime.now(UTC)
+    window_value = info.get("rateLimitType")
+    window = (
+        window_value
+        if isinstance(window_value, str) and window_value in ACCOUNT_WALL_WINDOWS
+        else ACCOUNT_WALL_UNKNOWN
+    )
+    overage_value = info.get("overageStatus")
+    overage_status = (
+        overage_value
+        if isinstance(overage_value, str)
+        and overage_value in ACCOUNT_WALL_OVERAGE_STATUSES
+        else ACCOUNT_WALL_UNKNOWN
+    )
+    reason_value = info.get("overageDisabledReason")
+    disabled_reason = (
+        reason_value
+        if isinstance(reason_value, str)
+        and reason_value in ACCOUNT_WALL_DISABLED_REASONS
+        else ACCOUNT_WALL_UNKNOWN
+    )
+    return AccountWallObservation(
+        provider="anthropic",
+        status=status,
+        window=window,
+        observed_at=observation.isoformat(),
+        resets_at=resets_at,
+        overage_status=overage_status,
+        disabled_reason=disabled_reason,
+    )
+
+
 def parse_codex_event(
     payload: Mapping[str, object], *, observed_at: datetime | None = None
 ) -> ProviderUsage | None:
@@ -701,6 +867,7 @@ class ProviderUsageObserver:
         self._lock = threading.Lock()
         self._usage: ProviderUsage | None = None
         self._saw_malformed_usage = False
+        self._account_wall_observations: tuple[AccountWallObservation, ...] = ()
 
     @property
     def usage(self) -> ProviderUsage:
@@ -713,8 +880,12 @@ class ProviderUsageObserver:
                     "native:provider",
                     "1",
                     malformed=True,
+                    account_wall_observations=self._account_wall_observations,
                 )
-            return unavailable_usage(self.provider, "provider_usage_not_reported")
+            return dataclasses.replace(
+                unavailable_usage(self.provider, "provider_usage_not_reported"),
+                account_wall_observations=self._account_wall_observations,
+            )
 
     def observe_line(self, line: str) -> ProviderUsage | None:
         text = line.strip()
@@ -729,16 +900,35 @@ class ProviderUsageObserver:
         if not isinstance(payload, dict):
             return None
         observed_at = datetime.now(UTC)
+        account_wall = parse_claude_rate_limit_event(payload, observed_at=observed_at)
         parsed = parse_claude_result(
             payload, observed_at=observed_at
         ) or parse_codex_event(payload, observed_at=observed_at)
-        if parsed is None:
+        if parsed is None and account_wall is None:
             return None
         with self._lock:
+            if account_wall is not None:
+                self._account_wall_observations = _merge_account_wall_observations(
+                    self._account_wall_observations, (account_wall,)
+                )
+            if parsed is None:
+                if self._usage is not None:
+                    self._usage = dataclasses.replace(
+                        self._usage,
+                        account_wall_observations=self._account_wall_observations,
+                    )
+                    return self._usage
+                return dataclasses.replace(
+                    unavailable_usage(self.provider, "provider_usage_not_reported"),
+                    account_wall_observations=self._account_wall_observations,
+                )
             self._saw_malformed_usage = self._saw_malformed_usage or parsed.malformed
             if self._usage is None:
-                self._usage = parsed
-                return parsed
+                self._usage = dataclasses.replace(
+                    parsed,
+                    account_wall_observations=self._account_wall_observations,
+                )
+                return self._usage
             current = self._usage
             usage = parsed if parsed.available else current
             snapshots = _merge_quota_snapshots(
@@ -750,8 +940,9 @@ class ProviderUsageObserver:
                 quota_snapshots=snapshots,
                 quota_unavailable_reason=quota_reason,
                 malformed=current.malformed or parsed.malformed,
+                account_wall_observations=self._account_wall_observations,
             )
-        return parsed
+            return self._usage
 
 
 def _merge_quota_snapshots(
@@ -770,6 +961,30 @@ def _merge_quota_snapshots(
             )
             snapshots[key] = snapshot
     return tuple(list(snapshots.values())[-8:])
+
+
+def _merge_account_wall_observations(
+    *items: Iterable[AccountWallObservation],
+) -> tuple[AccountWallObservation, ...]:
+    observations: dict[tuple[str, str], AccountWallObservation] = {}
+    for item in items:
+        for observation in item:
+            key = (observation.provider, observation.window)
+            current = observations.get(key)
+            current_at = parse_timestamp(current.observed_at) if current else None
+            observed_at = parse_timestamp(observation.observed_at)
+            if current_at is None or (
+                observed_at is not None
+                and (
+                    observed_at > current_at
+                    or (
+                        observed_at == current_at
+                        and observation.resets_at >= current.resets_at
+                    )
+                )
+            ):
+                observations[key] = observation
+    return tuple(observations.values())
 
 
 def parse_codex_rollout_usage(path: Path) -> ProviderUsage:
@@ -1012,6 +1227,7 @@ def _quota_provider_group(provider: str) -> dict[str, object]:
         "account_wall_evidence_available": False,
         "account_wall_observations": 0,
         "account_wall_last_observed_at": None,
+        "latest_account_wall_observations": [],
         "snapshots": [],
         "forecasts": [],
     }
@@ -1193,6 +1409,26 @@ def _quota_account_wall_summary(
             stored.extend(snapshots)
         elif stats_map.get("quota_unavailable_reason") == "malformed_quota_snapshot":
             malformed_evidence.add(provider)
+        account_wall = _sanitize_account_wall_observations(
+            stats_map.get("account_wall_observations")
+        )
+        for observation in account_wall:
+            observation_provider = str(observation["provider"])
+            account_group = providers.setdefault(
+                observation_provider,
+                _quota_provider_group(observation_provider),
+            )
+            account_group["account_wall_evidence_available"] = True
+            account_group["account_wall_observations"] = (
+                int(account_group["account_wall_observations"]) + 1
+            )
+            latest = account_group["latest_account_wall_observations"]
+            assert isinstance(latest, list)
+            latest.append(observation)
+            observed_at = parse_timestamp(observation["observed_at"])
+            prior = parse_timestamp(account_group["account_wall_last_observed_at"])
+            if observed_at is not None and (prior is None or observed_at > prior):
+                account_group["account_wall_last_observed_at"] = observed_at.isoformat()
         if record.get("classification") == "limit_wall":
             group["account_wall_evidence_available"] = True
             group["account_wall_observations"] = (
@@ -1230,6 +1466,30 @@ def _quota_account_wall_summary(
             )
         )
         group["forecasts"] = _quota_forecasts(stored)
+        latest = group["latest_account_wall_observations"]
+        assert isinstance(latest, list)
+        latest_by_window: dict[str, dict[str, object]] = {}
+        for observation in latest:
+            window = str(observation["window"])
+            current = latest_by_window.get(window)
+            current_at = (
+                parse_timestamp(current["observed_at"]) if current is not None else None
+            )
+            observed_at = parse_timestamp(observation["observed_at"])
+            if current_at is None or (
+                observed_at is not None
+                and (
+                    observed_at > current_at
+                    or (
+                        observed_at == current_at
+                        and int(observation["resets_at"]) >= int(current["resets_at"])
+                    )
+                )
+            ):
+                latest_by_window[window] = observation
+        group["latest_account_wall_observations"] = [
+            latest_by_window[key] for key in sorted(latest_by_window)
+        ]
     return {
         "evidence_available": any(
             bool(group["quota_evidence_available"])

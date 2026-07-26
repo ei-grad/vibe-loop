@@ -3085,6 +3085,20 @@ def render_usage_summary(summary: Mapping[str, object]) -> str:
                 reason = provider.get("quota_unavailable_reason")
                 if reason:
                     lines.append(f"  quota_unavailable_reason={reason}")
+                account_wall = provider.get("latest_account_wall_observations")
+                if isinstance(account_wall, list):
+                    for observation in account_wall:
+                        if not isinstance(observation, Mapping):
+                            continue
+                        lines.append(
+                            "  account_wall="
+                            f"window={observation.get('window')} "
+                            f"status={observation.get('status')} "
+                            f"resets_at={observation.get('resets_at')} "
+                            f"overage_status={observation.get('overage_status')} "
+                            f"disabled_reason={observation.get('disabled_reason')} "
+                            f"observed_at={observation.get('observed_at')}"
+                        )
                 activity = provider.get("activity")
                 if isinstance(activity, Mapping):
                     lines.append("  activity=" + json.dumps(activity, sort_keys=True))

@@ -1,0 +1,10 @@
+{
+  "type": "rate_limit_event",
+  "rate_limit_info": {
+    "status": "allowed",
+    "rateLimitType": "five_hour",
+    "resetsAt": 1784642400,
+    "overageStatus": "rejected",
+    "overageDisabledReason": "org_level_disabled"
+  }
+}

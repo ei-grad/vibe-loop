@@ -2812,6 +2812,9 @@ class VibeRunner:
                                     **rollout_usage.values,
                                 },
                                 raw={**provider_usage.raw, **rollout_usage.raw},
+                                account_wall_observations=(
+                                    provider_usage.account_wall_observations
+                                ),
                             )
                         if rollout_usage.quota_snapshots:
                             provider_usage = dataclasses.replace(
@@ -2824,9 +2827,15 @@ class VibeRunner:
                     and agent_kind in {"auto", "claude"}
                     and transcript_path
                 ):
-                    provider_usage = parse_claude_transcript_usage(
+                    transcript_usage = parse_claude_transcript_usage(
                         Path(transcript_path),
                         start_offset=transcript_start_offset,
+                    )
+                    provider_usage = dataclasses.replace(
+                        transcript_usage,
+                        account_wall_observations=(
+                            provider_usage.account_wall_observations
+                        ),
                     )
                 final_context_payload = build_run_context_payload(
                     task_id=task.task_id,

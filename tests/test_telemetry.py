@@ -19,6 +19,7 @@ from vibe_loop.telemetry import (
     ProviderUsageObserver,
     normalize_model_label,
     normalize_provider_label,
+    parse_claude_rate_limit_event,
     parse_claude_result,
     parse_claude_transcript_usage,
     parse_codex_event,
@@ -301,6 +302,144 @@ def test_malformed_quota_snapshot_is_unavailable_and_redacted() -> None:
         "RAW TRANSCRIPT",
     ):
         assert canary not in encoded
+
+
+@pytest.mark.parametrize(
+    ("name", "status", "window"),
+    [
+        ("claude-rate-limit-allowed.json", "allowed", "five_hour"),
+        ("claude-rate-limit-limited.json", "allowed_warning", "seven_day_sonnet"),
+        ("claude-rate-limit-rejected.json", "rejected", "five_hour"),
+    ],
+)
+def test_claude_rate_limit_event_keeps_only_bounded_account_wall_fields(
+    name: str, status: str, window: str
+) -> None:
+    observation = parse_claude_rate_limit_event(
+        fixture(name),
+        observed_at=datetime(2026, 7, 21, 9, 0, tzinfo=UTC),
+    )
+
+    assert observation is not None
+    assert observation.provider == "anthropic"
+    assert observation.status == status
+    assert observation.window == window
+    assert observation.resets_at > 0
+
+
+def test_claude_rate_limit_unknown_values_normalize_without_payload_text() -> None:
+    payload = fixture("claude-rate-limit-unknown-kind.json")
+    observation = parse_claude_rate_limit_event(payload)
+
+    assert observation is not None
+    assert observation.window == "unknown"
+    assert observation.overage_status == "unknown"
+    assert observation.disabled_reason == "unknown"
+    encoded = json.dumps(observation.to_stats())
+    assert "PRIVATE COMMAND" not in encoded
+    assert "credential-value" not in encoded
+    assert "sk-secret-canary" not in encoded
+    assert "RAW TRANSCRIPT" not in encoded
+
+
+def test_malformed_claude_rate_limit_event_is_unavailable_and_redacted() -> None:
+    payload = fixture("claude-rate-limit-malformed.json")
+    observer = ProviderUsageObserver("anthropic")
+
+    assert parse_claude_rate_limit_event(payload) is None
+    assert observer.observe_line(json.dumps(payload)) is None
+    encoded = json.dumps(observer.usage.to_stats(phase="implementation"))
+
+    assert "account_wall_observations" not in encoded
+    for canary in (
+        "PROMPT CANARY",
+        "sk-secret-canary",
+        "FENCING CANARY",
+        "PRIVATE COMMAND",
+        "RAW TRANSCRIPT",
+    ):
+        assert canary not in encoded
+    assert "account_wall_observations" not in sanitize_run_stats(
+        {
+            "account_wall_observations": [
+                {
+                    "provider": {"credential": "sk-secret-canary"},
+                    "status": ["allowed"],
+                    "window": {"prompt": "PROMPT CANARY"},
+                    "observed_at": "PRIVATE COMMAND",
+                    "resets_at": 1784642400,
+                    "overage_status": ["rejected"],
+                    "disabled_reason": {"raw_payload": "RAW TRANSCRIPT"},
+                }
+            ]
+        }
+    )
+
+
+def test_claude_account_wall_observer_keeps_latest_reset_boundary() -> None:
+    observer = ProviderUsageObserver("anthropic")
+    first = fixture("claude-rate-limit-allowed.json")
+    first["timestamp"] = "2026-07-21T10:00:00Z"
+
+    observer.observe_line(json.dumps(first))
+    observer.observe_line(json.dumps(fixture("claude-rate-limit-rejected.json")))
+
+    stats = observer.usage.to_stats(phase="implementation")
+    assert stats["quota_evidence_available"] is False
+    assert stats["quota_unavailable_reason"] == "quota_snapshot_not_reported"
+    assert stats["account_wall_observations"] == [
+        {
+            "provider": "anthropic",
+            "status": "rejected",
+            "window": "five_hour",
+            "observed_at": "2026-07-21T12:00:00+00:00",
+            "resets_at": 1784660400,
+            "overage_status": "rejected",
+            "disabled_reason": "member_zero_credit_limit",
+        }
+    ]
+
+
+def test_claude_account_wall_summary_has_evidence_without_percent_forecast() -> None:
+    observer = ProviderUsageObserver("anthropic")
+    first = fixture("claude-rate-limit-allowed.json")
+    first["timestamp"] = "2026-07-21T10:00:00Z"
+    observer.observe_line(json.dumps(first))
+    observer.observe_line(json.dumps(fixture("claude-rate-limit-rejected.json")))
+    record = run_record(
+        "claude-account-wall",
+        "task-account-wall",
+        datetime(2026, 7, 21, 12, 5, tzinfo=UTC),
+        provider="unknown",
+    )
+    record["stats"] = observer.usage.to_stats(phase="implementation")
+
+    summary = rolling_usage_summary(
+        [record],
+        project="demo",
+        now=datetime(2026, 7, 21, 13, 0, tzinfo=UTC),
+    )
+    providers = {
+        item["provider"]: item for item in summary["quota_account_wall"]["providers"]
+    }
+    provider = providers["anthropic"]
+
+    assert summary["quota_account_wall"]["evidence_available"] is True
+    assert provider["quota_evidence_available"] is False
+    assert provider["quota_unavailable_reason"] == "quota_snapshot_not_reported"
+    assert provider["account_wall_evidence_available"] is True
+    assert provider["forecasts"] == []
+    assert provider["latest_account_wall_observations"] == [
+        {
+            "provider": "anthropic",
+            "status": "rejected",
+            "window": "five_hour",
+            "observed_at": "2026-07-21T12:00:00+00:00",
+            "resets_at": 1784660400,
+            "overage_status": "rejected",
+            "disabled_reason": "member_zero_credit_limit",
+        }
+    ]
 
 
 def test_provider_usage_without_cache_fields_keeps_fresh_input() -> None:
@@ -969,6 +1108,9 @@ def test_runs_summary_text_separates_quota_account_wall(tmp_path: Path, capsys) 
         "task-1",
         datetime.now(UTC) - timedelta(minutes=1),
     )
+    observer = ProviderUsageObserver("anthropic")
+    observer.observe_line(json.dumps(fixture("claude-rate-limit-rejected.json")))
+    record["stats"] = observer.usage.to_stats(phase="implementation")
     runs_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
     exit_code = main(["runs", "summary", "--repo", str(repo)])
@@ -976,8 +1118,12 @@ def test_runs_summary_text_separates_quota_account_wall(tmp_path: Path, capsys) 
 
     assert exit_code == 0
     assert output.err == ""
-    assert "quota/account-wall: evidence_available=false" in output.out
+    assert "quota/account-wall: evidence_available=true" in output.out
     assert "quota_unavailable_reason=quota_snapshot_not_reported" in output.out
+    assert (
+        "account_wall=window=five_hour status=rejected resets_at=1784660400"
+        in output.out
+    )
 
 
 def test_rolling_summary_exposes_open_attempt_breakers_without_task_text() -> None:

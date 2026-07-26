@@ -1,0 +1,11 @@
+{
+  "type": "rate_limit_event",
+  "timestamp": "2026-07-21T11:00:00Z",
+  "rate_limit_info": {
+    "status": "allowed_warning",
+    "rateLimitType": "seven_day_sonnet",
+    "resetsAt": 1785247200,
+    "overageStatus": "allowed",
+    "overageDisabledReason": null
+  }
+}

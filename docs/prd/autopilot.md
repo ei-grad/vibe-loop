@@ -1066,6 +1066,17 @@ segment; providers, scopes, window labels, window durations, and actual reset
 epochs are never combined. Missing or malformed evidence does not produce an
 inferred quota from transcript bytes or token totals.
 
+Native Claude `rate_limit_event` stream records provide account-wall state
+without used-percent evidence. Telemetry retains only allowlisted status,
+window kind, reset time, overage status, observation time, and normalized
+disabled-reason enum values. Unknown kinds and reasons normalize to `unknown`;
+malformed timestamps and structural fields produce no observation. Comparable
+observations merge monotonically by provider and window, and summaries expose
+the latest observation for each window. These observations make account-wall
+evidence available but leave percent-based quota evidence and exhaustion
+forecasts explicitly unavailable. Raw event payloads and arbitrary event text
+are never persisted.
+
 Worker usage defaults to implementation. An allowlisted `phase` and optional
 `review` or `discovery` `work_kind` from the terminal worker report can refine
 that provenance. Native planning records model/provider provenance from the
@@ -1087,9 +1098,11 @@ separate informational diagnostic. Telemetry does not switch providers or
 reset quota in response.
 
 Acceptance covers Claude and Codex present/missing/malformed/limit-wall
-fixtures, cache-present/cache-absent and reported-cost cases, bounded quota
-snapshots, malformed snapshots, reset-window changes, unavailable account-wall
-evidence, run-record and Loopyard-compatible stats round trips, phase-aware
+fixtures, native Claude allowed/warning/rejected account-wall events,
+unknown-kind and reset-boundary events, cache-present/cache-absent and
+reported-cost cases, bounded quota snapshots, malformed snapshots,
+reset-window changes, unavailable account-wall evidence, pre-result stream
+ingestion, run-record and Loopyard-compatible stats round trips, phase-aware
 rolling summaries, forecast arithmetic, low-change/high-token detection,
 same-session continuation versus new-session re-review, redaction, and existing
 run-result consumers.

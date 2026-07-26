@@ -1,0 +1,11 @@
+{
+  "type": "rate_limit_event",
+  "timestamp": "2026-07-21T12:00:00Z",
+  "rate_limit_info": {
+    "status": "rejected",
+    "rateLimitType": "five_hour",
+    "resetsAt": 1784660400,
+    "overageStatus": "rejected",
+    "overageDisabledReason": "member_zero_credit_limit"
+  }
+}

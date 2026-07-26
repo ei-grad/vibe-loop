@@ -3292,6 +3292,46 @@ class RunnerTests(unittest.TestCase):
                 log_path.read_text(encoding="utf-8"),
             )
 
+    def test_streaming_command_keeps_rate_limit_event_before_immediate_exit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            event = {
+                "type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "allowed",
+                    "rateLimitType": "five_hour",
+                    "resetsAt": 1784642400,
+                    "overageStatus": "rejected",
+                    "overageDisabledReason": "org_level_disabled",
+                },
+            }
+            script.write_text(
+                f"print({json.dumps(json.dumps(event))})\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                    provider="anthropic",
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        stats = result.usage.to_stats(phase="implementation")
+        self.assertFalse(stats["quota_evidence_available"])
+        self.assertEqual(
+            stats["account_wall_observations"][0]["window"],
+            "five_hour",
+        )
+        self.assertEqual(
+            stats["account_wall_observations"][0]["status"],
+            "allowed",
+        )
+
     def test_streaming_command_captures_startup_model_context(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "cmd.py"

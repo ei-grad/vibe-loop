@@ -1,0 +1,12 @@
+{
+  "type": "rate_limit_event",
+  "timestamp": "2026-07-21T10:00:00Z",
+  "rate_limit_info": {
+    "status": "allowed",
+    "rateLimitType": "PRIVATE COMMAND",
+    "resetsAt": 1784642400,
+    "overageStatus": "credential-value",
+    "overageDisabledReason": "sk-secret-canary"
+  },
+  "raw_payload": "RAW TRANSCRIPT"
+}
