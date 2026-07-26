@@ -15,6 +15,7 @@ from vibe_loop.config import (
     DEFAULT_RUNNABLE_STATUSES,
     TaskSourceConfig,
 )
+from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import (
     fencing_token_value,
     fencing_token_values,
@@ -25,6 +26,7 @@ from vibe_loop.locks import (
 
 
 TASK_SOURCE_ERROR_STREAM_LIMIT = 2000
+TASK_SOURCE_ERROR_LAST_LINE_LIMIT = 500
 TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
 # Names whose *absence* from an adapter invocation is an assertion the runtime
 # makes, not an accident. The session pair says "this run recorded no such
@@ -2534,11 +2536,10 @@ def task_source_error_diagnostics(
 ) -> dict[str, object]:
     """Diagnosable evidence for a failed task-source adapter call.
 
-    Redaction removes fencing tokens and nothing else: an adapter's own refusal
-    text is the only thing that explains why settlement failed, so stripping it
-    would leave `error_class` alone - which is what made the post-result
-    settlement deadlock undiagnosable from the run record. The captured stream
-    is bounded to its tail because adapters put the refusal on the last line.
+    General secret redaction preserves an adapter's refusal text while removing
+    credentials and tokens that must not enter the durable run record. The
+    captured stream is bounded to its tail because adapters put the refusal on
+    the last line.
 
     Two token sources, because a refusal quotes tokens the caller never sent:
     `fencing_token` is the claim this call carried, and `lock_metadata` covers
@@ -2558,11 +2559,16 @@ def task_source_error_diagnostics(
         diagnostics["timeout_seconds"] = float(timeout)
     stderr = decoded_error_stream(getattr(error, "stderr", None))
     if stderr:
-        redacted = redact_fencing_token_diagnostic(stderr, lock_metadata or {})
+        redacted = redact_evidence_text(stderr)
+        redacted = redact_fencing_token_diagnostic(redacted, lock_metadata or {})
         redacted = redact_fencing_token_text(redacted, fencing_token)
         for token in fencing_token_values(lock_metadata or {}):
             redacted = redact_fencing_token_text(redacted, token)
         diagnostics["stderr"] = bounded_error_stream(redacted)
+        diagnostics["stderr_last_line"] = bounded_error_stream(
+            redacted.splitlines()[-1],
+            TASK_SOURCE_ERROR_LAST_LINE_LIMIT,
+        )
     return diagnostics
 
 

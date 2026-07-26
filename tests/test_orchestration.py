@@ -2968,6 +2968,54 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             "done",
         )
 
+    def test_completion_failure_records_bounded_scrubbed_adapter_stderr(
+        self,
+    ) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        secret = "adapter-password"
+        diagnostic = "transition refused because completion evidence is missing"
+        secret_dsn = f"postgres://user:{secret}@database/app"
+        noisy_prefix = "x" * (tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT + 100)
+
+        def refusing_complete(*args: object, **kwargs: object) -> Task:
+            raise subprocess.CalledProcessError(
+                3,
+                "complete",
+                stderr=(f"{noisy_prefix}\n{diagnostic}: {secret_dsn}\n"),
+            )
+
+        source.complete = refusing_complete  # type: ignore[method-assign]
+
+        with self.assertRaises(TaskSourceCompletionError) as raised:
+            self.completer(source).complete()
+
+        self.store.append_result(
+            RunResult(
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="blocked",
+                exit_code=1,
+                log_path=self.repo / "run.log",
+                start_main="a" * 40,
+                end_main="b" * 40,
+                message=str(raised.exception),
+            )
+        )
+        failure = self.store.read_records()[-1]
+        message = str(failure["message"])
+        self.assertIn("CalledProcessError", message)
+        self.assertIn(diagnostic, message)
+        self.assertIn("postgres://user:<redacted>@database/app", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(noisy_prefix, message)
+        self.assertLessEqual(
+            len(message),
+            tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT
+            + tasks_module.TASK_SOURCE_ERROR_LAST_LINE_LIMIT
+            + 250,
+        )
+
     def test_crash_after_external_transition_is_probe_confirmed(self) -> None:
         self.record_integration()
         source = MutableTaskSource("done")
@@ -3123,7 +3171,8 @@ class TaskSourceProvenanceTests(unittest.TestCase):
                 f"task-source-reset {task_id}",
                 stderr=(
                     f'task-source: task "{task_id}" has an unreleased lock; '
-                    f"refusing unfenced reset (token {token})\n"
+                    f"refusing unfenced reset (token {token}); "
+                    "API_KEY=adapter-secret\n"
                 ),
             )
 
@@ -3146,8 +3195,11 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(len(attempted), 1)
         self.assertEqual(attempted[0]["error_class"], "CalledProcessError")
         self.assertEqual(attempted[0]["exit_code"], 3)
-        # The diagnosis survives redaction; only the token is removed.
+        # The diagnosis survives while both runtime and adapter secrets are removed.
         self.assertIn("refusing unfenced reset", attempted[0]["stderr"])
+        self.assertIn("refusing unfenced reset", attempted[0]["stderr_last_line"])
+        self.assertIn("API_KEY=<redacted>", attempted[0]["stderr"])
+        self.assertNotIn("adapter-secret", json.dumps(attempted[0]))
         self.assertNotIn(token, json.dumps(attempted[0]))
         self.assertEqual(attempted[0]["confirmed_status"], "active")
 

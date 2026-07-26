@@ -4160,10 +4160,12 @@ class TaskSourceCompleter:
                     runtime_context=self.runtime_context,
                 )
             except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                diagnostics = self._error_diagnostics(exc)
+                diagnostic_message = self._diagnostic_message(diagnostics)
                 raise self._blocked_error(
                     "completion_adapter_failed",
                     "task_source.complete failed; integrated candidate preserved: "
-                    f"{type(exc).__name__}",
+                    f"{type(exc).__name__}{diagnostic_message}",
                 ) from exc
         if confirmed is None or confirmed.task_id != self.task_id or not confirmed.done:
             code = (
@@ -4222,6 +4224,25 @@ class TaskSourceCompleter:
         }:
             self.stage_machine.fail(StageFailure.BLOCKED, reason=code)
         return TaskSourceCompletionError(code, message)
+
+    def _error_diagnostics(self, error: BaseException) -> dict[str, object]:
+        metadata = getattr(self.task_lock, "metadata", None)
+        return task_source_error_diagnostics(
+            error,
+            fencing_token_value(self.runtime_context.get("VIBE_LOOP_FENCING_TOKEN")),
+            metadata if isinstance(metadata, Mapping) else None,
+        )
+
+    @staticmethod
+    def _diagnostic_message(diagnostics: Mapping[str, object]) -> str:
+        stderr = diagnostics.get("stderr")
+        last_line = diagnostics.get("stderr_last_line")
+        parts: list[str] = []
+        if isinstance(last_line, str) and last_line:
+            parts.append(f"stderr last line: {last_line}")
+        if isinstance(stderr, str) and stderr and stderr != last_line:
+            parts.append(f"stderr tail: {stderr}")
+        return f"; {'; '.join(parts)}" if parts else ""
 
     def _completed_integration(self) -> IntegrationResult | None:
         result = None
