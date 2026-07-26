@@ -1,0 +1,18 @@
+#!/bin/sh
+
+message_file=${1:-}
+source_kind=${2:-}
+
+case "$source_kind" in
+    merge | squash)
+        exit 0
+        ;;
+esac
+
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+hook_path="$repo_root/scripts/hooks/commit-msg"
+if [ -z "$message_file" ] || [ ! -x "$hook_path" ]; then
+    exit 0
+fi
+
+exec "$hook_path" "$message_file"

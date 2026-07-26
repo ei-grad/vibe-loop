@@ -62,6 +62,7 @@ class GitHookTests(unittest.TestCase):
         *,
         environment: dict[str, str],
         filename: str = "tracked.txt",
+        no_verify: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         tracked = self.repo / filename
         tracked.write_text(f"{filename}\n", encoding="utf-8")
@@ -69,15 +70,20 @@ class GitHookTests(unittest.TestCase):
             ["git", "-C", str(self.repo), "add", filename],
             check=True,
         )
+        pre_commit = self.repo / ".git/hooks/pre-commit"
+        pre_commit.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        pre_commit.chmod(0o755)
+        command = [
+            "git",
+            "-C",
+            str(self.repo),
+            "commit",
+        ]
+        if no_verify:
+            command.append("--no-verify")
+        command.extend(["-m", message])
         return subprocess.run(
-            [
-                "git",
-                "-C",
-                str(self.repo),
-                "commit",
-                "-m",
-                message,
-            ],
+            command,
             check=False,
             capture_output=True,
             text=True,
@@ -125,6 +131,24 @@ class GitHookTests(unittest.TestCase):
         self.assertIn("Run-Id: run-7", message)
         self.assertIn("Agent-Kind: codex", message)
         self.assertEqual(self.head_trailers("Plan-Item"), ["TASK-42"])
+
+    def test_no_verify_commit_keeps_worker_provenance(self) -> None:
+        self.assertEqual(self.install_hooks().returncode, 0)
+        commit_msg = self.repo / ".git/hooks/commit-msg"
+        commit_msg.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        commit_msg.chmod(0o755)
+        result = self.commit(
+            "Implement task despite lint failure",
+            environment=self.provenance_environment(
+                VIBE_LOOP_TASK_ID="TASK-77",
+                VIBE_LOOP_RUN_ID="run-8",
+            ),
+            no_verify=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.head_trailers("Plan-Item"), ["TASK-77"])
+        self.assertEqual(self.head_trailers("Run-Id"), ["run-8"])
 
     def test_commit_without_task_context_is_unchanged(self) -> None:
         self.assertEqual(self.install_hooks().returncode, 0)
@@ -191,28 +215,36 @@ class GitHookTests(unittest.TestCase):
         self.assertEqual(self.head_message().count("Plan-Item:"), 2)
         self.assertEqual(self.head_trailers("Plan-Item"), ["TASK-42"])
 
-    def test_merge_message_is_unchanged(self) -> None:
+    def test_merge_and_squash_messages_are_unchanged(self) -> None:
         hook = self.repo / "scripts/hooks/commit-msg"
-        merge_head = self.repo / ".git/MERGE_HEAD"
-        merge_head.write_text("0" * 40 + "\n", encoding="utf-8")
         environment = self.provenance_environment(VIBE_LOOP_TASK_ID="TASK-42")
-        message_file = self.repo / "merge.message"
-        message_file.write_text("Existing message\n", encoding="utf-8")
 
-        result = subprocess.run(
-            [str(hook), str(message_file)],
-            cwd=self.repo,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=environment,
-        )
+        for state_file, state_contents in (
+            ("MERGE_HEAD", "0" * 40 + "\n"),
+            ("SQUASH_MSG", "Squashed commit message\n"),
+        ):
+            with self.subTest(state_file=state_file):
+                state_path = self.repo / ".git" / state_file
+                state_path.write_text(state_contents, encoding="utf-8")
+                self.addCleanup(state_path.unlink, missing_ok=True)
+                message_file = self.repo / f"{state_file}.message"
+                message_file.write_text("Existing message\n", encoding="utf-8")
 
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            message_file.read_text(encoding="utf-8"),
-            "Existing message\n",
-        )
+                result = subprocess.run(
+                    [str(hook), str(message_file)],
+                    cwd=self.repo,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=environment,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    message_file.read_text(encoding="utf-8"),
+                    "Existing message\n",
+                )
+                state_path.unlink()
 
     def test_hook_failure_does_not_block_commit_message(self) -> None:
         hook = self.repo / "scripts/hooks/commit-msg"
@@ -282,7 +314,7 @@ class GitHookTests(unittest.TestCase):
         self.assertTrue((hooks_dir / "pre-commit").is_file())
         self.assertTrue((hooks_dir / "pre-push").is_file())
 
-    def test_installer_removes_obsolete_managed_prepare_commit_msg(self) -> None:
+    def test_installer_updates_managed_prepare_commit_msg(self) -> None:
         hooks_dir = self.repo / ".git/hooks"
         legacy_hook = hooks_dir / "prepare-commit-msg"
         legacy_hook.write_text(
@@ -293,7 +325,11 @@ class GitHookTests(unittest.TestCase):
         result = self.install_hooks()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertFalse(legacy_hook.exists())
+        self.assertTrue(legacy_hook.exists())
+        self.assertIn(
+            "scripts/hooks/prepare-commit-msg",
+            legacy_hook.read_text(encoding="utf-8"),
+        )
         self.assertTrue((hooks_dir / "commit-msg").is_file())
 
 

@@ -11,6 +11,11 @@ if [ -n "$merge_head" ] && [ -f "$merge_head" ]; then
     exit 0
 fi
 
+squash_message=$(git rev-parse --git-path SQUASH_MSG 2>/dev/null || true)
+if [ -n "$squash_message" ] && [ -f "$squash_message" ]; then
+    exit 0
+fi
+
 if git interpret-trailers --parse "$message_file" 2>/dev/null |
     grep -qiE '^Plan-Item:'; then
     exit 0

@@ -34,29 +34,26 @@ release-gate:
 install-hooks:
 	@hooks_dir="$$(git rev-parse --git-common-dir)/hooks"; \
 	mkdir -p "$$hooks_dir"; \
-	legacy_hook="$$hooks_dir/prepare-commit-msg"; \
-	for hook in pre-commit pre-push commit-msg; do \
+	for hook in pre-commit pre-push prepare-commit-msg commit-msg; do \
 	  hook_path="$$hooks_dir/$$hook"; \
 	  if [ -f "$$hook_path" ] && ! grep -q "scripts/hooks/$$hook" "$$hook_path"; then \
-	    if [ "$$hook" = commit-msg ] && [ -x "$$hook_path" ] && grep -q 'VIBE_LOOP_TASK_ID' "$$hook_path" && grep -q 'Plan-Item:' "$$hook_path" && grep -q 'interpret-trailers' "$$hook_path"; then \
-	      echo "$$hook_path is a compatible unmanaged provenance hook; keeping it"; \
-	      continue; \
+	    if [ "$$hook" = prepare-commit-msg ] || [ "$$hook" = commit-msg ]; then \
+	      if [ -x "$$hook_path" ] && grep -q 'VIBE_LOOP_TASK_ID' "$$hook_path" && grep -q 'Plan-Item:' "$$hook_path" && grep -q 'interpret-trailers' "$$hook_path"; then \
+	        echo "$$hook_path is a compatible unmanaged provenance hook; keeping it"; \
+	        continue; \
+	      fi; \
 	    fi; \
 	    echo "$$hook_path already exists and is not managed by this repo; move or remove it, then rerun make install-hooks" >&2; \
 	    exit 1; \
 	  fi; \
-	  if [ "$$hook" = commit-msg ]; then \
+	  if [ "$$hook" = prepare-commit-msg ] || [ "$$hook" = commit-msg ]; then \
 	    printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' "hook_path=\"\$$repo_root/scripts/hooks/$$hook\"" '[ -x "$$hook_path" ] || exit 0' 'exec "$$hook_path" "$$@"' > "$$hook_path"; \
 	  else \
 	    printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' "exec \"\$$repo_root/scripts/hooks/$$hook\" \"\$$@\"" > "$$hook_path"; \
 	  fi; \
 	  chmod +x "$$hook_path"; \
 	  echo "installed $$hook_path"; \
-	done; \
-	if [ -f "$$legacy_hook" ] && grep -q 'scripts/hooks/prepare-commit-msg' "$$legacy_hook"; then \
-	  rm "$$legacy_hook"; \
-	  echo "removed obsolete managed $$legacy_hook"; \
-	fi
+	done
 
 version-check:
 	@version="$(VERSION)"; \
