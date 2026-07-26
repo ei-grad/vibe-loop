@@ -24,6 +24,7 @@ from vibe_loop.autopilot import (
     ProjectStatus,
     collect_project_status,
     collect_registry_status,
+    collect_supervisor_status,
     cycle_schedule_deadline,
     load_registry_entry_config,
     default_registry_path,
@@ -892,6 +893,11 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--reload-config-jobs",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
         "--interval",
         type=autopilot_interval,
         default=None,
@@ -1114,11 +1120,30 @@ def dispatch(args: argparse.Namespace) -> int:
         }
         if stale:
             stale_report["next_command"] = "vibe-loop workers clean --force"
+        supervisor = collect_supervisor_status(
+            runner.run_store,
+            supervisor_lock=runner.lock_manager.autopilot_status(),
+            current_config=config,
+        )
+        config_report = config.config_report()
+        config_report.update(
+            {
+                "fingerprint": config.config_digest,
+                "perspective": "file_as_loaded_now",
+            }
+        )
+        if supervisor.advisories:
+            config_report["note"] = (
+                "this config block reports the file as it would be loaded now, "
+                "not the configuration used by the running supervisor"
+            )
         print(
             json.dumps(
                 {
                     "repo": str(config.repo),
-                    "config": config.config_report(),
+                    "config": config_report,
+                    "supervisor_config": supervisor.config,
+                    "advisories": [dict(item) for item in supervisor.advisories],
                     "main_branch": config.main_branch,
                     "state_dir": config.state_dir,
                     "task_source": redacted_task_source_config(config.task_source),
@@ -1502,6 +1527,10 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         return result.exit_code
     if command in (None, "run", "start"):
         ap = config.autopilot
+        jobs_from_config = getattr(args, "jobs", None) is None
+        reload_config_jobs = bool(
+            getattr(args, "reload_config_jobs", False) or jobs_from_config
+        )
         worktree_disposition = getattr(args, "worktree_disposition", None)
         if worktree_disposition is not None:
             ap = dataclasses.replace(
@@ -1520,6 +1549,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             launch = start_detached_autopilot(
                 config,
                 jobs=jobs,
+                reload_config_jobs=reload_config_jobs,
                 interval=interval,
                 once=getattr(args, "once", False),
                 max_cycles=getattr(args, "max_cycles", 0),
@@ -1537,6 +1567,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
         summary = run_autopilot(
             config,
             jobs=jobs,
+            reload_config_jobs=reload_config_jobs,
             interval=interval,
             once=getattr(args, "once", False),
             max_cycles=getattr(args, "max_cycles", 0),
@@ -1629,6 +1660,12 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if supervisor.pid:
         supervisor_line += f" pid={supervisor.pid}"
     lines.append(supervisor_line)
+    if supervisor.config:
+        lines.append(
+            "supervisor config: "
+            f"{supervisor.config['loaded_fingerprint']} "
+            f"loaded {supervisor.config['loaded_at']}"
+        )
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
     if supervisor.log is not None:
         lines.append(f"log: {supervisor.log}")
@@ -1645,6 +1682,11 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         lines.extend(f"  - {observation}" for observation in status.observations)
     else:
         lines.append("blockers: none")
+    if status.advisories:
+        lines.append("advisories:")
+        for advisory in status.advisories:
+            changed_keys = ", ".join(advisory.get("changed_keys", []))
+            lines.append(f"  - {advisory['code']}: {changed_keys}")
     if status.last_cycle is not None:
         cycle = status.last_cycle
         lines.append(

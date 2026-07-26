@@ -296,7 +296,8 @@ attempt suppression.
 `[autopilot]` controls worker count, cycle interval, ready-queue floor, planning
 poll/backoff limits, repository cleanliness, worktree disposition, disk reserve,
 and optional maintenance commands. Generated profiles cannot introduce those
-commands.
+commands. Configuration reload and supervisor/run pinning are defined by
+[Supervisor Configuration Lifetime](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime).
 
 `[project_binding]` and `[project_binding.context]` bind command adapters to an
 explicit project namespace; their operator contract remains in

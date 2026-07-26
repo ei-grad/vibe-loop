@@ -83,6 +83,7 @@ from vibe_loop.autopilot import (
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
+    reload_autopilot_cycle_config,
     run_autopilot,
     run_maintenance_command,
     launch_native_planning_worker,
@@ -1150,6 +1151,145 @@ class AutopilotRunTests(unittest.TestCase):
                 for record in policy_records
             )
         )
+
+    def test_running_supervisor_reports_changed_config_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            observed = None
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal observed
+                config_path = repo / ".vibe-loop.toml"
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace(
+                        "jobs = 1", "jobs = 3"
+                    ),
+                    encoding="utf-8",
+                )
+                observed = collect_project_status(load_config(repo))
+                return 0
+
+            run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertIsNotNone(observed)
+        supervisor = observed.supervisor
+        self.assertTrue(supervisor.config["stale"])
+        self.assertEqual(supervisor.config["changed_keys"], ["autopilot.jobs"])
+        self.assertEqual(supervisor.config["per_cycle_keys"], ["autopilot.jobs"])
+        self.assertEqual(supervisor.config["restart_required_keys"], [])
+        self.assertEqual(supervisor.advisories[0]["code"], "supervisor_config_stale")
+        self.assertNotIn(
+            "config_key_fingerprints",
+            supervisor.to_json()["record"],
+        )
+
+    def test_configured_jobs_reload_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            def reconfiguring_launcher(command, **kwargs):
+                result = launcher(command, **kwargs)
+                if len(calls) == 1:
+                    config_path = repo / ".vibe-loop.toml"
+                    config_path.write_text(
+                        config_path.read_text(encoding="utf-8").replace(
+                            "jobs = 1", "jobs = 3"
+                        ),
+                        encoding="utf-8",
+                    )
+                return result
+
+            run_autopilot(
+                config,
+                max_cycles=2,
+                interval=60,
+                reload_config_jobs=True,
+                launcher=reconfiguring_launcher,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        first = calls[0]["command"]
+        second = calls[1]["command"]
+        self.assertEqual(first[first.index("--jobs") + 1], "1")
+        self.assertEqual(second[second.index("--jobs") + 1], "3")
+
+    def test_explicit_jobs_remain_pinned_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            def reconfiguring_launcher(command, **kwargs):
+                result = launcher(command, **kwargs)
+                if len(calls) == 1:
+                    config_path = repo / ".vibe-loop.toml"
+                    config_path.write_text(
+                        config_path.read_text(encoding="utf-8").replace(
+                            "jobs = 1", "jobs = 3"
+                        ),
+                        encoding="utf-8",
+                    )
+                return result
+
+            run_autopilot(
+                config,
+                jobs=2,
+                max_cycles=2,
+                interval=60,
+                launcher=reconfiguring_launcher,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            command = call["command"]
+            self.assertEqual(command[command.index("--jobs") + 1], "2")
+
+    def test_agent_routing_reloads_for_the_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    '[agent.profiles.first]\nkind = "codex"\n'
+                    '[agent.profiles.second]\nkind = "codex"\n'
+                    '[[agent.routing]]\nprofile = "first"\n'
+                    'match_hazards_any = ["security"]\n'
+                ),
+            )
+            config = load_config(repo)
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    'profile = "first"', 'profile = "second"'
+                ),
+                encoding="utf-8",
+            )
+
+            current = reload_autopilot_cycle_config(config)
+
+        self.assertEqual(config.agent_routing[0].profile, "first")
+        self.assertEqual(current.agent_routing[0].profile, "second")
 
     def test_heartbeats_supervisor_lock_during_long_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

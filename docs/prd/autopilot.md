@@ -59,6 +59,39 @@ repo, queue, supervisor state, blockers or actions, log path, and next wake.
 
 Related implementation IDs: `AUTO-02`, `AUTO-03`.
 
+## PRD-AUT-002b Supervisor Configuration Lifetime
+
+The supervisor has three explicit configuration lifetimes:
+
+- `agent`, `agent.profiles`, `agent.routing`, and file-backed
+  `autopilot.jobs` are re-read before each cycle. A dispatched run pins that
+  cycle's resolved agent configuration and worker count for the lifetime of
+  the run.
+- An explicit CLI `--jobs` value is pinned at supervisor start and continues to
+  override the file.
+- Every other setting is pinned at supervisor start. This includes
+  `main_branch`, `state_dir`, task-source and completion configuration,
+  orchestration, supervision, locks, project binding, specs, budgets, and all
+  other autopilot scheduling, maintenance, and recovery settings. Changing one
+  of these requires a supervisor restart.
+
+The `autopilot_supervisor_started` record must include the loaded configuration
+fingerprint and load time. `autopilot status --json` reports those values and
+the current file fingerprint. While that supervisor is running, a mismatch
+produces a typed `supervisor_config_stale` advisory naming changed keys and
+separating per-cycle keys from restart-required keys. The per-key comparison
+material is internal journal data and must not appear in status output.
+
+`vibe-loop doctor` always describes the configuration file as it would be
+loaded at command invocation. When it differs from a running supervisor,
+doctor must include the same advisory and the running supervisor's load
+metadata so the two perspectives cannot be confused.
+
+Acceptance must cover a file change under a running supervisor, status and
+doctor advisories naming the changed keys, redaction of internal comparison
+data, file-backed jobs taking effect on the next cycle, and explicit CLI jobs
+remaining pinned.
+
 ## PRD-AUT-003 Append-Only Cycle Records
 
 Autopilot state must be recorded through additive records in the target
