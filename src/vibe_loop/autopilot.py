@@ -6280,6 +6280,17 @@ def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
     return result.status == "idle"
 
 
+def cycle_should_poll_task_source(result: AutopilotCycleResult) -> bool:
+    """Whether a cycle wait should wake on a material task-source change.
+
+    Idle cycles also wake when enough runnable work appears. Restartable cycles
+    use the same bounded polling machinery but wake only when the source
+    fingerprint changes, so an unchanged failed task cannot shorten its own
+    retry cooldown.
+    """
+    return result.status in {"idle", "restartable"}
+
+
 def recheck_sleep_slices(interval: float, recheck_seconds: float) -> Iterator[float]:
     """Partition ``interval`` into poll slices of at most ``recheck_seconds``.
 
@@ -6533,6 +6544,7 @@ def wait_for_idle_change(
     monotonic: Callable[[], float] | None = None,
     active_runs: tuple[ActiveRunState, ...] = (),
     baseline_fingerprint: str = "",
+    wake_on_runnable: bool = True,
 ) -> IdleWaitResult:
     """Wait for idle work with a trusted wake adapter and adaptive fallback."""
     threshold = require_positive_min_ready(min_ready)
@@ -6651,7 +6663,9 @@ def wait_for_idle_change(
             _record_bounded_error(source_errors, source_error)
         if clock() >= deadline_at:
             break
-        if not source_error and (runnable >= threshold or source_changed):
+        if not source_error and (
+            (wake_on_runnable and runnable >= threshold) or source_changed
+        ):
             return IdleWaitResult(
                 cycle_id=cycle_id,
                 wake_reason="task_change",
@@ -7205,6 +7219,7 @@ def run_autopilot(
                     ),
                 )
             idle_wait_seconds = interval
+            poll_task_source = cycle_should_poll_task_source(result)
             if (
                 not bounded_last
                 and interval > 0
@@ -7223,13 +7238,17 @@ def run_autopilot(
                 ):
                     idle_wait_seconds = planning_backoff_seconds
             post_cycle_planning_delay: float | None = None
+            post_cycle_queue: TaskQueueStatus | None = None
             if (
                 not bounded_last
                 and interval > 0
                 and "launched_run_until_done" in result.actions
                 and result.limit_wall_pause_seconds is None
             ):
-                post_cycle_runnable = poll_runnable_count(config)
+                post_cycle_queue = collect_task_queue_status(config)
+                post_cycle_runnable = (
+                    0 if post_cycle_queue.source_error else post_cycle_queue.runnable
+                )
                 threshold = min_ready
                 post_cycle_action = (
                     f"post_cycle_runnable:{post_cycle_runnable}/{threshold}"
@@ -7303,7 +7322,10 @@ def run_autopilot(
                 assert scheduled_wait_seconds is not None
                 # Persistent watch: keep cycling and sleeping until a bound or
                 # signal stops the loop, even across idle or blocked cycles.
-                if cycle_should_recheck(result):
+                poll_during_wait = poll_task_source and (
+                    cycle_should_recheck(result) or post_cycle_planning_delay is None
+                )
+                if poll_during_wait:
                     wake_adapter_callback: IdleWakeAdapter | None = None
                     idle_wake_command = config.autopilot.idle_wake_command
                     if idle_wake_command is not None:
@@ -7322,7 +7344,7 @@ def run_autopilot(
 
                         wake_adapter_callback = _wake_adapter
 
-                    if idle_wait_seconds > interval:
+                    if cycle_should_recheck(result) and idle_wait_seconds > interval:
                         print(
                             "[vibe-loop] autopilot planning backoff: withholding "
                             f"planning for {idle_wait_seconds:.0f}s after "
@@ -7330,6 +7352,17 @@ def run_autopilot(
                             "wakes the next cycle early",
                             flush=True,
                         )
+                    baseline_queue = (
+                        post_cycle_queue
+                        if result.status == "restartable"
+                        and post_cycle_queue is not None
+                        else result.project_status.queue
+                    )
+                    baseline_fingerprint = (
+                        ""
+                        if baseline_queue.source_error
+                        else planning_source_fingerprint(baseline_queue)
+                    )
                     wait_result = idle_waiter(
                         config,
                         cycle_id=result.cycle_id,
@@ -7349,9 +7382,8 @@ def run_autopilot(
                             for worker in result.project_status.workers
                             if worker_holds_active_conflict(worker)
                         ),
-                        baseline_fingerprint=planning_source_fingerprint(
-                            result.project_status.queue
-                        ),
+                        baseline_fingerprint=baseline_fingerprint,
+                        wake_on_runnable=cycle_should_recheck(result),
                     )
                     run_store.append_record(wait_result.to_record(config.repo))
                     if wait_result.wake_reason == "task_change":

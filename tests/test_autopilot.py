@@ -78,6 +78,7 @@ from vibe_loop.autopilot import (
     collect_task_queue_status,
     collect_supervisor_status,
     cycle_schedule_deadline,
+    cycle_should_poll_task_source,
     cycle_should_recheck,
     IdleWakeAdapterError,
     limit_wall_pause_seconds,
@@ -5094,6 +5095,186 @@ class AutopilotRecheckTests(unittest.TestCase):
             "blocked",
         ):
             self.assertFalse(cycle_should_recheck(result(status)))
+
+    def test_task_source_polling_includes_restartable_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+            project_status = collect_project_status(load_config(repo))
+
+        def result(status: str) -> AutopilotCycleResult:
+            return AutopilotCycleResult(
+                cycle_id="c1",
+                repo=Path("/tmp"),
+                status=status,
+                occurred_at="",
+                project_status=project_status,
+            )
+
+        for status in ("idle", "restartable"):
+            self.assertTrue(cycle_should_poll_task_source(result(status)))
+        for status in ("completed", "terminated", "observing", "blocked"):
+            self.assertFalse(cycle_should_poll_task_source(result(status)))
+
+    def test_restartable_backoff_wakes_only_after_source_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "initial route")],
+                extra_toml=(
+                    "[autopilot]\n"
+                    "planning_recheck_seconds = 10.0\n"
+                    "require_clean_repo = false\n"
+                ),
+            )
+            config = load_config(repo)
+            launcher_calls = 0
+            sleeps: list[float] = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal launcher_calls
+                launcher_calls += 1
+                if on_start is not None:
+                    on_start(4242)
+                return 1 if launcher_calls == 1 else 0
+
+            def sleeper(seconds: float) -> None:
+                sleeps.append(seconds)
+                if len(sleeps) == 2:
+                    write_plan(
+                        repo,
+                        [("TASK-01", "Next", "", "eligible authority route")],
+                    )
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeper,
+            )
+
+        self.assertEqual(
+            [cycle.status for cycle in summary.cycles],
+            ["restartable", "completed"],
+        )
+        self.assertEqual(sleeps, [10.0, 20.0])
+        self.assertEqual(launcher_calls, 2)
+
+    def test_unchanged_restartable_source_sleeps_to_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "unchanged route")],
+                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+            )
+            config = load_config(repo)
+            launcher_calls = 0
+            sleeps: list[float] = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal launcher_calls
+                launcher_calls += 1
+                if on_start is not None:
+                    on_start(4242)
+                return 1
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=100.0,
+                launcher=launcher,
+                sleep=sleeps.append,
+            )
+
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
+        self.assertEqual(launcher_calls, 2)
+        self.assertEqual(
+            [cycle.status for cycle in summary.cycles],
+            ["restartable", "restartable"],
+        )
+
+    def test_stop_interrupts_restartable_polling_and_releases_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "unchanged route")],
+                extra_toml="[autopilot]\nplanning_recheck_seconds = 10.0\n",
+            )
+            config = load_config(repo)
+            stop_requested = False
+            sleeps: list[float] = []
+
+            def sleeper(seconds: float) -> None:
+                nonlocal stop_requested
+                sleeps.append(seconds)
+                stop_requested = True
+
+            summary = run_autopilot(
+                config,
+                interval=100.0,
+                launcher=lambda *args, **kwargs: 1,
+                sleep=sleeper,
+                should_stop=lambda: stop_requested,
+            )
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            lock_after = manager.status(AUTOPILOT_LOCK_NAME)
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
+
+        self.assertEqual(len(summary.cycles), 1)
+        self.assertEqual(summary.cycles[0].status, "restartable")
+        self.assertEqual(sleeps, [10.0])
+        self.assertIsNone(lock_after)
+        wait_record = next(
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_IDLE_WAIT_RECORD_TYPE
+        )
+        self.assertEqual(wait_record["wake_reason"], "stopped")
+        stopped_record = next(
+            record
+            for record in records
+            if record.get("record_type") == AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE
+        )
+        self.assertTrue(stopped_record["lock_released"])
+
+    def test_restartable_deadline_is_anchored_after_failed_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
+            config = load_config(repo)
+            wait_started: list[datetime.datetime] = []
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                if on_start is not None:
+                    on_start(4242)
+                time.sleep(0.05)
+                return 1
+
+            def sleeper(_seconds: float) -> None:
+                wait_started.append(datetime.datetime.now(datetime.UTC))
+
+            summary = run_autopilot(
+                config,
+                max_cycles=2,
+                interval=60.0,
+                launcher=launcher,
+                sleep=sleeper,
+            )
+
+        first = summary.cycles[0]
+        self.assertEqual(first.status, "restartable")
+        self.assertGreater(
+            datetime.datetime.fromisoformat(first.next_wake),
+            wait_started[0] + datetime.timedelta(seconds=59.0),
+        )
 
     def test_idle_planning_cycle_rechecks_and_wakes_early(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
