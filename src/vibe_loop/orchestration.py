@@ -3374,6 +3374,9 @@ class Integrator:
         executor: GateExecutor = subprocess.run,
         stage_machine: RunLifecycleStateMachine | None = None,
         conflict_resolver: Callable[[tuple[str, ...], str], None] | None = None,
+        completion_fence: (
+            Callable[[IntegrationResult], Mapping[str, object] | None] | None
+        ) = None,
     ) -> None:
         if max_lock_attempts < 1:
             raise ValueError("max_lock_attempts must be positive")
@@ -3395,6 +3398,8 @@ class Integrator:
         self.executor = executor
         self.stage_machine = stage_machine
         self.conflict_resolver = conflict_resolver
+        self.completion_fence = completion_fence
+        self._retain_integration_lock = False
 
     def run(self) -> IntegrationResult:
         prior = self._prior_result()
@@ -3472,19 +3477,20 @@ class Integrator:
                 return self._record_preflight_failure(post_acquire_preflight)
             return self._run_locked(recovered_lock=recovered_lock)
         finally:
-            fencing_token = lock_status.status.metadata.get("fencing_token")
-            released = self.lock_manager.release_main_integration(
-                task_id=self.task_id,
-                run_id=self.run_id,
-                fencing_token=(
-                    fencing_token if isinstance(fencing_token, str) else None
-                ),
-            )
-            if released:
-                self._record_lock_event(
-                    "lock_released",
-                    lock_status.status.path,
+            if not self._retain_integration_lock:
+                fencing_token = lock_status.status.metadata.get("fencing_token")
+                released = self.lock_manager.release_main_integration(
+                    task_id=self.task_id,
+                    run_id=self.run_id,
+                    fencing_token=(
+                        fencing_token if isinstance(fencing_token, str) else None
+                    ),
                 )
+                if released:
+                    self._record_lock_event(
+                        "lock_released",
+                        lock_status.status.path,
+                    )
 
     def _run_locked(self, *, recovered_lock: bool) -> IntegrationResult:
         main_before = self._rev_parse(self.repo, self.main_branch)
@@ -3585,7 +3591,7 @@ class Integrator:
                     verification=checks,
                     recovered=recovered_lock,
                 )
-            return self._record_result(
+            return self._record_completed_result(
                 IntegrationResult(
                     outcome="branch_already_merged",
                     status="completed",
@@ -3707,7 +3713,7 @@ class Integrator:
                 verification=checks,
                 recovered=recovered_lock,
             )
-        return self._record_result(
+        return self._record_completed_result(
             IntegrationResult(
                 outcome="merged",
                 status="completed",
@@ -3721,6 +3727,32 @@ class Integrator:
                 recovered=recovered_lock,
                 diagnostics=resolution_diagnostics,
             )
+        )
+
+    def _record_completed_result(
+        self,
+        result: IntegrationResult,
+        *,
+        provenance_outcome: str | None = None,
+    ) -> IntegrationResult:
+        blocker = self.completion_fence(result) if self.completion_fence else None
+        if blocker is None:
+            return self._record_result(
+                result,
+                provenance_outcome=(
+                    provenance_outcome or integration_provenance_outcome(result)
+                ),
+            )
+        self._retain_integration_lock = True
+        return self._record_failure(
+            str(blocker.get("code") or "completion_fence_blocked"),
+            status="blocked",
+            main_before=result.main_before,
+            main_after=result.main_after,
+            refreshed_head=result.refreshed_head,
+            verification=result.verification,
+            diagnostics={"completion_fence": dict(blocker)},
+            recovered=result.recovered,
         )
 
     def _can_resume_conflict(self, preflight: Mapping[str, object]) -> bool:
@@ -4049,8 +4081,10 @@ class Integrator:
         )
 
     def _prior_result_is_reusable(self, result: IntegrationResult) -> bool:
-        return result.reason != "lock_timeout" and self._prior_result_is_consistent(
-            result
+        return (
+            result.reason != "lock_timeout"
+            and "completion_fence" not in result.diagnostics
+            and self._prior_result_is_consistent(result)
         )
 
     def _release_recovered_lock(self) -> None:

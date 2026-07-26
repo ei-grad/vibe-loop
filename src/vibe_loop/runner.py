@@ -168,6 +168,7 @@ from vibe_loop.tasks import (
     build_task_source,
     runnable_tasks_from_snapshot,
 )
+from vibe_loop.upstream import check_upstream_sync
 from vibe_loop.workers import (
     ActiveRunState,
     WorkerView,
@@ -3128,6 +3129,44 @@ class VibeRunner:
             ):
                 message = classification.detail
             end_main = git_rev_parse(self.config.repo, "HEAD")
+            if (
+                classification.status == "completed"
+                and self.config.autopilot.require_upstream_sync
+            ):
+                reviewed_commit = (
+                    worker_report.commit
+                    if worker_report is not None and worker_report.commit
+                    else end_main
+                )
+                unmet_prerequisite = ""
+                if not runtime_owned:
+                    try:
+                        completion_task = self.source.probe(task.task_id)
+                    except (OSError, subprocess.SubprocessError, ValueError):
+                        unmet_prerequisite = "task_source_probe"
+                    else:
+                        if completion_task is None or not completion_task.done:
+                            unmet_prerequisite = "task_source_completion"
+                upstream = check_upstream_sync(
+                    self.config.repo,
+                    self.config.main_branch,
+                    required=True,
+                    reviewed_commit=reviewed_commit or "",
+                    require_reviewed_commit=True,
+                    refresh=True,
+                    unmet_prerequisite=unmet_prerequisite,
+                )
+                if not upstream.satisfied:
+                    assert upstream.blocker is not None
+                    classification = ClassificationResult(
+                        "blocked",
+                        upstream.blocker.code,
+                        detail=json.dumps(
+                            upstream.blocker.to_json(),
+                            sort_keys=True,
+                        ),
+                    )
+                    message = classification.detail
             if runtime_owned and classification.status == "completed":
                 stage_machine = RunLifecycleStateMachine.from_records(
                     [
@@ -3761,6 +3800,19 @@ class VibeRunner:
                 candidate=gate_summary.candidate,
             )
 
+        def integration_completion_fence(
+            result: IntegrationResult,
+        ) -> Mapping[str, object] | None:
+            upstream = check_upstream_sync(
+                self.config.repo,
+                self.config.main_branch,
+                required=self.config.autopilot.require_upstream_sync,
+                reviewed_commit=result.candidate_head,
+                require_reviewed_commit=True,
+                refresh=True,
+            )
+            return upstream.blocker.to_json() if upstream.blocker else None
+
         integration_result = Integrator(
             repo=self.config.repo,
             main_branch=self.config.main_branch,
@@ -3786,6 +3838,7 @@ class VibeRunner:
             max_lock_attempts=2,
             stage_machine=stage_machine,
             conflict_resolver=resolve_integration_conflict,
+            completion_fence=integration_completion_fence,
         ).run()
         if not integration_result.completed:
             resolution_attempted = bool(

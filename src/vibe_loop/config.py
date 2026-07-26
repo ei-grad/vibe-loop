@@ -233,6 +233,7 @@ AUTOPILOT_CONFIG_KEYS = (
             "interval_seconds",
             "min_ready",
             "require_clean_repo",
+            "require_upstream_sync",
             "planning_recheck_seconds",
             "idle_poll_max_seconds",
             "planning_backoff_seconds",
@@ -993,6 +994,7 @@ class AutopilotConfig:
     interval_seconds: float | None = None
     min_ready: int | None = None
     require_clean_repo: bool = True
+    require_upstream_sync: bool = False
     planning_recheck_seconds: float = 60.0
     idle_poll_max_seconds: float = 600.0
     planning_backoff_seconds: float = AUTOPILOT_DEFAULT_PLANNING_BACKOFF_SECONDS
@@ -1028,6 +1030,7 @@ class AutopilotConfig:
             "interval_seconds": self.interval_seconds,
             "min_ready": self.min_ready,
             "require_clean_repo": self.require_clean_repo,
+            "require_upstream_sync": self.require_upstream_sync,
             "planning_recheck_seconds": self.planning_recheck_seconds,
             "idle_poll_max_seconds": self.idle_poll_max_seconds,
             "planning_backoff_seconds": self.planning_backoff_seconds,
@@ -2751,6 +2754,11 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             table.get("require_clean_repo"),
             True,
             "autopilot.require_clean_repo",
+        ),
+        require_upstream_sync=optional_bool(
+            table.get("require_upstream_sync"),
+            False,
+            "autopilot.require_upstream_sync",
         ),
         worktree_disposition=worktree_disposition,
         health_command=optional_nonempty_string(table.get("health_command")),

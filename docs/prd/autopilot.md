@@ -1012,6 +1012,34 @@ delivery, schema validation, deadline preservation, adaptive fallback polling,
 bounded error provenance, and unchanged clock/task-source behavior when no wake
 adapter is configured.
 
+## PRD-AUT-015a Upstream-Synchronized Autonomous Completion
+
+Repositories may opt into `[autopilot].require_upstream_sync`. When enabled,
+autonomous completion and main-integration lock release require a successful
+fresh fetch of the configured main branch's tracking remote, equality between
+local main and that upstream ref, and containment of the reviewed candidate in
+the upstream ref. The runtime never pushes, stores a remote URL, or stores
+credential or command payloads.
+
+The check reports a bounded typed blocker containing the Git relation, ahead
+and behind counts, reviewed-commit containment, freshness, and the unmet
+lifecycle prerequisite. Missing upstream configuration, fetch failure, stale
+local-only observations, ahead, behind, and divergence remain distinct
+outcomes. With the policy disabled, existing local-completion behavior is
+unchanged.
+
+The runtime evaluates this fence before recording successful integration
+provenance or releasing the main-integration lock. A failed fence records a
+blocked integration result and preserves the lock and workspace. That blocked
+result is not reusable as successful integration; after an operator separately
+synchronizes the upstream and settles configured provenance and task state, a
+fresh retry must re-evaluate the fence before it may release or dispatch again.
+
+Autopilot must also refuse unrelated dispatch while the authoritative task
+source contains an active task with no corresponding task lock and no durable
+terminal run classification. Selection resumes only after both that lifecycle
+state and the upstream fence are settled.
+
 ## PRD-AUT-016 Provider Usage Run Telemetry
 
 Worker and native-planning results record provider-reported usage without
