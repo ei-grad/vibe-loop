@@ -305,8 +305,21 @@ policy above the scheduler. In runtime-owned mode the generated worker prompt
 must describe only the implementation stage and the fenced commands available
 to the worker, not lifecycle steps the runtime owns.
 
-Acceptance must cover scheduler behavior parity in both modes, prompt-content
-assertions for runtime-owned mode, and unchanged autopilot boundaries.
+Agent-assisted selection receives only mechanically safe candidates plus
+bounded recent run evidence. The scheduler validates returned task ids, rejects
+duplicates and candidates that are unknown, locked, or in an overlapping
+declared conflict domain, and falls back to deterministic ready order.
+`run-next` dispatches one worker. `run-until-done` is serial by default and
+`--jobs N` bounds concurrent implementations. Its independent dispatch budget
+(`--max-slices`) counts every attempt, while its completion budget
+(`--max-tasks`) counts only completed results; parallel dispatch may not
+overshoot the remaining completion budget.
+
+Acceptance must cover scheduler behavior parity in both modes, safe
+agent-selection validation and deterministic fallback, conflict-domain
+exclusion, serial and parallel dispatch, independent attempt/completion limits
+without overshoot, prompt-content assertions for runtime-owned mode, and
+unchanged autopilot boundaries.
 
 Related implementation IDs: `ORC-10` (`orc-scheduler-separation`).
 

@@ -21,6 +21,9 @@ requirement IDs for review and future traceability.
 - The operator-facing option index lives in the
   [configuration reference](../configuration.md); links from that reference to
   PRD sections identify which contract owns each configuration family.
+- Operator-facing command syntax lives in the
+  [CLI reference](../cli-reference.md); linked PRD sections remain authoritative
+  for command behavior and lifecycle contracts.
 
 ## ID Rules
 

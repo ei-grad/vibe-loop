@@ -6,6 +6,7 @@ component contracts.
 
 ## Operator references
 
+- [CLI reference](cli-reference.md)
 - [Configuration reference](configuration.md)
 - [Generated task discovery](generated-task-discovery.md)
 - [Parallel worker orchestration](parallel-worker-orchestration.md)

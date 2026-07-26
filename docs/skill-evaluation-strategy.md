@@ -277,10 +277,14 @@ the bundled skills.
 ## Release Readiness Gate
 
 Bundled skill changes should pass `vibe-loop eval release-gate` before
-publishing. The gate runs the local demo suite with 3 trials per case and
-condition by default, then emits a `skill_release_readiness` record. That record
-links to the aggregate, records local-suite coverage, lists workflow-contract
-regressions, and stores optional external benchmark smoke summaries.
+publishing. The current gate runs one trial for each of 20 required
+case/condition matrix entries by default, then emits a
+`skill_release_readiness` record. The matrix covers table and generated
+discovery, explicit-list and spec-driven profiles, command-backed task and lock
+adapters, runtime-owned orchestration, review remediation, worktree safety, and
+integration failure paths. The record links to the aggregate, records
+local-suite coverage, lists workflow-contract regressions, and stores optional
+external benchmark smoke summaries.
 
 The blocking threshold is intentionally narrow for the first release gate:
 incomplete local-demo coverage or unresolved `workflow_contract_regression`
@@ -295,6 +299,29 @@ readiness record and any parked task ids.
 External benchmark smoke results are optional context. They must not replace the
 local release gate, and missing external results do not block ordinary bundled
 skill changes.
+
+## Command Entry Points
+
+`vibe-loop eval local-demo` runs the paired local fixture suite,
+`vibe-loop eval release-gate` creates or validates release-readiness evidence,
+and `vibe-loop eval benchmark` runs an explicitly selected external adapter.
+Their flag-level invocation is documented in the
+[CLI reference](cli-reference.md#evaluation-commands). This strategy is
+authoritative for evaluation methodology because it owns trial design, grading,
+artifact interpretation, and release-readiness policy; the CLI reference owns
+only invocation syntax.
+
+The optional post-`0.2.0` SWE-rebench V2 smoke follow-up uses
+`eval/benchmarks/swe-rebench-v2-smoke.json`. Its 24 pinned multilingual
+instances require an operator-supplied matching task export, pinned upstream
+harness checkout, pre-pulled Docker images, and an agent wrapper that writes one
+matching non-empty patch per task. The adapter verifies complete task-record
+fingerprints before invoking the pinned harness. Its version-2 result schema
+distinguishes agent failures from infrastructure failures; neither changes the
+local release gate. Aggregate and readiness records keep compact trial links
+without embedding raw task-source, lock, completion, planning, or worklog
+commands. The broader benchmark selection rationale remains in the
+[external benchmark fit](external-benchmark-fit.md).
 
 ## Remaining Questions
 
