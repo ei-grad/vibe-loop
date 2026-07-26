@@ -445,6 +445,70 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("waiting_for_active_workers:1", payload["observations"])
         self.assertNotIn("no_runnable_work", payload["observations"])
 
+    def test_status_names_a_legacy_pre_worker_lock_without_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            state = dataclasses.replace(
+                ActiveRunState.new(
+                    task_id="STRANDED-01",
+                    run_id="run-stranded",
+                    log_path=config.state_path / "runs" / "run-stranded.log",
+                    base_main=git_text(repo, "rev-parse", "HEAD"),
+                    command="codex",
+                ),
+                supervisor_pid=None,
+                supervisor_process_birth_id="",
+                started_at="2026-05-09T00:00:00+00:00",
+            )
+            manager.acquire(
+                "STRANDED-01",
+                "run-stranded",
+                metadata=state.to_lock_metadata(),
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id="run-stranded",
+                    task_id="STRANDED-01",
+                    contract={"mode": "runtime-owned"},
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.stage_transition(
+                    run_id="run-stranded",
+                    task_id="STRANDED-01",
+                    transition=StageTransition(
+                        from_stage=None,
+                        to_stage=RunStage.ACTIVATION,
+                        reason="run_contract_resolved",
+                        ordinal=1,
+                        accepted=True,
+                    ),
+                )
+            )
+
+            payload = collect_project_status(
+                config,
+                process_exists=lambda pid: False,
+            ).to_json()
+
+        self.assertIn("stale_locks_present", payload["blockers"])
+        blocker = next(
+            item
+            for item in payload["blockers"]
+            if item.startswith("unrecoverable_stale_lock:")
+        )
+        self.assertIn("task=STRANDED-01", blocker)
+        self.assertIn("no supported command can clear it", blocker)
+        self.assertFalse(payload["stale_locks"][0]["recovery_supported"])
+
     def test_collect_project_status_counts_lowercase_queue_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -1713,18 +1777,18 @@ class AutopilotRunTests(unittest.TestCase):
                 config,
                 once=True,
                 launcher=launcher,
-                process_exists=lambda pid: False,
+                process_exists=lambda pid: pid == active.supervisor_pid,
             )
             starting_lock = manager.status("STARTING-01")
             records = run_store.read_records()
 
         self.assertTrue(summary.started)
-        self.assertEqual(summary.exit_code, 1)
-        self.assertEqual(len(calls), 0)
+        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(len(calls), 1)
         self.assertIsNotNone(starting_lock)
         cycle = summary.cycles[0]
-        self.assertEqual(cycle.status, "blocked")
-        self.assertIn("stale_locks_present", cycle.blockers)
+        self.assertEqual(cycle.status, "completed")
+        self.assertNotIn("stale_locks_present", cycle.blockers)
         self.assertNotIn("cleaned_stale_locks:1", cycle.actions)
         self.assertFalse(
             any(record.get("record_type") == "lock_expired" for record in records)
@@ -1781,14 +1845,14 @@ class AutopilotRunTests(unittest.TestCase):
                 config,
                 once=True,
                 launcher=launcher,
-                process_exists=lambda pid: False,
+                process_exists=lambda pid: pid == active.supervisor_pid,
             )
             live_lock = manager.status("ACTIVATING-01")
             records = run_store.read_records()
 
         self.assertIsNotNone(live_lock)
         cycle = summary.cycles[0]
-        self.assertIn("stale_locks_present", cycle.blockers)
+        self.assertNotIn("stale_locks_present", cycle.blockers)
         self.assertNotIn("stale_lock_cleanup_failed", cycle.blockers)
         self.assertFalse(
             [action for action in cycle.actions if action.startswith("cleaned_stale")]

@@ -714,14 +714,21 @@ exists in either the lock or the local records, recovery fails closed with
 
 **`run`** is a foreground supervisor that launches `run-until-done` as a child
 and append-records one `autopilot_cycle` per iteration. Before each launch
-decision it cleans only stale worker locks whose recorded worker process is
-missing — the same validated, audited path as `vibe-loop workers clean --force`
-(it emits `lock_expired` records and never deletes worktrees, resets branches,
-steals live locks, or removes a lock that has not yet observed a worker PID).
-Each cycle then runs a native worktree-disposition step and gathers per-worktree
-evidence mechanically. The default `report-only` policy journals eligible
-candidates without invoking the analysis agent, removing a worktree, or deleting
-a branch. Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
+decision it cleans only stale worker locks whose recorded process identity is
+proven absent — the same validated, audited path as
+`vibe-loop workers clean --force`. Before worker launch, that proof requires
+the recorded supervisor PID and matching kernel process-birth identity; after
+worker launch, only the worker identity is authoritative. A missing or
+mismatched supervisor identity therefore recovers a run that died during
+activation without weakening the worker guard. A live, foreign-host, or
+identity-ambiguous process fails closed. Legacy pre-worker locks that lack a
+supervisor birth identity remain unsupported, and `autopilot status` names the
+offending task and that limitation. Cleanup emits `lock_expired` records and
+never deletes worktrees, resets branches, or steals live locks. Each cycle then
+runs a native worktree-disposition step and gathers per-worktree evidence
+mechanically. The default `report-only` policy journals eligible candidates
+without invoking the analysis agent, removing a worktree, or deleting a branch.
+Only an explicit `[autopilot] worktree_disposition = "reap"` setting or
 `--worktree-disposition reap` CLI override opts in to automatic disposition.
 Under that policy, the read-only analysis agent must return a reasoned reap
 decision and the executor still limits removal (`git worktree remove` plus

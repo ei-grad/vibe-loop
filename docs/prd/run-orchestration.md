@@ -245,12 +245,16 @@ attempted adapter call. A failed or unconfirmed attempt is journaled as
 `task_source_settlement_attempted` and satisfies neither the settlement
 step, the durable-outcome settlement gate, nor fenced lock release: the run
 remains `settlement_pending`, retains the task lock, and retries with
-bounded backoff. After process death, stage-aware fenced recovery must use
-the run's exact private lock identity, confirm the authoritative task
-source non-in-progress, append `task_source_settled`, and only then
-release; generic stale-lock cleanup must not release a settlement-pending
-lock. Leaving a task in-progress after lock release is never a legal
-settlement outcome.
+bounded backoff. Before worker launch, the task lock records the supervisor PID
+and kernel process-birth identity; recovery may treat the run as dead only when
+that exact identity is absent or has been replaced. Once the worker identity is
+published, only that identity is authoritative. After process death,
+stage-aware fenced recovery must use the run's exact private lock identity,
+confirm the authoritative task source non-in-progress, append
+`task_source_settled`, and only then release; generic stale-lock cleanup must
+not release a settlement-pending lock without that process-death proof.
+Leaving a task in-progress after lock release is never a legal settlement
+outcome.
 
 Acceptance must cover the integration window and verification steps, conflict
 and verification-failure transitions, the no-op case, adapter-configured and
