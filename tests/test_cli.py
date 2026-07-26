@@ -611,6 +611,12 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("--cycle-schedule 1800", autopilot_text)
         self.assertNotIn("vibe-loop autopilot run", autopilot_text)
         self.assertNotRegex(autopilot_text, r"\bnohup\s+vibe-loop\b")
+        self.assertIn("Recovering the agent inventory", orchestrated_text)
+        self.assertIn("agent-<agent-id>.meta.json", orchestrated_text)
+        self.assertIn("transcript_mtime_ns", orchestrated_text)
+        self.assertIn("Never spawn an unnamed", orchestrated_text)
+        self.assertIn("`TaskOutput`", orchestrated_text)
+        self.assertIn("`TaskStop`", orchestrated_text)
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM

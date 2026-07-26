@@ -37,6 +37,74 @@ Maintain a compact ledger during the run:
 Update the ledger after exploration, implementation, review, remediation,
 integration, blockers, and final summary.
 
+### Recovering the agent inventory
+
+Do not rely on conversation context as the only record of spawned agents. Before
+dispatching, give every agent a unique, task-scoped name and record the returned
+agent id, name, assignment, and workspace in the ledger. Never spawn an unnamed
+agent: some harnesses can address an agent by id for output but require its name
+to stop it.
+
+After a context compaction, use the harness's native agent-inventory operation
+when one exists. Do not confuse a todo-list operation such as `TaskList` or
+`TaskGet` with an agent inventory.
+
+Claude Code records a durable fallback inventory under the coordinator's exact
+session directory:
+
+```text
+~/.claude/projects/<project-slug>/<session-id>/subagents/
+  agent-<agent-id>.meta.json
+  agent-<agent-id>.jsonl
+```
+
+The small `.meta.json` sidecar contains fields including `name`, `description`,
+`model`, `agentType`, and `permissionMode`. The filename supplies the agent id,
+including for a legacy unnamed agent. The sibling `.jsonl` is the full
+transcript: never read, `cat`, or `tail` it merely to build an inventory.
+
+Given the exact `subagents` directory, this read-only recipe emits one JSON
+record per agent while only statting transcripts:
+
+```bash
+python - "$subagents_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+for meta_path in sorted(root.glob("agent-*.meta.json")):
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    agent_id = meta_path.name.removeprefix("agent-").removesuffix(".meta.json")
+    transcript = meta_path.with_name(meta_path.name.removesuffix(".meta.json") + ".jsonl")
+    transcript_stat = transcript.stat() if transcript.is_file() else None
+    print(json.dumps({
+        "agent_id": agent_id,
+        "name": metadata.get("name"),
+        "assignment": metadata.get("description"),
+        "model": metadata.get("model"),
+        "agent_type": metadata.get("agentType"),
+        "transcript_mtime_ns": (
+            transcript_stat.st_mtime_ns if transcript_stat is not None else None
+        ),
+    }, sort_keys=True))
+PY
+```
+
+Use the exact coordinator session directory; do not combine every session under
+the same project slug. If the session id itself was lost, search sidecar paths
+under that project slug for the unique task-scoped agent names, then treat their
+shared parent session directory as a candidate. Ambiguous matches are a blocker:
+do not dispatch replacements until ownership is resolved.
+
+Sidecar existence proves only that an agent was spawned. It has no status field.
+For Claude Code, pass the recovered filename id to `TaskOutput` for harness
+status and use the sidecar's `name` with `TaskStop` when closure is required.
+Otherwise compare `transcript_mtime_ns` across two inventory observations:
+advancement is the named fallback signal for ongoing agent activity; an
+unchanged or recent timestamp is not proof that the agent is still working.
+Preserve that distinction in the ledger and final status.
+
 ## Agent Roles
 
 Use explorer agents for read-only investigation. Assign concrete questions:
