@@ -116,6 +116,21 @@ Prompt extension acceptance must cover Codex and Claude dialects, routed agent
 profiles, recovery runs, explicit conflict precedence, and unchanged prompts
 when the setting is absent.
 
+`agent.analysis_command` is a separate read-only analysis template used by
+autopilot decision steps. Its inferred Codex form uses a read-only sandbox; its
+inferred Claude form disallows `Edit`, `Write`, and `NotebookEdit`. It must
+contain `{prompt}`, follows the same kind/model/effort resolution rules, and
+returns a strict JSON decision. Generated task-source profiles cannot introduce
+it, and routine read-only status commands do not invoke it.
+
+Workers receive the resolved run and agent identity through
+`VIBE_LOOP_RUN_ID`, `VIBE_LOOP_TASK_ID`, `VIBE_LOOP_REPO`,
+`VIBE_LOOP_WORKTREE`, `VIBE_LOOP_BRANCH`, `VIBE_LOOP_LOG`,
+`VIBE_LOOP_STATE_DIR`, `VIBE_LOOP_AGENT_KIND`, and
+`VIBE_LOOP_AGENT_PROFILE`. The repository variables identify the claimed task
+worktree, not the primary checkout. The profile value is empty when the default
+`[agent]` applies.
+
 Related implementation IDs: `AGENT-01`, `AGENT-02`, `AGENT-04`, `AGENT-05`,
 `AGENT-06`, `vl-worker-prompt-extension`.
 
@@ -125,6 +140,10 @@ Agent-facing result JSON must remain on stdout, while supervisor progress,
 mirrored worker stdout, empty-queue messages, and diagnostics that are not the
 result payload must go to stderr. Full worker stdout and stderr must be captured
 in per-run logs.
+
+Worker stderr is log-only by default. `agent.forward_stderr = true` additionally
+mirrors it to the supervisor's stderr; it never moves structured result output
+away from stdout.
 
 Acceptance must cover `run_id`, native `session_id` detection when emitted,
 fallback `session_id = run_id` semantics, `session_id_source`, invalid JSONL

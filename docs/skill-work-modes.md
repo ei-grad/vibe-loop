@@ -121,6 +121,72 @@ required approval, destructive-action confirmation, or an unsafe decision; safe
 completed work (including a committed-but-unintegrated reviewed slice) is
 preserved, not discarded.
 
+### Runtime-owned reviewer route
+
+Runtime-owned orchestration can route independent review to an agent profile
+different from the implementation profile:
+
+```toml
+[agent]
+kind = "claude"
+model = "opus"
+effort = "medium"
+
+[agent.profiles.review]
+kind = "codex"
+command = "codex review {prompt}"
+
+[orchestration]
+mode = "runtime-owned"
+reviewer_profile = "review"
+task_provenance_mode = "external-confirmed"
+external_completion_actor = "external-system"
+max_initial_review_passes = 1
+max_closure_review_passes = 2
+reviewer_concurrency_budget = 1
+max_candidate_reanchors = 2
+```
+
+The reviewer command must accept `{prompt}`. The runtime supplies the typed
+candidate, gate evidence, policy references, and prior findings, then records
+route identity, duration, native usage when available, and continuation
+ordinals. Initial review and targeted closure have separate bounded budgets;
+reviewer concurrency is independent from implementation `--jobs`.
+
+An exact explicit `codex review {prompt}` route is valid only without
+first-class `model` or `effort`. That command cannot expose enough effective
+route metadata to prove either setting before candidate disclosure. Configure a
+placeholder-capable command or leave those settings unset. Claude, custom,
+placeholder-based, worker-owned, and unbound exact-review routes retain their
+normal resolution behavior.
+
+Reviewer output is a schema-validated JSON verdict. A malformed verdict receives
+one bounded re-ask; a second malformed response blocks review while retaining
+the candidate and passed gate evidence. Findings live in a candidate-scoped
+ledger. Closure prompts contain that ledger and prior gate evidence rather than
+starting an unbounded new review.
+
+Provider continuation support is explicit. Claude supports injected sessions
+and resume. Codex implementation uses `exec resume`, but `codex review` has no
+review-session resume surface, so targeted closure starts a fresh bounded review
+and records `continuation_fallback = "provider_unsupported"`; missing or expired
+sessions similarly record their fallback reason. Reviewer prompts forbid nested
+model delegation.
+
+The runtime owns the review budgets and candidate fingerprint. Later candidate
+fingerprints consume the remaining closure budget instead of resetting it, and
+an unfinished `review_started` record parks rather than replaying silently.
+Before gates, a stale-base candidate may be re-anchored only when Git reports no
+conflict and the aggregate binary diff is unchanged. The runtime reruns gates
+after a successful re-anchor; `max_candidate_reanchors` bounds repeated base
+movement.
+
+Runtime-owned mode also owns integration and task provenance. Command-backed
+task sources that activate work must configure `reset`; adapter completion
+requires `complete`. Repositories that intentionally retain agent-owned
+verification, review, integration, and task-source mutation must opt into
+`mode = "worker-owned"`.
+
 What the FSM deliberately does *not* show — and where the prose is load-bearing:
 
 - **Guards carry the meaning.** "Integrate vs Park" hinges on *permitted to

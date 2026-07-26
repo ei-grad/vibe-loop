@@ -107,6 +107,12 @@ evidence, diagnostics mark the cache stale and point back to `tasks configure`.
 `tasks configure --force-refresh` regenerates the cache even when the current
 profile is still fresh.
 
+`tasks configure --promotion-toml` prints the validated profile as
+non-executable, committable TOML with `task_source.type = "markdown-profile"`.
+Adding that snippet to `.vibe-loop.toml` makes the generated parser profile an
+explicit source, so subsequent task discovery no longer depends on the cache
+remaining active.
+
 ## Repo-Specific Task Discovery Configuration
 
 This repository's built-in Markdown fallback recognizes a specific table shape:
@@ -131,9 +137,31 @@ source is explicit configuration, so setting `task_source.type =
 "ralphex-markdown"` disables generated cache use for the active task source in
 the same way as other user-authored source selectors.
 
+Configure one or more plan files explicitly when discovery would otherwise be
+ambiguous:
+
+```toml
+[task_source]
+type = "ralphex-markdown"
+plan_path = "docs/plans/checkout.md"
+# plan_paths = ["docs/plans/checkout.md", "docs/plans/refund.md"]
+```
+
+See the [ralphex Markdown plan example](examples/ralphex-markdown-plan.md) for
+task-local and plan-level conflict-domain syntax. Use `Resources: none` or
+`Paths: none` to declare an empty domain; a missing or blank label leaves the
+domain unknown.
+
 Repositories using common spec-driven development tools can opt into built-in
 non-executable presets rather than asking generated discovery to infer those
 formats or writing command adapters:
+
+```toml
+[task_source]
+type = "spec-kit"   # specs/*/tasks.md, .specify/specs/*/tasks.md
+# type = "kiro"     # .kiro/specs/*/tasks.md
+# type = "openspec" # openspec/changes/*/tasks.md
+```
 
 | `task_source.type` | Default source paths | Task shape |
 | --- | --- | --- |

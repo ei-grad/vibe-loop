@@ -19,6 +19,9 @@ requirement IDs for review and future traceability.
   It is not a project completion ledger.
 - README sections may explain positioning and supported workflows, but they do
   not replace PRD contracts or task-source entries.
+- The operator-facing option index lives in the
+  [configuration reference](../configuration.md); links from that reference to
+  PRD sections identify which contract owns each configuration family.
 
 ## ID Rules
 
@@ -27,15 +30,15 @@ task IDs stable when adding PRD coverage.
 
 | Namespace | File | Scope |
 | --- | --- | --- |
-| `PRD-CLI-*` | `cli-runtime.md` | CLI commands, configuration, agent command resolution, stdout/stderr contracts, local state, and release packaging. |
-| `PRD-TSK-*` | `task-discovery.md` | Task-source normalization, Markdown profiles, generated discovery cache, command adapters, precedence, and degraded states. |
-| `PRD-WRK-*` | `worker-supervision.md` | Worker execution, locks, reports, parallel scheduling, workspace claims, integration locking, and stale state visibility. |
-| `PRD-SKL-*` | `skills.md` | Bundled finite and infinite skills, installation, workflow contracts, review discipline, and skill release readiness. |
-| `PRD-ANL-*` | `planning-analytics.md` | _(Superseded — feature removed; timeline/Gantt now in loopyard.)_ Planning evidence, timeline/Gantt artifacts, duration benchmarking, coverage semantics, and `doctor` readiness. |
-| `PRD-EVL-*` | `evals-release.md` | Local skill eval suites, artifact schema, aggregate reporting, external benchmark adapters, and release gates. |
-| `PRD-SDE-*` | `spec-driven-execution.md` | Execution-engine support for spec-driven workflows, task-layer adapters, traceability, gates, drift checks, worker context, and completion evidence. |
-| `PRD-AUT-*` | `autopilot.md` | Persistent autopilot supervision, reusable status core, append-only cycle records, future multi-project management, and status-boundary readiness. _(In-tree TUI/WebUI removed; dashboards now in loopyard.)_ |
-| `PRD-ORC-*` | `run-orchestration.md` | Deterministic runtime-owned task lifecycle inside `vibe-loop run`: run contracts, workspace pre-provisioning, runtime gates, reviewer routing/continuation, findings ledger, integration and task provenance, stage-typed quotas, and worker-owned-mode migration. |
+| `PRD-CLI-*` | [CLI runtime](cli-runtime.md) | CLI commands, configuration, agent command resolution, stdout/stderr contracts, local state, and release packaging. |
+| `PRD-TSK-*` | [Task discovery](task-discovery.md) | Task-source normalization, Markdown profiles, generated discovery cache, command adapters, precedence, and degraded states. |
+| `PRD-WRK-*` | [Worker supervision](worker-supervision.md) | Worker execution, locks, reports, parallel scheduling, workspace claims, integration locking, and stale state visibility. |
+| `PRD-SKL-*` | [Skills](skills.md) | Bundled finite and infinite skills, installation, workflow contracts, review discipline, and skill release readiness. |
+| `PRD-ANL-*` | [Planning analytics](planning-analytics.md) | _(Superseded — feature removed; timeline/Gantt now in loopyard.)_ Planning evidence, timeline/Gantt artifacts, duration benchmarking, coverage semantics, and `doctor` readiness. |
+| `PRD-EVL-*` | [Evals and release](evals-release.md) | Local skill eval suites, artifact schema, aggregate reporting, external benchmark adapters, and release gates. |
+| `PRD-SDE-*` | [Spec-driven execution](spec-driven-execution.md) | Execution-engine support for spec-driven workflows, task-layer adapters, traceability, gates, drift checks, worker context, and completion evidence. |
+| `PRD-AUT-*` | [Autopilot](autopilot.md) | Persistent autopilot supervision, reusable status core, append-only cycle records, future multi-project management, and status-boundary readiness. _(In-tree TUI/WebUI removed; dashboards now in loopyard.)_ |
+| `PRD-ORC-*` | [Run orchestration](run-orchestration.md) | Deterministic runtime-owned task lifecycle inside `vibe-loop run`: run contracts, workspace pre-provisioning, runtime gates, reviewer routing/continuation, findings ledger, integration and task provenance, stage-typed quotas, and worker-owned-mode migration. |
 
 Task bodies should cite PRD IDs in their scope, acceptance, or evidence when a
 slice implements or changes a contract. A single task may satisfy multiple PRD
