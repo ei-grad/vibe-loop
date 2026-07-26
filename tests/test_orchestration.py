@@ -2976,7 +2976,7 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         secret = "adapter-password"
         diagnostic = "transition refused because completion evidence is missing"
         secret_dsn = f"postgres://user:{secret}@database/app"
-        noisy_prefix = "x" * (tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT + 100)
+        noisy_prefix = "x" * (tasks_module.TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT * 16)
 
         def refusing_complete(*args: object, **kwargs: object) -> Task:
             raise subprocess.CalledProcessError(
@@ -2990,31 +2990,76 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         with self.assertRaises(TaskSourceCompletionError) as raised:
             self.completer(source).complete()
 
-        self.store.append_result(
-            RunResult(
-                run_id="run-1",
-                task_id="TASK-01",
-                classification="blocked",
-                exit_code=1,
-                log_path=self.repo / "run.log",
-                start_main="a" * 40,
-                end_main="b" * 40,
-                message=str(raised.exception),
-            )
-        )
-        failure = self.store.read_records()[-1]
-        message = str(failure["message"])
+        message = str(raised.exception)
         self.assertIn("CalledProcessError", message)
         self.assertIn(diagnostic, message)
         self.assertIn("postgres://user:<redacted>@database/app", message)
         self.assertNotIn(secret, message)
-        self.assertNotIn(noisy_prefix, message)
+        self.assertNotIn(
+            "x" * (tasks_module.TASK_SOURCE_ERROR_LINE_LIMIT + 1),
+            message,
+        )
+        self.assertEqual(message.count(diagnostic), 1)
         self.assertLessEqual(
             len(message),
             tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT
             + tasks_module.TASK_SOURCE_ERROR_LAST_LINE_LIMIT
             + 250,
         )
+
+    def test_completion_probe_failure_keeps_scrubbed_adapter_stderr(self) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        diagnostic = "probe refused while source is unavailable"
+
+        def refusing_probe(*args: object, **kwargs: object) -> Task:
+            raise subprocess.CalledProcessError(
+                4,
+                "probe",
+                stderr=(
+                    f"{diagnostic}: "
+                    "postgres://probe-user:probe-password@database/app\n"
+                ),
+            )
+
+        source.probe = refusing_probe  # type: ignore[method-assign]
+
+        with self.assertRaises(TaskSourceCompletionError) as raised:
+            self.completer(source).complete()
+
+        message = str(raised.exception)
+        self.assertEqual(raised.exception.code, "completion_probe_failed")
+        self.assertIn("CalledProcessError", message)
+        self.assertIn(diagnostic, message)
+        self.assertIn(
+            "postgres://probe-user:<redacted>@database/app",
+            message,
+        )
+        self.assertNotIn("probe-password", message)
+
+    def test_completion_failure_does_not_repeat_a_long_single_stderr_line(
+        self,
+    ) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        diagnostic = "single-line completion refusal"
+
+        def refusing_complete(*args: object, **kwargs: object) -> Task:
+            raise subprocess.CalledProcessError(
+                3,
+                "complete",
+                stderr=f"{diagnostic}: {'x' * 700}\n",
+            )
+
+        source.complete = refusing_complete  # type: ignore[method-assign]
+
+        with self.assertRaises(TaskSourceCompletionError) as raised:
+            self.completer(source).complete()
+
+        message = str(raised.exception)
+        self.assertEqual(message.count(diagnostic), 1)
+        self.assertEqual(message.count("stderr last line:"), 1)
+        self.assertNotIn("stderr tail:", message)
 
     def test_crash_after_external_transition_is_probe_confirmed(self) -> None:
         self.record_integration()

@@ -4212,9 +4212,12 @@ class TaskSourceCompleter:
         try:
             return self.source.probe(self.task_id)
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            diagnostics = self._error_diagnostics(exc)
+            diagnostic_message = self._diagnostic_message(diagnostics)
             raise self._blocked_error(
                 code,
-                f"authoritative task-source probe failed: {type(exc).__name__}",
+                "authoritative task-source probe failed: "
+                f"{type(exc).__name__}{diagnostic_message}",
             ) from exc
 
     def _blocked_error(self, code: str, message: str) -> TaskSourceCompletionError:
@@ -4238,10 +4241,18 @@ class TaskSourceCompleter:
         stderr = diagnostics.get("stderr")
         last_line = diagnostics.get("stderr_last_line")
         parts: list[str] = []
-        if isinstance(last_line, str) and last_line:
+        if isinstance(stderr, str) and stderr:
+            split_tail = stderr.rsplit("\n", 1)
+            if len(split_tail) == 1:
+                parts.append(f"stderr last line: {stderr}")
+            else:
+                if isinstance(last_line, str) and last_line:
+                    parts.append(f"stderr last line: {last_line}")
+                tail = split_tail[0].rstrip()
+                if tail:
+                    parts.append(f"stderr tail: {tail}")
+        elif isinstance(last_line, str) and last_line:
             parts.append(f"stderr last line: {last_line}")
-        if isinstance(stderr, str) and stderr and stderr != last_line:
-            parts.append(f"stderr tail: {stderr}")
         return f"; {'; '.join(parts)}" if parts else ""
 
     def _completed_integration(self) -> IntegrationResult | None:

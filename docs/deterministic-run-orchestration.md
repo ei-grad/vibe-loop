@@ -321,7 +321,8 @@ New record types:
 - `task_source_settlement_attempted` — a settlement attempt that failed or
   could not be confirmed: intent, adapter identity redacted to its
   configured key, error class, retry ordinal, the adapter's exit code and
-  bounded stderr with only the fencing token redacted, the phase (`fenced` or
+  bounded stderr tail (`stderr`) and final line (`stderr_last_line`) after
+  general secret and fencing-token redaction, the phase (`fenced` or
   `post_release`), and for a post-release failure the adapter command an
   operator can run. Never a substitute for `task_source_settled`.
 - `task_source_settled` — confirmed failure-settlement outcome: intent

@@ -27,6 +27,8 @@ from vibe_loop.locks import (
 
 TASK_SOURCE_ERROR_STREAM_LIMIT = 2000
 TASK_SOURCE_ERROR_LAST_LINE_LIMIT = 500
+TASK_SOURCE_ERROR_LINE_LIMIT = 1024
+TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT = 4096
 TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
 # Names whose *absence* from an adapter invocation is an assertion the runtime
 # makes, not an accident. The session pair says "this run recorded no such
@@ -2537,17 +2539,17 @@ def task_source_error_diagnostics(
     """Diagnosable evidence for a failed task-source adapter call.
 
     General secret redaction preserves an adapter's refusal text while removing
-    credentials and tokens that must not enter the durable run record. The
-    captured stream is bounded to its tail because adapters put the refusal on
-    the last line.
+    credentials and tokens that must not enter the durable run record. Raw
+    stderr is capped per line and to a tail window before the superlinear secret
+    scrub runs, then the scrubbed stream is bounded again for persistence.
 
     Two token sources, because a refusal quotes tokens the caller never sent:
     `fencing_token` is the claim this call carried, and `lock_metadata` covers
     the generation the backend has stored - an unfenced call gets refusals like
     "expected fencing token N" naming a token that may belong to whichever run
-    holds the lock now. Redaction runs before bounding, so a token straddling
-    the truncation point cannot survive as a fragment the exact-value
-    lookarounds no longer match.
+    holds the lock now. Fencing-token redaction runs before the persisted bound,
+    so a token cannot straddle that truncation point and survive as a fragment
+    the exact-value lookarounds no longer match.
     """
 
     diagnostics: dict[str, object] = {"error_class": type(error).__name__}
@@ -2559,7 +2561,8 @@ def task_source_error_diagnostics(
         diagnostics["timeout_seconds"] = float(timeout)
     stderr = decoded_error_stream(getattr(error, "stderr", None))
     if stderr:
-        redacted = redact_evidence_text(stderr)
+        bounded = bound_error_stream_for_redaction(stderr)
+        redacted = redact_evidence_text(bounded)
         redacted = redact_fencing_token_diagnostic(redacted, lock_metadata or {})
         redacted = redact_fencing_token_text(redacted, fencing_token)
         for token in fencing_token_values(lock_metadata or {}):
@@ -2570,6 +2573,31 @@ def task_source_error_diagnostics(
             TASK_SOURCE_ERROR_LAST_LINE_LIMIT,
         )
     return diagnostics
+
+
+def bound_error_stream_for_redaction(value: object) -> str:
+    """Cap raw adapter stderr before applying the superlinear secret scrub.
+
+    A tail-window cut drops its leading partial line instead of preserving a
+    fragment that may have lost the secret label needed for redaction.
+    """
+
+    text = decoded_error_stream(value)
+    lines = text.split("\n")
+    capped = "\n".join(
+        (
+            line
+            if len(line) <= TASK_SOURCE_ERROR_LINE_LIMIT
+            else line[:TASK_SOURCE_ERROR_LINE_LIMIT]
+            + TASK_SOURCE_ERROR_TRUNCATION_MARKER
+        )
+        for line in lines
+    )
+    window = capped[-TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT:]
+    if len(window) < len(capped):
+        newline = window.find("\n")
+        window = window[newline + 1 :] if newline >= 0 else ""
+    return window
 
 
 def decoded_error_stream(value: object) -> str:
