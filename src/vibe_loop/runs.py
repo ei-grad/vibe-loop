@@ -83,6 +83,14 @@ REVIEW_BUDGET_RECORD_TYPE = "review_budget"
 CONTINUATION_FALLBACK_RECORD_TYPE = "continuation_fallback"
 FINDING_RECORDED_RECORD_TYPE = "finding_recorded"
 INTEGRATION_RESULT_RECORD_TYPE = "integration_result"
+INTEGRATION_PROVENANCE_RECORD_TYPE = "integration_provenance"
+INTEGRATION_PROVENANCE_OUTCOMES = frozenset(
+    {
+        "settled-directly",
+        "settled-by-reconciliation",
+        "refused-unprovable",
+    }
+)
 TASK_PROVENANCE_COMMITTED_RECORD_TYPE = "task_provenance_committed"
 TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE = "task_source_settlement_attempted"
 TASK_SOURCE_SETTLED_RECORD_TYPE = "task_source_settled"
@@ -157,6 +165,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         CONTINUATION_FALLBACK_RECORD_TYPE,
         FINDING_RECORDED_RECORD_TYPE,
         INTEGRATION_RESULT_RECORD_TYPE,
+        INTEGRATION_PROVENANCE_RECORD_TYPE,
         TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
         TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE,
         TASK_SOURCE_SETTLED_RECORD_TYPE,
@@ -942,6 +951,29 @@ class RunLifecycleEvent:
             run_id=run_id,
             task_id=task_id,
             payload=payload,
+        )
+
+    @classmethod
+    def integration_provenance(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        outcome: str,
+        candidate_commit: str,
+        target_commit: str,
+    ) -> RunLifecycleEvent:
+        if outcome not in INTEGRATION_PROVENANCE_OUTCOMES:
+            raise ValueError(f"unsupported integration provenance outcome: {outcome}")
+        return cls(
+            record_type=INTEGRATION_PROVENANCE_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "outcome": outcome,
+                "candidate_commit": candidate_commit,
+                "target_commit": target_commit,
+            },
         )
 
     @classmethod
@@ -1755,6 +1787,127 @@ class RunStore:
 
     def append_result(self, result: RunResult) -> None:
         self.append_record(result.to_record())
+
+    def settle_integration_provenance(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        candidate_commit: str,
+        target_commit: str,
+        reconciled_integration: RunLifecycleEvent,
+    ) -> str:
+        """Atomically settle one direct or ancestry-reconciled integration."""
+
+        integration_record = reconciled_integration.to_record()
+        if (
+            integration_record.get("record_type") != INTEGRATION_RESULT_RECORD_TYPE
+            or integration_record.get("run_id") != run_id
+            or integration_record.get("task_id") != task_id
+            or integration_record.get("status") != "completed"
+        ):
+            raise ValueError("reconciled integration must be a completed result")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                prior_settlement = next(
+                    (
+                        record
+                        for record in reversed(records)
+                        if record.get("record_type")
+                        == INTEGRATION_PROVENANCE_RECORD_TYPE
+                        and record.get("run_id") == run_id
+                        and record.get("task_id") == task_id
+                        and record.get("outcome")
+                        in {
+                            "settled-directly",
+                            "settled-by-reconciliation",
+                        }
+                    ),
+                    None,
+                )
+                if prior_settlement is not None:
+                    return string_value(prior_settlement.get("outcome"))
+
+                prior_integration = next(
+                    (
+                        record
+                        for record in reversed(records)
+                        if record.get("record_type") == INTEGRATION_RESULT_RECORD_TYPE
+                        and record.get("run_id") == run_id
+                        and record.get("task_id") == task_id
+                        and record.get("status") == "completed"
+                        and record.get("outcome")
+                        in {"merged", "branch_already_merged"}
+                        and isinstance(record.get("candidate_head"), str)
+                        and bool(record.get("candidate_head"))
+                        and isinstance(record.get("main_after"), str)
+                        and bool(record.get("main_after"))
+                    ),
+                    None,
+                )
+                if prior_integration is None:
+                    outcome = "settled-by-reconciliation"
+                    self._append_record_unlocked(integration_record)
+                else:
+                    outcome = "settled-directly"
+                    candidate_commit = string_value(
+                        prior_integration.get("candidate_head")
+                    )
+                    target_commit = string_value(prior_integration.get("main_after"))
+                self._append_record_unlocked(
+                    RunLifecycleEvent.integration_provenance(
+                        run_id=run_id,
+                        task_id=task_id,
+                        outcome=outcome,
+                        candidate_commit=candidate_commit,
+                        target_commit=target_commit,
+                    ).to_record()
+                )
+                return outcome
+
+    def record_integration_provenance_refusal(
+        self,
+        *,
+        run_id: str,
+        task_id: str,
+        candidate_commit: str,
+        target_commit: str,
+    ) -> None:
+        """Record one refusal for an exact candidate and target identity."""
+
+        event = RunLifecycleEvent.integration_provenance(
+            run_id=run_id,
+            task_id=task_id,
+            outcome="refused-unprovable",
+            candidate_commit=candidate_commit,
+            target_commit=target_commit,
+        ).to_record()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _APPEND_LOCK:
+            with append_record_lock(self.path):
+                records = self._read_records_unlocked()
+                already_recorded = any(
+                    record.get("record_type") == INTEGRATION_PROVENANCE_RECORD_TYPE
+                    and record.get("run_id") == run_id
+                    and record.get("task_id") == task_id
+                    and (
+                        record.get("outcome")
+                        in {
+                            "settled-directly",
+                            "settled-by-reconciliation",
+                        }
+                        or (
+                            record.get("outcome") == "refused-unprovable"
+                            and record.get("candidate_commit") == candidate_commit
+                            and record.get("target_commit") == target_commit
+                        )
+                    )
+                    for record in records
+                )
+                if not already_recorded:
+                    self._append_record_unlocked(event)
 
     def claim_review_attempt(
         self,

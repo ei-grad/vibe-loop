@@ -3884,6 +3884,8 @@ class VibeRunner:
             lock_manager=self.lock_manager,
             task_lock=task_lock,
             run_store=self.run_store,
+            repo=self.config.repo,
+            main_branch=self.config.main_branch,
             run_id=run_id,
             task_id=task_id,
             runtime_context=self.task_source_runtime_context(

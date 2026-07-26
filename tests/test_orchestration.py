@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
@@ -2559,6 +2560,26 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             )
         )
 
+    def record_candidate(self, head_commit: str | None = None) -> str:
+        target = git(self.repo, "rev-parse", "main").stdout.strip()
+        candidate_head = head_commit or target
+        candidate = CandidateRecord(
+            branch="worker/TASK-01",
+            worktree=self.repo,
+            base_main=target,
+            head_commit=candidate_head,
+            changed_paths=(),
+            source="derived",
+        )
+        self.store.append_lifecycle_event(
+            RunLifecycleEvent.candidate_recorded(
+                run_id="run-1",
+                task_id="TASK-01",
+                payload=candidate.to_payload(),
+            )
+        )
+        return candidate_head
+
     def completer(
         self,
         source: MutableTaskSource,
@@ -2580,6 +2601,8 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             lock_manager=self.manager,
             task_lock=self.task_lock,
             run_store=self.store,
+            repo=self.repo,
+            main_branch="main",
             run_id="run-1",
             task_id="TASK-01",
         )
@@ -2623,6 +2646,103 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(source.complete_calls, 0)
         self.assertEqual(self.store.read_records(), [])
 
+    def test_merged_candidate_reconciles_integration_exactly_once(self) -> None:
+        candidate_head = self.record_candidate()
+        source = MutableTaskSource()
+        completer = self.completer(source)
+
+        first = completer.complete()
+        second = completer.complete()
+
+        self.assertEqual(first, second)
+        self.assertEqual(first.integration_outcome, "branch_already_merged")
+        records = self.store.read_records()
+        integrations = [
+            record
+            for record in records
+            if record["record_type"] == "integration_result"
+        ]
+        settlements = [
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        ]
+        self.assertEqual(len(integrations), 1)
+        self.assertTrue(integrations[0]["recovered"])
+        self.assertEqual(len(settlements), 1)
+        self.assertEqual(settlements[0]["outcome"], "settled-by-reconciliation")
+        self.assertEqual(settlements[0]["candidate_commit"], candidate_head)
+        self.assertEqual(settlements[0]["target_commit"], candidate_head)
+
+    def test_unmerged_candidate_records_refusal_and_fails_closed(self) -> None:
+        base = git(self.repo, "rev-parse", "main").stdout.strip()
+        git(self.repo, "checkout", "-b", "unmerged-candidate")
+        (self.repo / "candidate.txt").write_text("candidate\n", encoding="utf-8")
+        git(self.repo, "add", "candidate.txt")
+        git(self.repo, "commit", "-m", "unmerged candidate")
+        candidate_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        git(self.repo, "checkout", "main")
+        self.record_candidate(candidate_head)
+        source = MutableTaskSource()
+
+        with self.assertRaisesRegex(
+            TaskSourceCompletionError, "candidate ancestry.*unproven"
+        ):
+            self.completer(source).complete()
+
+        self.assertEqual(source.complete_calls, 0)
+        records = self.store.read_records()
+        self.assertNotIn(
+            "integration_result",
+            [record["record_type"] for record in records],
+        )
+        refusal = [
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        ]
+        self.assertEqual(len(refusal), 1)
+        self.assertEqual(refusal[0]["outcome"], "refused-unprovable")
+        self.assertEqual(refusal[0]["candidate_commit"], candidate_head)
+        self.assertEqual(refusal[0]["target_commit"], base)
+
+    def test_concurrent_reconciliation_does_not_double_settle(self) -> None:
+        self.record_candidate()
+        source = MutableTaskSource("done")
+        first = self.completer(source, mode="external-confirmed")
+        second = self.completer(source, mode="external-confirmed")
+        barrier = threading.Barrier(2)
+        settle = self.store.settle_integration_provenance
+
+        def concurrent_settle(**kwargs: object) -> str:
+            barrier.wait(timeout=5)
+            return settle(**kwargs)
+
+        with patch.object(
+            self.store,
+            "settle_integration_provenance",
+            side_effect=concurrent_settle,
+        ):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(lambda item: item.complete(), (first, second))
+                )
+
+        self.assertTrue(all(result.recovered for result in results))
+        records = self.store.read_records()
+        self.assertEqual(
+            sum(record["record_type"] == "integration_result" for record in records),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                record["record_type"] == "integration_provenance"
+                and record["outcome"] == "settled-by-reconciliation"
+                for record in records
+            ),
+            1,
+        )
+
     def test_completion_rejects_completed_report_before_provenance(self) -> None:
         self.record_integration()
         self.store.append_result(
@@ -2655,11 +2775,20 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(first.confirmed_status, "done")
         self.assertEqual(first, second)
         self.assertEqual(source.complete_calls, 1)
-        record_types = [record["record_type"] for record in self.store.read_records()]
+        records = self.store.read_records()
+        record_types = [record["record_type"] for record in records]
         self.assertLess(
             record_types.index("integration_result"),
             record_types.index("task_provenance_committed"),
         )
+        settlement = next(
+            record
+            for record in records
+            if record["record_type"] == "integration_provenance"
+        )
+        self.assertEqual(settlement["outcome"], "settled-directly")
+        self.assertEqual(settlement["candidate_commit"], "a" * 40)
+        self.assertEqual(settlement["target_commit"], "b" * 40)
 
     def test_loopyard_style_adapter_enforces_transition_evidence_end_to_end(
         self,
@@ -2702,6 +2831,8 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             lock_manager=self.manager,
             task_lock=self.task_lock,
             run_store=self.store,
+            repo=self.repo,
+            main_branch="main",
             run_id="run-1",
             task_id="TASK-01",
         )

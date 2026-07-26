@@ -4027,6 +4027,8 @@ class TaskSourceCompleter:
         lock_manager: object,
         task_lock: object,
         run_store: object,
+        repo: Path,
+        main_branch: str,
         run_id: str,
         task_id: str,
         runtime_context: Mapping[str, str] | None = None,
@@ -4040,6 +4042,8 @@ class TaskSourceCompleter:
         self.lock_manager = lock_manager
         self.task_lock = task_lock
         self.run_store = run_store
+        self.repo = repo.resolve()
+        self.main_branch = main_branch
         self.run_id = run_id
         self.task_id = task_id
         self.runtime_context = dict(runtime_context or {})
@@ -4057,10 +4061,9 @@ class TaskSourceCompleter:
             )
         integration = self._completed_integration()
         if integration is None:
-            raise TaskSourceCompletionError(
-                "integration_not_recorded",
-                "task provenance requires a durable completed integration_result",
-            )
+            integration = self._reconcile_completed_integration()
+        else:
+            self._settle_integration_provenance(integration)
         if (
             self.stage_machine is not None
             and self.stage_machine.stage is not RunStage.PROVENANCE
@@ -4161,9 +4164,116 @@ class TaskSourceCompleter:
                 and record.get("task_id") == self.task_id
             ):
                 candidate = IntegrationResult.from_record(record)
-                if candidate is not None and candidate.completed:
+                if (
+                    candidate is not None
+                    and candidate.completed
+                    and candidate.candidate_head
+                    and candidate.main_after
+                ):
                     result = candidate
         return result
+
+    def _reconcile_completed_integration(self) -> IntegrationResult:
+        candidate = self._latest_candidate()
+        if candidate is None:
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance requires a durable completed integration_result",
+            )
+        target_commit = self._resolve_commit(self.main_branch)
+        if (
+            target_commit is None
+            or self._git(
+                "merge-base",
+                "--is-ancestor",
+                candidate.head_commit,
+                target_commit,
+            ).returncode
+            != 0
+        ):
+            if target_commit is not None:
+                self.run_store.record_integration_provenance_refusal(
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    candidate_commit=candidate.head_commit,
+                    target_commit=target_commit,
+                )
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance requires a durable completed integration_result; "
+                "candidate ancestry to the integration target is unproven",
+            )
+        reconciled = IntegrationResult(
+            outcome="branch_already_merged",
+            status="completed",
+            reason="reconciled_merged_candidate",
+            branch=candidate.branch,
+            candidate_head=candidate.head_commit,
+            refreshed_head=candidate.head_commit,
+            main_before=target_commit,
+            main_after=target_commit,
+            recovered=True,
+            diagnostics={
+                "provenance_settlement": "settled-by-reconciliation",
+            },
+        )
+        self._settle_integration_provenance(reconciled)
+        durable = self._completed_integration()
+        if durable is None:
+            raise RuntimeError("integration reconciliation was not durable")
+        return durable
+
+    def _settle_integration_provenance(
+        self,
+        integration: IntegrationResult,
+    ) -> None:
+        from vibe_loop.runs import RunLifecycleEvent
+
+        self.run_store.settle_integration_provenance(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            candidate_commit=integration.candidate_head,
+            target_commit=integration.main_after,
+            reconciled_integration=RunLifecycleEvent.integration_result(
+                run_id=self.run_id,
+                task_id=self.task_id,
+                payload=integration.to_payload(),
+            ),
+        )
+
+    def _latest_candidate(self) -> CandidateRecord | None:
+        for record in reversed(self.run_store.read_records()):
+            if (
+                record.get("run_id") == self.run_id
+                and record.get("task_id") == self.task_id
+                and (candidate := CandidateRecord.from_record(record)) is not None
+            ):
+                return candidate
+        return None
+
+    def _resolve_commit(self, revision: str) -> str | None:
+        result = self._git("rev-parse", "--verify", f"{revision}^{{commit}}")
+        if result.returncode != 0:
+            return None
+        resolved = result.stdout.strip()
+        return resolved or None
+
+    def _git(self, *args: str) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ["git", "-C", str(self.repo), *args],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except OSError as exc:
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance could not verify candidate ancestry: "
+                f"{type(exc).__name__}",
+            ) from exc
 
     def _completed_report_exists(self) -> bool:
         return any(
