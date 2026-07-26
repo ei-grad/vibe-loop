@@ -354,6 +354,25 @@ task sources: explicit user-authored commands in `.vibe-loop.toml`, bounded
 JSON contracts for acquire/release/status/list, and clear failure diagnostics.
 Generated profiles must not introduce lock adapters.
 
+The operator-facing configuration is:
+
+```toml
+[locks]
+type = "command"
+acquire_command = "my-lock-tool acquire --json"
+release_command = "my-lock-tool release --json"
+status_command = "my-lock-tool status --json"
+list_command = "my-lock-tool list --json"
+```
+
+Commands run from the repository root and receive
+`VIBE_LOOP_LOCK_OPERATION`, `VIBE_LOOP_LOCK_TASK_ID`,
+`VIBE_LOOP_LOCK_RUN_ID`, `VIBE_LOOP_LOCK_ROOT`, and
+`VIBE_LOOP_LOCK_METADATA_JSON`. Acquire handles both acquire and update and
+returns `{"acquired": true|false, "metadata": {...}}`; release returns
+`{"released": true|false}`; status returns `{"locked": true|false, ...}`; list
+returns an array or `{"locks": [...]}`.
+
 Acceptance must cover directory-based default behavior, command adapter
 configuration, acquire/release/status/list command contracts, error handling
 for adapter failures, fallback behavior when an adapter is unavailable, and
@@ -379,6 +398,10 @@ is advisory locks without leases, fully backward compatible.
 Acceptance must cover lease expiry detection, heartbeat updates resetting the
 lease timer, fencing token validation on release and update, expired lease
 visibility in diagnostics, and unchanged default advisory lock behavior.
+
+Set `locks.lease_seconds` to enable leases. Workers refresh an owned lease with
+`vibe-loop worker heartbeat`; stale holders are rejected when their fencing
+generation no longer matches.
 
 Related implementation IDs: `RT-03`.
 
