@@ -1639,6 +1639,52 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("runtime-edited", result.message)
         self.assertIn("worker skill preflight blocked", log_text)
 
+    def test_skill_verification_blocks_unknown_run_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            task = Task(task_id="TASK-DRIFT", title="Drift", status="Next")
+            runner._source = MutableTaskSource([task])
+            recovery = RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log="",
+                attempt=1,
+                max_attempts=2,
+                workspace_claimed=False,
+            )
+
+            def reject_task(
+                _task: Task,
+                *,
+                recovery: RecoveryContext | None = None,
+            ) -> RunResult:
+                self.assertIsNotNone(recovery)
+                raise SkillDeploymentError(
+                    "installed skills failed provenance verification",
+                    diagnostics=("/tmp/skills/example/SKILL.md: branch-sourced",),
+                )
+
+            runner.run_task = reject_task
+            with patch("vibe_loop.runner.git_rev_parse", return_value="aaa"):
+                result = runner.resume_pending_recovery(recovery)
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            log_text = result.log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(result.classification_source, "skill_verification")
+        self.assertIn("branch-sourced", result.message)
+        self.assertIn("worker skill preflight blocked", log_text)
+
     def test_run_until_done_serial_stops_after_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

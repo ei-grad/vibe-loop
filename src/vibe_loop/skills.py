@@ -33,5 +33,7 @@ def install_skills(
         claude=claude,
         force=force,
         allow_unmerged=allow_unmerged,
+        package_name="vibe-loop",
+        source_repository="https://github.com/ei-grad/vibe-loop",
         report_diagnostic=report_diagnostic,
     )

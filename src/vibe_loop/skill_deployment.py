@@ -9,6 +9,10 @@ import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timezone
+from importlib.metadata import (
+    PackageNotFoundError,
+    distribution as metadata_distribution,
+)
 from pathlib import Path
 
 
@@ -26,7 +30,8 @@ class SkillDeploymentError(RuntimeError):
 
 @dataclasses.dataclass(frozen=True)
 class SourceState:
-    repo: Path
+    repo: str
+    content_root: Path
     commit: str
     branch: str
     dirty: bool
@@ -61,7 +66,6 @@ class VerificationReport:
     def drifted(self) -> bool:
         return bool(
             self.manifest_error
-            or self.unmanaged
             or any(entry.state != "in-sync" for entry in self.entries)
         )
 
@@ -105,14 +109,34 @@ def selected_target_roots(
     return (codex_root, claude_root)
 
 
-def inspect_source(source_root: Path) -> SourceState:
+def inspect_source(
+    source_root: Path,
+    *,
+    package_name: str | None = None,
+    source_repository: str | None = None,
+    main_branch: str = "main",
+) -> SourceState:
     source_root = source_root.resolve()
-    repo = _git(source_root, "rev-parse", "--show-toplevel")
+    repo = _git_toplevel(source_root)
+    if repo is None:
+        if package_name is None:
+            raise SkillDeploymentError(
+                "skill source is not in a Git checkout and no package "
+                "provenance was provided"
+            )
+        return _package_source_state(
+            source_root,
+            package_name=package_name,
+            source_repository=source_repository,
+            main_branch=main_branch,
+        )
     commit = _git(source_root, "rev-parse", "--verify", "HEAD")
     branch = _git(source_root, "branch", "--show-current")
     dirty = bool(_git(source_root, "status", "--porcelain", "--untracked-files=all"))
+    repo_path = Path(repo).resolve()
     return SourceState(
-        repo=Path(repo).resolve(),
+        repo=str(repo_path),
+        content_root=repo_path,
         commit=commit,
         branch=branch,
         dirty=dirty,
@@ -129,11 +153,18 @@ def deploy_skill_bundle(
     force: bool = False,
     allow_unmerged: bool = False,
     main_branch: str = "main",
+    package_name: str | None = None,
+    source_repository: str | None = None,
     report_diagnostic: Callable[[str], None] | None = None,
 ) -> list[Path]:
     source_root = source_root.resolve()
     names = tuple(skill_names)
-    source_state = inspect_source(source_root)
+    source_state = inspect_source(
+        source_root,
+        package_name=package_name,
+        source_repository=source_repository,
+        main_branch=main_branch,
+    )
     if (
         source_state.branch != main_branch or source_state.dirty
     ) and not allow_unmerged:
@@ -155,7 +186,21 @@ def deploy_skill_bundle(
     manifests: dict[Path, dict[str, object]] = {}
     diagnostics: list[str] = []
     for root in roots:
-        manifest = _load_manifest(root, allow_missing=True)
+        try:
+            manifest = _load_manifest(root, allow_missing=True)
+        except SkillDeploymentError as exc:
+            diagnostic = (
+                f"{root / MANIFEST_NAME}: {exc}; "
+                "the manifest will be replaced because --force was supplied"
+            )
+            if not force:
+                raise SkillDeploymentError(
+                    "refusing to replace an invalid skill manifest; rerun with "
+                    "--force after reviewing the error",
+                    diagnostics=(diagnostic,),
+                ) from exc
+            diagnostics.append(diagnostic)
+            manifest = {"version": MANIFEST_VERSION, "entries": {}}
         manifests[root] = manifest
         entries = _manifest_entries(manifest)
         for relative_path, source in source_files.items():
@@ -209,7 +254,8 @@ def deploy_skill_bundle(
                 "source_branch": source_state.branch,
                 "source_main_branch": main_branch,
                 "source_dirty": source_state.dirty,
-                "source_path": str(source.relative_to(source_state.repo)),
+                "source_location": str(source_state.content_root),
+                "source_path": str(source.relative_to(source_state.content_root)),
                 "sha256": _sha256(source),
                 "installed_at": installed_at,
             }
@@ -308,10 +354,11 @@ def _verify_entry(
 
     recorded_hash = recorded.get("sha256")
     source_repo = recorded.get("source_repo")
+    source_location = recorded.get("source_location", source_repo)
     source_path = recorded.get("source_path")
     if not all(
         isinstance(value, str) and value
-        for value in (recorded_hash, source_repo, source_path)
+        for value in (recorded_hash, source_repo, source_location, source_path)
     ):
         return VerificationEntry(
             target_root,
@@ -338,7 +385,7 @@ def _verify_entry(
             detail,
         )
 
-    source = Path(source_repo) / source_path
+    source = Path(source_location) / source_path
     source_hash = _safe_sha256(source)
     if source_hash != recorded_hash:
         detail = "source file is missing" if source_hash is None else "source changed"
@@ -377,12 +424,12 @@ def _overwrite_diagnostics(
     recorded: dict[str, object] | None,
     relative_path: str,
     target_root: Path,
-    source_repo: Path,
+    source_repo: str,
 ) -> list[str]:
     if not target.exists() and not target.is_symlink():
         return []
     recorded_repo = recorded.get("source_repo") if recorded is not None else None
-    if isinstance(recorded_repo, str) and recorded_repo != str(source_repo):
+    if isinstance(recorded_repo, str) and recorded_repo != source_repo:
         return [
             f"{target_root / relative_path}: ownership collision; "
             f"manifest owner={recorded_repo}, installing owner={source_repo}"
@@ -481,13 +528,11 @@ def _owned_path(
     path: str,
     entry: dict[str, object],
     *,
-    source_repo: Path,
+    source_repo: str,
     skill_names: Sequence[str],
 ) -> bool:
     first_component = path.split("/", 1)[0]
-    return (
-        entry.get("source_repo") == str(source_repo) and first_component in skill_names
-    )
+    return entry.get("source_repo") == source_repo and first_component in skill_names
 
 
 def _unmanaged_paths(target_root: Path, managed: frozenset[str]) -> tuple[str, ...]:
@@ -528,9 +573,87 @@ def _is_safe_relative_path(value: object) -> bool:
     return not path.is_absolute() and ".." not in path.parts
 
 
-def _git(cwd: Path, *args: str) -> str:
+def _package_source_state(
+    source_root: Path,
+    *,
+    package_name: str,
+    source_repository: str | None,
+    main_branch: str,
+) -> SourceState:
     try:
-        completed = subprocess.run(
+        package = metadata_distribution(package_name)
+    except PackageNotFoundError as exc:
+        raise SkillDeploymentError(
+            f"package provenance is unavailable for {package_name}"
+        ) from exc
+
+    repo = source_repository or f"package:{package_name}"
+    commit = f"package:{package_name}@{package.version}"
+    branch = main_branch
+    dirty = False
+    direct_url_text = package.read_text("direct_url.json")
+    if direct_url_text:
+        try:
+            direct_url = json.loads(direct_url_text)
+        except json.JSONDecodeError as exc:
+            raise SkillDeploymentError(
+                f"package provenance for {package_name} is unreadable"
+            ) from exc
+        if not isinstance(direct_url, dict):
+            raise SkillDeploymentError(
+                f"package provenance for {package_name} is invalid"
+            )
+        direct_repo = direct_url.get("url")
+        if isinstance(direct_repo, str) and direct_repo:
+            repo = direct_repo
+        vcs_info = direct_url.get("vcs_info")
+        if isinstance(vcs_info, dict):
+            commit_id = vcs_info.get("commit_id")
+            requested_revision = vcs_info.get("requested_revision")
+            if isinstance(commit_id, str) and commit_id:
+                commit = commit_id
+            if isinstance(requested_revision, str) and requested_revision:
+                branch = requested_revision
+        dir_info = direct_url.get("dir_info")
+        if isinstance(dir_info, dict):
+            branch = "local-package"
+            dirty = True
+
+    return SourceState(
+        repo=repo,
+        content_root=source_root,
+        commit=commit,
+        branch=branch,
+        dirty=dirty,
+    )
+
+
+def _git_toplevel(cwd: Path) -> str | None:
+    completed = _run_git(cwd, "rev-parse", "--show-toplevel")
+    if completed.returncode == 0:
+        return completed.stdout.strip()
+    detail = completed.stderr.strip() or completed.stdout.strip()
+    if "not a git repository" in detail.lower():
+        return None
+    raise SkillDeploymentError(
+        "could not inspect skill source Git state" + (f": {detail}" if detail else "")
+    )
+
+
+def _git(cwd: Path, *args: str) -> str:
+    completed = _run_git(cwd, *args)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise SkillDeploymentError(
+            "could not inspect skill source Git state"
+            + (f": {detail}" if detail else "")
+        )
+    return completed.stdout.strip()
+
+
+def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
             ["git", "-C", str(cwd), *args],
             capture_output=True,
             text=True,
@@ -540,10 +663,3 @@ def _git(cwd: Path, *args: str) -> str:
         )
     except OSError as exc:
         raise SkillDeploymentError(f"could not inspect skill source Git state: {exc}")
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        raise SkillDeploymentError(
-            "could not inspect skill source Git state"
-            + (f": {detail}" if detail else "")
-        )
-    return completed.stdout.strip()

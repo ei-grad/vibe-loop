@@ -17,10 +17,13 @@ Each target root contains `.skill-manifest.json`. Every managed file records:
 - whether the source worktree was dirty;
 - the deployed SHA-256 digest and installation time.
 
-The installer must run from a clean `main` checkout. A dirty, detached, or
-non-`main` source is refused unless `--allow-unmerged` is supplied. The override
-is intentionally visible in the manifest, so worker preflight subsequently
-classifies that deployment as `branch-sourced` and blocks worker launch.
+When run from a Git checkout, the installer requires clean `main`. A dirty,
+detached, or non-`main` source is refused unless `--allow-unmerged` is supplied.
+The override is intentionally visible in the manifest, so worker preflight
+subsequently classifies that deployment as `branch-sourced` and blocks worker
+launch. A wheel or other immutable package installation instead records its
+package release identity; VCS package metadata retains an explicit requested
+revision and applies the same mainline guard.
 
 Before writing either runtime, the installer checks every existing managed
 file. If its digest differs from the recorded digest, installation stops
@@ -46,11 +49,14 @@ It also reports target-only files as `unmanaged` and never removes them. This is
 required because runtime roots can contain independently managed skills and
 mutable state such as `local-memory`.
 
-`verify-skills` exits non-zero for any managed drift, invalid or missing
-manifest, or unmanaged path. Worker preflight uses the same verifier but blocks
-only recorded unsafe managed states and invalid manifests. A root without a
-manifest is a migration state and remains advisory until its first recorded
-install; unmanaged paths do not block workers.
+`verify-skills` exits non-zero for managed drift or an invalid or missing
+manifest. Unmanaged paths are reported but do not affect the exit status or
+block workers. A root without a manifest is a migration state and remains
+advisory to worker preflight until its first recorded install.
+
+An invalid manifest fails closed by default. `install-skills --force` prints the
+manifest error before replacing it, providing an explicit recovery path without
+deleting target-only content.
 
 Stale deployments block rather than auto-repair. Automatic repair would make a
 global write part of worker launch and obscure when deployment changed. The

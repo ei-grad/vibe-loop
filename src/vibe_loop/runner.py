@@ -5126,6 +5126,8 @@ class VibeRunner:
         )
         try:
             result = self.run_task(task, recovery=recovery)
+        except SkillDeploymentError as exc:
+            result = self.record_skill_verification_failure(task, exc)
         except AttemptCircuitOpen as exc:
             report_status(str(exc))
             self.record_recovery_phase(

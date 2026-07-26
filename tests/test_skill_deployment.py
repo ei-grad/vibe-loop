@@ -7,6 +7,7 @@ import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
+from unittest import mock
 
 from vibe_loop.cli import main
 from vibe_loop.skill_deployment import (
@@ -16,6 +17,7 @@ from vibe_loop.skill_deployment import (
     verify_skill_deployments,
     verify_worker_skill_deployments,
 )
+from vibe_loop.skills import install_skills
 
 
 class SkillDeploymentTests(unittest.TestCase):
@@ -87,6 +89,87 @@ class SkillDeploymentTests(unittest.TestCase):
         )
         self.assertFalse(any(report.drifted for report in reports))
 
+    def test_non_git_package_source_uses_immutable_release_provenance(self) -> None:
+        package_source = self.root / "installed-package" / "skills"
+        skill = package_source / "example"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("packaged\n", encoding="utf-8")
+        package = mock.Mock(version="9.8.7")
+        package.read_text.return_value = None
+
+        with (
+            mock.patch(
+                "vibe_loop.skill_deployment.metadata_distribution",
+                return_value=package,
+            ),
+            mock.patch(
+                "vibe_loop.skills.importlib.resources.files",
+                return_value=package_source.parent,
+            ),
+            mock.patch("vibe_loop.skills.SKILL_NAMES", ("example",)),
+        ):
+            install_skills(False, False, self.home)
+
+        manifest = json.loads(
+            (self.home / ".codex" / "skills" / MANIFEST_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        entry = manifest["entries"]["example/SKILL.md"]
+        self.assertEqual(
+            entry["source_repo"],
+            "https://github.com/ei-grad/vibe-loop",
+        )
+        self.assertEqual(entry["source_commit"], "package:vibe-loop@9.8.7")
+        self.assertEqual(entry["source_branch"], "main")
+        self.assertFalse(entry["source_dirty"])
+        self.assertEqual(entry["source_location"], str(package_source))
+        self.assertFalse(
+            any(report.drifted for report in verify_skill_deployments(self.home))
+        )
+
+    def test_non_git_vcs_package_preserves_non_mainline_revision_guard(self) -> None:
+        package_source = self.root / "vcs-package" / "skills"
+        skill = package_source / "example"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("packaged\n", encoding="utf-8")
+        package = mock.Mock(version="1.0.0")
+        package.read_text.return_value = json.dumps(
+            {
+                "url": "https://example.invalid/example-package.git",
+                "vcs_info": {
+                    "vcs": "git",
+                    "commit_id": "a" * 40,
+                    "requested_revision": "task-branch",
+                },
+            }
+        )
+
+        with mock.patch(
+            "vibe_loop.skill_deployment.metadata_distribution",
+            return_value=package,
+        ):
+            with self.assertRaisesRegex(SkillDeploymentError, "expected main"):
+                deploy_skill_bundle(
+                    source_root=package_source,
+                    skill_names=("example",),
+                    home=self.home,
+                    package_name="example-package",
+                )
+            deploy_skill_bundle(
+                source_root=package_source,
+                skill_names=("example",),
+                home=self.home,
+                package_name="example-package",
+                allow_unmerged=True,
+            )
+
+        reports = verify_skill_deployments(self.home)
+        self.assertEqual(
+            {entry.state for report in reports for entry in report.entries},
+            {"branch-sourced"},
+        )
+
     def test_install_refuses_dirty_or_non_mainline_source_without_override(
         self,
     ) -> None:
@@ -138,6 +221,24 @@ class SkillDeploymentTests(unittest.TestCase):
         self.assertTrue(diagnostics)
         self.assertEqual(installed.read_text(encoding="utf-8"), "version one\n")
 
+    def test_force_replaces_invalid_manifest_after_reporting_error(self) -> None:
+        self.deploy()
+        codex_manifest = self.home / ".codex" / "skills" / MANIFEST_NAME
+        codex_manifest.write_text(
+            json.dumps({"version": 2, "entries": {}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(SkillDeploymentError) as raised:
+            self.deploy()
+        self.assertIn("unsupported format", "\n".join(raised.exception.diagnostics))
+
+        diagnostics: list[str] = []
+        self.deploy(force=True, report_diagnostic=diagnostics.append)
+        self.assertIn("unsupported format", "\n".join(diagnostics))
+        reports = verify_skill_deployments(self.home)
+        self.assertFalse(any(report.blocking for report in reports))
+
     def test_verify_classifies_stale_runtime_edits_and_unmanaged_paths(self) -> None:
         self.deploy()
         source = self.repo / "skills" / "example" / "SKILL.md"
@@ -160,6 +261,17 @@ class SkillDeploymentTests(unittest.TestCase):
         self.assertEqual(edited_states["example/script.py"], "runtime-edited")
         self.assertIn("local-memory/state.md", edited_report.unmanaged)
         self.assertTrue(edited_report.blocking)
+
+        runtime_script.write_text("VALUE = 1\n", encoding="utf-8")
+        source.write_text("version one\n", encoding="utf-8")
+        unmanaged_only = verify_skill_deployments(self.home, codex=True)[0]
+        self.assertIn("local-memory/state.md", unmanaged_only.unmanaged)
+        self.assertFalse(unmanaged_only.drifted)
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            exit_code = main(["verify-skills", "--codex", "--home", str(self.home)])
+        self.assertEqual(exit_code, 0)
+        self.assertIn("local-memory/state.md: unmanaged", stdout.getvalue())
 
     def test_worker_preflight_ignores_unmanaged_roots_without_a_manifest(self) -> None:
         unmanaged = self.home / ".codex" / "skills" / "local-memory" / "state.md"

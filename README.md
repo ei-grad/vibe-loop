@@ -141,12 +141,14 @@ vibe-loop install-skills --codex --claude
 vibe-loop verify-skills
 ```
 
-Run installation from a clean checkout of the `main` branch. The command refuses
-dirty and non-mainline sources by default, writes both runtime directories even
-when `--codex` or `--claude` filters its report, and records per-file provenance
-in each target root. `verify-skills` is read-only and exits non-zero on drift.
-See [recorded skill deployment](docs/skill-deployment.md) for the manifest,
-overwrite guard, classifications, and worker-preflight policy.
+From a Git checkout, run installation from clean `main`; dirty and non-mainline
+sources are refused by default. Standalone package installations record their
+immutable package release provenance instead. The command writes both runtime
+directories even when `--codex` or `--claude` filters its report and records
+per-file provenance in each target root. `verify-skills` is read-only, exits
+non-zero on managed drift, and reports unmanaged paths without treating them as
+errors. See [recorded skill deployment](docs/skill-deployment.md) for the
+manifest, overwrite guard, classifications, and worker-preflight policy.
 
 The worker skills do not require the CLI; you can invoke them directly for manual
 bounded or unattended work. The `autopilot` operator skill does drive the CLI.
