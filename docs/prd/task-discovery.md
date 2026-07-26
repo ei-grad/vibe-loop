@@ -136,6 +136,16 @@ conflict-domain arrays mean undeclared domains; empty arrays explicitly declare
 none. Resource names match exactly, while repository-relative path domains
 conflict when one is an ancestor of another.
 
+`run-next` selects from the runnable set. `run <task_id>` instead resolves only
+the named task and never falls through to another task. Explicit dispatch
+requires that task to exist, have an allowed runnable status, have all
+dependencies done, have no existing task lock, and not conflict with domains
+held by live runs. It then enters the same lock acquisition, task-source
+activation, run-record, gate, review, and completion lifecycle as selected
+dispatch. A concurrent lock or activation refusal terminates the command with a
+diagnostic naming the requested task. Explicit dispatch does not reorder tasks
+or otherwise mutate task-source priority.
+
 Spec diagnostics are read-only by default. Repositories can opt into execution
 gates:
 
@@ -149,9 +159,9 @@ approved_states = ["approved"]
 override_commands = ["make specs-override"]
 ```
 
-The `require_*` settings gate `run-next` and `run-until-done`; read-only
-`doctor` and `specs check` remain available. Override commands are reported as
-repository-owned recovery guidance and are not run automatically.
+The `require_*` settings gate `run`, `run-next`, and `run-until-done`;
+read-only `doctor` and `specs check` remain available. Override commands are
+reported as repository-owned recovery guidance and are not run automatically.
 
 Related implementation IDs: `CORE-02`, `DISC-10`, `PAR-01`, `PAR-07`,
 `PAR-08`.

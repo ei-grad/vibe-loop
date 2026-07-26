@@ -336,6 +336,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_argument(run_next)
     run_next.add_argument("--ask-agent", action="store_true")
 
+    run_task = subparsers.add_parser("run", help="Run one explicitly named task")
+    add_repo_argument(run_task)
+    run_task.add_argument("task_id")
+
     run_all = subparsers.add_parser(
         "run-until-done",
         help="Run one-slice loops until no runnable tasks remain",
@@ -1002,6 +1006,11 @@ def dispatch(args: argparse.Namespace) -> int:
         if result is None:
             print("no runnable tasks", file=sys.stderr)
             return 2
+        print(json.dumps(result.to_json(), indent=2))
+        return 0 if result.classification == "completed" else 1
+
+    if args.command == "run":
+        result = VibeRunner(config).run_task_id(args.task_id)
         print(json.dumps(result.to_json(), indent=2))
         return 0 if result.classification == "completed" else 1
 

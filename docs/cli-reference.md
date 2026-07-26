@@ -13,12 +13,32 @@ product behavior:
 
 | Commands | Behavioral authority | Why |
 | --- | --- | --- |
-| `run-next`, `run-until-done` | [Run orchestration PRD](prd/run-orchestration.md#prd-orc-009-scheduler-and-runtime-separation) | The PRD owns scheduling, selection, conflict-domain, lifecycle, and budget contracts. |
+| `run`, `run-next`, `run-until-done` | [Run orchestration PRD](prd/run-orchestration.md#prd-orc-009-scheduler-and-runtime-separation) | The PRD owns scheduling, selection, conflict-domain, lifecycle, and budget contracts. |
 | `report`, `worker`, `main-integration` | [Worker supervision PRD](prd/worker-supervision.md#prd-wrk-003-worker-reports) | The PRD owns worker reports, workspace claims, candidate declarations, settlement, and integration locking. |
 | `eval` | [Evals and release PRD](prd/evals-release.md) | The PRD owns evaluation behavior, artifact contracts, external adapters, and release policy; the [evaluation strategy](skill-evaluation-strategy.md) provides methodology and rationale. |
 | Session linkage, recovery, and usage telemetry | [Autopilot PRD](prd/autopilot.md#prd-aut-013-observed-agent-session-id-and-transcript-linkage) | PRD-AUT-013, PRD-AUT-014, and PRD-AUT-016 own these run-provenance contracts. |
 
 ## Run Commands
+
+### `vibe-loop run`
+
+Run one explicitly named task:
+
+```bash
+vibe-loop run TASK-01 --repo .
+```
+
+- `TASK_ID` names the task to run. It is required, and no other task is ever
+  selected in its place.
+- `--repo PATH` selects the repository. It defaults to the current directory.
+
+Use this when the selection is already made. `run-next` answers "pick work for
+me"; `run` answers "run this one", and reports why it cannot rather than
+falling back to a different task. Output follows the same stdout, stderr, log,
+and `run_id` conventions as `run-next`.
+
+The explicit-dispatch and selection contract is
+[Task Selection Semantics](prd/task-discovery.md#prd-tsk-007-task-selection-semantics).
 
 ### `vibe-loop run-next`
 

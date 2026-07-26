@@ -38,6 +38,7 @@ from vibe_loop.config import (
     resolve_task_agent,
     shell_quote,
 )
+from vibe_loop.generated_profiles import RuntimeTaskSourceResolution
 from vibe_loop.locks import (
     LockBusy,
     LockManager,
@@ -71,6 +72,7 @@ from vibe_loop.runner import (
     AgentRuntimeContext,
     PostReportActivityMonitor,
     SchedulerLockBusy,
+    ExplicitTaskDispatchError,
     TaskActivationError,
     VibeRunner,
     active_lock_conflict_domains,
@@ -207,6 +209,301 @@ def file_fingerprint(path: Path, relative_path: str) -> dict[str, object]:
 
 
 class RunnerTests(unittest.TestCase):
+    def explicit_runner(self, repo: Path, tasks: list[Task]) -> VibeRunner:
+        task_source = TaskSourceConfig(
+            type="markdown-plan",
+            runnable_statuses=("Next",),
+            explicit_keys=frozenset({"type"}),
+        )
+        runner = VibeRunner(
+            VibeConfig(
+                repo=repo,
+                agent=AgentConfig(command="worker"),
+                task_source=task_source,
+            )
+        )
+        runner._source = MutableTaskSource(tasks)
+        runner._source_resolution = RuntimeTaskSourceResolution(
+            task_source=task_source,
+            origin="test",
+        )
+        return runner
+
+    def test_run_task_id_dispatches_only_the_named_task_through_supervision(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            tasks = [
+                Task(task_id="TASK-01", title="First", status="Next"),
+                Task(task_id="TASK-02", title="Second", status="Next"),
+            ]
+            runner = self.explicit_runner(Path(directory), tasks)
+            expected = RunResult(
+                run_id="run-2",
+                task_id="TASK-02",
+                classification="completed",
+                exit_code=0,
+                log_path=Path(directory) / "run.log",
+                start_main="aaa",
+                end_main="bbb",
+            )
+
+            with (
+                patch.object(runner, "ensure_spec_execution_gate"),
+                patch.object(runner, "require_worker_launch_config"),
+                patch.object(
+                    runner,
+                    "run_task_with_supervision",
+                    return_value=expected,
+                ) as run_task,
+            ):
+                result = runner.run_task_id("TASK-02")
+
+        self.assertIs(result, expected)
+        run_task.assert_called_once_with(tasks[1])
+
+    def test_run_task_id_rejects_unknown_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [Task(task_id="TASK-01", title="First", status="Next")],
+            )
+
+            with self.assertRaisesRegex(
+                ExplicitTaskDispatchError,
+                "unknown task 'TASK-99'",
+            ):
+                runner.run_task_id("TASK-99")
+
+    def test_run_task_id_rejects_dependency_blocked_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [
+                    Task(task_id="BLOCKER", title="Blocker", status="Next"),
+                    Task(
+                        task_id="TASK-02",
+                        title="Blocked",
+                        status="Next",
+                        dependencies=("BLOCKER",),
+                    ),
+                ],
+            )
+
+            with self.assertRaisesRegex(
+                ExplicitTaskDispatchError,
+                "task 'TASK-02' is dependency-blocked by: BLOCKER",
+            ):
+                runner.run_task_id("TASK-02")
+
+    def test_run_task_id_rejects_on_hold_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [Task(task_id="TASK-01", title="Held", status="on-hold")],
+            )
+
+            with self.assertRaisesRegex(
+                ExplicitTaskDispatchError,
+                "task 'TASK-01' is not runnable with status 'on-hold'",
+            ):
+                runner.run_task_id("TASK-01")
+
+    def test_run_task_id_rejects_completed_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [Task(task_id="TASK-01", title="Complete", status="Done")],
+            )
+
+            with self.assertRaisesRegex(
+                ExplicitTaskDispatchError,
+                "task 'TASK-01' is already complete with status 'Done'",
+            ):
+                runner.run_task_id("TASK-01")
+
+    def test_run_task_id_rejects_existing_task_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [Task(task_id="TASK-01", title="Locked", status="Next")],
+            )
+            held_lock = runner.lock_manager.acquire("TASK-01", "live-run")
+            try:
+                with self.assertRaisesRegex(
+                    ExplicitTaskDispatchError,
+                    "task 'TASK-01' has an existing task lock",
+                ):
+                    runner.run_task_id("TASK-01")
+            finally:
+                runner.lock_manager.release(held_lock)
+
+    def test_run_task_id_reports_lock_race_without_selecting_another_task(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self.explicit_runner(
+                Path(directory),
+                [
+                    Task(task_id="TASK-01", title="Requested", status="Next"),
+                    Task(task_id="TASK-02", title="Other", status="Next"),
+                ],
+            )
+
+            with (
+                patch.object(runner, "ensure_spec_execution_gate"),
+                patch.object(runner, "require_worker_launch_config"),
+                patch.object(
+                    runner,
+                    "run_task_with_supervision",
+                    side_effect=LockBusy(
+                        Path(directory) / "TASK-01.lock",
+                        {"task_id": "TASK-01"},
+                    ),
+                ) as run_task,
+                self.assertRaisesRegex(
+                    ExplicitTaskDispatchError,
+                    "task 'TASK-01' has an existing task lock",
+                ),
+            ):
+                runner.run_task_id("TASK-01")
+
+        run_task.assert_called_once()
+
+    def test_run_task_id_rejects_live_conflict_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = self.explicit_runner(
+                repo,
+                [
+                    Task(
+                        task_id="TASK-01",
+                        title="Conflicting",
+                        status="Next",
+                        resources=("database",),
+                        conflict_domains_known=True,
+                    )
+                ],
+            )
+            active = _active_run_state(
+                task_id="ACTIVE-01",
+                run_id="live-run",
+                worker_pid=os.getpid(),
+                host=socket.gethostname(),
+                repo=repo,
+                resources=("database",),
+            )
+            held_lock = runner.lock_manager.acquire(
+                "ACTIVE-01",
+                "live-run",
+                metadata=active.to_lock_metadata(),
+            )
+            try:
+                with self.assertRaisesRegex(
+                    ExplicitTaskDispatchError,
+                    "task 'TASK-01' is excluded by a conflict domain",
+                ):
+                    runner.run_task_id("TASK-01")
+            finally:
+                runner.lock_manager.release(held_lock)
+
+    def test_run_task_id_uses_full_runnable_scope_for_conflict_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            requested = Task(
+                task_id="TASK-REQ",
+                title="Undeclared requested task",
+                status="Next",
+            )
+            runner = self.explicit_runner(
+                repo,
+                [
+                    requested,
+                    Task(
+                        task_id="TASK-OTHER",
+                        title="Declared candidate",
+                        status="Next",
+                        resources=("database",),
+                        conflict_domains_known=True,
+                    ),
+                ],
+            )
+            active = dataclasses.replace(
+                _active_run_state(
+                    task_id="ACTIVE-01",
+                    run_id="live-run",
+                    worker_pid=os.getpid(),
+                    host=socket.gethostname(),
+                    repo=repo,
+                ),
+                conflict_domains_known=False,
+            )
+            held_lock = runner.lock_manager.acquire(
+                "ACTIVE-01",
+                "live-run",
+                metadata=active.to_lock_metadata(),
+            )
+            try:
+                with (
+                    patch.object(runner, "run_task_with_supervision") as run_task,
+                    self.assertRaisesRegex(
+                        ExplicitTaskDispatchError,
+                        "task 'TASK-REQ' is excluded by a conflict domain",
+                    ),
+                ):
+                    runner.run_task_id("TASK-REQ")
+            finally:
+                runner.lock_manager.release(held_lock)
+
+        run_task.assert_not_called()
+
+    def test_run_task_id_carries_runnable_conflict_policy_to_supervision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            requested = Task(
+                task_id="TASK-REQ",
+                title="Undeclared requested task",
+                status="Next",
+            )
+            runner = self.explicit_runner(
+                Path(directory),
+                [
+                    requested,
+                    Task(
+                        task_id="TASK-OTHER",
+                        title="Declared candidate",
+                        status="Next",
+                        resources=("database",),
+                        conflict_domains_known=True,
+                    ),
+                ],
+            )
+            expected = RunResult(
+                run_id="run-requested",
+                task_id="TASK-REQ",
+                classification="completed",
+                exit_code=0,
+                log_path=Path(directory) / "run.log",
+                start_main="aaa",
+                end_main="bbb",
+            )
+
+            with (
+                patch.object(runner, "ensure_spec_execution_gate"),
+                patch.object(runner, "require_worker_launch_config"),
+                patch.object(
+                    runner,
+                    "run_task_with_supervision",
+                    return_value=expected,
+                ) as run_task,
+            ):
+                result = runner.run_task_id("TASK-REQ")
+
+        self.assertIs(result, expected)
+        run_task.assert_called_once_with(
+            requested,
+            enforce_resource_conflicts=True,
+        )
+
     def test_worker_workspace_environment_uses_canonical_claimed_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2403,6 +2700,53 @@ class RunnerTests(unittest.TestCase):
                         task,
                         "run-task",
                         active_state,
+                    )
+            finally:
+                runner.lock_manager.release(held_lock)
+
+        self.assertEqual(busy.exception.metadata["reason"], "resource_conflict")
+        self.assertFalse(runner.lock_manager.is_locked("TASK-01"))
+
+    def test_task_lock_acquire_preserves_snapshot_conflict_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            task = Task(
+                task_id="TASK-01",
+                title="Undeclared task",
+                status="Next",
+            )
+            active_state = ActiveRunState.new(
+                task_id=task.task_id,
+                run_id="run-task",
+                log_path=repo / "run.log",
+                base_main="aaa",
+                command="worker",
+            )
+            live = dataclasses.replace(
+                _active_run_state(
+                    task_id="ACTIVE-01",
+                    run_id="external-run",
+                    worker_pid=os.getpid(),
+                    host=socket.gethostname(),
+                    repo=repo,
+                ),
+                conflict_domains_known=False,
+            )
+            held_lock = runner.lock_manager.acquire(
+                "ACTIVE-01",
+                "external-run",
+                metadata=live.to_lock_metadata(),
+            )
+            try:
+                with self.assertRaises(LockBusy) as busy:
+                    runner.acquire_scheduled_task_lock(
+                        task,
+                        "run-task",
+                        active_state,
+                        enforce_resource_conflicts=True,
                     )
             finally:
                 runner.lock_manager.release(held_lock)
