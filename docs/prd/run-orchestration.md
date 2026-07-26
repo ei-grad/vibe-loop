@@ -82,7 +82,10 @@ refreshed automatically when it is clean by merging the current main base into
 the owned branch. Commits reachable only from the task branch are preserved by
 the merge. A content conflict is aborted, recorded as the distinct
 `workspace_refresh_conflict` condition, and leaves the branch and worktree
-unchanged for deliberate resolution. Any condition that cannot be proven -- an
+unchanged for deliberate resolution. Any failed merge that entered merge state
+is aborted before its failure is recorded, including failures from repository
+commit hooks. An abort failure is a distinct restoration condition rather than
+ordinary dirty-work evidence. Any condition that cannot be proven -- an
 unreadable Git state, a HEAD that moved under the check, a recovery adoption
 resuming against a recorded workspace state -- falls back to deferral. The
 preflight records a bounded typed decision, retry disposition, and -- when a

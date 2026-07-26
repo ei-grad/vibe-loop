@@ -6438,6 +6438,48 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 )
                 self.assertFalse((worktree / "main-change.txt").exists())
 
+    def test_stale_workspace_refresh_aborts_commit_hook_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, store, first, _stale_base, current_base = self._stale_workspace(
+                directory
+            )
+            (first.worktree / "candidate.txt").write_text(
+                "candidate\n", encoding="utf-8"
+            )
+            git(first.worktree, "add", "candidate.txt")
+            git(first.worktree, "commit", "-m", "candidate")
+            stale_head = git(first.worktree, "rev-parse", "HEAD").stdout.strip()
+            hook = repo / ".git" / "hooks" / "commit-msg"
+            hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+            hook.chmod(0o755)
+
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                self._adopt_stale(repo, store, current_base)
+
+            self.assertEqual(raised.exception.code, "workspace_stale_current_base")
+            self.assertEqual(
+                raised.exception.details["refresh_refused"], "merge_failed"
+            )
+            self.assertEqual(
+                git(first.worktree, "rev-parse", "HEAD").stdout.strip(), stale_head
+            )
+            self.assertEqual(git(first.worktree, "status", "--short").stdout, "")
+            self.assertNotEqual(
+                git(
+                    first.worktree,
+                    "rev-parse",
+                    "--verify",
+                    "-q",
+                    "MERGE_HEAD",
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertTrue((first.worktree / "candidate.txt").exists())
+            self.assertFalse((first.worktree / "main-change.txt").exists())
+            preflight = self._last_rejected_preflight(store)
+            self.assertEqual(preflight["refresh_refused"], "merge_failed")
+
     def test_stale_workspace_refresh_defers_when_the_dirty_snapshot_is_unreadable(
         self,
     ) -> None:

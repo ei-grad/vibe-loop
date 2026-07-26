@@ -739,15 +739,15 @@ ordinary interval wake.
 An ordinary restartable-backoff wait captures a complete task-source snapshot
 after the failed child and compares subsequent snapshots with that post-child
 fingerprint. A same-cardinality replacement or content/source edit can wake the
-next cycle early. When the child durably started a run, lifecycle-status or
-counter-only churn, an unchanged runnable task, and idle-wake-adapter events do
-not wake restartable backoff: those inputs must not reset the child-local retry
-budget or collapse exhausted-retry protection into a dispatch loop. A
-restartable child that appended zero `run_started` records while its starting
-queue was runnable instead uses the idle runnable-work recheck; already
-dispatchable work with a free slot must not incur the full interval. A
-zero-second limit-wall result falls back to the applicable ordinary wait.
-Positive limit-wall pauses retain their dedicated stop-responsive wait.
+next cycle early. Lifecycle-status or counter-only churn, an unchanged runnable
+task, and idle-wake-adapter events do not wake restartable backoff: those inputs
+must not reset the child-local retry budget or collapse exhausted-retry
+protection into a dispatch loop. The same rule applies when the child appended
+zero `run_started` records: the queue's runnable count does not account for
+child-local workspace and attempt deferrals, so only a material source change
+wakes the wait early. A zero-second limit-wall result falls back to the
+applicable ordinary wait. Positive limit-wall pauses retain their dedicated
+stop-responsive wait.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 

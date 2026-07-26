@@ -63,15 +63,12 @@ WORKSPACE_REFRESH_REFUSALS = frozenset(
     {
         "dirty_snapshot_unreadable",
         "dirty_workspace",
-        "fast_forward_refused",
         "head_unreadable_or_moved",
         "merge_failed",
         "recovery_adoption",
         "refresh_did_not_reach_base",
         "status_unreadable",
         "tracked_modification_behind_ignored_path",
-        "unique_commits",
-        "unique_commits_unreadable",
     }
 )
 CANDIDATE_RECORDED_RECORD_TYPE = "candidate_recorded"

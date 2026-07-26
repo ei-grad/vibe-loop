@@ -6330,35 +6330,39 @@ def require_positive_min_ready(min_ready: int) -> int:
 
 
 def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
-    """Whether a finished cycle should poll for dispatchable tasks.
+    """Whether a finished cycle should use the adaptive idle waiter.
 
     An idle cycle is one that neither dispatched nor observed a child because
     runnable work was below ``min_ready`` or because a successful child exited
-    without durable ``run_started`` evidence. A restartable child with the same
-    zero-dispatch evidence also rechecks when its starting queue was runnable:
-    unchanged task-source content must not force a full retry interval while a
-    slot and work are already available.
+    without durable ``run_started`` evidence. Both cases poll for task-source
+    changes, but only the below-threshold case wakes merely because the runnable
+    count reaches ``min_ready``.
 
     An idle cycle with no planning command configured still rechecks: that is
     deliberate, so out-of-band task additions (a peer or operator filling the
     board) are picked up without waiting the full interval.
     """
-    if result.status == "idle":
-        return True
-    return (
-        result.status == "restartable"
-        and result.dispatched_runs == 0
-        and "launched_run_until_done" in result.actions
-        and result.project_status.queue.runnable > 0
+    return result.status == "idle"
+
+
+def cycle_should_wake_on_runnable(result: AutopilotCycleResult) -> bool:
+    """Whether an idle wait may wake on runnable count without a source change.
+
+    A child that just found zero dispatchable tasks is stronger evidence than
+    the queue's coarse runnable count. Re-waking that child on the same count
+    would spin on tasks suppressed by workspace or attempt-state deferrals.
+    """
+    return cycle_should_recheck(result) and (
+        "launched_run_until_done" not in result.actions
     )
 
 
 def cycle_should_poll_task_source(result: AutopilotCycleResult) -> bool:
     """Whether a cycle wait should wake on a material task-source change.
 
-    Idle and zero-dispatch restartable cycles also wake when enough runnable
-    work appears. A restartable cycle that did dispatch retains its retry
-    cooldown and wakes only when the source fingerprint changes.
+    Idle cycles and restartable cycles use the same bounded polling machinery.
+    Only an idle cycle that never launched a child wakes on runnable count
+    alone; post-child waits require a material source change.
     """
     return cycle_should_recheck(result) or result.status == "restartable"
 
@@ -7458,7 +7462,7 @@ def run_autopilot(
                             if worker_holds_active_conflict(worker)
                         ),
                         baseline_fingerprint=baseline_fingerprint,
-                        wake_on_runnable=cycle_should_recheck(result),
+                        wake_on_runnable=cycle_should_wake_on_runnable(result),
                     )
                     run_store.append_record(wait_result.to_record(config.repo))
                     wait_name = (

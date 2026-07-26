@@ -5099,7 +5099,7 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertTrue(status.source_error)
         self.assertEqual(observed_timeouts, [7.5])
 
-    def test_cycle_should_recheck_idle_and_zero_dispatch_restartable(self) -> None:
+    def test_cycle_should_recheck_only_idle_cycles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready scope")])
@@ -5122,12 +5122,6 @@ class AutopilotRecheckTests(unittest.TestCase):
             )
 
         self.assertTrue(cycle_should_recheck(result("idle")))
-        self.assertTrue(cycle_should_recheck(result("restartable", launched=True)))
-        self.assertFalse(
-            cycle_should_recheck(
-                result("restartable", dispatched_runs=1, launched=True)
-            )
-        )
         for status in (
             "completed",
             "restartable",
@@ -5162,7 +5156,7 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertEqual(first.status, "idle")
         self.assertEqual(first.dispatched_runs, 0)
         self.assertIn("child_completed_without_dispatch", first.actions)
-        self.assertEqual(sleeps, [10.0])
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
         cycle_record = next(
             record
             for record in records
@@ -5176,10 +5170,12 @@ class AutopilotRecheckTests(unittest.TestCase):
             for record in records
             if record.get("record_type") == AUTOPILOT_IDLE_WAIT_RECORD_TYPE
         )
-        self.assertNotEqual(idle_wait["wake_reason"], "deadline")
+        self.assertEqual(idle_wait["wake_reason"], "deadline")
         self.assertGreater(idle_wait["poll_count"], 0)
 
-    def test_zero_dispatch_restartable_wakes_on_already_runnable_work(self) -> None:
+    def test_zero_dispatch_restartable_retains_backoff_for_unchanged_work(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(
@@ -5201,8 +5197,8 @@ class AutopilotRecheckTests(unittest.TestCase):
         first = summary.cycles[0]
         self.assertEqual(first.status, "restartable")
         self.assertEqual(first.dispatched_runs, 0)
-        self.assertTrue(cycle_should_recheck(first))
-        self.assertEqual(sleeps, [10.0])
+        self.assertFalse(cycle_should_recheck(first))
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 30.0])
 
     def test_task_source_polling_includes_restartable_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

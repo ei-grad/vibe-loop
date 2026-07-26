@@ -5449,6 +5449,7 @@ WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
         "workspace_main_history_mismatch",
         "workspace_ownership_unverified",
         "workspace_refresh_conflict",
+        "workspace_refresh_restore_failed",
         "workspace_stale_current_base",
     }
 )
@@ -6133,24 +6134,32 @@ class WorkspaceProvisioner:
                 "--name-only",
                 "--diff-filter=U",
             )
-            if conflicts.returncode == 0 and conflicts.stdout.splitlines():
-                conflict_paths = [
-                    path for path in conflicts.stdout.splitlines() if path.strip()
-                ][:20]
+            conflict_paths = (
+                [path for path in conflicts.stdout.splitlines() if path.strip()][:20]
+                if conflicts.returncode == 0
+                else []
+            )
+            merge_head = self._git_result_at(
+                worktree,
+                "rev-parse",
+                "--verify",
+                "-q",
+                "MERGE_HEAD",
+            )
+            if merge_head.returncode == 0:
                 aborted = self._git_result_at(worktree, "merge", "--abort")
                 if aborted.returncode != 0:
                     raise WorkspaceProvisionError(
-                        "workspace_refresh_conflict",
-                        "mainline refresh conflicted and git could not restore "
-                        "the owned branch",
+                        "workspace_refresh_restore_failed",
+                        "failed mainline refresh could not restore the owned branch",
                         details={
                             "selected_base": base_commit,
                             "workspace_base": owner_base,
                             "head_commit": head,
                             "conflict_paths": conflict_paths,
-                            "merge_abort_failed": True,
                         },
                     )
+            if conflict_paths:
                 raise WorkspaceProvisionError(
                     "workspace_refresh_conflict",
                     "mainline refresh conflicts with the owned task branch",
