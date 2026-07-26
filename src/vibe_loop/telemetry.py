@@ -134,6 +134,7 @@ ACCOUNT_WALL_DISABLED_REASONS = frozenset(
         "seat_tier_zero_credit_limit",
     }
 )
+ACCOUNT_WALL_NOT_REPORTED = "not_reported"
 ACCOUNT_WALL_UNKNOWN = "unknown"
 SENSITIVE_METADATA_MARKERS = (
     "credential",
@@ -279,7 +280,7 @@ def _sanitize_account_wall_observations(
             not isinstance(provider, str)
             or provider not in CANONICAL_USAGE_PROVIDERS
             or not isinstance(status, str)
-            or status not in ACCOUNT_WALL_STATUSES
+            or status not in {*ACCOUNT_WALL_STATUSES, ACCOUNT_WALL_UNKNOWN}
             or not isinstance(window, str)
             or window not in {*ACCOUNT_WALL_WINDOWS, ACCOUNT_WALL_UNKNOWN}
             or observed_at is None
@@ -287,10 +288,18 @@ def _sanitize_account_wall_observations(
             or not 0 < resets_at <= 253402300799
             or not isinstance(overage_status, str)
             or overage_status
-            not in {*ACCOUNT_WALL_OVERAGE_STATUSES, ACCOUNT_WALL_UNKNOWN}
+            not in {
+                *ACCOUNT_WALL_OVERAGE_STATUSES,
+                ACCOUNT_WALL_NOT_REPORTED,
+                ACCOUNT_WALL_UNKNOWN,
+            }
             or not isinstance(disabled_reason, str)
             or disabled_reason
-            not in {*ACCOUNT_WALL_DISABLED_REASONS, ACCOUNT_WALL_UNKNOWN}
+            not in {
+                *ACCOUNT_WALL_DISABLED_REASONS,
+                ACCOUNT_WALL_NOT_REPORTED,
+                ACCOUNT_WALL_UNKNOWN,
+            }
         ):
             continue
         observations.append(
@@ -772,15 +781,17 @@ def parse_claude_rate_limit_event(
     info = payload.get("rate_limit_info")
     if not isinstance(info, Mapping):
         return None
-    status = info.get("status")
+    status_value = info.get("status")
     resets_at = _integer(info.get("resetsAt"))
     if (
-        not isinstance(status, str)
-        or status not in ACCOUNT_WALL_STATUSES
+        not isinstance(status_value, str)
         or resets_at is None
         or not 0 < resets_at <= 253402300799
     ):
         return None
+    status = (
+        status_value if status_value in ACCOUNT_WALL_STATUSES else ACCOUNT_WALL_UNKNOWN
+    )
     timestamp = payload.get("timestamp")
     if timestamp is not None:
         observation = parse_timestamp(timestamp)
@@ -796,17 +807,25 @@ def parse_claude_rate_limit_event(
     )
     overage_value = info.get("overageStatus")
     overage_status = (
-        overage_value
-        if isinstance(overage_value, str)
-        and overage_value in ACCOUNT_WALL_OVERAGE_STATUSES
-        else ACCOUNT_WALL_UNKNOWN
+        ACCOUNT_WALL_NOT_REPORTED
+        if overage_value is None
+        else (
+            overage_value
+            if isinstance(overage_value, str)
+            and overage_value in ACCOUNT_WALL_OVERAGE_STATUSES
+            else ACCOUNT_WALL_UNKNOWN
+        )
     )
     reason_value = info.get("overageDisabledReason")
     disabled_reason = (
-        reason_value
-        if isinstance(reason_value, str)
-        and reason_value in ACCOUNT_WALL_DISABLED_REASONS
-        else ACCOUNT_WALL_UNKNOWN
+        ACCOUNT_WALL_NOT_REPORTED
+        if reason_value is None
+        else (
+            reason_value
+            if isinstance(reason_value, str)
+            and reason_value in ACCOUNT_WALL_DISABLED_REASONS
+            else ACCOUNT_WALL_UNKNOWN
+        )
     )
     return AccountWallObservation(
         provider="anthropic",
@@ -1419,16 +1438,9 @@ def _quota_account_wall_summary(
                 _quota_provider_group(observation_provider),
             )
             account_group["account_wall_evidence_available"] = True
-            account_group["account_wall_observations"] = (
-                int(account_group["account_wall_observations"]) + 1
-            )
             latest = account_group["latest_account_wall_observations"]
             assert isinstance(latest, list)
             latest.append(observation)
-            observed_at = parse_timestamp(observation["observed_at"])
-            prior = parse_timestamp(account_group["account_wall_last_observed_at"])
-            if observed_at is not None and (prior is None or observed_at > prior):
-                account_group["account_wall_last_observed_at"] = observed_at.isoformat()
         if record.get("classification") == "limit_wall":
             group["account_wall_evidence_available"] = True
             group["account_wall_observations"] = (

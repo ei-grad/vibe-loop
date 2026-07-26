@@ -305,15 +305,30 @@ def test_malformed_quota_snapshot_is_unavailable_and_redacted() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "status", "window"),
+    ("name", "status", "window", "disabled_reason"),
     [
-        ("claude-rate-limit-allowed.json", "allowed", "five_hour"),
-        ("claude-rate-limit-limited.json", "allowed_warning", "seven_day_sonnet"),
-        ("claude-rate-limit-rejected.json", "rejected", "five_hour"),
+        (
+            "claude-rate-limit-allowed.json",
+            "allowed",
+            "five_hour",
+            "org_level_disabled",
+        ),
+        (
+            "claude-rate-limit-limited.json",
+            "allowed_warning",
+            "seven_day_sonnet",
+            "not_reported",
+        ),
+        (
+            "claude-rate-limit-rejected.json",
+            "rejected",
+            "five_hour",
+            "member_zero_credit_limit",
+        ),
     ],
 )
 def test_claude_rate_limit_event_keeps_only_bounded_account_wall_fields(
-    name: str, status: str, window: str
+    name: str, status: str, window: str, disabled_reason: str
 ) -> None:
     observation = parse_claude_rate_limit_event(
         fixture(name),
@@ -325,21 +340,44 @@ def test_claude_rate_limit_event_keeps_only_bounded_account_wall_fields(
     assert observation.status == status
     assert observation.window == window
     assert observation.resets_at > 0
+    assert observation.disabled_reason == disabled_reason
 
 
 def test_claude_rate_limit_unknown_values_normalize_without_payload_text() -> None:
     payload = fixture("claude-rate-limit-unknown-kind.json")
+    info = payload["rate_limit_info"]
+    assert isinstance(info, dict)
+    info["status"] = "future_hard_block"
     observation = parse_claude_rate_limit_event(payload)
 
     assert observation is not None
+    assert observation.status == "unknown"
     assert observation.window == "unknown"
     assert observation.overage_status == "unknown"
     assert observation.disabled_reason == "unknown"
     encoded = json.dumps(observation.to_stats())
+    sanitized = sanitize_run_stats(
+        {"account_wall_observations": [observation.to_stats()]}
+    )
+    assert sanitized["account_wall_observations"][0]["status"] == "unknown"
     assert "PRIVATE COMMAND" not in encoded
     assert "credential-value" not in encoded
     assert "sk-secret-canary" not in encoded
     assert "RAW TRANSCRIPT" not in encoded
+
+
+def test_claude_rate_limit_missing_optional_values_are_not_reported() -> None:
+    payload = fixture("claude-rate-limit-allowed.json")
+    info = payload["rate_limit_info"]
+    assert isinstance(info, dict)
+    info.pop("overageStatus")
+    info.pop("overageDisabledReason")
+
+    observation = parse_claude_rate_limit_event(payload)
+
+    assert observation is not None
+    assert observation.overage_status == "not_reported"
+    assert observation.disabled_reason == "not_reported"
 
 
 def test_malformed_claude_rate_limit_event_is_unavailable_and_redacted() -> None:
@@ -428,6 +466,8 @@ def test_claude_account_wall_summary_has_evidence_without_percent_forecast() -> 
     assert provider["quota_evidence_available"] is False
     assert provider["quota_unavailable_reason"] == "quota_snapshot_not_reported"
     assert provider["account_wall_evidence_available"] is True
+    assert provider["account_wall_observations"] == 0
+    assert provider["account_wall_last_observed_at"] is None
     assert provider["forecasts"] == []
     assert provider["latest_account_wall_observations"] == [
         {
@@ -440,6 +480,31 @@ def test_claude_account_wall_summary_has_evidence_without_percent_forecast() -> 
             "disabled_reason": "member_zero_credit_limit",
         }
     ]
+
+
+def test_claude_account_wall_state_does_not_double_count_limit_wall_runs() -> None:
+    observer = ProviderUsageObserver("anthropic")
+    observer.observe_line(json.dumps(fixture("claude-rate-limit-rejected.json")))
+    finished = datetime(2026, 7, 21, 12, 5, tzinfo=UTC)
+    record = run_record(
+        "claude-limit-wall",
+        "task-account-wall",
+        finished,
+        provider="anthropic",
+        classification="limit_wall",
+    )
+    record["stats"] = observer.usage.to_stats(phase="implementation")
+
+    summary = rolling_usage_summary(
+        [record],
+        project="demo",
+        now=datetime(2026, 7, 21, 13, 0, tzinfo=UTC),
+    )
+    provider = summary["quota_account_wall"]["providers"][0]
+
+    assert provider["account_wall_evidence_available"] is True
+    assert provider["account_wall_observations"] == 1
+    assert provider["account_wall_last_observed_at"] == finished.isoformat()
 
 
 def test_provider_usage_without_cache_fields_keeps_fresh_input() -> None:
@@ -1109,7 +1174,7 @@ def test_runs_summary_text_separates_quota_account_wall(tmp_path: Path, capsys) 
         datetime.now(UTC) - timedelta(minutes=1),
     )
     observer = ProviderUsageObserver("anthropic")
-    observer.observe_line(json.dumps(fixture("claude-rate-limit-rejected.json")))
+    observer.observe_line(json.dumps(fixture("claude-rate-limit-limited.json")))
     record["stats"] = observer.usage.to_stats(phase="implementation")
     runs_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
 
@@ -1121,9 +1186,31 @@ def test_runs_summary_text_separates_quota_account_wall(tmp_path: Path, capsys) 
     assert "quota/account-wall: evidence_available=true" in output.out
     assert "quota_unavailable_reason=quota_snapshot_not_reported" in output.out
     assert (
-        "account_wall=window=five_hour status=rejected resets_at=1784660400"
-        in output.out
+        "account_wall=window=seven_day_sonnet status=allowed_warning "
+        "resets_at=1785247200 overage_status=allowed "
+        "disabled_reason=not_reported" in output.out
     )
+
+
+def test_runs_summary_text_reports_unavailable_account_wall_evidence(
+    tmp_path: Path, capsys
+) -> None:
+    repo = tmp_path / "demo"
+    runs_path = repo / ".vibe-loop" / "runs.jsonl"
+    runs_path.parent.mkdir(parents=True)
+    record = run_record(
+        "run-1",
+        "task-1",
+        datetime.now(UTC) - timedelta(minutes=1),
+    )
+    runs_path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+    exit_code = main(["runs", "summary", "--repo", str(repo)])
+    output = capsys.readouterr()
+
+    assert exit_code == 0
+    assert output.err == ""
+    assert "quota/account-wall: evidence_available=false" in output.out
 
 
 def test_rolling_summary_exposes_open_attempt_breakers_without_task_text() -> None:

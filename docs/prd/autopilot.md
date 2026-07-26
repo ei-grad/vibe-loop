@@ -1067,15 +1067,18 @@ epochs are never combined. Missing or malformed evidence does not produce an
 inferred quota from transcript bytes or token totals.
 
 Native Claude `rate_limit_event` stream records provide account-wall state
-without used-percent evidence. Telemetry retains only allowlisted status,
-window kind, reset time, overage status, observation time, and normalized
-disabled-reason enum values. Unknown kinds and reasons normalize to `unknown`;
-malformed timestamps and structural fields produce no observation. Comparable
-observations merge monotonically by provider and window, and summaries expose
-the latest observation for each window. These observations make account-wall
-evidence available but leave percent-based quota evidence and exhaustion
-forecasts explicitly unavailable. Raw event payloads and arbitrary event text
-are never persisted.
+without used-percent evidence. Telemetry retains only bounded normalized status,
+window kind, reset time, overage status, observation time, and disabled-reason
+enum values. Unrecognized string enum values normalize to `unknown`, while
+absent optional overage fields normalize to `not_reported`; malformed timestamps
+and required structural fields produce no observation.
+Comparable observations merge monotonically by provider and window, and
+summaries expose the latest observation for each window. These observations
+make account-wall evidence available but do not increment the historical
+account-wall count or last-hit timestamp, which remain limited to classified
+`limit_wall` runs. Percent-based quota evidence and exhaustion forecasts remain
+explicitly unavailable. Raw event payloads and arbitrary event text are never
+persisted.
 
 Worker usage defaults to implementation. An allowlisted `phase` and optional
 `review` or `discovery` `work_kind` from the terminal worker report can refine
