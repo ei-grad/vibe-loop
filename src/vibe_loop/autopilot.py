@@ -220,8 +220,12 @@ class SupervisorStatus:
     observed_at: str = ""
     record: dict[str, Any] | None = None
     blocker: str = ""
+    config: dict[str, object] = dataclasses.field(default_factory=dict)
+    advisories: tuple[dict[str, object], ...] = ()
 
     def to_json(self) -> dict[str, object]:
+        record = dict(self.record or {})
+        record.pop("config_key_fingerprints", None)
         payload = {
             "state": self.state,
             "pid": self.pid,
@@ -229,8 +233,10 @@ class SupervisorStatus:
             "run_id": self.run_id,
             "cycle_id": self.cycle_id,
             "observed_at": self.observed_at,
-            "record": self.record or {},
+            "record": record,
             "blocker": self.blocker,
+            "config": dict(self.config),
+            "advisories": [dict(advisory) for advisory in self.advisories],
         }
         redacted = redact_fencing_token_payload(payload)
         assert isinstance(redacted, dict)
@@ -319,6 +325,7 @@ class ProjectStatus:
     workspace_diagnostics: tuple[dict[str, object], ...] = ()
     supervisor: SupervisorStatus = dataclasses.field(default_factory=SupervisorStatus)
     blockers: tuple[str, ...] = ()
+    advisories: tuple[dict[str, object], ...] = ()
     observations: tuple[str, ...] = ()
     last_cycle: CycleSummary | None = None
     next_wake: str = ""
@@ -347,6 +354,7 @@ class ProjectStatus:
             ],
             "supervisor": self.supervisor.to_json(),
             "blockers": list(self.blockers),
+            "advisories": [dict(advisory) for advisory in self.advisories],
             "observations": list(self.observations),
             "last_cycle": (
                 self.last_cycle.to_json() if self.last_cycle is not None else None
@@ -498,6 +506,7 @@ def collect_project_status(
         run_store,
         supervisor_lock=supervisor_lock,
         process_exists=process_exists,
+        current_config=config,
     )
     workspace_diagnostics = tuple(
         diagnostic.to_json()
@@ -543,6 +552,7 @@ def collect_project_status(
         workspace_diagnostics=workspace_diagnostics,
         supervisor=supervisor,
         blockers=blockers,
+        advisories=supervisor.advisories,
         observations=observations,
         last_cycle=last_cycle,
         next_wake=next_wake,
@@ -763,6 +773,7 @@ def collect_supervisor_status(
     *,
     supervisor_lock: IntegrationLockStatus | None = None,
     process_exists: ProcessExists | None = None,
+    current_config: VibeConfig | None = None,
 ) -> SupervisorStatus:
     process_checker = process_exists if process_exists is not None else pid_exists
     records = run_store.read_records()
@@ -811,6 +822,14 @@ def collect_supervisor_status(
                 )
             ]
             newest_record = matching_records[-1] if matching_records else None
+            config_record = next(
+                (
+                    record
+                    for record in reversed(matching_records)
+                    if record.get("config_loaded_at")
+                ),
+                None,
+            )
             log = next(
                 (
                     path
@@ -829,6 +848,22 @@ def collect_supervisor_status(
                     state = "active_cycle"
                 elif phase_record.get("next_wake"):
                     state = "sleeping"
+            applied_record = next(
+                (
+                    record
+                    for record in reversed(records)
+                    if record.get("record_type") == AUTOPILOT_CYCLE_STARTED_RECORD_TYPE
+                    and str(record.get("run_id") or "") == lock_run_id
+                    and record.get("config_reload_status") == "loaded"
+                ),
+                None,
+            )
+            config_report, advisories = supervisor_config_staleness(
+                config_record,
+                applied_record=applied_record,
+                current_config=current_config,
+                running=supervisor_lock.state == "held",
+            )
             return SupervisorStatus(
                 state=state,
                 pid=lock_pid,
@@ -849,6 +884,8 @@ def collect_supervisor_status(
                     else str(supervisor_lock.metadata.get("heartbeat_at") or "")
                 ),
                 record=(newest_record or supervisor_lock.metadata),
+                config=config_report,
+                advisories=advisories,
             )
         if supervisor_lock.locked and supervisor_lock.state == "stale":
             lock_run_id = str(supervisor_lock.metadata.get("run_id") or "")
@@ -972,6 +1009,123 @@ def supervisor_status_from_record(
         record=record,
         blocker=blocker,
     )
+
+
+def supervisor_config_staleness(
+    record: Mapping[str, Any] | None,
+    *,
+    applied_record: Mapping[str, Any] | None = None,
+    current_config: VibeConfig | None,
+    running: bool,
+) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+    if record is None or current_config is None:
+        return {}, ()
+    loaded_fingerprint = str(record.get("config_fingerprint") or "")
+    loaded_at = str(record.get("config_loaded_at") or "")
+    if not loaded_fingerprint or not loaded_at:
+        return {}, ()
+    current_fingerprint = config_snapshot_fingerprint(current_config)
+    loaded_keys = {
+        str(key): str(value)
+        for key, value in dict(record.get("config_key_fingerprints") or {}).items()
+    }
+    applied_keys = (
+        {
+            str(key): str(value)
+            for key, value in dict(
+                applied_record.get("config_key_fingerprints") or {}
+            ).items()
+        }
+        if applied_record is not None
+        else loaded_keys
+    )
+    current_keys = dict(current_config.config_key_fingerprints)
+    changed_keys = tuple(
+        sorted(
+            key
+            for key in loaded_keys.keys() | applied_keys.keys() | current_keys.keys()
+            if (
+                applied_keys.get(key)
+                if config_key_lifetime(key) == "per_cycle"
+                else loaded_keys.get(key)
+            )
+            != current_keys.get(key)
+        )
+    )
+    stale = running and bool(changed_keys)
+    per_cycle_keys = tuple(
+        key for key in changed_keys if config_key_lifetime(key) == "per_cycle"
+    )
+    restart_required_keys = tuple(
+        key for key in changed_keys if config_key_lifetime(key) == "supervisor_start"
+    )
+    report: dict[str, object] = {
+        "loaded_fingerprint": loaded_fingerprint,
+        "loaded_at": loaded_at,
+        "per_cycle_fingerprint": (
+            str(applied_record.get("config_fingerprint") or "")
+            if applied_record is not None
+            else loaded_fingerprint
+        ),
+        "per_cycle_loaded_at": (
+            str(applied_record.get("config_loaded_at") or "")
+            if applied_record is not None
+            else loaded_at
+        ),
+        "current_fingerprint": current_fingerprint,
+        "current_path": (
+            str(current_config.config_path) if current_config.config_path else ""
+        ),
+        "stale": stale,
+        "changed_keys": list(changed_keys) if stale else [],
+        "per_cycle_keys": list(per_cycle_keys) if stale else [],
+        "restart_required_keys": list(restart_required_keys) if stale else [],
+    }
+    if not stale:
+        return report, ()
+    if per_cycle_keys and restart_required_keys:
+        message = (
+            "the running supervisor uses a different configuration; per-cycle "
+            "keys apply on the next cycle, while supervisor-start keys require "
+            "a restart"
+        )
+    elif per_cycle_keys:
+        message = (
+            "the running supervisor uses a different configuration; the changed "
+            "per-cycle keys apply on the next cycle"
+        )
+    else:
+        message = (
+            "the running supervisor uses a different configuration; the changed "
+            "supervisor-start keys require a restart"
+        )
+    advisory = {
+        "code": "supervisor_config_stale",
+        "severity": "warning",
+        "changed_keys": list(changed_keys),
+        "per_cycle_keys": list(per_cycle_keys),
+        "restart_required_keys": list(restart_required_keys),
+        "message": message,
+    }
+    return report, (advisory,)
+
+
+def config_snapshot_fingerprint(config: VibeConfig) -> str:
+    if config.config_digest:
+        return config.config_digest
+    encoded = json.dumps(
+        config.config_key_fingerprints,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def config_key_lifetime(key: str) -> str:
+    if key == "agent" or key.startswith("agent."):
+        return "per_cycle"
+    if key == "autopilot.jobs":
+        return "per_cycle"
+    return "supervisor_start"
 
 
 def collect_external_run_supervisor(
@@ -1324,6 +1478,7 @@ def detached_autopilot_command(
     config: VibeConfig,
     *,
     jobs: int,
+    reload_config_jobs: bool,
     interval: float,
     once: bool,
     max_cycles: int,
@@ -1350,6 +1505,8 @@ def detached_autopilot_command(
         "--worktree-disposition",
         config.autopilot.worktree_disposition,
     ]
+    if reload_config_jobs:
+        command.append("--reload-config-jobs")
     if once:
         command.append("--once")
     if max_cycles:
@@ -1369,6 +1526,7 @@ def start_detached_autopilot(
     config: VibeConfig,
     *,
     jobs: int = 1,
+    reload_config_jobs: bool = False,
     interval: float = 0.0,
     once: bool = False,
     max_cycles: int = 0,
@@ -1424,6 +1582,7 @@ def start_detached_autopilot(
     command = detached_autopilot_command(
         config,
         jobs=jobs,
+        reload_config_jobs=reload_config_jobs,
         interval=interval,
         once=once,
         max_cycles=max_cycles,
@@ -5227,6 +5386,7 @@ def execute_autopilot_cycle(
     native_planning_runner: NativePlanningRunner = run_native_planning,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
+    supervisor_blockers: tuple[str, ...] = (),
 ) -> AutopilotCycleResult:
     min_ready = require_positive_min_ready(min_ready)
     cycle_started_at = utc_now_iso()
@@ -5321,6 +5481,7 @@ def execute_autopilot_cycle(
     actions.append(cycle_summary.action)
 
     blocker_list = list(status.blockers)
+    blocker_list.extend(supervisor_blockers)
     if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
         blocker_list.remove("repo_dirty")
         actions.append("repo_dirty_ignored")
@@ -6057,10 +6218,33 @@ def autopilot_termination_signals() -> Iterator[Callable[[], None]]:
             pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
+def reload_autopilot_cycle_config(config: VibeConfig) -> VibeConfig:
+    current = load_config(
+        config.repo,
+        runtime_context=dict(config.runtime_context),
+    )
+    return dataclasses.replace(
+        config,
+        agent=current.agent,
+        agent_profiles=current.agent_profiles,
+        agent_routing=current.agent_routing,
+        worker_prompt_extra=current.worker_prompt_extra,
+        autopilot=dataclasses.replace(
+            config.autopilot,
+            jobs=current.autopilot.jobs,
+        ),
+        config_path=current.config_path,
+        config_source=current.config_source,
+        config_digest=current.config_digest,
+        config_key_fingerprints=current.config_key_fingerprints,
+    )
+
+
 def run_autopilot(
     config: VibeConfig,
     *,
     jobs: int = 1,
+    reload_config_jobs: bool = False,
     interval: float = 0.0,
     once: bool = False,
     max_cycles: int = 0,
@@ -6203,20 +6387,26 @@ def run_autopilot(
         lease_seconds=int_value(lock.metadata.get("lease_seconds")),
     )
     cycles: list[AutopilotCycleResult] = []
+    active_cycle_config = config
     termination_signal: int | None = None
     try:
         enable_termination_signals()
         heartbeat.start()
+        config_loaded_at = utc_now_iso()
         run_store.append_record(
             {
                 "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
                 "record_type": AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
-                "occurred_at": utc_now_iso(),
+                "occurred_at": config_loaded_at,
                 "repo": str(config.repo),
                 "run_id": supervisor_run_id,
                 "pid": os.getpid(),
                 "log": str(supervisor_log),
                 "worktree_disposition_policy": (config.autopilot.worktree_disposition),
+                "config_fingerprint": config_snapshot_fingerprint(config),
+                "config_loaded_at": config_loaded_at,
+                "config_path": str(config.config_path) if config.config_path else "",
+                "config_key_fingerprints": dict(config.config_key_fingerprints),
             }
         )
         cycle_number = 0
@@ -6224,23 +6414,50 @@ def run_autopilot(
             if should_stop is not None and should_stop():
                 break
             cycle_number += 1
+            config_reload_error = ""
+            config_loaded_at = ""
+            try:
+                active_cycle_config = reload_autopilot_cycle_config(config)
+                config_loaded_at = utc_now_iso()
+            except (OSError, UnicodeError, ValueError) as exc:
+                config_reload_error = type(exc).__name__
+                print(
+                    "[vibe-loop] autopilot config reload failed "
+                    f"({config_reload_error}); retaining the last valid cycle "
+                    "configuration and withholding dispatch until the file is "
+                    "valid; run vibe-loop doctor after correcting the file",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            cycle_config = active_cycle_config
+            cycle_jobs = jobs
+            if reload_config_jobs:
+                cycle_jobs = cycle_config.autopilot.jobs or 1
             bounded_last = once or (max_cycles > 0 and cycle_number >= max_cycles)
             cycle_id = f"{supervisor_run_id}-c{cycle_number}"
-            run_store.append_record(
-                {
-                    "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
-                    "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
-                    "occurred_at": utc_now_iso(),
-                    "repo": str(config.repo),
-                    "run_id": supervisor_run_id,
-                    "cycle_id": cycle_id,
-                }
-            )
+            cycle_started_record: dict[str, object] = {
+                "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+                "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
+                "occurred_at": utc_now_iso(),
+                "repo": str(config.repo),
+                "run_id": supervisor_run_id,
+                "cycle_id": cycle_id,
+                "config_fingerprint": config_snapshot_fingerprint(cycle_config),
+                "config_reload_status": ("failed" if config_reload_error else "loaded"),
+            }
+            if config_reload_error:
+                cycle_started_record["config_reload_error"] = config_reload_error
+            else:
+                cycle_started_record["config_loaded_at"] = config_loaded_at
+                cycle_started_record["config_key_fingerprints"] = dict(
+                    cycle_config.config_key_fingerprints
+                )
+            run_store.append_record(cycle_started_record)
             result = execute_autopilot_cycle(
-                config,
+                cycle_config,
                 cycle_id=cycle_id,
                 autopilot_run_id=supervisor_run_id,
-                jobs=jobs,
+                jobs=cycle_jobs,
                 ask_agent=ask_agent,
                 continue_on_failure=continue_on_failure,
                 max_slices=max_slices,
@@ -6254,7 +6471,18 @@ def run_autopilot(
                 disk_health_runner=disk_health_runner,
                 cycle_summary_runner=cycle_summary_runner,
                 native_planning_runner=native_planning_runner,
+                supervisor_blockers=(
+                    ("autopilot_config_reload_failed",) if config_reload_error else ()
+                ),
             )
+            if config_reload_error:
+                result = dataclasses.replace(
+                    result,
+                    actions=(
+                        *result.actions,
+                        f"config_reload_failed:{config_reload_error}",
+                    ),
+                )
             idle_wait_seconds = interval
             if (
                 not bounded_last

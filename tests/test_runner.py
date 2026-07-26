@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
+import vibe_loop.tasks as tasks_module
 from vibe_loop.budget import BudgetDecision
 from vibe_loop.config import (
     AgentConfig,
@@ -8607,6 +8608,64 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 source.complete_context["VIBE_LOOP_FENCING_TOKEN"],
                 release_metadata["fencing_token"],
             )
+
+    def test_runtime_owned_completion_failure_records_adapter_stderr(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            secret = "adapter-password"
+            diagnostic = "completion refused because evidence is missing"
+            noisy_line = "x" * (tasks_module.TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT * 16)
+
+            def refusing_complete(*args: object, **kwargs: object) -> Task:
+                raise subprocess.CalledProcessError(
+                    3,
+                    "complete",
+                    stderr=(
+                        f"{noisy_line}\n{diagnostic}: "
+                        f"postgres://user:{secret}@database/app\n"
+                    ),
+                )
+
+            source.complete = refusing_complete  # type: ignore[method-assign]
+
+            def fake_run(command, cwd, log, **kwargs):
+                env = kwargs.get("env") or {}
+                run_id = env["VIBE_LOOP_RUN_ID"]
+                task_id = env["VIBE_LOOP_TASK_ID"]
+                on_start = kwargs.get("on_start")
+                if on_start is not None:
+                    on_start(os.getpid())
+                self._record_runtime_integration(runner, run_id, task_id)
+                runner.run_store.append_report(
+                    WorkerReport(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status="completed",
+                    )
+                )
+                return runner_module.StreamingCommandResult(exit_code=0)
+
+            result = self._run_task(runner, task, fake_run)
+            record = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "run_result"
+            )
+
+        message = str(record["message"])
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(result.classification_source, "completion_adapter_failed")
+        self.assertIn("CalledProcessError", message)
+        self.assertIn(diagnostic, message)
+        self.assertIn("postgres://user:<redacted>@database/app", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(
+            "x" * (tasks_module.TASK_SOURCE_ERROR_LINE_LIMIT + 1),
+            message,
+        )
+        self.assertEqual(message.count(diagnostic), 1)
 
     def test_runtime_owned_result_append_failure_retains_fenced_lock(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")

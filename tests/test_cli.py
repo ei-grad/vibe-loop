@@ -24,6 +24,7 @@ import vibe_loop.cli as cli_module
 from vibe_loop.autopilot import (
     AUTOPILOT_RECORD_SCHEMA_VERSION,
     collect_supervisor_status,
+    run_autopilot,
     stop_detached_autopilot,
 )
 from vibe_loop.cli import main
@@ -9958,6 +9959,62 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertNotIn("idle_wake_command", autopilot)
         self.assertNotIn("secret-health", raw)
         self.assertNotIn("secret-wake", raw)
+
+    def test_doctor_distinguishes_file_config_from_running_supervisor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                '[agent]\ncommand = "codex exec {prompt}"\n'
+                "[autopilot]\njobs = 1\nrequire_clean_repo = false\n",
+                encoding="utf-8",
+            )
+            config = load_config(repo)
+            doctor_payload = None
+            status_text = ""
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal doctor_payload, status_text
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace(
+                        "jobs = 1", "jobs = 2"
+                    ),
+                    encoding="utf-8",
+                )
+                stdout = StringIO()
+                with redirect_stdout(stdout):
+                    exit_code = main(["doctor", "--repo", str(repo), "--json"])
+                self.assertEqual(exit_code, 0)
+                doctor_payload = json.loads(stdout.getvalue())
+                stdout = StringIO()
+                with redirect_stdout(stdout):
+                    exit_code = main(["autopilot", "status", "--repo", str(repo)])
+                self.assertEqual(exit_code, 0)
+                status_text = stdout.getvalue()
+                return 0
+
+            run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertIsNotNone(doctor_payload)
+        self.assertEqual(doctor_payload["config"]["perspective"], "file_as_loaded_now")
+        self.assertIn(
+            "not the configuration used by the running supervisor",
+            doctor_payload["config"]["note"],
+        )
+        self.assertTrue(doctor_payload["supervisor_config"]["stale"])
+        self.assertEqual(
+            doctor_payload["supervisor_config"]["changed_keys"],
+            ["autopilot.jobs"],
+        )
+        self.assertEqual(
+            doctor_payload["advisories"][0]["code"],
+            "supervisor_config_stale",
+        )
+        self.assertIn("supervisor config: start=sha256:", status_text)
+        self.assertIn("per-cycle=sha256:", status_text)
+        self.assertIn("advisories:", status_text)
+        self.assertIn("supervisor_config_stale: autopilot.jobs", status_text)
 
     def test_run_once_honors_config_min_ready_without_launching(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

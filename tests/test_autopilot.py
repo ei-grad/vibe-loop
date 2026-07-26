@@ -84,6 +84,7 @@ from vibe_loop.autopilot import (
     poll_runnable_count,
     recheck_interval_for_runnable,
     recheck_sleep_slices,
+    reload_autopilot_cycle_config,
     run_autopilot,
     run_maintenance_command,
     launch_native_planning_worker,
@@ -1229,6 +1230,242 @@ class AutopilotRunTests(unittest.TestCase):
                 for record in policy_records
             )
         )
+
+    def test_running_supervisor_reports_changed_config_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            observed = None
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal observed
+                config_path = repo / ".vibe-loop.toml"
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace(
+                        "jobs = 1", "jobs = 3"
+                    ),
+                    encoding="utf-8",
+                )
+                observed = collect_project_status(load_config(repo))
+                return 0
+
+            run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertIsNotNone(observed)
+        supervisor = observed.supervisor
+        self.assertTrue(supervisor.config["stale"])
+        self.assertEqual(supervisor.config["changed_keys"], ["autopilot.jobs"])
+        self.assertEqual(supervisor.config["per_cycle_keys"], ["autopilot.jobs"])
+        self.assertEqual(supervisor.config["restart_required_keys"], [])
+        self.assertEqual(supervisor.advisories[0]["code"], "supervisor_config_stale")
+        self.assertNotIn(
+            "config_key_fingerprints",
+            supervisor.to_json()["record"],
+        )
+
+    def test_configured_jobs_reload_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+            observed_after_reload = None
+
+            def reconfiguring_launcher(command, **kwargs):
+                nonlocal observed_after_reload
+                result = launcher(command, **kwargs)
+                if len(calls) == 1:
+                    config_path = repo / ".vibe-loop.toml"
+                    config_path.write_text(
+                        config_path.read_text(encoding="utf-8").replace(
+                            "jobs = 1", "jobs = 3"
+                        ),
+                        encoding="utf-8",
+                    )
+                else:
+                    observed_after_reload = collect_project_status(load_config(repo))
+                return result
+
+            run_autopilot(
+                config,
+                max_cycles=2,
+                interval=60,
+                reload_config_jobs=True,
+                launcher=reconfiguring_launcher,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        first = calls[0]["command"]
+        second = calls[1]["command"]
+        self.assertEqual(first[first.index("--jobs") + 1], "1")
+        self.assertEqual(second[second.index("--jobs") + 1], "3")
+        self.assertIsNotNone(observed_after_reload)
+        self.assertFalse(observed_after_reload.supervisor.config["stale"])
+        self.assertEqual(observed_after_reload.supervisor.advisories, ())
+
+    def test_invalid_cycle_config_withholds_dispatch_without_exiting(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            def corrupting_launcher(command, **kwargs):
+                result = launcher(command, **kwargs)
+                config_path = repo / ".vibe-loop.toml"
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8") + "broken = [",
+                    encoding="utf-8",
+                )
+                return result
+
+            summary = run_autopilot(
+                config,
+                max_cycles=3,
+                interval=60,
+                launcher=corrupting_launcher,
+                sleep=lambda _seconds: None,
+            )
+            records = RunStore(config.state_path / "runs.jsonl").read_records()
+
+        self.assertEqual(len(summary.cycles), 3)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [cycle.status for cycle in summary.cycles],
+            ["completed", "blocked", "blocked"],
+        )
+        for cycle in summary.cycles[1:]:
+            self.assertIn("autopilot_config_reload_failed", cycle.blockers)
+            self.assertIn(
+                "config_reload_failed:TOMLDecodeError",
+                cycle.actions,
+            )
+        failed_reloads = [
+            record
+            for record in records
+            if record.get("config_reload_status") == "failed"
+        ]
+        self.assertEqual(len(failed_reloads), 2)
+        self.assertTrue(
+            all(
+                record["config_reload_error"] == "TOMLDecodeError"
+                for record in failed_reloads
+            )
+        )
+
+    def test_status_separates_restart_required_config_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            observed = None
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                nonlocal observed
+                config_path = repo / ".vibe-loop.toml"
+                config_path.write_text(
+                    config_path.read_text(encoding="utf-8").replace(
+                        "jobs = 1", "jobs = 2"
+                    )
+                    + "\n[supervision]\nslice_token_threshold = 123\n",
+                    encoding="utf-8",
+                )
+                observed = collect_project_status(load_config(repo))
+                return 0
+
+            run_autopilot(config, once=True, launcher=launcher)
+
+        self.assertIsNotNone(observed)
+        self.assertEqual(
+            observed.supervisor.config["per_cycle_keys"],
+            ["autopilot.jobs"],
+        )
+        self.assertEqual(
+            observed.supervisor.config["restart_required_keys"],
+            ["supervision.slice_token_threshold"],
+        )
+
+    def test_explicit_jobs_remain_pinned_between_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=("[autopilot]\njobs = 1\nrequire_clean_repo = false\n"),
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            def reconfiguring_launcher(command, **kwargs):
+                result = launcher(command, **kwargs)
+                if len(calls) == 1:
+                    config_path = repo / ".vibe-loop.toml"
+                    config_path.write_text(
+                        config_path.read_text(encoding="utf-8").replace(
+                            "jobs = 1", "jobs = 3"
+                        ),
+                        encoding="utf-8",
+                    )
+                return result
+
+            run_autopilot(
+                config,
+                jobs=2,
+                max_cycles=2,
+                interval=60,
+                launcher=reconfiguring_launcher,
+                sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual(len(calls), 2)
+        for call in calls:
+            command = call["command"]
+            self.assertEqual(command[command.index("--jobs") + 1], "2")
+
+    def test_agent_routing_reloads_for_the_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    '[agent.profiles.first]\nkind = "codex"\n'
+                    '[agent.profiles.second]\nkind = "codex"\n'
+                    '[[agent.routing]]\nprofile = "first"\n'
+                    'match_hazards_any = ["security"]\n'
+                ),
+            )
+            config = load_config(repo)
+            config_path = repo / ".vibe-loop.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    'profile = "first"', 'profile = "second"'
+                ),
+                encoding="utf-8",
+            )
+
+            current = reload_autopilot_cycle_config(config)
+
+        self.assertEqual(config.agent_routing[0].profile, "first")
+        self.assertEqual(current.agent_routing[0].profile, "second")
 
     def test_heartbeats_supervisor_lock_during_long_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

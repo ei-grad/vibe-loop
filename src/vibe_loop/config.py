@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import hashlib
+import json
 import math
 import os
 import re
@@ -1359,6 +1360,7 @@ class VibeConfig:
     config_path: Path | None = None
     config_source: str = "default"
     config_digest: str = ""
+    config_key_fingerprints: tuple[tuple[str, str], ...] = ()
     worker_prompt_extra: str | None = None
     runtime_context: tuple[tuple[str, str], ...] = ()
     # Whether the caller's ambient environment is claiming to name *this*
@@ -1409,6 +1411,7 @@ def load_config(
     else:
         data = {}
         config_digest = ""
+    config_key_fingerprints = fingerprint_config_keys(data)
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
     agent_table = expect_table(data.get("agent", {}), "agent")
@@ -1437,6 +1440,7 @@ def load_config(
         config_path=config_path,
         config_source=config_source,
         config_digest=config_digest,
+        config_key_fingerprints=config_key_fingerprints,
         main_branch=str(data.get("main_branch") or "main"),
         state_dir=str(data.get("state_dir") or ".vibe-loop"),
         worker_prompt_extra=optional_text(
@@ -1631,6 +1635,35 @@ def read_config_file_snapshot(path: Path) -> tuple[dict[str, Any], str]:
         raise ValueError(f"{path}: expected TOML table")
     digest = "sha256:" + hashlib.sha256(content).hexdigest()
     return payload, digest
+
+
+def fingerprint_config_keys(
+    data: Mapping[str, Any],
+    *,
+    prefix: str = "",
+) -> tuple[tuple[str, str], ...]:
+    fingerprints: list[tuple[str, str]] = []
+    for name, value in sorted(data.items()):
+        key = f"{prefix}.{name}" if prefix else name
+        if isinstance(value, Mapping):
+            nested = fingerprint_config_keys(value, prefix=key)
+            if nested:
+                fingerprints.extend(nested)
+            else:
+                fingerprints.append((key, fingerprint_config_value(value)))
+            continue
+        fingerprints.append((key, fingerprint_config_value(value)))
+    return tuple(fingerprints)
+
+
+def fingerprint_config_value(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def parse_agent(data: object) -> AgentConfig:

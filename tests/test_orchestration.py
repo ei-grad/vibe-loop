@@ -410,6 +410,29 @@ class RunContractResolverTests(unittest.TestCase):
             "sha256:" + hashlib.sha256(original.encode("utf-8")).hexdigest(),
         )
 
+    def test_missing_config_uses_derived_run_contract_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(Path(directory))
+            config = dataclasses.replace(
+                config,
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
+            )
+            contract = RunContractResolver(config).resolve(
+                AgentSelection(config.agent, "", "default")
+            )
+
+        source = contract.payload["source"]
+        assert isinstance(source, dict)
+        self.assertEqual(config.config_digest, "")
+        self.assertEqual(source["id"], "defaults")
+        self.assertNotEqual(
+            source["digest"],
+            "sha256:" + hashlib.sha256(b"").hexdigest(),
+        )
+
     def test_proposal_digest_accepts_non_dict_mapping(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
         config = VibeConfig(
@@ -2968,6 +2991,99 @@ class TaskSourceProvenanceTests(unittest.TestCase):
             "done",
         )
 
+    def test_completion_failure_records_bounded_scrubbed_adapter_stderr(
+        self,
+    ) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        secret = "adapter-password"
+        diagnostic = "transition refused because completion evidence is missing"
+        secret_dsn = f"postgres://user:{secret}@database/app"
+        noisy_prefix = "x" * (tasks_module.TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT * 16)
+
+        def refusing_complete(*args: object, **kwargs: object) -> Task:
+            raise subprocess.CalledProcessError(
+                3,
+                "complete",
+                stderr=(f"{noisy_prefix}\n{diagnostic}: {secret_dsn}\n"),
+            )
+
+        source.complete = refusing_complete  # type: ignore[method-assign]
+
+        with self.assertRaises(TaskSourceCompletionError) as raised:
+            self.completer(source).complete()
+
+        message = str(raised.exception)
+        self.assertIn("CalledProcessError", message)
+        self.assertIn(diagnostic, message)
+        self.assertIn("postgres://user:<redacted>@database/app", message)
+        self.assertNotIn(secret, message)
+        self.assertNotIn(
+            "x" * (tasks_module.TASK_SOURCE_ERROR_LINE_LIMIT + 1),
+            message,
+        )
+        self.assertEqual(message.count(diagnostic), 1)
+        self.assertLessEqual(
+            len(message),
+            tasks_module.TASK_SOURCE_ERROR_STREAM_LIMIT
+            + tasks_module.TASK_SOURCE_ERROR_LAST_LINE_LIMIT
+            + 250,
+        )
+
+    def test_completion_probe_failure_keeps_scrubbed_adapter_stderr(self) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        diagnostic = "probe refused while source is unavailable"
+
+        def refusing_probe(*args: object, **kwargs: object) -> Task:
+            raise subprocess.CalledProcessError(
+                4,
+                "probe",
+                stderr=(
+                    f"{diagnostic}: "
+                    "postgres://probe-user:probe-password@database/app\n"
+                ),
+            )
+
+        source.probe = refusing_probe  # type: ignore[method-assign]
+
+        with self.assertRaises(TaskSourceCompletionError) as raised:
+            self.completer(source).complete()
+
+        message = str(raised.exception)
+        self.assertEqual(raised.exception.code, "completion_probe_failed")
+        self.assertIn("CalledProcessError", message)
+        self.assertIn(diagnostic, message)
+        self.assertIn(
+            "postgres://probe-user:<redacted>@database/app",
+            message,
+        )
+        self.assertNotIn("probe-password", message)
+
+    def test_completion_failure_does_not_repeat_a_long_single_stderr_line(
+        self,
+    ) -> None:
+        self.record_integration()
+        source = MutableTaskSource()
+        diagnostic = "single-line completion refusal"
+
+        def refusing_complete(*args: object, **kwargs: object) -> Task:
+            raise subprocess.CalledProcessError(
+                3,
+                "complete",
+                stderr=f"{diagnostic}: {'x' * 700}\n",
+            )
+
+        source.complete = refusing_complete  # type: ignore[method-assign]
+
+        with self.assertRaises(TaskSourceCompletionError) as raised:
+            self.completer(source).complete()
+
+        message = str(raised.exception)
+        self.assertEqual(message.count(diagnostic), 1)
+        self.assertEqual(message.count("stderr last line:"), 1)
+        self.assertNotIn("stderr tail:", message)
+
     def test_crash_after_external_transition_is_probe_confirmed(self) -> None:
         self.record_integration()
         source = MutableTaskSource("done")
@@ -3123,7 +3239,8 @@ class TaskSourceProvenanceTests(unittest.TestCase):
                 f"task-source-reset {task_id}",
                 stderr=(
                     f'task-source: task "{task_id}" has an unreleased lock; '
-                    f"refusing unfenced reset (token {token})\n"
+                    f"refusing unfenced reset (token {token}); "
+                    "API_KEY=adapter-secret\n"
                 ),
             )
 
@@ -3146,8 +3263,11 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(len(attempted), 1)
         self.assertEqual(attempted[0]["error_class"], "CalledProcessError")
         self.assertEqual(attempted[0]["exit_code"], 3)
-        # The diagnosis survives redaction; only the token is removed.
+        # The diagnosis survives while both runtime and adapter secrets are removed.
         self.assertIn("refusing unfenced reset", attempted[0]["stderr"])
+        self.assertIn("refusing unfenced reset", attempted[0]["stderr_last_line"])
+        self.assertIn("API_KEY=<redacted>", attempted[0]["stderr"])
+        self.assertNotIn("adapter-secret", json.dumps(attempted[0]))
         self.assertNotIn(token, json.dumps(attempted[0]))
         self.assertEqual(attempted[0]["confirmed_status"], "active")
 
