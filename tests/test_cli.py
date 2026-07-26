@@ -612,11 +612,127 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("vibe-loop autopilot run", autopilot_text)
         self.assertNotRegex(autopilot_text, r"\bnohup\s+vibe-loop\b")
         self.assertIn("Recovering the agent inventory", orchestrated_text)
-        self.assertIn("agent-<agent-id>.meta.json", orchestrated_text)
+        self.assertIn("agent-<registry-key>.meta.json", orchestrated_text)
         self.assertIn("transcript_mtime_ns", orchestrated_text)
         self.assertIn("Never spawn an unnamed", orchestrated_text)
         self.assertIn("`TaskOutput`", orchestrated_text)
         self.assertIn("`TaskStop`", orchestrated_text)
+
+    def test_installed_orchestrated_skill_inventory_recipe(self) -> None:
+        bash = shutil.which("bash")
+        if bash is None:
+            self.skipTest("documented inventory recipe requires bash")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+                exit_code = main(["install-skills", "--codex", "--home", str(home)])
+            self.assertEqual(exit_code, 0)
+
+            skill_path = (
+                home / ".codex" / "skills" / "orchestrated-vibe-loop" / "SKILL.md"
+            )
+            skill_text = skill_path.read_text(encoding="utf-8")
+            section_start = skill_text.index("### Recovering the agent inventory")
+            block_start = skill_text.index("```bash\n", section_start) + len(
+                "```bash\n"
+            )
+            block_end = skill_text.index("\n```", block_start)
+            recipe = skill_text[block_start:block_end]
+            self.assertTrue(recipe.startswith('python3 - "$subagents_dir"'))
+
+            subagents = root / "subagents"
+            subagents.mkdir()
+            agent_meta = subagents / "agent-a1234567890abcdef.meta.json"
+            agent_meta.write_text(
+                json.dumps(
+                    {
+                        "agentType": "general-purpose",
+                        "description": "Implement the inventory",
+                        "name": "inventory-impl",
+                        "toolUseId": "toolu_agent",
+                        "spawnDepth": 1,
+                        "worktreePath": "/tmp/inventory-worktree",
+                        "worktreeBranch": "worktree-inventory",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            teammate_meta = subagents / "agent-aui-inventory-6bf12353a5b0a8dc.meta.json"
+            teammate_meta.write_text(
+                json.dumps(
+                    {
+                        "agentType": "ui-inventory",
+                        "description": "Review the inventory UI",
+                        "name": "ui-inventory",
+                        "taskKind": "in_process_teammate",
+                        "teamName": "session-056f8296",
+                        "model": "opus",
+                        "permissionMode": "bypassPermissions",
+                        "spawnDepth": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agent_transcript = agent_meta.with_name("agent-a1234567890abcdef.jsonl")
+            agent_transcript.write_text("not valid transcript JSON", encoding="utf-8")
+            os.utime(agent_transcript, ns=(1_234_567_890, 1_234_567_890))
+
+            result = subprocess.run(
+                [bash, "-c", recipe],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": os.environ.get("PATH", ""),
+                    "subagents_dir": str(subagents),
+                },
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            records = {
+                record["registry_key"]: record
+                for record in map(json.loads, result.stdout.splitlines())
+            }
+
+        self.assertEqual(
+            records["a1234567890abcdef"],
+            {
+                "agent_type": "general-purpose",
+                "assignment": "Implement the inventory",
+                "model": None,
+                "name": "inventory-impl",
+                "permission_mode": None,
+                "registry_key": "a1234567890abcdef",
+                "spawn_depth": 1,
+                "stop_address": "inventory-impl",
+                "task_output_id": "a1234567890abcdef",
+                "team_name": None,
+                "tool_use_id": "toolu_agent",
+                "transcript_mtime_ns": 1_234_567_890,
+                "worktree_branch": "worktree-inventory",
+                "worktree_path": "/tmp/inventory-worktree",
+            },
+        )
+        self.assertEqual(
+            records["aui-inventory-6bf12353a5b0a8dc"],
+            {
+                "agent_type": "ui-inventory",
+                "assignment": "Review the inventory UI",
+                "model": "opus",
+                "name": "ui-inventory",
+                "permission_mode": "bypassPermissions",
+                "registry_key": "aui-inventory-6bf12353a5b0a8dc",
+                "spawn_depth": 0,
+                "stop_address": "ui-inventory@session-056f8296",
+                "task_output_id": None,
+                "team_name": "session-056f8296",
+                "tool_use_id": None,
+                "transcript_mtime_ns": None,
+                "worktree_branch": None,
+                "worktree_path": None,
+            },
+        )
 
     def test_cli_worker_addendum_contains_coordination(self) -> None:
         from vibe_loop.runner import CLI_WORKER_ADDENDUM
