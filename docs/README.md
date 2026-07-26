@@ -11,6 +11,7 @@ component contracts.
 - [Parallel worker orchestration](parallel-worker-orchestration.md)
 - [Deterministic run orchestration](deterministic-run-orchestration.md)
 - [Skill work modes](skill-work-modes.md)
+- [Recorded skill deployment](skill-deployment.md)
 - [Release checklist](release-checklist.md)
 - [Planning analytics migration](planning-analytics.md)
 
