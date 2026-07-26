@@ -1768,7 +1768,7 @@ class AutopilotRunTests(unittest.TestCase):
                     base_main=git_text(repo, "rev-parse", "HEAD"),
                     command="codex",
                 ),
-                worker_parent_death_guarded=True,
+                worker_launch_publication_guarded=True,
             )
             manager.acquire(
                 "STARTING-01",
@@ -1820,7 +1820,7 @@ class AutopilotRunTests(unittest.TestCase):
                     base_main=git_text(repo, "rev-parse", "HEAD"),
                     command="codex",
                 ),
-                worker_parent_death_guarded=True,
+                worker_launch_publication_guarded=True,
             )
             manager.acquire(
                 "ACTIVATING-01",

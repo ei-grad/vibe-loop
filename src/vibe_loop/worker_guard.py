@@ -1,38 +1,34 @@
-"""Launch a Linux worker with a kernel-enforced parent-death signal."""
+"""Block Linux worker execution until its supervisor publishes ownership."""
 
 from __future__ import annotations
 
-import ctypes
 import os
-import signal
 import sys
 
-PR_SET_PDEATHSIG = 1
 GUARD_FAILURE_EXIT = 126
-
-
-def arm_parent_death_signal(expected_parent_pid: int) -> None:
-    if os.getppid() != expected_parent_pid:
-        raise RuntimeError("worker supervisor exited before launch guard")
-    libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number))
-    if os.getppid() != expected_parent_pid:
-        raise RuntimeError("worker supervisor exited while arming launch guard")
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) < 3 or arguments[2] != "--":
+    if len(arguments) < 4 or arguments[3] != "--":
         return GUARD_FAILURE_EXIT
     try:
         expected_parent_pid = int(arguments[0])
-        arm_parent_death_signal(expected_parent_pid)
-    except (OSError, RuntimeError, ValueError):
+        gate_fd = int(arguments[1])
+    except ValueError:
         return GUARD_FAILURE_EXIT
-    mode = arguments[1]
-    command = arguments[3:]
+    if os.getppid() != expected_parent_pid:
+        return GUARD_FAILURE_EXIT
+    try:
+        released = os.read(gate_fd, 1)
+    except OSError:
+        return GUARD_FAILURE_EXIT
+    finally:
+        os.close(gate_fd)
+    if released != b"\0":
+        return GUARD_FAILURE_EXIT
+    mode = arguments[2]
+    command = arguments[4:]
     if mode == "shell" and len(command) == 1:
         os.execvpe("/bin/sh", ["/bin/sh", "-c", command[0]], os.environ)
     if mode == "exec" and command:

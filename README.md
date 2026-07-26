@@ -716,15 +716,17 @@ exists in either the lock or the local records, recovery fails closed with
 and append-records one `autopilot_cycle` per iteration. Before each launch
 decision it cleans only stale worker locks whose recorded process identity is
 proven absent — the same validated, audited path as
-`vibe-loop workers clean --force`. On Linux, the worker launcher arms a kernel
-parent-death signal before executing the worker command and the task lock
-records that guarantee. Before worker PID publication, recovery therefore
-requires that guard plus an absent or birth-mismatched supervisor identity;
-supervisor death cannot leave the worker running. The worker PID is written to
-the lock before its redundant durable start event, and either source makes only
-the worker identity authoritative thereafter. A live, foreign-host, or
-identity-ambiguous process fails closed. Legacy and non-Linux pre-worker locks
-without the guarded supervisor proof remain unsupported, and
+`vibe-loop workers clean --force`. On Linux, the worker launcher blocks on an
+inherited publication pipe before it invokes the configured command, including
+commands routed through `/bin/sh`. The supervisor releases that barrier only
+after the worker PID is written to the lock and its redundant durable start
+event. Before PID publication, recovery therefore requires the recorded launch
+barrier plus an absent or birth-mismatched supervisor identity; supervisor
+death closes the pipe without letting any worker or shell command execute. Once
+the barrier opens, either durable PID source makes only the worker identity
+authoritative. A live, foreign-host, or identity-ambiguous process fails closed.
+Legacy and non-Linux pre-worker locks without the publication-barrier proof
+remain unsupported, and
 `autopilot status` names the offending task and that limitation. Cleanup emits
 `lock_expired` records and never deletes worktrees, resets branches, or steals
 live locks. Each cycle then runs a native worktree-disposition step and gathers

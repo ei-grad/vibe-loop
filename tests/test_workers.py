@@ -87,7 +87,7 @@ class WorkerStateTests(unittest.TestCase):
                 worker_pid=1234,
                 supervisor_pid=5678,
                 supervisor_process_birth_id="boot-id:42",
-                worker_parent_death_guarded=True,
+                worker_launch_publication_guarded=True,
                 host="test-host",
                 started_at="2026-05-09T00:00:00+00:00",
                 log_path=log_path,
@@ -148,7 +148,7 @@ class WorkerStateTests(unittest.TestCase):
         self.assertEqual(loaded[0].pid_scope, "configured_command_process")
         self.assertEqual(loaded[0].supervisor_pid, 5678)
         self.assertEqual(loaded[0].supervisor_process_birth_id, "boot-id:42")
-        self.assertTrue(loaded[0].worker_parent_death_guarded)
+        self.assertTrue(loaded[0].worker_launch_publication_guarded)
         self.assertEqual(loaded[0].host, "test-host")
         self.assertEqual(loaded[0].started_at, "2026-05-09T00:00:00+00:00")
         self.assertEqual(loaded[0].log_path, log_path)
@@ -820,7 +820,7 @@ class WorkerStateTests(unittest.TestCase):
             worker_pid=None,
             supervisor_pid=100,
             supervisor_process_birth_id="boot-id:500",
-            worker_parent_death_guarded=True,
+            worker_launch_publication_guarded=True,
             host="test-host",
             started_at="2026-05-09T00:00:00+00:00",
             log_path=Path("run.log"),
@@ -862,7 +862,7 @@ class WorkerStateTests(unittest.TestCase):
             run_id="run-1",
             supervisor_pid=100,
             supervisor_process_birth_id="boot-id:500",
-            worker_parent_death_guarded=True,
+            worker_launch_publication_guarded=True,
             host="test-host",
             started_at="2026-05-09T00:00:00+00:00",
             log_path=Path("run.log"),
@@ -2160,7 +2160,7 @@ class StaleLockTests(unittest.TestCase):
                 worker_pid=None,
                 supervisor_pid=100,
                 supervisor_process_birth_id="boot-id:500",
-                worker_parent_death_guarded=True,
+                worker_launch_publication_guarded=True,
                 host="test-host",
                 started_at="2026-05-09T00:00:00+00:00",
                 log_path=repo / ".vibe-loop" / "runs" / "run-1.log",

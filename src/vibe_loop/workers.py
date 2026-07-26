@@ -174,7 +174,7 @@ class ActiveRunState:
     pid_scope: str = "configured_command_process"
     supervisor_pid: int | None = None
     supervisor_process_birth_id: str = ""
-    worker_parent_death_guarded: bool = False
+    worker_launch_publication_guarded: bool = False
     host: str = dataclasses.field(default_factory=socket.gethostname)
     lock_path: Path | None = None
     workspace: WorkspaceClaim | None = None
@@ -352,8 +352,8 @@ class ActiveRunState:
             supervisor_process_birth_id=(
                 optional_string(metadata.get("supervisor_process_birth_id")) or ""
             ),
-            worker_parent_death_guarded=optional_bool(
-                metadata.get("worker_parent_death_guarded")
+            worker_launch_publication_guarded=optional_bool(
+                metadata.get("worker_launch_publication_guarded")
             ),
             host=optional_string(metadata.get("host")) or "",
             lock_path=optional_path(metadata.get("path")),
@@ -451,7 +451,9 @@ class ActiveRunState:
             "pid_scope": self.pid_scope,
             "supervisor_pid": self.supervisor_pid,
             "supervisor_process_birth_id": self.supervisor_process_birth_id,
-            "worker_parent_death_guarded": self.worker_parent_death_guarded,
+            "worker_launch_publication_guarded": (
+                self.worker_launch_publication_guarded
+            ),
             "host": self.host,
             "started_at": self.started_at,
             "log": str(self.log_path),
@@ -1685,12 +1687,13 @@ def classify_process(
 ) -> str:
     """Live-process disposition for one active-run lock.
 
-    Before worker launch, the exact supervisor birth identity proves whether
-    activation may still be in flight. After launch, the worker identity is
-    authoritative and the supervisor no longer affects classification. A live
-    PID alone is insufficient when a birth ID was recorded because the kernel
-    may have recycled it for an unrelated process. Legacy worker records keep
-    the plain existence check; legacy pre-worker records stay unproven.
+    Before worker launch, the publication barrier plus the exact supervisor
+    birth identity proves whether activation may still be in flight. After the
+    barrier opens, the worker identity is authoritative and the supervisor no
+    longer affects classification. A live PID alone is insufficient when a
+    birth ID was recorded because the kernel may have recycled it for an
+    unrelated process. Legacy worker records keep the plain existence check;
+    legacy pre-worker records stay unproven.
     """
 
     process_checker = process_exists if process_exists is not None else pid_exists
@@ -1705,7 +1708,7 @@ def classify_process(
         if (
             active.supervisor_pid is None
             or not active.supervisor_process_birth_id
-            or not active.worker_parent_death_guarded
+            or not active.worker_launch_publication_guarded
         ):
             return "unknown_pid"
         if not process_checker(active.supervisor_pid):
