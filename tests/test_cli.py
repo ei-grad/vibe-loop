@@ -564,7 +564,15 @@ class CliTests(unittest.TestCase):
             stderr = StringIO()
 
             with redirect_stdout(stdout), redirect_stderr(stderr):
-                exit_code = main(["install-skills", "--codex", "--home", str(home)])
+                exit_code = main(
+                    [
+                        "install-skills",
+                        "--codex",
+                        "--home",
+                        str(home),
+                        "--allow-unmerged",
+                    ]
+                )
 
             installed_paths = stdout.getvalue().splitlines()
             skills_root = home / ".codex" / "skills"
@@ -576,9 +584,12 @@ class CliTests(unittest.TestCase):
             infinite_text = infinite.read_text(encoding="utf-8")
             orchestrated_text = orchestrated.read_text(encoding="utf-8")
             autopilot_text = autopilot.read_text(encoding="utf-8")
+            claude_finite = home / ".claude" / "skills" / "vibe-loop" / "SKILL.md"
+            claude_finite_installed = claude_finite.is_file()
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(claude_finite_installed)
         self.assertEqual(
             installed_paths,
             [
@@ -628,7 +639,15 @@ class CliTests(unittest.TestCase):
             root = Path(directory)
             home = root / "home"
             with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-                exit_code = main(["install-skills", "--codex", "--home", str(home)])
+                exit_code = main(
+                    [
+                        "install-skills",
+                        "--codex",
+                        "--home",
+                        str(home),
+                        "--allow-unmerged",
+                    ]
+                )
             self.assertEqual(exit_code, 0)
 
             skill_path = (

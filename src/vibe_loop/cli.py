@@ -109,6 +109,11 @@ from vibe_loop.runs import (
     record_status,
     utc_now_iso,
 )
+from vibe_loop.skill_deployment import (
+    SkillDeploymentError,
+    render_verification_reports,
+    verify_skill_deployments,
+)
 from vibe_loop.skills import install_skills
 from vibe_loop.spec_diagnostics import (
     build_spec_diagnostics_report,
@@ -819,6 +824,24 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--codex", action="store_true")
     install.add_argument("--claude", action="store_true")
     install.add_argument("--home", type=Path, default=Path.home())
+    install.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite runtime-edited files after printing their diff",
+    )
+    install.add_argument(
+        "--allow-unmerged",
+        action="store_true",
+        help="Allow a non-mainline or dirty source and record that provenance",
+    )
+    verify = subparsers.add_parser(
+        "verify-skills",
+        help="Verify installed skill content and provenance",
+    )
+    verify.add_argument("--codex", action="store_true")
+    verify.add_argument("--claude", action="store_true")
+    verify.add_argument("--home", type=Path, default=Path.home())
+    verify.add_argument("--json", action="store_true")
     return parser
 
 
@@ -1122,10 +1145,39 @@ def dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "install-skills":
-        installed = install_skills(args.codex, args.claude, args.home)
+        try:
+            installed = install_skills(
+                args.codex,
+                args.claude,
+                args.home,
+                force=args.force,
+                allow_unmerged=args.allow_unmerged,
+                report_diagnostic=lambda diagnostic: print(
+                    diagnostic,
+                    file=sys.stderr,
+                ),
+            )
+        except SkillDeploymentError as exc:
+            for diagnostic in exc.diagnostics:
+                print(diagnostic, file=sys.stderr)
+            print(f"install-skills: {exc}", file=sys.stderr)
+            return 1
         for path in installed:
             print(path)
         return 0
+
+    if args.command == "verify-skills":
+        reports = verify_skill_deployments(
+            args.home,
+            codex=args.codex,
+            claude=args.claude,
+        )
+        if args.json:
+            print(json.dumps([report.to_json() for report in reports], indent=2))
+        else:
+            for line in render_verification_reports(reports):
+                print(line)
+        return 1 if any(report.drifted for report in reports) else 0
 
     raise AssertionError(args.command)
 

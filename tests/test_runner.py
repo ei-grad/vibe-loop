@@ -21,10 +21,12 @@ from unittest.mock import patch
 
 import vibe_loop.locks as locks_module
 import vibe_loop.runner as runner_module
+from vibe_loop.budget import BudgetDecision
 from vibe_loop.config import (
     AgentConfig,
     AgentRoutingRule,
     AgentResolutionError,
+    BudgetConfig,
     CompletionConfig,
     OrchestrationConfig,
     SpecDiagnosticsConfig,
@@ -57,6 +59,7 @@ from vibe_loop.orchestration import (
     RunStage,
     TaskSourceCompletionError,
     WorkspaceProvisionError,
+    WorkspaceProvisioner,
 )
 from vibe_loop.runner import (
     CLI_WORKER_ADDENDUM,
@@ -117,6 +120,7 @@ from vibe_loop.runner import (
     worker_usage_provenance,
 )
 from vibe_loop.runs import (
+    AttemptCircuitState,
     LOCK_FINALIZATION_FAILED_RECORD_TYPE,
     SETTLED_RUN_OUTCOMES,
     WORKER_REPORT_STATUSES,
@@ -125,6 +129,7 @@ from vibe_loop.runs import (
     WorkerReport,
     settled_run_outcome,
 )
+from vibe_loop.skill_deployment import SkillDeploymentError
 from vibe_loop.spec_diagnostics import SpecExecutionGateError
 from vibe_loop.tasks import Task, run_json_command
 from vibe_loop.workers import (
@@ -132,6 +137,7 @@ from vibe_loop.workers import (
     StaleLock,
     clean_stale_locks,
     collect_stale_locks,
+    git_dirty_snapshot,
     WorkspaceClaim,
 )
 
@@ -1659,6 +1665,78 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(failed.classification_source, "agent_resolution")
                 self.assertIn("agent profile 'typo'", failed.message)
                 self.assertIn("agent resolution failed", failed_log)
+
+    def test_skill_verification_blocks_before_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            task = Task(task_id="TASK-DRIFT", title="Drift", status="Next")
+
+            def reject_task(_task: Task) -> RunResult:
+                raise SkillDeploymentError(
+                    "installed skills failed provenance verification",
+                    diagnostics=(
+                        "/tmp/skills/example/SKILL.md: runtime-edited: hash changed",
+                    ),
+                )
+
+            runner.run_task = reject_task
+            with patch("vibe_loop.runner.git_rev_parse", return_value="aaa"):
+                result = runner.run_task_with_supervision(task)
+            log_text = result.log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(result.classification_source, "skill_verification")
+        self.assertIn("runtime-edited", result.message)
+        self.assertIn("worker skill preflight blocked", log_text)
+
+    def test_skill_verification_blocks_unknown_run_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(repo=repo, agent=AgentConfig(command="worker"))
+            )
+            task = Task(task_id="TASK-DRIFT", title="Drift", status="Next")
+            runner._source = MutableTaskSource([task])
+            recovery = RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log="",
+                attempt=1,
+                max_attempts=2,
+                workspace_claimed=False,
+            )
+
+            def reject_task(
+                _task: Task,
+                *,
+                recovery: RecoveryContext | None = None,
+            ) -> RunResult:
+                self.assertIsNotNone(recovery)
+                raise SkillDeploymentError(
+                    "installed skills failed provenance verification",
+                    diagnostics=("/tmp/skills/example/SKILL.md: branch-sourced",),
+                )
+
+            runner.run_task = reject_task
+            with patch("vibe_loop.runner.git_rev_parse", return_value="aaa"):
+                result = runner.resume_pending_recovery(recovery)
+
+            self.assertIsNotNone(result)
+            assert result is not None
+            log_text = result.log_path.read_text(encoding="utf-8")
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(result.classification_source, "skill_verification")
+        self.assertIn("branch-sourced", result.message)
+        self.assertIn("worker skill preflight blocked", log_text)
 
     def test_run_until_done_serial_stops_after_max_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8980,7 +9058,7 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertNotIn("gate_result", record_types)
         self.assertNotIn("review_started", record_types)
 
-    def test_runtime_owned_activation_crash_retains_lock_before_first_attempt(
+    def test_runtime_owned_activation_crash_releases_lock_before_first_attempt(
         self,
     ) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
@@ -9002,10 +9080,12 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 )
 
             records = runner.run_store.read_records()
-            self.assertTrue(lock_manager.is_locked("T-1"))
-            self.assertNotIn(
-                "task_source_settlement_attempted",
-                [record.get("record_type") for record in records],
+            self.assertFalse(lock_manager.is_locked("T-1"))
+            self.assertEqual(source.status, "ready")
+            record_types = [record.get("record_type") for record in records]
+            self.assertLess(
+                record_types.index("lock_released"),
+                record_types.index("task_source_settled"),
             )
             stale = collect_stale_locks(
                 lock_manager,
@@ -9014,10 +9094,260 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 process_exists=lambda pid: False,
             )
             clean_result = clean_stale_locks(stale, lock_manager)
-            self.assertEqual(len(stale), 1)
-            self.assertTrue(stale[0].settlement_pending)
+            self.assertEqual(stale, [])
             self.assertEqual(clean_result.cleaned, [])
-            self.assertTrue(lock_manager.is_locked("T-1"))
+            self.assertFalse(lock_manager.is_locked("T-1"))
+
+    def test_recovery_prelaunch_exits_leave_no_task_lock(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+
+        def recovery_context(repo: Path) -> RecoveryContext:
+            return RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log=str(repo / "prior-run.log"),
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=False,
+            )
+
+        for exit_path in (
+            "probe_failure",
+            "task_absent",
+            "attempt_circuit_open",
+            "budget_denial",
+        ):
+            with (
+                self.subTest(exit_path=exit_path),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                runner, lock_manager, _ = self._build_runner(directory, [task], {})
+                source = self._enable_runtime_owned_task_source(runner, task)
+                recovery = recovery_context(Path(directory))
+
+                if exit_path == "probe_failure":
+
+                    def failing_probe(task_id: str) -> Task:
+                        raise OSError("task source unavailable")
+
+                    source.probe = failing_probe  # type: ignore[method-assign]
+                    result = runner.resume_pending_recovery(recovery)
+                elif exit_path == "task_absent":
+                    runner._source = StubTaskSource([], {})
+                    result = runner.resume_pending_recovery(recovery)
+                elif exit_path == "attempt_circuit_open":
+
+                    def open_circuit(*, inputs, threshold, **kwargs):
+                        return AttemptCircuitState(
+                            task_id=inputs.task_id,
+                            inputs=inputs,
+                            threshold=threshold,
+                            attempt_count=threshold,
+                        )
+
+                    with patch.object(
+                        runner.run_store,
+                        "reserve_attempt_circuit",
+                        side_effect=open_circuit,
+                    ):
+                        result = runner.resume_pending_recovery(recovery)
+                else:
+                    runner.config = dataclasses.replace(
+                        runner.config,
+                        budget=BudgetConfig(enabled=True),
+                    )
+                    denial = BudgetDecision(
+                        admitted=False,
+                        decision="block",
+                        phase="implementation",
+                        binding=(
+                            {
+                                "selector": {},
+                                "remaining": 0.0,
+                                "declared": 1.0,
+                            },
+                        ),
+                    )
+                    with patch.object(
+                        runner.budget_store,
+                        "reserve",
+                        return_value=denial,
+                    ):
+                        result = runner.resume_pending_recovery(recovery)
+
+                self.assertIsNone(result)
+                self.assertFalse(lock_manager.is_locked(task.task_id))
+
+    def test_runtime_owned_recovery_stale_workspace_releases_task_lock(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            repo = runner.config.repo
+            old_base = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            prior_lock = lock_manager.acquire(
+                task.task_id,
+                "prior-run",
+                metadata={
+                    "task_id": task.task_id,
+                    "run_id": "prior-run",
+                    "base_main": old_base,
+                    "started_at": "2026-07-26T00:00:00+00:00",
+                },
+            )
+            workspace = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=lock_manager,
+                run_store=runner.run_store,
+            ).provision(
+                task_id=task.task_id,
+                run_id="prior-run",
+                base_commit=old_base,
+                fencing_token=str(prior_lock.metadata["fencing_token"]),
+            )
+            (workspace.worktree / "candidate.txt").write_text(
+                "interrupted candidate\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "add", "candidate.txt"],
+                cwd=workspace.worktree,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-m", "interrupted candidate"],
+                cwd=workspace.worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stale_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=workspace.worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            lock_manager.release(lock_manager.current_lock(task.task_id))
+            (repo / "current-base.txt").write_text("new base\n", encoding="utf-8")
+            subprocess.run(["git", "add", "current-base.txt"], cwd=repo, check=True)
+            subprocess.run(
+                ["git", "commit", "-m", "advance main"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            dirty_snapshot, dirty_fingerprint = git_dirty_snapshot(workspace.worktree)
+            git_common_dir = subprocess.run(
+                ["git", "rev-parse", "--git-common-dir"],
+                cwd=workspace.worktree,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            recovery = RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch=workspace.branch,
+                worktree=str(workspace.worktree),
+                head_commit=stale_head,
+                transcript_path="",
+                wrapper_log=str(repo / "prior-run.log"),
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=True,
+                base_commit=old_base,
+                git_common_dir=str((workspace.worktree / git_common_dir).resolve()),
+                dirty_snapshot=tuple(dirty_snapshot),
+                dirty_fingerprint=dirty_fingerprint,
+            )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch("vibe_loop.runner.run_streaming_command") as launch:
+                    result = runner.resume_pending_recovery(recovery)
+
+            self.assertIsNone(result)
+            launch.assert_not_called()
+            records = runner.run_store.read_records()
+            record_types = [record.get("record_type") for record in records]
+            settlement = next(
+                record
+                for record in records
+                if record.get("record_type") == "task_source_settled"
+            )
+            self.assertEqual(source.status, "ready")
+            self.assertFalse(lock_manager.is_locked(task.task_id))
+            self.assertEqual(settlement["intent"], "requeue")
+            self.assertEqual(settlement["confirmed_status"], "ready")
+            self.assertTrue(settlement["recovered"])
+            self.assertLess(
+                record_types.index("lock_released"),
+                record_types.index("task_source_settled"),
+            )
+
+    def test_prelaunch_requeue_failure_still_releases_task_lock(self) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, lock_manager, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            def failing_reset(*args, **kwargs) -> bool:
+                raise OSError("task source reset unavailable")
+
+            source.reset = failing_reset  # type: ignore[method-assign]
+            recovery = RecoveryContext(
+                task_id=task.task_id,
+                prior_run_id="prior-run",
+                prior_classification="unknown",
+                branch="",
+                worktree="",
+                head_commit="",
+                transcript_path="",
+                wrapper_log=str(runner.config.repo / "prior-run.log"),
+                attempt=1,
+                max_attempts=3,
+                workspace_claimed=False,
+            )
+
+            with patch.object(runner, "ensure_spec_execution_gate"):
+                with patch.object(
+                    WorkspaceProvisioner,
+                    "provision",
+                    side_effect=WorkspaceProvisionError(
+                        "workspace_stale_current_base",
+                        "existing workspace does not contain the selected current base",
+                    ),
+                ):
+                    result = runner.resume_pending_recovery(recovery)
+
+            attempted = next(
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "task_source_settlement_attempted"
+            )
+            self.assertIsNone(result)
+            self.assertEqual(source.status, "active")
+            self.assertFalse(lock_manager.is_locked(task.task_id))
+            self.assertEqual(attempted["intent"], "requeue")
+            self.assertEqual(attempted["phase"], "post_release")
+            self.assertTrue(attempted["settlement_pending"])
+            self.assertTrue(attempted["recovery_command"])
 
     def test_runtime_owned_requeue_reset_receives_live_fencing_context(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
