@@ -89,8 +89,11 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+    REVIEW_VERDICT_RECORD_TYPE,
+    RUN_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+    TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
@@ -138,6 +141,8 @@ AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
     + 6 * REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES
     + 2
 )
+NON_CLOSURE_WINDOW_RUNS = 20
+NON_CLOSURE_ALARM_THRESHOLD = 2
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
 BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
 
@@ -311,6 +316,40 @@ class CycleSummary:
 
 
 @dataclasses.dataclass(frozen=True)
+class NonClosureSummary:
+    window_runs: int = NON_CLOSURE_WINDOW_RUNS
+    observed_runs: int = 0
+    approved_candidates: int = 0
+    count: int = 0
+    consecutive: int = 0
+    alarm_threshold: int = NON_CLOSURE_ALARM_THRESHOLD
+    reasons: dict[str, int] = dataclasses.field(default_factory=dict)
+
+    @property
+    def rate(self) -> float | None:
+        if not self.approved_candidates:
+            return None
+        return self.count / self.approved_candidates
+
+    @property
+    def alarmed(self) -> bool:
+        return self.consecutive >= self.alarm_threshold
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "window_runs": self.window_runs,
+            "observed_runs": self.observed_runs,
+            "approved_candidates": self.approved_candidates,
+            "count": self.count,
+            "rate": self.rate,
+            "consecutive": self.consecutive,
+            "alarm_threshold": self.alarm_threshold,
+            "alarmed": self.alarmed,
+            "reasons": dict(self.reasons),
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class ProjectStatus:
     repo: Path
     display_name: str
@@ -330,6 +369,9 @@ class ProjectStatus:
     advisories: tuple[dict[str, object], ...] = ()
     observations: tuple[str, ...] = ()
     last_cycle: CycleSummary | None = None
+    non_closure: NonClosureSummary = dataclasses.field(
+        default_factory=NonClosureSummary
+    )
     next_wake: str = ""
     attempt_circuit_breakers: tuple[dict[str, object], ...] = ()
     runtime_context: tuple[tuple[str, str], ...] = ()
@@ -361,6 +403,7 @@ class ProjectStatus:
             "last_cycle": (
                 self.last_cycle.to_json() if self.last_cycle is not None else None
             ),
+            "non_closure": self.non_closure.to_json(),
             "next_wake": self.next_wake,
             "attempt_circuit_breakers": [
                 dict(breaker) for breaker in self.attempt_circuit_breakers
@@ -430,6 +473,8 @@ def collect_project_status(
     process_exists: ProcessExists | None = None,
 ) -> ProjectStatus:
     project_binding = resolve_project_binding(config)
+    run_store = RunStore(config.state_path / "runs.jsonl")
+    non_closure = summarize_non_closures(run_store)
     if project_binding.blocker is not None:
         # Querying the task source or lock adapter now would route this
         # repository's status through whatever project the ambient
@@ -457,8 +502,12 @@ def collect_project_status(
                 state="unknown",
                 blocker=project_binding.blocker,
             ),
-            last_cycle=latest_cycle_summary(RunStore(config.state_path / "runs.jsonl")),
-            blockers=tuple(item.code for item in project_binding.diagnostics),
+            last_cycle=latest_cycle_summary(run_store),
+            non_closure=non_closure,
+            blockers=tuple(item.code for item in project_binding.diagnostics)
+            + (
+                (non_closure_alarm_blocker(non_closure),) if non_closure.alarmed else ()
+            ),
             runtime_context=config.runtime_context,
             project_binding=project_binding,
         )
@@ -468,7 +517,6 @@ def collect_project_status(
         config.locks,
         runtime_context=config.runtime_environment,
     )
-    run_store = RunStore(config.state_path / "runs.jsonl")
     workers = tuple(
         collect_worker_views(
             config,
@@ -515,18 +563,18 @@ def collect_project_status(
         for worker in workers
         for diagnostic in worker.workspace_diagnostics
     )
-    blockers = tuple(
-        project_blockers(
-            project_binding=project_binding,
-            git_status=git_status,
-            queue_status=queue_status,
-            stale_locks=stale_locks,
-            workspace_diagnostics=workspace_diagnostics,
-            integration_lock=integration_lock,
-            agent_diagnostics=agent_blockers,
-            supervisor=supervisor,
-        )
+    blockers = project_blockers(
+        project_binding=project_binding,
+        git_status=git_status,
+        queue_status=queue_status,
+        stale_locks=stale_locks,
+        workspace_diagnostics=workspace_diagnostics,
+        integration_lock=integration_lock,
+        agent_diagnostics=agent_blockers,
+        supervisor=supervisor,
     )
+    if non_closure.alarmed:
+        blockers.append(non_closure_alarm_blocker(non_closure))
     observations = tuple(
         project_observations(queue_status=queue_status, workers=workers)
     )
@@ -553,10 +601,11 @@ def collect_project_status(
         worktree_disposition_policy=config.autopilot.worktree_disposition,
         workspace_diagnostics=workspace_diagnostics,
         supervisor=supervisor,
-        blockers=blockers,
+        blockers=tuple(blockers),
         advisories=supervisor.advisories,
         observations=observations,
         last_cycle=last_cycle,
+        non_closure=non_closure,
         next_wake=next_wake,
         attempt_circuit_breakers=attempt_circuit_breakers,
         runtime_context=config.runtime_context,
@@ -1273,6 +1322,98 @@ def recent_cycle_summaries(
             break
     summaries.reverse()
     return summaries
+
+
+def summarize_non_closures(
+    run_store: RunStore,
+    *,
+    window_runs: int = NON_CLOSURE_WINDOW_RUNS,
+    alarm_threshold: int = NON_CLOSURE_ALARM_THRESHOLD,
+) -> NonClosureSummary:
+    """Summarize approved candidates that did not close their task."""
+
+    records = run_store.read_records()
+    terminal_runs: list[dict[str, Any]] = []
+    seen_run_ids: set[str] = set()
+    for record in reversed(records):
+        if record.get("record_type") not in {None, RUN_RECORD_TYPE}:
+            continue
+        run_id = str(record.get("run_id") or "")
+        if not run_id or run_id in seen_run_ids:
+            continue
+        terminal_runs.append(record)
+        seen_run_ids.add(run_id)
+        if len(terminal_runs) >= window_runs:
+            break
+    terminal_runs.reverse()
+
+    selected_run_ids = {str(record.get("run_id") or "") for record in terminal_runs}
+    approved: set[tuple[str, str]] = set()
+    closed: set[tuple[str, str]] = set()
+    for record in records:
+        run_id = str(record.get("run_id") or "")
+        if run_id not in selected_run_ids:
+            continue
+        identity = (run_id, str(record.get("task_id") or ""))
+        if (
+            record.get("record_type") == REVIEW_VERDICT_RECORD_TYPE
+            and record.get("verdict") == "approve"
+        ):
+            approved.add(identity)
+        elif record.get("record_type") == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
+            closed.add(identity)
+
+    outcomes: list[tuple[bool, bool, str]] = []
+    reasons: dict[str, int] = {}
+    approved_candidates = 0
+    non_closures = 0
+    for record in terminal_runs:
+        identity = (
+            str(record.get("run_id") or ""),
+            str(record.get("task_id") or ""),
+        )
+        was_approved = identity in approved
+        reached_done = identity in closed
+        is_non_closure = was_approved and not reached_done
+        reason = ""
+        if was_approved:
+            approved_candidates += 1
+        if is_non_closure:
+            non_closures += 1
+            reason = str(
+                record.get("classification_source")
+                or record.get("classification")
+                or record.get("status")
+                or "unknown"
+            )
+            reasons[reason] = reasons.get(reason, 0) + 1
+        outcomes.append((was_approved, is_non_closure, reason))
+
+    consecutive = 0
+    for _, is_non_closure, _ in reversed(outcomes):
+        if not is_non_closure:
+            break
+        consecutive += 1
+
+    ordered_reasons = dict(
+        sorted(reasons.items(), key=lambda item: (-item[1], item[0]))
+    )
+    return NonClosureSummary(
+        window_runs=window_runs,
+        observed_runs=len(terminal_runs),
+        approved_candidates=approved_candidates,
+        count=non_closures,
+        consecutive=consecutive,
+        alarm_threshold=alarm_threshold,
+        reasons=ordered_reasons,
+    )
+
+
+def non_closure_alarm_blocker(summary: NonClosureSummary) -> str:
+    return (
+        "non_closure_alarm:"
+        f"{summary.consecutive}_consecutive_approved_candidates_not_done"
+    )
 
 
 def project_blockers(
