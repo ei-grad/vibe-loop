@@ -83,7 +83,7 @@ from vibe_loop.locks import (
 )
 from vibe_loop.runs import RunLifecycleEvent, RunResult, RunStore, WorkerReport
 from vibe_loop import tasks as tasks_module
-from vibe_loop.tasks import CommandTaskSource, Task
+from vibe_loop.tasks import CommandTaskSource, Task, build_task_source
 from vibe_loop.workers import claim_worker_workspace, git_dirty_snapshot
 
 
@@ -101,6 +101,7 @@ class OrchestrationConfigTests(unittest.TestCase):
             config.orchestration.task_provenance_mode,
             "external-confirmed",
         )
+        self.assertIsNone(config.orchestration.external_completion_actor)
 
     def test_parses_typed_allowlisted_contract_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -122,7 +123,8 @@ class OrchestrationConfigTests(unittest.TestCase):
                 "max_remediation_rounds = 4\n"
                 "max_candidate_reanchors = 3\n"
                 "integration_enabled = false\n"
-                'task_provenance_mode = "external-confirmed"\n',
+                'task_provenance_mode = "external-confirmed"\n'
+                'external_completion_actor = "operator"\n',
                 encoding="utf-8",
             )
 
@@ -140,6 +142,7 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_remediation_rounds, 4)
         self.assertEqual(config.orchestration.max_candidate_reanchors, 3)
         self.assertFalse(config.orchestration.integration_enabled)
+        self.assertEqual(config.orchestration.external_completion_actor, "operator")
 
     def test_accepts_runtime_owned_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -174,6 +177,10 @@ class OrchestrationConfigTests(unittest.TestCase):
             (
                 'task_provenance_mode = ""\n',
                 "orchestration.task_provenance_mode must be one of",
+            ),
+            (
+                'external_completion_actor = ""\n',
+                "orchestration.external_completion_actor must be one of",
             ),
         )
         for settings, diagnostic in cases:
@@ -223,10 +230,17 @@ class RunContractResolverTests(unittest.TestCase):
                 mode="runtime-owned",
                 reviewer_profile="review",
                 task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
                 explicit_keys=frozenset(
-                    {"mode", "reviewer_profile", "task_provenance_mode"}
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
                 ),
             ),
+            task_source=TaskSourceConfig(type="markdown-plan"),
         )
 
         with self.assertRaisesRegex(
@@ -453,17 +467,105 @@ class RunContractResolverTests(unittest.TestCase):
                 OrchestrationConfig(
                     mode="runtime-owned",
                     reviewer_profile="review",
-                    task_provenance_mode="external-confirmed",
+                    task_provenance_mode="adapter",
                     explicit_keys=frozenset(
                         {"mode", "reviewer_profile", "task_provenance_mode"}
                     ),
                 ),
                 TaskSourceConfig(
+                    type="markdown-plan",
+                    complete_command="complete {task_id}",
+                ),
+                "task_source.complete on a command task source",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="adapter",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(complete_command="complete {task_id}"),
+                "external_completion_actor is only valid",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(
                     type="command",
                     list_command="list",
+                    probe_command="probe {task_id}",
                     activate_command="activate {task_id}",
                 ),
                 "requires task_source.reset",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    explicit_keys=frozenset(
+                        {"mode", "reviewer_profile", "task_provenance_mode"}
+                    ),
+                ),
+                TaskSourceConfig(type="markdown-plan"),
+                "requires an explicit.*external_completion_actor",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(type="command"),
+                "requires a task source with probe capability",
+            ),
+            (
+                OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="worker",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                TaskSourceConfig(type="markdown-plan"),
+                "workers are forbidden from transitioning",
             ),
         )
         for orchestration, task_source, diagnostic in cases:
@@ -553,11 +655,148 @@ class RunContractResolverTests(unittest.TestCase):
             {
                 "mode": "adapter",
                 "complete_adapter": "task_source.complete",
+                "confirmation_adapter": "task_source.complete",
+                "transition_actor": "runtime",
                 "settlement": {
                     "requeue_adapter": "task_source.reset",
                     "park_adapter": "task_source.park",
                 },
             },
+        )
+
+    def test_external_confirmation_accepts_native_markdown_probe(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "PLAN.md").write_text(
+                "# Plan\n\n"
+                "| ID | Priority | Status | Dependencies | Scope | Acceptance | "
+                "Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | P1 | Done | none | Native source. | Works. | Test. |\n",
+                encoding="utf-8",
+            )
+            task_source = TaskSourceConfig(type="markdown-plan")
+            config = VibeConfig(
+                repo=repo,
+                agent=agent,
+                agent_profiles={"review": reviewer},
+                orchestration=OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="external-confirmed",
+                    external_completion_actor="operator",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                            "external_completion_actor",
+                        }
+                    ),
+                ),
+                task_source=task_source,
+            )
+
+            contract = RunContractResolver(config).resolve(
+                AgentSelection(agent, "", "default")
+            )
+            confirmed = build_task_source(repo, task_source).probe("TASK-01")
+
+        self.assertEqual(
+            contract.payload["task_provenance"]["confirmation_adapter"],
+            "task_source.probe",
+        )
+        self.assertIsNotNone(confirmed)
+        assert confirmed is not None
+        self.assertTrue(confirmed.done)
+
+    def test_worker_owned_contract_omits_runtime_confirmation_evidence(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="worker-owned",
+                explicit_keys=frozenset({"mode"}),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                complete_command="complete {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"],
+            {
+                "mode": "external-confirmed",
+                "complete_adapter": "task_source.complete",
+                "settlement": {
+                    "requeue_adapter": None,
+                    "park_adapter": None,
+                },
+            },
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "external_completion_actor is only valid.*runtime-owned",
+        ):
+            RunContractResolver(
+                dataclasses.replace(
+                    config,
+                    orchestration=OrchestrationConfig(
+                        mode="worker-owned",
+                        external_completion_actor="worker",
+                        explicit_keys=frozenset({"mode", "external_completion_actor"}),
+                    ),
+                )
+            ).resolve(AgentSelection(agent, "", "default"))
+
+    def test_external_confirmation_preserves_available_complete_adapter(self) -> None:
+        agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            agent_profiles={"review": reviewer},
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="review",
+                task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
+                explicit_keys=frozenset(
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
+                ),
+            ),
+            task_source=TaskSourceConfig(
+                type="command",
+                list_command="list",
+                complete_command="complete {task_id}",
+            ),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(agent, "", "default")
+        )
+
+        self.assertEqual(
+            contract.payload["task_provenance"]["complete_adapter"],
+            "task_source.complete",
+        )
+        self.assertEqual(
+            contract.payload["task_provenance"]["confirmation_adapter"],
+            "task_source.probe",
         )
 
     def test_default_runtime_owned_contract_records_provider_role_matrix(self) -> None:
@@ -590,10 +829,16 @@ class RunContractResolverTests(unittest.TestCase):
                     orchestration=OrchestrationConfig(
                         reviewer_profile="review",
                         task_provenance_mode="external-confirmed",
+                        external_completion_actor="external-system",
                         explicit_keys=frozenset(
-                            {"reviewer_profile", "task_provenance_mode"}
+                            {
+                                "reviewer_profile",
+                                "task_provenance_mode",
+                                "external_completion_actor",
+                            }
                         ),
                     ),
+                    task_source=TaskSourceConfig(type="markdown-plan"),
                 )
 
                 contract = RunContractResolver(config).resolve(
@@ -610,6 +855,14 @@ class RunContractResolverTests(unittest.TestCase):
                 self.assertEqual(
                     contract.payload["task_provenance"]["mode"],
                     "external-confirmed",
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["transition_actor"],
+                    "external-system",
+                )
+                self.assertEqual(
+                    contract.payload["task_provenance"]["confirmation_adapter"],
+                    "task_source.probe",
                 )
 
 
@@ -3487,6 +3740,75 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertEqual(wall["retry_classification"], "limit_wall")
         self.assertEqual(wall["route"]["provider"], "codex")
+
+    def test_reviewer_that_read_limit_wall_fixtures_is_not_a_wall(self) -> None:
+        # The observed false positive. Reviewing a limit-wall slice means reading
+        # its classifier fixtures, so the reviewer transcript quotes the phrases
+        # verbatim; the reviewer then finished and approved. Text below is
+        # verbatim from run 20260725T192937Z-...-58298d25-remediation-1, which
+        # paused dispatch 1800s and was reported to the operator as an exhausted
+        # provider quota.
+        transcript = "\n".join(
+            (
+                "Reading tests/test_retry.py",
+                '        ("Error 429: Too Many Requests. usage limit exceeded, '
+                'retry after 30s", True),',
+                '        ("503: weekly limit reached, service temporarily '
+                'unavailable", True),',
+                "You've hit your usage limit is the phrase the detector matches.",
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [],
+                        "session_id": "review-1",
+                        "session_id_source": "provider",
+                        "continuation_ordinal": 0,
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=transcript)
+
+        result = self.router("codex", execute).review(self.gates)
+
+        self.assertTrue(result.approved)
+        self.assertEqual(
+            [
+                record.get("retry_classification")
+                for record in self.store.read_records()
+                if record.get("record_type") == "review_verdict"
+            ],
+            ["ok"],
+        )
+
+    def test_reviewer_wall_in_a_provider_envelope_still_pauses(self) -> None:
+        # The real thing, in the shape the provider emits it: the reviewer
+        # process failed and its terminal record carries the refusal. Matches
+        # tests/fixtures/provider_usage/claude-limit-wall.json.
+        envelope = json.dumps(
+            {
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": True,
+                "result": "usage limit reached",
+                "usage": {"input_tokens": 10, "output_tokens": 2},
+            }
+        )
+        transcript = "\n".join(("reading src/vibe_loop/retry.py", envelope))
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 1, stdout=transcript)
+
+        with self.assertRaises(ReviewLimitWallError) as raised:
+            self.router("codex", execute).review(self.gates)
+
+        message = str(raised.exception)
+        self.assertIn("usage limit reached", message)
+        # The diagnostic must name what qualified the match, so an operator
+        # reading a recorded pause can tell it from a quoted phrase.
+        self.assertIn(f"[exit=1; scanned all {len(transcript)} chars]", message)
 
     def test_missing_prompt_delivery_fails_before_launch(self) -> None:
         router = ReviewRouter(
