@@ -1827,14 +1827,6 @@ def start_detached_autopilot(
     """Start and verify a detached POSIX autopilot supervisor."""
 
     interval = require_autopilot_interval(interval)
-    contract_blockers = config_contract_blockers(config)
-    if contract_blockers:
-        return DetachedAutopilotLaunch(
-            repo=config.repo,
-            started=False,
-            blocker=contract_blockers[0].code,
-            config_contract_blockers=contract_blockers,
-        )
     if os.name != "posix" or not hasattr(os, "setsid"):
         return DetachedAutopilotLaunch(
             repo=config.repo,
@@ -1848,6 +1840,15 @@ def start_detached_autopilot(
             repo=config.repo,
             started=False,
             blocker=binding.blocker,
+        )
+
+    contract_blockers = config_contract_blockers(config)
+    if contract_blockers:
+        return DetachedAutopilotLaunch(
+            repo=config.repo,
+            started=False,
+            blocker=contract_blockers[0].code,
+            config_contract_blockers=contract_blockers,
         )
 
     lock_manager = build_lock_manager(

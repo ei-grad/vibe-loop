@@ -455,6 +455,8 @@ class ProjectBindingGateTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.repo = Path(directory.name)
         (self.repo / ".vibe-loop.toml").write_text(
+            "[orchestration]\n"
+            'mode = "worker-owned"\n'
             "[locks]\n"
             'type = "command"\n'
             'acquire_command = "false"\n'
@@ -701,6 +703,8 @@ class CrossProjectIsolationTests(unittest.TestCase):
         quoted_task = f"{sys.executable} {self.task_adapter}"
         quoted_lock = f"{sys.executable} {self.lock_adapter}"
         (repo / ".vibe-loop.toml").write_text(
+            "[orchestration]\n"
+            'mode = "worker-owned"\n'
             "[task_source]\n"
             'type = "command"\n'
             f'list = "{quoted_task} list"\n'
