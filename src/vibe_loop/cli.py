@@ -1732,6 +1732,9 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         f"consecutive={non_closure.consecutive}/"
         f"{non_closure.alarm_threshold}{alarm}; reasons: {reasons}"
     )
+    if status.alarms:
+        lines.append("alarms:")
+        lines.extend(f"  - {alarm}" for alarm in status.alarms)
     supervisor = status.supervisor
     supervisor_line = f"supervisor: {supervisor.state}"
     if supervisor.pid:

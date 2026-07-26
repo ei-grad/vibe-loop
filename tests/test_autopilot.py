@@ -195,14 +195,16 @@ class AutopilotStatusTests(unittest.TestCase):
         classification: str,
         reason: str,
         reached_done: bool = False,
+        approved: bool = True,
     ) -> None:
-        run_store.append_lifecycle_event(
-            RunLifecycleEvent.review_verdict(
-                run_id=run_id,
-                task_id=task_id,
-                payload={"verdict": "approve", "pass_kind": "initial"},
+        if approved:
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.review_verdict(
+                    run_id=run_id,
+                    task_id=task_id,
+                    payload={"verdict": "approve", "pass_kind": "initial"},
+                )
             )
-        )
         if reached_done:
             run_store.append_lifecycle_event(
                 RunLifecycleEvent.task_provenance_committed(
@@ -272,14 +274,19 @@ class AutopilotStatusTests(unittest.TestCase):
                 },
             },
         )
-        self.assertIn(
+        self.assertEqual(
+            payload["alarms"],
+            ["non_closure_alarm:6_consecutive_approved_candidates_not_done"],
+        )
+        self.assertNotIn(
             "non_closure_alarm:6_consecutive_approved_candidates_not_done",
             payload["blockers"],
         )
         self.assertIn("non-closure: 6/6 approved candidates", rendered)
         self.assertIn("consecutive=6/2 ALARM", rendered)
         self.assertIn("merge_conflict=2", rendered)
-        self.assertNotIn("blockers: none", rendered)
+        self.assertIn("alarms:", rendered)
+        self.assertIn("blockers: none", rendered)
 
     def test_healthy_approved_closures_do_not_raise_non_closure_alarm(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -304,12 +311,51 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["non_closure"]["rate"], 0.0)
         self.assertEqual(payload["non_closure"]["consecutive"], 0)
         self.assertFalse(payload["non_closure"]["alarmed"])
+        self.assertEqual(payload["alarms"], [])
         self.assertFalse(
             any(
                 blocker.startswith("non_closure_alarm:")
                 for blocker in payload["blockers"]
             )
         )
+
+    def test_unapproved_run_does_not_reset_approved_non_closure_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            self._record_approved_outcome(
+                run_store,
+                run_id="run-1",
+                task_id="TASK-01",
+                classification="blocked",
+                reason="merge_conflict",
+            )
+            self._record_approved_outcome(
+                run_store,
+                run_id="run-2",
+                task_id="TASK-02",
+                classification="failed",
+                reason="gate_failed",
+                approved=False,
+            )
+            self._record_approved_outcome(
+                run_store,
+                run_id="run-3",
+                task_id="TASK-03",
+                classification="blocked",
+                reason="completion_adapter_failed",
+            )
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["non_closure"]["observed_runs"], 3)
+        self.assertEqual(payload["non_closure"]["approved_candidates"], 2)
+        self.assertEqual(payload["non_closure"]["count"], 2)
+        self.assertEqual(payload["non_closure"]["rate"], 1.0)
+        self.assertEqual(payload["non_closure"]["consecutive"], 2)
+        self.assertTrue(payload["non_closure"]["alarmed"])
 
     def test_collect_project_status_summarizes_repo_queue_workers_and_cycle(
         self,

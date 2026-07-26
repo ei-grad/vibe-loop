@@ -379,6 +379,12 @@ class ProjectStatus:
         default_factory=ResolvedProjectBinding
     )
 
+    @property
+    def alarms(self) -> tuple[str, ...]:
+        if not self.non_closure.alarmed:
+            return ()
+        return (non_closure_alarm(self.non_closure),)
+
     def to_json(self) -> dict[str, object]:
         payload = {
             "repo": str(self.repo),
@@ -398,6 +404,7 @@ class ProjectStatus:
             ],
             "supervisor": self.supervisor.to_json(),
             "blockers": list(self.blockers),
+            "alarms": list(self.alarms),
             "advisories": [dict(advisory) for advisory in self.advisories],
             "observations": list(self.observations),
             "last_cycle": (
@@ -504,10 +511,7 @@ def collect_project_status(
             ),
             last_cycle=latest_cycle_summary(run_store),
             non_closure=non_closure,
-            blockers=tuple(item.code for item in project_binding.diagnostics)
-            + (
-                (non_closure_alarm_blocker(non_closure),) if non_closure.alarmed else ()
-            ),
+            blockers=tuple(item.code for item in project_binding.diagnostics),
             runtime_context=config.runtime_context,
             project_binding=project_binding,
         )
@@ -573,8 +577,6 @@ def collect_project_status(
         agent_diagnostics=agent_blockers,
         supervisor=supervisor,
     )
-    if non_closure.alarmed:
-        blockers.append(non_closure_alarm_blocker(non_closure))
     observations = tuple(
         project_observations(queue_status=queue_status, workers=workers)
     )
@@ -1363,7 +1365,7 @@ def summarize_non_closures(
         elif record.get("record_type") == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
             closed.add(identity)
 
-    outcomes: list[tuple[bool, bool, str]] = []
+    approved_outcomes: list[bool] = []
     reasons: dict[str, int] = {}
     approved_candidates = 0
     non_closures = 0
@@ -1375,9 +1377,9 @@ def summarize_non_closures(
         was_approved = identity in approved
         reached_done = identity in closed
         is_non_closure = was_approved and not reached_done
-        reason = ""
         if was_approved:
             approved_candidates += 1
+            approved_outcomes.append(is_non_closure)
         if is_non_closure:
             non_closures += 1
             reason = str(
@@ -1387,10 +1389,9 @@ def summarize_non_closures(
                 or "unknown"
             )
             reasons[reason] = reasons.get(reason, 0) + 1
-        outcomes.append((was_approved, is_non_closure, reason))
 
     consecutive = 0
-    for _, is_non_closure, _ in reversed(outcomes):
+    for is_non_closure in reversed(approved_outcomes):
         if not is_non_closure:
             break
         consecutive += 1
@@ -1409,7 +1410,7 @@ def summarize_non_closures(
     )
 
 
-def non_closure_alarm_blocker(summary: NonClosureSummary) -> str:
+def non_closure_alarm(summary: NonClosureSummary) -> str:
     return (
         "non_closure_alarm:"
         f"{summary.consecutive}_consecutive_approved_candidates_not_done"

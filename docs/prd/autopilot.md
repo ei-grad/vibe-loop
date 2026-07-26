@@ -63,9 +63,11 @@ journal. A non-closure is a terminal run that recorded an approving review
 verdict but did not record task-source completion. The summary reports the
 approved-candidate denominator, non-closure count and rate, consecutive
 non-closure streak, and distinct terminal classification reasons. Two
-consecutive non-closures raise a blocker-visible alarm; a run that reaches
-task-source completion resets the streak. This is an outcome signal and must
-not depend on an allowlist of known failure reasons.
+consecutive non-closures raise a dedicated visible alarm that does not become a
+dispatch blocker. Terminal runs without an approving verdict are neutral to the
+approved-candidate streak; task-source completion of an approved candidate
+resets it. This is an outcome signal and must not depend on an allowlist of
+known failure reasons.
 
 Related implementation IDs: `AUTO-02`, `AUTO-03`.
 
