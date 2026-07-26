@@ -138,12 +138,15 @@ Install them into Codex and/or Claude:
 
 ```bash
 vibe-loop install-skills --codex --claude
+vibe-loop verify-skills
 ```
 
-Run that from a clean checkout of the main branch. The runtime skill directories
-are global to the machine, so installing from a task branch or a dirty tree
-makes that branch's instructions live for every agent on the host, including
-agents working on unrelated projects.
+Run installation from a clean checkout of the `main` branch. The command refuses
+dirty and non-mainline sources by default, writes both runtime directories even
+when `--codex` or `--claude` filters its report, and records per-file provenance
+in each target root. `verify-skills` is read-only and exits non-zero on drift.
+See [recorded skill deployment](docs/skill-deployment.md) for the manifest,
+overwrite guard, classifications, and worker-preflight policy.
 
 The worker skills do not require the CLI; you can invoke them directly for manual
 bounded or unattended work. The `autopilot` operator skill does drive the CLI.

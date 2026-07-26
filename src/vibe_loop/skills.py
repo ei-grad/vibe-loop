@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.resources
-import shutil
+from collections.abc import Callable
 from pathlib import Path
+
+from vibe_loop.skill_deployment import deploy_skill_bundle
 
 
 SKILL_NAMES = (
@@ -13,22 +15,23 @@ SKILL_NAMES = (
 )
 
 
-def install_skills(codex: bool, claude: bool, home: Path) -> list[Path]:
-    targets: list[Path] = []
-    if codex:
-        targets.append(home / ".codex" / "skills")
-    if claude:
-        targets.append(home / ".claude" / "skills")
-    if not targets:
-        targets.extend([home / ".codex" / "skills", home / ".claude" / "skills"])
-
-    installed: list[Path] = []
-    source_root = importlib.resources.files("vibe_loop") / "skills"
-    for target_root in targets:
-        target_root.mkdir(parents=True, exist_ok=True)
-        for skill_name in SKILL_NAMES:
-            source = source_root / skill_name
-            target = target_root / skill_name
-            shutil.copytree(source, target, dirs_exist_ok=True)
-            installed.append(target)
-    return installed
+def install_skills(
+    codex: bool,
+    claude: bool,
+    home: Path,
+    *,
+    force: bool = False,
+    allow_unmerged: bool = False,
+    report_diagnostic: Callable[[str], None] | None = None,
+) -> list[Path]:
+    source_root = Path(str(importlib.resources.files("vibe_loop") / "skills"))
+    return deploy_skill_bundle(
+        source_root=source_root,
+        skill_names=SKILL_NAMES,
+        home=home,
+        codex=codex,
+        claude=claude,
+        force=force,
+        allow_unmerged=allow_unmerged,
+        report_diagnostic=report_diagnostic,
+    )

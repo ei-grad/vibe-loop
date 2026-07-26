@@ -51,6 +51,7 @@ the install output and prompt contract from a clean tree:
 
 ```bash
 uv run vibe-loop install-skills --codex --home <tmpdir>
+uv run vibe-loop verify-skills --home <tmpdir>
 uv run python -m unittest tests.test_cli.CliTests.test_install_skills_are_cli_agnostic \
   tests.test_cli.CliTests.test_cli_worker_addendum_contains_coordination
 ```
