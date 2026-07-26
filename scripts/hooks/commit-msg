@@ -1,19 +1,18 @@
 #!/bin/sh
 
 message_file=${1:-}
-source_kind=${2:-}
-
-case "$source_kind" in
-    merge | squash)
-        exit 0
-        ;;
-esac
 
 if [ -z "$message_file" ] || [ -z "${VIBE_LOOP_TASK_ID:-}" ]; then
     exit 0
 fi
 
-if grep -qiE '^Plan-Item:' "$message_file" 2>/dev/null; then
+merge_head=$(git rev-parse --git-path MERGE_HEAD 2>/dev/null || true)
+if [ -n "$merge_head" ] && [ -f "$merge_head" ]; then
+    exit 0
+fi
+
+if git interpret-trailers --parse "$message_file" 2>/dev/null |
+    grep -qiE '^Plan-Item:'; then
     exit 0
 fi
 

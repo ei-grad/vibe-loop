@@ -842,7 +842,7 @@ make tag
 
 `make tag` uses the current `uv version --short` value by default; pass
 `VERSION=...` to check or tag an explicit version. The installed
-`prepare-commit-msg` hook adds `Plan-Item`, `Run-Id`, and `Agent-Kind` trailers
+`commit-msg` hook adds `Plan-Item`, `Run-Id`, and `Agent-Kind` trailers
 to commits made by a vibe-loop worker. The installed `pre-commit` hook runs
 `ruff check` and `ruff format --check`; the installed `pre-push` hook rejects
 pushed `v*` tags when `pyproject.toml` or the `vibe-loop` entry in `uv.lock`
