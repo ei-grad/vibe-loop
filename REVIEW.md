@@ -27,20 +27,7 @@ step documented in `README.md`.
 
 ## One Authority Gate
 
-For any behavior, contract, or interface, exactly one file is authoritative.
-Every other mention must link to it rather than paraphrase it. When two files
-describe the same thing, require the change to name the authoritative file in
-both and reduce the other account to a pointer.
-
-Move, do not copy. A change that adds a section under `docs/` without deleting
-the corresponding account elsewhere must state which file is authoritative. An
-unanswered "both" is a finding.
-
-- [ ] Verify each added or moved contract account has a corresponding deletion
-      or names its single authoritative file.
-
-In this repository, `docs/prd/*.md` is authoritative for contract and behavior
-material, and `README.md` is not authoritative for anything it links to. A PRD
-may be stale: where behavior and prose disagree, use the code to determine the
-correct account and require the correction to land in the PRD rather than
-bypassing it or adding another account.
+- [ ] Apply the authoritative
+      [one-authority policy](CLAUDE.md#one-authority-per-behavior): each added or
+      moved contract account deletes the former account or names and links its
+      single authority; an unanswered "both" is a finding.

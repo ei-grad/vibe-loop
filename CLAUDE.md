@@ -22,19 +22,30 @@ the loopyard `vibe-loop` project for implementation slices.
 
 ## One Authority Per Behavior
 
+This section is authoritative for repository documentation ownership policy.
+
 For any behavior, contract, or interface, exactly one file is authoritative.
 Every other mention is a link, not a paraphrase. When two files describe the
-same thing, name the authoritative file in both and reduce the other account to
-a pointer.
+same thing, name the authoritative one in both and reduce the other to a
+pointer.
 
-Move, do not copy. A change that adds a section under `docs/` without deleting
+Move, don't copy. A change that adds a section under `docs/` without deleting
 the corresponding account elsewhere must state which file is authoritative.
 An unanswered "both" is a review finding.
 
-For contract and behavior material, `docs/prd/*.md` is authoritative.
-`README.md` is not authoritative for anything it links to. A PRD may be stale:
-when behavior and prose disagree, use the code to determine the correct account
-and correct the PRD rather than bypassing it or adding another account.
+For Level 2 product contract and behavior material covered by a PRD,
+`docs/prd/*.md` is authoritative. `README.md` is not authoritative for anything
+it links to. A PRD may be stale: when behavior and prose disagree, use the code
+to determine the correct account and correct the PRD rather than bypassing it or
+adding another account.
+
+This PRD authority does not override a narrower owner for material outside the
+Level 2 product contract. `src/vibe_loop/skills/**/SKILL.md` owns exact shipped
+skill instructions, [the configuration reference](docs/configuration.md) owns
+the operator-facing option index, and
+[the skill eval schema](docs/skill-eval-schema.md) owns its local artifact
+format. Design and implementation references may explain rationale or mechanics,
+but must link to the PRD instead of restating its product contract.
 
 ## Repository Task Status Authority
 

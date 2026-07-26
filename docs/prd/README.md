@@ -10,18 +10,14 @@ requirement IDs for review and future traceability.
 
 ## Authority
 
-- `docs/prd/*.md` is the authoritative prose account for contract and behavior
-  material. Other documents link to that account rather than paraphrasing it.
-- A PRD may be stale and is not proof that behavior is implemented. Where code
-  and prose disagree, use the code and tests to determine the correct account,
-  then correct the PRD rather than bypassing it or adding another account.
+- The repository's authoritative
+  [one-authority policy](../../CLAUDE.md#one-authority-per-behavior) assigns
+  Level 2 product contract and behavior material covered by a PRD to this PRD
+  set.
 - The loopyard `vibe-loop` project is this repository's scheduler-facing task
   source and implementation history.
 - `.vibe-loop/` remains local run, lock, cache, and generated-discovery state.
   It is not a project completion ledger.
-- `README.md` is not authoritative for anything it links to. README sections
-  may explain positioning and supported workflows, but they do not replace PRD
-  contracts or task-source entries.
 - The operator-facing option index lives in the
   [configuration reference](../configuration.md); links from that reference to
   PRD sections identify which contract owns each configuration family.
