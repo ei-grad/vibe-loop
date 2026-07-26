@@ -231,14 +231,21 @@ report, durable local result before external settlement (`PRD-WRK-003`
 unchanged).
 
 Failure settlement is the completion path's counterpart. Every
-post-activation failure transition must settle the task source under the
-held lock with a typed intent — `requeue` to the runnable state via
-`task_source.reset`, or `park` into the source's non-runnable held state via
-an optional `task_source.park` adapter, with a recorded fallback to
-`requeue` when park is unconfigured — journaled as `task_source_settled`
-before the fenced lock release. On an activation-capable task source the
-contract must include a settlement path; contract validation fails closed
-before any mutation when `task_source.reset` is absent.
+post-activation failure transition after worker launch must settle the task
+source under the held lock with a typed intent — `requeue` to the runnable
+state via `task_source.reset`, or `park` into the source's non-runnable held
+state via an optional `task_source.park` adapter, with a recorded fallback to
+`requeue` when park is unconfigured — journaled as `task_source_settled` before
+the fenced lock release. On an activation-capable task source the contract must
+include a settlement path; contract validation fails closed before any mutation
+when `task_source.reset` is absent.
+
+A failure before worker launch must not retain its task lock. If activation may
+already have succeeded, pre-launch finalization releases the lock and
+immediately attempts an unfenced `requeue`; the attempt is journaled as
+`task_source_settled` when confirmed or `task_source_settlement_attempted` with
+recovery instructions when it remains unconfirmed.
+
 `task_source_settled` records only a confirmed settlement — the
 authoritative task source observed non-in-progress — never a merely
 attempted adapter call. A failed or unconfirmed attempt is journaled as

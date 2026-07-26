@@ -332,11 +332,17 @@ earlier one; recovery re-derives position from this order):
 11. durable `RunResult` → 12. settled outcome published → 13. fenced release.
 
 The existing `PRD-WRK-003` settlement gate (11→12→13) is preserved unchanged.
-Post-activation failure transitions share the same tail with task-source
-settlement first: failure event → `task_source_settled` durable → 11 → 12 →
-13. Only a confirmed `task_source_settled` record satisfies the settlement
-step: `task_source_settlement_attempted` never advances the tail, so the run
-holds at `settlement_pending` with the task lock retained (retrying with
+Post-activation failure transitions after worker launch share the same tail
+with task-source settlement first: failure event → `task_source_settled`
+durable → 11 → 12 → 13. A pre-worker failure is the narrower exception: it
+releases the task lock during pre-launch finalization, then immediately retries
+requeue settlement unfenced. This prevents a run with no worker and no durable
+`RunResult` from leaving either a held lock or an activated task with no
+settlement attempt.
+
+Only a confirmed `task_source_settled` record satisfies the settlement step:
+`task_source_settlement_attempted` never advances the post-launch tail, so the
+run holds at `settlement_pending` with the task lock retained (retrying with
 bounded backoff) until confirmation. After process death the fenced
 settlement-recovery path above is the preferred route to 13; when the fenced
 attempts are exhausted (or the operator forces cleanup), 13 proceeds with the

@@ -2131,13 +2131,6 @@ class VibeRunner:
                     RunStage.FINALIZATION,
                     reason="pre_launch_failure",
                 )
-            if activated_runtime_owned and not task_source_terminal_confirmed:
-                report_status(
-                    "retained task lock after runtime-owned activation failure "
-                    f"for stage-aware task-source settlement: {task.task_id} "
-                    f"run_id={run_id}"
-                )
-                return
             self.lock_manager.release(task_lock)
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.lock_event(
@@ -2152,6 +2145,14 @@ class VibeRunner:
                     },
                 )
             )
+            if activated_runtime_owned and not task_source_terminal_confirmed:
+                self.settle_task_source_after_release(
+                    task_id=task.task_id,
+                    run_id=run_id,
+                    task_lock=task_lock,
+                    intent="requeue",
+                    report_status=report_status,
+                )
 
         try:
             run_contract = RunContractResolver(self.config).resolve(agent_selection)
