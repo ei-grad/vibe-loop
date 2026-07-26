@@ -44,10 +44,22 @@ from vibe_loop.runs import (
     RunStore,
     WorkerReport,
     derive_run_lifecycle,
+    record_status,
 )
 
 
 class RunStoreTests(unittest.TestCase):
+    def test_integration_provenance_status_exposes_outcome(self) -> None:
+        record = RunLifecycleEvent.integration_provenance(
+            run_id="run-1",
+            task_id="TASK-01",
+            outcome="refused-unprovable",
+            candidate_commit="a" * 40,
+            target_commit="b" * 40,
+        ).to_record()
+
+        self.assertEqual(record_status(record), "refused-unprovable")
+
     def test_cross_run_attempt_circuit_opens_and_records_avoided_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = RunStore(Path(directory) / "runs.jsonl")

@@ -1788,25 +1788,31 @@ class RunStore:
     def append_result(self, result: RunResult) -> None:
         self.append_record(result.to_record())
 
-    def settle_integration_provenance(
+    def record_completed_integration(
         self,
         *,
         run_id: str,
         task_id: str,
-        candidate_commit: str,
-        target_commit: str,
-        reconciled_integration: RunLifecycleEvent,
+        integration: RunLifecycleEvent,
+        provenance_outcome: str,
     ) -> str:
-        """Atomically settle one direct or ancestry-reconciled integration."""
+        """Atomically record one completed integration and its provenance."""
 
-        integration_record = reconciled_integration.to_record()
+        if provenance_outcome not in {
+            "settled-directly",
+            "settled-by-reconciliation",
+        }:
+            raise ValueError(
+                "completed integration provenance must describe a settlement"
+            )
+        integration_record = integration.to_record()
         if (
             integration_record.get("record_type") != INTEGRATION_RESULT_RECORD_TYPE
             or integration_record.get("run_id") != run_id
             or integration_record.get("task_id") != task_id
             or integration_record.get("status") != "completed"
         ):
-            raise ValueError("reconciled integration must be a completed result")
+            raise ValueError("integration must be a completed result")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with _APPEND_LOCK:
             with append_record_lock(self.path):
@@ -1830,7 +1836,7 @@ class RunStore:
                 if prior_settlement is not None:
                     return string_value(prior_settlement.get("outcome"))
 
-                prior_integration = next(
+                durable_integration = next(
                     (
                         record
                         for record in reversed(records)
@@ -1838,8 +1844,7 @@ class RunStore:
                         and record.get("run_id") == run_id
                         and record.get("task_id") == task_id
                         and record.get("status") == "completed"
-                        and record.get("outcome")
-                        in {"merged", "branch_already_merged"}
+                        and record.get("outcome") in {"merged", "branch_already_merged"}
                         and isinstance(record.get("candidate_head"), str)
                         and bool(record.get("candidate_head"))
                         and isinstance(record.get("main_after"), str)
@@ -1847,25 +1852,23 @@ class RunStore:
                     ),
                     None,
                 )
-                if prior_integration is None:
-                    outcome = "settled-by-reconciliation"
+                if durable_integration is None:
                     self._append_record_unlocked(integration_record)
-                else:
-                    outcome = "settled-directly"
-                    candidate_commit = string_value(
-                        prior_integration.get("candidate_head")
-                    )
-                    target_commit = string_value(prior_integration.get("main_after"))
+                    durable_integration = integration_record
                 self._append_record_unlocked(
                     RunLifecycleEvent.integration_provenance(
                         run_id=run_id,
                         task_id=task_id,
-                        outcome=outcome,
-                        candidate_commit=candidate_commit,
-                        target_commit=target_commit,
+                        outcome=provenance_outcome,
+                        candidate_commit=string_value(
+                            durable_integration.get("candidate_head")
+                        ),
+                        target_commit=string_value(
+                            durable_integration.get("main_after")
+                        ),
                     ).to_record()
                 )
-                return outcome
+                return provenance_outcome
 
     def record_integration_provenance_refusal(
         self,
@@ -2425,6 +2428,8 @@ def record_status(record: dict[str, Any]) -> str:
         return f"{phase}:{outcome}" if outcome else phase
     if record_type == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
         return string_value(record.get("confirmed_status")) or "committed"
+    if record_type == INTEGRATION_PROVENANCE_RECORD_TYPE:
+        return string_value(record.get("outcome"))
     if record_type == TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE:
         return "settlement_pending"
     if record_type == TASK_SOURCE_SETTLED_RECORD_TYPE:

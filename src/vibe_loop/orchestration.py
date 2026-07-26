@@ -3227,6 +3227,7 @@ INTEGRATION_FAILURE_REASONS = (
     "main_worktree_unavailable",
     "main_fast_forward_failed",
     "main_verification_failed",
+    "integration_ancestry_unproven",
 )
 
 
@@ -3343,6 +3344,12 @@ class IntegrationResult:
         )
 
 
+def integration_provenance_outcome(result: IntegrationResult) -> str:
+    if result.outcome == "branch_already_merged":
+        return "settled-by-reconciliation"
+    return "settled-directly"
+
+
 @dataclasses.dataclass(frozen=True)
 class _RecoveredIntegrationLock:
     status: object
@@ -3390,6 +3397,11 @@ class Integrator:
     def run(self) -> IntegrationResult:
         prior = self._prior_result()
         if prior is not None and self._prior_result_is_consistent(prior):
+            if prior.completed:
+                self._record_result(
+                    prior,
+                    provenance_outcome=integration_provenance_outcome(prior),
+                )
             self._release_recovered_lock()
             return prior
 
@@ -3420,6 +3432,13 @@ class Integrator:
             if concurrent_result is not None and self._prior_result_is_consistent(
                 concurrent_result
             ):
+                if concurrent_result.completed:
+                    self._record_result(
+                        concurrent_result,
+                        provenance_outcome=integration_provenance_outcome(
+                            concurrent_result
+                        ),
+                    )
                 return concurrent_result
             post_acquire_preflight = self._workspace_preflight()
             if post_acquire_preflight is not None:
@@ -3465,11 +3484,26 @@ class Integrator:
                 diagnostics={"code": "candidate_not_ancestor_of_branch"},
                 recovered=recovered_lock,
             )
-        if branch_head == main_before:
+        if self._is_ancestor(self.candidate.head_commit, main_before):
+            if branch_head not in {self.candidate.head_commit, main_before}:
+                self.run_store.record_integration_provenance_refusal(
+                    run_id=self.run_id,
+                    task_id=self.task_id,
+                    candidate_commit=self.candidate.head_commit,
+                    target_commit=main_before,
+                )
+                return self._record_failure(
+                    "integration_ancestry_unproven",
+                    status="blocked",
+                    main_before=main_before,
+                    refreshed_head=branch_head,
+                    diagnostics={"code": "unrecognized_refreshed_candidate"},
+                    recovered=recovered_lock,
+                )
             integration_checks = self._run_checks(
                 phase="integration",
                 keys=self.integration_keys,
-                worktree=self.candidate.worktree,
+                worktree=self.repo,
             )
             if not all(check.passed for check in integration_checks):
                 return self._record_failure(
@@ -3501,15 +3535,21 @@ class Integrator:
                 IntegrationResult(
                     outcome="branch_already_merged",
                     status="completed",
-                    reason="branch_already_merged",
+                    reason="reconciled_merged_candidate",
                     branch=self.candidate.branch,
                     candidate_head=self.candidate.head_commit,
                     refreshed_head=branch_head,
                     main_before=main_before,
                     main_after=main_before,
                     verification=checks,
-                    recovered=recovered_lock,
-                )
+                    recovered=(
+                        recovered_lock or self.candidate.head_commit != main_before
+                    ),
+                    diagnostics={
+                        "provenance_settlement": "settled-by-reconciliation",
+                    },
+                ),
+                provenance_outcome="settled-by-reconciliation",
             )
 
         if branch_head == self.candidate.head_commit:
@@ -3645,7 +3685,7 @@ class Integrator:
             return {"code": "workspace_claim_mismatch", "diagnostics": []}
         if not view.workspace_diagnostics:
             return None
-        if self._is_exact_merged_noop(view):
+        if self._is_provable_merged_noop(view):
             return None
         conflicts = self._unmerged_paths()
         return {
@@ -3656,7 +3696,7 @@ class Integrator:
             "conflicted_paths": conflicts,
         }
 
-    def _is_exact_merged_noop(self, view: object) -> bool:
+    def _is_provable_merged_noop(self, view: object) -> bool:
         diagnostics = view.workspace_diagnostics
         state = view.workspace_git_state
         claim = view.active.workspace
@@ -3670,7 +3710,15 @@ class Integrator:
             and not state.dirty
             and state.current_branch == claim.branch
             and state.head_commit
-            and state.head_commit == self._rev_parse(self.repo, self.main_branch)
+            and state.head_commit
+            in {
+                self.candidate.head_commit,
+                self._rev_parse(self.repo, self.main_branch),
+            }
+            and self._is_ancestor(
+                self.candidate.head_commit,
+                self._rev_parse(self.repo, self.main_branch),
+            )
         )
 
     def _acquire_lock(self) -> tuple[bool, bool, object]:
@@ -3874,16 +3922,28 @@ class Integrator:
             )
         return result
 
-    def _record_result(self, result: IntegrationResult) -> IntegrationResult:
+    def _record_result(
+        self,
+        result: IntegrationResult,
+        *,
+        provenance_outcome: str = "settled-directly",
+    ) -> IntegrationResult:
         from vibe_loop.runs import RunLifecycleEvent
 
-        self.run_store.append_lifecycle_event(
-            RunLifecycleEvent.integration_result(
+        event = RunLifecycleEvent.integration_result(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            payload=result.to_payload(),
+        )
+        if result.completed:
+            self.run_store.record_completed_integration(
                 run_id=self.run_id,
                 task_id=self.task_id,
-                payload=result.to_payload(),
+                integration=event,
+                provenance_outcome=provenance_outcome,
             )
-        )
+        else:
+            self.run_store.append_lifecycle_event(event)
         return result
 
     def _record_lock_event(self, record_type: str, path: Path) -> None:
@@ -4059,11 +4119,6 @@ class TaskSourceCompleter:
                 "completed_report_precedes_provenance",
                 "completed run result cannot precede task provenance",
             )
-        integration = self._completed_integration()
-        if integration is None:
-            integration = self._reconcile_completed_integration()
-        else:
-            self._settle_integration_provenance(integration)
         if (
             self.stage_machine is not None
             and self.stage_machine.stage is not RunStage.PROVENANCE
@@ -4073,6 +4128,18 @@ class TaskSourceCompleter:
                     "integration_stage_not_current",
                     "task provenance may only follow the integration stage",
                 )
+        integration = self._completed_integration()
+        if integration is None:
+            self._record_unprovable_integration()
+            raise TaskSourceCompletionError(
+                "integration_not_recorded",
+                "task provenance requires a durable completed integration_result",
+            )
+        self._ensure_integration_provenance(integration)
+        if (
+            self.stage_machine is not None
+            and self.stage_machine.stage is not RunStage.PROVENANCE
+        ):
             self.stage_machine.transition(
                 RunStage.PROVENANCE,
                 reason="integration_confirmed",
@@ -4173,72 +4240,35 @@ class TaskSourceCompleter:
                     result = candidate
         return result
 
-    def _reconcile_completed_integration(self) -> IntegrationResult:
+    def _record_unprovable_integration(self) -> None:
         candidate = self._latest_candidate()
         if candidate is None:
-            raise TaskSourceCompletionError(
-                "integration_not_recorded",
-                "task provenance requires a durable completed integration_result",
-            )
+            return
         target_commit = self._resolve_commit(self.main_branch)
-        if (
-            target_commit is None
-            or self._git(
-                "merge-base",
-                "--is-ancestor",
-                candidate.head_commit,
-                target_commit,
-            ).returncode
-            != 0
-        ):
-            if target_commit is not None:
-                self.run_store.record_integration_provenance_refusal(
-                    run_id=self.run_id,
-                    task_id=self.task_id,
-                    candidate_commit=candidate.head_commit,
-                    target_commit=target_commit,
-                )
-            raise TaskSourceCompletionError(
-                "integration_not_recorded",
-                "task provenance requires a durable completed integration_result; "
-                "candidate ancestry to the integration target is unproven",
-            )
-        reconciled = IntegrationResult(
-            outcome="branch_already_merged",
-            status="completed",
-            reason="reconciled_merged_candidate",
-            branch=candidate.branch,
-            candidate_head=candidate.head_commit,
-            refreshed_head=candidate.head_commit,
-            main_before=target_commit,
-            main_after=target_commit,
-            recovered=True,
-            diagnostics={
-                "provenance_settlement": "settled-by-reconciliation",
-            },
+        if target_commit is None:
+            return
+        self.run_store.record_integration_provenance_refusal(
+            run_id=self.run_id,
+            task_id=self.task_id,
+            candidate_commit=candidate.head_commit,
+            target_commit=target_commit,
         )
-        self._settle_integration_provenance(reconciled)
-        durable = self._completed_integration()
-        if durable is None:
-            raise RuntimeError("integration reconciliation was not durable")
-        return durable
 
-    def _settle_integration_provenance(
+    def _ensure_integration_provenance(
         self,
         integration: IntegrationResult,
     ) -> None:
         from vibe_loop.runs import RunLifecycleEvent
 
-        self.run_store.settle_integration_provenance(
+        self.run_store.record_completed_integration(
             run_id=self.run_id,
             task_id=self.task_id,
-            candidate_commit=integration.candidate_head,
-            target_commit=integration.main_after,
-            reconciled_integration=RunLifecycleEvent.integration_result(
+            integration=RunLifecycleEvent.integration_result(
                 run_id=self.run_id,
                 task_id=self.task_id,
                 payload=integration.to_payload(),
             ),
+            provenance_outcome=integration_provenance_outcome(integration),
         )
 
     def _latest_candidate(self) -> CandidateRecord | None:

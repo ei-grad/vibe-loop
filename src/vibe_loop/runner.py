@@ -3769,7 +3769,12 @@ class VibeRunner:
         for record in self.run_store.read_records():
             if record.get("run_id") == run_id and record.get("task_id") == task_id:
                 candidate = IntegrationResult.from_record(record)
-                if candidate is not None and candidate.completed:
+                if (
+                    candidate is not None
+                    and candidate.completed
+                    and candidate.candidate_head
+                    and candidate.main_after
+                ):
                     result = candidate
         return result
 

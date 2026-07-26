@@ -301,6 +301,14 @@ New record types:
   could not (provider unsupported, transcript missing); reason recorded.
 - `integration_result` — merged ref movement, verification evidence,
   no-op case (`branch_already_merged`).
+- `integration_provenance` — how the completed integration result was
+  established (`settled-directly` | `settled-by-reconciliation`) or why a
+  missing result was rejected (`refused-unprovable`), with the exact candidate
+  and integration-target commits. Reconciliation runs under the integration
+  lock and repeats configured integration and main verification before this
+  event and its completed `integration_result` are recorded under the same
+  journal serialization lock; retries repair missing provenance without
+  duplicating the integration result.
 - `task_provenance_committed` — task-source completion adapter result.
 - `task_source_settlement_attempted` — a settlement attempt that failed or
   could not be confirmed: intent, adapter identity redacted to its
@@ -320,7 +328,7 @@ earlier one; recovery re-derives position from this order):
 1. lock acquired → 2. contract resolved → 3. activation confirmed →
 4. workspace provisioned + claimed → 5. implementer launched →
 6. candidate recorded → 7. gates passed → 8. review verdict recorded →
-9. integration result → 10. task provenance committed →
+9. integration result + integration provenance → 10. task provenance committed →
 11. durable `RunResult` → 12. settled outcome published → 13. fenced release.
 
 The existing `PRD-WRK-003` settlement gate (11→12→13) is preserved unchanged.

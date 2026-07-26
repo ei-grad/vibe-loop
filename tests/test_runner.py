@@ -8011,13 +8011,27 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             runner, _, _ = self._build_runner(directory, [task], {})
             source = self._enable_runtime_owned_task_source(runner, task)
 
+            def completed_without_integration(**kwargs):
+                stage_machine = kwargs["stage_machine"]
+                for stage in (
+                    RunStage.CANDIDATE,
+                    RunStage.GATES,
+                    RunStage.REVIEW,
+                    RunStage.INTEGRATION,
+                ):
+                    stage_machine.transition(
+                        stage,
+                        reason="test_missing_integration_result",
+                    )
+                return runner_module.ClassificationResult(
+                    "completed",
+                    "runtime_lifecycle",
+                )
+
             with patch.object(
                 runner,
                 "execute_runtime_owned_lifecycle",
-                return_value=runner_module.ClassificationResult(
-                    "completed",
-                    "runtime_lifecycle",
-                ),
+                side_effect=completed_without_integration,
             ):
                 result = self._run_task(
                     runner,
@@ -8036,6 +8050,33 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                 record_types.index("run_result"),
             )
             self.assertEqual(source.status, "on-hold")
+
+    def test_runtime_integration_recovery_rejects_identityless_result(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [], {})
+            runner.run_store.append_lifecycle_event(
+                RunLifecycleEvent.integration_result(
+                    run_id="run-1",
+                    task_id="T-1",
+                    payload=IntegrationResult(
+                        outcome="branch_already_merged",
+                        status="completed",
+                        reason="legacy",
+                        branch="worker/T-1",
+                        candidate_head="",
+                        refreshed_head="",
+                        main_before="",
+                        main_after="",
+                    ).to_payload(),
+                )
+            )
+
+            result = runner._runtime_integration_result(
+                run_id="run-1",
+                task_id="T-1",
+            )
+
+        self.assertIsNone(result)
 
     def test_candidate_reanchor_retry_bound_parks_as_blocked(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
