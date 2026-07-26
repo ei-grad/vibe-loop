@@ -34,14 +34,23 @@ release-gate:
 install-hooks:
 	@hooks_dir="$$(git rev-parse --git-common-dir)/hooks"; \
 	mkdir -p "$$hooks_dir"; \
-	for hook in prepare-commit-msg pre-commit pre-push; do \
-	  if [ -f "$$hooks_dir/$$hook" ] && ! grep -q "scripts/hooks/$$hook" "$$hooks_dir/$$hook"; then \
-	    echo "$$hooks_dir/$$hook already exists and is not managed by this repo" >&2; \
+	for hook in pre-commit pre-push prepare-commit-msg; do \
+	  hook_path="$$hooks_dir/$$hook"; \
+	  if [ -f "$$hook_path" ] && ! grep -q "scripts/hooks/$$hook" "$$hook_path"; then \
+	    if [ "$$hook" = prepare-commit-msg ] && [ -x "$$hook_path" ] && grep -q 'VIBE_LOOP_TASK_ID' "$$hook_path" && grep -q 'Plan-Item:' "$$hook_path" && grep -q 'interpret-trailers' "$$hook_path"; then \
+	      echo "$$hook_path is a compatible unmanaged provenance hook; keeping it"; \
+	      continue; \
+	    fi; \
+	    echo "$$hook_path already exists and is not managed by this repo; move or remove it, then rerun make install-hooks" >&2; \
 	    exit 1; \
 	  fi; \
-	  printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' "exec \"\$$repo_root/scripts/hooks/$$hook\" \"\$$@\"" > "$$hooks_dir/$$hook"; \
-	  chmod +x "$$hooks_dir/$$hook"; \
-	  echo "installed $$hooks_dir/$$hook"; \
+	  if [ "$$hook" = prepare-commit-msg ]; then \
+	    printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' "hook_path=\"\$$repo_root/scripts/hooks/$$hook\"" '[ -x "$$hook_path" ] || exit 0' 'exec "$$hook_path" "$$@"' > "$$hook_path"; \
+	  else \
+	    printf '%s\n' '#!/bin/sh' 'repo_root=$$(git rev-parse --show-toplevel)' "exec \"\$$repo_root/scripts/hooks/$$hook\" \"\$$@\"" > "$$hook_path"; \
+	  fi; \
+	  chmod +x "$$hook_path"; \
+	  echo "installed $$hook_path"; \
 	done
 
 version-check:
