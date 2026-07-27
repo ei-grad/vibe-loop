@@ -2245,6 +2245,15 @@ def command_option_value(argv: list[str], name: str) -> str:
     return ""
 
 
+def inject_executable_options(
+    command: str,
+    executable: str,
+    options: str,
+) -> str:
+    pattern = re.compile(rf"(?<!\S)((?:[^\s]*/)?{re.escape(executable)})(?=\s|$)")
+    return pattern.sub(rf"\1 {options}", command, count=1)
+
+
 def inject_structured_usage_output(command: str, agent_kind: str) -> str:
     """Request native usage events only for recognized first-party CLIs."""
     try:
@@ -2260,10 +2269,12 @@ def inject_structured_usage_output(command: str, agent_kind: str) -> str:
         output_format = command_option_value(argv, "--output-format")
         if output_format:
             if output_format == "stream-json" and "--verbose" not in argv:
-                return command.replace("claude ", "claude --verbose ", 1)
+                return inject_executable_options(command, "claude", "--verbose")
             return command
-        return command.replace(
-            "claude ", "claude --output-format stream-json --verbose ", 1
+        return inject_executable_options(
+            command,
+            "claude",
+            "--output-format stream-json --verbose",
         )
     return command
 

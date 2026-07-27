@@ -497,6 +497,18 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agent.prompt_dialect_source, "agent.kind:claude")
         self.assertEqual(config.agent.skill_ref_prefix, "/")
         self.assertEqual(config.agent.diagnostics(), [])
+        self.assertEqual(
+            config.agent.to_json()["usage_observation"],
+            {
+                "possible": True,
+                "provider": "anthropic",
+                "output_format": "stream-json",
+                "source": "runtime-injected",
+                "diagnostic": (
+                    "the resolved Claude command emits structured usage events"
+                ),
+            },
+        )
 
     def test_explicit_selection_command_reports_custom_executable_identity(
         self,

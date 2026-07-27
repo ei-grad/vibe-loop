@@ -8357,6 +8357,29 @@ class SessionIdInjectionTests(unittest.TestCase):
             ),
             "claude --verbose -p --output-format stream-json {prompt}",
         )
+        self.assertEqual(
+            inject_structured_usage_output(
+                "CLAUDE_HOME=.claude claude -p --output-format stream-json {prompt}",
+                "claude",
+            ),
+            "CLAUDE_HOME=.claude claude --verbose -p "
+            "--output-format stream-json {prompt}",
+        )
+        self.assertEqual(
+            inject_structured_usage_output(
+                "CLAUDE_HOME=.claude claude -p {prompt}",
+                "claude",
+            ),
+            "CLAUDE_HOME=.claude claude --output-format stream-json "
+            "--verbose -p {prompt}",
+        )
+        self.assertEqual(
+            inject_structured_usage_output(
+                "/usr/bin/claude -p {prompt}",
+                "claude",
+            ),
+            "/usr/bin/claude --output-format stream-json --verbose -p {prompt}",
+        )
 
     def test_claude_implementer_denies_nested_agent_and_task_tools(self) -> None:
         prepared = inject_claude_implementer_tool_denial(

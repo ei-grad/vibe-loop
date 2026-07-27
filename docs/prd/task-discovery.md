@@ -56,12 +56,14 @@ percent expansion, delayed-expansion markers, or line breaks fail closed
 because `cmd.exe` cannot safely preserve them in an operator-authored shell
 string. Activation runs only after the exact task lock is held. When `probe` is
 configured, the runtime first reads the post-lock task state. A non-runnable
-state confirms that the lock backend already performed activation, so the
-configured activation command is not repeated. A runnable state requires the
-activation command to atomically move the task to a non-runnable in-progress
-state and return that normalized task. This keeps activation correct whether or
-not lock acquisition updates task state. A continuation probes the existing
-activated state rather than repeating the compare-and-set.
+`active` state confirms that the lock backend already performed activation, so
+the configured activation command is not repeated. Every other state reaches
+the configured compare-and-set; a state changed by another actor must therefore
+be refused rather than treated as lock-side activation. A runnable state
+requires the activation command to atomically move the task to a non-runnable
+in-progress state and return that normalized task. This keeps activation
+correct whether or not lock acquisition updates task state. A continuation
+probes the existing activated state rather than repeating the compare-and-set.
 
 ```toml
 [task_source]

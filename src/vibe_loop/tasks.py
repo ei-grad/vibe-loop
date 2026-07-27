@@ -57,6 +57,7 @@ WITHHELD_ADAPTER_ENV = frozenset(
 DONE_STATUS = "Done"
 BLOCKED_STATUSES = {"Done", "Gated", "Low"}
 BLOCKED_FAMILY_STATUSES = frozenset({"blocked", "gated", "low"})
+LOCK_ACTIVATED_STATUS = "active"
 STATUS_RANK = {"Active": 0, "Next": 1, "Planned": 2}
 _STATUS_RANK_CASEFOLDED = {
     status.casefold(): rank for status, rank in STATUS_RANK.items()
@@ -2348,7 +2349,10 @@ class CommandTaskSource:
                     "task_source activation probe returned no task after the "
                     f"runtime acquired the lock for {task_id}"
                 )
-            if confirmed.status not in self.config.runnable_statuses:
+            if (
+                confirmed.status not in self.config.runnable_statuses
+                and confirmed.status.casefold() == LOCK_ACTIVATED_STATUS
+            ):
                 return confirmed
         payload = run_json_command(
             self.repo,

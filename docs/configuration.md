@@ -215,12 +215,12 @@ summed across providers.
 
 ### Unknown and recovered usage
 
-Authoritative provider usage reconciles a reservation exactly once. Unknown or
-malformed usage is never charged as zero:
-
 The [CLI Runtime PRD](prd/cli-runtime.md#prd-cli-004-agent-command-and-prompt-dialect-resolution)
 owns command capability detection, structured-output injection, `doctor`
 reporting, and unavailable-reason semantics.
+
+Authoritative provider usage reconciles a reservation exactly once. Unknown or
+malformed usage is never charged as zero:
 
 - `fail_safe = "reserved"` retains the declared reservation.
 - `fail_safe = "fixed"` charges the positive `fail_safe_amount`.

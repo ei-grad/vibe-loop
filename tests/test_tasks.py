@@ -1398,6 +1398,54 @@ class MarkdownPlanTests(unittest.TestCase):
             ["probe TASK-42", "transition TASK-42 --expect ready"],
         )
 
+    def test_command_task_source_does_not_accept_other_non_runnable_states(
+        self,
+    ) -> None:
+        for probed_status in ("Parked", "review"):
+            with self.subTest(status=probed_status):
+                calls: list[str] = []
+
+                def fake_run(
+                    *args: object,
+                    **kwargs: object,
+                ) -> subprocess.CompletedProcess:
+                    command = str(args[0])
+                    calls.append(command)
+                    status = probed_status if command.startswith("probe ") else "active"
+                    return subprocess.CompletedProcess(
+                        args[0],
+                        0,
+                        stdout=json.dumps(
+                            {
+                                "id": "TASK-42",
+                                "title": "Claimed",
+                                "status": status,
+                            }
+                        ),
+                        stderr="",
+                    )
+
+                with tempfile.TemporaryDirectory() as directory:
+                    source = CommandTaskSource(
+                        Path(directory),
+                        TaskSourceConfig(
+                            type="command",
+                            list_command="list-tasks",
+                            probe_command="probe {task_id}",
+                            activate_command="transition {task_id} --expect ready",
+                            runnable_statuses=("ready",),
+                        ),
+                    )
+                    with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                        task = source.activate("TASK-42", "run-7")
+
+                self.assertIsNotNone(task)
+                self.assertEqual(task.status, "active")
+                self.assertEqual(
+                    calls,
+                    ["probe TASK-42", "transition TASK-42 --expect ready"],
+                )
+
     def test_command_task_source_activation_failure_includes_stderr(self) -> None:
         def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
             raise subprocess.CalledProcessError(
