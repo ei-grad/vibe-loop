@@ -36,6 +36,19 @@ defines their authority and density rules.
 
 ## Documentation checks
 
-`make doc-budget` checks Markdown size budgets, structural prose runs, links,
-and reachability. `make doc-budget-refresh` explicitly lowers baselines after
-documentation shrinks; normal checks never rewrite `doc-budgets.toml`.
+`make doc-budget` checks the `README.md` and repository-root Markdown size
+budgets, structural prose runs across all Markdown files, links, and
+reachability. CI, release builds, and the installed pre-commit hook run this
+gate.
+
+Before each budget's deadline, content above its target but no larger than its
+baseline passes with a warning. After the deadline, the target is the hard
+limit, so CI, `make check`, and release builds remain blocked until the target
+is met. The pre-commit hook likewise rejects any staged change that evaluates
+an over-target budget. Extending or renegotiating a deadline requires a
+reviewed edit to `doc-budgets.toml`.
+
+`make doc-budget-refresh` explicitly lowers baselines after documentation
+shrinks; normal checks never rewrite `doc-budgets.toml`. Structural exceptions
+are intentionally grandfathered per file, so removing the recorded README
+exception remains higher priority than adding another long prose run there.

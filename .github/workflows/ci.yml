@@ -41,6 +41,9 @@ jobs:
       - name: Run ruff format check
         run: uv run ruff format --check
 
+      - name: Run documentation gate
+        run: make doc-budget
+
   test:
     name: Test / Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest

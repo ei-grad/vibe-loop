@@ -6,7 +6,11 @@ fail() {
   exit 1
 }
 
-make doc-budget DOC_BUDGET_ARGS=--staged || fail "documentation gate failed"
+if git diff --cached --name-only --diff-filter=DR -- "*.md" | grep -q .; then
+  make doc-budget || fail "documentation gate failed"
+else
+  make doc-budget DOC_BUDGET_ARGS=--staged || fail "documentation gate failed"
+fi
 
 command -v ruff >/dev/null 2>&1 || fail "ruff is not on PATH"
 
