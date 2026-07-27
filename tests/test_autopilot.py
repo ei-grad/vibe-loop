@@ -159,7 +159,7 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.orchestration import RunStage, StageTransition
-from vibe_loop.tasks import Task
+from vibe_loop.tasks import WITHHELD_ADAPTER_ENV, Task
 from vibe_loop.workers import (
     KEEP_EVIDENCE_CHANGED,
     ActiveRunState,
@@ -1989,9 +1989,29 @@ class AutopilotRunTests(unittest.TestCase):
             run_store = RunStore(config.state_path / "runs.jsonl")
             run_store.append_record(
                 {
+                    "record_type": "autopilot_cycle",
+                    "cycle_id": "prior-cycle",
+                    "occurred_at": "2026-06-09T23:59:00+00:00",
+                }
+            )
+            run_store.append_record(
+                {
                     "record_type": "run_supervisor_started",
                     "pid": 7777,
                     "occurred_at": "2026-06-10T00:00:00+00:00",
+                }
+            )
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "task_activation_failed",
+                    "occurred_at": "2026-06-10T00:00:01+00:00",
+                    "run_id": "external-run",
+                    "task_id": "TASK-01",
+                    "adapter": "task_source.activate",
+                    "error_class": "TaskSourceCommandError",
+                    "exit_code": 9,
+                    "stderr_last_line": "shared backend refused activation",
                 }
             )
 
@@ -2003,12 +2023,17 @@ class AutopilotRunTests(unittest.TestCase):
             )
 
         self.assertTrue(summary.started)
-        self.assertEqual(summary.exit_code, 0)
+        self.assertEqual(summary.exit_code, 1)
         self.assertEqual(len(calls), 0)
         cycle = summary.cycles[0]
         self.assertEqual(cycle.status, "observing")
         self.assertEqual(cycle.child_pid, 7777)
         self.assertIn("observed_external_run_until_done:7777", cycle.actions)
+        self.assertIn(
+            "task_source_activation_failed:TASK-01:exit=9: "
+            "shared backend refused activation",
+            cycle.blockers,
+        )
 
     def test_once_launches_child_and_records_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8050,6 +8075,55 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             [calls[0]["timeout"] for calls in calls_by_board],
             [37.0, 37.0],
         )
+
+    def test_task_source_health_withholds_ambient_run_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            health_script = repo / "health.py"
+            health_script.write_text(
+                "import json, os\n"
+                f"names = {sorted(WITHHELD_ADAPTER_ENV)!r}\n"
+                "print(json.dumps({\n"
+                "    'present': [name for name in names if name in os.environ],\n"
+                "    'selector': os.environ.get('PROJECT_SELECTOR'),\n"
+                "}))\n",
+                encoding="utf-8",
+            )
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml=(
+                    "[task_source]\n"
+                    f"health = {json.dumps(shlex.join([sys.executable, str(health_script)]))}\n"
+                ),
+            )
+            run(repo, "git", "add", "health.py")
+            run(repo, "git", "commit", "-m", "add health probe")
+            config = load_config(
+                repo,
+                runtime_context={"PROJECT_SELECTOR": "shared-backend"},
+            )
+            ambient_identity = {
+                name: f"ambient-{index}"
+                for index, name in enumerate(sorted(WITHHELD_ADAPTER_ENV), start=1)
+            }
+            with mock.patch.dict(os.environ, ambient_identity, clear=False):
+                summary = run_autopilot(
+                    config,
+                    once=True,
+                    launcher=lambda *args, **kwargs: 0,
+                )
+            command_record = next(
+                record
+                for record in RunStore(config.state_path / "runs.jsonl").read_records()
+                if record.get("record_type") == AUTOPILOT_COMMAND_RESULT_RECORD_TYPE
+                and record.get("kind") == "task_source_health"
+            )
+            payload = json.loads(command_record["output"])
+
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertEqual(payload["present"], [])
+        self.assertEqual(payload["selector"], "shared-backend")
 
     def test_activation_failure_record_becomes_visible_cycle_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

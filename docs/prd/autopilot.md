@@ -424,7 +424,9 @@ a failing hook blocks that repository as `task_source_health_failed`, even when
 a sibling repository checks the same backend. The hook is operational metadata,
 not source selection, so it does not disable generated task-source discovery.
 Unlike general maintenance hooks, it receives the same validated project
-binding/runtime selector context as the task-source adapters it checks.
+binding/runtime selector context and the same absent-identity boundary as the
+task-source adapters it checks. Ambient branch, worktree, fencing, and session
+variables are withheld unless the runtime explicitly supplies them.
 
 Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status

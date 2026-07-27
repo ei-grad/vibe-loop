@@ -117,7 +117,12 @@ from vibe_loop.runs import (
     autopilot_child_started_record,
     utc_now_iso,
 )
-from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task
+from vibe_loop.tasks import (
+    BLOCKED_FAMILY_STATUSES,
+    WITHHELD_ADAPTER_ENV,
+    Task,
+    build_adapter_environment,
+)
 from vibe_loop.telemetry import (
     normalize_model_label,
     normalize_provider_label,
@@ -153,6 +158,7 @@ Sleep = Callable[[float], None]
 
 
 AUTOPILOT_RECORD_SCHEMA_VERSION = 1
+TASK_SOURCE_HEALTH_COMMAND_KIND = "task_source_health"
 AUTOPILOT_RUNTIME_CONTEXT_FD_ENV = "VIBE_LOOP_AUTOPILOT_RUNTIME_CONTEXT_FD"
 AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
     6 * REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES
@@ -4633,8 +4639,11 @@ def run_maintenance_command(
     output is truncated on a byte boundary.
     """
 
-    env = os.environ.copy()
-    env.update(env_extra)
+    if kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
+        env = build_adapter_environment(env_extra)
+    else:
+        env = os.environ.copy()
+        env.update(env_extra)
     popen_kwargs: dict[str, Any] = {}
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True
@@ -6680,6 +6689,9 @@ def execute_autopilot_cycle(
         command_environment = maintenance_command_env(
             config, kind=kind, cycle_id=cycle_id, runnable=runnable
         )
+        if kind == TASK_SOURCE_HEALTH_COMMAND_KIND:
+            for name in WITHHELD_ADAPTER_ENV:
+                command_environment.pop(name, None)
         if runtime_context is not None:
             command_environment.update(runtime_context)
         result = maintenance_runner(
@@ -6701,7 +6713,7 @@ def execute_autopilot_cycle(
     if health is not None and not health.succeeded:
         blocker_list.append("autopilot_health_failed")
     task_source_health = run_maintenance(
-        "task_source_health",
+        TASK_SOURCE_HEALTH_COMMAND_KIND,
         command_override=config.task_source.health_command,
         runtime_context=config.runtime_environment,
         timeout_override=config.task_source.command_timeout_seconds,
@@ -6900,14 +6912,6 @@ def execute_autopilot_cycle(
             if record.get("record_type") == RUN_STARTED_RECORD_TYPE
         )
         dispatched_runs = max(0, run_started_after - run_started_before)
-        activation_blockers = task_activation_failure_blockers(
-            records_after_launch[len(records_before_launch) :]
-        )
-        if activation_blockers:
-            blockers = tuple(dict.fromkeys((*blockers, *activation_blockers)))
-            actions.append(
-                f"task_source_activation_failures:{len(activation_blockers)}"
-            )
         cycle_status = classify_child_exit(exit_code)
         actions.append(f"child_exit:{exit_code}")
         actions.append(f"dispatched_runs:{dispatched_runs}")
@@ -6917,6 +6921,13 @@ def execute_autopilot_cycle(
         run_maintenance("summary")
         if cycle_status in {"restartable", "terminated"}:
             run_maintenance("troubleshoot")
+
+    activation_blockers = task_activation_failure_blockers(
+        records_since_latest_autopilot_cycle(run_store.read_records())
+    )
+    if activation_blockers:
+        blockers = tuple(dict.fromkeys((*blockers, *activation_blockers)))
+        actions.append(f"task_source_activation_failures:{len(activation_blockers)}")
 
     pause_seconds = provider_limit_pause_seconds(
         run_store,
@@ -6969,6 +6980,15 @@ def task_activation_failure_blockers(
             diagnostic = str(record.get("error_class") or "adapter failed")
         blockers.append(f"{blocker}: {diagnostic[:500]}")
     return tuple(dict.fromkeys(blockers))
+
+
+def records_since_latest_autopilot_cycle(
+    records: Sequence[Mapping[str, object]],
+) -> Sequence[Mapping[str, object]]:
+    for index in range(len(records) - 1, -1, -1):
+        if records[index].get("record_type") == AUTOPILOT_CYCLE_RECORD_TYPE:
+            return records[index + 1 :]
+    return records
 
 
 _RECHECK_EPSILON = 1e-9
