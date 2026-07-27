@@ -14,6 +14,7 @@ from runpy import run_path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOC_BUDGET_SCRIPT = REPO_ROOT / "scripts/check-doc-budgets.py"
 MD_LINK_SCRIPT = REPO_ROOT / "scripts/check-md-links.py"
+DOC_COMMAND_SCRIPT = REPO_ROOT / "scripts/check-doc-commands.py"
 PROJECT_BINDING_LINK_SCRIPT = REPO_ROOT / "scripts/check-project-binding-doc-linkage.py"
 
 
@@ -263,6 +264,71 @@ class MarkdownLinkHookTests(TemporaryGitRepository):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(hook_log.read_text(encoding="utf-8"), "doc-budget\n")
+
+
+class DocumentedCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.checker = run_path(
+            os.fspath(DOC_COMMAND_SCRIPT),
+            run_name="test_documented_commands",
+        )
+
+    def test_extracts_inline_and_fenced_commands_without_matching_prose(self) -> None:
+        references = self.checker["documented_commands"](
+            Path("docs/example.md"),
+            textwrap.dedent(
+                """\
+                Use `vibe-loop run` for one task.
+                The vibe-loop lifecycle is bounded.
+
+                ```bash
+                $ vibe-loop run-next --repo .
+                printf 'vibe-loop not-a-command'
+                ```
+
+                ```mermaid
+                Slice: vibe-loop lifecycle
+                ```
+                """
+            ),
+        )
+
+        self.assertEqual(
+            [(reference.line, reference.command) for reference in references],
+            [(1, "run"), (5, "run-next")],
+        )
+
+    def test_unknown_inline_command_is_rejected(self) -> None:
+        unresolved = self.checker["unresolved_references"](
+            {Path("README.md"): "Use `vibe-loop vanished` here.\n"},
+            {"run", "run-next"},
+        )
+
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0].path, Path("README.md"))
+        self.assertEqual(unresolved[0].line, 1)
+        self.assertEqual(unresolved[0].command, "vanished")
+
+    def test_parser_surface_contains_only_top_level_commands(self) -> None:
+        from vibe_loop.cli import build_parser
+
+        commands = self.checker["top_level_commands"](build_parser())
+
+        self.assertIn("run", commands)
+        self.assertIn("tasks", commands)
+        self.assertNotIn("list", commands)
+
+    def test_current_documentation_resolves(self) -> None:
+        result = subprocess.run(
+            [sys.executable, os.fspath(DOC_COMMAND_SCRIPT)],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "documented command surface: ok\n")
 
 
 class CodeDocLinkageTrialTests(TemporaryGitRepository):

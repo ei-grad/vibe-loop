@@ -33,6 +33,7 @@ project-binding-linkage-trial:
 doc-budget:
 	$(UV) run python scripts/check-doc-budgets.py --config doc-budgets.toml $(DOC_BUDGET_ARGS)
 	$(UV) run python scripts/check-md-links.py $(DOC_BUDGET_ARGS)
+	$(UV) run python scripts/check-doc-commands.py $(DOC_BUDGET_ARGS)
 
 doc-budget-refresh:
 	$(UV) run python scripts/check-doc-budgets.py --config doc-budgets.toml --update-baselines
