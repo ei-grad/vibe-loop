@@ -1065,6 +1065,12 @@ atomically checkpoints an advanced cursor before returning a wake. Therefore a
 normally completed invocation cannot wake again on the same durable event. If
 the helper crashes after checkpointing but before printing, the event remains
 consumed; this at-most-once crash rule is deterministic and avoids wake storms.
+Journal polling replays from record zero by default. An explicit start-at-tail
+bootstrap instead validates the current journal prefix under its append lock
+and atomically checkpoints that record boundary using the same project-scoped
+opaque cursor schema. It refuses an existing cursor unless replacement is also
+explicit, and records appended during bootstrap remain beyond the checkpoint
+for normal polling.
 
 Adapter output is limited to 64 KiB, individual strings and cursors to 1 KiB,
 and the sanitized event to 4 KiB. Identifier metadata is returned only as

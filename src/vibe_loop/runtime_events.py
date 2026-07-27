@@ -7,7 +7,7 @@ import signal
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +89,48 @@ def save_runtime_event_cursor(path: Path, *, project: str, cursor: str) -> None:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
         raise RuntimeEventAdapterError("cursor_write_error") from exc
+
+
+def bootstrap_run_journal_cursor(
+    journal: Path,
+    cursor_path: Path,
+    *,
+    project: str,
+    replace: bool = False,
+) -> str:
+    _require_scope(project=project)
+    if journal.resolve() == cursor_path.resolve():
+        raise RuntimeEventAdapterError("invalid_cursor_path")
+
+    from vibe_loop.runs import append_record_lock
+
+    try:
+        cursor_path.parent.mkdir(parents=True, exist_ok=True)
+        with append_record_lock(cursor_path):
+            if cursor_path.exists():
+                if not replace:
+                    load_runtime_event_cursor(cursor_path, project=project)
+                    raise RuntimeEventAdapterError("cursor_already_exists")
+                try:
+                    load_runtime_event_cursor(cursor_path, project=project)
+                except RuntimeEventAdapterError as exc:
+                    if exc.category not in {"invalid_cursor", "cursor_too_large"}:
+                        raise
+            try:
+                with append_record_lock(journal):
+                    cursor = _validated_run_journal_tail_unlocked(journal)
+                    save_runtime_event_cursor(
+                        cursor_path,
+                        project=project,
+                        cursor=cursor,
+                    )
+            except TimeoutError as exc:
+                raise RuntimeEventAdapterError("journal_read_error") from exc
+    except RuntimeEventAdapterError:
+        raise
+    except (OSError, TimeoutError) as exc:
+        raise RuntimeEventAdapterError("cursor_write_error") from exc
+    return cursor
 
 
 def poll_runtime_event_command(
@@ -214,38 +256,55 @@ def poll_run_journal_event(
     if not journal.exists():
         return str(offset), None
     index = 0
+    for record_index, record in _iter_run_journal_records(journal):
+        index = record_index + 1
+        if record_index < offset:
+            continue
+        event = runtime_event_from_journal_record(
+            record,
+            project=project,
+            record_index=record_index,
+            run_id=run_id,
+            task_id=task_id,
+        )
+        if event is not None:
+            return str(index), event
+    if offset > index:
+        raise RuntimeEventAdapterError("cursor_out_of_range")
+    return str(index), None
+
+
+def _validated_run_journal_tail_unlocked(journal: Path) -> str:
+    index = 0
+    for record_index, _record in _iter_run_journal_records(journal):
+        index = record_index + 1
+    return str(index)
+
+
+def _iter_run_journal_records(
+    journal: Path,
+) -> Iterator[tuple[int, dict[str, Any]]]:
+    if not journal.exists():
+        return
     try:
         with journal.open("rb") as handle:
+            index = 0
             while True:
                 raw = handle.readline(RUNTIME_EVENT_OUTPUT_MAX_BYTES + 1)
                 if not raw:
                     break
                 if len(raw) > RUNTIME_EVENT_OUTPUT_MAX_BYTES:
                     raise RuntimeEventAdapterError("journal_record_too_large")
-                if index < offset:
-                    index += 1
-                    continue
                 try:
                     record = json.loads(raw)
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
                     raise RuntimeEventAdapterError("invalid_journal") from exc
                 if not isinstance(record, dict):
                     raise RuntimeEventAdapterError("invalid_journal")
-                event = runtime_event_from_journal_record(
-                    record,
-                    project=project,
-                    record_index=index,
-                    run_id=run_id,
-                    task_id=task_id,
-                )
+                yield index, record
                 index += 1
-                if event is not None:
-                    return str(index), event
     except OSError as exc:
         raise RuntimeEventAdapterError("journal_read_error") from exc
-    if offset > index:
-        raise RuntimeEventAdapterError("cursor_out_of_range")
-    return str(index), None
 
 
 def runtime_event_from_journal_record(

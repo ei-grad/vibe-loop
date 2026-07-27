@@ -179,8 +179,12 @@ wake. When the repository exposes a trusted direct-message adapter, add
 `--message-command` and identify the recipient with `--session-ref` (or
 `VIBE_LOOP_RUN_ID`). When it exposes typed lifecycle events, add a trusted
 `--runtime-event-command` or `--runtime-event-journal` with a project-scoped
-durable cursor. Keep harness-specific wake signals, such as completion of one
-of your own subagents, in the agent environment.
+durable cursor. For first-time live stewardship of a trusted run journal,
+initialize that cursor with `--runtime-event-start-at-tail`; reuse it without
+that flag on later waits. Replay from the beginning only for a deliberate
+audit, and replace an existing cursor only as an explicit reset action. Keep
+harness-specific wake signals, such as completion of one of your own subagents,
+in the agent environment.
 
 ## Investigate Loop Termination
 

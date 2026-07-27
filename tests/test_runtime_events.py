@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import shlex
 import sys
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+import vibe_loop.runtime_events as runtime_events_module
 from vibe_loop.runtime_events import (
     ACTIONABLE_RUNTIME_EVENT_KINDS,
     RUNTIME_EVENT_FIELD_MAX_BYTES,
     RuntimeEventAdapterError,
+    bootstrap_run_journal_cursor,
     load_runtime_event_cursor,
     opaque_runtime_identifier,
     poll_run_journal_event,
@@ -20,6 +23,7 @@ from vibe_loop.runtime_events import (
     save_runtime_event_cursor,
     validate_runtime_event_envelope,
 )
+from vibe_loop.runs import RunStore
 
 
 def append_records(path: Path, *records: dict[str, object]) -> None:
@@ -149,6 +153,183 @@ def test_checkpoint_recovery_is_project_scoped(tmp_path: Path) -> None:
     assert "alpha" not in checkpoint.read_text(encoding="utf-8")
     with pytest.raises(RuntimeEventAdapterError, match="cursor_scope_mismatch"):
         load_runtime_event_cursor(checkpoint, project="beta")
+
+
+@pytest.mark.parametrize("journal_exists", [False, True])
+def test_tail_bootstrap_empty_or_missing_journal(
+    tmp_path: Path, journal_exists: bool
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    if journal_exists:
+        journal.touch()
+
+    assert bootstrap_run_journal_cursor(journal, checkpoint, project="alpha") == "0"
+    assert load_runtime_event_cursor(checkpoint, project="alpha") == "0"
+
+
+def test_tail_bootstrap_refuses_existing_cursor_without_explicit_replace(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    append_records(journal, {"record_type": "stage_transition"})
+    save_runtime_event_cursor(checkpoint, project="alpha", cursor="0")
+
+    with pytest.raises(RuntimeEventAdapterError, match="cursor_already_exists"):
+        bootstrap_run_journal_cursor(journal, checkpoint, project="alpha")
+    assert load_runtime_event_cursor(checkpoint, project="alpha") == "0"
+
+    assert (
+        bootstrap_run_journal_cursor(
+            journal,
+            checkpoint,
+            project="alpha",
+            replace=True,
+        )
+        == "1"
+    )
+    assert load_runtime_event_cursor(checkpoint, project="alpha") == "1"
+
+
+def test_tail_bootstrap_explicitly_replaces_corrupt_cursor(tmp_path: Path) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    append_records(journal, {"record_type": "stage_transition"})
+    checkpoint.write_text("corrupt", encoding="utf-8")
+
+    assert (
+        bootstrap_run_journal_cursor(
+            journal,
+            checkpoint,
+            project="alpha",
+            replace=True,
+        )
+        == "1"
+    )
+    assert load_runtime_event_cursor(checkpoint, project="alpha") == "1"
+
+
+def test_tail_bootstrap_rejects_existing_cursor_for_another_project(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    save_runtime_event_cursor(checkpoint, project="beta", cursor="3")
+
+    with pytest.raises(RuntimeEventAdapterError, match="cursor_scope_mismatch"):
+        bootstrap_run_journal_cursor(
+            journal,
+            checkpoint,
+            project="alpha",
+            replace=True,
+        )
+
+
+def test_tail_bootstrap_rejects_journal_as_cursor_path(tmp_path: Path) -> None:
+    journal = tmp_path / "runs.jsonl"
+    journal.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeEventAdapterError, match="invalid_cursor_path"):
+        bootstrap_run_journal_cursor(journal, journal, project="alpha")
+
+
+@pytest.mark.parametrize(
+    ("record", "category"),
+    [
+        (b"not-json\n", "invalid_journal"),
+        (b"x" * (64 * 1024 + 1), "journal_record_too_large"),
+    ],
+)
+def test_tail_bootstrap_rejects_invalid_journal_without_checkpoint(
+    tmp_path: Path,
+    record: bytes,
+    category: str,
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    journal.write_bytes(record)
+
+    with pytest.raises(RuntimeEventAdapterError, match=category):
+        bootstrap_run_journal_cursor(journal, checkpoint, project="alpha")
+    assert not checkpoint.exists()
+
+
+def test_tail_bootstrap_and_poll_share_validated_record_framing(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    append_records(
+        journal,
+        {"record_type": "stage_transition"},
+        {"record_type": "worker_report"},
+        {"record_type": "autopilot_disk_health", "status": "ok"},
+    )
+
+    assert poll_run_journal_event(
+        journal,
+        cursor="",
+        project="alpha",
+    ) == ("3", None)
+    assert bootstrap_run_journal_cursor(journal, checkpoint, project="alpha") == "3"
+
+
+def test_tail_bootstrap_serializes_concurrent_append_before_checkpoint(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    append_records(journal, {"record_type": "stage_transition"})
+    scan_started = threading.Event()
+    append_attempted = threading.Event()
+    append_finished = threading.Event()
+    original_scan = runtime_events_module._validated_run_journal_tail_unlocked
+
+    def scan_with_wait(path: Path) -> str:
+        scan_started.set()
+        assert append_attempted.wait(timeout=2)
+        return original_scan(path)
+
+    def append_during_bootstrap() -> None:
+        assert scan_started.wait(timeout=2)
+        append_attempted.set()
+        RunStore(journal).append_record(
+            {
+                "record_type": "operator_action_required",
+                "event_id": "new-event",
+            }
+        )
+        append_finished.set()
+
+    writer = threading.Thread(target=append_during_bootstrap)
+    writer.start()
+    with patch(
+        "vibe_loop.runtime_events._validated_run_journal_tail_unlocked",
+        side_effect=scan_with_wait,
+    ):
+        cursor = bootstrap_run_journal_cursor(
+            journal,
+            checkpoint,
+            project="alpha",
+        )
+    writer.join(timeout=2)
+
+    assert append_finished.is_set()
+    assert cursor == "1"
+    next_cursor, event = poll_run_journal_event(
+        journal,
+        cursor=load_runtime_event_cursor(checkpoint, project="alpha"),
+        project="alpha",
+    )
+    assert next_cursor == "2"
+    assert event is not None
+    assert event["kind"] == "operator_action_required"
+    assert poll_run_journal_event(
+        journal,
+        cursor=next_cursor,
+        project="alpha",
+    ) == ("2", None)
 
 
 def test_journal_filters_project_run_and_task(tmp_path: Path) -> None:
