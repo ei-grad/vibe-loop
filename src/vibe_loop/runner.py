@@ -3600,7 +3600,7 @@ class VibeRunner:
                 )
             if runtime_owned and classification.status != "completed":
                 review_carryover_requested = bool(
-                    review_budget_exhausted or task.review_budget_exhaustions
+                    review_budget_exhausted or task.prior_findings
                 )
                 if review_carryover_requested and not review_budget_finding_payloads:
                     review_budget_finding_payloads = task.prior_findings
@@ -4691,6 +4691,8 @@ class VibeRunner:
         context.pop("VIBE_LOOP_REPO", None)
         context.pop("VIBE_LOOP_WORKTREE", None)
         context.pop("VIBE_LOOP_BRANCH", None)
+        context.pop("VIBE_LOOP_PRIOR_FINDINGS", None)
+        context.pop("VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS", None)
         fencing_token = fencing_token_value(task_lock.metadata.get("fencing_token"))
         if fencing_token:
             context["VIBE_LOOP_FENCING_TOKEN"] = fencing_token

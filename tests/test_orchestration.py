@@ -4740,6 +4740,61 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertEqual(contexts[-1], {})
         self.assertEqual(settler.recovery_command("requeue"), "reset TASK-01")
 
+    def test_post_release_settlement_preserves_review_carryover_context(self) -> None:
+        finding = {
+            "id": "F-1",
+            "severity": "P1",
+            "summary": "Open finding",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "lines": ["12"],
+            "state": "open",
+        }
+        source = MutableTaskSource()
+        context = MappingProxyType(
+            {
+                "VIBE_LOOP_FENCING_TOKEN": "7",
+                "VIBE_LOOP_PRIOR_FINDINGS": json.dumps([finding]),
+                "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": "2",
+            }
+        )
+
+        def persist_carryover(task_id: str, **kwargs: object) -> bool:
+            runtime_context = kwargs.get("runtime_context")
+            assert isinstance(runtime_context, dict)
+            source.reset_context = runtime_context
+            source.status = "ready"
+            source.probe = lambda requested_id: Task(  # type: ignore[method-assign]
+                task_id=requested_id,
+                title="Task",
+                status=source.status,
+                prior_findings=(finding,),
+                review_budget_exhaustions=2,
+            )
+            return True
+
+        source.reset = persist_carryover  # type: ignore[method-assign]
+        settler = self.settler(
+            source,
+            park=False,
+            max_attempts=1,
+            runtime_context=context,
+        )
+        self.manager.release(self.task_lock)
+
+        result = settler.settle_after_release("requeue")
+
+        self.assertTrue(result.settled)
+        self.assertNotIn("VIBE_LOOP_FENCING_TOKEN", source.reset_context)
+        self.assertEqual(
+            source.reset_context["VIBE_LOOP_PRIOR_FINDINGS"],
+            json.dumps([finding]),
+        )
+        self.assertEqual(
+            source.reset_context["VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS"],
+            "2",
+        )
+
     def test_post_release_settlement_failure_records_the_operator_command(
         self,
     ) -> None:

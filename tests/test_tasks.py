@@ -2362,7 +2362,9 @@ class WithheldAdapterEnvironmentTests(unittest.TestCase):
         "VIBE_LOOP_BRANCH": "ambient-branch",
         "VIBE_LOOP_FENCING_TOKEN": "ambient-generation",
         "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-implementer",
+        "VIBE_LOOP_PRIOR_FINDINGS": '[{"id":"ambient"}]',
         "VIBE_LOOP_REPO": "/ambient/repo",
+        "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": "99",
         "VIBE_LOOP_REVIEWER_SESSION": "ambient-reviewer",
         "VIBE_LOOP_WORKTREE": "/ambient/worktree",
     }

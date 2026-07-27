@@ -32,11 +32,12 @@ TASK_SOURCE_ERROR_RAW_WINDOW_LIMIT = 4096
 TASK_SOURCE_ERROR_TRUNCATION_MARKER = "[truncated] "
 # Names whose *absence* from an adapter invocation is an assertion the runtime
 # makes, not an accident. The session pair says "this run recorded no such
-# session"; the fencing token says "this invocation is unfenced"; the workspace
-# triple says "an adapter may not assume a worktree" and is popped for that
-# reason. `os.environ.copy()` would re-supply any of them from whatever
-# environment the supervisor happens to be running in -- including a worker's --
-# and `dict.update` cannot express a removal, so the assertion has to be made
+# session"; the review-carryover pair says "this settlement carries no prior
+# findings"; the fencing token says "this invocation is unfenced"; the
+# workspace triple says "an adapter may not assume a worktree" and is popped
+# for that reason. `os.environ.copy()` would re-supply any of them from whatever
+# environment the supervisor happens to be running in -- including a worker's
+# -- and `dict.update` cannot express a removal, so the assertion has to be made
 # here, at the process boundary, or it is not made at all.
 #
 # Names the runtime merely *supplies* (`VIBE_LOOP_TASK_ID`, `VIBE_LOOP_RUN_ID`,
@@ -49,7 +50,9 @@ WITHHELD_ADAPTER_ENV = frozenset(
         "VIBE_LOOP_BRANCH",
         "VIBE_LOOP_FENCING_TOKEN",
         "VIBE_LOOP_IMPLEMENTER_SESSION",
+        "VIBE_LOOP_PRIOR_FINDINGS",
         "VIBE_LOOP_REPO",
+        "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS",
         "VIBE_LOOP_REVIEWER_SESSION",
         "VIBE_LOOP_WORKTREE",
     }

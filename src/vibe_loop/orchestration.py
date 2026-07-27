@@ -5230,11 +5230,20 @@ class TaskSourceSettler:
             "task_source.park" if effective_intent == "park" else "task_source.reset"
         )
         diagnostics: dict[str, object] = {"error_class": "unconfirmed_status"}
+        runtime_context = dict(self.runtime_context)
+        runtime_context.pop("VIBE_LOOP_FENCING_TOKEN", None)
         try:
             if effective_intent == "park":
-                self.source.park(self.task_id, self.run_id)
+                self.source.park(
+                    self.task_id,
+                    self.run_id,
+                    runtime_context=runtime_context,
+                )
             else:
-                self.source.reset(self.task_id)
+                self.source.reset(
+                    self.task_id,
+                    runtime_context=runtime_context,
+                )
             confirmed = self._probe_for_settlement()
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
             # No fencing claim was sent, but the refusal can still quote the

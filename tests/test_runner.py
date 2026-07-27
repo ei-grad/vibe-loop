@@ -9141,7 +9141,7 @@ class RuntimeOwnedTaskSource(StubTaskSource):
         self.activate_context: dict[str, str] = {}
         self.complete_context: dict[str, str] = {}
         self.settlement_context: dict[str, str] = {}
-        self.prior_findings: tuple[dict[str, object], ...] = ()
+        self.prior_findings = task.prior_findings
         self.review_budget_exhaustions = task.review_budget_exhaustions
 
     def probe(self, task_id: str) -> Task:
@@ -10046,11 +10046,21 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
         self.assertIn("Consecutive review-budget exhaustions: 2", next_prompt)
 
     def test_non_budget_failure_resets_consecutive_exhaustion_count(self) -> None:
+        finding = {
+            "id": "F-1",
+            "severity": "P1",
+            "summary": "Retained finding",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "lines": ["12"],
+            "state": "open",
+        }
         task = Task(
             task_id="T-1",
             title="Task",
             status="ready",
             agent="worker",
+            prior_findings=(finding,),
             review_budget_exhaustions=2,
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -10069,6 +10079,46 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             "0",
         )
         self.assertEqual(source.review_budget_exhaustions, 0)
+        self.assertEqual(source.prior_findings, (finding,))
+
+    def test_non_budget_failure_reasserts_findings_after_counter_reset(self) -> None:
+        finding = {
+            "id": "F-1",
+            "severity": "P1",
+            "summary": "Retained finding",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "lines": ["12"],
+            "state": "open",
+        }
+        task = Task(
+            task_id="T-1",
+            title="Task",
+            status="ready",
+            agent="worker",
+            prior_findings=(finding,),
+            review_budget_exhaustions=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+
+            result = self._run_task(
+                runner,
+                task,
+                self._reporting_worker(runner, "blocked"),
+            )
+
+        self.assertEqual(result.classification, "blocked")
+        self.assertEqual(
+            json.loads(source.settlement_context["VIBE_LOOP_PRIOR_FINDINGS"]),
+            [finding],
+        )
+        self.assertEqual(
+            source.settlement_context["VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS"],
+            "0",
+        )
+        self.assertEqual(source.prior_findings, (finding,))
 
     def test_review_control_fence_parks_with_stable_classification(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
@@ -12973,6 +13023,22 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+
+    def test_inherited_review_carryover_is_dropped_not_passed_through(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+
+            context = self._context(
+                runner,
+                self._lock(directory),
+                {
+                    "VIBE_LOOP_PRIOR_FINDINGS": '[{"id":"ambient"}]',
+                    "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": "99",
+                },
+            )
+
+        self.assertNotIn("VIBE_LOOP_PRIOR_FINDINGS", context)
+        self.assertNotIn("VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS", context)
 
     def test_another_run_and_task_never_supply_this_run_attribution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
