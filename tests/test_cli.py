@@ -5987,7 +5987,8 @@ class CliTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (repo / ".vibe-loop.toml").write_text(
-                '[agent]\ncommand = "python agent.py"\n',
+                '[agent]\ncommand = "python agent.py"\n'
+                "[supervision]\nlimit_wall_backoff_seconds = 600\n",
                 encoding="utf-8",
             )
             init_worker_repo(repo)
@@ -6008,6 +6009,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent out", stderr.getvalue())
         self.assertNotIn("agent err", stderr.getvalue())
         self.assertIn("[vibe-loop] running TASK-01", stderr.getvalue())
+        diagnostic = (
+            "supervision diagnostic: supervision.limit_wall_backoff_seconds "
+            "is deprecated; use supervision.provider_limit_backoff_seconds"
+        )
+        self.assertIn(diagnostic, stderr.getvalue())
+        self.assertIn(diagnostic, log_text)
         self.assertIn(
             f"[vibe-loop] session_id={payload['session_id']}", stderr.getvalue()
         )

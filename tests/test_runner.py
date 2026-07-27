@@ -36,6 +36,7 @@ from vibe_loop.config import (
     SUPERVISION_DEFAULT_MAX_RESTARTS,
     TaskSourceConfig,
     VibeConfig,
+    parse_supervision,
     resolve_task_agent,
     shell_quote,
 )
@@ -2084,6 +2085,37 @@ class RunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(inputs.task_revision, updated_inputs.task_revision)
+
+    def test_attempt_circuit_supervision_payload_preserves_pre_rename_schema(
+        self,
+    ) -> None:
+        legacy = parse_supervision({"limit_wall_backoff_seconds": 600})
+        current = parse_supervision({"provider_limit_backoff_seconds": 600})
+
+        legacy_payload = runner_module.attempt_circuit_supervision_payload(legacy)
+        current_payload = runner_module.attempt_circuit_supervision_payload(current)
+
+        self.assertEqual(legacy_payload, current_payload)
+        self.assertEqual(
+            legacy_payload,
+            {
+                "max_restarts": 3,
+                "cooldown_seconds": 30.0,
+                "recover_unknown_runs": True,
+                "resume_unknown_runs": True,
+                "limit_wall_detection": True,
+                "limit_wall_backoff_seconds": 600.0,
+                "limit_wall_patterns": [],
+                "worker_timeout_seconds": 10800.0,
+                "slice_token_threshold": 100000,
+                "cross_run_attempt_threshold": 3,
+                "explicit_keys": ["limit_wall_backoff_seconds"],
+            },
+        )
+        self.assertEqual(
+            runner_module._circuit_digest({"supervision": legacy_payload}),
+            "9bfbc644f2bcd5744cc529d4",
+        )
 
     def test_reviewer_agent_override_fails_task_without_aborting_batch(self) -> None:
         for jobs in (1, 2):

@@ -73,6 +73,7 @@ from vibe_loop.orchestration import (
     TaskSourceSettler,
     WorkspaceProvisionError,
     WorkspaceProvisioner,
+    accepted_stage_transition,
     bound_malformed_review_output,
     derive_stage_progress,
     inject_provider_continuation,
@@ -1478,6 +1479,41 @@ class RunLifecycleStateMachineTests(unittest.TestCase):
         gate_records = [record for record in records if record["to_stage"] == "gates"]
         self.assertEqual([record["ordinal"] for record in candidate_records], [1, 2])
         self.assertEqual([record["ordinal"] for record in gate_records], [1, 2])
+
+    def test_legacy_provider_limit_failure_reconstructs_stage_progress(self) -> None:
+        records = [
+            {
+                "record_type": "stage_transition",
+                "accepted": True,
+                "from_stage": "gates",
+                "to_stage": "review",
+                "ordinal": 1,
+                "failure": None,
+                "reason": "review_started",
+            },
+            {
+                "record_type": "stage_transition",
+                "accepted": True,
+                "from_stage": "review",
+                "to_stage": "classification",
+                "ordinal": 2,
+                "failure": "limit_wall",
+                "reason": "legacy_provider_limit",
+            },
+        ]
+
+        transition = accepted_stage_transition(records[-1])
+        progress = derive_stage_progress(records)
+        machine = RunLifecycleStateMachine.from_records(records, lambda _: None)
+
+        self.assertIsNotNone(transition)
+        assert transition is not None
+        self.assertIs(transition.failure, StageFailure.PROVIDER_LIMIT)
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertIs(progress.stage, RunStage.CLASSIFICATION)
+        self.assertEqual(progress.ordinal, 2)
+        self.assertIs(machine.stage, RunStage.CLASSIFICATION)
 
 
 class RuntimeGateTests(unittest.TestCase):

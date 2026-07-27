@@ -529,6 +529,8 @@ def accepted_stage_transition(
     if raw_ordinal < 1:
         return None
     raw_failure = record.get("failure")
+    if isinstance(raw_failure, str):
+        raw_failure = normalize_provider_limit_classification(raw_failure)
     try:
         failure = StageFailure(raw_failure) if raw_failure else None
     except (TypeError, ValueError):

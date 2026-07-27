@@ -144,8 +144,9 @@ loopyard, all 124 Claude `unknown` results were clean exits with classification
 source `fallback`. Of the 120 results with UUID session evidence, 103 launched
 background work and 42 ended on an explicit waiting message. The current
 session parser finds Agent calls in 60 of those sessions, so denying Agent alone
-does not cover the observed background Bash path. All 11 Claude `provider_limit`
-results were nonzero exits with source `provider_limit`, so they do not share the
+does not cover the observed background Bash path. All 11 Claude records stored
+the legacy classification `limit_wall` with source `limit_wall` (read now as
+canonical `provider_limit`) and were nonzero exits, so they do not share the
 clean-exit mechanism. These are baseline
 measurements from `runs.jsonl`; post-deployment rates must be measured from new
 run records rather than inferred from the regression suite.

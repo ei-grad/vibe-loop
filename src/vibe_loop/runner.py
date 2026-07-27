@@ -36,6 +36,8 @@ from vibe_loop.config import (
     AgentConfig,
     AgentDetection,
     AgentResolutionError,
+    SUPERVISION_PROVIDER_LIMIT_ALIASES,
+    SupervisionConfig,
     TaskAgentResolutionError,
     VibeConfig,
     agent_command_provider,
@@ -2883,6 +2885,8 @@ class VibeRunner:
                 )
                 for diagnostic in agent.compatibility_diagnostics:
                     report_status(f"agent diagnostic: {diagnostic}", log)
+                for diagnostic in self.config.supervision.compatibility_diagnostics:
+                    report_status(f"supervision diagnostic: {diagnostic}", log)
                 report_status(
                     f"detected agents: {format_detected_agents(agent.detected)}",
                     log,
@@ -9482,7 +9486,7 @@ def attempt_circuit_inputs(
     configuration_revision = _circuit_digest(
         {
             "config_digest": config.config_digest,
-            "supervision": config.supervision.to_json(),
+            "supervision": attempt_circuit_supervision_payload(config.supervision),
             "orchestration": config.orchestration.to_json(),
             "completion": list(config.completion.commands),
             "agent": attempt_circuit_agent_payload(agent),
@@ -9520,6 +9524,28 @@ def attempt_circuit_agent_payload(agent: AgentConfig) -> dict[str, object]:
         "effort": agent.effort,
         "prompt_dialect": agent.prompt_dialect,
         "skill_ref_prefix": agent.skill_ref_prefix,
+    }
+
+
+def attempt_circuit_supervision_payload(
+    supervision: SupervisionConfig,
+) -> dict[str, object]:
+    """Keep the pre-rename digest schema stable for persisted attempt records."""
+    return {
+        "max_restarts": supervision.max_restarts,
+        "cooldown_seconds": supervision.cooldown_seconds,
+        "recover_unknown_runs": supervision.recover_unknown_runs,
+        "resume_unknown_runs": supervision.resume_unknown_runs,
+        "limit_wall_detection": supervision.provider_limit_detection,
+        "limit_wall_backoff_seconds": supervision.provider_limit_backoff_seconds,
+        "limit_wall_patterns": list(supervision.provider_limit_patterns),
+        "worker_timeout_seconds": supervision.worker_timeout_seconds,
+        "slice_token_threshold": supervision.slice_token_threshold,
+        "cross_run_attempt_threshold": supervision.cross_run_attempt_threshold,
+        "explicit_keys": sorted(
+            SUPERVISION_PROVIDER_LIMIT_ALIASES.get(key, key)
+            for key in supervision.explicit_keys
+        ),
     }
 
 
