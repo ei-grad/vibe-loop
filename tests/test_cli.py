@@ -409,9 +409,10 @@ class CliTests(unittest.TestCase):
                 "    text.replace('| TASK-01 | P0 | Next |', '| TASK-01 | P0 | Done |'),\n"
                 "    encoding='utf-8',\n"
                 ")\n"
-                "print(json.dumps({'model': {'provider': 'openai', "
+                "print(json.dumps({'type': 'session.created', "
+                "'session_id': 'codex-native-123', "
+                "'model': {'provider': 'openai', "
                 "'id': 'gpt-5.5', 'reasoning_effort': 'high'}}))\n"
-                "print('session id: codex-native-123')\n"
                 "print(f'codex out: {sys.argv[2]}')\n" + WORKER_FAST_FORWARD_MAIN,
             )
             stdout = StringIO()
@@ -458,7 +459,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["classification"], "completed")
         self.assertNotEqual(payload["session_id"], payload["run_id"])
         self.assertEqual(payload["session_id"], "codex-native-123")
-        self.assertEqual(payload["session_id_source"], "native:stdout")
+        self.assertEqual(
+            payload["session_id_source"],
+            "native:stdout:json.session_id",
+        )
         self.assertEqual(payload["agent_command_source"], "auto:codex")
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
         self.assertEqual(payload["agent_kind"], "codex")
@@ -466,7 +470,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent_prompt_dialect_source"], "auto:codex")
         self.assertEqual(payload["agent_skill_ref_prefix"], "$")
         self.assertEqual(run_result["session_id"], "codex-native-123")
-        self.assertEqual(run_result["session_id_source"], "native:stdout")
+        self.assertEqual(
+            run_result["session_id_source"],
+            "native:stdout:json.session_id",
+        )
         self.assertEqual(run_result["agent_prompt_dialect"], "codex")
         self.assertEqual(run_result["trailer_context"]["agent_kind"], "codex")
         self.assertEqual(
@@ -528,7 +535,10 @@ class CliTests(unittest.TestCase):
         self.assertIn("agent prompt dialect source: auto:codex", stderr.getvalue())
         self.assertIn("agent_command_source=auto:codex", log_text)
         self.assertIn("agent_prompt_dialect_source=auto:codex", log_text)
-        self.assertIn("session_id_source=native:stdout", log_text)
+        self.assertIn(
+            "session_id_source=native:stdout:json.session_id",
+            log_text,
+        )
 
     def test_auto_codex_worker_can_report_with_run_id_environment(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
