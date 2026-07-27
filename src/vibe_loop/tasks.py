@@ -2471,8 +2471,8 @@ class CommandTaskSource:
         self,
         runtime_context: Mapping[str, str] | None,
     ) -> dict[str, str]:
-        merged = dict(self.runtime_context)
-        merged.update(runtime_context or {})
+        merged = dict(runtime_context or {})
+        merged.update(self.runtime_context)
         return merged
 
 

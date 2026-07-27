@@ -2244,7 +2244,8 @@ class VibeRunner:
             log_path=log_path,
             agent_kind=agent_kind,
             agent_profile=agent_profile,
-            bound_names=self.config.project_binding.require,
+            bound_context=self.config.runtime_environment,
+            expose_bound_context=not runtime_owned_mode,
             disable_background_tasks=runtime_owned_mode and agent_kind == "claude",
         )
         claude_home: Path | None = None
@@ -9232,13 +9233,25 @@ def worker_command_env(
     log_path: Path,
     agent_kind: str,
     agent_profile: str,
-    bound_names: Sequence[str] = (),
+    bound_context: Mapping[str, str] | None = None,
+    expose_bound_context: bool = False,
     disable_background_tasks: bool = False,
 ) -> dict[str, str]:
+    """Build the agent environment without inheriting selector bindings.
+
+    Worker-owned orchestration deliberately receives resolved non-secret
+    bindings because that compatibility mode makes the agent complete the task
+    source directly. Runtime-owned workers leave them absent because the
+    supervisor performs every adapter transition.
+    """
+
     env = os.environ.copy()
     env.pop("VIBE_LOOP_PRIMARY_REPO", None)
-    for name in bound_names:
+    explicit_context = dict(bound_context or {})
+    for name in explicit_context:
         env.pop(name, None)
+    if expose_bound_context:
+        env.update(explicit_context)
     env.update(
         {
             "VIBE_LOOP_RUN_ID": run_id,

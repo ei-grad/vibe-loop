@@ -1317,7 +1317,10 @@ class MarkdownPlanTests(unittest.TestCase):
                 task = source.activate(
                     "TASK-42",
                     "run-7",
-                    runtime_context={"VIBE_LOOP_FENCING_TOKEN": "generation-3"},
+                    runtime_context={
+                        "PROJECT_SELECTOR": "ambient",
+                        "VIBE_LOOP_FENCING_TOKEN": "generation-3",
+                    },
                 )
 
         self.assertIsNotNone(task)

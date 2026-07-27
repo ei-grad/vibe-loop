@@ -30,6 +30,7 @@ from vibe_loop.config import (
     BudgetConfig,
     CompletionConfig,
     OrchestrationConfig,
+    ProjectBindingConfig,
     SpecDiagnosticsConfig,
     SupervisionConfig,
     SUPERVISION_DEFAULT_MAX_RESTARTS,
@@ -8494,21 +8495,30 @@ class SessionIdInjectionTests(unittest.TestCase):
 
     def test_worker_process_does_not_observe_bound_selector_names(self) -> None:
         selector_name = "LOOPYARD_PROJECT"
-        with patch.dict(os.environ, {selector_name: "ambient-project"}):
+        inherited_name = "WORKER_ENV_UNRELATED"
+        with patch.dict(
+            os.environ,
+            {
+                selector_name: "ambient-project",
+                inherited_name: "preserved",
+            },
+        ):
             environment = worker_command_env(
                 run_id="run-1",
                 task_id="TASK-01",
                 log_path=Path("/tmp/run.log"),
                 agent_kind="codex",
                 agent_profile="codex",
-                bound_names=(selector_name,),
+                bound_context={selector_name: "configured-project"},
             )
 
         observed = subprocess.run(
             [
                 sys.executable,
                 "-c",
-                "import os; print(os.environ.get('LOOPYARD_PROJECT', 'absent'))",
+                "import json, os; print(json.dumps({"
+                "'selector': os.environ.get('LOOPYARD_PROJECT', 'absent'), "
+                "'unrelated': os.environ.get('WORKER_ENV_UNRELATED')}))",
             ],
             env=environment,
             check=True,
@@ -8516,7 +8526,10 @@ class SessionIdInjectionTests(unittest.TestCase):
             text=True,
         )
 
-        self.assertEqual(observed.stdout.strip(), "absent")
+        self.assertEqual(
+            json.loads(observed.stdout),
+            {"selector": "absent", "unrelated": "preserved"},
+        )
 
     def test_worker_usage_provenance_is_allowlisted(self) -> None:
         report = WorkerReport(
@@ -9290,6 +9303,58 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             # must already see the settled outcome, not infer one afterwards.
             self.assertEqual(lock_manager.outcome_at_release("T-1"), "completed")
 
+    def test_worker_owned_launch_uses_explicit_binding_without_overstripping(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="Next", agent="worker")
+        done = Task(task_id="T-1", title="Task", status="Done", agent="worker")
+        selector_name = "LOOPYARD_PROJECT"
+        inherited_name = "WORKER_ENV_UNRELATED"
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {"T-1": done})
+            runner.config = dataclasses.replace(
+                runner.config,
+                project_binding=ProjectBindingConfig(
+                    require=(selector_name,),
+                    context=((selector_name, "configured-project"),),
+                ),
+            )
+            reporting_worker = self._reporting_worker(runner, "completed")
+
+            def observing_worker(command, cwd, log, **kwargs):
+                observed = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "import json, os; print(json.dumps({"
+                        "'selector': os.environ.get('LOOPYARD_PROJECT'), "
+                        "'unrelated': os.environ.get('WORKER_ENV_UNRELATED')}))",
+                    ],
+                    env=kwargs["env"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    json.loads(observed.stdout),
+                    {
+                        "selector": "configured-project",
+                        "unrelated": "preserved",
+                    },
+                )
+                return reporting_worker(command, cwd, log, **kwargs)
+
+            with patch.dict(
+                os.environ,
+                {
+                    selector_name: "",
+                    inherited_name: "preserved",
+                },
+            ):
+                result = self._run_task(runner, task, observing_worker)
+
+        self.assertEqual(result.classification, "completed")
+
     def test_completed_report_is_reclassified_when_main_is_not_upstream(
         self,
     ) -> None:
@@ -9419,6 +9484,10 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                     **runner.config.agent_profiles,
                     "worker": claude,
                 },
+                project_binding=ProjectBindingConfig(
+                    require=("LOOPYARD_PROJECT",),
+                    context=(("LOOPYARD_PROJECT", "configured-project"),),
+                ),
             )
 
             def complete_runtime_lifecycle(**kwargs):
@@ -9440,18 +9509,20 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
                     kwargs["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"],
                     "1",
                 )
+                self.assertNotIn("LOOPYARD_PROJECT", kwargs["env"])
                 return worker(command, cwd, log, **kwargs)
 
-            with patch.object(
-                runner,
-                "execute_runtime_owned_lifecycle",
-                side_effect=complete_runtime_lifecycle,
-            ) as lifecycle:
-                result = self._run_task(
+            with patch.dict(os.environ, {"LOOPYARD_PROJECT": ""}):
+                with patch.object(
                     runner,
-                    task,
-                    reportless_worker,
-                )
+                    "execute_runtime_owned_lifecycle",
+                    side_effect=complete_runtime_lifecycle,
+                ) as lifecycle:
+                    result = self._run_task(
+                        runner,
+                        task,
+                        reportless_worker,
+                    )
 
             lifecycle.assert_called_once()
             self.assertEqual(result.classification, "completed")

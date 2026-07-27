@@ -495,7 +495,8 @@ Registry entries may carry an optional bounded `context` object for non-secret
 runtime selectors required by command-backed task-source and lock adapters, for
 example `LOOPYARD_PROJECT`. The context is copied into each adapter subprocess
 environment without mutating the supervisor environment or interpolating values
-into shell commands. It does not apply to worker-agent or maintenance commands.
+into shell commands. Worker-agent applicability is defined by
+[PRD-AUT-020](#prd-aut-020); the context does not apply to maintenance commands.
 Entries are limited to 16 variables, 4 KiB per value, and 16 KiB total. Secret-
 like names and values, process-loader variables, shell startup controls, command
 lookup paths, credential/config selectors, and `VIBE_LOOP_*` protocol variables
@@ -580,7 +581,13 @@ supplied on its own.
 Binding must survive process launch. Detached start and registry-driven launches
 transport registry context to the child out of band and drop the ambient copy of
 every bound name from the child environment, so a stale shell export cannot
-reach an adapter if the child's own resolution changes.
+reach an adapter if the child's own resolution changes. Worker launch applies
+the same rule to every selector in the resolved context at the agent boundary:
+runtime-owned workers observe those names as absent, while worker-owned
+compatibility agents receive only the resolved values they need to perform the
+task-source completion transition. At the adapter boundary, configured and
+registry context remains authoritative over per-transition runtime context, so
+an inherited worker value cannot override adapter routing.
 
 The table is optional. A command backend that already scopes its project
 explicitly in the command string has no ambiguity to close and keeps working

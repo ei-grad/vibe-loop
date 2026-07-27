@@ -122,7 +122,9 @@ results are missing or ambiguous.
   absolute path outside that workspace. Runtime task-source adapters use the
   separate `VIBE_LOOP_PRIMARY_REPO` context; that primary path is not exported
   to the worker command. Worker report and integration-lock helpers resolve
-  shared primary control state internally from the task worktree.
+  shared primary control state internally from the task worktree. Project
+  selector handling at the worker boundary follows
+  [PRD-AUT-020](prd/autopilot.md#prd-aut-020).
 - Runtime task-source adapters also receive `VIBE_LOOP_IMPLEMENTER_SESSION` and
   `VIBE_LOOP_REVIEWER_SESSION` so a backend can attribute a status transition to
   the session that produced the candidate and the session that approved it. Both
