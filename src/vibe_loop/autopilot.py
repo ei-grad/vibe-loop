@@ -101,6 +101,7 @@ from vibe_loop.runs import (
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
+    WORKSPACE_PREFLIGHT_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
     RunStore,
@@ -598,6 +599,19 @@ def collect_project_status(
     )
     queue_status = collect_task_queue_status(config)
     records = run_store.read_records()
+    preflight_blockers = workspace_preflight_dispatch_blockers(
+        queue_status,
+        workers,
+        records,
+    )
+    if preflight_blockers:
+        queue_status = dataclasses.replace(
+            queue_status,
+            dispatch_blockers=(
+                *queue_status.dispatch_blockers,
+                *preflight_blockers,
+            ),
+        )
     stranded_reviews = stranded_review_tasks(
         queue_status,
         workers,
@@ -829,6 +843,66 @@ def queue_has_no_launchable_task(queue_status: TaskQueueStatus) -> bool:
         for task in queue_status.runnable_tasks
     }
     return bool(runnable_task_ids) and runnable_task_ids <= blocked_task_ids
+
+
+def workspace_preflight_dispatch_blockers(
+    queue_status: TaskQueueStatus,
+    workers: tuple[WorkerView, ...],
+    records: Sequence[Mapping[str, object]],
+) -> tuple[dict[str, object], ...]:
+    runnable_task_ids = {
+        str(task.get("id") or task.get("task_id") or "")
+        for task in queue_status.runnable_tasks
+    }
+    locked_task_ids = {worker.active.task_id for worker in workers}
+    already_blocked = {
+        str(blocker.get("task_id") or "") for blocker in queue_status.dispatch_blockers
+    }
+    latest: dict[str, Mapping[str, object]] = {}
+    for record in records:
+        if record.get("record_type") != WORKSPACE_PREFLIGHT_RECORD_TYPE:
+            continue
+        task_id = str(record.get("task_id") or "")
+        if task_id:
+            latest[task_id] = record
+
+    blockers: list[dict[str, object]] = []
+    for task_id in sorted(runnable_task_ids):
+        if task_id in locked_task_ids or task_id in already_blocked:
+            continue
+        record = latest.get(task_id)
+        if (
+            record is None
+            or record.get("decision") != "rejected"
+            or record.get("worker_launch_allowed") is not False
+        ):
+            continue
+        reason = str(record.get("reason") or "unknown")
+        retry_disposition = str(record.get("retry_disposition") or "retry_later")
+        blocker: dict[str, object] = {
+            "task_id": task_id,
+            "code": "workspace_preflight_rejected",
+            "key": "workspace",
+            "message": (
+                "workspace preflight rejected worker launch: "
+                f"{reason} ({retry_disposition})"
+            ),
+            "remedy": (
+                "Change or repair the recorded workspace state before retrying."
+                if retry_disposition == "defer_until_workspace_changes"
+                else "Inspect the recorded branch and worktree state; "
+                "the supervisor will retry."
+            ),
+            "reason": reason,
+            "retry_disposition": retry_disposition,
+            "run_id": str(record.get("run_id") or ""),
+        }
+        for key in ("branch", "worktree"):
+            value = record.get(key)
+            if isinstance(value, str) and value:
+                blocker[key] = value
+        blockers.append(blocker)
+    return tuple(blockers)
 
 
 def stranded_review_tasks(

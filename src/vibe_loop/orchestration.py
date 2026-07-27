@@ -5972,23 +5972,13 @@ WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
     {
         "ambiguous_owned_workspaces",
         "dirty_existing_workspace",
-        "incomplete_recovery_workspace",
-        "primary_workspace_forbidden",
-        "recovery_base_changed",
         "recovery_dirty_content_changed",
         "recovery_dirty_snapshot_changed",
         "recovery_git_common_dir_changed",
         "recovery_head_changed",
         "workspace_base_mismatch",
-        "workspace_base_unverified",
-        "workspace_changed_during_claim",
-        "workspace_collision",
-        "workspace_foreign_owner",
         "workspace_live_owner",
         "workspace_main_history_mismatch",
-        "workspace_ownership_unverified",
-        "workspace_refresh_conflict",
-        "workspace_refresh_restore_failed",
         "workspace_stale_current_base",
     }
 )
@@ -6319,10 +6309,24 @@ class WorkspaceProvisioner:
         if owned is not None:
             return owned
         name = workspace_name(task_id)
-        return (
-            f"{WORKSPACE_BRANCH_PREFIX}{name}",
-            self.repo.parent / f"{self.repo.name}-worktrees" / name,
-        )
+        worktree_root = self.repo.parent / f"{self.repo.name}-worktrees"
+        branch = f"{WORKSPACE_BRANCH_PREFIX}{name}"
+        worktree = worktree_root / name
+        suffix = 1
+        while (
+            self._git_returncode(
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{branch}",
+            )
+            == 0
+            or worktree.exists()
+        ):
+            suffix += 1
+            branch = f"{WORKSPACE_BRANCH_PREFIX}{name}-{suffix}"
+            worktree = worktree_root / f"{name}-{suffix}"
+        return branch, worktree
 
     def _create_or_adopt(
         self,
@@ -6365,6 +6369,49 @@ class WorkspaceProvisioner:
             == 0
         )
         path_exists = worktree.exists()
+        detached_owner = None
+        if (
+            not branch_entries
+            and not path_entries
+            and branch_exists
+            and not path_exists
+        ):
+            detached_owner = self._ownership_record(
+                task_id=task_id,
+                branch=branch,
+                worktree=worktree,
+                recovery_run_id=recovery_run_id,
+            )
+        if detached_owner is not None:
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            result = self._git_result(
+                "worktree",
+                "add",
+                str(worktree),
+                branch,
+            )
+            if result.returncode != 0:
+                raise WorkspaceProvisionError(
+                    "workspace_reattach_failed",
+                    "git could not reattach the owned task branch",
+                    details={
+                        "branch": branch,
+                        "worktree": str(worktree),
+                        "stderr": result.stderr.strip(),
+                    },
+                )
+            context = build_workspace_git_context(
+                self.repo,
+                main_branch=self.main_branch,
+                ignored_dirty_paths=self.ignored_dirty_paths,
+            )
+            branch_entries = [
+                entry for entry in context.worktrees if entry.branch == branch
+            ]
+            path_entries = [
+                entry for entry in context.worktrees if entry.path == worktree.resolve()
+            ]
+            path_exists = worktree.exists()
         if (
             not branch_entries
             and not path_entries
@@ -6741,7 +6788,10 @@ class WorkspaceProvisioner:
             ignored_dirty_paths=self.ignored_dirty_paths,
         )
         listed = {(entry.branch, entry.path.resolve()) for entry in context.worktrees}
-        candidates: set[tuple[str, Path]] = set()
+        listed_branches = {entry.branch for entry in context.worktrees}
+        listed_paths = {entry.path.resolve() for entry in context.worktrees}
+        listed_candidates: set[tuple[str, Path]] = set()
+        detached_candidates: list[tuple[str, Path]] = []
         for record in self.run_store.read_records():
             if record.get("record_type") != "workspace_claim":
                 continue
@@ -6752,9 +6802,26 @@ class WorkspaceProvisioner:
             if not isinstance(branch, str) or not isinstance(raw_worktree, str):
                 continue
             identity = (branch, Path(raw_worktree).resolve())
+            branch_exists = (
+                self._git_returncode(
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                )
+                == 0
+            )
+            detached_owned_branch = (
+                branch_exists
+                and branch not in listed_branches
+                and identity[1] not in listed_paths
+                and not identity[1].exists()
+            )
             if identity in listed:
-                candidates.add(identity)
-        if len(candidates) > 1:
+                listed_candidates.add(identity)
+            elif detached_owned_branch and identity not in detached_candidates:
+                detached_candidates.append(identity)
+        if len(listed_candidates) > 1:
             raise WorkspaceProvisionError(
                 "ambiguous_owned_workspaces",
                 "multiple existing workspaces have ownership records for the task",
@@ -6762,13 +6829,15 @@ class WorkspaceProvisioner:
                     "workspaces": [
                         {"branch": branch, "worktree": str(worktree)}
                         for branch, worktree in sorted(
-                            candidates,
+                            listed_candidates,
                             key=lambda item: (item[0], str(item[1])),
                         )
                     ]
                 },
             )
-        return next(iter(candidates), None)
+        if listed_candidates:
+            return next(iter(listed_candidates))
+        return detached_candidates[-1] if detached_candidates else None
 
     def _compensate_partial_creation(
         self,

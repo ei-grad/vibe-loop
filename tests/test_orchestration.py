@@ -79,6 +79,7 @@ from vibe_loop.orchestration import (
     plan_session_continuation,
     provider_capabilities,
     require_candidate_review_clear,
+    workspace_retry_disposition,
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.locks import (
@@ -7251,6 +7252,99 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(preflight["retry_disposition"], "not_needed")
             self.assertTrue(preflight["worker_launch_allowed"])
 
+    def test_reattaches_owned_branch_after_worktree_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            init_git_repo(repo)
+            manager, store, token = acquire_run(repo, "TASK-01", "run-1")
+            base = git(repo, "rev-parse", "HEAD").stdout.strip()
+            first = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
+            (first.worktree / "candidate.txt").write_text(
+                "preserved\n", encoding="utf-8"
+            )
+            git(first.worktree, "add", "candidate.txt")
+            git(first.worktree, "commit", "-m", "preserve candidate")
+            preserved_head = git(first.worktree, "rev-parse", "HEAD").stdout.strip()
+            manager.release(manager.current_lock("TASK-01"))
+            git(repo, "worktree", "remove", str(first.worktree))
+            self.assertFalse(first.worktree.exists())
+            self.assertEqual(
+                git(repo, "rev-parse", first.branch).stdout.strip(),
+                preserved_head,
+            )
+            manager, _, token = acquire_run(
+                repo,
+                "TASK-01",
+                "run-2",
+                store=store,
+            )
+
+            adopted = WorkspaceProvisioner(
+                repo=repo,
+                main_branch="main",
+                lock_manager=manager,
+                run_store=store,
+            ).provision(
+                task_id="TASK-01",
+                run_id="run-2",
+                base_commit=base,
+                fencing_token=token,
+            )
+
+            self.assertEqual(adopted.mode, "adopted")
+            self.assertEqual(adopted.branch, first.branch)
+            self.assertEqual(adopted.worktree, first.worktree)
+            self.assertEqual(adopted.head_commit, preserved_head)
+            self.assertEqual(
+                (adopted.worktree / "candidate.txt").read_text(encoding="utf-8"),
+                "preserved\n",
+            )
+            preflight = store.read_records()[-3]
+            self.assertEqual(preflight["record_type"], "workspace_preflight")
+            self.assertEqual(preflight["decision"], "reusable")
+            self.assertTrue(preflight["worker_launch_allowed"])
+
+    def test_retry_disposition_does_not_park_immutable_workspace_failures(
+        self,
+    ) -> None:
+        immutable_failures = {
+            "incomplete_recovery_workspace",
+            "primary_workspace_forbidden",
+            "recovery_base_changed",
+            "workspace_base_unverified",
+            "workspace_changed_during_claim",
+            "workspace_collision",
+            "workspace_foreign_owner",
+            "workspace_ownership_unverified",
+            "workspace_refresh_conflict",
+            "workspace_refresh_restore_failed",
+        }
+        for code in immutable_failures:
+            with self.subTest(code=code):
+                self.assertEqual(workspace_retry_disposition(code), "retry_later")
+
+        for code in {
+            "dirty_existing_workspace",
+            "workspace_live_owner",
+            "workspace_main_history_mismatch",
+            "workspace_stale_current_base",
+        }:
+            with self.subTest(code=code):
+                self.assertEqual(
+                    workspace_retry_disposition(code),
+                    "defer_until_workspace_changes",
+                )
+
     def test_adopts_legacy_path_with_matching_task_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
@@ -7771,7 +7865,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "workspace_refresh_conflict")
             self.assertEqual(
                 raised.exception.retry_disposition,
-                "defer_until_workspace_changes",
+                "retry_later",
             )
             self.assertEqual(raised.exception.details["conflict_paths"], ["shared.txt"])
             self.assertEqual(
@@ -8289,9 +8383,10 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(
-                runner.unchanged_workspace_dispatch_deferrals(),
-                {task.task_id},
+                rejected[0]["retry_disposition"],
+                "retry_later",
             )
+            self.assertEqual(runner.unchanged_workspace_dispatch_deferrals(), set())
 
     def test_runner_rejects_head_change_between_preflight_and_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8424,7 +8519,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 "preserve\n",
             )
 
-    def test_branch_collision_fails_without_mutating_primary(self) -> None:
+    def test_unowned_branch_collision_selects_unused_workspace_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
@@ -8436,24 +8531,27 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 lock_manager=manager,
                 run_store=store,
             )
-            branch, _ = provisioner._workspace_identity(
+            branch, default_worktree = provisioner._workspace_identity(
                 task_id="TASK-01",
                 recovery_branch="",
                 recovery_worktree=None,
             )
             git(repo, "branch", branch)
-            before = primary_snapshot(repo)
+            preserved_head = git(repo, "rev-parse", branch).stdout.strip()
 
-            with self.assertRaises(WorkspaceProvisionError) as raised:
-                provisioner.provision(
-                    task_id="TASK-01",
-                    run_id="run-1",
-                    base_commit=base,
-                    fencing_token=token,
-                )
+            workspace = provisioner.provision(
+                task_id="TASK-01",
+                run_id="run-1",
+                base_commit=base,
+                fencing_token=token,
+            )
 
-            self.assertEqual(raised.exception.code, "workspace_collision")
-            self.assertEqual(primary_snapshot(repo), before)
+            self.assertEqual(workspace.mode, "created")
+            self.assertNotEqual(workspace.branch, branch)
+            self.assertNotEqual(workspace.worktree, default_worktree)
+            self.assertEqual(
+                git(repo, "rev-parse", branch).stdout.strip(), preserved_head
+            )
 
     def test_dirty_primary_fails_before_workspace_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8630,6 +8728,11 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 lock_manager=manager,
                 run_store=store,
             )
+            _, raced_worktree = provisioner._workspace_identity(
+                task_id="TASK-01",
+                recovery_branch="",
+                recovery_worktree=None,
+            )
 
             with self.assertRaises(WorkspaceProvisionError) as raised:
                 provisioner.provision(
@@ -8639,14 +8742,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                     fencing_token=token,
                 )
 
-            _, worktree = provisioner._workspace_identity(
-                task_id="TASK-01",
-                recovery_branch="",
-                recovery_worktree=None,
-            )
             self.assertEqual(raised.exception.code, "workspace_collision")
             self.assertEqual(
-                (worktree / "foreign.txt").read_text(encoding="utf-8"),
+                (raced_worktree / "foreign.txt").read_text(encoding="utf-8"),
                 "preserve\n",
             )
 

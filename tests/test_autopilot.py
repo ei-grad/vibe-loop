@@ -623,6 +623,88 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("TASK-MALFORMED", rendered)
         self.assertNotIn("blockers: none", rendered)
 
+    def test_status_reports_latest_workspace_preflight_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    decision="rejected",
+                    reason="workspace_collision",
+                    retry_disposition="retry_later",
+                    worker_launch_allowed=False,
+                )
+            )
+
+            status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(
+            payload["blockers"],
+            [
+                "task_dispatch_blocked:TASK-01: workspace preflight rejected "
+                "worker launch: workspace_collision (retry_later)"
+            ],
+        )
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "blocked")
+        self.assertEqual(
+            payload["queue"]["dispatch_blockers"],
+            [
+                {
+                    "task_id": "TASK-01",
+                    "code": "workspace_preflight_rejected",
+                    "key": "workspace",
+                    "message": (
+                        "workspace preflight rejected worker launch: "
+                        "workspace_collision (retry_later)"
+                    ),
+                    "remedy": (
+                        "Inspect the recorded branch and worktree state; "
+                        "the supervisor will retry."
+                    ),
+                    "reason": "workspace_collision",
+                    "retry_disposition": "retry_later",
+                    "run_id": "run-1",
+                }
+            ],
+        )
+        self.assertIn("blockers:", rendered)
+        self.assertIn("TASK-01", rendered)
+        self.assertIn("workspace_collision", rendered)
+        self.assertNotIn("blockers: none", rendered)
+
+    def test_successful_workspace_preflight_clears_prior_status_rejection(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            for decision, reason, disposition, allowed in (
+                ("rejected", "workspace_collision", "retry_later", False),
+                ("reusable", "workspace_adopted", "not_needed", True),
+            ):
+                run_store.append_lifecycle_event(
+                    RunLifecycleEvent.workspace_preflight(
+                        run_id="run-1",
+                        task_id="TASK-01",
+                        decision=decision,
+                        reason=reason,
+                        retry_disposition=disposition,
+                        worker_launch_allowed=allowed,
+                    )
+                )
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["queue"]["dispatch_blockers"], [])
+
     def test_collect_project_status_keeps_nonblocking_agent_diagnostics(
         self,
     ) -> None:
