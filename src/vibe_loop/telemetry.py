@@ -97,6 +97,7 @@ USAGE_VERSIONS = frozenset(
 USAGE_PROVIDERS = frozenset({"anthropic", "openai", "mixed", "unknown"})
 USAGE_UNAVAILABLE_REASONS = frozenset(
     {
+        "configured_command_cannot_report_usage",
         "provider_usage_not_reported",
         "malformed_provider_usage",
         "provider_transcript_unavailable",
@@ -881,8 +882,18 @@ def parse_codex_event(
 
 
 class ProviderUsageObserver:
-    def __init__(self, provider: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        *,
+        unavailable_reason: str = "provider_usage_not_reported",
+    ) -> None:
+        if unavailable_reason not in USAGE_UNAVAILABLE_REASONS:
+            raise ValueError(
+                f"unsupported usage-unavailable reason: {unavailable_reason}"
+            )
         self.provider = provider or "unknown"
+        self.unavailable_reason = unavailable_reason
         self._lock = threading.Lock()
         self._usage: ProviderUsage | None = None
         self._saw_malformed_usage = False
@@ -902,7 +913,7 @@ class ProviderUsageObserver:
                     account_wall_observations=self._account_wall_observations,
                 )
             return dataclasses.replace(
-                unavailable_usage(self.provider, "provider_usage_not_reported"),
+                unavailable_usage(self.provider, self.unavailable_reason),
                 account_wall_observations=self._account_wall_observations,
             )
 
@@ -938,7 +949,7 @@ class ProviderUsageObserver:
                     )
                     return self._usage
                 return dataclasses.replace(
-                    unavailable_usage(self.provider, "provider_usage_not_reported"),
+                    unavailable_usage(self.provider, self.unavailable_reason),
                     account_wall_observations=self._account_wall_observations,
                 )
             self._saw_malformed_usage = self._saw_malformed_usage or parsed.malformed

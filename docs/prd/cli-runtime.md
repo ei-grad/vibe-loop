@@ -110,6 +110,16 @@ A worker command for a task with traceability metadata must include `{prompt}`;
 task-id-only compatibility templates must fail clearly rather than silently
 dropping spec-aware worker context.
 
+Resolved first-party worker commands must request provider usage in a shape the
+runtime parser accepts. Codex execution uses JSONL events; Claude print mode
+uses JSON or verbose stream-JSON events. Runtime injection may add the required
+flags to recognized built-in commands without changing the user-authored
+template. `doctor` reports whether usage observation is possible for the
+resolved command and does not expose the command text. A command that emits no
+supported structured format records
+`configured_command_cannot_report_usage`; it must not be described as a
+provider reporting failure.
+
 Acceptance must cover Codex-only, Claude-only, both-present, neither-present,
 explicit `kind`, explicit prompt dialect or skill prefix, explicit command
 overrides including environment-prefixed Claude commands, custom commands with
@@ -120,7 +130,10 @@ diagnostics, prompt-required diagnostics for traceable tasks, and clear failure
 when no supported agent command or required custom prompt syntax is available.
 Prompt extension acceptance must cover Codex and Claude dialects, routed agent
 profiles, recovery runs, explicit conflict precedence, and unchanged prompts
-when the setting is absent.
+when the setting is absent. Usage-observation acceptance must cover the
+first-party structured formats, runtime flag injection, explicit commands that
+cannot emit supported usage, the unavailable-reason distinction, and redacted
+`doctor` output.
 
 `agent.analysis_command` is a separate read-only analysis template used by
 autopilot decision steps. Its inferred Codex form uses a read-only sandbox; its

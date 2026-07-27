@@ -625,6 +625,32 @@ class AgentPromptDialectResolution:
 
 
 @dataclasses.dataclass(frozen=True)
+class UsageObservationCapability:
+    possible: bool
+    provider: str
+    output_format: str
+    source: str
+    diagnostic: str
+
+    @property
+    def unavailable_reason(self) -> str:
+        return (
+            "provider_usage_not_reported"
+            if self.possible
+            else "configured_command_cannot_report_usage"
+        )
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "possible": self.possible,
+            "provider": self.provider,
+            "output_format": self.output_format,
+            "source": self.source,
+            "diagnostic": self.diagnostic,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class AgentConfig:
     command: str | None = None
     selection_command: str | None = None
@@ -824,6 +850,10 @@ class AgentConfig:
             "detected": self.detected.to_json(),
             "default_policy_source": AGENT_DEFAULT_POLICY_SOURCE,
             "default_policy": AGENT_DEFAULT_POLICY,
+            "usage_observation": structured_usage_observation(
+                self.command,
+                self.agent_kind,
+            ).to_json(),
             "diagnostics": self.diagnostics(),
         }
 
@@ -2196,6 +2226,116 @@ def default_agent_command(
             "codex exec", "codex exec -c model_reasoning_effort={effort}", 1
         )
     return configured.replace("claude -p", "claude -p --effort {effort}", 1)
+
+
+def command_executable_name(argv: list[str]) -> str:
+    for token in argv:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            continue
+        return Path(token).name
+    return ""
+
+
+def command_option_value(argv: list[str], name: str) -> str:
+    for index, token in enumerate(argv):
+        if token.startswith(f"{name}="):
+            return token.partition("=")[2]
+        if token == name and index + 1 < len(argv):
+            return argv[index + 1]
+    return ""
+
+
+def inject_structured_usage_output(command: str, agent_kind: str) -> str:
+    """Request native usage events only for recognized first-party CLIs."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    executable = command_executable_name(argv)
+    if executable == "codex" and agent_kind in {"auto", "codex"}:
+        if "exec" not in argv or "--json" in argv:
+            return command
+        return re.sub(r"(?<!\S)exec(?=\s|$)", "exec --json", command, count=1)
+    if executable == "claude" and agent_kind in {"auto", "claude"}:
+        output_format = command_option_value(argv, "--output-format")
+        if output_format:
+            if output_format == "stream-json" and "--verbose" not in argv:
+                return command.replace("claude ", "claude --verbose ", 1)
+            return command
+        return command.replace(
+            "claude ", "claude --output-format stream-json --verbose ", 1
+        )
+    return command
+
+
+def structured_usage_observation(
+    command: str | None,
+    agent_kind: str,
+) -> UsageObservationCapability:
+    if not command:
+        return UsageObservationCapability(
+            possible=False,
+            provider="unknown",
+            output_format="",
+            source="unavailable",
+            diagnostic="no resolved agent command can emit provider usage",
+        )
+    effective = inject_structured_usage_output(command, agent_kind)
+    source = "runtime-injected" if effective != command else "configured"
+    try:
+        argv = shlex.split(effective)
+    except ValueError:
+        return UsageObservationCapability(
+            possible=False,
+            provider="unknown",
+            output_format="",
+            source=source,
+            diagnostic=(
+                "the configured command cannot report usage because it cannot be parsed"
+            ),
+        )
+    executable = command_executable_name(argv)
+    if executable == "codex":
+        possible = "exec" in argv and "--json" in argv
+        return UsageObservationCapability(
+            possible=possible,
+            provider="openai",
+            output_format="jsonl" if possible else "",
+            source=source,
+            diagnostic=(
+                "the resolved Codex command emits JSONL usage events"
+                if possible
+                else "the configured Codex command cannot report usage without "
+                "`codex exec --json`"
+            ),
+        )
+    if executable == "claude":
+        output_format = command_option_value(argv, "--output-format")
+        print_mode = "-p" in argv or "--print" in argv
+        stream_ready = output_format == "stream-json" and "--verbose" in argv
+        possible = print_mode and (output_format == "json" or stream_ready)
+        return UsageObservationCapability(
+            possible=possible,
+            provider="anthropic",
+            output_format=output_format if possible else "",
+            source=source,
+            diagnostic=(
+                "the resolved Claude command emits structured usage events"
+                if possible
+                else "the configured Claude command cannot report usage without "
+                "print mode and JSON or verbose stream-JSON output"
+            ),
+        )
+    return UsageObservationCapability(
+        possible=False,
+        provider="unknown",
+        output_format="",
+        source=source,
+        diagnostic=(
+            "usage observation is unavailable because the configured command is "
+            "not a recognized Codex or Claude CLI invocation"
+        ),
+    )
 
 
 def format_agent_command(

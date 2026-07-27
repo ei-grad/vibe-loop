@@ -41,8 +41,9 @@ Acceptance must cover array and `{"tasks":[...]}` list output, probe behavior,
 required fields, optional conflict domains, adapter failure diagnostics, and no
 substitution of generated discovery when an explicit adapter fails. Worker
 execution must additionally require an explicit activation command that owns
-the runnable-to-in-progress compare-and-set and returns normalized post-state;
-read-only list and probe operations remain available without activation.
+the runnable-to-in-progress compare-and-set when the task is still runnable and
+returns normalized post-state; read-only list and probe operations remain
+available without activation.
 
 The command keys are `list`, optional `probe`, required-for-launch `activate`,
 and lifecycle hooks `complete`, `reset`, and `park`. Templates receive
@@ -53,10 +54,14 @@ template values. Only the documented exact placeholders are accepted, without
 conversions or format specifications. On Windows, values containing quotes,
 percent expansion, delayed-expansion markers, or line breaks fail closed
 because `cmd.exe` cannot safely preserve them in an operator-authored shell
-string. Activation runs only after the exact task lock is held, must atomically
-move a runnable task to a non-runnable in-progress state, and must return that
-normalized task. A continuation probes the existing activated state rather than
-repeating the compare-and-set.
+string. Activation runs only after the exact task lock is held. When `probe` is
+configured, the runtime first reads the post-lock task state. A non-runnable
+state confirms that the lock backend already performed activation, so the
+configured activation command is not repeated. A runnable state requires the
+activation command to atomically move the task to a non-runnable in-progress
+state and return that normalized task. This keeps activation correct whether or
+not lock acquisition updates task state. A continuation probes the existing
+activated state rather than repeating the compare-and-set.
 
 ```toml
 [task_source]

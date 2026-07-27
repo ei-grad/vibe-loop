@@ -1329,6 +1329,99 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertEqual(environment["PROJECT_SELECTOR"], "configured")
         self.assertEqual(environment["VIBE_LOOP_FENCING_TOKEN"], "generation-3")
 
+    def test_command_task_source_accepts_lock_side_activation(self) -> None:
+        calls: list[str] = []
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            command = str(args[0])
+            calls.append(command)
+            self.assertTrue(command.startswith("probe "))
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout='{"id":"TASK-42","title":"Claimed","status":"active"}',
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    activate_command="transition {task_id} --expect ready",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                task = source.activate("TASK-42", "run-7")
+
+        self.assertIsNotNone(task)
+        self.assertEqual(task.status, "active")
+        self.assertEqual(calls, ["probe TASK-42"])
+
+    def test_command_task_source_activates_when_lock_leaves_task_runnable(
+        self,
+    ) -> None:
+        calls: list[str] = []
+
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            command = str(args[0])
+            calls.append(command)
+            status = "Next" if command.startswith("probe ") else "active"
+            return subprocess.CompletedProcess(
+                args[0],
+                0,
+                stdout=json.dumps(
+                    {"id": "TASK-42", "title": "Claimed", "status": status}
+                ),
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    activate_command="transition {task_id} --expect ready",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                task = source.activate("TASK-42", "run-7")
+
+        self.assertIsNotNone(task)
+        self.assertEqual(task.status, "active")
+        self.assertEqual(
+            calls,
+            ["probe TASK-42", "transition TASK-42 --expect ready"],
+        )
+
+    def test_command_task_source_activation_failure_includes_stderr(self) -> None:
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            raise subprocess.CalledProcessError(
+                3,
+                args[0],
+                stderr="expected ready but task is active\n",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    activate_command="transition {task_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                with self.assertRaisesRegex(
+                    subprocess.CalledProcessError,
+                    "expected ready but task is active",
+                ):
+                    source.activate("TASK-42", "run-7")
+
     def test_command_task_source_activate_is_required_for_fresh_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             source = CommandTaskSource(
@@ -1725,6 +1818,15 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertNotIn(token, str(error))
         self.assertEqual(error.output, "stdout token=<redacted>")
         self.assertEqual(error.stderr, b"stderr token=<redacted>")
+
+    def test_json_command_diagnoses_empty_stdout(self) -> None:
+        def fake_run(*args: object, **kwargs: object) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(args[0], 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch("vibe_loop.tasks.subprocess.run", fake_run):
+                with self.assertRaisesRegex(ValueError, "returned empty stdout"):
+                    run_json_command(Path(directory), "adapter")
 
     def test_command_task_source_surfaces_timeout_as_subprocess_error(self) -> None:
         # A hung backend command expires as TimeoutExpired — a SubprocessError

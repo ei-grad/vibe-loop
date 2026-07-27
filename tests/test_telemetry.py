@@ -198,6 +198,17 @@ def test_usage_stats_never_persist_sensitive_payload_text() -> None:
     assert "raw_transcript" not in encoded
 
 
+def test_observer_names_command_incapability_instead_of_provider_failure() -> None:
+    observer = ProviderUsageObserver(
+        "unknown",
+        unavailable_reason="configured_command_cannot_report_usage",
+    )
+
+    stats = observer.usage.to_stats(phase="implementation")
+
+    assert stats["usage_unavailable_reason"] == "configured_command_cannot_report_usage"
+
+
 def test_stats_expose_post_report_teardown_breakdown() -> None:
     usage = ProviderUsage(
         "anthropic",

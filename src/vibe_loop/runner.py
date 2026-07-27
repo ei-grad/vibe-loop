@@ -39,11 +39,14 @@ from vibe_loop.config import (
     TaskAgentResolutionError,
     VibeConfig,
     agent_command_provider,
+    command_executable_name,
     command_template_uses_field,
     format_agent_command,
+    inject_structured_usage_output,
     require_project_binding,
     resolve_task_agent,
     prepare_shell_command,
+    structured_usage_observation,
     validate_worker_prompt_delivery,
 )
 from vibe_loop.generated_profiles import (
@@ -908,7 +911,13 @@ class AgentLimitWallError(RuntimeError):
 
 
 class AgentOutputObserver:
-    def __init__(self, provider: str, *, source_generation: str) -> None:
+    def __init__(
+        self,
+        provider: str,
+        *,
+        source_generation: str,
+        usage_unavailable_reason: str = "provider_usage_not_reported",
+    ) -> None:
         self._lock = threading.Lock()
         self._session_observation: SessionIdObservation | None = None
         self._runtime_context = AgentRuntimeContext()
@@ -916,7 +925,10 @@ class AgentOutputObserver:
         self._stream_line_counts: dict[str, int] = {}
         self._source_generation = source_generation
         self._codex_startup_frame = CodexStartupFrameObserver()
-        self._usage_observer = ProviderUsageObserver(provider)
+        self._usage_observer = ProviderUsageObserver(
+            provider,
+            unavailable_reason=usage_unavailable_reason,
+        )
         self._activity_tracker = AgentActivityTracker()
 
     @property
@@ -1417,6 +1429,7 @@ class PostReportActivityMonitor:
         self,
         provider: str,
         *,
+        usage_unavailable_reason: str = "provider_usage_not_reported",
         monotonic: Callable[[], float] = time.monotonic,
         wallclock: Callable[[], float] = time.time,
     ) -> None:
@@ -1426,7 +1439,10 @@ class PostReportActivityMonitor:
         self._lock = threading.Lock()
         self._reported_at: float | None = None
         self._boundary_wall: float | None = None
-        self._usage_observer = ProviderUsageObserver(provider)
+        self._usage_observer = ProviderUsageObserver(
+            provider,
+            unavailable_reason=usage_unavailable_reason,
+        )
         self._activity_kind = ""
         self._activity_count = 0
         # Wall time of the first observed start for each correlation id, used to
@@ -1887,7 +1903,13 @@ class VibeRunner:
             "codex": "openai",
             "claude": "anthropic",
         }.get(self.config.agent.agent_kind, "unknown")
-        usage_observer = ProviderUsageObserver(provider)
+        usage_observer = ProviderUsageObserver(
+            provider,
+            unavailable_reason=structured_usage_observation(
+                command_str,
+                "custom",
+            ).unavailable_reason,
+        )
         for line in (result.stdout or "").splitlines():
             usage_observer.observe_line(line)
         self.last_analysis_usage = usage_observer.usage
@@ -7735,14 +7757,6 @@ def infer_model_provider_from_command(argv: list[str]) -> tuple[str, str]:
     return "", ""
 
 
-def command_executable_name(argv: list[str]) -> str:
-    for token in argv:
-        if SHELL_ASSIGNMENT_RE.match(token):
-            continue
-        return Path(token).name
-    return ""
-
-
 # Only Claude commands accept a forced --session-id. Codex `exec --json`
 # surfaces a native thread id, but it cannot be selected before launch.
 SESSION_CAPTURE_AGENT_KINDS = frozenset({"auto", "claude"})
@@ -7766,28 +7780,6 @@ def command_supports_session_capture(command: str, agent_kind: str) -> bool:
     if command_executable_name(argv) != "claude":
         return False
     return not command_specifies_session_id(argv)
-
-
-def inject_structured_usage_output(command: str, agent_kind: str) -> str:
-    """Request native result events only for recognized first-party CLIs."""
-    try:
-        argv = shlex.split(command)
-    except ValueError:
-        return command
-    executable = command_executable_name(argv)
-    if executable == "codex" and agent_kind in {"auto", "codex"}:
-        if "exec" not in argv or "--json" in argv:
-            return command
-        return re.sub(r"(?<!\S)exec(?=\s|$)", "exec --json", command, count=1)
-    if executable == "claude" and agent_kind in {"auto", "claude"}:
-        if "--output-format" in argv or any(
-            token.startswith("--output-format=") for token in argv
-        ):
-            return command
-        return command.replace(
-            "claude ", "claude --output-format stream-json --verbose ", 1
-        )
-    return command
 
 
 def inject_claude_implementer_tool_denial(command: str, agent_kind: str) -> str:
@@ -9120,11 +9112,19 @@ def run_streaming_command(
         process_id=process.pid,
         process_birth_id=expected_birth_id,
     )
+    usage_unavailable_reason = structured_usage_observation(
+        command,
+        "custom",
+    ).unavailable_reason
     output_observer = AgentOutputObserver(
         provider,
         source_generation=source_generation,
+        usage_unavailable_reason=usage_unavailable_reason,
     )
-    post_report_monitor = PostReportActivityMonitor(provider)
+    post_report_monitor = PostReportActivityMonitor(
+        provider,
+        usage_unavailable_reason=usage_unavailable_reason,
+    )
     stdout_thread = threading.Thread(
         target=stream_pipe,
         args=(

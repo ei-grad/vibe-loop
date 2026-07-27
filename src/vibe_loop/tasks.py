@@ -2341,6 +2341,15 @@ class CommandTaskSource:
             task_id=task_id,
             run_id=run_id,
         )
+        if self.config.probe_command:
+            confirmed = self._probe(task_id, runtime_context)
+            if confirmed is None:
+                raise ValueError(
+                    "task_source activation probe returned no task after the "
+                    f"runtime acquired the lock for {task_id}"
+                )
+            if confirmed.status not in self.config.runnable_statuses:
+                return confirmed
         payload = run_json_command(
             self.repo,
             command,
@@ -2507,10 +2516,21 @@ def run_json_command(
             timeout=timeout,
             env=environment,
         )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+    except subprocess.CalledProcessError as exc:
+        redact_task_source_subprocess_error(exc, fencing_token)
+        raise TaskSourceCommandError.from_error(exc) from exc
+    except subprocess.TimeoutExpired as exc:
         redact_task_source_subprocess_error(exc, fencing_token)
         raise
-    payload = json.loads(result.stdout)
+    if not result.stdout.strip():
+        raise ValueError("task-source command returned empty stdout; expected JSON")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            "task-source command returned invalid JSON "
+            f"at line {exc.lineno} column {exc.colno}"
+        ) from exc
     return redact_exact_fencing_token(payload, fencing_token)
 
 
@@ -2552,6 +2572,27 @@ def redact_task_source_subprocess_error(
     error.cmd = redact_exact_fencing_token(error.cmd, fencing_token)
     error.output = redact_exact_fencing_token(error.output, fencing_token)
     error.stderr = redact_exact_fencing_token(error.stderr, fencing_token)
+
+
+class TaskSourceCommandError(subprocess.CalledProcessError):
+    @classmethod
+    def from_error(
+        cls,
+        error: subprocess.CalledProcessError,
+    ) -> TaskSourceCommandError:
+        return cls(
+            error.returncode,
+            error.cmd,
+            output=error.output,
+            stderr=error.stderr,
+        )
+
+    def __str__(self) -> str:
+        diagnostics = task_source_error_diagnostics(self)
+        detail = diagnostics.get("stderr_last_line")
+        if isinstance(detail, str) and detail:
+            return f"task-source command exited {self.returncode}: {detail}"
+        return f"task-source command exited {self.returncode} without diagnostic stderr"
 
 
 def task_source_error_diagnostics(

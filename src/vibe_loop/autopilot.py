@@ -34,6 +34,7 @@ from vibe_loop.config import (
     VibeConfig,
     command_template_uses_field,
     format_agent_command,
+    structured_usage_observation,
     load_config,
     resolve_project_binding,
     normalize_registry_runtime_context,
@@ -6211,7 +6212,11 @@ def run_native_planning(
     usage_observer = ProviderUsageObserver(
         {"codex": "openai", "claude": "anthropic"}.get(
             config.agent.agent_kind, "unknown"
-        )
+        ),
+        unavailable_reason=structured_usage_observation(
+            command if launch_attempted else None,
+            "custom",
+        ).unavailable_reason,
     )
     try:
         for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():

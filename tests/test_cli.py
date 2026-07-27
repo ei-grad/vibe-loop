@@ -2348,6 +2348,11 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["agent"]["prompt_dialect_source"], "auto:codex")
         self.assertEqual(payload["agent"]["skill_ref_prefix"], "$")
         self.assertEqual(payload["agent"]["detected"]["available"], ["codex"])
+        self.assertTrue(payload["agent"]["usage_observation"]["possible"])
+        self.assertEqual(
+            payload["agent"]["usage_observation"]["output_format"],
+            "jsonl",
+        )
 
     def test_doctor_reports_configured_model_and_effort_separately(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2439,6 +2444,36 @@ class CliTests(unittest.TestCase):
             "agent.kind is custom",
             "\n".join(payload["agent"]["diagnostics"]),
         )
+        self.assertFalse(payload["agent"]["usage_observation"]["possible"])
+        self.assertIn(
+            "configured command is not a recognized",
+            payload["agent"]["usage_observation"]["diagnostic"],
+        )
+
+    def test_doctor_reports_recognized_command_without_usage_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            bin_dir = Path(directory) / "bin"
+            repo.mkdir()
+            bin_dir.mkdir()
+            write_python_executable(bin_dir / "codex", "raise SystemExit(0)\n")
+            (repo / ".vibe-loop.toml").write_text(
+                '[agent]\nkind = "codex"\ncommand = "codex {prompt}"\n',
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+
+            with patch.dict("os.environ", {"PATH": str(bin_dir)}):
+                with redirect_stdout(stdout):
+                    exit_code = main(["doctor", "--repo", str(repo), "--json"])
+
+            payload = json.loads(stdout.getvalue())
+
+        self.assertEqual(exit_code, 0)
+        observation = payload["agent"]["usage_observation"]
+        self.assertFalse(observation["possible"])
+        self.assertEqual(observation["provider"], "openai")
+        self.assertIn("cannot report usage", observation["diagnostic"])
 
     def test_doctor_redacts_user_authored_command_config(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

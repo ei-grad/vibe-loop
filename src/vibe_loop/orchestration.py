@@ -28,6 +28,7 @@ from vibe_loop.config import (
     agent_command_provider,
     command_template_uses_field,
     format_agent_command,
+    structured_usage_observation,
     format_shell_command_template,
     parse_orchestration,
     resolve_task_agent,
@@ -2024,7 +2025,13 @@ class ReviewRouter:
             ) from exc
         duration = max(0.0, time.monotonic() - started)
         output = completed.stdout or ""
-        observer = ProviderUsageObserver(self._usage_provider())
+        observer = ProviderUsageObserver(
+            self._usage_provider(),
+            unavailable_reason=structured_usage_observation(
+                command,
+                "custom",
+            ).unavailable_reason,
+        )
         for line in output.splitlines():
             observer.observe_line(line)
         usage = observer.usage

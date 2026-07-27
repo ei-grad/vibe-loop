@@ -3632,6 +3632,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result.exit_code, 0)
             self.assertIsNone(result.session_id)
             self.assertIsNone(result.session_id_source)
+            self.assertEqual(
+                result.usage.unavailable_reason,
+                "configured_command_cannot_report_usage",
+            )
             self.assertEqual("", stdout.getvalue())
             self.assertIn("out", stderr.getvalue())
             self.assertNotIn("err", stderr.getvalue())
@@ -8341,6 +8345,17 @@ class SessionIdInjectionTests(unittest.TestCase):
                 "MODE=review /usr/bin/codex --model gpt-5 exec {prompt}", "auto"
             ),
             "MODE=review /usr/bin/codex --model gpt-5 exec --json {prompt}",
+        )
+
+    def test_claude_structured_output_injection_completes_stream_contract(
+        self,
+    ) -> None:
+        self.assertEqual(
+            inject_structured_usage_output(
+                "claude -p --output-format stream-json {prompt}",
+                "claude",
+            ),
+            "claude --verbose -p --output-format stream-json {prompt}",
         )
 
     def test_claude_implementer_denies_nested_agent_and_task_tools(self) -> None:
