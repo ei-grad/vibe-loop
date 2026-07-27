@@ -27,6 +27,7 @@ from vibe_loop.config import (
     agent_command_provider,
     command_template_uses_field,
     format_agent_command,
+    format_shell_command_template,
     parse_orchestration,
     resolve_task_agent,
     validate_worker_prompt_delivery,
@@ -4953,9 +4954,12 @@ class TaskSourceSettler:
         if not template:
             return ""
         try:
-            return template.format(task_id=self.task_id, run_id=self.run_id)
-        except (KeyError, IndexError, ValueError):
-            return template
+            return format_shell_command_template(
+                template,
+                {"task_id": self.task_id, "run_id": self.run_id},
+            )
+        except ValueError:
+            return ""
 
     def recover_and_release(self, intent: str) -> TaskSourceSettlementResult:
         result = self.settle(intent)

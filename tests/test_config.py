@@ -24,6 +24,7 @@ from vibe_loop.config import (
     reject_generated_command_adapters,
     resolve_task_agent,
     resolve_task_agent_profile,
+    shell_quote,
 )
 from vibe_loop.tasks import Task
 from vibe_loop.generated_discovery import EvidenceBundle, EvidenceFile, EvidenceLimits
@@ -34,6 +35,13 @@ from vibe_loop.generated_profiles import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_windows_shell_quote_encloses_cmd_metacharacters(self) -> None:
+        with patch("vibe_loop.config.sys.platform", "win32"):
+            self.assertEqual(
+                shell_quote("TASK&|<>()^%!"),
+                '"TASK&|<>()^%!"',
+            )
+
     def test_load_config_rejects_unknown_keys_with_full_paths(self) -> None:
         cases = (
             (

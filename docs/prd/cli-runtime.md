@@ -83,8 +83,9 @@ Explicit user-authored `command` and `selection_command` values remain
 authoritative executable templates. `command` receives `{prompt}`, `{model}`,
 `{effort}`,
 `{task_id}`, and `{run_id}`; `selection_command` receives `{prompt}` and
-`{model}`/`{effort}`. Both values are shell-quoted and fail closed before launch
-when a template references an unresolved value. When first-class `effort` is
+`{model}`/`{effort}`. Every substituted value is shell-quoted, and templates
+fail closed before launch on unknown fields, conversions, format
+specifications, malformed syntax, or unresolved route values. When first-class `effort` is
 configured, an explicit command must use `{effort}` and cannot also embed a
 native effort flag; templates that omit `{effort}` remain unchanged only when
 no first-class effort is configured. An exact explicit `codex review {prompt}`

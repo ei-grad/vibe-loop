@@ -46,8 +46,12 @@ read-only list and probe operations remain available without activation.
 
 The command keys are `list`, optional `probe`, required-for-launch `activate`,
 and lifecycle hooks `complete`, `reset`, and `park`. Templates receive
-shell-quoted task/run identifiers. Activation runs only after the exact task lock
-is held, must atomically move a runnable task to a non-runnable in-progress
+shell-quoted task/run identifiers. The operator-authored template, including
+pipelines and other shell operators, is trusted configuration; task identifiers
+and run identifiers originate in task/backend or runtime data and are untrusted
+template values. Only the documented exact placeholders are accepted, without
+conversions or format specifications. Activation runs only after the exact task
+lock is held, must atomically move a runnable task to a non-runnable in-progress
 state, and must return that normalized task. A continuation probes the existing
 activated state rather than repeating the compare-and-set.
 

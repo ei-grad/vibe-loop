@@ -4,7 +4,6 @@ import dataclasses
 import json
 import os
 import re
-import shlex
 import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
@@ -14,6 +13,7 @@ from vibe_loop.config import (
     DEFAULT_PLAN_PATHS,
     DEFAULT_RUNNABLE_STATUSES,
     TaskSourceConfig,
+    format_shell_command_template,
 )
 from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import (
@@ -2296,7 +2296,11 @@ class CommandTaskSource:
         runtime_context: Mapping[str, str] | None = None,
     ) -> Task | None:
         if self.config.probe_command:
-            command = self.config.probe_command.format(task_id=task_id)
+            command = self._format_command(
+                "probe",
+                self.config.probe_command,
+                task_id=task_id,
+            )
             payload = run_json_command(
                 self.repo,
                 command,
@@ -2331,16 +2335,12 @@ class CommandTaskSource:
                 "command task source requires task_source.activate before "
                 "worker execution"
             )
-        try:
-            command = self.config.activate_command.format(
-                task_id=shlex.quote(task_id),
-                run_id=shlex.quote(run_id),
-            )
-        except (KeyError, IndexError, ValueError) as exc:
-            raise ValueError(
-                "task_source.activate may only use {task_id} and {run_id} "
-                "template fields"
-            ) from exc
+        command = self._format_command(
+            "activate",
+            self.config.activate_command,
+            task_id=task_id,
+            run_id=run_id,
+        )
         payload = run_json_command(
             self.repo,
             command,
@@ -2361,7 +2361,11 @@ class CommandTaskSource:
     ) -> bool:
         if not self.config.reset_command:
             return False
-        command = self.config.reset_command.format(task_id=task_id)
+        command = self._format_command(
+            "reset",
+            self.config.reset_command,
+            task_id=task_id,
+        )
         run_reset_command(
             self.repo,
             command,
@@ -2412,16 +2416,12 @@ class CommandTaskSource:
         run_id: str,
         runtime_context: Mapping[str, str] | None,
     ) -> Task:
-        try:
-            command = command_template.format(
-                task_id=shlex.quote(task_id),
-                run_id=shlex.quote(run_id),
-            )
-        except (KeyError, IndexError, ValueError) as exc:
-            raise ValueError(
-                f"task_source.{adapter} may only use {{task_id}} and {{run_id}} "
-                "template fields"
-            ) from exc
+        command = self._format_command(
+            adapter,
+            command_template,
+            task_id=task_id,
+            run_id=run_id,
+        )
         payload = run_json_command(
             self.repo,
             command,
@@ -2433,6 +2433,21 @@ class CommandTaskSource:
                 f"task_source.{adapter} must return one normalized task JSON object"
             )
         return task_from_mapping(payload, 0)
+
+    @staticmethod
+    def _format_command(
+        adapter: str,
+        command_template: str,
+        **values: str,
+    ) -> str:
+        try:
+            return format_shell_command_template(command_template, values)
+        except ValueError as exc:
+            allowed = " and ".join(f"{{{field}}}" for field in values)
+            raise ValueError(
+                f"task_source.{adapter} may only use {allowed} template fields "
+                "without conversions or format specifications"
+            ) from exc
 
     def _runtime_context(
         self,

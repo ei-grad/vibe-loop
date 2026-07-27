@@ -22,8 +22,38 @@ from vibe_loop.telemetry import PHASES as USAGE_PHASES
 
 def shell_quote(s: str) -> str:
     if sys.platform == "win32":
-        return subprocess.list2cmdline([s])
+        quoted = subprocess.list2cmdline([s])
+        # list2cmdline leaves metacharacter-only values such as ``a&b``
+        # unquoted because they are valid CreateProcess arguments. They are not
+        # safe when the configured template requires cmd.exe for operators.
+        if not quoted.startswith('"'):
+            quoted = f'"{quoted}"'
+        return quoted
     return shlex.quote(s)
+
+
+def format_shell_command_template(
+    command_template: str,
+    values: Mapping[str, str],
+) -> str:
+    """Substitute exact shell-quoted fields into an operator-authored template."""
+
+    try:
+        parsed = tuple(string.Formatter().parse(command_template))
+    except ValueError as exc:
+        raise ValueError("malformed shell command template") from exc
+    for _literal, field_name, format_spec, conversion in parsed:
+        if field_name is None:
+            continue
+        if field_name not in values:
+            raise ValueError(f"unsupported shell command template field: {field_name}")
+        if format_spec or conversion:
+            raise ValueError(
+                f"shell command template field {field_name!r} may not use "
+                "conversion or formatting"
+            )
+    quoted_values = {name: shell_quote(value) for name, value in values.items()}
+    return command_template.format(**quoted_values)
 
 
 def prepare_shell_command(
@@ -2106,11 +2136,14 @@ def format_agent_command(
             f"{task_context}agent profile {profile_name!r} command template "
             f"references {{effort}}, but no effort is resolved; set {effort_setting}."
         )
-    return command_template.format(
-        prompt=shell_quote(prompt),
-        model=shell_quote(model or ""),
-        effort=shell_quote(effort or ""),
-        **format_fields,
+    return format_shell_command_template(
+        command_template,
+        {
+            "prompt": prompt,
+            "model": model or "",
+            "effort": effort or "",
+            **format_fields,
+        },
     )
 
 
