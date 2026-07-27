@@ -184,10 +184,12 @@ review records remain unchanged. If the fresh reviewer cannot be launched, the
 run blocks with the concrete unresolved findings instead of remaining in the
 review stage. The contract records the implementing and reviewer profiles,
 their selection sources, and whether their providers are cross-provider,
-same-provider, or unknown. No eligible cross-provider route falls back to the
-configured reviewer and proceeds with review while recording the provider
-relation explicitly. Session identity, model/effort, and native usage are
-recorded for every initial and closure pass.
+same-provider, or unknown. The resolved reviewer profile must differ from the
+resolved implementer profile; distinct profiles may use the same provider.
+When no eligible cross-provider route exists, the runtime falls back to the
+configured reviewer and proceeds while recording the provider relation
+explicitly. Session identity, model/effort, and native usage are recorded for
+every initial and closure pass.
 
 The exact runtime-owned Codex reviewer command `codex review {prompt}` has no
 supported way to bind a first-class provider/model/effort route without changing

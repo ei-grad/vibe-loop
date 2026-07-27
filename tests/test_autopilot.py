@@ -603,7 +603,11 @@ class AutopilotStatusTests(unittest.TestCase):
         }
         self.assertEqual(
             set(dispatch_blockers),
-            {"TASK-BROKEN", "TASK-MALFORMED"},
+            {"TASK-BAD", "TASK-BROKEN", "TASK-MALFORMED"},
+        )
+        self.assertIn(
+            "same profile for implementation and review",
+            dispatch_blockers["TASK-BAD"]["message"],
         )
         self.assertIn(
             "references {model}, but no model is resolved",
@@ -614,6 +618,7 @@ class AutopilotStatusTests(unittest.TestCase):
             dispatch_blockers["TASK-MALFORMED"]["message"],
         )
         self.assertIn("task dispatch blockers:", rendered)
+        self.assertIn("TASK-BAD", rendered)
         self.assertIn("TASK-BROKEN", rendered)
         self.assertIn("TASK-MALFORMED", rendered)
         self.assertNotIn("blockers: none", rendered)

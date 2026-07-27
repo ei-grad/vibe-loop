@@ -269,6 +269,9 @@ are present, both must match. The first matching rule whose reviewer command is
 available wins. Otherwise `reviewer_profile` remains the fallback. This lets an
 operator send every Claude-implemented candidate to Codex without copying the
 task predicates that routed individual hazard families to Claude.
+The resolved reviewer profile must differ from the resolved implementer
+profile. Distinct profiles may use the same provider; the run contract records
+that fallback as `same-provider`.
 
 The pass counts, reviewer concurrency budget, and candidate re-anchor count
 bound runtime work. `task_provenance_mode` and `external_completion_actor`

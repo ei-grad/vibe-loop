@@ -2083,7 +2083,7 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(inputs.task_revision, updated_inputs.task_revision)
 
-    def test_reviewer_agent_override_proceeds_without_aborting_batch(self) -> None:
+    def test_reviewer_agent_override_fails_task_without_aborting_batch(self) -> None:
         for jobs in (1, 2):
             with self.subTest(jobs=jobs):
                 with tempfile.TemporaryDirectory() as directory:
@@ -2151,11 +2151,15 @@ class RunnerTests(unittest.TestCase):
                         ]
                     )
                     runner._source = source
+                    original_run_task = runner.run_task
                     bad_finished = threading.Event()
 
                     def run_task(task: Task) -> RunResult:
                         if task.task_id == "TASK-BAD":
-                            bad_finished.set()
+                            try:
+                                return original_run_task(task)
+                            finally:
+                                bad_finished.set()
                         if task.task_id == "TASK-SLOW":
                             self.assertTrue(bad_finished.wait(timeout=1))
                             time.sleep(0.05)
@@ -2187,7 +2191,15 @@ class RunnerTests(unittest.TestCase):
                 )
                 self.assertEqual(by_task["TASK-SLOW"].classification, "completed")
                 self.assertEqual(by_task["TASK-LATER"].classification, "completed")
-                self.assertEqual(by_task["TASK-BAD"].classification, "completed")
+                self.assertEqual(by_task["TASK-BAD"].classification, "failed")
+                self.assertEqual(
+                    by_task["TASK-BAD"].classification_source,
+                    "task_agent_contract",
+                )
+                self.assertIn(
+                    "same profile for implementation and review",
+                    by_task["TASK-BAD"].message,
+                )
 
     def test_invalid_explicit_agent_route_does_not_abort_batch(self) -> None:
         for jobs in (1, 2):

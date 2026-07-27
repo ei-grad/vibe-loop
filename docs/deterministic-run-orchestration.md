@@ -371,8 +371,12 @@ recorded as `run_contract_resolved` before any mutation:
   "contract_version": 1,
   "mode": "runtime-owned | worker-owned",
   "source": {"kind": "config|profile|skill-proposal", "id": "...", "digest": "sha256:..."},
-  "implementer": {"profile": "...", "provider": "...", "model": "...", "effort": "...", "timeout_seconds": 0},
-  "reviewer": {"profile": "...", "provider": "...", "model": "...", "effort": "...", "timeout_seconds": 0,
+  "implementer": {"profile": "...", "provider": "...", "model": "...", "effort": "...",
+                  "selection_source": "default | task.agent | agent.routing[N]", "timeout_seconds": 0},
+  "reviewer": {"profile": "...", "provider": "...", "model": "...", "effort": "...",
+               "selection_source": "orchestration.reviewer_profile | orchestration.reviewer_routing[N]",
+               "provider_relation": "cross-provider | same-provider | unknown-provider",
+               "cross_provider": true, "unavailable_routing_profiles": ["..."], "timeout_seconds": 0,
                "max_initial_passes": 1, "max_closure_passes": 2, "concurrency_budget": 1},
   "gates": [{"id": "tests", "command_key": "completion.commands[1]"}],
   "integration": {"enabled": true, "verify_on_main": ["..."]},
@@ -460,11 +464,12 @@ implementation retries.
 
 ## Reviewer Routing, Continuation, And Budgets
 
-- `[review]` (or `[agent.review]`) config selects the reviewer route —
-  profile/provider/model/effort/command — independently from the implementer,
-  with the same validation as agent profiles. A repository-mandated review
-  command (e.g. `codex review`) becomes a typed reviewer route, not a prose
-  instruction to the implementer.
+- Reviewer selection behavior is authoritative in
+  [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation);
+  the operator-facing profile and per-implementer routing syntax is indexed in
+  [Orchestration and reviewer routing](configuration.md#orchestration-and-reviewer-routing).
+  This design resolves and records both route identities before candidate
+  disclosure.
 - An exact runtime-owned `codex review {prompt}` command is valid only with
   first-class model and effort unset. Project config cannot bind
   `model_provider`, and this exact command exposes no supported effective-route

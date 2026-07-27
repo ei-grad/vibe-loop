@@ -5447,13 +5447,20 @@ def config_contract_blockers(
         effective,
         agent_selection,
     )
-    reviewer_agent = (
-        config.agent_profiles.get(selected_reviewer_profile)
-        if selected_reviewer_profile is not None
-        else None
-    )
-    if selected_reviewer_profile is not None and reviewer_agent is not None:
-        command_key = f"agent.profiles.{selected_reviewer_profile}.command"
+    reviewer_profiles_to_validate: list[str] = []
+    if selected_reviewer_profile is not None:
+        reviewer_profiles_to_validate.append(selected_reviewer_profile)
+    if agent_selection is None:
+        reviewer_profiles_to_validate.extend(
+            rule.profile
+            for rule in effective.reviewer_routing
+            if config.agent_profiles[rule.profile].command is not None
+        )
+    for reviewer_profile in dict.fromkeys(reviewer_profiles_to_validate):
+        reviewer_agent = config.agent_profiles.get(reviewer_profile)
+        if reviewer_agent is None:
+            continue
+        command_key = f"agent.profiles.{reviewer_profile}.command"
         try:
             reviewer_command = (
                 reviewer_agent.require_reviewer_command()
@@ -5501,6 +5508,27 @@ def config_contract_blockers(
                 "orchestration.reviewer_profile",
                 "Set orchestration.reviewer_profile to a configured "
                 "agent.profiles entry.",
+            )
+        if (
+            agent_selection is not None
+            and selected_reviewer_profile == agent_selection.profile
+        ):
+            key = (
+                "task.agent"
+                if agent_selection.source == "task.agent"
+                else (
+                    f"{agent_selection.source}.profile"
+                    if agent_selection.source.startswith("agent.routing[")
+                    else "orchestration.reviewer_profile"
+                )
+            )
+            add(
+                "config_contract_reviewer_not_independent",
+                key,
+                "runtime-owned orchestration resolved the same profile for "
+                "implementation and review",
+                "Select a reviewer profile different from the resolved "
+                "implementer profile; profiles may use the same provider.",
             )
         if "task_provenance_mode" not in effective.explicit_keys:
             add(
