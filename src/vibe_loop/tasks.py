@@ -208,6 +208,8 @@ class Task:
     model: str = ""
     hazards: tuple[str, ...] = ()
     status_reason: str = ""
+    prior_findings: tuple[dict[str, object], ...] = ()
+    review_budget_exhaustions: int = 0
 
     @property
     def done(self) -> bool:
@@ -245,6 +247,12 @@ class Task:
         }
         if self.status_reason:
             payload["status_reason"] = self.status_reason
+        if self.prior_findings:
+            payload["prior_findings"] = [
+                dict(finding) for finding in self.prior_findings
+            ]
+        if self.review_budget_exhaustions:
+            payload["review_budget_exhaustions"] = self.review_budget_exhaustions
         if self.requirement_ids:
             payload["requirement_ids"] = list(self.requirement_ids)
         if self.spec_paths:
@@ -2722,6 +2730,17 @@ def task_from_mapping(value: object, order: int) -> Task:
         value,
         ("status_reason", "gating_reason", "reason", "blocker"),
     )
+    fields = value.get("fields")
+    task_fields = fields if isinstance(fields, Mapping) else {}
+    prior_findings = normalize_prior_findings(
+        value.get("prior_findings", task_fields.get("prior_findings"))
+    )
+    review_budget_exhaustions = normalize_review_budget_exhaustions(
+        value.get(
+            "review_budget_exhaustions",
+            task_fields.get("review_budget_exhaustions"),
+        )
+    )
     source_fingerprints = normalize_source_fingerprints(
         value.get("source_fingerprints"),
         "source_fingerprints",
@@ -2745,6 +2764,8 @@ def task_from_mapping(value: object, order: int) -> Task:
         evidence=str(value.get("evidence") or ""),
         source=str(value.get("source") or ""),
         status_reason=status_reason,
+        prior_findings=prior_findings,
+        review_budget_exhaustions=review_budget_exhaustions,
         requirement_ids=dedupe_preserving_order(requirement_ids),
         spec_paths=dedupe_preserving_order(spec_paths),
         design_refs=dedupe_preserving_order(
@@ -2759,6 +2780,71 @@ def task_from_mapping(value: object, order: int) -> Task:
             hazard.strip() for hazard in hazards if hazard.strip()
         ),
     )
+
+
+def normalize_prior_findings(value: object) -> tuple[dict[str, object], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise ValueError("task prior_findings must be an array")
+    findings: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise ValueError("task prior_findings entries must be objects")
+        finding_id = item.get("id")
+        severity = item.get("severity")
+        summary = item.get("summary")
+        evidence = item.get("evidence")
+        files = item.get("files")
+        lines = item.get("lines", [])
+        state = item.get("state")
+        if not isinstance(finding_id, str) or not finding_id:
+            raise ValueError("task prior finding id must be a non-empty string")
+        if severity not in {"P0", "P1", "P2", "P3"}:
+            raise ValueError("task prior finding severity must be P0, P1, P2, or P3")
+        if not isinstance(summary, str) or not summary:
+            raise ValueError("task prior finding summary must be a non-empty string")
+        if not isinstance(evidence, str) or not evidence:
+            raise ValueError("task prior finding evidence must be a non-empty string")
+        if not isinstance(files, list) or not all(
+            isinstance(file, str) and file for file in files
+        ):
+            raise ValueError(
+                "task prior finding files must be an array of non-empty strings"
+            )
+        if not isinstance(lines, list) or not all(
+            isinstance(line, str) and line for line in lines
+        ):
+            raise ValueError(
+                "task prior finding lines must be an array of non-empty strings"
+            )
+        if state not in {"open", "remediated", "accepted", "rejected"}:
+            raise ValueError(
+                "task prior finding state must be open, remediated, accepted, or "
+                "rejected"
+            )
+        findings.append(
+            {
+                "id": finding_id,
+                "severity": severity,
+                "summary": summary,
+                "evidence": evidence,
+                "files": list(files),
+                "lines": list(lines),
+                "state": state,
+            }
+        )
+    return tuple(findings)
+
+
+def normalize_review_budget_exhaustions(value: object) -> int:
+    if value is None:
+        return 0
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise ValueError(
+            "task review_budget_exhaustions must be a non-negative integer"
+        )
+    return value
 
 
 def split_markdown_row(line: str) -> list[str]:

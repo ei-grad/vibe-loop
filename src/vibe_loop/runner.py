@@ -2380,6 +2380,7 @@ class VibeRunner:
         task_source_terminal_confirmed = True
         durable_run_result_recorded = False
         post_release_settlement_intent = ""
+        post_release_settlement_context: dict[str, str] = {}
         # Set once a conservative budget allowance is reserved for this launch;
         # released again if the run fails before the worker process starts, so a
         # denied-then-abandoned pre-launch failure never leaves a phantom charge.
@@ -3357,6 +3358,8 @@ class VibeRunner:
                 and not worker_timed_out
                 and (worker_report is None or worker_report.status == "completed")
             )
+            review_budget_finding_payloads: tuple[dict[str, object], ...] = ()
+            review_budget_exhausted = False
             if (
                 runtime_owned
                 and worker_report is not None
@@ -3395,6 +3398,11 @@ class VibeRunner:
                     )
                     message = str(exc)
                 except ReviewBudgetExhausted as exc:
+                    review_budget_exhausted = True
+                    review_budget_finding_payloads = (
+                        tuple(finding.to_payload() for finding in exc.findings)
+                        or task.prior_findings
+                    )
                     classification = ClassificationResult(
                         "blocked",
                         "review_budget_exhausted",
@@ -3591,12 +3599,24 @@ class VibeRunner:
                     reason=classification.source,
                 )
             if runtime_owned and classification.status != "completed":
+                review_carryover_requested = bool(
+                    review_budget_exhausted or task.review_budget_exhaustions
+                )
+                if review_carryover_requested and not review_budget_finding_payloads:
+                    review_budget_finding_payloads = task.prior_findings
                 settlement = self.settle_runtime_task_source(
                     task_id=task.task_id,
                     run_id=run_id,
                     task_lock=task_lock,
                     runtime_context=command_env,
                     classification=classification.status,
+                    review_budget_finding_payloads=review_budget_finding_payloads,
+                    review_carryover_requested=review_carryover_requested,
+                    review_budget_exhaustions=(
+                        task.review_budget_exhaustions + 1
+                        if review_budget_exhausted
+                        else 0
+                    ),
                 )
                 task_source_terminal_confirmed = settlement.settled
                 if not settlement.settled:
@@ -3607,6 +3627,19 @@ class VibeRunner:
                     post_release_settlement_intent = settlement_intent(
                         classification.status
                     )
+                    if review_carryover_requested:
+                        post_release_settlement_context = {
+                            "VIBE_LOOP_PRIOR_FINDINGS": json.dumps(
+                                list(review_budget_finding_payloads),
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                            "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": str(
+                                task.review_budget_exhaustions + 1
+                                if review_budget_exhausted
+                                else 0
+                            ),
+                        }
                     task_source_terminal_confirmed = True
             self.run_store.append_lifecycle_event(
                 RunLifecycleEvent.run_state_transition(
@@ -3835,6 +3868,7 @@ class VibeRunner:
                         task_lock=task_lock,
                         intent=post_release_settlement_intent,
                         report_status=report_status,
+                        runtime_context=post_release_settlement_context,
                     )
 
     def acquire_scheduled_task_lock(
@@ -4118,6 +4152,7 @@ class VibeRunner:
                 raise ReviewBudgetExhausted(
                     "remediation",
                     max_remediation_rounds,
+                    router.ledger.open(),
                 )
             open_findings = router.ledger.open()
             self._launch_runtime_remediation(
@@ -4557,8 +4592,26 @@ class VibeRunner:
         task_lock: TaskLock,
         runtime_context: Mapping[str, str],
         classification: str,
+        review_budget_finding_payloads: Sequence[Mapping[str, object]] = (),
+        review_carryover_requested: bool = False,
+        review_budget_exhaustions: int = 0,
     ) -> TaskSourceSettlementResult:
         intent = settlement_intent(classification)
+        settlement_context = self.task_source_runtime_context(
+            task_id=task_id,
+            run_id=run_id,
+            task_lock=task_lock,
+            runtime_context=runtime_context,
+        )
+        if review_carryover_requested:
+            settlement_context["VIBE_LOOP_PRIOR_FINDINGS"] = json.dumps(
+                [dict(finding) for finding in review_budget_finding_payloads],
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            settlement_context["VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS"] = str(
+                review_budget_exhaustions
+            )
         return TaskSourceSettler(
             source=self.source,
             task_source_config=self.source_resolution.task_source,
@@ -4567,12 +4620,7 @@ class VibeRunner:
             run_store=self.run_store,
             run_id=run_id,
             task_id=task_id,
-            runtime_context=self.task_source_runtime_context(
-                task_id=task_id,
-                run_id=run_id,
-                task_lock=task_lock,
-                runtime_context=runtime_context,
-            ),
+            runtime_context=settlement_context,
         ).settle(intent)
 
     def settle_task_source_after_release(
@@ -4583,6 +4631,7 @@ class VibeRunner:
         task_lock: TaskLock,
         intent: str,
         report_status: Callable[[str], None],
+        runtime_context: Mapping[str, str] | None = None,
     ) -> TaskSourceSettlementResult | None:
         """Retry settlement unfenced once the lock is gone, never re-raising.
 
@@ -4600,6 +4649,7 @@ class VibeRunner:
             run_store=self.run_store,
             run_id=run_id,
             task_id=task_id,
+            runtime_context=runtime_context,
         )
         try:
             settlement = settler.settle_after_release(intent)
@@ -6560,6 +6610,18 @@ def build_worker_prompt(
         else CLI_WORKER_ADDENDUM
     )
     prompt = f"{skill_prefix}vibe-loop {task.task_id}{addendum}"
+    if task.prior_findings:
+        prompt = (
+            f"{prompt}\n\n"
+            "### Prior Review Findings\n\n"
+            "A previous run exhausted its remediation budget. Treat these as "
+            "open prior findings and address them before starting a fresh review:\n\n"
+            "```json\n"
+            f"{json.dumps(list(task.prior_findings), indent=2, sort_keys=True)}\n"
+            "```\n\n"
+            "Consecutive review-budget exhaustions: "
+            f"{task.review_budget_exhaustions}.\n"
+        )
     if task.has_traceability:
         prompt = (
             f"{prompt}\n\n"

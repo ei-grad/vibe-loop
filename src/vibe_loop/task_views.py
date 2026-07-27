@@ -77,6 +77,10 @@ def render_task_list(views: list[TaskView]) -> str:
             markers.append("ready")
         if view.locked:
             markers.append("locked")
+        if view.task.review_budget_exhaustions > 1:
+            markers.append(
+                f"review-budget-exhaustions={view.task.review_budget_exhaustions}"
+            )
         suffix = f" ({', '.join(markers)})" if markers else ""
         lines.append(
             f"{view.task.task_id}\t{view.task.priority}\t{view.task.status}\t"
@@ -140,10 +144,15 @@ def append_tree_lines(
     seen.add(view.task.task_id)
     marker = " *" if view.ready else ""
     lock_marker = " locked" if view.locked else ""
+    exhaustion_marker = (
+        f" review-budget-exhaustions={view.task.review_budget_exhaustions}"
+        if view.task.review_budget_exhaustions > 1
+        else ""
+    )
     indent = "  " * depth
     lines.append(
         f"{indent}{view.task.task_id} [{view.task.status}/{view.task.priority}] "
-        f"{view.task.title}{marker}{lock_marker}"
+        f"{view.task.title}{marker}{lock_marker}{exhaustion_marker}"
     )
     for child in sorted(children.get(view.task.task_id, []), key=view_sort_key):
         append_tree_lines(lines, child, children, seen, depth + 1)

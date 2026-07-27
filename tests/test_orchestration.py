@@ -4456,6 +4456,37 @@ class TaskSourceProvenanceTests(unittest.TestCase):
         self.assertTrue(result.settled)
         self.assertEqual(source.reset_context, dict(context))
 
+    def test_review_carryover_requires_authoritative_task_confirmation(self) -> None:
+        source = MutableTaskSource()
+        context = MappingProxyType(
+            {
+                "VIBE_LOOP_PRIOR_FINDINGS": json.dumps(
+                    [
+                        {
+                            "id": "F-1",
+                            "severity": "P1",
+                            "summary": "Open finding",
+                            "evidence": "reproduction",
+                            "files": ["src/example.py"],
+                            "lines": ["12"],
+                            "state": "open",
+                        }
+                    ]
+                ),
+                "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": "2",
+            }
+        )
+
+        result = self.settler(
+            source,
+            max_attempts=1,
+            runtime_context=context,
+        ).settle("requeue")
+
+        self.assertTrue(result.settlement_pending)
+        self.assertTrue(self.manager.is_locked("TASK-01"))
+        self.assertEqual(source.reset_context, dict(context))
+
     def test_missing_park_adapter_records_requeue_fallback(self) -> None:
         source = MutableTaskSource()
 

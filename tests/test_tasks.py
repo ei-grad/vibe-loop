@@ -130,6 +130,33 @@ class MarkdownPlanTests(unittest.TestCase):
             "agent profile is not registered",
         )
 
+    def test_command_task_preserves_review_budget_carryover_fields(self) -> None:
+        finding = {
+            "id": "F-1",
+            "severity": "P1",
+            "summary": "Open finding",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "lines": ["12"],
+            "state": "open",
+        }
+        task = task_from_mapping(
+            {
+                "id": "TASK-REVIEW",
+                "status": "ready",
+                "fields": {
+                    "prior_findings": [finding],
+                    "review_budget_exhaustions": 2,
+                },
+            },
+            0,
+        )
+
+        self.assertEqual(task.prior_findings, (finding,))
+        self.assertEqual(task.review_budget_exhaustions, 2)
+        self.assertEqual(task.to_json()["prior_findings"], [finding])
+        self.assertEqual(task.to_json()["review_budget_exhaustions"], 2)
+
     def test_runnable_tasks_filter_dependencies_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "PLAN.md"
@@ -205,6 +232,18 @@ class MarkdownPlanTests(unittest.TestCase):
 
         self.assertIn("Demo", output)
         self.assertIn("DEMO-02 [Next/P1] Ready task", output)
+
+    def test_task_tree_surfaces_repeated_review_budget_exhaustion(self) -> None:
+        task = Task(
+            "REVIEW-1",
+            "Repeated review failure",
+            "ready",
+            review_budget_exhaustions=2,
+        )
+
+        output = render_task_tree(build_task_views([task], locked_ids=set()))
+
+        self.assertIn("review-budget-exhaustions=2", output)
 
     def test_default_markdown_source_discovers_nonstandard_plan_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -299,9 +299,15 @@ class ReviewClosureUnavailable(ReviewExecutionError):
 
 
 class ReviewBudgetExhausted(ReviewExecutionError):
-    def __init__(self, pass_kind: str, limit: int) -> None:
+    def __init__(
+        self,
+        pass_kind: str,
+        limit: int,
+        findings: Sequence[ReviewFinding] = (),
+    ) -> None:
         self.pass_kind = pass_kind
         self.limit = limit
+        self.findings = tuple(findings)
         super().__init__(f"review budget exhausted for {pass_kind}: limit={limit}")
 
 
@@ -2636,7 +2642,11 @@ class ReviewRouter:
                         f"limit={exhausted_limit}"
                     ),
                 )
-            raise ReviewBudgetExhausted(request.family, exhausted_limit)
+            raise ReviewBudgetExhausted(
+                request.family,
+                exhausted_limit,
+                request.prior_findings,
+            )
         raise ReviewExecutionError("review attempt claim returned invalid status")
 
     def _continuation_from_start_record(
@@ -5372,6 +5382,8 @@ class TaskSourceSettler:
     def _confirmed(self, task: Task | None, intent: str) -> bool:
         if task is None or task.task_id != self.task_id:
             return False
+        if not self._review_carryover_confirmed(task):
+            return False
         status = task.status.casefold()
         if intent == "requeue":
             return status in {
@@ -5383,6 +5395,26 @@ class TaskSourceSettler:
             "on_hold",
             "parked",
         }
+
+    def _review_carryover_confirmed(self, task: Task) -> bool:
+        findings_json = self.runtime_context.get("VIBE_LOOP_PRIOR_FINDINGS")
+        exhaustion_text = self.runtime_context.get(
+            "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS"
+        )
+        if findings_json is None and exhaustion_text is None:
+            return True
+        if findings_json is None or exhaustion_text is None:
+            return False
+        try:
+            findings = json.loads(findings_json)
+            exhaustions = int(exhaustion_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(findings, list)
+            and [dict(finding) for finding in task.prior_findings] == findings
+            and task.review_budget_exhaustions == exhaustions
+        )
 
     def _record_attempt(
         self,
