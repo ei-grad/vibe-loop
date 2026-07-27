@@ -677,7 +677,13 @@ class AutopilotStatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             init_repo(repo)
-            write_plan(repo, [("TASK-01", "Next", "", "ready slice")])
+            write_plan(
+                repo,
+                [
+                    ("TASK-01", "Next", "", "ready slice"),
+                    ("TASK-02", "Gated", "", "source-gated slice"),
+                ],
+            )
             commit_all(repo)
             config = load_config(repo)
             manager = build_lock_manager(
@@ -703,8 +709,15 @@ class AutopilotStatusTests(unittest.TestCase):
             payload = collect_project_status(config).to_json()
 
         self.assertEqual(payload["queue"]["statuses"]["Next"], 1)
+        self.assertEqual(payload["queue"]["statuses"]["Gated"], 1)
         self.assertEqual(payload["queue"]["runnable"], 0)
         self.assertIn("waiting_for_active_workers:1", payload["observations"])
+        self.assertTrue(
+            any(
+                observation.startswith("source_gated_task:TASK-02:")
+                for observation in payload["observations"]
+            )
+        )
         self.assertNotIn("no_runnable_work", payload["observations"])
 
     def test_collect_project_status_counts_foreign_host_workers_as_waiting(
@@ -981,14 +994,52 @@ class AutopilotStatusTests(unittest.TestCase):
                 ],
             )
             commit_all(repo)
-            config = load_config(repo)
+            config = dataclasses.replace(
+                load_config(repo),
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
+            )
 
             payload = collect_project_status(config).to_json()
+            rendered = render_autopilot_status(collect_project_status(config))
 
         self.assertEqual(payload["queue"]["active"], 1)
         self.assertEqual(payload["queue"]["blocked"], 3)
         self.assertEqual(payload["queue"]["done"], 1)
         self.assertEqual(payload["queue"]["statuses"]["on-hold"], 1)
+        self.assertEqual(
+            payload["queue"]["gated_tasks"],
+            [
+                {
+                    "id": "TASK-03",
+                    "title": "gated slice",
+                    "status": "gated",
+                    "priority": "P0",
+                    "source": str(repo / "PLAN.md") + ":line 7",
+                    "reason": "task source reported status 'gated'; the task is "
+                    "excluded from the runnable queue",
+                }
+            ],
+        )
+        self.assertIn("source-gated tasks:", rendered)
+        self.assertIn("TASK-03", rendered)
+        self.assertIn("excluded from the runnable queue", rendered)
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "blocked")
+        self.assertFalse(
+            any(
+                blocker.startswith("source_gated_task:TASK-03:")
+                for blocker in payload["blockers"]
+            )
+        )
+        self.assertTrue(
+            any(
+                observation.startswith("source_gated_task:TASK-03:")
+                for observation in payload["observations"]
+            )
+        )
+        self.assertIn("no_runnable_work", payload["observations"])
 
     def test_collect_project_status_reports_task_source_errors_as_blockers(
         self,
@@ -3022,6 +3073,34 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertIn("no_runnable_work", summary.cycles[0].actions)
         self.assertEqual(len(cycle_records), 1)
         self.assertIn("native_planning_decision:no_plan", cycle_records[0]["actions"])
+
+    def test_gated_queue_allows_planning_without_dispatch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [
+                    ("TASK-01", "Done", "", "finished slice"),
+                    ("TASK-02", "Gated", "", "source-gated slice"),
+                ],
+            )
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
+
+        self.assertTrue(summary.started)
+        self.assertEqual(calls, [])
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "idle")
+        self.assertNotIn("blocked_preflight", cycle.actions)
+        self.assertIn("native_planning_decision:no_plan", cycle.actions)
+        self.assertIn("no_runnable_work", cycle.actions)
 
     def test_low_ready_queue_with_live_worker_reports_waiting(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

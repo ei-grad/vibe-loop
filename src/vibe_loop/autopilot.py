@@ -211,6 +211,7 @@ class TaskQueueStatus:
     statuses: dict[str, int] = dataclasses.field(default_factory=dict)
     runnable_tasks: tuple[dict[str, object], ...] = ()
     source_tasks: tuple[dict[str, object], ...] = ()
+    gated_tasks: tuple[dict[str, object], ...] = ()
     dispatch_blockers: tuple[dict[str, object], ...] = ()
     source_error: str = ""
 
@@ -223,6 +224,7 @@ class TaskQueueStatus:
             "blocked": self.blocked,
             "statuses": dict(self.statuses),
             "runnable_tasks": [dict(task) for task in self.runnable_tasks],
+            "gated_tasks": [dict(task) for task in self.gated_tasks],
             "dispatch_blockers": [dict(blocker) for blocker in self.dispatch_blockers],
             "source_error": self.source_error,
         }
@@ -613,7 +615,9 @@ def collect_project_status(
         supervisor,
         dispatch_state=(
             "blocked"
-            if contract_blockers or queue_status.source_error
+            if contract_blockers
+            or queue_status.source_error
+            or queue_has_no_launchable_task(queue_status)
             else "idle"
             if queue_status.runnable == 0
             else "available"
@@ -775,6 +779,16 @@ def collect_task_queue_status(
         statuses=statuses,
         runnable_tasks=tuple(task_summary(task) for task in runnable),
         source_tasks=tuple(task.to_json() for task in tasks),
+        gated_tasks=tuple(
+            {
+                **task_summary(task),
+                "reason": task.status_reason
+                or "task source reported status 'gated'; the task is excluded "
+                "from the runnable queue",
+            }
+            for task in tasks
+            if task.status.casefold() == "gated"
+        ),
         dispatch_blockers=dispatch_blockers,
     )
 
@@ -793,6 +807,19 @@ def task_summary(task: Task) -> dict[str, object]:
         "priority": task.priority,
         "source": task.source,
     }
+
+
+def queue_has_no_launchable_task(queue_status: TaskQueueStatus) -> bool:
+    if queue_status.runnable == 0:
+        return bool(queue_status.gated_tasks)
+    blocked_task_ids = {
+        str(blocker.get("task_id") or "") for blocker in queue_status.dispatch_blockers
+    }
+    runnable_task_ids = {
+        str(task.get("id") or task.get("task_id") or "")
+        for task in queue_status.runnable_tasks
+    }
+    return bool(runnable_task_ids) and runnable_task_ids <= blocked_task_ids
 
 
 def stranded_review_tasks(
@@ -1622,6 +1649,13 @@ def project_blockers(
         blockers.append("repo_dirty")
     if queue_status.source_error:
         blockers.append(f"task_source_unavailable: {queue_status.source_error}")
+    if queue_status.runnable > 0 and queue_has_no_launchable_task(queue_status):
+        blockers.extend(
+            "task_dispatch_blocked:"
+            f"{blocker.get('task_id')}: "
+            f"{str(blocker.get('message') or 'no reason reported')[:512]}"
+            for blocker in queue_status.dispatch_blockers
+        )
     for diagnostic in agent_diagnostics:
         blockers.append(f"agent_unavailable: {diagnostic}")
     if stale_locks:
@@ -1649,7 +1683,12 @@ def project_observations(
     queue_status: TaskQueueStatus,
     workers: tuple[WorkerView, ...] = (),
 ) -> list[str]:
-    observations: list[str] = []
+    observations = [
+        "source_gated_task:"
+        f"{task.get('id') or task.get('task_id')}: "
+        f"{str(task.get('reason') or 'no reason reported')[:512]}"
+        for task in queue_status.gated_tasks
+    ]
     if not queue_status.source_error and queue_status.runnable == 0:
         running_workers = active_conflict_worker_count(workers)
         if running_workers:

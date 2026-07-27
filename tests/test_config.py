@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -33,6 +34,95 @@ from vibe_loop.generated_profiles import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_load_config_rejects_unknown_keys_with_full_paths(self) -> None:
+        cases = (
+            (
+                '[planning_analytics]\nworklog_command = "loopyard vibe worklog"\n',
+                "configuration.planning_analytics",
+            ),
+            ('[agent]\ncommmand = "worker"\n', "agent.commmand"),
+            (
+                "[agent.profiles.review]\n"
+                'kind = "codex"\n'
+                'worker_prompt_extra = "not profile-local"\n',
+                "agent.profiles.review.worker_prompt_extra",
+            ),
+            (
+                '[task_source]\nrunable_statuses = ["ready"]\n',
+                "task_source.runable_statuses",
+            ),
+            ('[completion]\ncommand = ["test"]\n', "completion.command"),
+            (
+                '[orchestration]\nreviewer_profle = "review"\n',
+                "orchestration.reviewer_profle",
+            ),
+            (
+                "[supervision]\nmax_restart = 1\n",
+                "supervision.max_restart",
+            ),
+            (
+                '[autopilot]\nhealth_commmand = "check"\n',
+                "autopilot.health_commmand",
+            ),
+            (
+                "[autopilot.disk_reserve]\nunsupported = 1\n",
+                "autopilot.disk_reserve.unsupported",
+            ),
+            ("[locks]\nlease_second = 30\n", "locks.lease_second"),
+            (
+                '[project_binding]\nrequires = ["PROJECT"]\n',
+                "project_binding.requires",
+            ),
+            ("[specs]\nrequire_approve = true\n", "specs.require_approve"),
+            ("[budget]\nenable = true\n", "budget.enable"),
+            (
+                "[agent.profiles.review]\n"
+                'kind = "codex"\n'
+                "[[agent.routing]]\n"
+                'profile = "review"\n'
+                'match_hazard = ["abi"]\n',
+                "agent.routing[0].match_hazard",
+            ),
+            (
+                "[[budget.limits]]\nlimt = 100\n",
+                "budget.limits[0].limt",
+            ),
+        )
+
+        for content, offending_path in cases:
+            with self.subTest(offending_path=offending_path):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, re.escape(offending_path)):
+                        load_config(repo)
+
+    def test_load_config_accepts_documented_dynamic_mapping_namespaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "markdown-profile"\n'
+                "[task_source.profile]\n"
+                'custom_parser_key = "value"\n'
+                "[project_binding]\n"
+                'require = ["LOOPYARD_PROJECT"]\n'
+                "[project_binding.context]\n"
+                'LOOPYARD_PROJECT = "vibe-loop"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(
+            config.task_source.profile,
+            {"custom_parser_key": "value"},
+        )
+        self.assertEqual(
+            dict(config.project_binding.context),
+            {"LOOPYARD_PROJECT": "vibe-loop"},
+        )
+
     def test_registry_runtime_context_is_bounded_and_literal(self) -> None:
         context = normalize_registry_runtime_context(
             {
@@ -761,7 +851,8 @@ class ConfigTests(unittest.TestCase):
             ),
             (
                 "unsupported = 1\n",
-                "autopilot.disk_reserve contains unsupported keys: unsupported",
+                "autopilot.disk_reserve contains unsupported keys: "
+                "autopilot.disk_reserve.unsupported",
             ),
             (
                 "min_free_bytes = 8589934592\nmin_free_fraction = 0.0\n",
@@ -1999,7 +2090,13 @@ class AgentProfileRoutingTests(unittest.TestCase):
             self._load_with_both_clis('[[agent.routing]]\nprofile = "missing"\n')
 
     def test_routing_rule_rejects_unknown_predicate_keys(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unsupported keys: match_hazard"):
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                "agent.routing[0] contains unsupported keys: "
+                "agent.routing[0].match_hazard"
+            ),
+        ):
             self._load_with_both_clis(
                 "[agent.profiles.opus]\n"
                 'kind = "claude"\n\n'

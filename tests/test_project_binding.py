@@ -207,7 +207,10 @@ class ProjectBindingParseTests(unittest.TestCase):
         self.assertEqual(binding.require, ())
 
     def test_rejects_unsupported_keys(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unsupported keys: namespace"):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"unsupported keys: project_binding\.namespace",
+        ):
             parse_project_binding({"namespace": "alpha"})
 
     def test_rejects_non_selector_names(self) -> None:

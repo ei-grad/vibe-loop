@@ -204,6 +204,57 @@ SUPERVISION_CONFIG_KEYS = frozenset(
         "cross_run_attempt_threshold",
     }
 )
+TOP_LEVEL_CONFIG_KEYS = frozenset(
+    {
+        "main_branch",
+        "state_dir",
+        "agent",
+        "task_source",
+        "completion",
+        "orchestration",
+        "supervision",
+        "locks",
+        "project_binding",
+        "autopilot",
+        "specs",
+        "budget",
+    }
+)
+AGENT_PROFILE_CONFIG_KEYS = frozenset(
+    {
+        "command",
+        "selection_command",
+        "analysis_command",
+        "model",
+        "effort",
+        "forward_stderr",
+        "kind",
+        "prompt_dialect",
+        "skill_ref_prefix",
+    }
+)
+AGENT_CONFIG_KEYS = AGENT_PROFILE_CONFIG_KEYS | frozenset(
+    {"profiles", "routing", "worker_prompt_extra"}
+)
+TASK_SOURCE_CONFIG_KEYS = frozenset(
+    {
+        "type",
+        "plan_path",
+        "plan_paths",
+        "list",
+        "next",
+        "probe",
+        "activate",
+        "complete",
+        "reset",
+        "park",
+        "profile",
+        "command_timeout_seconds",
+        "runnable_statuses",
+        "respect_source_order",
+    }
+)
+COMPLETION_CONFIG_KEYS = frozenset({"commands"})
 LOCK_BACKEND_TYPES = ("directory", "command")
 LOCKS_COMMAND_KEYS = frozenset(
     {"acquire_command", "release_command", "status_command", "list_command"}
@@ -1425,6 +1476,7 @@ def load_config(
     else:
         data = {}
         config_digest = ""
+    reject_unknown_config_keys(data, TOP_LEVEL_CONFIG_KEYS, "configuration")
     config_key_fingerprints = fingerprint_config_keys(data)
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
@@ -1682,6 +1734,7 @@ def fingerprint_config_value(value: object) -> str:
 
 def parse_agent(data: object) -> AgentConfig:
     table = expect_table(data, "agent")
+    reject_unknown_config_keys(table, AGENT_CONFIG_KEYS, "agent")
     detected = detect_agent_clis()
     model = optional_nonempty_string(table.get("model"))
     model_source = "explicit" if model is not None else "default:none"
@@ -1793,9 +1846,15 @@ def parse_agent_profiles(table: dict[str, Any]) -> dict[str, AgentConfig]:
         label = f"agent.profiles.{name}"
         if not isinstance(profile_table, dict):
             raise ValueError(f"{label} must be a table")
+        reject_unknown_config_keys(
+            profile_table,
+            AGENT_PROFILE_CONFIG_KEYS,
+            label,
+        )
         try:
-            # Each profile is a full [agent]-shaped table, so it resolves through
-            # the same command/kind/prompt-dialect machinery as the default.
+            # Each profile uses the agent execution fields, so it resolves
+            # through the same command/kind/prompt-dialect machinery as the
+            # default without accepting top-level routing or prompt policy.
             profiles[name] = dataclasses.replace(
                 parse_agent(profile_table), profile_name=name
             )
@@ -1818,10 +1877,7 @@ def parse_agent_routing(
         label = f"agent.routing[{index}]"
         if not isinstance(entry, dict):
             raise ValueError(f"{label} must be a table")
-        keys = frozenset(str(key) for key in entry)
-        unknown = sorted(keys - AGENT_ROUTING_RULE_KEYS)
-        if unknown:
-            raise ValueError(f"{label} contains unsupported keys: {', '.join(unknown)}")
+        reject_unknown_config_keys(entry, AGENT_ROUTING_RULE_KEYS, label)
         profile = optional_nonempty_string(entry.get("profile"))
         if profile is None:
             raise ValueError(f"{label}.profile is required")
@@ -2356,6 +2412,7 @@ def unresolved_prompt_dialect_message(agent_kind: str, source: str) -> str:
 
 def parse_task_source(data: object) -> TaskSourceConfig:
     table = expect_table(data, "task_source")
+    reject_unknown_config_keys(table, TASK_SOURCE_CONFIG_KEYS, "task_source")
     explicit_keys = frozenset(str(key) for key in table)
     profile = optional_profile(table.get("profile"))
     statuses = table.get("runnable_statuses")
@@ -2465,6 +2522,7 @@ def find_forbidden_generated_command_keys(
 
 def parse_completion(data: object, repo: Path) -> CompletionConfig:
     table = expect_table(data, "completion")
+    reject_unknown_config_keys(table, COMPLETION_CONFIG_KEYS, "completion")
     commands = table.get("commands")
     if commands is None:
         return CompletionConfig(commands=default_completion_commands(repo))
@@ -2481,11 +2539,7 @@ def parse_orchestration(
 ) -> OrchestrationConfig:
     table = expect_table(data, "orchestration")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - ORCHESTRATION_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            "orchestration contains unsupported keys: " + ", ".join(unknown_keys)
-        )
+    reject_unknown_config_keys(table, ORCHESTRATION_CONFIG_KEYS, "orchestration")
 
     mode = orchestration_enum_value(
         table,
@@ -2651,11 +2705,7 @@ def default_completion_commands(repo: Path) -> tuple[str, ...]:
 def parse_supervision(data: object) -> SupervisionConfig:
     table = expect_table(data, "supervision")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - SUPERVISION_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            f"supervision contains unsupported keys: {', '.join(unknown_keys)}"
-        )
+    reject_unknown_config_keys(table, SUPERVISION_CONFIG_KEYS, "supervision")
     return SupervisionConfig(
         max_restarts=nonnegative_int(
             table.get("max_restarts"),
@@ -2725,11 +2775,7 @@ def parse_limit_wall_patterns(value: object) -> tuple[str, ...]:
 def parse_autopilot(data: object) -> AutopilotConfig:
     table = expect_table(data, "autopilot")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - AUTOPILOT_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            f"autopilot contains unsupported keys: {', '.join(unknown_keys)}"
-        )
+    reject_unknown_config_keys(table, AUTOPILOT_CONFIG_KEYS, "autopilot")
     worktree_disposition = table.get("worktree_disposition", "report-only")
     if (
         not isinstance(worktree_disposition, str)
@@ -2798,12 +2844,11 @@ def parse_autopilot(data: object) -> AutopilotConfig:
 def parse_disk_reserve(data: object) -> DiskReserveConfig:
     table = expect_table(data, "autopilot.disk_reserve")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - DISK_RESERVE_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            "autopilot.disk_reserve contains unsupported keys: "
-            + ", ".join(unknown_keys)
-        )
+    reject_unknown_config_keys(
+        table,
+        DISK_RESERVE_CONFIG_KEYS,
+        "autopilot.disk_reserve",
+    )
     min_free_bytes = optional_nonnegative_int(
         table.get("min_free_bytes"), "autopilot.disk_reserve.min_free_bytes"
     )
@@ -2856,9 +2901,7 @@ def reject_contradictory_reserve_pair(
 def parse_locks(data: object) -> LockConfig:
     table = expect_table(data, "locks")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - LOCKS_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"locks contains unsupported keys: {', '.join(unknown_keys)}")
+    reject_unknown_config_keys(table, LOCKS_CONFIG_KEYS, "locks")
     lock_type = optional_nonempty_string(table.get("type")) or "directory"
     if lock_type not in LOCK_BACKEND_TYPES:
         allowed = ", ".join(LOCK_BACKEND_TYPES)
@@ -2896,11 +2939,11 @@ def parse_locks(data: object) -> LockConfig:
 def parse_project_binding(data: object) -> ProjectBindingConfig:
     table = expect_table(data, "project_binding")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - PROJECT_BINDING_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            f"project_binding contains unsupported keys: {', '.join(unknown_keys)}"
-        )
+    reject_unknown_config_keys(
+        table,
+        PROJECT_BINDING_CONFIG_KEYS,
+        "project_binding",
+    )
     require = parse_project_binding_require(table.get("require"))
     try:
         context = normalize_registry_runtime_context(table.get("context"))
@@ -3079,9 +3122,7 @@ def require_project_binding(
 def parse_specs(data: object) -> SpecDiagnosticsConfig:
     table = expect_table(data, "specs")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - SPEC_DIAGNOSTICS_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"specs contains unsupported keys: {', '.join(unknown_keys)}")
+    reject_unknown_config_keys(table, SPEC_DIAGNOSTICS_CONFIG_KEYS, "specs")
     return SpecDiagnosticsConfig(
         require_approved=optional_bool(
             table.get("require_approved"), False, "specs.require_approved"
@@ -3119,9 +3160,7 @@ def parse_specs(data: object) -> SpecDiagnosticsConfig:
 def parse_budget(data: object) -> BudgetConfig:
     table = expect_table(data, "budget")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - BUDGET_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"budget contains unsupported keys: {', '.join(unknown_keys)}")
+    reject_unknown_config_keys(table, BUDGET_CONFIG_KEYS, "budget")
     enabled = optional_bool(table.get("enabled"), False, "budget.enabled")
     metric = optional_nonempty_string(table.get("metric")) or "total_tokens"
     if metric not in BUDGET_METRICS:
@@ -3203,10 +3242,7 @@ def parse_budget_limits(value: object) -> tuple[BudgetLimit, ...]:
         label = f"budget.limits[{index}]"
         if not isinstance(entry, dict):
             raise ValueError(f"{label} must be a table")
-        keys = frozenset(str(key) for key in entry)
-        unknown = sorted(keys - BUDGET_LIMIT_KEYS)
-        if unknown:
-            raise ValueError(f"{label} contains unsupported keys: {', '.join(unknown)}")
+        reject_unknown_config_keys(entry, BUDGET_LIMIT_KEYS, label)
         limit_value = optional_positive_number(entry.get("limit"), f"{label}.limit")
         if limit_value is None:
             raise ValueError(f"{label}.limit is required and must be a positive number")
@@ -3265,6 +3301,18 @@ def expect_table(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a TOML table")
     return value
+
+
+def reject_unknown_config_keys(
+    table: Mapping[str, object],
+    supported: frozenset[str],
+    path: str,
+) -> None:
+    unknown = sorted(str(key) for key in table if str(key) not in supported)
+    if not unknown:
+        return
+    paths = ", ".join(f"{path}.{key}" for key in unknown)
+    raise ValueError(f"{path} contains unsupported keys: {paths}")
 
 
 def optional_string(value: object) -> str | None:

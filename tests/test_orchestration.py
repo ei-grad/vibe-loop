@@ -5728,9 +5728,9 @@ class RunContractJournalTests(unittest.TestCase):
             activation_record_types,
             [
                 "lock_acquired",
+                "attempt_circuit_attempt",
                 "run_contract_resolved",
                 "stage_transition",
-                "attempt_circuit_attempt",
             ],
         )
         self.assertLess(

@@ -4,6 +4,13 @@ All configuration is optional. Put explicit settings in `.vibe-loop.toml` at
 the repository root. Explicit configuration remains authoritative over
 generated discovery and auto-detected behavior.
 
+Configuration tables are closed schemas: an unknown top-level table or key,
+including an unknown key in a named agent profile, makes loading fail with the
+full offending path. Two mapping namespaces deliberately accept dynamic keys:
+`[task_source.profile]` contains a parser-profile definition, and
+`[project_binding.context]` maps environment selector names to values. Their
+contents remain subject to their profile and selector validation.
+
 When `--repo` names a linked Git worktree without its own `.vibe-loop.toml`,
 `vibe-loop` falls back to the main worktree's configuration and warns on
 stderr. Runtime state, locks, logs, and caches still live under the invoked

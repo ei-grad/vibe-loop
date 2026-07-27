@@ -112,6 +112,22 @@ class MarkdownPlanTests(unittest.TestCase):
         self.assertNotIn("approval_state", payload)
         self.assertNotIn("source_fingerprints", payload)
 
+    def test_command_task_preserves_source_status_reason(self) -> None:
+        task = task_from_mapping(
+            {
+                "id": "TASK-GATED",
+                "status": "gated",
+                "reason": "agent profile is not registered",
+            },
+            0,
+        )
+
+        self.assertEqual(task.status_reason, "agent profile is not registered")
+        self.assertEqual(
+            task.to_json()["status_reason"],
+            "agent profile is not registered",
+        )
+
     def test_runnable_tasks_filter_dependencies_and_status(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "PLAN.md"

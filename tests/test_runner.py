@@ -1964,6 +1964,125 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("agent profile 'typo'", failed.message)
                 self.assertIn("agent resolution failed", failed_log)
 
+    def test_contract_failure_records_result_and_opens_attempt_circuit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            runner = VibeRunner(
+                VibeConfig(
+                    repo=repo,
+                    agent=AgentConfig(command="worker {prompt}"),
+                    supervision=SupervisionConfig(
+                        cross_run_attempt_threshold=2,
+                    ),
+                )
+            )
+            task = Task(task_id="TASK-CONTRACT", title="Contract", status="Next")
+            runner._source = MutableTaskSource([task])
+
+            with (
+                patch(
+                    "vibe_loop.runner.verify_worker_skill_deployments",
+                    return_value=(),
+                ),
+                patch("vibe_loop.runner.git_rev_parse", return_value="aaa"),
+            ):
+                first = runner.run_task_with_supervision(task)
+                second = runner.run_task_with_supervision(task)
+                with self.assertRaises(runner_module.AttemptCircuitOpen):
+                    runner.run_task_with_supervision(task)
+
+            records = runner.run_store.read_records()
+            results = [
+                record
+                for record in records
+                if record.get("record_type") == "run_result"
+            ]
+            circuit = runner.run_store.attempt_circuit_states(threshold=2)
+            failed_inputs = runner_module.attempt_circuit_inputs(
+                task,
+                runner.config,
+                base="aaa",
+                candidate="aaa",
+                agent=runner.config.agent,
+                profile="",
+            )
+            fixed_config = dataclasses.replace(
+                runner.config,
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
+            )
+            fixed_inputs = runner_module.attempt_circuit_inputs(
+                task,
+                fixed_config,
+                base="aaa",
+                candidate="aaa",
+                agent=fixed_config.agent,
+                profile="",
+            )
+
+        self.assertEqual(
+            [first.classification, second.classification],
+            ["failed", "failed"],
+        )
+        self.assertEqual(
+            first.classification_source,
+            "config_contract_reviewer_profile_missing",
+        )
+        self.assertIn("requires an explicit independent", first.message)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            {record["run_id"] for record in results},
+            {first.run_id, second.run_id},
+        )
+        self.assertEqual(len(circuit), 1)
+        self.assertTrue(circuit[0].open)
+        self.assertEqual(circuit[0].attempt_count, 2)
+        self.assertEqual(
+            circuit[0].blocker_class,
+            "failed:config_contract_reviewer_profile_missing",
+        )
+        self.assertNotEqual(
+            failed_inputs.configuration_revision,
+            fixed_inputs.configuration_revision,
+        )
+        self.assertFalse(runner.lock_manager.is_locked(task.task_id))
+
+    def test_attempt_circuit_ignores_source_status_and_reason_text(self) -> None:
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=AgentConfig(command="worker {prompt}"),
+        )
+        task = Task(
+            task_id="TASK-RETRY",
+            title="Retry",
+            status="ready",
+            status_reason="retry 1: worker timed out at 10:00",
+        )
+        inputs = runner_module.attempt_circuit_inputs(
+            task,
+            config,
+            base="aaa",
+            candidate="aaa",
+            agent=config.agent,
+            profile="",
+        )
+        updated_inputs = runner_module.attempt_circuit_inputs(
+            dataclasses.replace(
+                task,
+                status="active",
+                status_reason="retry 2: worker timed out at 11:00",
+            ),
+            config,
+            base="aaa",
+            candidate="aaa",
+            agent=config.agent,
+            profile="",
+        )
+
+        self.assertEqual(inputs.task_revision, updated_inputs.task_revision)
+
     def test_reviewer_agent_override_fails_task_without_aborting_batch(self) -> None:
         for jobs in (1, 2):
             with self.subTest(jobs=jobs):
