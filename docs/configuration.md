@@ -301,13 +301,15 @@ worktree disposition, disk reserve, and optional maintenance commands. Generated
 profiles cannot introduce those commands. Configuration reload and
 supervisor/run pinning are defined by
 [Supervisor Configuration Lifetime](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime).
+The trusted `idle_wake_command` adapter interface is defined by
+[Direct User Message Wake](prd/autopilot.md#prd-aut-015-direct-user-message-wake).
 
 `[project_binding]` and `[project_binding.context]` bind command adapters to an
 explicit project namespace; their operator contract remains in
-[Command backend project binding](../README.md#command-backend-project-binding).
+[Command Backend Project Binding](prd/autopilot.md#prd-aut-020-command-backend-project-binding).
 `[autopilot.disk_reserve]` overrides the native byte, inode, and proportional
 capacity floors; its validation and disablement rules remain in the
-[Autopilot reference](../README.md#autopilot).
+[Native Disk Health Defaults](prd/autopilot.md#native-disk-health-defaults).
 
 `[specs]` controls approval, fingerprint, requirement-coverage, and completion
 evidence gates plus allowed approval states and operator-owned override commands.
@@ -330,8 +332,8 @@ configuration section now lives.
 | `locks.type`, `acquire_command`, `release_command`, `status_command`, `list_command`, `lease_seconds` | [PRD-WRK-011 and PRD-WRK-012](prd/worker-supervision.md#prd-wrk-011-pluggable-lock-backends). |
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |
 | `autopilot.jobs`, `interval_seconds`, `min_ready`, `planning_recheck_seconds`, `idle_poll_max_seconds`, `planning_backoff_seconds`, `planning_max_launches_per_day`, `planning_unproductive_threshold`, `require_clean_repo`, `require_upstream_sync`, `worktree_disposition`, `health_command`, `summary_command`, `troubleshoot_command`, `planning_command`, `idle_wake_command` | Annotated and other groups above. |
-| `project_binding.require`, `project_binding.context.*` | [Command backend project binding](../README.md#command-backend-project-binding). |
-| `autopilot.disk_reserve.min_free_bytes`, `min_free_fraction`, `min_free_inodes`, `min_free_inode_fraction` | [Autopilot disk-reserve reference](../README.md#autopilot). |
+| `project_binding.require`, `project_binding.context.*` | [Command Backend Project Binding](prd/autopilot.md#prd-aut-020-command-backend-project-binding). |
+| `autopilot.disk_reserve.min_free_bytes`, `min_free_fraction`, `min_free_inodes`, `min_free_inode_fraction` | [Native Disk Health Defaults](prd/autopilot.md#native-disk-health-defaults). |
 | `specs.require_approved`, `require_current_fingerprints`, `require_requirement_coverage`, `require_completion_evidence`, `approved_states`, `override_commands` | [Task Discovery PRD](prd/task-discovery.md) and other groups above. |
 
 ## Reconciliation record
