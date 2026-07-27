@@ -473,13 +473,12 @@ implementation retries.
   rollouts, rewrite `CODEX_HOME`, or create temporary binding state.
 - Reviewer concurrency is budgeted separately from `--jobs` (implementation
   slots). `jobs=1` keeps meaning one implementation task per project.
-- Continuation: remediation resumes the same implementer session and targeted
-  closure resumes the same reviewer session whenever the provider supports it
-  (Claude: `--resume <session-id>`; Codex: no supported non-JSON resume for
-  `codex exec`/`codex review` today). When resume is unsupported or the
-  transcript is gone, the runtime records `continuation_fallback` with the
-  reason and passes the prior findings ledger and session artifacts as
-  explicit context instead — the fallback is recorded, never silent.
+- Continuation and fresh-reviewer closure semantics are owned by
+  [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation).
+  Mechanically, Claude supports `--resume <session-id>` while Codex has no
+  supported non-JSON resume for `codex exec`/`codex review` today; the journal
+  records either the resumed identity or the distinct fresh-closure identity
+  and its `continuation_fallback` reason.
 - Budgets are runtime-enforced from mechanical input only: the candidate
   fingerprint (head commit plus changed-path set) recorded with each verdict.
   Any candidate change enters remediation and consumes the remaining closure

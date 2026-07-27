@@ -2612,6 +2612,31 @@ class CliTests(unittest.TestCase):
                 "require_approved = true\n",
                 encoding="utf-8",
             )
+            RunStore(repo / ".vibe-loop" / "runs.jsonl").append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": "autopilot_cycle",
+                    "cycle_id": "cycle-1",
+                    "occurred_at": "2026-07-27T00:00:00+00:00",
+                    "stranded_review_tasks": [
+                        {
+                            "task_id": "TASK-REVIEW",
+                            "title": "awaiting closure",
+                            "status": "review",
+                            "run_id": "run-review",
+                            "reason": "no_live_worker_or_reviewer",
+                            "unresolved_findings": [
+                                {
+                                    "id": "F1",
+                                    "severity": "P1",
+                                    "summary": "unsafe completion",
+                                    "state": "open",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            )
             doctor_stdout = StringIO()
             doctor_stderr = StringIO()
             specs_stdout = StringIO()
@@ -2633,6 +2658,33 @@ class CliTests(unittest.TestCase):
         self.assertEqual(
             doctor_payload["specs"]["diagnostics"][0]["code"],
             "command_task_source_unchecked",
+        )
+        self.assertEqual(
+            doctor_payload["stranded_review_tasks"],
+            {
+                "count": 1,
+                "tasks": [
+                    {
+                        "task_id": "TASK-REVIEW",
+                        "title": "awaiting closure",
+                        "status": "review",
+                        "run_id": "run-review",
+                        "reason": "no_live_worker_or_reviewer",
+                        "unresolved_findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "unsafe completion",
+                                "state": "open",
+                            }
+                        ],
+                    }
+                ],
+                "source": "latest_autopilot_cycle",
+                "snapshot_available": True,
+                "source_cycle_id": "cycle-1",
+                "source_occurred_at": "2026-07-27T00:00:00+00:00",
+            },
         )
         self.assertEqual(
             specs_payload["diagnostics"][0]["code"],
@@ -2669,6 +2721,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["specs"]["status"], "not_configured")
         self.assertEqual(payload["specs"]["diagnostics"], [])
         self.assertEqual(payload["task_source_runtime"]["origin"], "command_output")
+        self.assertEqual(
+            payload["stranded_review_tasks"],
+            {
+                "count": 0,
+                "tasks": [],
+                "source": "latest_autopilot_cycle",
+                "snapshot_available": False,
+                "source_cycle_id": "",
+                "source_occurred_at": "",
+            },
+        )
 
     def test_specs_check_advisory_diagnostics_do_not_fail_without_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -152,6 +152,7 @@ AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
 NON_CLOSURE_WINDOW_RUNS = 20
 NON_CLOSURE_ALARM_THRESHOLD = 2
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
+REVIEW_QUEUE_STATUSES = frozenset({"review"})
 BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
 
 
@@ -225,6 +226,14 @@ class TaskQueueStatus:
             "dispatch_blockers": [dict(blocker) for blocker in self.dispatch_blockers],
             "source_error": self.source_error,
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class StrandedReviewSnapshot:
+    tasks: tuple[dict[str, object], ...] = ()
+    cycle_id: str = ""
+    occurred_at: str = ""
+    available: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,6 +389,7 @@ class ProjectStatus:
     blockers: tuple[str, ...] = ()
     advisories: tuple[dict[str, object], ...] = ()
     observations: tuple[str, ...] = ()
+    stranded_review_tasks: tuple[dict[str, object], ...] = ()
     last_cycle: CycleSummary | None = None
     non_closure: NonClosureSummary = dataclasses.field(
         default_factory=NonClosureSummary
@@ -420,6 +430,9 @@ class ProjectStatus:
             "alarms": list(self.alarms),
             "advisories": [dict(advisory) for advisory in self.advisories],
             "observations": list(self.observations),
+            "stranded_review_tasks": [
+                dict(task) for task in self.stranded_review_tasks
+            ],
             "last_cycle": (
                 self.last_cycle.to_json() if self.last_cycle is not None else None
             ),
@@ -472,6 +485,9 @@ class AutopilotCycleResult:
             "occurred_at": self.occurred_at,
             "queue": self.project_status.queue.to_json(),
             "workers": [worker.to_json() for worker in self.project_status.workers],
+            "stranded_review_tasks": [
+                dict(task) for task in self.project_status.stranded_review_tasks
+            ],
             "stale_locks": [lock.to_json() for lock in self.project_status.stale_locks],
             "integration_lock": self.project_status.integration_lock,
             "git": self.project_status.git.to_json(),
@@ -570,6 +586,13 @@ def collect_project_status(
         ignored_dirty_paths=(config.state_path,),
     )
     queue_status = collect_task_queue_status(config)
+    records = run_store.read_records()
+    stranded_reviews = stranded_review_tasks(
+        queue_status,
+        workers,
+        records,
+        runnable_statuses=config.task_source.runnable_statuses,
+    )
     agent = config.agent.to_json()
     agent_blockers = agent_blocking_diagnostics(config)
     last_cycle = latest_cycle_summary(run_store)
@@ -611,6 +634,9 @@ def collect_project_status(
         agent_diagnostics=agent_blockers,
         supervisor=supervisor,
         config_contract_blockers=contract_blockers,
+    )
+    blockers.extend(
+        f"stranded_review_task:{task['task_id']}" for task in stranded_reviews
     )
     if config.autopilot.require_upstream_sync:
         upstream = check_upstream_sync(
@@ -657,6 +683,7 @@ def collect_project_status(
         blockers=tuple(blockers),
         advisories=supervisor.advisories,
         observations=observations,
+        stranded_review_tasks=stranded_reviews,
         last_cycle=last_cycle,
         non_closure=non_closure,
         next_wake=next_wake,
@@ -766,6 +793,94 @@ def task_summary(task: Task) -> dict[str, object]:
         "priority": task.priority,
         "source": task.source,
     }
+
+
+def stranded_review_tasks(
+    queue_status: TaskQueueStatus,
+    workers: Sequence[WorkerView],
+    records: Sequence[Mapping[str, object]],
+    *,
+    runnable_statuses: Sequence[str],
+) -> tuple[dict[str, object], ...]:
+    live_task_ids = {
+        worker.active.task_id for worker in workers if worker_view_is_live(worker)
+    }
+    latest_run_ids: dict[str, str] = {}
+    findings: dict[tuple[str, str, str], dict[str, object]] = {}
+    for record in records:
+        task_id = str(record.get("task_id") or "")
+        run_id = str(record.get("run_id") or "")
+        if not task_id or not run_id:
+            continue
+        if record.get("record_type") in {
+            RUN_STARTED_RECORD_TYPE,
+            RUN_RECORD_TYPE,
+            REVIEW_VERDICT_RECORD_TYPE,
+        }:
+            latest_run_ids[task_id] = run_id
+        if record.get("record_type") != "finding_recorded":
+            continue
+        finding_id = str(record.get("finding_id") or "")
+        if finding_id:
+            findings[(task_id, run_id, finding_id)] = {
+                "id": finding_id,
+                "severity": str(record.get("severity") or ""),
+                "summary": str(record.get("summary") or ""),
+                "state": str(record.get("state") or ""),
+            }
+
+    stranded: list[dict[str, object]] = []
+    for task in queue_status.source_tasks:
+        task_id = str(task.get("id") or task.get("task_id") or "")
+        status = str(task.get("status") or "")
+        if (
+            not task_id
+            or status.casefold() not in REVIEW_QUEUE_STATUSES
+            or status in runnable_statuses
+            or task_id in live_task_ids
+        ):
+            continue
+        run_id = latest_run_ids.get(task_id, "")
+        unresolved = [
+            finding
+            for (
+                finding_task_id,
+                finding_run_id,
+                _finding_id,
+            ), finding in findings.items()
+            if finding_task_id == task_id
+            and (not run_id or finding_run_id == run_id)
+            and finding["state"] == "open"
+        ]
+        stranded.append(
+            {
+                "task_id": task_id,
+                "title": str(task.get("title") or ""),
+                "status": status,
+                "run_id": run_id,
+                "reason": "no_live_worker_or_reviewer",
+                "unresolved_findings": unresolved,
+            }
+        )
+    return tuple(stranded)
+
+
+def latest_stranded_review_snapshot(
+    run_store: RunStore,
+) -> StrandedReviewSnapshot:
+    for record in reversed(run_store.read_records()):
+        if record.get("record_type") != AUTOPILOT_CYCLE_RECORD_TYPE:
+            continue
+        raw_tasks = record.get("stranded_review_tasks")
+        if not isinstance(raw_tasks, list):
+            raw_tasks = []
+        return StrandedReviewSnapshot(
+            tasks=tuple(dict(task) for task in raw_tasks if isinstance(task, Mapping)),
+            cycle_id=str(record.get("cycle_id") or ""),
+            occurred_at=str(record.get("occurred_at") or ""),
+            available=True,
+        )
+    return StrandedReviewSnapshot()
 
 
 def agent_blocking_diagnostics(config: VibeConfig) -> tuple[str, ...]:

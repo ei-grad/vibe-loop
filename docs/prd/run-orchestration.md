@@ -151,9 +151,16 @@ schema-validated into a verdict and findings; malformed output gets one
 bounded re-ask then a typed failure. Remediation resumes the same implementer
 session and targeted closure resumes the same reviewer session when the
 provider supports continuation; when it cannot, the runtime records an
-explicit continuation fallback with the reason and supplies prior-session
-artifacts as context. Session identity, model/effort, and native usage are
-recorded for every initial and closure pass.
+explicit continuation fallback with the reason and launches a fresh independent
+reviewer with only the candidate, gate evidence, and recorded open-findings
+ledger as closure context. The fresh reviewer verifies those findings' closure
+checks rather than repeating the initial review. Its session identity must
+differ from the original reviewer's, and each start and verdict records
+`fresh_closure` provenance plus the prior reviewer identity; the original
+review records remain unchanged. If the fresh reviewer cannot be launched, the
+run blocks with the concrete unresolved findings instead of remaining in the
+review stage. Session identity, model/effort, and native usage are recorded for
+every initial and closure pass.
 
 The exact runtime-owned Codex reviewer command `codex review {prompt}` has no
 supported way to bind a first-class provider/model/effort route without changing
@@ -168,7 +175,9 @@ Acceptance must cover independent route configuration and validation, typed
 request/response round trips, Claude-implementer/Codex-reviewer and
 Codex-implementer/Claude-reviewer matrices, missing reviewer command
 diagnostics, continuation on resume-capable providers, recorded fallback on
-non-resumable providers, and malformed-output handling.
+non-resumable providers, distinct fresh-closure provenance, blocked closure
+with unresolved findings when no independent reviewer is available, and
+malformed-output handling.
 
 The continuation contract also forbids unbudgeted nested reviewer/model
 delegation. Provider launch policy disables nested Agent/Task use when the
