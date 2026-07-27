@@ -50,9 +50,7 @@ from vibe_loop.runs import (
 
 
 class RunStoreTests(unittest.TestCase):
-    def test_malformed_review_output_does_not_count_as_implementation_attempt(
-        self,
-    ) -> None:
+    def test_malformed_review_output_counts_toward_attempt_circuit(self) -> None:
         self.assertEqual(
             attempt_circuit_blocker_class(
                 {
@@ -60,7 +58,7 @@ class RunStoreTests(unittest.TestCase):
                     "classification_source": "review_output_malformed",
                 }
             ),
-            "",
+            "blocked:review_output_malformed",
         )
         self.assertEqual(
             attempt_circuit_blocker_class(

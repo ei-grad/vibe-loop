@@ -457,10 +457,8 @@ several seconds, but the cost is bounded by the window rather than total output
 size. Redaction still runs before the final truncation so no unredacted fragment
 is stored.
 
-`blocked:review_output_malformed` does not consume the cross-run implementation
-attempt circuit breaker. The breaker measures evidence that implementation is
-stuck; reviewer syntax, schema, and protocol failures are review-route failures,
-not implementation attempts.
+Cross-run attempt circuit-breaker eligibility is authoritative in
+[PRD-AUT-002a](prd/autopilot.md#prd-aut-002a-cross-run-attempt-circuit-breaker).
 
 Delivery mechanism: reviewer commands are configured templates like agent
 commands today; the runtime passes the request via file/stdin and requires
@@ -510,10 +508,10 @@ implementation retries.
   Any candidate change enters remediation and consumes the remaining closure
   budget; the runtime never resets a budget autonomously, and no implementer
   or reviewer output can. When the budget is exhausted without closure, the
-  run parks as `stage_failed(review_budget_exhausted)` with the findings
-  ledger preserved. The only reset mechanism is a new dispatch — a fresh
-  `run` with a fresh contract — which requires scheduler or operator action
-  and is journaled as such.
+  run parks as `blocked` with reason `review_budget_exhausted` and preserves the
+  findings ledger. The only reset mechanism is a new dispatch — a fresh `run`
+  with a fresh contract — which requires scheduler or operator action and is
+  journaled as such.
 - Status (`workers`, `runs inspect`, autopilot status) exposes whether a task
   is implementing, reviewing, remediating, or integrating, with per-stage
   timestamps derived from `stage_transition` records.

@@ -1567,12 +1567,11 @@ class RunInspection:
 
 
 def attempt_circuit_blocker_class(record: Mapping[str, object]) -> str:
-    """Return a stable failure class, excluding non-implementation outcomes.
+    """Return a stable failure class, excluding provider-wall outcomes.
 
     The circuit breaker is an implementation-attempt budget. Provider/account
-    walls already have a timed backoff path, and malformed reviewer output is a
-    review-protocol failure. Neither is evidence that task implementation is
-    stuck.
+    walls already have a timed backoff path and must not become evidence that a
+    task implementation is stuck.
     """
 
     classification = string_value(record.get("classification") or record.get("status"))
@@ -1584,7 +1583,6 @@ def attempt_circuit_blocker_class(record: Mapping[str, object]) -> str:
     if is_provider_limit_classification(source) or source in {
         "provider_wall",
         "account_limit",
-        "review_output_malformed",
     }:
         return ""
     return f"{classification}:{source or 'unspecified'}"

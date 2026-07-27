@@ -76,9 +76,12 @@ three) of non-completed attempts with the same task revision, candidate/base,
 relevant configuration, and blocker class, it withholds further launches until
 that fingerprint changes or an explicit operator reset is journaled. Provider
 or account walls use their existing backoff and never consume the attempt
-budget. Status and `runs summary` expose breaker state, safe fingerprint
-inputs, opening reason, reset provenance, and avoided-launch counts without
-task prompts, commands, credentials, or fencing values.
+budget. Malformed review output does consume the attempt budget: its bounded
+in-run re-ask has no cross-run backoff or retry ceiling, so a persistently broken
+reviewer route must not spend implementation capacity indefinitely. Status and
+`runs summary` expose breaker state, safe fingerprint inputs, opening reason,
+reset provenance, and avoided-launch counts without task prompts, commands,
+credentials, or fencing values.
 
 ## PRD-AUT-002 Command Surface
 
