@@ -6493,11 +6493,7 @@ def execute_autopilot_cycle(
         return result
 
     health = run_maintenance("health")
-    if (
-        health is not None
-        and not health.succeeded
-        and "autopilot_health_failed" not in blocker_list
-    ):
+    if health is not None and not health.succeeded:
         blocker_list.append("autopilot_health_failed")
 
     blockers = tuple(blocker_list)

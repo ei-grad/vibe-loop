@@ -7668,7 +7668,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         self.assertEqual(len(launched), 0)
         self.assertEqual([call["kind"] for call in calls], ["health"])
         self.assertIn(
-            "health blockers:\n  - autopilot_health_failed",
+            "last cycle health blockers:\n  - autopilot_health_failed",
             rendered,
         )
         self.assertIn(
@@ -7676,6 +7676,42 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             "  - TASK-01: workspace preflight rejected worker launch: "
             "workspace_refresh_conflict (defer_until_workspace_changes)",
             rendered,
+        )
+
+    def test_historical_health_failure_preserves_current_observations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Done", "", "finished slice")],
+                extra_toml='[autopilot]\nhealth_command = "health"\n',
+            )
+            config = load_config(repo)
+            runner, _ = self._stub_runner({"health": 1})
+
+            run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *a, **k: 0,
+                maintenance_runner=runner,
+            )
+            status = collect_project_status(config, process_exists=lambda pid: False)
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(status.blockers, ())
+        self.assertEqual(status.observations, ("no_runnable_work",))
+        self.assertEqual(
+            status.last_cycle.blockers,
+            ("autopilot_health_failed",),
+        )
+        self.assertIn("observations:\n  - no_runnable_work", rendered)
+        self.assertIn(
+            "last cycle health blockers:\n  - autopilot_health_failed",
+            rendered,
+        )
+        self.assertLess(
+            rendered.index("observations:"),
+            rendered.index("last cycle health blockers:"),
         )
 
     def test_summary_and_troubleshoot_fire_around_launch(self) -> None:

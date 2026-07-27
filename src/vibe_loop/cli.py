@@ -1870,21 +1870,10 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
     if supervisor.log is not None:
         lines.append(f"log: {supervisor.log}")
-    health_blockers = tuple(
-        dict.fromkeys(
-            blocker
-            for blocker in (
-                *status.blockers,
-                *(status.last_cycle.blockers if status.last_cycle is not None else ()),
-            )
-            if blocker == "autopilot_health_failed"
-        )
-    )
     project_blockers = tuple(
         blocker
         for blocker in status.blockers
-        if blocker != "autopilot_health_failed"
-        and not blocker.startswith("task_dispatch_blocked:")
+        if not blocker.startswith("task_dispatch_blocked:")
     )
     if project_blockers:
         lines.append("blockers:")
@@ -1894,9 +1883,6 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         guidance = project_binding_guidance(status.project_binding)
         if guidance:
             lines.append(f"  {guidance}")
-    if health_blockers:
-        lines.append("health blockers:")
-        lines.extend(f"  - {blocker}" for blocker in health_blockers)
     if queue.dispatch_blockers:
         lines.append("task dispatch blockers:")
         lines.extend(
@@ -1904,7 +1890,7 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             f"remedy: {blocker['remedy']}"
             for blocker in queue.dispatch_blockers
         )
-    if not project_blockers and not health_blockers and not queue.dispatch_blockers:
+    if not project_blockers and not queue.dispatch_blockers:
         if status.observations:
             lines.append("observations:")
             lines.extend(f"  - {observation}" for observation in status.observations)
@@ -1927,6 +1913,14 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         lines.append(
             f"last cycle: {cycle.cycle_id} {cycle.status} @ {cycle.occurred_at}"
         )
+        health_blockers = tuple(
+            blocker
+            for blocker in cycle.blockers
+            if blocker == "autopilot_health_failed"
+        )
+        if health_blockers:
+            lines.append("last cycle health blockers:")
+            lines.extend(f"  - {blocker}" for blocker in health_blockers)
         # A paused cycle keeps the plain "idle" status, so name the wall
         # explicitly: otherwise it is indistinguishable from a planning error.
         if cycle.limit_wall_action:
