@@ -1946,10 +1946,7 @@ class RunnerTests(unittest.TestCase):
 
                     runner.run_task = run_task
                     with patch("vibe_loop.runner.git_rev_parse", return_value="aaa"):
-                        results = runner.run_until_done(
-                            jobs=jobs,
-                            continue_on_failure=True,
-                        )
+                        results = runner.run_until_done(jobs=jobs)
 
                     by_task = {result.task_id: result for result in results}
                     failed = by_task["TASK-BAD"]
@@ -1963,6 +1960,106 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(failed.classification_source, "agent_resolution")
                 self.assertIn("agent profile 'typo'", failed.message)
                 self.assertIn("agent resolution failed", failed_log)
+
+    def test_reviewer_agent_override_fails_task_without_aborting_batch(self) -> None:
+        for jobs in (1, 2):
+            with self.subTest(jobs=jobs):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    worker = AgentConfig(
+                        command="worker {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                    reviewer = AgentConfig(
+                        command="reviewer {prompt}",
+                        prompt_dialect="codex",
+                        skill_ref_prefix="$",
+                    )
+                    runner = VibeRunner(
+                        VibeConfig(
+                            repo=repo,
+                            agent=worker,
+                            agent_profiles={
+                                "worker": worker,
+                                "review": reviewer,
+                            },
+                            task_source=TaskSourceConfig(
+                                type="command",
+                                list_command="list-tasks",
+                                complete_command="complete-task",
+                            ),
+                            orchestration=OrchestrationConfig(
+                                mode="runtime-owned",
+                                reviewer_profile="review",
+                                task_provenance_mode="adapter",
+                                explicit_keys=frozenset(
+                                    {
+                                        "mode",
+                                        "reviewer_profile",
+                                        "task_provenance_mode",
+                                    }
+                                ),
+                            ),
+                        )
+                    )
+                    source = MutableTaskSource(
+                        [
+                            Task(
+                                task_id="TASK-BAD",
+                                title="Bad route",
+                                status="Next",
+                                agent="review",
+                                order=1,
+                            ),
+                            Task(
+                                task_id="TASK-GOOD",
+                                title="Good route",
+                                status="Next",
+                                agent="worker",
+                                order=2,
+                            ),
+                        ]
+                    )
+                    runner._source = source
+                    original_run_task = runner.run_task
+
+                    def run_task(task: Task) -> RunResult:
+                        if task.task_id == "TASK-BAD":
+                            return original_run_task(task)
+                        source.mark_done(task.task_id)
+                        return RunResult(
+                            run_id="run-good",
+                            task_id=task.task_id,
+                            classification="completed",
+                            exit_code=0,
+                            log_path=repo / "good.log",
+                            start_main="aaa",
+                            end_main="aaa",
+                        )
+
+                    runner.run_task = run_task
+                    with (
+                        patch("vibe_loop.runner.git_rev_parse", return_value="aaa"),
+                        patch(
+                            "vibe_loop.runner.verify_worker_skill_deployments",
+                            return_value=(),
+                        ),
+                    ):
+                        results = runner.run_until_done(jobs=jobs)
+
+                by_task = {result.task_id: result for result in results}
+                self.assertEqual(set(by_task), {"TASK-BAD", "TASK-GOOD"})
+                self.assertEqual(by_task["TASK-GOOD"].classification, "completed")
+                self.assertEqual(by_task["TASK-BAD"].classification, "failed")
+                self.assertEqual(
+                    by_task["TASK-BAD"].classification_source,
+                    "task_agent_contract",
+                )
+                self.assertIn(
+                    "reviewer_profile must differ",
+                    by_task["TASK-BAD"].message,
+                )
 
     def test_skill_verification_blocks_before_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

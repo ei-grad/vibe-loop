@@ -108,6 +108,7 @@ from vibe_loop.orchestration import (
     plan_session_continuation,
     run_configured_command,
     settlement_intent,
+    task_agent_dispatch_blocker,
 )
 from vibe_loop.processes import (
     ProcessNode,
@@ -1808,10 +1809,18 @@ class VibeRunner:
             except SkillDeploymentError as exc:
                 return self.record_skill_verification_failure(task, exc)
             except AgentResolutionError as exc:
-                explicit_agent = (task.agent or "").strip()
-                if not explicit_agent or explicit_agent in self.config.agent_profiles:
+                blocker = task_agent_dispatch_blocker(self.config, task)
+                if blocker is None:
                     raise
-                return self.record_agent_resolution_failure(task, exc)
+                return self.record_agent_resolution_failure(
+                    task,
+                    exc,
+                    classification_source=(
+                        "agent_resolution"
+                        if blocker.code == "task_agent_profile_unknown"
+                        else "task_agent_contract"
+                    ),
+                )
         finally:
             if previous_restart is None:
                 try:
@@ -1869,6 +1878,8 @@ class VibeRunner:
         self,
         task: Task,
         error: AgentResolutionError,
+        *,
+        classification_source: str = "agent_resolution",
     ) -> RunResult:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
@@ -1891,7 +1902,7 @@ class VibeRunner:
             end_main=git_rev_parse(self.config.repo, "HEAD"),
             message=message,
             started_at=started_at,
-            classification_source="agent_resolution",
+            classification_source=classification_source,
             restart_count=self.current_restart_count(task.task_id),
             max_restarts=self.config.supervision.max_restarts,
         )
@@ -4711,10 +4722,16 @@ class VibeRunner:
                         break
                     continue
             skipped.add(result.task_id)
-            if not continue_on_failure and result.classification in {
-                "failed",
-                "unknown",
-            }:
+            if (
+                not continue_on_failure
+                and result.classification
+                in {
+                    "failed",
+                    "unknown",
+                }
+                and result.classification_source
+                not in {"agent_resolution", "task_agent_contract"}
+            ):
                 break
         return results
 
@@ -5002,7 +5019,11 @@ class VibeRunner:
                             continue
                     skipped.add(result.task_id)
                     if result.classification in {"failed", "unknown"}:
-                        stop_after_running = not continue_on_failure
+                        stop_after_running = (
+                            not continue_on_failure
+                            and result.classification_source
+                            not in {"agent_resolution", "task_agent_contract"}
+                        )
         return results
 
     def require_worker_launch_config(self) -> None:

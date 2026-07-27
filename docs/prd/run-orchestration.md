@@ -345,11 +345,18 @@ declared conflict domain, and falls back to deterministic ready order.
 (`--max-tasks`) counts only completed results; parallel dispatch may not
 overshoot the remaining completion budget.
 
+An explicit per-task agent route that cannot satisfy the run contract fails
+that task with the route diagnostic and is excluded for the rest of the current
+scheduler invocation. This task-scoped refusal does not activate a worker and
+does not stop `run-until-done` from dispatching other candidates, even when
+general continue-on-failure behavior is disabled.
+
 Acceptance must cover scheduler behavior parity in both modes, safe
 agent-selection validation and deterministic fallback, conflict-domain
 exclusion, serial and parallel dispatch, independent attempt/completion limits
-without overshoot, prompt-content assertions for runtime-owned mode, and
-unchanged autopilot boundaries.
+without overshoot, task-scoped route refusal with the refused task first in
+dispatch order, prompt-content assertions for runtime-owned mode, and unchanged
+autopilot boundaries.
 
 Related implementation IDs: `ORC-10` (`orc-scheduler-separation`).
 

@@ -110,7 +110,13 @@ from vibe_loop.autopilot import (
     WaitMessageAdapterError,
     _bounded_idle_wake_output,
 )
-from vibe_loop.config import load_config, normalize_registry_runtime_context
+from vibe_loop.config import (
+    AgentConfig,
+    OrchestrationConfig,
+    TaskSourceConfig,
+    load_config,
+    normalize_registry_runtime_context,
+)
 from vibe_loop.retry import LimitWallSignal
 from vibe_loop.runner import AgentLimitWallError
 from vibe_loop.locks import (
@@ -151,6 +157,7 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.orchestration import RunStage, StageTransition
+from vibe_loop.tasks import Task
 from vibe_loop.workers import (
     KEEP_EVIDENCE_CHANGED,
     ActiveRunState,
@@ -497,6 +504,80 @@ class AutopilotStatusTests(unittest.TestCase):
             )
         )
         self.assertTrue(payload["agent"]["diagnostics"])
+
+    def test_status_names_reviewer_profile_task_override_without_blocking_cycle(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            loaded = load_config(repo)
+            worker = AgentConfig(
+                command="worker {prompt}",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            reviewer = AgentConfig(
+                command="reviewer {prompt}",
+                prompt_dialect="codex",
+                skill_ref_prefix="$",
+            )
+            config = dataclasses.replace(
+                loaded,
+                agent=worker,
+                agent_profiles={"worker": worker, "review": reviewer},
+                task_source=TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    complete_command="complete-task",
+                ),
+                orchestration=OrchestrationConfig(
+                    mode="runtime-owned",
+                    reviewer_profile="review",
+                    task_provenance_mode="adapter",
+                    explicit_keys=frozenset(
+                        {
+                            "mode",
+                            "reviewer_profile",
+                            "task_provenance_mode",
+                        }
+                    ),
+                ),
+            )
+            source = mock.Mock()
+            source.list_tasks.return_value = [
+                Task(
+                    task_id="TASK-BAD",
+                    title="Bad route",
+                    status="Next",
+                    agent="review",
+                ),
+                Task(
+                    task_id="TASK-GOOD",
+                    title="Good route",
+                    status="Next",
+                    agent="worker",
+                ),
+            ]
+
+            with mock.patch(
+                "vibe_loop.runner.build_task_source",
+                return_value=source,
+            ):
+                status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(payload["blockers"], [])
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "available")
+        self.assertEqual(
+            payload["queue"]["dispatch_blockers"][0]["task_id"],
+            "TASK-BAD",
+        )
+        self.assertIn("task dispatch blockers:", rendered)
+        self.assertIn("TASK-BAD", rendered)
+        self.assertIn("reviewer_profile must differ", rendered)
+        self.assertNotIn("blockers: none", rendered)
 
     def test_collect_project_status_keeps_nonblocking_agent_diagnostics(
         self,

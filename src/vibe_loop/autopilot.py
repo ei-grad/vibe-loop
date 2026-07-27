@@ -56,6 +56,7 @@ from vibe_loop.locks import (
 from vibe_loop.orchestration import (
     ConfigContractBlocker,
     config_contract_blockers,
+    task_agent_dispatch_blocker,
 )
 from vibe_loop.processes import (
     ProcessNode,
@@ -207,6 +208,7 @@ class TaskQueueStatus:
     statuses: dict[str, int] = dataclasses.field(default_factory=dict)
     runnable_tasks: tuple[dict[str, object], ...] = ()
     source_tasks: tuple[dict[str, object], ...] = ()
+    dispatch_blockers: tuple[dict[str, object], ...] = ()
     source_error: str = ""
 
     def to_json(self) -> dict[str, object]:
@@ -218,6 +220,7 @@ class TaskQueueStatus:
             "blocked": self.blocked,
             "statuses": dict(self.statuses),
             "runnable_tasks": [dict(task) for task in self.runnable_tasks],
+            "dispatch_blockers": [dict(blocker) for blocker in self.dispatch_blockers],
             "source_error": self.source_error,
         }
 
@@ -709,6 +712,15 @@ def collect_task_queue_status(
     statuses: dict[str, int] = {}
     for task in tasks:
         statuses[task.status] = statuses.get(task.status, 0) + 1
+    dispatch_blockers = tuple(
+        {
+            "task_id": task.task_id,
+            "agent": task.agent,
+            **blocker.to_json(),
+        }
+        for task in runnable
+        if (blocker := task_agent_dispatch_blocker(effective_config, task)) is not None
+    )
     return TaskQueueStatus(
         total=len(tasks),
         runnable=len(runnable),
@@ -718,6 +730,7 @@ def collect_task_queue_status(
         statuses=statuses,
         runnable_tasks=tuple(task_summary(task) for task in runnable),
         source_tasks=tuple(task.to_json() for task in tasks),
+        dispatch_blockers=dispatch_blockers,
     )
 
 

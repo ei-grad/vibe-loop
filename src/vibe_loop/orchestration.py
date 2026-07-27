@@ -27,6 +27,7 @@ from vibe_loop.config import (
     command_template_uses_field,
     format_agent_command,
     parse_orchestration,
+    resolve_task_agent,
 )
 from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
@@ -5253,6 +5254,32 @@ def config_contract_blockers(
                 "a pre-launch or runtime failure.",
             )
     return tuple(blockers)
+
+
+def task_agent_dispatch_blocker(
+    config: VibeConfig,
+    task: Task,
+) -> ConfigContractBlocker | None:
+    explicit_profile = (task.agent or "").strip()
+    if not explicit_profile:
+        return None
+    try:
+        agent_selection = resolve_task_agent(config, task)
+    except AgentResolutionError as exc:
+        return ConfigContractBlocker(
+            code="task_agent_profile_unknown",
+            key="task.agent",
+            message=str(exc),
+            remedy="Route task.agent to a configured agent.profiles entry.",
+        )
+    return next(
+        (
+            blocker
+            for blocker in config_contract_blockers(config, agent_selection)
+            if blocker.key == "task.agent"
+        ),
+        None,
+    )
 
 
 class RunContractResolver:
