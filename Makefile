@@ -1,7 +1,7 @@
 UV ?= uv
 RELEASE_RECORD ?= .vibe-loop/release-readiness.json
 
-.PHONY: build bump-major bump-minor bump-patch check install-hooks release-gate tag test unittest version version-check
+.PHONY: build bump-major bump-minor bump-patch check doc-budget doc-budget-refresh install-hooks release-gate tag test unittest version version-check
 
 version:
 	$(UV) version --short
@@ -25,9 +25,16 @@ build:
 	$(UV) build
 	$(UV) run --with twine --no-project -m twine check dist/*
 
-check: test build
+check: doc-budget test build
 
-release-gate:
+doc-budget:
+	$(UV) run python scripts/check-doc-budgets.py --config doc-budgets.toml $(DOC_BUDGET_ARGS)
+	$(UV) run python scripts/check-md-links.py $(DOC_BUDGET_ARGS)
+
+doc-budget-refresh:
+	$(UV) run python scripts/check-doc-budgets.py --config doc-budgets.toml --update-baselines
+
+release-gate: doc-budget
 	$(UV) run vibe-loop eval release-gate --repo . --overwrite \
 	  --record-output $(RELEASE_RECORD)
 

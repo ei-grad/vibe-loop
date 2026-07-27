@@ -1,0 +1,4 @@
+[reachability]
+roots = ["docs/README.md", "docs/prd/README.md"]
+exclude = []
+max_hops = 3

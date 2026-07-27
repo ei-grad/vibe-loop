@@ -45,3 +45,9 @@ dev = [
     "pytest>=9.0.3",
     "ruff>=0.15.14",
 ]
+
+[tool.ruff.format]
+exclude = [
+    "scripts/check-doc-budgets.py",
+    "scripts/check-md-links.py",
+]
