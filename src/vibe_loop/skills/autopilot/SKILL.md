@@ -1,25 +1,30 @@
 ---
 name: autopilot
-description: Use for unattended stewardship of an autonomous vibe-loop development loop. The agent keeps the detached autopilot supervisor running and healthy, reviews what landed, replenishes the ready queue by running planning through the orchestrated-vibe-loop skill, and recovers the supervisor, running until stopped.
+description: Use for unattended stewardship of an autonomous vibe-loop development loop. The agent keeps the detached autopilot supervisor running and healthy while its native generic cycle checks capacity, summarizes landed work, diagnoses recurring trouble, plans when the queue is shallow, and dispatches workers.
 ---
 
 # Autopilot
 
 Use this skill to steward an autonomous `vibe-loop` development loop. The agent
 keeps the CLI autopilot supervisor healthy while it drives
-`vibe-loop run-until-done` as the worker pool, and adds the judgement a plain
-loop cannot: reviewing landed work, troubleshooting worker sessions, planning
-to keep the ready queue fed, and deciding when to recover or stop.
+`vibe-loop run-until-done` as the worker pool. The supervisor already implements
+the repository-agnostic generic cycle: it checks capacity and worktrees,
+summarizes landed work, detects recurring trouble, invokes native planning when
+the ready queue is shallow, and records the complete cycle before waiting or
+dispatching again. Repository-authored maintenance commands are optional
+overrides or additions, not prerequisites for those native behaviors.
 
 This is an operator skill, not a worker skill. It drives the `vibe-loop` CLI and
-delegates analysis, planning, and any code/docs work to subagents and skills. It
-does not author product code in the main worktree.
+monitors the supervisor's recorded evidence. It does not duplicate routine
+native analysis, planning, summary, or troubleshooting outside the supervisor,
+and it does not author product code in the main worktree.
 
-For any actual work — including planning and docs updates — follow the
-`orchestrated-vibe-loop` skill: no edits in the main worktree, dedicated
-branches/worktrees per piece of work, and independent review before merge to
-`main`. Keep the main worktree clean — if it becomes dirty, inspect the exact
-files and process evidence first and do not revert peer or user changes.
+For actual product work outside the native cycle, use the
+`orchestrated-vibe-loop` skill or the repository's equivalent reviewed workflow:
+no edits in the main worktree, dedicated branches/worktrees per piece of work,
+and independent review before merge to `main`. Keep the main worktree clean —
+if it becomes dirty, inspect the exact files and process evidence first and do
+not revert peer or user changes.
 
 ## Continuation
 
@@ -30,48 +35,68 @@ instruction or session end.
 
 ## Cycle
 
-1. **Health**: disk, process liveness, git sync, locks, worktrees, queue depth.
-   Use `vibe-loop doctor`, `vibe-loop workers`, and `vibe-loop main-integration
-   status`; cross-check process liveness for the `run-until-done` supervisor and
-   its workers. Confirm the configured worktree-disposition policy; do not infer
-   permission to reap from the existence of an autopilot session.
-2. **Summarize**: run a read-only subagent to analyze commits merged to `main`
-   since the previous cycle anchor and produce a concise "what landed" note. Use
-   the last reported `main` SHA as the anchor; if no durable anchor exists, state
-   the chosen range explicitly and continue.
-3. **Troubleshoot**: run a read-only subagent over recent worker run logs and
-   `.vibe-loop/runs.jsonl` (or `vibe-loop runs list` / `vibe-loop runs inspect`)
-   to catch problems faced during implementation. Address findings appropriately
-   — update project instructions, or feed them into planning as new tasks.
-4. **Plan**: when the ready queue is shallow, invoke the `orchestrated-vibe-loop`
-   skill to plan from the repository's own planning inputs — the configured task
-   source, design docs, roadmaps, issues, and TODOs — and to decompose enough
-   reviewed, ready tasks for workers to implement for a couple of cycles. Run
-   that planning/docs work in a worktree with independent review before it merges
-   to `main`, like any other work.
-5. **Maintain**: keep the task source and related status docs current.
-6. **Recover**: if the `run-until-done` process has exited, investigate from
-   evidence, fix the concrete cause, and relaunch it.
+Each supervisor cycle performs these native steps without requiring
+repository-specific maintenance commands:
+
+1. **Inspect and recover safely**: collect queue, worker, lock, git, and
+   supervisor status; settle only terminal stale locks that satisfy the runtime's
+   ownership and task-source checks; refresh required upstream-sync evidence.
+2. **Disposition worktrees**: gather mechanical ownership, liveness, dirty-state,
+   and merged-state evidence. The default `report-only` policy journals eligible
+   candidates without mutation. An explicit `reap` policy asks the read-only
+   analysis agent for a reasoned keep-or-reap decision, then code applies the
+   ownership, liveness, cleanliness, merged-state, and task-state guardrails
+   before any removal.
+3. **Check disk capacity**: measure the filesystem that holds native worker
+   worktrees and build output. Warnings remain observations; a critical byte or
+   inode verdict blocks new launches without terminating existing workers.
+4. **Summarize what landed**: derive the `main` commit span from the previous
+   recorded cycle anchor to the current ref and append a bounded read-only
+   summary. Bootstrap, unchanged, unavailable, and truncated spans remain
+   explicit.
+5. **Troubleshoot recent runs**: inspect a bounded, record-aware journal tail for
+   recurring task failures, exhausted restart budgets, and persistent workspace
+   claim mismatches. Journal observations and blockers without killing
+   processes, changing workspaces, or mutating the task source.
+6. **Run explicit hooks**: apply any repository-authored health hook as an
+   additional gate. Explicit summary and troubleshoot hooks augment their native
+   steps; an explicit planning hook overrides native planning.
+7. **Plan when the queue is shallow**: if no blocker or planning budget/backoff
+   prevents it, pass bounded queue, worker, and repository-planning evidence to
+   the read-only analysis agent. Validate its structured plan-or-no-plan
+   decision. Only a separately supervised read-write worker launched through
+   the configured worker command may author tasks. Re-read the authoritative
+   task source afterward; the supervisor never edits it directly. Invalid
+   decisions fail closed, and planning launches, outcomes, provider limits,
+   worker lifecycle, and before/after task identities are journaled.
+8. **Dispatch or wait**: re-collect status after planning, honor blockers,
+   dispatch floors, provider pauses, and outcome budgets, then observe an
+   existing child or launch `run-until-done`. Record the child identity before
+   waiting on it and record its exit and dispatch count afterward.
+
+The contract is **agent decides, code executes, guardrails constrain, every
+action is logged**. Judgement is isolated in the read-only analysis agent;
+write-capable planning and implementation run in separate supervised workers.
+The runtime validates structured decisions and owns side effects. Detailed
+native maintenance results use registered typed records in the append-only run
+journal, while every action also appears as a concise tag on the enclosing
+cycle, including successful no-op decisions. Treat that journal and
+`vibe-loop autopilot status --json` as the cycle's authority rather than
+reconstructing actions from process absence or ad hoc log inspection.
 
 ## Launch The Supervisor
 
 Before launching, confirm:
 
-- for a command-backed task source or lock adapter, the repository's project
-  namespace is bound in configuration, not exported into your shell. Check
-  `vibe-loop autopilot status --json` and read `project_binding`: each required
-  selector must appear under `resolved` with the value you expect. Never rely on
-  `export LOOPYARD_PROJECT=...` to route a supervisor — an unset or wrong export
-  silently binds this repository to another project's board and locks. If the
-  repo declares `[project_binding] require` and the value is unpinned,
-  `autopilot run/start` refuses with `project_binding_unset:<NAME>`,
-  `project_binding_ambient_only:<NAME>`, or `project_binding_conflict:<NAME>`;
-  fix the repository config or the registry entry rather than exporting the
-  variable.
+- `vibe-loop autopilot status --json` resolves the intended repository and task
+  source. If `project_binding` reports required selectors, each must be under
+  `resolved` with the expected value; fix the durable repository or registry
+  binding rather than relying on ambient shell state.
 - `main` is clean.
 - `vibe-loop doctor` reports no stale task or integration locks blocking
   selection.
-- the task source has at least one ready task.
+- the task source is readable. It may be empty: native planning handles a
+  shallow queue within its recorded budget and backoff.
 - no other `vibe-loop run-until-done` supervisor is already active for this
   repository.
 
@@ -207,8 +232,10 @@ Answer from evidence, not process absence alone.
 - Locks and workspaces: trust `vibe-loop doctor` and `vibe-loop workers` before
   adopting work; do not delete scheduler metadata from JSON contents alone.
 - Queue state: zero ready tasks plus no active worker means the supervisor
-  drained the runnable set or cannot select work. That is a planning signal for
-  this operator skill, not a crash and not built-in task authoring by the CLI.
+  drained the runnable set, cannot select work, or recorded a native planning
+  decision, backoff, provider limit, or planning failure. Inspect the latest
+  cycle actions and planning records before classifying it as a crash or
+  launching any separate planning work.
 - A worker log ending with a completed report and released locks is a clean
   completion, not a failure. Repeated review/remediation rounds are
   implementation churn, not supervisor failure, while the worker log keeps
