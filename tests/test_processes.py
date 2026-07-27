@@ -4,7 +4,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import vibe_loop.processes
 from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
@@ -69,21 +71,77 @@ class ProcessTableTests(unittest.TestCase):
 
         self.assertEqual(sorted(table), [10, 11])
 
+    def test_table_snapshot_reads_boot_identity_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(root, {10: (1, 10, 10, 100), 11: (10, 10, 10, 101)})
+            with mock.patch(
+                "vibe_loop.processes.boot_identity",
+                wraps=vibe_loop.processes.boot_identity,
+            ) as boot_lookup:
+                read_process_table(proc_root=root)
+
+        self.assertEqual(boot_lookup.call_count, 1)
+
     def test_process_group_survives_its_session_leader(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_fake_proc(root, {43: (1, 42, 42, 901)})
 
-            live = process_group_is_live(42, 42, proc_root=root)
+            live = process_group_is_live(
+                42,
+                42,
+                f"{BOOT_ID}:900",
+                proc_root=root,
+            )
 
         self.assertTrue(live)
+
+    def test_process_group_rejects_a_recycled_session_leader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(
+                root,
+                {
+                    42: (1, 42, 42, 999),
+                    43: (42, 42, 42, 1000),
+                },
+            )
+
+            live = process_group_is_live(
+                42,
+                42,
+                f"{BOOT_ID}:900",
+                proc_root=root,
+            )
+
+        self.assertFalse(live)
+
+    def test_process_group_rejects_members_from_another_boot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(root, {43: (1, 42, 42, 901)})
+
+            live = process_group_is_live(
+                42,
+                42,
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:900",
+                proc_root=root,
+            )
+
+        self.assertFalse(live)
 
     def test_process_group_requires_the_recorded_session(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             write_fake_proc(root, {43: (1, 42, 99, 901)})
 
-            live = process_group_is_live(42, 42, proc_root=root)
+            live = process_group_is_live(
+                42,
+                42,
+                f"{BOOT_ID}:900",
+                proc_root=root,
+            )
 
         self.assertFalse(live)
 

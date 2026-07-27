@@ -179,6 +179,7 @@ from vibe_loop.workers import (
     active_run_is_live,
     build_worker_views,
     git_dirty_snapshot,
+    process_group_liveness_checker,
     workspace_state_fingerprint,
 )
 
@@ -7425,6 +7426,7 @@ def active_lock_conflict_domains(
     lock_manager: LockManager,
 ) -> tuple[ConflictDomains, ...]:
     domains: list[ConflictDomains] = []
+    group_checker = process_group_liveness_checker()
     for metadata in lock_manager.list_locks():
         active = ActiveRunState.from_lock_metadata(metadata)
         if active is None:
@@ -7432,7 +7434,10 @@ def active_lock_conflict_domains(
         # Only live runs hold their conflict-domain leases. A lock left behind
         # by a dead/expired run must not keep serializing unrelated work
         # against its (often broad) domain set.
-        if not active_run_is_live(active):
+        if not active_run_is_live(
+            active,
+            process_group_exists=group_checker,
+        ):
             continue
         domains.append(conflict_domains_from_task_like(active))
     return tuple(domains)

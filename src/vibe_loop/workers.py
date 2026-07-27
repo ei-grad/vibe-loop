@@ -28,7 +28,12 @@ from vibe_loop.locks import (
     validate_lock_fencing_token,
 )
 from vibe_loop.config import TaskSourceConfig, format_shell_command_template
-from vibe_loop.processes import process_birth_identity, process_group_is_live
+from vibe_loop.processes import (
+    ProcessNode,
+    process_birth_identity,
+    process_group_is_live,
+    read_process_table,
+)
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
@@ -697,7 +702,30 @@ class WorkerView:
 
 
 ProcessExists = Callable[[int], bool]
-ProcessGroupExists = Callable[[int, int], bool]
+ProcessGroupExists = Callable[[int, int, str], bool]
+
+
+def process_group_liveness_checker() -> ProcessGroupExists:
+    """Build a lazy process-group checker over one process-table snapshot."""
+
+    process_table: dict[int, ProcessNode] | None = None
+
+    def group_is_live(
+        process_group_id: int,
+        session_id: int,
+        expected_process_birth_id: str,
+    ) -> bool:
+        nonlocal process_table
+        if process_table is None:
+            process_table = read_process_table()
+        return process_group_is_live(
+            process_group_id,
+            session_id,
+            expected_process_birth_id,
+            process_table=process_table,
+        )
+
+    return group_is_live
 
 
 def load_active_run_states(lock_manager: LockManager) -> list[ActiveRunState]:
@@ -1503,6 +1531,9 @@ def build_worker_views(
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
     process_checker = process_exists if process_exists is not None else pid_exists
+    group_checker = process_group_exists
+    if group_checker is None and process_exists is None:
+        group_checker = process_group_liveness_checker()
     records = run_store.read_records()
     result_by_run_id = latest_worker_status_by_run_id(records)
     workspace_context = (
@@ -1531,7 +1562,7 @@ def build_worker_views(
             active,
             host,
             process_checker,
-            process_group_exists=process_group_exists,
+            process_group_exists=group_checker,
         )
         result_status = result_value(result, "status") or result_value(
             result, "classification"
@@ -1940,11 +1971,9 @@ def classify_process(
         if birth_identity_lookup is not None
         else process_birth_identity
     )
-    group_checker = (
-        process_group_exists
-        if process_group_exists is not None
-        else process_group_is_live
-    )
+    group_checker = process_group_exists
+    if group_checker is None and process_exists is None:
+        group_checker = process_group_is_live
     if active.host and active.host != current_host:
         return "foreign_host"
     if active.worker_pid is None:
@@ -1964,25 +1993,29 @@ def classify_process(
             if current_birth_id == active.supervisor_process_birth_id
             else "missing"
         )
+    if process_checker(active.worker_pid):
+        if not active.worker_process_birth_id:
+            return "running"
+        current_birth_id = get_birth_identity(active.worker_pid)
+        if not current_birth_id:
+            return "running"
+        return (
+            "running"
+            if current_birth_id == active.worker_process_birth_id
+            else "missing"
+        )
     if (
-        active.worker_process_group_id is not None
+        group_checker is not None
+        and active.worker_process_group_id is not None
         and active.worker_session_id is not None
         and group_checker(
             active.worker_process_group_id,
             active.worker_session_id,
+            active.worker_process_birth_id,
         )
     ):
         return "running"
-    if not process_checker(active.worker_pid):
-        return "missing"
-    if not active.worker_process_birth_id:
-        return "running"
-    current_birth_id = get_birth_identity(active.worker_pid)
-    if not current_birth_id:
-        return "running"
-    return (
-        "running" if current_birth_id == active.worker_process_birth_id else "missing"
-    )
+    return "missing"
 
 
 def classify_run(

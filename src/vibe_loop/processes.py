@@ -62,10 +62,12 @@ def process_birth_identity(pid: int, *, proc_root: Path = PROC_ROOT) -> str:
     return f"{boot_id}:{fields[19]}"
 
 
-def read_process_node(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessNode | None:
-    if sys.platform != "linux" or pid <= 0:
-        return None
-    boot_id = boot_identity(proc_root)
+def _read_process_node(
+    pid: int,
+    boot_id: str,
+    *,
+    proc_root: Path,
+) -> ProcessNode | None:
     fields = _stat_fields(pid, proc_root)
     if not boot_id or len(fields) <= 19:
         return None
@@ -90,6 +92,12 @@ def read_process_node(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessNode |
     )
 
 
+def read_process_node(pid: int, *, proc_root: Path = PROC_ROOT) -> ProcessNode | None:
+    if sys.platform != "linux" or pid <= 0:
+        return None
+    return _read_process_node(pid, boot_identity(proc_root), proc_root=proc_root)
+
+
 def read_process_table(*, proc_root: Path = PROC_ROOT) -> dict[int, ProcessNode]:
     """One snapshot of every readable process, keyed by PID.
 
@@ -101,6 +109,9 @@ def read_process_table(*, proc_root: Path = PROC_ROOT) -> dict[int, ProcessNode]
     table: dict[int, ProcessNode] = {}
     if sys.platform != "linux":
         return table
+    boot_id = boot_identity(proc_root)
+    if not boot_id:
+        return table
     try:
         entries = list(proc_root.iterdir())
     except OSError:
@@ -108,7 +119,11 @@ def read_process_table(*, proc_root: Path = PROC_ROOT) -> dict[int, ProcessNode]
     for entry in entries:
         if not entry.name.isdigit():
             continue
-        node = read_process_node(int(entry.name), proc_root=proc_root)
+        node = _read_process_node(
+            int(entry.name),
+            boot_id,
+            proc_root=proc_root,
+        )
         if node is not None:
             table[node.pid] = node
     return table
@@ -117,23 +132,41 @@ def read_process_table(*, proc_root: Path = PROC_ROOT) -> dict[int, ProcessNode]
 def process_group_is_live(
     process_group_id: int,
     session_id: int,
+    expected_process_birth_id: str,
     *,
+    process_table: dict[int, ProcessNode] | None = None,
     proc_root: Path = PROC_ROOT,
 ) -> bool:
-    """Whether a Linux process group still has a non-zombie member.
+    """Whether the birth-anchored worker group has a non-zombie member.
 
-    Matching both group and session rejects partial numeric-ID collisions. The
-    session ID remains allocated while any member of the original session
-    survives, even after its leader exits.
+    A live original leader must retain its exact birth identity. If the leader
+    has exited, Linux keeps the session ID allocated while descendants remain,
+    so same-boot members of that group and session still prove liveness. A
+    mismatched leader or boot proves the numeric group ID was recycled.
     """
 
-    if process_group_id <= 0 or session_id <= 0:
+    expected_boot_id, separator, _start_time = expected_process_birth_id.partition(":")
+    if (
+        process_group_id <= 0
+        or session_id <= 0
+        or not separator
+        or not expected_boot_id
+    ):
+        return False
+    table = (
+        process_table
+        if process_table is not None
+        else read_process_table(proc_root=proc_root)
+    )
+    leader = table.get(process_group_id)
+    if leader is not None and leader.process_birth_id != expected_process_birth_id:
         return False
     return any(
         node.process_group_id == process_group_id
         and node.session_id == session_id
+        and node.process_birth_id.startswith(f"{expected_boot_id}:")
         and node.state not in {"X", "Z"}
-        for node in read_process_table(proc_root=proc_root).values()
+        for node in table.values()
     )
 
 

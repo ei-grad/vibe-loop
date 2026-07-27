@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from vibe_loop.config import LockConfig, TaskSourceConfig
 from vibe_loop.locks import (
@@ -20,7 +21,7 @@ from vibe_loop.locks import (
     build_lock_manager,
 )
 from vibe_loop.orchestration import RunStage, StageTransition
-from vibe_loop.processes import process_birth_identity
+from vibe_loop.processes import ProcessNode, process_birth_identity
 from vibe_loop.tasks import Task
 from vibe_loop.runs import (
     LOCK_ACQUIRED_RECORD_TYPE,
@@ -790,12 +791,9 @@ class WorkerStateTests(unittest.TestCase):
                 state,
                 "test-host",
                 process_exists=lambda pid: False,
-                process_group_exists=lambda process_group_id, session_id: (
-                    (
-                        process_group_id,
-                        session_id,
-                    )
-                    == (100, 100)
+                process_group_exists=lambda process_group_id, session_id, birth_id: (
+                    (process_group_id, session_id, birth_id)
+                    == (100, 100, "boot-id:500")
                 ),
             ),
             "running",
@@ -844,13 +842,11 @@ class WorkerStateTests(unittest.TestCase):
                     manager,
                     run_store,
                     current_host="test-host",
-                    process_exists=lambda pid: False,
                 )
                 stale = collect_stale_locks(
                     manager,
                     run_store,
                     current_host="test-host",
-                    process_exists=lambda pid: False,
                 )
 
             self.assertEqual(views[0].process_state, "running")
@@ -892,6 +888,9 @@ class WorkerStateTests(unittest.TestCase):
                 "test-host",
                 process_exists=lambda pid: True,
                 birth_identity_lookup=lambda pid: "boot-id:900",
+                process_group_exists=lambda process_group_id, session_id, birth_id: (
+                    True
+                ),
             ),
             "missing",
         )
@@ -907,6 +906,84 @@ class WorkerStateTests(unittest.TestCase):
             ),
             "running",
         )
+
+    def test_injected_process_checker_does_not_fall_back_to_host_proc(self) -> None:
+        state = ActiveRunState(
+            task_id="PAR-02",
+            run_id="run-1",
+            worker_pid=100,
+            worker_process_group_id=100,
+            worker_session_id=100,
+            worker_process_birth_id="boot-id:500",
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-02",
+        )
+
+        with mock.patch(
+            "vibe_loop.workers.process_group_is_live",
+            side_effect=AssertionError("host process table consulted"),
+        ):
+            process_state = classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: False,
+            )
+
+        self.assertEqual(process_state, "missing")
+
+    def test_worker_view_uses_one_process_snapshot_for_all_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            for worker_pid in (100, 200):
+                state = ActiveRunState(
+                    task_id=f"PAR-{worker_pid}",
+                    run_id=f"run-{worker_pid}",
+                    worker_pid=worker_pid,
+                    worker_process_group_id=worker_pid,
+                    worker_session_id=worker_pid,
+                    worker_process_birth_id=f"boot-id:{worker_pid}",
+                    host="test-host",
+                    started_at="2026-05-09T00:00:00+00:00",
+                    log_path=repo / f"run-{worker_pid}.log",
+                    base_main="abc123",
+                    command=f"agent PAR-{worker_pid}",
+                )
+                manager.acquire(
+                    state.task_id,
+                    state.run_id,
+                    metadata=state.to_lock_metadata(),
+                )
+            process_table = {
+                child_pid: ProcessNode(
+                    pid=child_pid,
+                    parent_pid=1,
+                    process_group_id=worker_pid,
+                    session_id=worker_pid,
+                    process_birth_id=f"boot-id:{child_pid}",
+                    state="S",
+                )
+                for worker_pid, child_pid in ((100, 101), (200, 201))
+            }
+            with (
+                mock.patch("vibe_loop.workers.pid_exists", return_value=False),
+                mock.patch(
+                    "vibe_loop.workers.read_process_table",
+                    return_value=process_table,
+                ) as read_table,
+            ):
+                views = build_worker_views(
+                    manager,
+                    run_store,
+                    current_host="test-host",
+                )
+
+        self.assertEqual([view.state for view in views], ["running", "running"])
+        self.assertEqual(read_table.call_count, 1)
 
     def test_supervisor_identity_proves_pre_worker_process_liveness(self) -> None:
         state = ActiveRunState(

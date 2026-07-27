@@ -6442,6 +6442,49 @@ class ActiveLockConflictDomainLivenessTests(unittest.TestCase):
         self.assertEqual(len(domains), 1)
         self.assertIn("db", domains[0].resources)
 
+    def test_group_liveness_uses_one_process_snapshot_for_all_locks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            for worker_pid in (999999901, 999999902):
+                state = dataclasses.replace(
+                    _active_run_state(
+                        task_id=f"LIVE-{worker_pid}",
+                        run_id=f"run-{worker_pid}",
+                        worker_pid=worker_pid,
+                        host=socket.gethostname(),
+                        repo=repo,
+                        resources=(f"resource-{worker_pid}",),
+                    ),
+                    worker_process_group_id=worker_pid,
+                    worker_session_id=worker_pid,
+                    worker_process_birth_id=f"boot-id:{worker_pid}",
+                )
+                manager.acquire(
+                    state.task_id,
+                    state.run_id,
+                    metadata=state.to_lock_metadata(),
+                )
+            process_table = {
+                worker_pid + 10: ProcessNode(
+                    pid=worker_pid + 10,
+                    parent_pid=1,
+                    process_group_id=worker_pid,
+                    session_id=worker_pid,
+                    process_birth_id=f"boot-id:{worker_pid + 10}",
+                    state="S",
+                )
+                for worker_pid in (999999901, 999999902)
+            }
+            with patch(
+                "vibe_loop.workers.read_process_table",
+                return_value=process_table,
+            ) as read_table:
+                domains = active_lock_conflict_domains(manager)
+
+        self.assertEqual(len(domains), 2)
+        self.assertEqual(read_table.call_count, 1)
+
 
 class StaleLockSelectionDrainingTests(unittest.TestCase):
     """list_candidates drains dep-free ready tasks past a stale broad lock."""
