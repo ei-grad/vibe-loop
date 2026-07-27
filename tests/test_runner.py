@@ -70,7 +70,10 @@ from vibe_loop.orchestration import (
     WorkspaceProvisioner,
 )
 from vibe_loop.runner import (
+    AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
     CLI_WORKER_ADDENDUM,
+    REVIEWER_SESSION_ATTESTATION_ENV,
+    RUNTIME_BOUND_REVIEWER_SESSION_ATTESTATION,
     RUNTIME_OWNED_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     ActivityEvent,
@@ -96,6 +99,7 @@ from vibe_loop.runner import (
     deterministic_task_batch,
     format_agent_command,
     implementer_session_from_records,
+    reviewer_session_attribution_from_records,
     reviewer_session_from_records,
     build_resume_continuation_prompt,
     classify_post_report_activity,
@@ -12864,14 +12868,13 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
 
 
 class TaskSourceSessionExportTests(unittest.TestCase):
-    """The task-source environment must carry who implemented and who reviewed.
+    """The task-source environment carries session attribution and its quality.
 
     A backend attributes a status transition to those sessions, and refuses to
     close a task whose reviewer is absent, so the runtime exports a value only
-    when the run actually recorded a usable session for that role. How strongly
-    the id is attested depends on the provider -- see
-    `runner.RECOGNIZED_SESSION_ID_SOURCES`; these tests cover what is exported,
-    not how much it is worth.
+    when the run actually recorded a usable session for that role. The reviewer
+    companion distinguishes a runtime-bound identity from one the agent
+    reported itself.
     """
 
     RUN_ID = "run-session-export"
@@ -12917,6 +12920,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
         verdict: str,
         session_id: str,
         session_id_source: str = "runtime_injected",
+        provider: str = "claude",
         pass_kind: str = "initial",
         run_id: str = RUN_ID,
         task_id: str = TASK_ID,
@@ -12930,6 +12934,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
                     "verdict": verdict,
                     "session_id": session_id,
                     "session_id_source": session_id_source,
+                    "route": {"provider": provider},
                 },
             )
         )
@@ -12952,7 +12957,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             include_reviewer_session=include_reviewer_session,
         )
 
-    def test_reviewed_run_exports_both_recorded_sessions(self) -> None:
+    def test_claude_review_exports_runtime_bound_attestation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = self._runner(directory)
             self._record_session_observed(
@@ -12975,6 +12980,10 @@ class TaskSourceSessionExportTests(unittest.TestCase):
         self.assertEqual(
             context["VIBE_LOOP_REVIEWER_SESSION"],
             "reviewer-session-a",
+        )
+        self.assertEqual(
+            context[REVIEWER_SESSION_ATTESTATION_ENV],
+            RUNTIME_BOUND_REVIEWER_SESSION_ATTESTATION,
         )
 
     def test_last_approving_pass_supplies_the_reviewer_session(self) -> None:
@@ -13016,6 +13025,10 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             context["VIBE_LOOP_REVIEWER_SESSION"],
             "reviewer-session-closure-2",
         )
+        self.assertEqual(
+            context[REVIEWER_SESSION_ATTESTATION_ENV],
+            RUNTIME_BOUND_REVIEWER_SESSION_ATTESTATION,
+        )
 
     def test_reviewer_session_absent_when_the_approval_is_unattributable(
         self,
@@ -13045,6 +13058,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             context = self._context(runner, self._lock(directory))
 
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
         self.assertEqual(
             context["VIBE_LOOP_IMPLEMENTER_SESSION"],
             "worker-session-a",
@@ -13066,6 +13080,31 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             context = self._context(runner, self._lock(directory))
 
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
+
+    def test_non_injecting_provider_cannot_claim_runtime_bound_attestation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            runner = self._runner(directory)
+            self._record_review_verdict(
+                runner,
+                verdict="approve",
+                session_id="reviewer-session-a",
+                session_id_source="runtime_injected",
+                provider="codex",
+            )
+
+            context = self._context(runner, self._lock(directory))
+
+        self.assertEqual(
+            context["VIBE_LOOP_REVIEWER_SESSION"],
+            "reviewer-session-a",
+        )
+        self.assertEqual(
+            context[REVIEWER_SESSION_ATTESTATION_ENV],
+            AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
+        )
 
     def test_the_run_id_is_never_exported_as_a_session(self) -> None:
         # The value the design most wants withheld, whatever source is claimed.
@@ -13087,6 +13126,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_settlement_and_reset_transitions_omit_the_reviewer(self) -> None:
         # A settled run merged nothing, so the approver of an unmerged
@@ -13111,6 +13151,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             )
 
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
         self.assertEqual(
             context["VIBE_LOOP_IMPLEMENTER_SESSION"],
             "worker-session-a",
@@ -13128,6 +13169,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             context = self._context(runner, self._lock(directory))
 
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_reviewer_session_absent_when_review_never_approved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -13146,6 +13188,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             context = self._context(runner, self._lock(directory))
 
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_implementer_session_absent_when_never_observed(self) -> None:
         # The runtime falls back to the run id when it never saw a session;
@@ -13179,6 +13222,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_inherited_session_values_are_dropped_not_passed_through(self) -> None:
         # An ambient value would attribute the transition to a session that did
@@ -13192,11 +13236,13 @@ class TaskSourceSessionExportTests(unittest.TestCase):
                 {
                     "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-implementer",
                     "VIBE_LOOP_REVIEWER_SESSION": "ambient-reviewer",
+                    REVIEWER_SESSION_ATTESTATION_ENV: "runtime-bound",
                 },
             )
 
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_inherited_review_carryover_is_dropped_not_passed_through(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -13234,6 +13280,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_session_ids_outside_the_identifier_alphabet_are_omitted(self) -> None:
         # Reviewer-reported ids are agent-influenced text; a value the runtime
@@ -13256,6 +13303,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", context)
         self.assertNotIn("VIBE_LOOP_REVIEWER_SESSION", context)
+        self.assertNotIn(REVIEWER_SESSION_ATTESTATION_ENV, context)
 
     def test_session_export_keeps_the_existing_context_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -13320,6 +13368,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
                 "verdict": "approve",
                 "session_id": "reviewer-session-a",
                 "session_id_source": "runtime_launch",
+                "route": {"provider": "codex"},
             },
         ]
 
@@ -13338,6 +13387,14 @@ class TaskSourceSessionExportTests(unittest.TestCase):
                 task_id=self.TASK_ID,
             ),
             "reviewer-session-a",
+        )
+        self.assertEqual(
+            reviewer_session_attribution_from_records(
+                records,
+                run_id=self.RUN_ID,
+                task_id=self.TASK_ID,
+            ).attestation,
+            AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
         )
 
     def test_a_non_session_state_transition_is_not_an_observation(self) -> None:
@@ -13377,6 +13434,9 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             '            "reviewer": os.environ.get(\n'
             '                "VIBE_LOOP_REVIEWER_SESSION", "<absent>"\n'
             "            ),\n"
+            '            "reviewer_attestation": os.environ.get(\n'
+            '                "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION", "<absent>"\n'
+            "            ),\n"
             "        }\n"
             "    )\n"
             ")\n",
@@ -13399,6 +13459,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
                 {
                     "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-stale-implementer",
                     "VIBE_LOOP_REVIEWER_SESSION": "ambient-stale-reviewer",
+                    REVIEWER_SESSION_ATTESTATION_ENV: "runtime-bound",
                 },
             ):
                 context = self._context(runner, self._lock(directory))
@@ -13410,7 +13471,11 @@ class TaskSourceSessionExportTests(unittest.TestCase):
 
         self.assertEqual(
             payload,
-            {"implementer": "<absent>", "reviewer": "<absent>"},
+            {
+                "implementer": "<absent>",
+                "reviewer": "<absent>",
+                "reviewer_attestation": "<absent>",
+            },
         )
 
     def test_derived_sessions_reach_the_adapter_process(self) -> None:
@@ -13435,6 +13500,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
                 {
                     "VIBE_LOOP_IMPLEMENTER_SESSION": "ambient-stale-implementer",
                     "VIBE_LOOP_REVIEWER_SESSION": "ambient-stale-reviewer",
+                    REVIEWER_SESSION_ATTESTATION_ENV: "agent-reported",
                 },
             ):
                 context = self._context(runner, self._lock(directory))
@@ -13449,6 +13515,7 @@ class TaskSourceSessionExportTests(unittest.TestCase):
             {
                 "implementer": "worker-session-a",
                 "reviewer": "reviewer-session-a",
+                "reviewer_attestation": "runtime-bound",
             },
         )
 
@@ -13568,6 +13635,10 @@ class TaskSourceSessionExportTests(unittest.TestCase):
         self.assertEqual(
             context["VIBE_LOOP_REVIEWER_SESSION"],
             result.session_id,
+        )
+        self.assertEqual(
+            context[REVIEWER_SESSION_ATTESTATION_ENV],
+            AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION,
         )
 
 

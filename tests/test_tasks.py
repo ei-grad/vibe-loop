@@ -2354,8 +2354,8 @@ class WithheldAdapterEnvironmentTests(unittest.TestCase):
     The runtime asserts absence by leaving a name out of the runtime context,
     but the child environment starts from `os.environ.copy()` and `dict.update`
     cannot remove a key. Without an explicit removal an ambient value satisfies
-    a name the runtime deliberately withheld -- which, for the session pair,
-    converts "no attestation" into an attestation a consumer then acts on.
+    a name the runtime deliberately withheld, converting absent attribution
+    into attribution a consumer then acts on.
     """
 
     AMBIENT = {
@@ -2366,6 +2366,7 @@ class WithheldAdapterEnvironmentTests(unittest.TestCase):
         "VIBE_LOOP_REPO": "/ambient/repo",
         "VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS": "99",
         "VIBE_LOOP_REVIEWER_SESSION": "ambient-reviewer",
+        "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION": "runtime-bound",
         "VIBE_LOOP_WORKTREE": "/ambient/worktree",
     }
 
@@ -2382,10 +2383,17 @@ class WithheldAdapterEnvironmentTests(unittest.TestCase):
     def test_supplied_names_override_the_ambient_value(self) -> None:
         with mock.patch.dict(os.environ, self.AMBIENT):
             environment = build_adapter_environment(
-                {"VIBE_LOOP_REVIEWER_SESSION": "derived-reviewer"}
+                {
+                    "VIBE_LOOP_REVIEWER_SESSION": "derived-reviewer",
+                    "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION": "agent-reported",
+                }
             )
 
         self.assertEqual(environment["VIBE_LOOP_REVIEWER_SESSION"], "derived-reviewer")
+        self.assertEqual(
+            environment["VIBE_LOOP_REVIEWER_SESSION_ATTESTATION"],
+            "agent-reported",
+        )
         self.assertNotIn("VIBE_LOOP_IMPLEMENTER_SESSION", environment)
 
     def test_state_dir_and_run_identity_are_still_inherited(self) -> None:

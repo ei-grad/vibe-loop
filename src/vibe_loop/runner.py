@@ -116,6 +116,7 @@ from vibe_loop.orchestration import (
     inject_claude_session,
     inject_provider_continuation,
     plan_session_continuation,
+    provider_capabilities,
     record_review_control_fence,
     require_candidate_review_clear,
     run_configured_command,
@@ -223,6 +224,9 @@ SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 # runtime must never export a placeholder, an empty value, or the run id.
 IMPLEMENTER_SESSION_ENV = "VIBE_LOOP_IMPLEMENTER_SESSION"
 REVIEWER_SESSION_ENV = "VIBE_LOOP_REVIEWER_SESSION"
+REVIEWER_SESSION_ATTESTATION_ENV = "VIBE_LOOP_REVIEWER_SESSION_ATTESTATION"
+RUNTIME_BOUND_REVIEWER_SESSION_ATTESTATION = "runtime-bound"
+AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION = "agent-reported"
 # The runtime stamps this source when it never saw a session and fell back to
 # the run id. That value identifies the run, not a session, so it attributes
 # nothing.
@@ -248,9 +252,9 @@ SESSION_ID_FALLBACK_SOURCE = "fallback:run_id"
 #   likes under any label in this set. The value is self-reported, not attested.
 #
 # What this list does buy on that path is bounded vocabulary; the run-id refusal
-# in `exportable_session_id` covers the one value that must never escape. Making
-# the distinction visible to the backend needs the export to carry attestation
-# quality, which is separate work.
+# in `exportable_session_id` covers the one value that must never escape.
+# `reviewer_session_attribution_from_records` combines the source with the
+# runtime-owned provider route before exporting the attestation quality.
 RECOGNIZED_SESSION_ID_SOURCES = frozenset(
     {"observed", "runtime_injected", "runtime_launch", "runtime_resumed"}
 )
@@ -4756,6 +4760,7 @@ class VibeRunner:
         records = self.run_store.read_records()
         context.pop(IMPLEMENTER_SESSION_ENV, None)
         context.pop(REVIEWER_SESSION_ENV, None)
+        context.pop(REVIEWER_SESSION_ATTESTATION_ENV, None)
         implementer_session = implementer_session_from_records(
             records,
             run_id=run_id,
@@ -4770,13 +4775,14 @@ class VibeRunner:
         # to the session that approved a candidate no one shipped.
         if not include_reviewer_session:
             return context
-        reviewer_session = reviewer_session_from_records(
+        reviewer_attribution = reviewer_session_attribution_from_records(
             records,
             run_id=run_id,
             task_id=task_id,
         )
-        if reviewer_session:
-            context[REVIEWER_SESSION_ENV] = reviewer_session
+        if reviewer_attribution.session_id:
+            context[REVIEWER_SESSION_ENV] = reviewer_attribution.session_id
+            context[REVIEWER_SESSION_ATTESTATION_ENV] = reviewer_attribution.attestation
         return context
 
     def acquire_scheduler_lock(self, run_id: str, task_id: str) -> SchedulerLock:
@@ -8668,10 +8674,9 @@ def exportable_session_id(record: Mapping[str, object], *, run_id: str) -> str:
     is reported by the agent, which could otherwise report it back as its own.
 
     How much the returned id is worth depends on the provider -- see
-    `RECOGNIZED_SESSION_ID_SOURCES`. On an injecting provider it is bound to the
-    id the runtime issued; on a non-injecting one the agent supplied it. This
-    function cannot tell a caller which, because the record does not distinguish
-    them; the export carries no attestation-quality signal today.
+    `RECOGNIZED_SESSION_ID_SOURCES`. This function validates identity syntax and
+    source vocabulary only; callers that need attestation quality must also
+    inspect the runtime-owned provider route.
     """
 
     session_id = record.get("session_id")
@@ -8720,7 +8725,28 @@ def reviewer_session_from_records(
     run_id: str,
     task_id: str,
 ) -> str:
-    """Session id behind the approval integration relied on, else "".
+    """Session id behind the approval integration relied on, else ""."""
+
+    return reviewer_session_attribution_from_records(
+        records,
+        run_id=run_id,
+        task_id=task_id,
+    ).session_id
+
+
+@dataclasses.dataclass(frozen=True)
+class ReviewerSessionAttribution:
+    session_id: str = ""
+    attestation: str = ""
+
+
+def reviewer_session_attribution_from_records(
+    records: Sequence[Mapping[str, object]],
+    *,
+    run_id: str,
+    task_id: str,
+) -> ReviewerSessionAttribution:
+    """Identity and attestation behind the approval integration relied on.
 
     The review loop exits into integration only on an approving pass, and the
     output parser refuses an `approve` that carries findings or that leaves any
@@ -8730,9 +8756,14 @@ def reviewer_session_from_records(
     change ever makes a second approving pass reachable: an earlier pass never
     stands in for a later one, including when the later one recorded no
     exportable session.
+
+    Attestation is runtime-bound only when the runtime-selected reviewer
+    provider supports session injection and the verdict carries an injected or
+    resumed source. A non-injecting reviewer supplies both the id and source, so
+    even a claimed ``runtime_injected`` label remains agent-reported.
     """
 
-    session_id = ""
+    attribution = ReviewerSessionAttribution()
     for record in records:
         if record.get("record_type") != REVIEW_VERDICT_RECORD_TYPE:
             continue
@@ -8741,7 +8772,26 @@ def reviewer_session_from_records(
         if record.get("verdict") not in {"approve", "clean"}:
             continue
         session_id = exportable_session_id(record, run_id=run_id)
-    return session_id
+        if not session_id:
+            attribution = ReviewerSessionAttribution()
+            continue
+        route = record.get("route")
+        provider = route.get("provider") if isinstance(route, Mapping) else None
+        session_id_source = record.get("session_id_source")
+        runtime_bound = (
+            isinstance(provider, str)
+            and provider_capabilities(provider, "reviewer").session_injection
+            and session_id_source in {"runtime_injected", "runtime_resumed"}
+        )
+        attribution = ReviewerSessionAttribution(
+            session_id=session_id,
+            attestation=(
+                RUNTIME_BOUND_REVIEWER_SESSION_ATTESTATION
+                if runtime_bound
+                else AGENT_REPORTED_REVIEWER_SESSION_ATTESTATION
+            ),
+        )
+    return attribution
 
 
 def write_log_header(

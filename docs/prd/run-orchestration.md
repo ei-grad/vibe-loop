@@ -205,6 +205,24 @@ configured reviewer and proceeds while recording the provider relation
 explicitly. Session identity, model/effort, and native usage are recorded for
 every initial and closure pass.
 
+The completion adapter receives the approving identity in
+`VIBE_LOOP_REVIEWER_SESSION` and its quality in
+`VIBE_LOOP_REVIEWER_SESSION_ATTESTATION`. The quality is `runtime-bound` only
+when the runtime-selected reviewer provider supports session injection and the
+approving pass used the injected or resumed identity; it is `agent-reported`
+for every non-injecting provider, regardless of the source label the reviewer
+reports. The quality variable is absent whenever the session variable is
+absent and from task-source transitions other than completion. A completion
+backend must persist the quality with the reviewer actor and expose it in task
+history rather than treating the two qualities as equivalent.
+
+Agent-reported identities are accepted and recorded by default so legitimate
+non-injecting reviewer providers remain usable. Each project may instead
+require `runtime-bound` identity through explicit task-source backend policy;
+that policy must refuse an agent-reported completion before changing project
+state. A backend that supports neither recording the quality nor an explicit
+policy does not implement this completion contract.
+
 The exact runtime-owned Codex reviewer command `codex review {prompt}` has no
 supported way to bind a first-class provider/model/effort route without changing
 argv. Project config cannot override `model_provider`, and the command exposes
