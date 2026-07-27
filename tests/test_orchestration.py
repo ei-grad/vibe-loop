@@ -7314,29 +7314,28 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(preflight["decision"], "reusable")
             self.assertTrue(preflight["worker_launch_allowed"])
 
-    def test_retry_disposition_does_not_park_immutable_workspace_failures(
+    def test_retry_disposition_only_retries_fixed_recovery_identity_failures(
         self,
     ) -> None:
-        immutable_failures = {
+        for code in {
             "incomplete_recovery_workspace",
             "primary_workspace_forbidden",
-            "recovery_base_changed",
-            "workspace_base_unverified",
-            "workspace_changed_during_claim",
-            "workspace_collision",
-            "workspace_foreign_owner",
-            "workspace_ownership_unverified",
-            "workspace_refresh_conflict",
-            "workspace_refresh_restore_failed",
-        }
-        for code in immutable_failures:
+        }:
             with self.subTest(code=code):
                 self.assertEqual(workspace_retry_disposition(code), "retry_later")
 
         for code in {
             "dirty_existing_workspace",
+            "recovery_base_changed",
+            "workspace_base_unverified",
+            "workspace_changed_during_claim",
+            "workspace_collision",
+            "workspace_foreign_owner",
             "workspace_live_owner",
             "workspace_main_history_mismatch",
+            "workspace_ownership_unverified",
+            "workspace_refresh_conflict",
+            "workspace_refresh_restore_failed",
             "workspace_stale_current_base",
         }:
             with self.subTest(code=code):
@@ -7865,7 +7864,7 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, "workspace_refresh_conflict")
             self.assertEqual(
                 raised.exception.retry_disposition,
-                "retry_later",
+                "defer_until_workspace_changes",
             )
             self.assertEqual(raised.exception.details["conflict_paths"], ["shared.txt"])
             self.assertEqual(
@@ -8384,9 +8383,12 @@ class WorkspaceProvisionerTests(unittest.TestCase):
             )
             self.assertEqual(
                 rejected[0]["retry_disposition"],
-                "retry_later",
+                "defer_until_workspace_changes",
             )
-            self.assertEqual(runner.unchanged_workspace_dispatch_deferrals(), set())
+            self.assertEqual(
+                runner.unchanged_workspace_dispatch_deferrals(),
+                {task.task_id},
+            )
 
     def test_runner_rejects_head_change_between_preflight_and_claim(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8519,7 +8521,9 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 "preserve\n",
             )
 
-    def test_unowned_branch_collision_selects_unused_workspace_identity(self) -> None:
+    def test_unowned_branch_collision_preserves_commits_and_reports_identity(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             init_git_repo(repo)
@@ -8536,22 +8540,43 @@ class WorkspaceProvisionerTests(unittest.TestCase):
                 recovery_branch="",
                 recovery_worktree=None,
             )
-            git(repo, "branch", branch)
-            preserved_head = git(repo, "rev-parse", branch).stdout.strip()
-
-            workspace = provisioner.provision(
-                task_id="TASK-01",
-                run_id="run-1",
-                base_commit=base,
-                fencing_token=token,
+            seed_worktree = Path(directory) / "seed-worktree"
+            git(repo, "worktree", "add", "-b", branch, str(seed_worktree), base)
+            (seed_worktree / "candidate.txt").write_text(
+                "preserved\n", encoding="utf-8"
             )
+            git(seed_worktree, "add", "candidate.txt")
+            git(seed_worktree, "commit", "-m", "preserve unowned candidate")
+            preserved_head = git(repo, "rev-parse", branch).stdout.strip()
+            git(repo, "worktree", "remove", str(seed_worktree))
 
-            self.assertEqual(workspace.mode, "created")
-            self.assertNotEqual(workspace.branch, branch)
-            self.assertNotEqual(workspace.worktree, default_worktree)
+            with self.assertRaises(WorkspaceProvisionError) as raised:
+                provisioner.provision(
+                    task_id="TASK-01",
+                    run_id="run-1",
+                    base_commit=base,
+                    fencing_token=token,
+                )
+
+            self.assertEqual(raised.exception.code, "workspace_collision")
+            self.assertEqual(
+                raised.exception.retry_disposition,
+                "defer_until_workspace_changes",
+            )
             self.assertEqual(
                 git(repo, "rev-parse", branch).stdout.strip(), preserved_head
             )
+            self.assertFalse(default_worktree.exists())
+            preflight = store.read_records()[-1]
+            self.assertEqual(preflight["record_type"], "workspace_preflight")
+            self.assertEqual(preflight["decision"], "rejected")
+            self.assertEqual(preflight["reason"], "workspace_collision")
+            self.assertEqual(
+                preflight["retry_disposition"],
+                "defer_until_workspace_changes",
+            )
+            self.assertEqual(preflight["branch"], branch)
+            self.assertEqual(preflight["worktree"], str(default_worktree))
 
     def test_dirty_primary_fails_before_workspace_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

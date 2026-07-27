@@ -5972,13 +5972,21 @@ WORKSPACE_STATE_CHANGE_REQUIRED = frozenset(
     {
         "ambiguous_owned_workspaces",
         "dirty_existing_workspace",
+        "recovery_base_changed",
         "recovery_dirty_content_changed",
         "recovery_dirty_snapshot_changed",
         "recovery_git_common_dir_changed",
         "recovery_head_changed",
         "workspace_base_mismatch",
+        "workspace_base_unverified",
+        "workspace_changed_during_claim",
+        "workspace_collision",
+        "workspace_foreign_owner",
         "workspace_live_owner",
         "workspace_main_history_mismatch",
+        "workspace_ownership_unverified",
+        "workspace_refresh_conflict",
+        "workspace_refresh_restore_failed",
         "workspace_stale_current_base",
     }
 )
@@ -6309,24 +6317,10 @@ class WorkspaceProvisioner:
         if owned is not None:
             return owned
         name = workspace_name(task_id)
-        worktree_root = self.repo.parent / f"{self.repo.name}-worktrees"
-        branch = f"{WORKSPACE_BRANCH_PREFIX}{name}"
-        worktree = worktree_root / name
-        suffix = 1
-        while (
-            self._git_returncode(
-                "show-ref",
-                "--verify",
-                "--quiet",
-                f"refs/heads/{branch}",
-            )
-            == 0
-            or worktree.exists()
-        ):
-            suffix += 1
-            branch = f"{WORKSPACE_BRANCH_PREFIX}{name}-{suffix}"
-            worktree = worktree_root / f"{name}-{suffix}"
-        return branch, worktree
+        return (
+            f"{WORKSPACE_BRANCH_PREFIX}{name}",
+            self.repo.parent / f"{self.repo.name}-worktrees" / name,
+        )
 
     def _create_or_adopt(
         self,
