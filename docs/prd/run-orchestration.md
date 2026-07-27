@@ -259,6 +259,26 @@ preserved approved candidate branch and commit; a generic conflict reason alone
 is insufficient. The runtime never performs semantic conflict resolution
 itself.
 
+Main verification runs the exact target commit in a temporary standalone clone
+whose refs and worktree registry are independent of the live primary
+repository. The clone reuses local Git objects and links ignored local
+dependencies and configuration, except `.vibe-loop` runtime control state, so
+verification retains the configured environment without observing concurrent
+runtime ref or worktree changes. Failure to prepare that checkout is recorded
+as an `execution_error`, distinct from a command failure.
+
+If main verification fails after a fast-forward, the runtime restores
+`main_before` with Git's keep-local-changes semantics. Unrelated tracked edits
+in the primary checkout survive the rollback; an overlapping edit makes
+restoration fail closed rather than discarding operator work. The integration
+result records the actual post-attempt ref in `main_after`, names the
+`main_recovery` outcome, and sets `recovered` when the mainline was restored.
+`recovered` denotes any successful integration recovery, including stale-lock
+recovery, already-merged reconciliation, or mainline restoration;
+`integration_lock_recovered` in diagnostics preserves the narrower lock fact.
+When the candidate already preceded `main_before`, no rollback occurs and a
+verification failure records that already-merged state explicitly.
+
 The runtime-owned contract must declare a completion path and contract
 validation fails closed
 before any mutation when none is available: either the runtime performs the
@@ -295,8 +315,9 @@ serialized integration window once. If the retry also expires, the runtime
 records retry exhaustion and returns a blocked result instead of waiting
 indefinitely. The wait per attempt is configurable as
 `orchestration.integration_lock_timeout_seconds`; its 900-second default exceeds
-this repository's measured 328-second verify-on-main duration and leaves time
-for refresh, merge, provenance, and routine variance.
+this repository's measured 328-second verify-on-main duration, including
+lightweight isolated-checkout preparation through local Git object reuse, and
+leaves time for refresh, merge, provenance, and routine variance.
 
 A failure before worker launch must not retain its task lock. If activation may
 already have succeeded, pre-launch finalization releases the lock and

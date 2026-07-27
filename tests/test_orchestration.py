@@ -2123,6 +2123,22 @@ class RuntimeIntegrationTests(unittest.TestCase):
             "1",
         )
 
+    def test_already_merged_verification_failure_names_mainline_state(self) -> None:
+        git(self.repo, "merge", "--ff-only", "worker/TASK-01")
+        main_head = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+
+        result = self.integrator(
+            commands=("true", "false"),
+            integration_keys=(),
+        ).run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertEqual(result.main_before, main_head)
+        self.assertEqual(result.main_after, main_head)
+        self.assertTrue(result.diagnostics["candidate_already_merged"])
+        self.assertEqual(result.diagnostics["main_recovery"], "not_required")
+        self.assertFalse(result.diagnostics["integration_lock_recovered"])
+
     def test_strict_ancestor_candidate_reconciles_with_verification(self) -> None:
         git(self.repo, "merge", "--ff-only", self.candidate_head)
         target_head = self.advance_main()
@@ -2910,8 +2926,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(self.manager.main_integration_status().locked)
 
-    def test_main_verification_failure_records_moved_ref_for_recovery(self) -> None:
-        main_before = self.advance_main()
+    def test_main_verification_failure_restores_main_and_records_recovery(self) -> None:
+        self.advance_main()
+        operator_file = self.repo / "operator.txt"
+        operator_file.write_text("committed\n", encoding="utf-8")
+        git(self.repo, "add", "operator.txt")
+        git(self.repo, "commit", "-m", "operator baseline")
+        main_before = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        operator_file.write_text("uncommitted operator work\n", encoding="utf-8")
 
         result = self.integrator(
             commands=("true", "false"),
@@ -2919,20 +2941,312 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertEqual(result.diagnostics["main_recovery"], "restored")
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), main_before
+        )
+        self.assertEqual(
+            operator_file.read_text(encoding="utf-8"),
+            "uncommitted operator work\n",
+        )
+        self.assertEqual(
+            git(self.repo, "status", "--short").stdout, " M operator.txt\n"
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_main_recovery_refuses_to_overwrite_overlapping_worktree_change(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+
+        def fail_after_main_change(command, **kwargs):
+            if command == "main-check":
+                (self.repo / "candidate.txt").write_text(
+                    "uncommitted operator work\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 1)
+            return subprocess.CompletedProcess(command, 0)
+
+        result = self.integrator(
+            commands=("integration-check", "main-check"),
+            executor=fail_after_main_change,
+        ).run()
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertFalse(result.recovered)
+        self.assertNotEqual(result.main_after, main_before)
+        self.assertEqual(result.main_after, result.refreshed_head)
+        self.assertEqual(
+            result.diagnostics["main_recovery"],
+            "worktree_restore_refused",
+        )
+        self.assertEqual(
+            (self.repo / "candidate.txt").read_text(encoding="utf-8"),
+            "uncommitted operator work\n",
+        )
+        self.assertEqual(
+            git(self.repo, "status", "--short").stdout,
+            " M candidate.txt\n",
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_main_recovery_refuses_when_main_changed_before_restore(self) -> None:
+        main_before = self.advance_main()
+
+        def move_main_before_failure(command, **kwargs):
+            if command == "main-check":
+                advanced_main = git(self.repo, "rev-parse", "HEAD").stdout.strip()
+                git(
+                    self.repo,
+                    "update-ref",
+                    "refs/heads/main",
+                    main_before,
+                    advanced_main,
+                )
+                return subprocess.CompletedProcess(command, 1)
+            return subprocess.CompletedProcess(command, 0)
+
+        result = self.integrator(
+            commands=("integration-check", "main-check"),
+            executor=move_main_before_failure,
+        ).run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertFalse(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertEqual(
+            result.diagnostics["main_recovery"],
+            "main_changed_before_restore",
+        )
+        self.assertEqual(result.diagnostics["expected_main"], result.refreshed_head)
+
+    def test_main_verification_clone_failure_is_recorded_and_restores_main(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+        integrator = self.integrator()
+        run_git = integrator._git
+
+        def fail_clone(worktree, *args):
+            if args and args[0] == "clone":
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="clone failed",
+                )
+            return run_git(worktree, *args)
+
+        with patch.object(integrator, "_git", side_effect=fail_clone):
+            result = integrator.run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertEqual(result.verification[-1].exit_class, "execution_error")
+        self.assertIn(
+            "isolated main verification checkout could not be prepared",
+            Path(result.verification[-1].log_reference).read_text(encoding="utf-8"),
+        )
+
+    def test_main_verification_checkout_failure_is_recorded_and_restores_main(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+        integrator = self.integrator()
+        run_git = integrator._git
+
+        def fail_checkout(worktree, *args):
+            if args and args[0] == "checkout":
+                return subprocess.CompletedProcess(
+                    args,
+                    1,
+                    stdout="",
+                    stderr="checkout failed",
+                )
+            return run_git(worktree, *args)
+
+        with patch.object(integrator, "_git", side_effect=fail_checkout):
+            result = integrator.run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertEqual(result.verification[-1].exit_class, "execution_error")
+
+    def test_main_verification_local_state_failure_is_recorded_and_restores_main(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+        integrator = self.integrator()
+
+        with patch.object(
+            integrator,
+            "_link_ignored_verification_state",
+            return_value="local state unavailable",
+        ):
+            result = integrator.run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertEqual(result.verification[-1].exit_class, "execution_error")
+        self.assertIn(
+            "local state unavailable",
+            Path(result.verification[-1].log_reference).read_text(encoding="utf-8"),
+        )
+
+    def test_main_verification_failure_preserves_recovered_lock_diagnostic(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+
+        result = self.integrator(commands=("true", "false")).run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertTrue(result.diagnostics["integration_lock_recovered"])
+
+    def test_recovered_lock_survives_refused_main_restore(self) -> None:
+        main_before = self.advance_main()
+        self.manager.acquire_main_integration(
+            task_id="TASK-01",
+            run_id="run-1",
+            metadata={"pid": 999_999_999},
+        )
+
+        def fail_after_main_change(command, **kwargs):
+            if command == "main-check":
+                (self.repo / "candidate.txt").write_text(
+                    "uncommitted operator work\n",
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(command, 1)
+            return subprocess.CompletedProcess(command, 0)
+
+        result = self.integrator(
+            commands=("integration-check", "main-check"),
+            executor=fail_after_main_change,
+        ).run()
+
+        self.assertEqual(result.reason, "main_verification_failed")
+        self.assertTrue(result.recovered)
         self.assertNotEqual(result.main_after, main_before)
         self.assertEqual(
-            git(self.repo, "rev-parse", "HEAD").stdout.strip(), result.main_after
+            result.diagnostics["main_recovery"],
+            "worktree_restore_refused",
         )
-        self.assertTrue(
+        self.assertTrue(result.diagnostics["integration_lock_recovered"])
+
+    def test_main_verification_is_isolated_from_sibling_repository_activity(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+        sibling_worktree = Path(self.directory.name) / "sibling-worktree"
+        local_dependency = self.repo / "local-dependency"
+        local_dependency.mkdir()
+        (local_dependency / "ready").write_text("ready\n", encoding="utf-8")
+        exclude = (
+            self.repo
+            / git(
+                self.repo,
+                "rev-parse",
+                "--git-path",
+                "info/exclude",
+            ).stdout.strip()
+        )
+        exclude.write_text(
+            exclude.read_text(encoding="utf-8") + "local-dependency/\n",
+            encoding="utf-8",
+        )
+        verification_worktree = None
+
+        def repository_sensitive_check(command, **kwargs):
+            nonlocal verification_worktree
+            if command == "integration-check":
+                return subprocess.CompletedProcess(command, 0)
+            verification_worktree = Path(kwargs["cwd"])
+            self.assertFalse((verification_worktree / ".vibe-loop").exists())
+            self.assertEqual(
+                (verification_worktree / "local-dependency/ready").read_text(
+                    encoding="utf-8"
+                ),
+                "ready\n",
+            )
+            isolated_common_dir = git(
+                verification_worktree,
+                "rev-parse",
+                "--git-common-dir",
+            ).stdout.strip()
+            primary_common_dir = git(
+                self.repo,
+                "rev-parse",
+                "--git-common-dir",
+            ).stdout.strip()
+            self.assertNotEqual(
+                (verification_worktree / isolated_common_dir).resolve(),
+                (self.repo / primary_common_dir).resolve(),
+            )
+            refs_before = git(
+                verification_worktree,
+                "show-ref",
+            ).stdout
+            worktrees_before = git(
+                verification_worktree,
+                "worktree",
+                "list",
+                "--porcelain",
+            ).stdout
             git(
                 self.repo,
-                "merge-base",
-                "--is-ancestor",
-                result.refreshed_head,
-                "main",
-            ).returncode
-            == 0
+                "worktree",
+                "add",
+                "-b",
+                "sibling-run-active",
+                str(sibling_worktree),
+                main_before,
+            )
+            refs_after = git(
+                verification_worktree,
+                "show-ref",
+            ).stdout
+            worktrees_after = git(
+                verification_worktree,
+                "worktree",
+                "list",
+                "--porcelain",
+            ).stdout
+            return subprocess.CompletedProcess(
+                command,
+                0
+                if (refs_before, worktrees_before) == (refs_after, worktrees_after)
+                else 1,
+            )
+
+        result = self.integrator(
+            commands=("integration-check", "repository-sensitive-check"),
+            executor=repository_sensitive_check,
+        ).run()
+
+        self.assertTrue(result.completed)
+        self.assertIsNotNone(verification_worktree)
+        self.assertNotEqual(verification_worktree, self.repo)
+        self.assertEqual(result.main_before, main_before)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(),
+            result.main_after,
         )
+        self.assertTrue(sibling_worktree.exists())
         self.assertFalse(self.manager.main_integration_status().locked)
 
     def test_non_main_checkout_is_blocked_without_moving_configured_ref(self) -> None:
