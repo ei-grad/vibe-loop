@@ -970,8 +970,17 @@ def add_autopilot_run_arguments(parser: argparse.ArgumentParser) -> None:
         type=positive_int_argument,
         default=None,
         help=(
-            "Positive minimum runnable tasks required before launching a child "
+            "Positive runnable-task threshold that triggers planning refill "
             "(overrides [autopilot] min_ready; default 1)"
+        ),
+    )
+    parser.add_argument(
+        "--dispatch-min-ready",
+        type=positive_int_argument,
+        default=None,
+        help=(
+            "Positive minimum runnable tasks required before launching a child "
+            "(overrides [autopilot] dispatch_min_ready; default 1)"
         ),
     )
     parser.add_argument(
@@ -1640,6 +1649,11 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             0.0,
         )
         min_ready = _first_set(getattr(args, "min_ready", None), ap.min_ready, 1)
+        dispatch_min_ready = _first_set(
+            getattr(args, "dispatch_min_ready", None),
+            ap.dispatch_min_ready,
+            1,
+        )
         if command == "start":
             launch = start_detached_autopilot(
                 config,
@@ -1653,6 +1667,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
                 max_slices=getattr(args, "max_slices", 0),
                 max_tasks=getattr(args, "max_tasks", 0),
                 min_ready=min_ready,
+                dispatch_min_ready=dispatch_min_ready,
             )
             if getattr(args, "json", False):
                 print(json.dumps(launch.to_json(), indent=2))
@@ -1671,6 +1686,7 @@ def dispatch_autopilot(args: argparse.Namespace, config) -> int:
             max_slices=getattr(args, "max_slices", 0),
             max_tasks=getattr(args, "max_tasks", 0),
             min_ready=min_ready,
+            dispatch_min_ready=dispatch_min_ready,
             install_reload_signal=bool(getattr(args, "detached_reload_signal", False)),
         )
         print(json.dumps(summary.to_json(), indent=2, default=list))
@@ -1899,6 +1915,8 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             lines.append(f"planning outcome: {cycle.planning_outcome}")
         if cycle.planning_backoff_action:
             lines.append(f"planning backoff: {cycle.planning_backoff_action}")
+        if cycle.dispatch_floor_action:
+            lines.append(f"dispatch floor: {cycle.dispatch_floor_action}")
     if status.next_wake:
         lines.append(f"next wake: {status.next_wake}")
     if status.attempt_circuit_breakers:

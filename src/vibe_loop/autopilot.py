@@ -277,6 +277,7 @@ NATIVE_PLANNING_LIMIT_WALL_ACTION = "native_planning_limit_wall"
 CHILD_LIMIT_WALL_ACTION = "limit_wall_pause"
 PLANNING_BACKOFF_ACTION = "planning_backoff"
 PLANNING_OUTCOME_ACTION_PREFIX = "native_planning_outcome:"
+DISPATCH_FLOOR_HOLD_ACTION = "dispatch_floor_hold"
 LIMIT_WALL_ACTION_PREFIXES = (
     f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:",
     f"{CHILD_LIMIT_WALL_ACTION}:",
@@ -316,6 +317,14 @@ class CycleSummary:
         """
         for action in self.actions:
             if action.startswith(f"{PLANNING_BACKOFF_ACTION}:"):
+                return action
+        return ""
+
+    @property
+    def dispatch_floor_action(self) -> str:
+        """The explicit dispatch-floor hold recorded for this cycle, if any."""
+        for action in self.actions:
+            if action.startswith(f"{DISPATCH_FLOOR_HOLD_ACTION}:"):
                 return action
         return ""
 
@@ -2028,6 +2037,7 @@ def detached_autopilot_command(
     max_slices: int,
     max_tasks: int,
     min_ready: int,
+    dispatch_min_ready: int = 1,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -2043,6 +2053,8 @@ def detached_autopilot_command(
         str(interval),
         "--min-ready",
         str(min_ready),
+        "--dispatch-min-ready",
+        str(dispatch_min_ready),
         "--worktree-disposition",
         config.autopilot.worktree_disposition,
         "--detached-reload-signal",
@@ -2077,6 +2089,7 @@ def start_detached_autopilot(
     max_slices: int = 0,
     max_tasks: int = 0,
     min_ready: int = 1,
+    dispatch_min_ready: int = 1,
     verification_timeout: float = 5.0,
     verification_interval: float = 0.05,
 ) -> DetachedAutopilotLaunch:
@@ -2142,6 +2155,7 @@ def start_detached_autopilot(
         max_slices=max_slices,
         max_tasks=max_tasks,
         min_ready=min_ready,
+        dispatch_min_ready=dispatch_min_ready,
     )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     child_environment, context_file = runtime_context_subprocess_transport(
@@ -6231,8 +6245,10 @@ def execute_autopilot_cycle(
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
     supervisor_blockers: tuple[str, ...] = (),
+    dispatch_min_ready: int = 1,
 ) -> AutopilotCycleResult:
     min_ready = require_positive_min_ready(min_ready)
+    dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
     cycle_started_at = utc_now_iso()
     status = collect_project_status(config, process_exists=process_exists)
     runnable = status.queue.runnable
@@ -6292,7 +6308,13 @@ def execute_autopilot_cycle(
         status = collect_project_status(config, process_exists=process_exists)
         runnable = status.queue.runnable
 
-    if config.autopilot.require_upstream_sync:
+    def apply_fresh_upstream_sync(
+        project_status: ProjectStatus,
+        *,
+        record_action: bool,
+    ) -> ProjectStatus:
+        if not config.autopilot.require_upstream_sync:
+            return project_status
         upstream = check_upstream_sync(
             config.repo,
             config.main_branch,
@@ -6301,22 +6323,30 @@ def execute_autopilot_cycle(
         )
         retained_blockers = tuple(
             blocker
-            for blocker in status.blockers
+            for blocker in project_status.blockers
             if not blocker.startswith("upstream_sync:")
         )
         if upstream.satisfied:
-            status = dataclasses.replace(status, blockers=retained_blockers)
-            actions.append("upstream_sync:equal")
+            updated = dataclasses.replace(
+                project_status,
+                blockers=retained_blockers,
+            )
+            action = "upstream_sync:equal"
         else:
             assert upstream.blocker is not None
-            status = dataclasses.replace(
-                status,
+            updated = dataclasses.replace(
+                project_status,
                 blockers=(
                     *retained_blockers,
                     f"upstream_sync:{upstream.blocker.code}",
                 ),
             )
-            actions.append(f"upstream_sync:{upstream.blocker.code}")
+            action = f"upstream_sync:{upstream.blocker.code}"
+        if record_action:
+            actions.append(action)
+        return updated
+
+    status = apply_fresh_upstream_sync(status, record_action=True)
 
     disposition = worktree_disposition_runner(
         config,
@@ -6351,15 +6381,19 @@ def execute_autopilot_cycle(
     run_store.append_record(cycle_summary.to_record(config.repo))
     actions.append(cycle_summary.action)
 
-    blocker_list = list(status.blockers)
-    blocker_list.extend(supervisor_blockers)
-    if not config.autopilot.require_clean_repo and "repo_dirty" in blocker_list:
-        blocker_list.remove("repo_dirty")
-        actions.append("repo_dirty_ignored")
-    if cleanup_errors:
-        blocker_list.append("stale_lock_cleanup_failed")
-    if disk_health.blocker:
-        blocker_list.append(disk_health.blocker)
+    def current_blockers(project_status: ProjectStatus) -> list[str]:
+        current = [*project_status.blockers, *supervisor_blockers]
+        if not config.autopilot.require_clean_repo and "repo_dirty" in current:
+            current.remove("repo_dirty")
+            if "repo_dirty_ignored" not in actions:
+                actions.append("repo_dirty_ignored")
+        if cleanup_errors:
+            current.append("stale_lock_cleanup_failed")
+        if disk_health.blocker:
+            current.append(disk_health.blocker)
+        return current
+
+    blocker_list = current_blockers(status)
 
     def run_maintenance(kind: str) -> MaintenanceCommandResult | None:
         command = config.autopilot.maintenance_command(kind)
@@ -6386,11 +6420,8 @@ def execute_autopilot_cycle(
             blocker_list.append("autopilot_health_failed")
 
     blockers = tuple(blocker_list)
-    if blockers:
-        cycle_status = "blocked"
-        actions.append("blocked_preflight")
-    elif runnable < min_ready:
-        cycle_status = "idle"
+    blockers_checked_after_planning = False
+    if not blockers and runnable < min_ready:
         active_conflict_workers = active_conflict_worker_count(status.workers)
         planning = run_maintenance("planning")
         if planning is None:
@@ -6491,6 +6522,30 @@ def execute_autopilot_cycle(
                 actions.append("no_runnable_work")
             else:
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
+        status = apply_fresh_upstream_sync(
+            collect_project_status(config, process_exists=process_exists),
+            record_action=False,
+        )
+        runnable = status.queue.runnable
+        blocker_list = current_blockers(status)
+        blockers = tuple(blocker_list)
+        blockers_checked_after_planning = True
+
+    if blockers:
+        cycle_status = "blocked"
+        actions.append(
+            "blocked_post_planning"
+            if blockers_checked_after_planning
+            else "blocked_preflight"
+        )
+    elif planning_limit_wall_pause is not None:
+        cycle_status = "idle"
+    elif runnable < dispatch_min_ready:
+        cycle_status = "idle"
+        if runnable > 0:
+            actions.append(
+                f"{DISPATCH_FLOOR_HOLD_ACTION}:{runnable}/{dispatch_min_ready}"
+            )
     elif (
         external_pid := collect_external_run_supervisor(
             run_store, process_exists=process_exists
@@ -6608,14 +6663,24 @@ def require_positive_min_ready(min_ready: int) -> int:
     return min_ready
 
 
+def require_positive_dispatch_min_ready(dispatch_min_ready: int) -> int:
+    if (
+        isinstance(dispatch_min_ready, bool)
+        or not isinstance(dispatch_min_ready, int)
+        or dispatch_min_ready < 1
+    ):
+        raise ValueError("dispatch_min_ready must be a positive integer")
+    return dispatch_min_ready
+
+
 def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
     """Whether a finished cycle should use the adaptive idle waiter.
 
     An idle cycle is one that neither dispatched nor observed a child because
-    runnable work was below ``min_ready`` or because a successful child exited
-    without durable ``run_started`` evidence. Both cases poll for task-source
-    changes, but only the below-threshold case wakes merely because the runnable
-    count reaches ``min_ready``.
+    runnable work was below the dispatch floor or because a successful child
+    exited without durable ``run_started`` evidence. Both cases poll for
+    task-source changes, but only the below-floor case wakes merely because the
+    runnable count reaches the dispatch floor.
 
     An idle cycle with no planning command configured still rechecks: that is
     deliberate, so out-of-band task additions (a peer or operator filling the
@@ -7300,6 +7365,7 @@ def run_autopilot(
     max_slices: int = 0,
     max_tasks: int = 0,
     min_ready: int = 1,
+    dispatch_min_ready: int = 1,
     process_exists: ProcessExists | None = None,
     sleep: Sleep | None = None,
     launcher: RunUntilDoneLauncher | None = None,
@@ -7325,6 +7391,7 @@ def run_autopilot(
     """
     interval = require_autopilot_interval(interval)
     min_ready = require_positive_min_ready(min_ready)
+    dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
 
     supervisor_run_id = new_run_id("autopilot")
     binding = resolve_project_binding(config)
@@ -7553,6 +7620,7 @@ def run_autopilot(
                 max_slices=max_slices,
                 max_tasks=max_tasks,
                 min_ready=min_ready,
+                dispatch_min_ready=dispatch_min_ready,
                 process_exists=process_exists,
                 launcher=launch,
                 run_store=run_store,
@@ -7733,7 +7801,7 @@ def run_autopilot(
                         sleeper=reload_sleeper,
                         should_stop=should_stop,
                         should_reload=reload_requested.is_set,
-                        min_ready=min_ready,
+                        min_ready=dispatch_min_ready,
                         wake_adapter=wake_adapter_callback,
                         active_runs=tuple(
                             worker.active

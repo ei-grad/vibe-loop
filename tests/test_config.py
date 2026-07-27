@@ -704,6 +704,7 @@ class ConfigTests(unittest.TestCase):
                 "jobs = 2\n"
                 "interval_seconds = 60.0\n"
                 "min_ready = 2\n"
+                "dispatch_min_ready = 3\n"
                 "planning_recheck_seconds = 45.0\n"
                 "idle_poll_max_seconds = 300.0\n"
                 "require_clean_repo = false\n"
@@ -719,6 +720,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.autopilot.jobs, 2)
         self.assertEqual(config.autopilot.interval_seconds, 60.0)
         self.assertEqual(config.autopilot.min_ready, 2)
+        self.assertEqual(config.autopilot.dispatch_min_ready, 3)
         self.assertEqual(config.autopilot.planning_recheck_seconds, 45.0)
         self.assertEqual(config.autopilot.to_json()["planning_recheck_seconds"], 45.0)
         self.assertEqual(config.autopilot.idle_poll_max_seconds, 300.0)
@@ -744,6 +746,7 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.autopilot.jobs)
         self.assertIsNone(config.autopilot.interval_seconds)
         self.assertIsNone(config.autopilot.min_ready)
+        self.assertIsNone(config.autopilot.dispatch_min_ready)
         self.assertTrue(config.autopilot.require_clean_repo)
         self.assertEqual(config.autopilot.worktree_disposition, "report-only")
         self.assertEqual(config.autopilot.planning_recheck_seconds, 60.0)
@@ -769,6 +772,7 @@ class ConfigTests(unittest.TestCase):
         cases = [
             ("jobs = 0\n", "autopilot.jobs"),
             ("min_ready = -1\n", "autopilot.min_ready"),
+            ("dispatch_min_ready = 0\n", "autopilot.dispatch_min_ready"),
             ('interval_seconds = "soon"\n', "autopilot.interval_seconds"),
             (
                 "interval_seconds = 59.9\n",

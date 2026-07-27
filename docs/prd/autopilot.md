@@ -764,20 +764,28 @@ not mistaken for fresh planning evidence. The daily cap is a spend ceiling, not
 an evidence gate, so a changed fingerprint does not lift it.
 
 During an outcome backoff, the idle waiter compares each complete task-source
-snapshot with the pre-wait fingerprint in addition to checking `min_ready`. A
+snapshot with the pre-wait fingerprint in addition to checking
+`dispatch_min_ready`. A
 same-cardinality replacement or content/source edit therefore wakes the next
 cycle even when runnable depth remains below the dispatch threshold. Status-only
 and counter-only churn retains the same fingerprint and does not wake early.
 
+The planning-refill threshold (`min_ready`) and dispatch floor
+(`dispatch_min_ready`, default `1`) are independent. Existing `min_ready`
+configuration continues to control planning but cannot suppress dispatch by
+itself. A nonempty queue below the explicit dispatch floor remains idle and
+records `dispatch_floor_hold:N/F`; status renders that action so the hold cannot
+be mistaken for an empty board.
+
 The backoff extends the idle wait budget rather than adding a blocking sleep, so
 it can never shorten an operator's configured interval, only lengthen it, and so
 the idle waiter keeps its existing guarantees throughout: a task source that
-reaches `min_ready` still wakes the next cycle early and dispatches at most one
-implementer, stop requests are still honoured per slice, exponential poll backoff
-still prevents a busy loop, and the journaled `next_wake` is the deadline the
-supervisor actually honours. Status output must name the recorded outcome, the
-attempt count, and the backoff reason, using outcome names and counts only - no
-prompt text, objectives, or credentials.
+reaches `dispatch_min_ready` still wakes the next cycle early and dispatches at
+most one implementer, stop requests are still honoured per slice, exponential
+poll backoff still prevents a busy loop, and the journaled `next_wake` is the
+deadline the supervisor actually honours. Status output must name the recorded
+outcome, the attempt count, and the backoff reason, using outcome names and
+counts only - no prompt text, objectives, or credentials.
 
 Persistent supervisors compute the ordinary post-cycle deadline only after the
 child and post-dispatch queue check finish. The same selected wait duration
