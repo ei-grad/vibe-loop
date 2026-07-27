@@ -22,6 +22,34 @@ the matching `autopilot_supervisor_started` or
 remain the latest cycle state and must not hide a still-live supervisor. A
 released or stale supervisor lock must not be reported as live.
 
+### Supervisor Status Consistency
+
+Supervisor process state and cycle outcome are independent. A live supervisor
+reports `active_cycle` while its child cycle is executing and `sleeping` after
+the completed `autopilot_cycle` records the `next_wake` deadline it is
+honouring. A bounded or operator-requested exit reports `stopped`, while
+`last_cycle` retains the child outcome.
+
+`stopped` requires both an explicit terminal stop record and verified absence
+of its recorded process. Status reports `inconsistent` with a stable blocker
+when those facts disagree:
+
+- `autopilot_supervisor_stop_record_live_process` means the stop record's
+  process still exists.
+- `autopilot_supervisor_live_without_lock` means a live recorded supervisor no
+  longer owns the singleton lock.
+- `autopilot_supervisor_exited_without_stop_record` means the process vanished
+  without recording termination.
+- `autopilot_supervisor_stop_record_missing_pid` means a terminal record lacks
+  the identity needed to verify absence.
+- `autopilot_supervisor_record_missing_pid` means a non-terminal record lacks
+  that identity after the lock is absent.
+
+These blockers are part of `ProjectStatus`; a stale cycle outcome must never
+mask them. A foreground supervisor writes its stop record while unwinding, so a
+status read during that bounded interval can legitimately report
+`autopilot_supervisor_stop_record_live_process` until the process exits.
+
 Autopilot must stay repository-agnostic. Its source, documentation, bundled eval
 fixtures, and command output must not embed downstream project names or absolute
 developer-machine paths, and a release check must assert this so the feature is
@@ -195,17 +223,17 @@ configured state directory, pid/log observation, no duplicate supervisor
 launch, one-cycle mode, bounded cycle counts, foreground interval sleeping,
 signal behavior, and classification of clean drain versus restartable exit
 versus blocked state. Idle foreground and ordinary restartable-backoff waits use
-an adaptive full-list fallback whose delays grow to a configured cap while
+an adaptive full-list fallback starting at `planning_recheck_seconds` (default
+60 seconds) and doubling to `idle_poll_max_seconds` (default 600 seconds) while
 preserving the outer interval deadline; repeated task-source failures must not
 spin. Idle waits may additionally use the trusted wake adapter, whose failures
 also remain bounded. With the default settings, a 30-minute interval performs
-substantially fewer than 30 task-source listings. Each logical fallback poll
-performs one task-source listing and bounds a command-backed listing by the
-remaining absolute monotonic deadline. Idle candidate filtering derives
-runnable work from that snapshot and uses the cycle's active-run/conflict
-snapshot so the fallback does not introduce an independently timed lock-backend
-query; a lock-only change is observed through the trusted wake adapter or at the
-outer deadline.
+five fallback listings. Each logical fallback poll performs one task-source
+listing and bounds a command-backed listing by the remaining absolute monotonic
+deadline. Idle candidate filtering derives runnable work from that snapshot and
+uses the cycle's active-run/conflict snapshot so the fallback does not introduce
+an independently timed lock-backend query; a lock-only change is observed
+through the trusted wake adapter or at the outer deadline.
 
 `autopilot run` remains the foreground supervisor contract. On POSIX systems,
 `autopilot start` must provide the supported detached lifecycle by starting
@@ -347,21 +375,17 @@ compensation failures of that same kind, not replacements for the original
 witness failure.
 
 Successful ordinary, signal, and recovery exits append a terminal supervisor
-record only after lock release. Status reports `stopped` only when such a
-terminal record exists AND the recorded process is verifiably absent. A stop
-record with a live process, a live process without the singleton lock, a
-vanished process with no terminal record, or any supervisor record carrying no
-PID at all must each report an `inconsistent` supervisor state with a specific
-blocker, so an unresolved supervisor is never presented as a clean stop or
-masked by an older cycle status. A record without a PID is inconsistent by
-construction: absence cannot be verified against an identity that was never
-recorded. Recovery therefore never writes a terminal record without a PID. A
-command-backed lock is entitled to record no PID; recovery must then derive the
-exact PID from the matching local `autopilot_supervisor_started` record for the
-requested run, verify that exact process absent, release with the exact run and
-locally minted generation, and prove lock absence so the singleton is
-immediately reacquirable. Only when no PID exists in the lock or the local
-records does recovery refuse outright.
+record only after lock release. The resulting status classification and stable
+inconsistency blockers are owned by
+[Supervisor Status Consistency](#supervisor-status-consistency).
+
+A command-backed lock may record no PID. Recovery must then derive the exact PID
+from this installation's matching `autopilot_supervisor_started` record, verify
+that process is absent, release with the exact run and locally minted
+generation, and prove lock absence. If neither the lock nor the local record
+contains a PID, recovery refuses with
+`autopilot_stale_recovery_missing_pid`; it never writes an unverifiable terminal
+record.
 
 Related implementation IDs: `AUTO-03`.
 
@@ -499,8 +523,11 @@ Resolution must fail closed before any observable effect. Supervisor run,
 start, stop, and stale-recovery operations; task selection; worker inspection
 and cleanup; integration locking; and fenced reporting refuse a missing,
 ambient-only, or conflicting binding before invoking a command adapter.
-Diagnostics name the variable and the failure reason (`unset`, `ambient_only`,
-`conflict`, `ambient_conflict`) and never echo the ambient or configured value.
+Diagnostics name the variable through
+`project_binding_unset:<NAME>`, `project_binding_ambient_only:<NAME>`,
+`project_binding_conflict:<NAME>`, or
+`project_binding_ambient_conflict:<NAME>` and never echo the ambient or
+configured value.
 
 Structured status reports the resolved binding so operators can verify routing
 without reading configuration: each required selector appears with its resolved
@@ -802,9 +829,10 @@ the existing maintenance-command-result record shape (schema version, record
 type, occurrence time, repo, cycle id, configured policy, candidates, evidence,
 reasoned outcomes, and reaped/kept/errors/status payload),
 registration of every new native record type in the run store's autopilot and
-known record-type sets, tolerance of unknown record types on read, and a cycle
-action tag for the policy, candidate count, and reap count appended for the
-disposition step.
+known record-type sets, tolerance of unknown record types on read, and the exact
+`worktree_disposition_policy:<MODE>`,
+`worktree_disposition_candidates:<COUNT>`, and
+`reaped_worktrees:<COUNT>` cycle action tags.
 
 Related implementation IDs: `AUTO-13`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
 `AUTO-17`.
@@ -844,18 +872,32 @@ Project-authored `[autopilot]` maintenance commands (`PRD-AUT-005`) continue to
 override or augment the native behaviors; native behavior is the default, not a
 replacement for explicit configuration.
 
-The native disk-health floors are configuration-free by default but
-project-tunable. A repository may raise or lower any of the four floors
-(absolute free bytes, proportional free fraction, absolute free inodes,
-proportional free-inode fraction) through an `[autopilot.disk_reserve]` table so
-a heavy repository can demand a larger reserve without changing the global
-default, which would create false positives for small or light repositories.
-An unset override keeps the reviewed default, so a configuration-free project's
-behavior is unchanged. Configuration validation rejects invalid, negative,
-non-finite, and out-of-range values, and rejects a positive reserve paired with
-an explicit zero reserve on the same axis as contradictory because the paired
-floors can then never both be exhausted. The effective thresholds are journaled
-in every `autopilot_disk_health` record and surfaced in project status.
+The summary step appends
+`cycle_summary:landed|unchanged|bootstrap|unavailable:<COUNT>` to the cycle
+actions. A trailing `+` on the count means the commit span was truncated.
+
+### Native Disk Health Defaults
+
+The native disk-health floors are 512 MiB free bytes, 10,000 free inodes, and
+2% proportional free space and inodes. A target is critical only when both the
+absolute and proportional floors for an axis are exhausted. A critical target
+withholds launch with `autopilot_disk_capacity_low`; the read-only check never
+deletes or truncates data. Every cycle journals one `autopilot_disk_health`
+record and a `disk_health:ok|critical` action tag. Filesystems without inode
+counts skip that axis, and unreadable paths remain non-blocking observations.
+
+These floors are configuration-free by default but project-tunable. A
+repository may raise or lower any of the four floors (absolute free bytes,
+proportional free fraction, absolute free inodes, proportional free-inode
+fraction) through an `[autopilot.disk_reserve]` table so a heavy repository can
+demand a larger reserve without changing the global default, which would create
+false positives for small or light repositories. An unset override keeps the
+reviewed default, so a configuration-free project's behavior is unchanged.
+Configuration validation rejects invalid, negative, non-finite, and
+out-of-range values, and rejects a positive reserve paired with an explicit zero
+reserve on the same axis as contradictory because the paired floors can then
+never both be exhausted. The effective thresholds are journaled in every
+`autopilot_disk_health` record and surfaced in project status.
 
 Acceptance must cover each native behavior landing as an independently
 reviewable slice, every native action appearing in the append-only journal
