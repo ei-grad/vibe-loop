@@ -1644,12 +1644,27 @@ def task_agent_failure_stops_dispatch(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class CandidateExclusion:
+    task: Task
+    mechanism: str
+    details: tuple[str, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateSnapshot:
+    ready: tuple[Task, ...] = ()
+    runnable: tuple[Task, ...] = ()
+    exclusions: tuple[CandidateExclusion, ...] = ()
+
+
 class VibeRunner:
     def __init__(self, config: VibeConfig):
         self.config = config
         self._source: TaskSource | None = None
         self._source_resolution: RuntimeTaskSourceResolution | None = None
         self._lock_manager: LockManager | None = None
+        self.last_candidate_snapshot = CandidateSnapshot()
         self.runs_dir = config.state_path / "runs"
         self.run_store = RunStore(config.state_path / "runs.jsonl")
         # One shared ledger and canonical project identity per repository, so
@@ -1722,37 +1737,111 @@ class VibeRunner:
         exclude: set[str] | None = None,
         *,
         active_runs: tuple[ActiveRunState, ...] | None = None,
+        locked_task_ids: frozenset[str] | None = None,
     ) -> list[Task]:
+        snapshot = self.candidate_snapshot_from_tasks(
+            tasks,
+            exclude=exclude,
+            active_runs=active_runs,
+            locked_task_ids=locked_task_ids,
+        )
+        self.last_candidate_snapshot = snapshot
+        return list(snapshot.runnable)
+
+    def candidate_snapshot_from_tasks(
+        self,
+        tasks: list[Task],
+        exclude: set[str] | None = None,
+        *,
+        active_runs: tuple[ActiveRunState, ...] | None = None,
+        locked_task_ids: frozenset[str] | None = None,
+    ) -> CandidateSnapshot:
         excluded = exclude or set()
-        candidates = runnable_tasks_from_snapshot(
+        ready = tuple(
+            task
+            for task in tasks
+            if not task.done
+            and task.status in self.source_resolution.task_source.runnable_statuses
+            and task.task_id not in excluded
+        )
+        dependency_candidates = runnable_tasks_from_snapshot(
             tasks,
             self.source_resolution.task_source.runnable_statuses,
             self.source_resolution.task_source.respect_source_order,
         )
+        dependency_candidates = [
+            task for task in dependency_candidates if task.task_id not in excluded
+        ]
+        dependency_candidate_ids = {task.task_id for task in dependency_candidates}
+        done_task_ids = {task.task_id for task in tasks if task.done}
+        exclusions = [
+            CandidateExclusion(
+                task=task,
+                mechanism="dependency",
+                details=tuple(
+                    dependency
+                    for dependency in task.dependencies
+                    if dependency not in done_task_ids
+                ),
+            )
+            for task in ready
+            if task.task_id not in dependency_candidate_ids
+        ]
         if active_runs is None:
-            active_domains = active_lock_conflict_domains(self.lock_manager)
-            locked_task_ids: set[str] | None = None
+            lock_records = self.lock_manager.list_locks()
+            locked_ids = frozenset(
+                str(record.get("task_id") or "")
+                for record in lock_records
+                if record.get("task_id")
+            )
+            group_checker = process_group_liveness_checker()
+            live_runs = tuple(
+                active
+                for record in lock_records
+                if (active := ActiveRunState.from_lock_metadata(record)) is not None
+                and active_run_is_live(
+                    active,
+                    process_group_exists=group_checker,
+                )
+            )
         else:
-            active_domains = tuple(
-                conflict_domains_from_task_like(active) for active in active_runs
+            live_runs = active_runs
+            locked_ids = (
+                locked_task_ids
+                if locked_task_ids is not None
+                else frozenset(active.task_id for active in active_runs)
             )
-            locked_task_ids = {active.task_id for active in active_runs}
-        enforce_conflicts = resource_conflicts_enabled(candidates, active_domains)
-        return [
+        active_domains = tuple(
+            conflict_domains_from_task_like(active) for active in live_runs
+        )
+        unlocked = [
+            task for task in dependency_candidates if task.task_id not in locked_ids
+        ]
+        exclusions.extend(
+            CandidateExclusion(task=task, mechanism="lock")
+            for task in dependency_candidates
+            if task.task_id in locked_ids
+        )
+        enforce_conflicts = resource_conflicts_enabled(unlocked, active_domains)
+        runnable = tuple(
             task
-            for task in candidates
-            if task.task_id not in excluded
-            and (
-                locked_task_ids is not None
-                and task.task_id not in locked_task_ids
-                or locked_task_ids is None
-                and not self.lock_manager.is_locked(task.task_id)
-            )
-            and (
+            for task in unlocked
+            if (
                 not enforce_conflicts
                 or not task_conflicts_with_domains(task, active_domains)
             )
-        ]
+        )
+        runnable_ids = {task.task_id for task in runnable}
+        exclusions.extend(
+            CandidateExclusion(task=task, mechanism="domain")
+            for task in unlocked
+            if task.task_id not in runnable_ids
+        )
+        return CandidateSnapshot(
+            ready=ready,
+            runnable=runnable,
+            exclusions=tuple(exclusions),
+        )
 
     def select_task(
         self, ask_agent: bool = False, exclude: set[str] | None = None

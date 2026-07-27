@@ -118,7 +118,7 @@ from vibe_loop.config import (
     normalize_registry_runtime_context,
 )
 from vibe_loop.retry import ProviderLimitSignal
-from vibe_loop.runner import AgentProviderLimitError
+from vibe_loop.runner import AgentProviderLimitError, CandidateSnapshot
 from vibe_loop.locks import (
     AUTOPILOT_LOCK_NAME,
     LockBackendError,
@@ -606,6 +606,14 @@ class AutopilotStatusTests(unittest.TestCase):
             set(dispatch_blockers),
             {"TASK-BAD", "TASK-BROKEN", "TASK-MALFORMED"},
         )
+        self.assertEqual(payload["queue"]["ready"], 4)
+        self.assertEqual(payload["queue"]["runnable"], 1)
+        self.assertTrue(
+            all(
+                blocker["mechanism"] == "admission"
+                for blocker in dispatch_blockers.values()
+            )
+        )
         self.assertIn(
             "same profile for implementation and review",
             dispatch_blockers["TASK-BAD"]["message"],
@@ -622,7 +630,7 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("TASK-BAD", rendered)
         self.assertIn("TASK-BROKEN", rendered)
         self.assertIn("TASK-MALFORMED", rendered)
-        self.assertNotIn("blockers: none", rendered)
+        self.assertIn("blockers: none", rendered)
 
     def test_unchanged_workspace_preflight_deferral_blocks_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -670,6 +678,7 @@ class AutopilotStatusTests(unittest.TestCase):
             [
                 {
                     "task_id": "TASK-01",
+                    "mechanism": "admission",
                     "code": "workspace_preflight_rejected",
                     "key": "workspace",
                     "message": (
@@ -692,7 +701,7 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("TASK-01", rendered)
         self.assertIn("workspace_collision", rendered)
         self.assertNotIn("\nblockers:\n", rendered)
-        self.assertNotIn("blockers: none", rendered)
+        self.assertIn("blockers: none", rendered)
 
     def test_retry_later_workspace_preflight_is_retried_next_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -994,6 +1003,99 @@ class AutopilotStatusTests(unittest.TestCase):
             )
         )
         self.assertNotIn("no_runnable_work", payload["observations"])
+
+    def test_collect_project_status_uses_one_worker_snapshot_for_domain_filtering(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [])
+            config = load_config(repo)
+            source = mock.Mock()
+            source.list_tasks.return_value = [
+                Task(
+                    task_id="ACTIVE-01",
+                    title="Active slice",
+                    status="Active",
+                    paths=("src",),
+                    conflict_domains_known=True,
+                ),
+                Task(
+                    task_id="READY-01",
+                    title="Ready slice",
+                    status="Next",
+                    paths=("src/module.py",),
+                    conflict_domains_known=True,
+                ),
+            ]
+            active = ActiveRunState.new(
+                task_id="ACTIVE-01",
+                run_id="run-active",
+                log_path=config.state_path / "runs" / "run-active.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+                paths=("src",),
+                conflict_domains_known=True,
+            ).with_worker_pid(os.getpid())
+            workers = [
+                WorkerView(
+                    active=active,
+                    state="running",
+                    process_state="live",
+                )
+            ]
+
+            with (
+                mock.patch(
+                    "vibe_loop.autopilot.collect_worker_views",
+                    return_value=workers,
+                ),
+                mock.patch(
+                    "vibe_loop.runner.build_task_source",
+                    return_value=source,
+                ),
+            ):
+                status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(payload["queue"]["ready"], 2)
+        self.assertEqual(payload["queue"]["runnable"], 0)
+        self.assertEqual(payload["queue"]["runnable_tasks"], [])
+        self.assertEqual(
+            {
+                blocker["task_id"]: blocker["mechanism"]
+                for blocker in payload["queue"]["dispatch_blockers"]
+            },
+            {
+                "ACTIVE-01": "lock",
+                "READY-01": "domain",
+            },
+        )
+        self.assertIn("blockers: none", rendered)
+        self.assertIn("READY-01: [domain] a conflict domain is held", rendered)
+
+    def test_collect_project_status_names_dependency_exclusion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "MISSING", "dependency-blocked slice")],
+            )
+
+            status = collect_project_status(load_config(repo))
+            payload = status.to_json()
+
+        self.assertEqual(payload["queue"]["ready"], 1)
+        self.assertEqual(payload["queue"]["runnable"], 0)
+        self.assertEqual(
+            payload["queue"]["dispatch_blockers"][0]["mechanism"],
+            "dependency",
+        )
+        self.assertIn(
+            "unmet dependencies: MISSING",
+            payload["queue"]["dispatch_blockers"][0]["message"],
+        )
 
     def test_collect_project_status_counts_foreign_host_workers_as_waiting(
         self,
@@ -6332,6 +6434,10 @@ class AutopilotRecheckTests(unittest.TestCase):
 
         first = summary.cycles[0]
         self.assertEqual(active_statuses[0].supervisor.state, "active_cycle")
+        self.assertEqual(active_statuses[0].queue.ready, 1)
+        self.assertEqual(active_statuses[0].queue.runnable, 1)
+        self.assertEqual(len(active_statuses[0].queue.runnable_tasks), 1)
+        self.assertIn("blockers: none", render_autopilot_status(active_statuses[0]))
         self.assertEqual(active_statuses[0].next_wake, "")
         self.assertEqual(sleeping_statuses[0][0], 60.0)
         sleeping_status = sleeping_statuses[0][1]
@@ -6906,14 +7012,17 @@ class AutopilotIdleWaitTests(unittest.TestCase):
             class Runner:
                 source = Source()
 
-                def list_candidates_from_snapshot(
+                def candidate_snapshot_from_tasks(
                     self,
                     _tasks: list[object],
                     *,
                     active_runs: tuple[object, ...] | None = None,
-                ) -> list[object]:
+                    locked_task_ids: frozenset[str] | None = None,
+                ) -> CandidateSnapshot:
                     self.assert_no_active_runs(active_runs)
-                    return []
+                    if locked_task_ids is not None:
+                        raise AssertionError(locked_task_ids)
+                    return CandidateSnapshot()
 
                 @staticmethod
                 def assert_no_active_runs(
@@ -7888,7 +7997,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         )
         self.assertIn(
             "task dispatch blockers:\n"
-            "  - TASK-01: workspace preflight rejected worker launch: "
+            "  - TASK-01: [admission] workspace preflight rejected worker launch: "
             "workspace_refresh_conflict (defer_until_workspace_changes)",
             rendered,
         )

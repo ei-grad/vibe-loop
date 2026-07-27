@@ -74,6 +74,7 @@ from vibe_loop.runtime_events import ACTIONABLE_RUNTIME_EVENT_KINDS
 from vibe_loop.runner import (
     AgentProviderLimitError,
     AgentRuntimeContext,
+    CandidateExclusion,
     ProviderUsageObserver,
     VibeRunner,
     inject_structured_usage_output,
@@ -211,6 +212,7 @@ class GitStatus:
 @dataclasses.dataclass(frozen=True)
 class TaskQueueStatus:
     total: int = 0
+    ready: int = 0
     runnable: int = 0
     active: int = 0
     done: int = 0
@@ -225,6 +227,7 @@ class TaskQueueStatus:
     def to_json(self) -> dict[str, object]:
         return {
             "total": self.total,
+            "ready": self.ready,
             "runnable": self.runnable,
             "active": self.active,
             "done": self.done,
@@ -603,7 +606,14 @@ def collect_project_status(
         config.main_branch,
         ignored_dirty_paths=(config.state_path,),
     )
-    queue_status = collect_task_queue_status(config)
+    live_active_runs = tuple(
+        worker.active for worker in workers if worker_holds_active_conflict(worker)
+    )
+    queue_status = collect_task_queue_status(
+        config,
+        active_runs=live_active_runs,
+        locked_task_ids=frozenset(worker.active.task_id for worker in workers),
+    )
     records = run_store.read_records()
     preflight_blockers = workspace_preflight_dispatch_blockers(
         queue_status,
@@ -613,12 +623,9 @@ def collect_project_status(
         main_branch=config.main_branch,
     )
     if preflight_blockers:
-        queue_status = dataclasses.replace(
+        queue_status = apply_dispatch_blockers(
             queue_status,
-            dispatch_blockers=(
-                *queue_status.dispatch_blockers,
-                *preflight_blockers,
-            ),
+            preflight_blockers,
         )
     stranded_reviews = stranded_review_tasks(
         queue_status,
@@ -757,6 +764,7 @@ def collect_task_queue_status(
     timeout_seconds: float | None = None,
     *,
     active_runs: tuple[ActiveRunState, ...] | None = None,
+    locked_task_ids: frozenset[str] | None = None,
 ) -> TaskQueueStatus:
     effective_config = config
     if timeout_seconds is not None:
@@ -774,9 +782,10 @@ def collect_task_queue_status(
     runner = VibeRunner(effective_config)
     try:
         tasks = runner.source.list_tasks()
-        runnable = runner.list_candidates_from_snapshot(
+        candidate_snapshot = runner.candidate_snapshot_from_tasks(
             tasks,
             active_runs=active_runs,
+            locked_task_ids=locked_task_ids,
         )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         return TaskQueueStatus(source_error=str(exc))
@@ -792,17 +801,29 @@ def collect_task_queue_status(
     statuses: dict[str, int] = {}
     for task in tasks:
         statuses[task.status] = statuses.get(task.status, 0) + 1
-    dispatch_blockers = tuple(
+    candidate_blockers = tuple(
+        candidate_exclusion_dispatch_blocker(exclusion)
+        for exclusion in candidate_snapshot.exclusions
+    )
+    admission_blockers = tuple(
         {
             "task_id": task.task_id,
             "agent": task.agent,
+            "mechanism": "admission",
             **blocker.to_json(),
         }
-        for task in runnable
+        for task in candidate_snapshot.runnable
         if (blocker := task_agent_dispatch_blocker(effective_config, task)) is not None
+    )
+    admission_blocked_ids = {str(blocker["task_id"]) for blocker in admission_blockers}
+    runnable = tuple(
+        task
+        for task in candidate_snapshot.runnable
+        if task.task_id not in admission_blocked_ids
     )
     return TaskQueueStatus(
         total=len(tasks),
+        ready=len(candidate_snapshot.ready),
         runnable=len(runnable),
         active=count_statuses(statuses, ACTIVE_QUEUE_STATUSES),
         done=sum(1 for task in tasks if task.done),
@@ -820,7 +841,60 @@ def collect_task_queue_status(
             for task in tasks
             if task.status.casefold() == "gated"
         ),
-        dispatch_blockers=dispatch_blockers,
+        dispatch_blockers=(*candidate_blockers, *admission_blockers),
+    )
+
+
+def candidate_exclusion_dispatch_blocker(
+    exclusion: CandidateExclusion,
+) -> dict[str, object]:
+    task_id = exclusion.task.task_id
+    if exclusion.mechanism == "dependency":
+        dependencies = ", ".join(exclusion.details)
+        return {
+            "task_id": task_id,
+            "mechanism": "dependency",
+            "code": "task_dependency_blocked",
+            "key": "task.dependencies",
+            "message": f"unmet dependencies: {dependencies}",
+            "remedy": "Complete the named dependencies.",
+        }
+    if exclusion.mechanism == "lock":
+        return {
+            "task_id": task_id,
+            "mechanism": "lock",
+            "code": "task_lock_held",
+            "key": "task.lock",
+            "message": "an existing task lock prevents dispatch",
+            "remedy": "Wait for the lock holder to finish or recover a stale lock.",
+        }
+    if exclusion.mechanism == "domain":
+        return {
+            "task_id": task_id,
+            "mechanism": "domain",
+            "code": "task_conflict_domain_held",
+            "key": "task.conflict_domains",
+            "message": "a conflict domain is held by an active run",
+            "remedy": "Wait for the conflicting active run to finish.",
+        }
+    raise ValueError(f"unknown candidate exclusion mechanism: {exclusion.mechanism}")
+
+
+def apply_dispatch_blockers(
+    queue_status: TaskQueueStatus,
+    blockers: tuple[dict[str, object], ...],
+) -> TaskQueueStatus:
+    blocked_task_ids = {str(blocker.get("task_id") or "") for blocker in blockers}
+    runnable_tasks = tuple(
+        task
+        for task in queue_status.runnable_tasks
+        if str(task.get("id") or task.get("task_id") or "") not in blocked_task_ids
+    )
+    return dataclasses.replace(
+        queue_status,
+        runnable=len(runnable_tasks),
+        runnable_tasks=runnable_tasks,
+        dispatch_blockers=(*queue_status.dispatch_blockers, *blockers),
     )
 
 
@@ -841,16 +915,14 @@ def task_summary(task: Task) -> dict[str, object]:
 
 
 def queue_has_no_launchable_task(queue_status: TaskQueueStatus) -> bool:
-    if queue_status.runnable == 0:
-        return bool(queue_status.gated_tasks)
-    blocked_task_ids = {
-        str(blocker.get("task_id") or "") for blocker in queue_status.dispatch_blockers
-    }
-    runnable_task_ids = {
-        str(task.get("id") or task.get("task_id") or "")
-        for task in queue_status.runnable_tasks
-    }
-    return bool(runnable_task_ids) and runnable_task_ids <= blocked_task_ids
+    operational_blockers = tuple(
+        blocker
+        for blocker in queue_status.dispatch_blockers
+        if blocker.get("mechanism") not in {"dependency", "lock", "domain"}
+    )
+    return queue_status.runnable == 0 and bool(
+        queue_status.gated_tasks or operational_blockers
+    )
 
 
 def workspace_preflight_dispatch_blockers(
@@ -893,6 +965,7 @@ def workspace_preflight_dispatch_blockers(
         retry_disposition = str(record.get("retry_disposition") or "retry_later")
         blocker: dict[str, object] = {
             "task_id": task_id,
+            "mechanism": "admission",
             "code": "workspace_preflight_rejected",
             "key": "workspace",
             "message": (
@@ -1741,7 +1814,7 @@ def project_blockers(
         blockers.append("repo_dirty")
     if queue_status.source_error:
         blockers.append(f"task_source_unavailable: {queue_status.source_error}")
-    if queue_status.runnable > 0 and queue_has_no_launchable_task(queue_status):
+    if queue_has_no_launchable_task(queue_status):
         blockers.extend(
             "task_dispatch_blocked:"
             f"{blocker.get('task_id')}: "
@@ -1785,7 +1858,7 @@ def project_observations(
         running_workers = active_conflict_worker_count(workers)
         if running_workers:
             observations.append(f"waiting_for_active_workers:{running_workers}")
-        else:
+        elif queue_status.ready == 0:
             observations.append("no_runnable_work")
     return observations
 

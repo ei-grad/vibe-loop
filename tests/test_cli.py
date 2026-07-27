@@ -45,6 +45,7 @@ from vibe_loop.runs import (
     RunStore,
     utc_now_iso,
 )
+from vibe_loop.workers import ActiveRunState
 
 
 @contextmanager
@@ -6588,6 +6589,54 @@ class CliTests(unittest.TestCase):
         self.assertIn("TASK-02", prompt)
         self.assertIn("Return JSON only", prompt)
         self.assertIn("agent selected TASK-02", stderr.getvalue())
+
+    def test_next_reports_when_ready_work_is_domain_excluded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "PLAN.md").write_text(
+                "# Plan\n\n"
+                "| ID | Priority | Status | Dependencies | Paths | Scope | "
+                "Acceptance | Evidence |\n"
+                "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+                "| TASK-01 | P0 | Next | | src/module.py | ready slice | works | "
+                "tests |\n",
+                encoding="utf-8",
+            )
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nplan_path = "PLAN.md"\n',
+                encoding="utf-8",
+            )
+            config = load_config(repo)
+            active = ActiveRunState.new(
+                task_id="ACTIVE-01",
+                run_id="run-active",
+                log_path=config.state_path / "runs" / "run-active.log",
+                base_main="base",
+                command="codex",
+                paths=("src",),
+                conflict_domains_known=True,
+            ).with_worker_pid(os.getpid())
+            build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            ).acquire(
+                active.task_id,
+                active.run_id,
+                metadata=active.to_lock_metadata(),
+            )
+            stdout = StringIO()
+            stderr = StringIO()
+
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = main(["next", "--repo", str(repo)])
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn(
+            "no dispatchable tasks: 1 ready; excluded by domain=1",
+            stderr.getvalue(),
+        )
 
     def test_run_next_empty_queue_keeps_stdout_empty(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

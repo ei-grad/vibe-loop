@@ -1035,11 +1035,12 @@ def dispatch(args: argparse.Namespace) -> int:
         return dispatch_tasks(args, config)
 
     if args.command == "next":
-        task = read_only_task_operation(
+        runner, task = read_only_task_operation(
             config,
-            lambda: VibeRunner(config).select_task(ask_agent=args.ask_agent),
+            lambda: select_task_with_snapshot(config, ask_agent=args.ask_agent),
         )
         if task is None:
+            print(empty_selection_message(runner), file=sys.stderr)
             return 2
         if args.json:
             print(json.dumps(selected_task_json(config, task), indent=2))
@@ -1795,7 +1796,8 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     else:
         lines.append(
             f"queue: {queue.runnable} runnable / {queue.total} total "
-            f"({queue.active} active, {queue.done} done, {queue.blocked} blocked)"
+            f"({queue.ready} ready, {queue.active} active, {queue.done} done, "
+            f"{queue.blocked} blocked)"
         )
     if queue.gated_tasks:
         lines.append("source-gated tasks:")
@@ -1883,19 +1885,20 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         guidance = project_binding_guidance(status.project_binding)
         if guidance:
             lines.append(f"  {guidance}")
+    else:
+        lines.append("blockers: none")
     if queue.dispatch_blockers:
         lines.append("task dispatch blockers:")
         lines.extend(
-            f"  - {blocker['task_id']}: {blocker['message']}; "
+            f"  - {blocker['task_id']}: "
+            + (f"[{blocker['mechanism']}] " if blocker.get("mechanism") else "")
+            + f"{blocker['message']}; "
             f"remedy: {blocker['remedy']}"
             for blocker in queue.dispatch_blockers
         )
-    if not project_blockers and not queue.dispatch_blockers:
-        if status.observations:
-            lines.append("observations:")
-            lines.extend(f"  - {observation}" for observation in status.observations)
-        else:
-            lines.append("blockers: none")
+    if status.observations:
+        lines.append("observations:")
+        lines.extend(f"  - {observation}" for observation in status.observations)
     if status.config_contract_blockers:
         lines.append("config contract blockers:")
         lines.extend(
@@ -2701,11 +2704,12 @@ def dispatch_tasks(args: argparse.Namespace, config) -> int:
         return 0
 
     if args.tasks_command == "next":
-        task = read_only_task_operation(
+        runner, task = read_only_task_operation(
             config,
-            lambda: VibeRunner(config).select_task(ask_agent=args.ask_agent),
+            lambda: select_task_with_snapshot(config, ask_agent=args.ask_agent),
         )
         if task is None:
+            print(empty_selection_message(runner), file=sys.stderr)
             return 2
         if args.json:
             print(json.dumps(selected_task_json(config, task), indent=2))
@@ -2921,6 +2925,31 @@ def selected_task_json(config, task: Task) -> dict[str, object]:
         }
     )
     return payload
+
+
+def select_task_with_snapshot(
+    config,
+    *,
+    ask_agent: bool,
+) -> tuple[VibeRunner, Task | None]:
+    runner = VibeRunner(config)
+    return runner, runner.select_task(ask_agent=ask_agent)
+
+
+def empty_selection_message(runner: VibeRunner) -> str:
+    snapshot = runner.last_candidate_snapshot
+    if not snapshot.ready:
+        return "no runnable tasks"
+    counts: dict[str, int] = {}
+    for exclusion in snapshot.exclusions:
+        counts[exclusion.mechanism] = counts.get(exclusion.mechanism, 0) + 1
+    reasons = ", ".join(
+        f"{mechanism}={count}" for mechanism, count in sorted(counts.items())
+    )
+    return (
+        f"no dispatchable tasks: {len(snapshot.ready)} ready; "
+        f"excluded by {reasons or 'unknown mechanism'}"
+    )
 
 
 def render_task_inspect(view) -> str:
