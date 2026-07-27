@@ -78,16 +78,21 @@ existing work is preserved fail-closed, never reset or deleted. Adoption also
 requires the recorded current main base to be an ancestor of the workspace
 HEAD; an older workspace base appearing in current main history is not
 sufficient. An ordinary adoption whose workspace fails that requirement is
-refreshed automatically, but only when the workspace provably holds nothing to
-lose: no commit reachable only from it, no tracked modification, and a
-fast-forward onto the current base that Git itself accepts. Any condition that
-cannot be proven -- an unreadable Git state, a HEAD that moved under the check,
-a recovery adoption resuming against a recorded workspace state -- falls back to
-deferral. The preflight records a bounded typed decision, retry disposition, and
--- when a refresh was declined -- the closed-vocabulary reason it was declined,
-before any implementation process starts, so a stale or diverged workspace that
-cannot be refreshed defers until its state changes without consuming a model
-launch, and an operator can tell a preserved workspace from an unreadable one. The durable claim must still match the validated branch, current base,
+refreshed automatically when it is clean by merging the current main base into
+the owned branch. Commits reachable only from the task branch are preserved by
+the merge. A content conflict is aborted, recorded as the distinct
+`workspace_refresh_conflict` condition, and leaves the branch and worktree
+unchanged for deliberate resolution. Any failed merge that entered merge state
+is aborted before its failure is recorded, including failures from repository
+commit hooks. An abort failure is a distinct restoration condition rather than
+ordinary dirty-work evidence. Any condition that cannot be proven -- an
+unreadable Git state, a HEAD that moved under the check, a recovery adoption
+resuming against a recorded workspace state -- falls back to deferral. The
+preflight records a bounded typed decision, retry disposition, and -- when a
+refresh was declined -- the closed-vocabulary reason it was declined, before
+any implementation process starts, so an operator can distinguish a merge
+conflict, preserved dirty work, and unreadable state. The durable claim must
+still match the validated branch, current base,
 `HEAD`, and content-sensitive dirty snapshot; a change between preflight and
 claim fails closed. Deferred recovery persists only a bounded state fingerprint and remains
 suppressed in serial and parallel dispatch until the relevant base, branch,
@@ -102,7 +107,8 @@ rather than silently creating a duplicate.
 
 Acceptance must cover normal provisioning, safe adoption, dirty-primary and
 name-collision failures, unwind on launch failure, jobs=2 separation,
-primary-worktree non-mutation, and recovery adoption, per the re-scoped
+primary-worktree non-mutation, non-conflicting refresh of a diverged owned
+branch, named conflict preservation, and recovery adoption, per the re-scoped
 `run-until-done-preprovision-worker-worktree` task.
 
 Related implementation IDs: `ORC-04` (`run-until-done-preprovision-worker-worktree`).

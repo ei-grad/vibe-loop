@@ -456,6 +456,7 @@ class AutopilotCycleResult:
     limit_wall_pause_seconds: float | None = None
     planning_backoff_seconds: float | None = None
     autopilot_run_id: str = ""
+    dispatched_runs: int = 0
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -481,6 +482,7 @@ class AutopilotCycleResult:
             "next_wake": self.next_wake,
             "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
             "planning_backoff_seconds": self.planning_backoff_seconds,
+            "dispatched_runs": self.dispatched_runs,
         }
 
     def append_to(self, run_store: RunStore) -> None:
@@ -6073,6 +6075,7 @@ def execute_autopilot_cycle(
     cleanup_errors = 0
     planning_limit_wall_pause: float | None = None
     planning_backoff_pause: float | None = None
+    dispatched_runs = 0
 
     # Missing worker processes are normal after a runtime-owned terminal report.
     # Cleanup is eligible only when the run itself is durably terminal or its
@@ -6360,6 +6363,11 @@ def execute_autopilot_cycle(
                 )
             )
 
+        run_started_before = sum(
+            1
+            for record in run_store.read_records()
+            if record.get("record_type") == RUN_STARTED_RECORD_TYPE
+        )
         actions.append("launched_run_until_done")
         exit_code = launcher(
             command,
@@ -6368,8 +6376,18 @@ def execute_autopilot_cycle(
             on_start=_on_start,
         )
         child_pid = observed_pid.get("pid")
+        run_started_after = sum(
+            1
+            for record in run_store.read_records()
+            if record.get("record_type") == RUN_STARTED_RECORD_TYPE
+        )
+        dispatched_runs = max(0, run_started_after - run_started_before)
         cycle_status = classify_child_exit(exit_code)
         actions.append(f"child_exit:{exit_code}")
+        actions.append(f"dispatched_runs:{dispatched_runs}")
+        if cycle_status == "completed" and dispatched_runs == 0:
+            cycle_status = "idle"
+            actions.append("child_completed_without_dispatch")
         run_maintenance("summary")
         if cycle_status in {"restartable", "terminated"}:
             run_maintenance("troubleshoot")
@@ -6404,6 +6422,7 @@ def execute_autopilot_cycle(
         limit_wall_pause_seconds=pause_seconds,
         planning_backoff_seconds=planning_backoff_pause,
         autopilot_run_id=autopilot_run_id,
+        dispatched_runs=dispatched_runs,
     )
 
 
@@ -6423,15 +6442,13 @@ def require_positive_min_ready(min_ready: int) -> int:
 
 
 def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
-    """Whether a finished cycle should poll for freshly planned tasks.
+    """Whether a finished cycle should use the adaptive idle waiter.
 
     An idle cycle is one that neither dispatched nor observed a child because
-    runnable work was below ``min_ready``; it is also the only branch that runs
-    the planning command. So an idle status captures exactly the cases where the
-    board may gain runnable tasks out of band, and sleeping the full interval
-    would strand them. Completed dispatch cycles use a separate fresh queue poll
-    to detect a drained board; observing and blocked cycles keep the plain
-    interval sleep.
+    runnable work was below ``min_ready`` or because a successful child exited
+    without durable ``run_started`` evidence. Both cases poll for task-source
+    changes, but only the below-threshold case wakes merely because the runnable
+    count reaches ``min_ready``.
 
     An idle cycle with no planning command configured still rechecks: that is
     deliberate, so out-of-band task additions (a peer or operator filling the
@@ -6440,15 +6457,26 @@ def cycle_should_recheck(result: AutopilotCycleResult) -> bool:
     return result.status == "idle"
 
 
+def cycle_should_wake_on_runnable(result: AutopilotCycleResult) -> bool:
+    """Whether an idle wait may wake on runnable count without a source change.
+
+    A child that just found zero dispatchable tasks is stronger evidence than
+    the queue's coarse runnable count. Re-waking that child on the same count
+    would spin on tasks suppressed by workspace or attempt-state deferrals.
+    """
+    return cycle_should_recheck(result) and (
+        "launched_run_until_done" not in result.actions
+    )
+
+
 def cycle_should_poll_task_source(result: AutopilotCycleResult) -> bool:
     """Whether a cycle wait should wake on a material task-source change.
 
-    Idle cycles also wake when enough runnable work appears. Restartable cycles
-    use the same bounded polling machinery but wake only when the source
-    fingerprint changes, so an unchanged failed task cannot shorten its own
-    retry cooldown.
+    Idle cycles and restartable cycles use the same bounded polling machinery.
+    Only an idle cycle that never launched a child wakes on runnable count
+    alone; post-child waits require a material source change.
     """
-    return result.status in {"idle", "restartable"}
+    return cycle_should_recheck(result) or result.status == "restartable"
 
 
 def recheck_sleep_slices(interval: float, recheck_seconds: float) -> Iterator[float]:
@@ -7546,7 +7574,7 @@ def run_autopilot(
                             if worker_holds_active_conflict(worker)
                         ),
                         baseline_fingerprint=baseline_fingerprint,
-                        wake_on_runnable=cycle_should_recheck(result),
+                        wake_on_runnable=cycle_should_wake_on_runnable(result),
                     )
                     run_store.append_record(wait_result.to_record(config.repo))
                     wait_name = (

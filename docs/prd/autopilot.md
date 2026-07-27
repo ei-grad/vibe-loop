@@ -162,6 +162,9 @@ Records include `autopilot_cycle`, `autopilot_cycle_started`,
 must carry schema version, record type, occurrence time, cycle id, repo, queue
 counts, worker and lock summaries, current and previous main refs when
 available, actions, blockers, child pid/log path when relevant, and next wake.
+The record also carries the number of durable `run_started` records appended by
+the child. A child that exits cleanly with zero such records is an idle cycle,
+not a completed dispatch cycle.
 Cycle and supervisor records also carry the configured worktree-disposition
 policy. Worktree-disposition records carry that policy plus candidate counts,
 evidence, reasons, and outcomes. Existing run readers must keep tolerating
@@ -739,9 +742,12 @@ fingerprint. A same-cardinality replacement or content/source edit can wake the
 next cycle early. Lifecycle-status or counter-only churn, an unchanged runnable
 task, and idle-wake-adapter events do not wake restartable backoff: those inputs
 must not reset the child-local retry budget or collapse exhausted-retry
-protection into a dispatch loop. A zero-second limit-wall result falls back to
-the ordinary interval and therefore still captures the post-child baseline.
-Positive limit-wall pauses retain their dedicated stop-responsive wait.
+protection into a dispatch loop. The same rule applies when the child appended
+zero `run_started` records: the queue's runnable count does not account for
+child-local workspace and attempt deferrals, so only a material source change
+wakes the wait early. A zero-second limit-wall result falls back to the
+applicable ordinary wait. Positive limit-wall pauses retain their dedicated
+stop-responsive wait.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step
 
