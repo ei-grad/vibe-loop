@@ -186,6 +186,7 @@ from vibe_loop.workers import (
     build_worker_views,
     git_dirty_snapshot,
     process_group_liveness_checker,
+    run_git_result,
     workspace_state_fingerprint,
 )
 
@@ -1669,12 +1670,7 @@ class VibeRunner:
         self._exhausted_recovery_results: dict[str, RunResult] = {}
         self._durably_exhausted_recovery_tasks: set[str] = set()
         self._workspace_deferred_recovery_tasks: set[str] = set()
-        # Workspace-state fingerprints only suppress redundant dispatch while
-        # the provisioner that records one and every site that recomputes it
-        # exclude exactly the same paths; any divergence makes the recorded and
-        # recomputed digests permanently unequal and silently disables
-        # suppression. This is the single source both sides read.
-        self.workspace_ignored_dirty_paths: tuple[Path, ...] = ()
+        self.workspace_ignored_dirty_paths = workspace_fingerprint_ignored_dirty_paths()
         self._review_concurrency = ReviewConcurrencyBudget(
             config.orchestration.reviewer_concurrency_budget
         )
@@ -4887,42 +4883,18 @@ class VibeRunner:
             task_id = record.get("task_id")
             if not isinstance(task_id, str) or not task_id:
                 continue
-            if (
-                record.get("decision") == "rejected"
-                and record.get("retry_disposition") == "defer_until_workspace_changes"
-                and isinstance(record.get("workspace_state_fingerprint"), str)
-            ):
-                latest[task_id] = record
-            else:
-                latest.pop(task_id, None)
+            latest[task_id] = record
 
-        unchanged: set[str] = set()
-        for task_id, record in latest.items():
-            recorded_fingerprint = str(record["workspace_state_fingerprint"])
-            if not SHA256_HEX_RE.fullmatch(recorded_fingerprint):
-                continue
-            branch = record.get("branch")
-            worktree_text = record.get("worktree")
-            worktree = None
-            if isinstance(worktree_text, str) and worktree_text:
-                worktree = Path(worktree_text)
-                if not worktree.is_absolute():
-                    worktree = self.config.repo / worktree
-            current_fingerprint = workspace_state_fingerprint(
+        return {
+            task_id
+            for task_id, record in latest.items()
+            if workspace_preflight_deferral_is_unchanged(
+                record,
                 repo=self.config.repo,
                 main_branch=self.config.main_branch,
-                branch=branch if isinstance(branch, str) else "",
-                worktree=worktree,
-                expected_base=(
-                    str(record.get("selected_base"))
-                    if isinstance(record.get("selected_base"), str)
-                    else ""
-                ),
                 ignored_dirty_paths=self.workspace_ignored_dirty_paths,
             )
-            if current_fingerprint == recorded_fingerprint:
-                unchanged.add(task_id)
-        return unchanged
+        }
 
     def run_until_done_serial(
         self,
@@ -6139,6 +6111,75 @@ def workspace_retry_state_fingerprint(
         worktree=Path(recovery.worktree) if recovery.worktree else None,
         expected_base=recovery.base_commit,
         ignored_dirty_paths=ignored_dirty_paths,
+    )
+
+
+def workspace_fingerprint_ignored_dirty_paths() -> tuple[Path, ...]:
+    """Return exclusions shared by every workspace-state fingerprint site."""
+
+    return ()
+
+
+def workspace_preflight_deferral_is_unchanged(
+    record: Mapping[str, object],
+    *,
+    repo: Path,
+    main_branch: str,
+    ignored_dirty_paths: Sequence[Path] = (),
+) -> bool:
+    if (
+        record.get("decision") != "rejected"
+        or record.get("worker_launch_allowed") is not False
+        or record.get("retry_disposition") != "defer_until_workspace_changes"
+    ):
+        return False
+    recorded_fingerprint = record.get("workspace_state_fingerprint")
+    if not isinstance(recorded_fingerprint, str) or not SHA256_HEX_RE.fullmatch(
+        recorded_fingerprint
+    ):
+        return False
+
+    branch = record.get("branch")
+    branch = branch if isinstance(branch, str) else ""
+    worktree_text = record.get("worktree")
+    worktree = None
+    if isinstance(worktree_text, str) and worktree_text:
+        worktree = Path(worktree_text)
+        if not worktree.is_absolute():
+            worktree = repo / worktree
+    branch_result = (
+        run_git_result(
+            repo,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+        )
+        if branch
+        else None
+    )
+    if (
+        branch_result is not None
+        and branch_result.returncode == 1
+        and worktree is not None
+        and not worktree.is_dir()
+    ):
+        return False
+
+    return (
+        workspace_state_fingerprint(
+            repo=repo,
+            main_branch=main_branch,
+            branch=branch,
+            worktree=worktree,
+            expected_base=(
+                str(record.get("selected_base"))
+                if isinstance(record.get("selected_base"), str)
+                else ""
+            ),
+            ignored_dirty_paths=ignored_dirty_paths,
+        )
+        == recorded_fingerprint
     )
 
 

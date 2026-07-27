@@ -624,11 +624,12 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("TASK-MALFORMED", rendered)
         self.assertNotIn("blockers: none", rendered)
 
-    def test_status_reports_latest_workspace_preflight_rejection(self) -> None:
+    def test_unchanged_workspace_preflight_deferral_blocks_dispatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
             config = load_config(repo)
+            selected_base = git_text(repo, "rev-parse", "main")
             run_store = RunStore(config.state_path / "runs.jsonl")
             run_store.append_lifecycle_event(
                 RunLifecycleEvent.workspace_preflight(
@@ -636,8 +637,18 @@ class AutopilotStatusTests(unittest.TestCase):
                     task_id="TASK-01",
                     decision="rejected",
                     reason="workspace_collision",
-                    retry_disposition="retry_later",
+                    retry_disposition="defer_until_workspace_changes",
                     worker_launch_allowed=False,
+                    branch="main",
+                    worktree=repo,
+                    selected_base=selected_base,
+                    workspace_state_fingerprint=workspace_state_fingerprint(
+                        repo=repo,
+                        main_branch="main",
+                        branch="main",
+                        worktree=repo,
+                        expected_base=selected_base,
+                    ),
                 )
             )
 
@@ -649,7 +660,8 @@ class AutopilotStatusTests(unittest.TestCase):
             payload["blockers"],
             [
                 "task_dispatch_blocked:TASK-01: workspace preflight rejected "
-                "worker launch: workspace_collision (retry_later)"
+                "worker launch: workspace_collision "
+                "(defer_until_workspace_changes)"
             ],
         )
         self.assertEqual(payload["supervisor"]["dispatch_state"], "blocked")
@@ -662,15 +674,17 @@ class AutopilotStatusTests(unittest.TestCase):
                     "key": "workspace",
                     "message": (
                         "workspace preflight rejected worker launch: "
-                        "workspace_collision (retry_later)"
+                        "workspace_collision (defer_until_workspace_changes)"
                     ),
                     "remedy": (
-                        "Inspect the recorded branch and worktree state; "
-                        "the supervisor will retry."
+                        "Repair or remove the recorded branch/worktree; the "
+                        "supervisor re-evaluates their state each cycle."
                     ),
                     "reason": "workspace_collision",
-                    "retry_disposition": "retry_later",
+                    "retry_disposition": "defer_until_workspace_changes",
                     "run_id": "run-1",
+                    "branch": "main",
+                    "worktree": str(repo),
                 }
             ],
         )
@@ -679,6 +693,34 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("workspace_collision", rendered)
         self.assertNotIn("\nblockers:\n", rendered)
         self.assertNotIn("blockers: none", rendered)
+
+    def test_retry_later_workspace_preflight_is_retried_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            RunStore(config.state_path / "runs.jsonl").append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    decision="rejected",
+                    reason="workspace_provision_failed",
+                    retry_disposition="retry_later",
+                    worker_launch_allowed=False,
+                )
+            )
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **kwargs: launched.append(command) or 0,
+            )
+            status = collect_project_status(config)
+
+        self.assertEqual(status.queue.dispatch_blockers, ())
+        self.assertEqual(len(launched), 1)
+        self.assertIn("launched_run_until_done", summary.cycles[0].actions)
 
     def test_successful_workspace_preflight_clears_prior_status_rejection(
         self,
@@ -754,6 +796,88 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(refreshed.queue.dispatch_blockers, ())
         self.assertEqual(len(launched), 1)
         self.assertIn("launched_run_until_done", summary.cycles[0].actions)
+
+    def test_repaired_present_workspace_is_dispatched_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            branch = "vibe-loop/task-01"
+            worktree = Path(directory) / "task-worktree"
+            run(repo, "git", "worktree", "add", "-b", branch, str(worktree))
+            dirty_file = worktree / "dirty.txt"
+            dirty_file.write_text("dirty\n", encoding="utf-8")
+            config = load_config(repo)
+            selected_base = git_text(repo, "rev-parse", "main")
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    decision="rejected",
+                    reason="dirty_existing_workspace",
+                    retry_disposition="defer_until_workspace_changes",
+                    worker_launch_allowed=False,
+                    branch=branch,
+                    worktree=worktree,
+                    selected_base=selected_base,
+                    workspace_state_fingerprint=workspace_state_fingerprint(
+                        repo=repo,
+                        main_branch="main",
+                        branch=branch,
+                        worktree=worktree,
+                        expected_base=selected_base,
+                    ),
+                )
+            )
+
+            blocked = collect_project_status(config)
+            dirty_file.unlink()
+            launched: list[object] = []
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **kwargs: launched.append(command) or 0,
+            )
+            refreshed = collect_project_status(config)
+            workspace_remained = worktree.is_dir()
+            branch_remained = bool(
+                git_text(repo, "show-ref", "--verify", f"refs/heads/{branch}")
+            )
+
+        self.assertEqual(len(blocked.queue.dispatch_blockers), 1)
+        self.assertTrue(workspace_remained)
+        self.assertTrue(branch_remained)
+        self.assertEqual(refreshed.queue.dispatch_blockers, ())
+        self.assertEqual(len(launched), 1)
+        self.assertIn("launched_run_until_done", summary.cycles[0].actions)
+
+    def test_missing_or_invalid_workspace_fingerprint_does_not_block(self) -> None:
+        for fingerprint in ("", "not-a-sha256"):
+            with (
+                self.subTest(fingerprint=fingerprint),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                repo = Path(directory)
+                configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+                config = load_config(repo)
+                record = RunLifecycleEvent.workspace_preflight(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    decision="rejected",
+                    reason="workspace_refresh_conflict",
+                    retry_disposition="defer_until_workspace_changes",
+                    worker_launch_allowed=False,
+                    branch="main",
+                    worktree=repo,
+                ).to_record()
+                if fingerprint:
+                    record["workspace_state_fingerprint"] = fingerprint
+                RunStore(config.state_path / "runs.jsonl").append_record(record)
+
+                status = collect_project_status(config)
+
+            self.assertEqual(status.queue.dispatch_blockers, ())
 
     def test_collect_project_status_keeps_nonblocking_agent_diagnostics(
         self,
@@ -7683,6 +7807,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 extra_toml='[autopilot]\nhealth_command = "health"\n',
             )
             config = load_config(repo)
+            selected_base = git_text(repo, "rev-parse", "main")
             run_store = RunStore(config.state_path / "runs.jsonl")
             run_store.append_lifecycle_event(
                 RunLifecycleEvent.workspace_preflight(
@@ -7692,6 +7817,16 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                     reason="workspace_refresh_conflict",
                     retry_disposition="defer_until_workspace_changes",
                     worker_launch_allowed=False,
+                    branch="main",
+                    worktree=repo,
+                    selected_base=selected_base,
+                    workspace_state_fingerprint=workspace_state_fingerprint(
+                        repo=repo,
+                        main_branch="main",
+                        branch="main",
+                        worktree=repo,
+                        expected_base=selected_base,
+                    ),
                 )
             )
             runner, calls = self._stub_runner({"health": 1})

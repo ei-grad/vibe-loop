@@ -76,6 +76,8 @@ from vibe_loop.runner import (
     inject_structured_usage_output,
     new_run_id,
     parse_agent_runtime_context_from_command,
+    workspace_fingerprint_ignored_dirty_paths,
+    workspace_preflight_deferral_is_unchanged,
 )
 from vibe_loop.runs import (
     AUTOPILOT_CHILD_STARTED_RECORD_TYPE,
@@ -132,13 +134,11 @@ from vibe_loop.workers import (
     collect_worktree_disposition_evidence,
     execute_worktree_disposition,
     git_branch_delete,
-    run_git_result,
     git_worktree_remove,
     pid_exists,
     record_expired_locks,
     restore_projected_worker_process_identity,
     worker_view_is_live,
-    workspace_state_fingerprint,
     worktree_branch_delete_revalidation_guardrails,
 )
 
@@ -879,55 +879,15 @@ def workspace_preflight_dispatch_blockers(
         if task_id in locked_task_ids or task_id in already_blocked:
             continue
         record = latest.get(task_id)
-        if (
-            record is None
-            or record.get("decision") != "rejected"
-            or record.get("worker_launch_allowed") is not False
+        if record is None or not workspace_preflight_deferral_is_unchanged(
+            record,
+            repo=repo,
+            main_branch=main_branch,
+            ignored_dirty_paths=workspace_fingerprint_ignored_dirty_paths(),
         ):
             continue
         reason = str(record.get("reason") or "unknown")
         retry_disposition = str(record.get("retry_disposition") or "retry_later")
-        if retry_disposition == "defer_until_workspace_changes":
-            branch = str(record.get("branch") or "")
-            worktree_text = str(record.get("worktree") or "")
-            worktree = Path(worktree_text) if worktree_text else None
-            if worktree is not None and not worktree.is_absolute():
-                worktree = repo / worktree
-            branch_result = (
-                run_git_result(
-                    repo,
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    f"refs/heads/{branch}",
-                )
-                if branch
-                else None
-            )
-            branch_is_absent = (
-                branch_result is not None and branch_result.returncode == 1
-            )
-            if branch_is_absent and worktree is not None and not worktree.is_dir():
-                continue
-
-            recorded_fingerprint = record.get("workspace_state_fingerprint")
-            if (
-                isinstance(recorded_fingerprint, str)
-                and len(recorded_fingerprint) == 64
-                and all(
-                    character in "0123456789abcdef"
-                    for character in recorded_fingerprint
-                )
-            ):
-                current_fingerprint = workspace_state_fingerprint(
-                    repo=repo,
-                    main_branch=main_branch,
-                    branch=branch,
-                    worktree=worktree,
-                    expected_base=str(record.get("selected_base") or ""),
-                )
-                if current_fingerprint != recorded_fingerprint:
-                    continue
         blocker: dict[str, object] = {
             "task_id": task_id,
             "code": "workspace_preflight_rejected",
@@ -939,9 +899,6 @@ def workspace_preflight_dispatch_blockers(
             "remedy": (
                 "Repair or remove the recorded branch/worktree; the supervisor "
                 "re-evaluates their state each cycle."
-                if retry_disposition == "defer_until_workspace_changes"
-                else "Inspect the recorded branch and worktree state; "
-                "the supervisor will retry."
             ),
             "reason": reason,
             "retry_disposition": retry_disposition,
