@@ -261,12 +261,24 @@ MODEL_IDENTITY_EVENT_TYPES = frozenset(
         "turn.started",
     }
 )
+SESSION_IDENTITY_EVENT_TYPES = frozenset(
+    {
+        "init",
+        "session.created",
+        "session.start",
+        "session_configured",
+        "system",
+        "thread.started",
+    }
+)
 # Higher rank wins when two observations disagree about the same field. Command
 # arguments are explicit operator intent; structured native events outrank both
 # free-text log scraping and executable-name inference.
 AGENT_CONTEXT_SOURCE_RANKS = (
     ("command_arg:", 40),
     ("command_config:", 35),
+    ("native:stdout:json.", 32),
+    ("native:stderr:json.", 32),
     ("native:", 30),
     ("command_executable:", 10),
 )
@@ -287,6 +299,20 @@ SECRET_LIKE_CONTEXT_TOKENS = (
 )
 AGENT_STARTUP_OBSERVATION_LINE_LIMIT = 80
 AGENT_CONTEXT_VALUE_MAX_CHARS = 160
+ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))"
+    r"|(?:\x1b\[[0-?]*[ -/]*[@-~])"
+    r"|(?:\x1b[@-_])"
+)
+CODEX_STARTUP_HEADER_RE = re.compile(r"\bOpenAI\s+Codex\b", re.IGNORECASE)
+CODEX_STARTUP_SEPARATOR_RE = re.compile(r"^[\s─━═╌╍┄┅┈┉-]{3,}$")
+CODEX_STARTUP_FIELD_RE = re.compile(
+    r"(?:^|[\s│┃|])"
+    r"(?P<label>model|provider|reasoning effort|session id)"
+    r"\s*:\s*(?P<value>[A-Za-z0-9][A-Za-z0-9._:/+-]{0,254})"
+    r"(?:$|[\s│┃|])",
+    re.IGNORECASE,
+)
 RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
 SPEC_WORKER_CONTEXT_SCHEMA_VERSION = 1
 SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS = 12_000
@@ -490,6 +516,79 @@ RESOURCE_SCHEDULER_LOCK_POLL_SECONDS = 0.01
 class SessionIdObservation:
     session_id: str
     source: str
+
+
+class CodexStartupFrameObserver:
+    """Capture the fixed Codex banner without treating later prose as metadata."""
+
+    def __init__(self) -> None:
+        self._active = False
+        self._closed = False
+        self._saw_field = False
+        self._stream_name = ""
+
+    def observe_line(
+        self,
+        line: str,
+        stream_name: str,
+    ) -> tuple[SessionIdObservation | None, AgentRuntimeContext]:
+        if self._closed:
+            return None, AgentRuntimeContext()
+        text = strip_ansi_control_sequences(line).replace("\r", "\n")
+        session_observation = None
+        context = AgentRuntimeContext()
+        for raw_segment in text.splitlines() or (text,):
+            segment = raw_segment.strip()
+            if not self._active:
+                if CODEX_STARTUP_HEADER_RE.search(segment) is None:
+                    continue
+                self._active = True
+                self._stream_name = stream_name
+                continue
+            if stream_name != self._stream_name:
+                continue
+            if self._saw_field and CODEX_STARTUP_SEPARATOR_RE.fullmatch(segment):
+                self._closed = True
+                break
+            match = CODEX_STARTUP_FIELD_RE.search(segment)
+            if match is None:
+                continue
+            label = normalize_agent_context_key(match.group("label"))
+            value = match.group("value")
+            source = f"native:{stream_name}:startup_frame.{label}"
+            self._saw_field = True
+            if label == "session_id":
+                session_id = parse_worker_session_id(f"session id: {value}")
+                if session_id is not None:
+                    session_observation = SessionIdObservation(session_id, source)
+            elif label == "model":
+                model_id, rejected = clean_model_attribution_value(value)
+                context = context.overlay(
+                    AgentRuntimeContext(
+                        model_id=model_id,
+                        model_id_source=source if model_id else "",
+                        attribution_diagnostics=("model",) if rejected else (),
+                    )
+                )
+            elif label == "provider":
+                provider, rejected = clean_provider_attribution_value(value)
+                context = context.overlay(
+                    AgentRuntimeContext(
+                        model_provider=provider,
+                        model_provider_source=source if provider else "",
+                        attribution_diagnostics=("provider",) if rejected else (),
+                    )
+                )
+            elif label == "reasoning_effort":
+                effort = clean_reasoning_effort_value(value)
+                if effort:
+                    context = context.overlay(
+                        AgentRuntimeContext(
+                            reasoning_effort=effort,
+                            reasoning_effort_source=source,
+                        )
+                    )
+        return session_observation, context
 
 
 @dataclasses.dataclass(frozen=True)
@@ -773,6 +872,7 @@ class AgentOutputObserver:
         self._runtime_context = AgentRuntimeContext()
         self._line_count = 0
         self._source_generation = source_generation
+        self._codex_startup_frame = CodexStartupFrameObserver()
         self._usage_observer = ProviderUsageObserver(provider)
         self._activity_tracker = AgentActivityTracker()
 
@@ -805,7 +905,7 @@ class AgentOutputObserver:
         source_position: int,
     ) -> AgentRuntimeObservation | None:
         self._usage_observer.observe_line(line)
-        session_id = observe_worker_session_id(line)
+        session_observation = None
         runtime_context = AgentRuntimeContext()
         with self._lock:
             self._line_count += 1
@@ -813,10 +913,21 @@ class AgentOutputObserver:
                 self._line_count <= AGENT_STARTUP_OBSERVATION_LINE_LIMIT
             )
         if should_parse_context:
+            session_observation = observe_worker_session(line, stream_name)
             runtime_context = parse_agent_runtime_context_from_line(
                 line,
                 stream_name,
             )
+            with self._lock:
+                startup_session, startup_context = (
+                    self._codex_startup_frame.observe_line(
+                        line,
+                        stream_name,
+                    )
+                )
+            if session_observation is None:
+                session_observation = startup_session
+            runtime_context = runtime_context.prefer(startup_context)
         with self._lock:
             activity_emissions = self._activity_tracker.observe_line(
                 line,
@@ -826,13 +937,10 @@ class AgentOutputObserver:
             )
             delta_session_id = None
             delta_session_id_source = None
-            if session_id is not None and self._session_observation is None:
-                self._session_observation = SessionIdObservation(
-                    session_id=session_id,
-                    source=f"native:{stream_name}",
-                )
-                delta_session_id = session_id
-                delta_session_id_source = f"native:{stream_name}"
+            if session_observation is not None and self._session_observation is None:
+                self._session_observation = session_observation
+                delta_session_id = session_observation.session_id
+                delta_session_id_source = session_observation.source
             delta_context = self._runtime_context.missing_delta(runtime_context)
             if not delta_context.empty:
                 self._runtime_context = self._runtime_context.overlay(delta_context)
@@ -2630,7 +2738,6 @@ class VibeRunner:
                         )
                     )
                     session_observed_recorded = True
-                    return
                 if not observation.runtime_context.empty:
                     self.run_store.append_lifecycle_event(
                         RunLifecycleEvent.agent_context_observed(
@@ -7906,6 +8013,8 @@ def parse_agent_runtime_context_from_json_payload(
     payload: dict[str, object],
     source_prefix: str,
 ) -> AgentRuntimeContext:
+    if not payload_declares_model_identity(payload):
+        return AgentRuntimeContext()
     model_value = payload.get("model")
     model_mapping = model_value if isinstance(model_value, dict) else {}
     model_provider, provider_rejected = first_attribution_context_value(
@@ -7916,11 +8025,7 @@ def parse_agent_runtime_context_from_json_payload(
         ),
         clean_provider_attribution_value,
     )
-    bare_model = (
-        model_value
-        if isinstance(model_value, str) and payload_declares_model_identity(payload)
-        else None
-    )
+    bare_model = model_value if isinstance(model_value, str) else None
     model_id, model_rejected = first_attribution_context_value(
         (payload.get("model_id"), model_mapping.get("id"), bare_model),
         clean_model_attribution_value,
@@ -8150,20 +8255,50 @@ def parse_worker_session_id(line: str) -> str | None:
     return match.group("session_id")
 
 
-def observe_worker_session_id(line: str) -> str | None:
-    """Read identity fields without scanning structured message content."""
+def strip_ansi_control_sequences(value: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", value)
+
+
+def observe_worker_session(
+    line: str,
+    stream_name: str,
+) -> SessionIdObservation | None:
+    """Read session identity only from a structured startup event."""
     payload = agent_context_json_payload(line)
     if payload is None:
-        return parse_worker_session_id(line)
+        return None
     nested = payload.get("payload")
     event = nested if isinstance(nested, Mapping) else payload
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return None
+    normalized_type = event_type.strip().lower()
+    subtype = event.get("subtype")
+    if normalized_type == "system" and (
+        not isinstance(subtype, str) or subtype.strip().lower() != "init"
+    ):
+        return None
+    if normalized_type not in SESSION_IDENTITY_EVENT_TYPES:
+        return None
     for key in ("session_id", "thread_id"):
         value = event.get(key)
         if not isinstance(value, str) or len(value.encode("utf-8")) > 256:
             continue
-        if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?", value):
-            return value
+        if EXPORTABLE_SESSION_ID_RE.fullmatch(value):
+            return SessionIdObservation(
+                session_id=value,
+                source=f"native:{stream_name}:json.{key}",
+            )
     return None
+
+
+def observe_worker_session_id(line: str) -> str | None:
+    """Compatibility parser for one line; stream capture uses stricter framing."""
+    payload = agent_context_json_payload(line)
+    if payload is None:
+        return parse_worker_session_id(line)
+    observation = observe_worker_session(line, "stdout")
+    return observation.session_id if observation is not None else None
 
 
 def exportable_session_id(record: Mapping[str, object], *, run_id: str) -> str:

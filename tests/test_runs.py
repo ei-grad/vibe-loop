@@ -431,7 +431,7 @@ class RunStoreTests(unittest.TestCase):
         result = RunResult(
             run_id="run-1",
             session_id="native-session-1",
-            session_id_source="native:stdout",
+            session_id_source="native:stdout:startup_frame.session_id",
             agent_command_source="auto:codex",
             agent_selection_command_source="auto:codex",
             agent_default_policy_source="codex-first",
@@ -448,7 +448,10 @@ class RunStoreTests(unittest.TestCase):
 
         self.assertEqual(payload["run_id"], "run-1")
         self.assertEqual(payload["session_id"], "native-session-1")
-        self.assertEqual(payload["session_id_source"], "native:stdout")
+        self.assertEqual(
+            payload["session_id_source"],
+            "native:stdout:startup_frame.session_id",
+        )
         self.assertEqual(payload["agent_command_source"], "auto:codex")
         self.assertEqual(payload["agent_selection_command_source"], "auto:codex")
         self.assertEqual(payload["agent_default_policy_source"], "codex-first")

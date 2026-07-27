@@ -3757,11 +3757,13 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(payload["count"], 1)
                 self.assertEqual(payload["task_id"], "TASK-1")
 
-    def test_streaming_command_captures_stdout_session_id(self) -> None:
+    def test_streaming_command_captures_structured_stdout_session_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "cmd.py"
             script.write_text(
-                "print('session id: native-stdout-123')\n",
+                "import json\n"
+                "print(json.dumps({'type': 'thread.started', "
+                "'thread_id': 'native-stdout-123'}))\n",
                 encoding="utf-8",
             )
             log_path = Path(directory) / "run.log"
@@ -3776,12 +3778,88 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(result.session_id, "native-stdout-123")
-            self.assertEqual(result.session_id_source, "native:stdout")
-            self.assertIn("session id: native-stdout-123", stderr.getvalue())
+            self.assertEqual(
+                result.session_id_source,
+                "native:stdout:json.thread_id",
+            )
+            self.assertIn("native-stdout-123", stderr.getvalue())
             self.assertIn(
-                "session id: native-stdout-123",
+                "native-stdout-123",
                 log_path.read_text(encoding="utf-8"),
             )
+
+    def test_streaming_command_captures_ansi_codex_startup_frame_only(self) -> None:
+        session_id = "019c0104-6f6b-7cd1-ae1f-a7bdc01f24f9"
+        frame = [
+            "\x1b[1mOpenAI Codex\x1b[0m",
+            "\x1b[2m--------\x1b[0m",
+            "\x1b[2mmodel:\x1b[0m gpt-5.6-sol",
+            "\x1b[2mprovider:\x1b[0m openai",
+            "\x1b[2mreasoning effort:\x1b[0m high",
+            f"\x1b[2msession id:\x1b[0m {session_id}",
+            "\x1b[2m--------\x1b[0m",
+            "user",
+            "str session_id abc-123 run_id optional_string",
+            "model: gpt-9.9",
+            "provider: value",
+            "reasoning effort: low",
+            "session id: later-session",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                f"lines = {frame!r}\nfor line in lines:\n    print(line)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.session_id, session_id)
+        self.assertEqual(
+            result.session_id_source,
+            "native:stdout:startup_frame.session_id",
+        )
+        self.assertEqual(result.runtime_context.model_provider, "openai")
+        self.assertEqual(
+            result.runtime_context.model_provider_source,
+            "native:stdout:startup_frame.provider",
+        )
+        self.assertEqual(result.runtime_context.model_id, "gpt-5.6-sol")
+        self.assertEqual(
+            result.runtime_context.model_id_source,
+            "native:stdout:startup_frame.model",
+        )
+        self.assertEqual(result.runtime_context.reasoning_effort, "high")
+        self.assertEqual(
+            result.runtime_context.reasoning_effort_source,
+            "native:stdout:startup_frame.reasoning_effort",
+        )
+
+    def test_streaming_command_does_not_capture_session_id_from_later_prose(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "print('worker output')\nprint('session id: abc-123')\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertIsNone(result.session_id)
+        self.assertIsNone(result.session_id_source)
 
     def test_streaming_command_keeps_rate_limit_event_before_immediate_exit(
         self,
@@ -3828,7 +3906,8 @@ class RunnerTests(unittest.TestCase):
             script = Path(directory) / "cmd.py"
             script.write_text(
                 "import json\n"
-                "print(json.dumps({'model': {'provider': 'openai', "
+                "print(json.dumps({'type': 'session.created', "
+                "'model': {'provider': 'openai', "
                 "'id': 'gpt-5.5', 'reasoning_effort': 'high'}}))\n",
                 encoding="utf-8",
             )
@@ -3854,7 +3933,8 @@ class RunnerTests(unittest.TestCase):
             script = Path(directory) / "cmd.py"
             script.write_text(
                 "import json\n"
-                "print(json.dumps({'model': {'id': 'gpt-5.5'}, "
+                "print(json.dumps({'type': 'session.created', "
+                "'model': {'id': 'gpt-5.5'}, "
                 "'reasoning': 'private chain of thought'}))\n"
                 "print('reasoning: secret-token-value')\n",
                 encoding="utf-8",
@@ -4118,7 +4198,10 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "cmd.py"
             script.write_text(
-                "import sys\nprint('session id: native-stderr-123', file=sys.stderr)\n",
+                "import json\n"
+                "import sys\n"
+                "print(json.dumps({'type': 'thread.started', "
+                "'thread_id': 'native-stderr-123'}), file=sys.stderr)\n",
                 encoding="utf-8",
             )
             log_path = Path(directory) / "run.log"
@@ -4133,10 +4216,13 @@ class RunnerTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0)
             self.assertEqual(result.session_id, "native-stderr-123")
-            self.assertEqual(result.session_id_source, "native:stderr")
+            self.assertEqual(
+                result.session_id_source,
+                "native:stderr:json.thread_id",
+            )
             self.assertEqual(stderr.getvalue(), "")
             self.assertIn(
-                "session id: native-stderr-123",
+                "native-stderr-123",
                 log_path.read_text(encoding="utf-8"),
             )
 
@@ -11745,6 +11831,17 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         self.assertEqual(context.model_id, "gpt-5.6-sol")
         self.assertEqual(context.model_id_source, "native:stdout:json.model")
 
+    def test_generic_structured_session_id_is_not_runtime_identity(self) -> None:
+        line = json.dumps(
+            {
+                "type": "item.completed",
+                "session_id": "abc-123",
+                "item": {"type": "agent_message", "text": "done"},
+            }
+        )
+
+        self.assertIsNone(runner_module.observe_worker_session_id(line))
+
     def test_claude_init_event_still_supplies_model_identity(self) -> None:
         context = parse_agent_runtime_context_from_line(
             json.dumps(
@@ -11757,7 +11854,12 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
 
     def test_structured_model_mapping_retains_existing_precedence(self) -> None:
         context = parse_agent_runtime_context_from_line(
-            json.dumps({"model": {"provider": "openai", "id": "gpt-5.5"}}),
+            json.dumps(
+                {
+                    "type": "session.created",
+                    "model": {"provider": "openai", "id": "gpt-5.5"},
+                }
+            ),
             "stdout",
         )
 
@@ -11766,7 +11868,7 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
 
     def test_explicit_model_id_field_retains_existing_precedence(self) -> None:
         context = parse_agent_runtime_context_from_line(
-            json.dumps({"model_id": "gpt-5.5"}),
+            json.dumps({"type": "session.created", "model_id": "gpt-5.5"}),
             "stdout",
         )
 
@@ -11776,7 +11878,12 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         self,
     ) -> None:
         context = parse_agent_runtime_context_from_line(
-            json.dumps({"model": {"provider": "value", "id": "task"}}),
+            json.dumps(
+                {
+                    "type": "session.created",
+                    "model": {"provider": "value", "id": "task"},
+                }
+            ),
             "stdout",
         )
 
@@ -11791,6 +11898,7 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         context = parse_agent_runtime_context_from_line(
             json.dumps(
                 {
+                    "type": "session.created",
                     "model_provider": "value",
                     "model_id": "task",
                     "model": {"provider": "openai", "id": "gpt-5.6-sol"},
@@ -11883,7 +11991,12 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
     def test_structured_native_provider_refines_executable_inference(self) -> None:
         command_context = parse_agent_runtime_context_from_command("codex exec")
         observed = parse_agent_runtime_context_from_line(
-            json.dumps({"model": {"provider": "openai", "id": "gpt-5.6-sol"}}),
+            json.dumps(
+                {
+                    "type": "session.created",
+                    "model": {"provider": "openai", "id": "gpt-5.6-sol"},
+                }
+            ),
             "stdout",
         )
 

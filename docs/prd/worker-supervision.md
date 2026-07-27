@@ -357,6 +357,12 @@ provenance. `vibe-loop` publishes this context; repository-specific
 `vibe-loop` runtime and are responsible for deciding whether and how to mutate
 commits.
 
+Codex identity capture is restricted to native structured startup events. When
+structured startup metadata is unavailable, the runtime may parse the bounded
+ANSI-aware `OpenAI Codex` startup frame and records a field-specific
+`startup_frame` source. Prompt, source, diff, test, tool, and final-answer prose
+never establish or replace session, model, provider, or reasoning provenance.
+
 Acceptance must cover new record types appended without breaking existing
 readers, unknown type tolerance, correlation by `run_id` and `task_id`, payload
 schema per type, trailer-ready context availability before worker commits when
