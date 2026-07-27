@@ -9,6 +9,7 @@ from vibe_loop.processes import (
     ProcessNode,
     collect_owned_descendants,
     process_birth_identity,
+    process_group_is_live,
     read_process_node,
     read_process_table,
 )
@@ -67,6 +68,24 @@ class ProcessTableTests(unittest.TestCase):
             table = read_process_table(proc_root=root)
 
         self.assertEqual(sorted(table), [10, 11])
+
+    def test_process_group_survives_its_session_leader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(root, {43: (1, 42, 42, 901)})
+
+            live = process_group_is_live(42, 42, proc_root=root)
+
+        self.assertTrue(live)
+
+    def test_process_group_requires_the_recorded_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_fake_proc(root, {43: (1, 42, 99, 901)})
+
+            live = process_group_is_live(42, 42, proc_root=root)
+
+        self.assertFalse(live)
 
 
 class OwnedDescendantTests(unittest.TestCase):

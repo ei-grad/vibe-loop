@@ -3024,7 +3024,13 @@ def render_stale_locks(stale_locks: list[StaleLock]) -> str:
             f"{lock.task_id}\t{lock.kind}\treason={lock.stale_reason}"
             f"\trun_id={lock.run_id}\tpath={lock.lock_path}"
         )
-        lines.append(f"  recovery: {lock.recovery_command}")
+        if lock.advertised_recovery_command:
+            lines.append(f"  recovery: {lock.advertised_recovery_command}")
+        else:
+            lines.append(
+                "  recovery: operator action required; run ownership is not "
+                "proven finished"
+            )
     return "\n".join(lines)
 
 
@@ -3099,7 +3105,13 @@ def dispatch_workers_clean(args: argparse.Namespace, config) -> int:
             )
         )
     else:
-        print(f"{len(stale)} stale lock(s) found (dry-run, use --force to remove):")
+        if all(lock.recovery_supported for lock in stale):
+            guidance = "dry-run, use --force to remove"
+        elif any(lock.recovery_supported for lock in stale):
+            guidance = "dry-run, --force applies only to supported locks"
+        else:
+            guidance = "dry-run, operator action required"
+        print(f"{len(stale)} stale lock(s) found ({guidance}):")
         print(render_stale_locks(stale))
     return 0
 

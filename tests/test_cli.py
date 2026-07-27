@@ -8699,6 +8699,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["stale_locks"][0]["task_id"], "STALE-01")
         self.assertEqual(payload["cleaned"], [])
 
+    def test_workers_clean_does_not_advertise_force_for_unproven_run(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            lock_root = repo / ".vibe-loop" / "locks"
+            stale_lock = lock_root / "STALE-01.lock"
+            stale_lock.mkdir(parents=True)
+            (stale_lock / "lock.json").write_text(
+                json.dumps(
+                    {
+                        "record_type": "active_run",
+                        "schema_version": 1,
+                        "task_id": "STALE-01",
+                        "run_id": "run-1",
+                        "pid": None,
+                        "worker_pid": None,
+                        "host": socket.gethostname(),
+                        "started_at": "2026-05-09T00:00:00+00:00",
+                        "log": str(repo / ".vibe-loop" / "runs" / "run-1.log"),
+                        "base_main": "abc123",
+                        "command": "agent STALE-01",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            json_stdout = StringIO()
+            with redirect_stdout(json_stdout):
+                dry_run_exit = main(["workers", "--repo", str(repo), "clean", "--json"])
+            text_stdout = StringIO()
+            with redirect_stdout(text_stdout):
+                text_exit = main(["workers", "--repo", str(repo), "clean"])
+            force_stdout = StringIO()
+            force_stderr = StringIO()
+            with redirect_stdout(force_stdout), redirect_stderr(force_stderr):
+                force_exit = main(["workers", "--repo", str(repo), "clean", "--force"])
+            lock_still_exists = stale_lock.exists()
+
+        payload = json.loads(json_stdout.getvalue())
+        self.assertEqual(dry_run_exit, 0)
+        self.assertEqual(text_exit, 0)
+        self.assertEqual(force_exit, 1)
+        self.assertEqual(payload["stale_locks"][0]["recovery_command"], "")
+        self.assertFalse(payload["stale_locks"][0]["recovery_supported"])
+        self.assertIn("operator action required", text_stdout.getvalue())
+        self.assertNotIn("use --force to remove", text_stdout.getvalue())
+        self.assertIn("no supported command", force_stderr.getvalue())
+        self.assertTrue(lock_still_exists)
+
     def test_workers_clean_no_stale_locks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

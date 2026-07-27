@@ -114,6 +114,29 @@ def read_process_table(*, proc_root: Path = PROC_ROOT) -> dict[int, ProcessNode]
     return table
 
 
+def process_group_is_live(
+    process_group_id: int,
+    session_id: int,
+    *,
+    proc_root: Path = PROC_ROOT,
+) -> bool:
+    """Whether a Linux process group still has a non-zombie member.
+
+    Matching both group and session rejects partial numeric-ID collisions. The
+    session ID remains allocated while any member of the original session
+    survives, even after its leader exits.
+    """
+
+    if process_group_id <= 0 or session_id <= 0:
+        return False
+    return any(
+        node.process_group_id == process_group_id
+        and node.session_id == session_id
+        and node.state not in {"X", "Z"}
+        for node in read_process_table(proc_root=proc_root).values()
+    )
+
+
 def collect_owned_descendants(
     table: dict[int, ProcessNode],
     roots: dict[int, str],

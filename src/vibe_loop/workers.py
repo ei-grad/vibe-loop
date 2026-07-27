@@ -28,7 +28,7 @@ from vibe_loop.locks import (
     validate_lock_fencing_token,
 )
 from vibe_loop.config import TaskSourceConfig, format_shell_command_template
-from vibe_loop.processes import process_birth_identity
+from vibe_loop.processes import process_birth_identity, process_group_is_live
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
 from vibe_loop.runs import (
     LOCK_EXPIRED_RECORD_TYPE,
@@ -697,6 +697,7 @@ class WorkerView:
 
 
 ProcessExists = Callable[[int], bool]
+ProcessGroupExists = Callable[[int, int], bool]
 
 
 def load_active_run_states(lock_manager: LockManager) -> list[ActiveRunState]:
@@ -1497,6 +1498,7 @@ def build_worker_views(
     main_branch: str = "main",
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
+    process_group_exists: ProcessGroupExists | None = None,
     ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[WorkerView]:
     host = current_host if current_host is not None else socket.gethostname()
@@ -1525,7 +1527,12 @@ def build_worker_views(
             and result.get("task_id") != active.task_id
         ):
             result = None
-        process_state = classify_process(active, host, process_checker)
+        process_state = classify_process(
+            active,
+            host,
+            process_checker,
+            process_group_exists=process_group_exists,
+        )
         result_status = result_value(result, "status") or result_value(
             result, "classification"
         )
@@ -1914,6 +1921,7 @@ def classify_process(
     current_host: str,
     process_exists: ProcessExists | None = None,
     birth_identity_lookup: Callable[[int], str] | None = None,
+    process_group_exists: ProcessGroupExists | None = None,
 ) -> str:
     """Live-process disposition for one active-run lock.
 
@@ -1931,6 +1939,11 @@ def classify_process(
         birth_identity_lookup
         if birth_identity_lookup is not None
         else process_birth_identity
+    )
+    group_checker = (
+        process_group_exists
+        if process_group_exists is not None
+        else process_group_is_live
     )
     if active.host and active.host != current_host:
         return "foreign_host"
@@ -1951,6 +1964,15 @@ def classify_process(
             if current_birth_id == active.supervisor_process_birth_id
             else "missing"
         )
+    if (
+        active.worker_process_group_id is not None
+        and active.worker_session_id is not None
+        and group_checker(
+            active.worker_process_group_id,
+            active.worker_session_id,
+        )
+    ):
+        return "running"
     if not process_checker(active.worker_pid):
         return "missing"
     if not active.worker_process_birth_id:
@@ -2009,6 +2031,7 @@ def active_run_is_live(
     *,
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
+    process_group_exists: ProcessGroupExists | None = None,
 ) -> bool:
     """Whether an active-run lock still represents a run that may make progress.
 
@@ -2021,7 +2044,12 @@ def active_run_is_live(
     if lock_lease_expired(active.to_lock_metadata()):
         return False
     host = current_host if current_host is not None else socket.gethostname()
-    process_state = classify_process(active, host, process_exists)
+    process_state = classify_process(
+        active,
+        host,
+        process_exists,
+        process_group_exists=process_group_exists,
+    )
     if process_state not in {"missing", "unknown_pid"}:
         return True
     if active.host and active.host != host:
@@ -2166,6 +2194,10 @@ class StaleLock:
             or self.force_recovery_supported
         )
 
+    @property
+    def advertised_recovery_command(self) -> str:
+        return self.recovery_command if self.recovery_supported else ""
+
     def to_json(self) -> dict[str, object]:
         return {
             "task_id": self.task_id,
@@ -2173,7 +2205,7 @@ class StaleLock:
             "lock_path": str(self.lock_path),
             "stale_reason": self.stale_reason,
             "kind": self.kind,
-            "recovery_command": self.recovery_command,
+            "recovery_command": self.advertised_recovery_command,
             "started_at": self.started_at,
             "settlement_pending": self.settlement_pending,
             "process_state": self.process_state,
@@ -2190,6 +2222,7 @@ def collect_stale_locks(
     main_branch: str = "main",
     current_host: str | None = None,
     process_exists: ProcessExists | None = None,
+    process_group_exists: ProcessGroupExists | None = None,
     ignored_dirty_paths: Iterable[Path] = (),
 ) -> list[StaleLock]:
     stale: list[StaleLock] = []
@@ -2203,6 +2236,7 @@ def collect_stale_locks(
         main_branch=main_branch,
         current_host=current_host,
         process_exists=process_exists,
+        process_group_exists=process_group_exists,
         ignored_dirty_paths=ignored_dirty_paths,
     ):
         if view.state != "stale":

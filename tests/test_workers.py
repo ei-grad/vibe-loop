@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -768,6 +769,98 @@ class WorkerStateTests(unittest.TestCase):
             classify_process(state, "test-host", process_exists=lambda pid: False),
             "missing",
         )
+
+    def test_process_classification_uses_the_recorded_process_group(self) -> None:
+        state = ActiveRunState(
+            task_id="PAR-02",
+            run_id="run-1",
+            worker_pid=100,
+            worker_process_group_id=100,
+            worker_session_id=100,
+            worker_process_birth_id="boot-id:500",
+            host="test-host",
+            started_at="2026-05-09T00:00:00+00:00",
+            log_path=Path("run.log"),
+            base_main="abc123",
+            command="agent PAR-02",
+        )
+
+        self.assertEqual(
+            classify_process(
+                state,
+                "test-host",
+                process_exists=lambda pid: False,
+                process_group_exists=lambda process_group_id, session_id: (
+                    (
+                        process_group_id,
+                        session_id,
+                    )
+                    == (100, 100)
+                ),
+            ),
+            "running",
+        )
+
+    @unittest.skipUnless(sys.platform == "linux", "process groups require Linux")
+    def test_shell_exit_does_not_make_its_live_grandchild_stale(self) -> None:
+        shell = subprocess.Popen(
+            [
+                "/bin/sh",
+                "-c",
+                "sleep 0.2; sleep 30 >/dev/null 2>&1 & echo $!",
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        worker_birth_id = process_birth_identity(shell.pid)
+        output, _ = shell.communicate(timeout=2)
+        grandchild_pid = int(output.strip())
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                manager = LockManager(repo / ".vibe-loop" / "locks")
+                run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+                state = ActiveRunState(
+                    task_id="PAR-02",
+                    run_id="run-1",
+                    worker_pid=shell.pid,
+                    worker_process_group_id=shell.pid,
+                    worker_session_id=shell.pid,
+                    worker_process_birth_id=worker_birth_id,
+                    host="test-host",
+                    started_at="2026-05-09T00:00:00+00:00",
+                    log_path=repo / "run.log",
+                    base_main="abc123",
+                    command="agent PAR-02",
+                )
+                manager.acquire(
+                    state.task_id,
+                    state.run_id,
+                    metadata=state.to_lock_metadata(),
+                )
+
+                views = build_worker_views(
+                    manager,
+                    run_store,
+                    current_host="test-host",
+                    process_exists=lambda pid: False,
+                )
+                stale = collect_stale_locks(
+                    manager,
+                    run_store,
+                    current_host="test-host",
+                    process_exists=lambda pid: False,
+                )
+
+            self.assertEqual(views[0].process_state, "running")
+            self.assertEqual(views[0].state, "running")
+            self.assertEqual(stale, [])
+        finally:
+            try:
+                os.kill(grandchild_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
     def test_recycled_worker_pid_does_not_read_as_the_recorded_worker(self) -> None:
         state = ActiveRunState(
@@ -2567,6 +2660,12 @@ class StaleLockTests(unittest.TestCase):
         self.assertFalse(
             dataclasses.replace(base, run_state="unknown").recovery_supported
         )
+        self.assertEqual(
+            dataclasses.replace(base, run_state="unknown").to_json()[
+                "recovery_command"
+            ],
+            "",
+        )
         self.assertFalse(
             dataclasses.replace(base, run_state="running").recovery_supported
         )
@@ -2893,6 +2992,8 @@ class StaleLockTests(unittest.TestCase):
             stale_reason="missing_process",
             kind="task",
             recovery_command="rm -rf /state/locks/T-01.lock",
+            process_state="missing",
+            run_state="missing",
         )
         payload = lock.to_json()
         self.assertEqual(payload["task_id"], "T-01")
