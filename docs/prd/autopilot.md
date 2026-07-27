@@ -931,45 +931,55 @@ actions. A trailing `+` on the count means the commit span was truncated.
 
 ### Native Disk Health Defaults
 
-The native disk-health floors are 512 MiB free bytes, 10,000 free inodes, and
-2% proportional free space and inodes. A target is critical only when both the
-absolute and proportional floors for an axis are exhausted. A critical target
-withholds launch with `autopilot_disk_capacity_low`; the read-only check never
-deletes or truncates data. Every cycle journals one `autopilot_disk_health`
-record and a `disk_health:ok|critical` action tag. Filesystems without inode
-counts skip that axis, and unreadable paths remain non-blocking observations.
+The native disk-headroom gate warns below 50 GiB free and hard-stops new worker
+launches below 10 GiB free. Byte thresholds are absolute: build capacity
+depends on available bytes rather than the size of the backing filesystem. The
+gate measures the filesystem where native worker worktrees and their build
+outputs are provisioned, including when that filesystem differs from the
+repository checkout.
 
-These floors are configuration-free by default but project-tunable through
+Below the warning threshold, the cycle journals a typed
+`autopilot_disk_health` warning and continues dispatch. Below the hard-stop
+threshold, it withholds new launches with `autopilot_disk_capacity_low` while
+the supervisor remains alive. The blocker evidence names the mount, measured
+path, and free bytes. Existing workers are never terminated by this gate. Every
+cycle records one `autopilot_disk_health` record and a
+`disk_health:ok|warning|critical` action tag. `vibe-loop doctor` and
+`autopilot status --json` use the same live measurement and verdict schema.
+
+The inode guard remains a hard-stop condition at 10,000 free inodes and 2%
+proportional free inodes. Filesystems without inode counts skip that axis, and
+unreadable paths remain non-blocking observations.
+
+These thresholds are configuration-free by default but project-tunable through
 `[autopilot.disk_reserve]`:
 
 | Key | Meaning and unit | Default |
 | --- | --- | --- |
-| `min_free_bytes` | Absolute free-space floor in bytes | `536870912` (512 MiB) |
-| `min_free_fraction` | Free-space fraction in `[0.0, 1.0]` | `0.02` (2%) |
+| `warn_free_bytes` | Warning threshold in bytes | `53687091200` (50 GiB) |
+| `hard_stop_free_bytes` | New-worker hard-stop threshold in bytes | `10737418240` (10 GiB) |
 | `min_free_inodes` | Absolute free-inode floor | `10000` |
 | `min_free_inode_fraction` | Free-inode fraction in `[0.0, 1.0]` | `0.02` (2%) |
 
-A heavy repository can demand a larger reserve without changing the global
-default, which would create false positives for small or light repositories. An
-unset override keeps the reviewed default, so a configuration-free project's
-behavior is unchanged. Values must be non-negative and finite; fractions must
-be within `[0.0, 1.0]`. To disable byte or inode capacity checks, set both the
-absolute and proportional floors for that axis to zero. A lone zero paired with
-a positive effective companion is rejected as contradictory because the two
-floors could never be exhausted together. The effective thresholds are
-journaled in every `autopilot_disk_health` record and surfaced in project
-status.
+`warn_free_bytes` must be greater than or equal to
+`hard_stop_free_bytes`. Values must be non-negative and finite; inode fractions
+must be within `[0.0, 1.0]`. `min_free_bytes` remains accepted as a compatibility
+alias for `hard_stop_free_bytes`, but configuring both is rejected.
+`min_free_fraction` remains readable for configuration compatibility and is not
+part of the byte-headroom verdict. To disable inode capacity checks, set both
+inode floors to zero. The effective thresholds and live reading are journaled
+in every `autopilot_disk_health` record and surfaced in project status.
 
 ### Generic Cycle Acceptance
 
 Acceptance must cover each native behavior landing as an independently
 reviewable slice, every native action appearing in the append-only journal
 (`PRD-AUT-011`), and no native behavior performing destructive recovery outside
-its declared evidence-gated guardrails. Configurable disk reserves must preserve
-the reviewed AUTO-15 defaults when unset, block an injected 3.4 GiB/242 GiB
-sample under an 8 GiB reserve, fail validation on invalid or contradictory
-values, and expose the effective thresholds in cycle records and status without
-introducing any cleanup or repository mutation.
+its declared evidence-gated guardrails. Disk-headroom acceptance covers the
+50 GiB/10 GiB defaults, warning-with-dispatch, hard-stop-without-worker-launch,
+running-worker preservation, worktree-filesystem targeting, typed blocker
+evidence, matching doctor/status projections, invalid threshold validation, and
+no cleanup or repository mutation.
 
 Related implementation IDs: `AUTO-12`, `AUTO-14`, `AUTO-15`, `AUTO-16`,
 `AUTO-17`, `AUTO-18`, `AUTO-19`, `autopilot-configurable-disk-reserve`.
@@ -1082,7 +1092,8 @@ opaque `id`, an allowlisted `kind`, and bounded opaque `project`, `run_id`, and
 return so identifier-shaped sensitive text is never emitted. The initial kinds
 are `operator_action_required`,
 `supervisor_inconsistent`, `recovery_exhausted`, `lock_finalization_failed`,
-`disk_blocked`, `provider_quota_wall`, and `provider_account_wall`. Provider
+`disk_warning`, `disk_blocked`, `provider_quota_wall`, and
+`provider_account_wall`. Provider
 wall records must carry explicit verified evidence. Progress, tool activity,
 reviewer chatter or findings, ordinary lifecycle transitions, and successful
 completion are not actionable runtime events.

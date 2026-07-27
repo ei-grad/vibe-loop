@@ -369,17 +369,19 @@ AUTOPILOT_CONFIG_KEYS = (
 )
 DISK_RESERVE_CONFIG_KEYS = frozenset(
     {
+        "warn_free_bytes",
+        "hard_stop_free_bytes",
         "min_free_bytes",
         "min_free_fraction",
         "min_free_inodes",
         "min_free_inode_fraction",
     }
 )
-# Native disk-health floors (the reviewed AUTO-15 defaults). A target is a
-# genuine capacity blocker only when BOTH the absolute and the proportional
-# floor of an axis are exhausted. These are the single source of truth for the
-# defaults; autopilot.DiskHealthThresholds aliases them.
-DISK_RESERVE_DEFAULT_MIN_FREE_BYTES = 512 * 1024 * 1024
+# Native disk-headroom thresholds. Byte thresholds are absolute because build
+# capacity depends on bytes available, not the size of the backing filesystem.
+DISK_RESERVE_DEFAULT_WARN_FREE_BYTES = 50 * 1024 * 1024 * 1024
+DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES = 10 * 1024 * 1024 * 1024
+DISK_RESERVE_DEFAULT_MIN_FREE_BYTES = DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES
 DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION = 0.02
 DISK_RESERVE_DEFAULT_MIN_FREE_INODES = 10_000
 DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION = 0.02
@@ -1149,16 +1151,15 @@ class SupervisionConfig:
 
 @dataclasses.dataclass(frozen=True)
 class DiskReserveConfig:
-    """Per-project overrides for the native disk-health capacity floors.
+    """Per-project overrides for the native disk-headroom thresholds.
 
-    Each field is ``None`` when unset, so the native AUTO-15 default applies and
-    a configuration-free project keeps its reviewed behavior. The disk-health
-    check blocks a target only when *both* the absolute and the proportional
-    floor of an axis are exhausted, so pairing a positive reserve on one axis
-    with a zero reserve on the other can never block; that combination is
-    rejected as contradictory during validation.
+    ``min_free_bytes`` remains a compatibility alias for
+    ``hard_stop_free_bytes``. Inode pressure retains its absolute-and-
+    proportional evaluation because inode capacity is not a build-size budget.
     """
 
+    warn_free_bytes: int | None = None
+    hard_stop_free_bytes: int | None = None
     min_free_bytes: int | None = None
     min_free_fraction: float | None = None
     min_free_inodes: int | None = None
@@ -1169,10 +1170,22 @@ class DiskReserveConfig:
         return key in self.explicit_keys
 
     @property
+    def effective_warn_free_bytes(self) -> int:
+        if self.warn_free_bytes is None:
+            return DISK_RESERVE_DEFAULT_WARN_FREE_BYTES
+        return self.warn_free_bytes
+
+    @property
+    def effective_hard_stop_free_bytes(self) -> int:
+        if self.hard_stop_free_bytes is not None:
+            return self.hard_stop_free_bytes
+        if self.min_free_bytes is not None:
+            return self.min_free_bytes
+        return DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES
+
+    @property
     def effective_min_free_bytes(self) -> int:
-        if self.min_free_bytes is None:
-            return DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
-        return self.min_free_bytes
+        return self.effective_hard_stop_free_bytes
 
     @property
     def effective_min_free_fraction(self) -> float:
@@ -1194,6 +1207,8 @@ class DiskReserveConfig:
 
     def to_json(self) -> dict[str, object]:
         return {
+            "warn_free_bytes": self.warn_free_bytes,
+            "hard_stop_free_bytes": self.hard_stop_free_bytes,
             "min_free_bytes": self.min_free_bytes,
             "min_free_fraction": self.min_free_fraction,
             "min_free_inodes": self.min_free_inodes,
@@ -1202,6 +1217,8 @@ class DiskReserveConfig:
             # override, or the native default when unset. Doctor/status show
             # these so an operator sees the values in force, not just overrides.
             "effective": {
+                "warn_free_bytes": self.effective_warn_free_bytes,
+                "hard_stop_free_bytes": self.effective_hard_stop_free_bytes,
                 "min_free_bytes": self.effective_min_free_bytes,
                 "min_free_fraction": self.effective_min_free_fraction,
                 "min_free_inodes": self.effective_min_free_inodes,
@@ -3262,6 +3279,13 @@ def parse_disk_reserve(data: object) -> DiskReserveConfig:
         DISK_RESERVE_CONFIG_KEYS,
         "autopilot.disk_reserve",
     )
+    warn_free_bytes = optional_nonnegative_int(
+        table.get("warn_free_bytes"), "autopilot.disk_reserve.warn_free_bytes"
+    )
+    hard_stop_free_bytes = optional_nonnegative_int(
+        table.get("hard_stop_free_bytes"),
+        "autopilot.disk_reserve.hard_stop_free_bytes",
+    )
     min_free_bytes = optional_nonnegative_int(
         table.get("min_free_bytes"), "autopilot.disk_reserve.min_free_bytes"
     )
@@ -3276,16 +3300,24 @@ def parse_disk_reserve(data: object) -> DiskReserveConfig:
         "autopilot.disk_reserve.min_free_inode_fraction",
     )
     reserve = DiskReserveConfig(
+        warn_free_bytes=warn_free_bytes,
+        hard_stop_free_bytes=hard_stop_free_bytes,
         min_free_bytes=min_free_bytes,
         min_free_fraction=min_free_fraction,
         min_free_inodes=min_free_inodes,
         min_free_inode_fraction=min_free_inode_fraction,
         explicit_keys=explicit_keys,
     )
-    reject_contradictory_reserve_pair(
-        ("min_free_bytes", reserve.effective_min_free_bytes),
-        ("min_free_fraction", reserve.effective_min_free_fraction),
-    )
+    if hard_stop_free_bytes is not None and min_free_bytes is not None:
+        raise ValueError(
+            "autopilot.disk_reserve.hard_stop_free_bytes and .min_free_bytes "
+            "cannot both be configured"
+        )
+    if reserve.effective_warn_free_bytes < reserve.effective_hard_stop_free_bytes:
+        raise ValueError(
+            "autopilot.disk_reserve.warn_free_bytes must be greater than or "
+            "equal to hard_stop_free_bytes"
+        )
     reject_contradictory_reserve_pair(
         ("min_free_inodes", reserve.effective_min_free_inodes),
         ("min_free_inode_fraction", reserve.effective_min_free_inode_fraction),

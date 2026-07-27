@@ -828,7 +828,8 @@ class ConfigTests(unittest.TestCase):
             repo = Path(directory)
             (repo / ".vibe-loop.toml").write_text(
                 "[autopilot.disk_reserve]\n"
-                "min_free_bytes = 8589934592\n"
+                "warn_free_bytes = 32212254720\n"
+                "hard_stop_free_bytes = 21474836480\n"
                 "min_free_fraction = 0.05\n"
                 "min_free_inodes = 50000\n"
                 "min_free_inode_fraction = 0.03\n",
@@ -838,26 +839,30 @@ class ConfigTests(unittest.TestCase):
             config = load_config(repo)
 
         reserve = config.autopilot.disk_reserve
-        self.assertEqual(reserve.min_free_bytes, 8589934592)
+        self.assertEqual(reserve.warn_free_bytes, 32212254720)
+        self.assertEqual(reserve.hard_stop_free_bytes, 21474836480)
         self.assertEqual(reserve.min_free_fraction, 0.05)
         self.assertEqual(reserve.min_free_inodes, 50000)
         self.assertEqual(reserve.min_free_inode_fraction, 0.03)
         payload = config.autopilot.to_json()["disk_reserve"]
-        self.assertEqual(payload["min_free_bytes"], 8589934592)
+        self.assertEqual(payload["warn_free_bytes"], 32212254720)
+        self.assertEqual(payload["hard_stop_free_bytes"], 21474836480)
         self.assertEqual(payload["min_free_fraction"], 0.05)
-        self.assertEqual(payload["effective"]["min_free_bytes"], 8589934592)
+        self.assertEqual(payload["effective"]["warn_free_bytes"], 32212254720)
+        self.assertEqual(payload["effective"]["hard_stop_free_bytes"], 21474836480)
         self.assertEqual(payload["effective"]["min_free_inodes"], 50000)
         self.assertEqual(
             sorted(payload["explicit_keys"]),
             [
-                "min_free_bytes",
+                "hard_stop_free_bytes",
                 "min_free_fraction",
                 "min_free_inode_fraction",
                 "min_free_inodes",
+                "warn_free_bytes",
             ],
         )
-        # Effective floors resolve overrides for the runtime and doctor output.
-        self.assertEqual(reserve.effective_min_free_bytes, 8589934592)
+        self.assertEqual(reserve.effective_warn_free_bytes, 32212254720)
+        self.assertEqual(reserve.effective_hard_stop_free_bytes, 21474836480)
         self.assertEqual(reserve.effective_min_free_inode_fraction, 0.03)
 
     def test_autopilot_disk_reserve_defaults_to_unset(self) -> None:
@@ -865,13 +870,18 @@ class ConfigTests(unittest.TestCase):
             config = load_config(Path(directory))
 
         reserve = config.autopilot.disk_reserve
+        self.assertIsNone(reserve.warn_free_bytes)
+        self.assertIsNone(reserve.hard_stop_free_bytes)
         self.assertIsNone(reserve.min_free_bytes)
         self.assertIsNone(reserve.min_free_fraction)
         self.assertIsNone(reserve.min_free_inodes)
         self.assertIsNone(reserve.min_free_inode_fraction)
         self.assertEqual(reserve.explicit_keys, frozenset())
-        # Unset overrides resolve to the native AUTO-15 defaults.
-        self.assertEqual(reserve.effective_min_free_bytes, 512 * 1024 * 1024)
+        self.assertEqual(reserve.effective_warn_free_bytes, 50 * 1024 * 1024 * 1024)
+        self.assertEqual(
+            reserve.effective_hard_stop_free_bytes, 10 * 1024 * 1024 * 1024
+        )
+        self.assertEqual(reserve.effective_min_free_bytes, 10 * 1024 * 1024 * 1024)
         self.assertEqual(reserve.effective_min_free_fraction, 0.02)
         self.assertEqual(reserve.effective_min_free_inodes, 10_000)
         self.assertEqual(reserve.effective_min_free_inode_fraction, 0.02)
@@ -908,22 +918,16 @@ class ConfigTests(unittest.TestCase):
                 "autopilot.disk_reserve.unsupported",
             ),
             (
-                "min_free_bytes = 8589934592\nmin_free_fraction = 0.0\n",
-                "are contradictory",
+                "warn_free_bytes = 1073741824\n",
+                "must be greater than or equal",
             ),
             (
                 "min_free_inodes = 0\nmin_free_inode_fraction = 0.02\n",
                 "are contradictory",
             ),
-            # A lone explicit zero silently disables an axis against a positive
-            # native default; the resolved effective pair must be rejected.
             (
-                "min_free_fraction = 0.0\n",
-                "are contradictory",
-            ),
-            (
-                "min_free_bytes = 0\n",
-                "are contradictory",
+                "min_free_bytes = 10737418240\nhard_stop_free_bytes = 10737418240\n",
+                "cannot both be configured",
             ),
             (
                 "min_free_inode_fraction = 0.0\n",

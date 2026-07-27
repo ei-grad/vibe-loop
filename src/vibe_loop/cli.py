@@ -37,6 +37,7 @@ from vibe_loop.autopilot import (
     redact_runtime_context_text,
     reload_detached_autopilot,
     run_autopilot,
+    run_disk_health,
     start_detached_autopilot,
     stranded_review_tasks,
     stop_detached_autopilot,
@@ -1198,6 +1199,7 @@ def dispatch(args: argparse.Namespace) -> int:
             stranded_snapshot = None
             stranded_review_source = "current_task_source"
         config_report = config.config_report()
+        disk_headroom = run_disk_health(config, cycle_id="doctor").to_status_json()
         config_report.update(
             {
                 "fingerprint": config_snapshot_fingerprint(config),
@@ -1230,6 +1232,7 @@ def dispatch(args: argparse.Namespace) -> int:
                     "agent": config.agent.to_json(),
                     "locks": redacted_lock_config(config.locks),
                     "autopilot": redacted_autopilot_config(config.autopilot),
+                    "disk_headroom": disk_headroom,
                     "completion": redacted_completion_config(config.completion),
                     "stale_locks": stale_report,
                     "concurrency_diagnostics": concurrency_diagnostics_report(workers),
@@ -1790,6 +1793,25 @@ def render_autopilot_reload(result) -> str:
 
 def render_autopilot_status(status: ProjectStatus) -> str:
     lines = [f"repo: {status.display_name} ({status.repo})"]
+    disk_headroom = status.disk_headroom
+    targets = disk_headroom.get("targets")
+    first_target = (
+        targets[0]
+        if isinstance(targets, list) and targets and isinstance(targets[0], dict)
+        else {}
+    )
+    sample = first_target.get("sample")
+    sample = sample if isinstance(sample, dict) else {}
+    thresholds = disk_headroom.get("thresholds")
+    thresholds = thresholds if isinstance(thresholds, dict) else {}
+    lines.append(
+        "disk headroom: "
+        f"{disk_headroom.get('status', 'unknown')} "
+        f"mount={sample.get('mount') or sample.get('path') or 'unknown'} "
+        f"free_bytes={sample.get('free_bytes', 'unknown')} "
+        f"warn_below={thresholds.get('warn_free_bytes', 'unknown')} "
+        f"hard_stop_below={thresholds.get('hard_stop_free_bytes', 'unknown')}"
+    )
     queue = status.queue
     if queue.source_error:
         lines.append(f"queue: unavailable ({queue.source_error})")

@@ -21,6 +21,7 @@ from vibe_loop.autopilot import (
     AUTOPILOT_DISK_CAPACITY_BLOCKER,
     DISK_HEALTH_CRITICAL,
     DISK_HEALTH_OK,
+    DISK_HEALTH_WARNING,
     AutopilotCycleResult,
     AutopilotReloadResult,
     CYCLE_SUMMARY_BOOTSTRAP,
@@ -9304,6 +9305,7 @@ def _capacity_probe(
     free_bytes: int,
     total_inodes: int = 1_000_000,
     free_inodes: int = 800_000,
+    mount: str = "/worktrees",
 ):
     def probe(path: Path) -> DiskCapacitySample:
         return DiskCapacitySample(
@@ -9312,6 +9314,7 @@ def _capacity_probe(
             free_bytes=free_bytes,
             total_inodes=total_inodes,
             free_inodes=free_inodes,
+            mount=mount,
         )
 
     return probe
@@ -9330,38 +9333,46 @@ class DiskHealthCheckTests(unittest.TestCase):
             return run_disk_health(config, cycle_id="c1", probe=probe)
 
     def test_healthy_disk_reports_ok_without_blocker(self) -> None:
-        result = self._run(_capacity_probe(total_bytes=100 * GIB, free_bytes=50 * GIB))
+        result = self._run(_capacity_probe(total_bytes=100 * GIB, free_bytes=60 * GIB))
 
         self.assertEqual(result.status, DISK_HEALTH_OK)
         self.assertEqual(result.blocker, "")
-        self.assertEqual([target.label for target in result.targets], ["repo", "state"])
+        self.assertEqual([target.label for target in result.targets], ["worktrees"])
         self.assertTrue(all(not target.critical for target in result.targets))
 
+    def test_below_warn_reports_warning_without_blocker(self) -> None:
+        result = self._run(_capacity_probe(total_bytes=100 * GIB, free_bytes=40 * GIB))
+
+        self.assertEqual(result.status, DISK_HEALTH_WARNING)
+        self.assertEqual(result.blocker, "")
+        self.assertEqual(result.targets[0].warnings, ("free_bytes",))
+
     def test_exhausted_free_space_is_a_blocker(self) -> None:
-        result = self._run(
-            _capacity_probe(total_bytes=100 * GIB, free_bytes=100 * 1024 * 1024)
-        )
+        result = self._run(_capacity_probe(total_bytes=100 * GIB, free_bytes=9 * GIB))
 
         self.assertEqual(result.status, DISK_HEALTH_CRITICAL)
         self.assertEqual(result.blocker, AUTOPILOT_DISK_CAPACITY_BLOCKER)
         self.assertIn("free_bytes", result.targets[0].pressure)
+        self.assertEqual(result.blocker_details[0]["free_bytes"], 9 * GIB)
+        self.assertEqual(result.blocker_details[0]["mount"], "/worktrees")
 
-    def test_small_disk_low_on_bytes_but_roomy_is_not_a_blocker(self) -> None:
-        # 400 MiB free is below the absolute floor but is 39% of a 1 GiB disk:
-        # proportionally roomy, so not a genuine exhaustion signal.
-        result = self._run(
-            _capacity_probe(total_bytes=GIB, free_bytes=400 * 1024 * 1024)
+    def test_probe_targets_native_worktree_storage_filesystem(self) -> None:
+        observed: list[Path] = []
+
+        def probe(path: Path) -> DiskCapacitySample:
+            observed.append(path)
+            return _capacity_probe(total_bytes=100 * GIB, free_bytes=60 * GIB)(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            result = run_disk_health(load_config(repo), cycle_id="c1", probe=probe)
+
+        self.assertEqual(observed, [repo.parent])
+        self.assertEqual(
+            result.targets[0].path,
+            str(repo.parent / f"{repo.name}-worktrees"),
         )
-
-        self.assertEqual(result.status, DISK_HEALTH_OK)
-
-    def test_huge_disk_low_percentage_but_ample_bytes_is_not_a_blocker(self) -> None:
-        # Below 2% free but still 1 GiB available on a 100 TiB volume.
-        result = self._run(
-            _capacity_probe(total_bytes=100 * 1024 * GIB, free_bytes=GIB)
-        )
-
-        self.assertEqual(result.status, DISK_HEALTH_OK)
 
     def test_exhausted_inodes_is_a_blocker(self) -> None:
         result = self._run(
@@ -9393,7 +9404,7 @@ class DiskHealthCheckTests(unittest.TestCase):
 
         self.assertEqual(result.status, DISK_HEALTH_OK)
         self.assertEqual(result.blocker, "")
-        self.assertEqual(result.probe_errors, 2)
+        self.assertEqual(result.probe_errors, 1)
         self.assertTrue(all(target.sample is None for target in result.targets))
         self.assertTrue(all(target.error for target in result.targets))
 
@@ -9409,7 +9420,7 @@ class DiskHealthCheckTests(unittest.TestCase):
         self.assertEqual(record["repo"], "/repo")
         self.assertEqual(record["cycle_id"], "c1")
         self.assertIn("thresholds", record)
-        self.assertEqual(len(record["targets"]), 2)
+        self.assertEqual(len(record["targets"]), 1)
 
     def _run_with_toml(self, probe, extra_toml: str) -> DiskHealthCycleResult:
         with tempfile.TemporaryDirectory() as directory:
@@ -9423,23 +9434,20 @@ class DiskHealthCheckTests(unittest.TestCase):
             return run_disk_health(config, cycle_id="c1", probe=probe)
 
     def test_configured_reserve_blocks_sample_that_default_allows(self) -> None:
-        # 3.4 GiB free on a 242 GiB volume clears the native 512 MiB floor, so
-        # the default cycle records ok. An 8 GiB project reserve turns the same
-        # sample into a genuine capacity blocker (matches the task evidence).
-        sample = _capacity_probe(total_bytes=242 * GIB, free_bytes=int(3.4 * GIB))
+        sample = _capacity_probe(total_bytes=242 * GIB, free_bytes=12 * GIB)
 
         default_result = self._run(sample)
-        self.assertEqual(default_result.status, DISK_HEALTH_OK)
+        self.assertEqual(default_result.status, DISK_HEALTH_WARNING)
 
         configured_result = self._run_with_toml(
             sample,
-            "[autopilot.disk_reserve]\nmin_free_bytes = 8589934592\n",
+            "[autopilot.disk_reserve]\nhard_stop_free_bytes = 21474836480\n",
         )
         self.assertEqual(configured_result.status, DISK_HEALTH_CRITICAL)
         self.assertEqual(configured_result.blocker, AUTOPILOT_DISK_CAPACITY_BLOCKER)
         self.assertIn("free_bytes", configured_result.targets[0].pressure)
         record = configured_result.to_record(Path("/repo"))
-        self.assertEqual(record["thresholds"]["min_free_bytes"], 8589934592)
+        self.assertEqual(record["thresholds"]["hard_stop_free_bytes"], 21474836480)
 
     def test_configured_thresholds_resolve_defaults_for_unset_axes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -9447,12 +9455,16 @@ class DiskHealthCheckTests(unittest.TestCase):
             configured_repo(
                 repo,
                 [("TASK-01", "Next", "", "ready slice")],
-                extra_toml="[autopilot.disk_reserve]\nmin_free_bytes = 8589934592\n",
+                extra_toml=(
+                    "[autopilot.disk_reserve]\n"
+                    "warn_free_bytes = 32212254720\n"
+                    "hard_stop_free_bytes = 21474836480\n"
+                ),
             )
             thresholds = disk_health_thresholds_for(load_config(repo))
 
-        self.assertEqual(thresholds.min_free_bytes, 8589934592)
-        # Unset axes keep the reviewed AUTO-15 defaults.
+        self.assertEqual(thresholds.warn_free_bytes, 32212254720)
+        self.assertEqual(thresholds.hard_stop_free_bytes, 21474836480)
         self.assertEqual(thresholds.min_free_fraction, 0.02)
         self.assertEqual(thresholds.min_free_inodes, 10_000)
         self.assertEqual(thresholds.min_free_inode_fraction, 0.02)
@@ -9463,6 +9475,7 @@ class DiskHealthCheckTests(unittest.TestCase):
 
         self.assertGreater(sample.total_bytes, 0)
         self.assertGreaterEqual(sample.free_bytes, 0)
+        self.assertTrue(sample.mount)
 
     def test_default_probe_falls_back_when_statvfs_unavailable(self) -> None:
         # Simulate a platform without os.statvfs (e.g. Windows): the probe must
@@ -9523,6 +9536,59 @@ class DiskHealthCycleTests(unittest.TestCase):
         self.assertEqual(len(disk_records), 1)
         self.assertEqual(disk_records[0]["status"], DISK_HEALTH_CRITICAL)
 
+    def test_capacity_blocker_leaves_running_worker_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_record(
+                {
+                    "record_type": "run_supervisor_started",
+                    "pid": 7777,
+                    "occurred_at": "2026-06-10T00:00:00+00:00",
+                }
+            )
+
+            with mock.patch(
+                "vibe_loop.autopilot.terminate_command_process_group"
+            ) as terminate:
+                summary = run_autopilot(
+                    config,
+                    once=True,
+                    launcher=lambda command, **kwargs: 0,
+                    process_exists=lambda pid: pid == 7777,
+                    disk_health_runner=self._runner(
+                        _capacity_probe(total_bytes=100 * GIB, free_bytes=9 * GIB)
+                    ),
+                )
+
+        self.assertEqual(summary.cycles[0].status, "blocked")
+        self.assertEqual(summary.cycles[0].child_pid, None)
+        terminate.assert_not_called()
+
+    def test_capacity_blocker_keeps_supervisor_running(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                interval=60,
+                max_cycles=2,
+                sleep=lambda seconds: None,
+                launcher=lambda command, **kwargs: launched.append(command) or 0,
+                disk_health_runner=self._runner(
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=9 * GIB)
+                ),
+            )
+
+        self.assertTrue(summary.started)
+        self.assertEqual([cycle.status for cycle in summary.cycles], ["blocked"] * 2)
+        self.assertEqual(launched, [])
+
     def test_healthy_disk_records_observation_and_allows_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -9535,7 +9601,7 @@ class DiskHealthCycleTests(unittest.TestCase):
                 once=True,
                 launcher=lambda command, **k: launched.append(command) or 0,
                 disk_health_runner=self._runner(
-                    _capacity_probe(total_bytes=100 * GIB, free_bytes=50 * GIB)
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=60 * GIB)
                 ),
             )
             disk_records = self._disk_records(config)
@@ -9546,6 +9612,29 @@ class DiskHealthCycleTests(unittest.TestCase):
         self.assertEqual(len(launched), 1)
         self.assertEqual(len(disk_records), 1)
         self.assertEqual(disk_records[0]["status"], DISK_HEALTH_OK)
+
+    def test_warning_records_observation_and_allows_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launched: list[object] = []
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **k: launched.append(command) or 0,
+                disk_health_runner=self._runner(
+                    _capacity_probe(total_bytes=100 * GIB, free_bytes=40 * GIB)
+                ),
+            )
+            disk_records = self._disk_records(config)
+
+        cycle = summary.cycles[0]
+        self.assertNotEqual(cycle.status, "blocked")
+        self.assertIn(f"disk_health:{DISK_HEALTH_WARNING}", cycle.actions)
+        self.assertEqual(len(launched), 1)
+        self.assertEqual(disk_records[0]["status"], DISK_HEALTH_WARNING)
 
 
 class CycleSummaryUnitTests(unittest.TestCase):

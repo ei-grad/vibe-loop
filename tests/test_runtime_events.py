@@ -35,6 +35,7 @@ def append_records(path: Path, *records: dict[str, object]) -> None:
 def test_actionable_allowlist_is_small_and_explicit() -> None:
     assert ACTIONABLE_RUNTIME_EVENT_KINDS == {
         "disk_blocked",
+        "disk_warning",
         "lock_finalization_failed",
         "operator_action_required",
         "provider_account_wall",
@@ -53,6 +54,10 @@ def test_actionable_allowlist_is_small_and_explicit() -> None:
         (
             {"record_type": "autopilot_disk_health", "status": "critical"},
             "disk_blocked",
+        ),
+        (
+            {"record_type": "autopilot_disk_health", "status": "warning"},
+            "disk_warning",
         ),
         ({"record_type": "task_restart", "exhausted": True}, "recovery_exhausted"),
         (

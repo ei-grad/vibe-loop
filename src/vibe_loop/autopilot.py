@@ -23,10 +23,12 @@ from typing import Any, BinaryIO
 from vibe_loop.config import (
     AgentResolutionError,
     AUTOPILOT_MIN_INTERVAL_SECONDS,
+    DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES,
     DISK_RESERVE_DEFAULT_MIN_FREE_BYTES,
     DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION,
     DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION,
     DISK_RESERVE_DEFAULT_MIN_FREE_INODES,
+    DISK_RESERVE_DEFAULT_WARN_FREE_BYTES,
     REGISTRY_RUNTIME_CONTEXT_MAX_ENTRIES,
     REGISTRY_RUNTIME_CONTEXT_MAX_TOTAL_BYTES,
     RUNTIME_CONTEXT_REDACTION,
@@ -34,6 +36,7 @@ from vibe_loop.config import (
     VibeConfig,
     command_template_uses_field,
     format_agent_command,
+    git_main_worktree_path,
     structured_usage_observation,
     load_config,
     resolve_project_binding,
@@ -404,6 +407,7 @@ class ProjectStatus:
     stale_locks: tuple[StaleLock, ...] = ()
     integration_lock: dict[str, object] = dataclasses.field(default_factory=dict)
     agent: dict[str, object] = dataclasses.field(default_factory=dict)
+    disk_headroom: dict[str, object] = dataclasses.field(default_factory=dict)
     worktree_disposition_policy: str = "report-only"
     workspace_diagnostics: tuple[dict[str, object], ...] = ()
     supervisor: SupervisorStatus = dataclasses.field(default_factory=SupervisorStatus)
@@ -442,6 +446,7 @@ class ProjectStatus:
             "stale_locks": [lock.to_json() for lock in self.stale_locks],
             "integration_lock": self.integration_lock,
             "agent": self.agent,
+            "disk_headroom": self.disk_headroom,
             "worktree_disposition_policy": self.worktree_disposition_policy,
             "workspace_diagnostics": [
                 dict(diagnostic) for diagnostic in self.workspace_diagnostics
@@ -533,11 +538,15 @@ def collect_project_status(
     config: VibeConfig,
     *,
     process_exists: ProcessExists | None = None,
+    disk_health_result: DiskHealthCycleResult | None = None,
 ) -> ProjectStatus:
     project_binding = resolve_project_binding(config)
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
     non_closure = summarize_non_closures(run_store)
+    if disk_health_result is None:
+        disk_health_result = run_disk_health(config, cycle_id="status")
+    disk_headroom = disk_health_result.to_status_json()
     if project_binding.blocker is not None:
         # Querying the task source or lock adapter now would route this
         # repository's status through whatever project the ambient
@@ -556,6 +565,7 @@ def collect_project_status(
             ),
             queue=TaskQueueStatus(source_error=project_binding.blocker),
             agent=config.agent.to_json(),
+            disk_headroom=disk_headroom,
             worktree_disposition_policy=config.autopilot.worktree_disposition,
             # Supervisor liveness is only observable through the lock adapter,
             # which is exactly what must not be queried here. Report it as
@@ -571,6 +581,7 @@ def collect_project_status(
             blockers=(
                 *(item.code for item in project_binding.diagnostics),
                 *(item.code for item in contract_blockers),
+                *((disk_health_result.blocker,) if disk_health_result.blocker else ()),
             ),
             runtime_context=config.runtime_context,
             project_binding=project_binding,
@@ -654,6 +665,7 @@ def collect_project_status(
         dispatch_state=(
             "blocked"
             if contract_blockers
+            or disk_health_result.blocker
             or queue_status.source_error
             or queue_has_no_launchable_task(queue_status)
             else "idle"
@@ -680,6 +692,8 @@ def collect_project_status(
     blockers.extend(
         f"stranded_review_task:{task['task_id']}" for task in stranded_reviews
     )
+    if disk_health_result.blocker:
+        blockers.append(disk_health_result.blocker)
     if config.autopilot.require_upstream_sync:
         upstream = check_upstream_sync(
             config.repo,
@@ -719,6 +733,7 @@ def collect_project_status(
         stale_locks=stale_locks,
         integration_lock=integration_lock,
         agent=agent,
+        disk_headroom=disk_headroom,
         worktree_disposition_policy=config.autopilot.worktree_disposition,
         workspace_diagnostics=workspace_diagnostics,
         supervisor=supervisor,
@@ -4690,16 +4705,17 @@ def run_maintenance_command(
     )
 
 
-# Bounded capacity thresholds for the native disk-health check (PRD-AUT-012).
-# A target is a genuine capacity blocker only when BOTH an absolute reserve and
-# a proportional reserve are exhausted, so a large disk with a low percentage
-# but ample bytes, and a small disk low on bytes but proportionally roomy, are
-# not misreported as capacity failures.
+# Byte headroom uses absolute warning and hard-stop thresholds because build
+# capacity is measured in bytes. Inode pressure retains paired absolute and
+# proportional floors to avoid false positives across filesystem sizes.
+AUTOPILOT_DISK_WARN_FREE_BYTES = DISK_RESERVE_DEFAULT_WARN_FREE_BYTES
+AUTOPILOT_DISK_HARD_STOP_FREE_BYTES = DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES
 AUTOPILOT_DISK_MIN_FREE_BYTES = DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
 AUTOPILOT_DISK_MIN_FREE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
 AUTOPILOT_DISK_MIN_FREE_INODES = DISK_RESERVE_DEFAULT_MIN_FREE_INODES
 AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION
 DISK_HEALTH_OK = "ok"
+DISK_HEALTH_WARNING = "warning"
 DISK_HEALTH_CRITICAL = "critical"
 AUTOPILOT_DISK_CAPACITY_BLOCKER = "autopilot_disk_capacity_low"
 
@@ -4708,6 +4724,8 @@ AUTOPILOT_DISK_CAPACITY_BLOCKER = "autopilot_disk_capacity_low"
 class DiskHealthThresholds:
     """Bounded free-space/inode floors the disk-health check compares against."""
 
+    warn_free_bytes: int = AUTOPILOT_DISK_WARN_FREE_BYTES
+    hard_stop_free_bytes: int = AUTOPILOT_DISK_HARD_STOP_FREE_BYTES
     min_free_bytes: int = AUTOPILOT_DISK_MIN_FREE_BYTES
     min_free_fraction: float = AUTOPILOT_DISK_MIN_FREE_FRACTION
     min_free_inodes: int = AUTOPILOT_DISK_MIN_FREE_INODES
@@ -4715,6 +4733,8 @@ class DiskHealthThresholds:
 
     def to_json(self) -> dict[str, object]:
         return {
+            "warn_free_bytes": self.warn_free_bytes,
+            "hard_stop_free_bytes": self.hard_stop_free_bytes,
             "min_free_bytes": self.min_free_bytes,
             "min_free_fraction": self.min_free_fraction,
             "min_free_inodes": self.min_free_inodes,
@@ -4734,6 +4754,8 @@ def disk_health_thresholds_for(config: VibeConfig) -> DiskHealthThresholds:
     """
     reserve = config.autopilot.disk_reserve
     return DiskHealthThresholds(
+        warn_free_bytes=reserve.effective_warn_free_bytes,
+        hard_stop_free_bytes=reserve.effective_hard_stop_free_bytes,
         min_free_bytes=reserve.effective_min_free_bytes,
         min_free_fraction=reserve.effective_min_free_fraction,
         min_free_inodes=reserve.effective_min_free_inodes,
@@ -4755,6 +4777,7 @@ class DiskCapacitySample:
     free_bytes: int
     total_inodes: int
     free_inodes: int
+    mount: str = ""
 
     @property
     def free_bytes_fraction(self) -> float:
@@ -4771,6 +4794,7 @@ class DiskCapacitySample:
     def to_json(self) -> dict[str, object]:
         return {
             "path": self.path,
+            "mount": self.mount,
             "total_bytes": self.total_bytes,
             "free_bytes": self.free_bytes,
             "free_bytes_fraction": self.free_bytes_fraction,
@@ -4795,6 +4819,7 @@ def statvfs_capacity_probe(path: Path) -> DiskCapacitySample:
         stat = statvfs(path)
         return DiskCapacitySample(
             path=str(path),
+            mount=str(filesystem_mount_for(path)),
             total_bytes=stat.f_frsize * stat.f_blocks,
             free_bytes=stat.f_frsize * stat.f_bavail,
             total_inodes=stat.f_files,
@@ -4803,6 +4828,7 @@ def statvfs_capacity_probe(path: Path) -> DiskCapacitySample:
     usage = shutil.disk_usage(path)
     return DiskCapacitySample(
         path=str(path),
+        mount=str(filesystem_mount_for(path)),
         total_bytes=usage.total,
         free_bytes=usage.free,
         total_inodes=0,
@@ -4810,22 +4836,58 @@ def statvfs_capacity_probe(path: Path) -> DiskCapacitySample:
     )
 
 
+def filesystem_mount_for(path: Path) -> Path:
+    current = path.resolve()
+    while not current.exists() and current.parent != current:
+        current = current.parent
+    try:
+        mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
+    except OSError:
+        mountinfo = ""
+    candidates: list[Path] = []
+    for line in mountinfo.splitlines():
+        fields = line.partition(" - ")[0].split()
+        if len(fields) < 5:
+            continue
+        mount = Path(
+            fields[4]
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+        )
+        try:
+            current.relative_to(mount)
+        except ValueError:
+            continue
+        candidates.append(mount)
+    if candidates:
+        return max(candidates, key=lambda candidate: len(candidate.parts))
+    device = current.stat().st_dev
+    while current.parent != current:
+        parent = current.parent
+        if parent.stat().st_dev != device:
+            break
+        current = parent
+    return current
+
+
 def _evaluate_capacity_pressure(
     sample: DiskCapacitySample, thresholds: DiskHealthThresholds
-) -> tuple[str, ...]:
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    warnings: list[str] = []
     reasons: list[str] = []
-    if (
-        sample.free_bytes < thresholds.min_free_bytes
-        and sample.free_bytes_fraction < thresholds.min_free_fraction
-    ):
+    if sample.free_bytes < thresholds.hard_stop_free_bytes:
         reasons.append("free_bytes")
+    elif sample.free_bytes < thresholds.warn_free_bytes:
+        warnings.append("free_bytes")
     if (
         sample.total_inodes > 0
         and sample.free_inodes < thresholds.min_free_inodes
         and sample.free_inodes_fraction < thresholds.min_free_inode_fraction
     ):
         reasons.append("free_inodes")
-    return tuple(reasons)
+    return tuple(warnings), tuple(reasons)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -4835,6 +4897,7 @@ class DiskCapacityTarget:
     label: str
     path: str
     sample: DiskCapacitySample | None
+    warnings: tuple[str, ...]
     pressure: tuple[str, ...]
     error: str
 
@@ -4842,11 +4905,16 @@ class DiskCapacityTarget:
     def critical(self) -> bool:
         return bool(self.pressure)
 
+    @property
+    def warning(self) -> bool:
+        return bool(self.warnings)
+
     def to_json(self) -> dict[str, object]:
         return {
             "label": self.label,
             "path": self.path,
             "sample": self.sample.to_json() if self.sample is not None else None,
+            "warnings": list(self.warnings),
             "pressure": list(self.pressure),
             "error": self.error,
         }
@@ -4871,6 +4939,8 @@ class DiskHealthCycleResult:
     def status(self) -> str:
         if any(target.critical for target in self.targets):
             return DISK_HEALTH_CRITICAL
+        if any(target.warning for target in self.targets):
+            return DISK_HEALTH_WARNING
         return DISK_HEALTH_OK
 
     @property
@@ -4883,6 +4953,30 @@ class DiskHealthCycleResult:
     def probe_errors(self) -> int:
         return sum(1 for target in self.targets if target.error)
 
+    @property
+    def blocker_details(self) -> tuple[dict[str, object], ...]:
+        return tuple(
+            {
+                "code": AUTOPILOT_DISK_CAPACITY_BLOCKER,
+                "mount": target.sample.mount or target.sample.path,
+                "free_bytes": target.sample.free_bytes,
+                "path": target.path,
+            }
+            for target in self.targets
+            if target.critical
+            and "free_bytes" in target.pressure
+            and target.sample is not None
+        )
+
+    def to_status_json(self) -> dict[str, object]:
+        return {
+            "status": self.status,
+            "blocker": self.blocker,
+            "blocker_details": [dict(detail) for detail in self.blocker_details],
+            "thresholds": self.thresholds.to_json(),
+            "targets": [target.to_json() for target in self.targets],
+        }
+
     def to_record(self, repo: Path) -> dict[str, object]:
         return {
             "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
@@ -4892,6 +4986,7 @@ class DiskHealthCycleResult:
             "cycle_id": self.cycle_id,
             "status": self.status,
             "blocker": self.blocker,
+            "blocker_details": [dict(detail) for detail in self.blocker_details],
             "thresholds": self.thresholds.to_json(),
             "targets": [target.to_json() for target in self.targets],
         }
@@ -4904,14 +4999,14 @@ def run_disk_health(
     config: VibeConfig,
     *,
     cycle_id: str,
-    probe: DiskCapacityProbe = statvfs_capacity_probe,
+    probe: DiskCapacityProbe | None = None,
     thresholds: DiskHealthThresholds | None = None,
 ) -> DiskHealthCycleResult:
     """Run the native, read-only disk-health check for the cycle.
 
-    Probes the repository and state directory for free-space/inode pressure
-    against bounded thresholds. The probe is dependency-injected so tests never
-    depend on real disk state. Thresholds default to the project's configured
+    Probes the filesystem where native worker worktrees and their build outputs
+    are provisioned. The probe is dependency-injected so tests never depend on
+    real disk state. Thresholds default to the project's configured
     ``[autopilot.disk_reserve]`` floors (native defaults when unset); an
     explicit ``thresholds`` argument overrides them for focused tests. This step
     never deletes, truncates, or otherwise mutates anything: it only reports
@@ -4920,27 +5015,37 @@ def run_disk_health(
     """
     if thresholds is None:
         thresholds = disk_health_thresholds_for(config)
+    if probe is None:
+        probe = statvfs_capacity_probe
     targets: list[DiskCapacityTarget] = []
-    for label, path in (("repo", config.repo), ("state", config.state_path)):
+    primary_repo = git_main_worktree_path(config.repo) or config.repo
+    worktree_root = primary_repo.parent / f"{primary_repo.name}-worktrees"
+    probe_path = worktree_root
+    while not probe_path.exists() and probe_path.parent != probe_path:
+        probe_path = probe_path.parent
+    for label, path, measured_path in (("worktrees", worktree_root, probe_path),):
         try:
-            sample = probe(path)
+            sample = probe(measured_path)
         except OSError as error:
             targets.append(
                 DiskCapacityTarget(
                     label=label,
                     path=str(path),
                     sample=None,
+                    warnings=(),
                     pressure=(),
                     error=str(error),
                 )
             )
             continue
+        warnings, pressure = _evaluate_capacity_pressure(sample, thresholds)
         targets.append(
             DiskCapacityTarget(
                 label=label,
                 path=str(path),
                 sample=sample,
-                pressure=_evaluate_capacity_pressure(sample, thresholds),
+                warnings=warnings,
+                pressure=pressure,
                 error="",
             )
         )
@@ -6414,7 +6519,12 @@ def execute_autopilot_cycle(
     min_ready = require_positive_min_ready(min_ready)
     dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
     cycle_started_at = utc_now_iso()
-    status = collect_project_status(config, process_exists=process_exists)
+    disk_health = disk_health_runner(config, cycle_id=cycle_id)
+    status = collect_project_status(
+        config,
+        process_exists=process_exists,
+        disk_health_result=disk_health,
+    )
     runnable = status.queue.runnable
     actions: list[str] = []
     child_pid: int | None = None
@@ -6469,7 +6579,11 @@ def execute_autopilot_cycle(
         if clean_result.errors:
             cleanup_errors = len(clean_result.errors)
             actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")
-        status = collect_project_status(config, process_exists=process_exists)
+        status = collect_project_status(
+            config,
+            process_exists=process_exists,
+            disk_health_result=disk_health,
+        )
         runnable = status.queue.runnable
 
     def apply_fresh_upstream_sync(
@@ -6527,7 +6641,6 @@ def execute_autopilot_cycle(
     if disposition.agent_error:
         actions.append("worktree_disposition_agent_error")
 
-    disk_health = disk_health_runner(config, cycle_id=cycle_id)
     run_store.append_record(disk_health.to_record(config.repo))
     actions.append(f"disk_health:{disk_health.status}")
     if disk_health.probe_errors:
@@ -6553,8 +6666,6 @@ def execute_autopilot_cycle(
                 actions.append("repo_dirty_ignored")
         if cleanup_errors:
             current.append("stale_lock_cleanup_failed")
-        if disk_health.blocker:
-            current.append(disk_health.blocker)
         return current
 
     blocker_list = current_blockers(status)
@@ -6686,7 +6797,11 @@ def execute_autopilot_cycle(
             else:
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
         status = apply_fresh_upstream_sync(
-            collect_project_status(config, process_exists=process_exists),
+            collect_project_status(
+                config,
+                process_exists=process_exists,
+                disk_health_result=disk_health,
+            ),
             record_action=False,
         )
         runnable = status.queue.runnable

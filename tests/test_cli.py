@@ -23,6 +23,7 @@ from unittest.mock import Mock, patch
 import vibe_loop.cli as cli_module
 from vibe_loop.autopilot import (
     AUTOPILOT_RECORD_SCHEMA_VERSION,
+    DiskCapacitySample,
     collect_supervisor_status,
     run_autopilot,
     stop_detached_autopilot,
@@ -2549,8 +2550,8 @@ class CliTests(unittest.TestCase):
             repo = Path(directory)
             (repo / ".vibe-loop.toml").write_text(
                 "[autopilot.disk_reserve]\n"
-                "min_free_bytes = 8589934592\n"
-                "min_free_fraction = 0.05\n",
+                "warn_free_bytes = 32212254720\n"
+                "hard_stop_free_bytes = 21474836480\n",
                 encoding="utf-8",
             )
             stdout = StringIO()
@@ -2564,19 +2565,53 @@ class CliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr.getvalue(), "")
         reserve = payload["autopilot"]["disk_reserve"]
-        self.assertEqual(reserve["min_free_bytes"], 8589934592)
-        self.assertEqual(reserve["min_free_fraction"], 0.05)
+        self.assertEqual(reserve["warn_free_bytes"], 32212254720)
+        self.assertEqual(reserve["hard_stop_free_bytes"], 21474836480)
         self.assertIsNone(reserve["min_free_inodes"])
         self.assertEqual(
             sorted(reserve["explicit_keys"]),
-            ["min_free_bytes", "min_free_fraction"],
+            ["hard_stop_free_bytes", "warn_free_bytes"],
         )
-        # Effective floors surface the values actually enforced, including the
-        # native defaults substituted for unset overrides.
-        self.assertEqual(reserve["effective"]["min_free_bytes"], 8589934592)
-        self.assertEqual(reserve["effective"]["min_free_fraction"], 0.05)
+        self.assertEqual(reserve["effective"]["warn_free_bytes"], 32212254720)
+        self.assertEqual(reserve["effective"]["hard_stop_free_bytes"], 21474836480)
         self.assertEqual(reserve["effective"]["min_free_inodes"], 10000)
         self.assertEqual(reserve["effective"]["min_free_inode_fraction"], 0.02)
+
+    def test_doctor_and_status_report_same_disk_headroom_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            sample = DiskCapacitySample(
+                path=str(repo.parent),
+                mount="/worktrees",
+                total_bytes=100 * 1024**3,
+                free_bytes=40 * 1024**3,
+                total_inodes=1_000_000,
+                free_inodes=800_000,
+            )
+            payloads: dict[str, dict[str, object]] = {}
+            with patch(
+                "vibe_loop.autopilot.statvfs_capacity_probe",
+                return_value=sample,
+            ):
+                for name, command in {
+                    "doctor": ["doctor", "--repo", str(repo), "--json"],
+                    "status": [
+                        "autopilot",
+                        "status",
+                        "--repo",
+                        str(repo),
+                        "--json",
+                    ],
+                }.items():
+                    stdout = StringIO()
+                    with redirect_stdout(stdout):
+                        self.assertEqual(main(command), 0)
+                    payloads[name] = json.loads(stdout.getvalue())
+
+        self.assertEqual(
+            payloads["doctor"]["disk_headroom"], payloads["status"]["disk_headroom"]
+        )
+        self.assertEqual(payloads["status"]["disk_headroom"]["status"], "warning")
 
     def test_doctor_reports_spec_diagnostics_without_running_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
