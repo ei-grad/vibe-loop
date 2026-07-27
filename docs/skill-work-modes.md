@@ -124,7 +124,10 @@ preserved, not discarded.
 ### Runtime-owned reviewer route
 
 Runtime-owned orchestration can route independent review to an agent profile
-different from the implementation profile:
+selected from the route that implemented the candidate. The authoritative
+behavior is [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation),
+and the configuration syntax is in
+[Orchestration and reviewer routing](configuration.md#orchestration-and-reviewer-routing).
 
 ```toml
 [agent]

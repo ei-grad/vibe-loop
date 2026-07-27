@@ -468,6 +468,7 @@ GENERATED_TASK_PROFILE_FORBIDDEN_KEYS = frozenset(
         "analysis_command",
         "orchestration",
         "reviewer_profile",
+        "reviewer_routing",
         "gates",
         "verify_on_main",
         "integration_lock_timeout_seconds",
@@ -495,6 +496,7 @@ ORCHESTRATION_CONFIG_KEYS = frozenset(
     {
         "mode",
         "reviewer_profile",
+        "reviewer_routing",
         "gates",
         "verify_on_main",
         "integration_lock_timeout_seconds",
@@ -506,6 +508,13 @@ ORCHESTRATION_CONFIG_KEYS = frozenset(
         "integration_enabled",
         "task_provenance_mode",
         "external_completion_actor",
+    }
+)
+REVIEWER_ROUTING_RULE_KEYS = frozenset(
+    {
+        "profile",
+        "match_implementer_profile",
+        "match_implementer_provider",
     }
 )
 ORCHESTRATION_COMMAND_REF_RE = re.compile(r"^completion\.commands\[(\d+)]$")
@@ -862,6 +871,36 @@ class AgentRoutingRule:
 
 
 @dataclasses.dataclass(frozen=True)
+class ReviewerRoutingRule:
+    """Select a reviewer profile from the route that implemented a candidate."""
+
+    profile: str
+    match_implementer_profile: str | None = None
+    match_implementer_provider: str | None = None
+
+    def matches(self, *, implementer_profile: str, implementer_provider: str) -> bool:
+        if (
+            self.match_implementer_profile is not None
+            and implementer_profile != self.match_implementer_profile
+        ):
+            return False
+        if (
+            self.match_implementer_provider is not None
+            and implementer_provider != self.match_implementer_provider
+        ):
+            return False
+        return True
+
+    def to_json(self) -> dict[str, object]:
+        payload: dict[str, object] = {"profile": self.profile}
+        if self.match_implementer_profile is not None:
+            payload["match_implementer_profile"] = self.match_implementer_profile
+        if self.match_implementer_provider is not None:
+            payload["match_implementer_provider"] = self.match_implementer_provider
+        return payload
+
+
+@dataclasses.dataclass(frozen=True)
 class AgentSelection:
     """The agent profile resolved for one task at dispatch time.
 
@@ -963,6 +1002,7 @@ class CompletionConfig:
 class OrchestrationConfig:
     mode: str = DEFAULT_ORCHESTRATION_MODE
     reviewer_profile: str | None = None
+    reviewer_routing: tuple[ReviewerRoutingRule, ...] = ()
     gates: tuple[str, ...] = ()
     verify_on_main: tuple[str, ...] = ()
     integration_lock_timeout_seconds: float = (
@@ -985,6 +1025,7 @@ class OrchestrationConfig:
         return {
             "mode": self.mode,
             "reviewer_profile": self.reviewer_profile,
+            "reviewer_routing": [rule.to_json() for rule in self.reviewer_routing],
             "gates": list(self.gates),
             "verify_on_main": list(self.verify_on_main),
             "integration_lock_timeout_seconds": (self.integration_lock_timeout_seconds),
@@ -2617,6 +2658,7 @@ def parse_orchestration(
             "orchestration.reviewer_profile must reference a configured "
             f"agent.profiles entry: {reviewer_profile}"
         )
+    reviewer_routing = parse_reviewer_routing(table, agent_profiles)
 
     default_command_refs = tuple(
         f"completion.commands[{index}]" for index, _ in enumerate(completion.commands)
@@ -2659,6 +2701,7 @@ def parse_orchestration(
     return OrchestrationConfig(
         mode=mode,
         reviewer_profile=reviewer_profile,
+        reviewer_routing=reviewer_routing,
         gates=gates,
         verify_on_main=verify_on_main,
         integration_lock_timeout_seconds=positive_float(
@@ -2700,6 +2743,62 @@ def parse_orchestration(
         external_completion_actor=external_completion_actor,
         explicit_keys=explicit_keys,
     )
+
+
+def parse_reviewer_routing(
+    table: Mapping[str, object],
+    agent_profiles: Mapping[str, AgentConfig],
+) -> tuple[ReviewerRoutingRule, ...]:
+    raw = table.get("reviewer_routing")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(
+            "orchestration.reviewer_routing must be an array of routing tables"
+        )
+    rules: list[ReviewerRoutingRule] = []
+    for index, entry in enumerate(raw):
+        label = f"orchestration.reviewer_routing[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label} must be a table")
+        reject_unknown_config_keys(entry, REVIEWER_ROUTING_RULE_KEYS, label)
+        profile = optional_nonempty_string(entry.get("profile"))
+        if profile is None:
+            raise ValueError(f"{label}.profile is required")
+        if profile not in agent_profiles:
+            available = ", ".join(sorted(agent_profiles)) or "none"
+            raise ValueError(
+                f"{label}.profile {profile!r} is not defined in [agent.profiles] "
+                f"(defined: {available})"
+            )
+        match_profile = optional_nonempty_string(entry.get("match_implementer_profile"))
+        match_provider = optional_nonempty_string(
+            entry.get("match_implementer_provider")
+        )
+        if match_profile is None and match_provider is None:
+            raise ValueError(
+                f"{label} must define match_implementer_profile or "
+                "match_implementer_provider"
+            )
+        if match_profile is not None and match_profile not in agent_profiles:
+            available = ", ".join(sorted(agent_profiles)) or "none"
+            raise ValueError(
+                f"{label}.match_implementer_profile {match_profile!r} is not "
+                f"defined in [agent.profiles] (defined: {available})"
+            )
+        if match_provider is not None and match_provider not in SUPPORTED_AGENT_CLIS:
+            allowed = ", ".join(SUPPORTED_AGENT_CLIS)
+            raise ValueError(
+                f"{label}.match_implementer_provider must be one of: {allowed}"
+            )
+        rules.append(
+            ReviewerRoutingRule(
+                profile=profile,
+                match_implementer_profile=match_profile,
+                match_implementer_provider=match_provider,
+            )
+        )
+    return tuple(rules)
 
 
 def validate_orchestration_command_refs(

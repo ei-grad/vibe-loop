@@ -603,11 +603,7 @@ class AutopilotStatusTests(unittest.TestCase):
         }
         self.assertEqual(
             set(dispatch_blockers),
-            {"TASK-BAD", "TASK-BROKEN", "TASK-MALFORMED"},
-        )
-        self.assertIn(
-            "reviewer_profile must differ",
-            dispatch_blockers["TASK-BAD"]["message"],
+            {"TASK-BROKEN", "TASK-MALFORMED"},
         )
         self.assertIn(
             "references {model}, but no model is resolved",
@@ -618,10 +614,8 @@ class AutopilotStatusTests(unittest.TestCase):
             dispatch_blockers["TASK-MALFORMED"]["message"],
         )
         self.assertIn("task dispatch blockers:", rendered)
-        self.assertIn("TASK-BAD", rendered)
         self.assertIn("TASK-BROKEN", rendered)
         self.assertIn("TASK-MALFORMED", rendered)
-        self.assertIn("reviewer_profile must differ", rendered)
         self.assertNotIn("blockers: none", rendered)
 
     def test_collect_project_status_keeps_nonblocking_agent_diagnostics(

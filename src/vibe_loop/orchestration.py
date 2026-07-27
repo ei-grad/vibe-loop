@@ -5393,6 +5393,36 @@ class TaskConfigContractResolutionError(TaskAgentResolutionError):
         self.blocker = blocker
 
 
+def select_reviewer_profile(
+    config: VibeConfig,
+    orchestration: OrchestrationConfig,
+    agent_selection: AgentSelection | None,
+) -> tuple[str | None, str, tuple[str, ...]]:
+    reviewer_profile = orchestration.reviewer_profile
+    selection_source = "orchestration.reviewer_profile"
+    unavailable_profiles: list[str] = []
+    if agent_selection is None:
+        return reviewer_profile, selection_source, ()
+
+    implementer_provider = str(
+        route_payload(agent_selection.config, agent_selection.profile)["provider"]
+    )
+    for index, rule in enumerate(orchestration.reviewer_routing):
+        if not rule.matches(
+            implementer_profile=agent_selection.profile,
+            implementer_provider=implementer_provider,
+        ):
+            continue
+        reviewer = config.agent_profiles[rule.profile]
+        if reviewer.command is None:
+            unavailable_profiles.append(rule.profile)
+            continue
+        reviewer_profile = rule.profile
+        selection_source = f"orchestration.reviewer_routing[{index}]"
+        break
+    return reviewer_profile, selection_source, tuple(unavailable_profiles)
+
+
 def config_contract_blockers(
     config: VibeConfig,
     agent_selection: AgentSelection | None = None,
@@ -5412,14 +5442,18 @@ def config_contract_blockers(
             )
         )
 
-    configured_reviewer_profile = effective.reviewer_profile
+    selected_reviewer_profile, _, _ = select_reviewer_profile(
+        config,
+        effective,
+        agent_selection,
+    )
     reviewer_agent = (
-        config.agent_profiles.get(configured_reviewer_profile)
-        if configured_reviewer_profile is not None
+        config.agent_profiles.get(selected_reviewer_profile)
+        if selected_reviewer_profile is not None
         else None
     )
-    if configured_reviewer_profile is not None and reviewer_agent is not None:
-        command_key = f"agent.profiles.{configured_reviewer_profile}.command"
+    if selected_reviewer_profile is not None and reviewer_agent is not None:
+        command_key = f"agent.profiles.{selected_reviewer_profile}.command"
         try:
             reviewer_command = (
                 reviewer_agent.require_reviewer_command()
@@ -5459,44 +5493,14 @@ def config_contract_blockers(
             'orchestration.mode = "runtime-owned".',
         )
     if effective.mode == "runtime-owned":
-        if configured_reviewer_profile is None:
+        if effective.reviewer_profile is None:
             add(
                 "config_contract_reviewer_profile_missing",
                 "orchestration.reviewer_profile",
-                "runtime-owned orchestration requires an explicit independent "
+                "runtime-owned orchestration requires an explicit fallback "
                 "orchestration.reviewer_profile",
-                "Set orchestration.reviewer_profile to a configured independent "
+                "Set orchestration.reviewer_profile to a configured "
                 "agent.profiles entry.",
-            )
-        implementer_routes = (
-            ((agent_selection.profile, agent_selection.source),)
-            if agent_selection is not None
-            else tuple(
-                (rule.profile, f"agent.routing[{index}]")
-                for index, rule in enumerate(config.agent_routing)
-            )
-        )
-        for implementer_profile, source in implementer_routes:
-            if configured_reviewer_profile != implementer_profile:
-                continue
-            key = (
-                f"{source}.profile"
-                if source.startswith("agent.routing[")
-                else "task.agent"
-                if source == "task.agent"
-                else "orchestration.reviewer_profile"
-            )
-            add(
-                "config_contract_reviewer_not_independent",
-                key,
-                "runtime-owned orchestration reviewer_profile must differ from "
-                "the implementer profile",
-                (
-                    "Select a reviewer profile different from the implementer profile."
-                    if key == "orchestration.reviewer_profile"
-                    else f"Route {key} to a profile different from "
-                    "orchestration.reviewer_profile."
-                ),
             )
         if "task_provenance_mode" not in effective.explicit_keys:
             add(
@@ -5668,12 +5672,17 @@ class RunContractResolver:
         else:
             primary_source = contributors[-1]
 
-        implementer = route_payload(agent_selection.config, agent_selection.profile)
-        configured_reviewer_profile = effective.reviewer_profile
-        reviewer_profile = configured_reviewer_profile
+        implementer = {
+            **route_payload(agent_selection.config, agent_selection.profile),
+            "selection_source": agent_selection.source,
+        }
+        reviewer_profile, reviewer_selection_source, unavailable_profiles = (
+            select_reviewer_profile(self.config, effective, agent_selection)
+        )
         if reviewer_profile is None:
             reviewer_agent = agent_selection.config
             reviewer_profile = agent_selection.profile
+            reviewer_selection_source = "implementer_fallback"
         else:
             reviewer_agent = self.config.agent_profiles[reviewer_profile]
         blockers = config_contract_blockers(
@@ -5731,6 +5740,19 @@ class RunContractResolver:
                 }
             )
 
+        reviewer_route = route_payload(reviewer_agent, reviewer_profile)
+        implementer_provider = str(implementer["provider"])
+        reviewer_provider = str(reviewer_route["provider"])
+        if "unknown" in {implementer_provider, reviewer_provider}:
+            provider_relation = "unknown-provider"
+            cross_provider: bool | None = None
+        elif implementer_provider == reviewer_provider:
+            provider_relation = "same-provider"
+            cross_provider = False
+        else:
+            provider_relation = "cross-provider"
+            cross_provider = True
+
         payload: dict[str, object] = {
             "contract_version": RUN_CONTRACT_VERSION,
             "mode": effective.mode,
@@ -5743,7 +5765,11 @@ class RunContractResolver:
                 "timeout_seconds": self.config.supervision.worker_timeout_seconds,
             },
             "reviewer": {
-                **route_payload(reviewer_agent, reviewer_profile),
+                **reviewer_route,
+                "selection_source": reviewer_selection_source,
+                "provider_relation": provider_relation,
+                "cross_provider": cross_provider,
+                "unavailable_routing_profiles": list(unavailable_profiles),
                 "timeout_seconds": 0,
                 "max_initial_passes": effective.max_initial_review_passes,
                 "max_closure_passes": effective.max_closure_review_passes,

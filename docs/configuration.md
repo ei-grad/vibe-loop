@@ -50,8 +50,8 @@ commands = [
   "uv run python scripts/generate_gantt.py --coverage-check",
 ]
 
-# Runtime-owned is the default. It fails closed until an independent reviewer
-# route and a task-provenance completion path are configured.
+# Runtime-owned is the default. It fails closed until a reviewer fallback and a
+# task-provenance completion path are configured.
 [orchestration]
 mode = "runtime-owned"
 # reviewer_profile = "review"
@@ -242,15 +242,42 @@ model process that is already producing tokens.
 integration, and task provenance to the runtime. The worker-owned compatibility
 mode keeps those duties with the worker.
 
-`reviewer_profile` selects a named agent profile independently from the
-implementation profile. The pass counts, reviewer concurrency budget, and
-candidate re-anchor count bound runtime work. `task_provenance_mode` and
-`external_completion_actor` determine how integration is confirmed against the
-task source.
+`reviewer_profile` selects the default named reviewer profile. Ordered
+`[[orchestration.reviewer_routing]]` rules can replace that default based on the
+route that actually implemented a candidate:
+
+```toml
+[agent.profiles.claude-review]
+kind = "claude"
+model = "opus"
+
+[agent.profiles.codex-review]
+kind = "codex"
+command = "codex review {prompt}"
+
+[orchestration]
+reviewer_profile = "claude-review"
+
+[[orchestration.reviewer_routing]]
+profile = "codex-review"
+match_implementer_provider = "claude"
+```
+
+A rule must set `profile` and at least one of
+`match_implementer_provider` or `match_implementer_profile`; when both matchers
+are present, both must match. The first matching rule whose reviewer command is
+available wins. Otherwise `reviewer_profile` remains the fallback. This lets an
+operator send every Claude-implemented candidate to Codex without copying the
+task predicates that routed individual hazard families to Claude.
+
+The pass counts, reviewer concurrency budget, and candidate re-anchor count
+bound runtime work. `task_provenance_mode` and `external_completion_actor`
+determine how integration is confirmed against the task source.
 
 The full reviewer-route behavior, including exact `codex review` restrictions,
 continuation fallback, malformed verdict handling, and immutable review budgets,
-is reconciled in [Runtime-owned reviewer route](skill-work-modes.md#runtime-owned-reviewer-route).
+is authoritative in
+[PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation).
 
 ## Lock configuration
 
@@ -334,7 +361,7 @@ configuration section now lives.
 | `task_source.type`, `plan_path`, `plan_paths`, `profile`, `runnable_statuses`, `list`, `next`, `probe`, `activate`, `complete`, `reset`, `park` | [Generated Task Discovery](generated-task-discovery.md) and [Task Discovery PRD](prd/task-discovery.md). |
 | Profile fields `resources`, `paths`, `column`, `none_values`; ralphex conflict surfaces; `spec-kit`, `kiro`, `openspec` | [Generated Task Discovery](generated-task-discovery.md) and the [ralphex example](examples/ralphex-markdown-plan.md). |
 | `completion.commands` | Other configuration groups above and [PRD-CLI-003](prd/cli-runtime.md#prd-cli-003-completion-checks). |
-| `orchestration.mode`, `reviewer_profile`, `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds` | [Runtime-owned reviewer route](skill-work-modes.md#runtime-owned-reviewer-route) and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |
+| `orchestration.mode`, `reviewer_profile`; reviewer routing `profile`, `match_implementer_profile`, `match_implementer_provider`; `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds` | Reviewer routing above, [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation), and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |
 | `supervision.max_restarts`, `cooldown_seconds`, `recover_unknown_runs`, `worker_timeout_seconds`, `slice_token_threshold`, `cross_run_attempt_threshold` | Annotated and other groups above; supervision contracts in [Worker Supervision PRD](prd/worker-supervision.md). |
 | `locks.type`, `acquire_command`, `release_command`, `status_command`, `list_command`, `lease_seconds` | [PRD-WRK-011 and PRD-WRK-012](prd/worker-supervision.md#prd-wrk-011-pluggable-lock-backends). |
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |

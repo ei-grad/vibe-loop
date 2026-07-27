@@ -162,24 +162,32 @@ Related implementation IDs: `ORC-05` (`orc-runtime-gates`).
 
 ## PRD-ORC-005 Reviewer Routing, Identity, And Continuation
 
-Reviewer provider/model/effort/command must be selected by configuration,
-independent of the implementer, and launched by the runtime with a typed
-review request (candidate identity, changed paths, gate evidence, policy
-references, pass kind, prior findings for closure). Reviewer output is
-schema-validated into a verdict and findings; malformed output gets one
-bounded re-ask then a typed failure. Remediation resumes the same implementer
-session and targeted closure resumes the same reviewer session when the
-provider supports continuation; when it cannot, the runtime records an
-explicit continuation fallback with the reason and launches a fresh independent
-reviewer with only the candidate, gate evidence, and recorded open-findings
-ledger as closure context. The fresh reviewer verifies those findings' closure
+Reviewer provider/model/effort/command must be selected by configuration from
+the route that actually implemented the candidate, with a repo-wide reviewer
+profile retained as the default when no per-route rule matches. The operator
+must be able to route by implementing provider or profile without repeating the
+task predicates that selected that implementer. The runtime launches the
+resolved reviewer with a typed review request (candidate identity, changed
+paths, gate evidence, policy references, pass kind, prior findings for
+closure). Reviewer output is schema-validated into a verdict and findings;
+malformed output gets one bounded re-ask then a typed failure. Remediation
+resumes the same implementer session and targeted closure resumes the same
+reviewer session when the provider supports continuation; when it cannot, the
+runtime records an explicit continuation fallback with the reason and launches
+a fresh independent reviewer with only the candidate, gate evidence, and
+recorded open-findings ledger as closure context. The fresh reviewer verifies
+those findings' closure
 checks rather than repeating the initial review. Its session identity must
 differ from the original reviewer's, and each start and verdict records
 `fresh_closure` provenance plus the prior reviewer identity; the original
 review records remain unchanged. If the fresh reviewer cannot be launched, the
 run blocks with the concrete unresolved findings instead of remaining in the
-review stage. Session identity, model/effort, and native usage are recorded for
-every initial and closure pass.
+review stage. The contract records the implementing and reviewer profiles,
+their selection sources, and whether their providers are cross-provider,
+same-provider, or unknown. No eligible cross-provider route falls back to the
+configured reviewer and proceeds with review while recording the provider
+relation explicitly. Session identity, model/effort, and native usage are
+recorded for every initial and closure pass.
 
 The exact runtime-owned Codex reviewer command `codex review {prompt}` has no
 supported way to bind a first-class provider/model/effort route without changing
@@ -190,13 +198,14 @@ candidate disclosure or executor launch. The exact command remains valid when
 both settings are unset. The runtime does not inspect Codex session rollouts or
 create temporary config state to infer the route.
 
-Acceptance must cover independent route configuration and validation, typed
-request/response round trips, Claude-implementer/Codex-reviewer and
-Codex-implementer/Claude-reviewer matrices, missing reviewer command
+Acceptance must cover the unchanged constant reviewer default, per-implementer
+route configuration and validation, routed Claude-implementer/Codex-reviewer
+and Codex-implementer/Claude-reviewer matrices, explicit same-provider fallback
+provenance, typed request/response round trips, missing reviewer command
 diagnostics, continuation on resume-capable providers, recorded fallback on
 non-resumable providers, distinct fresh-closure provenance, blocked closure
-with unresolved findings when no independent reviewer is available, and
-malformed-output handling.
+with unresolved findings when no reviewer can be launched, and malformed-output
+handling.
 
 The continuation contract also forbids unbudgeted nested reviewer/model
 delegation. Provider launch policy disables nested Agent/Task use when the

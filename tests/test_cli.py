@@ -10362,10 +10362,6 @@ class AutopilotCliTests(unittest.TestCase):
                 "key": "agent.profiles.review.command",
             },
             {
-                "code": "config_contract_reviewer_not_independent",
-                "key": "agent.routing[0].profile",
-            },
-            {
                 "code": "config_contract_task_reset_missing",
                 "key": "task_source.reset",
             },

@@ -21,11 +21,11 @@ import vibe_loop.runner as runner_module
 import vibe_loop.workers as workers_module
 from vibe_loop.config import (
     AgentConfig,
-    AgentRoutingRule,
     AgentResolutionError,
     AgentSelection,
     CompletionConfig,
     OrchestrationConfig,
+    ReviewerRoutingRule,
     TaskSourceConfig,
     VibeConfig,
     load_config,
@@ -139,6 +139,7 @@ class OrchestrationConfigTests(unittest.TestCase):
             config = load_config(repo)
 
         self.assertEqual(config.orchestration.reviewer_profile, "review")
+        self.assertEqual(config.orchestration.reviewer_routing, ())
         self.assertEqual(config.orchestration.gates, ("completion.commands[0]",))
         self.assertEqual(
             config.orchestration.verify_on_main,
@@ -155,6 +156,57 @@ class OrchestrationConfigTests(unittest.TestCase):
         self.assertEqual(config.orchestration.max_candidate_reanchors, 3)
         self.assertFalse(config.orchestration.integration_enabled)
         self.assertEqual(config.orchestration.external_completion_actor, "operator")
+
+    def test_parses_reviewer_routing_by_implementer_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[agent.profiles.claude-review]\n"
+                'kind = "claude"\n'
+                "\n[agent.profiles.codex-review]\n"
+                'kind = "codex"\n'
+                "\n[orchestration]\n"
+                'reviewer_profile = "claude-review"\n'
+                "\n[[orchestration.reviewer_routing]]\n"
+                'profile = "codex-review"\n'
+                'match_implementer_provider = "claude"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(len(config.orchestration.reviewer_routing), 1)
+        rule = config.orchestration.reviewer_routing[0]
+        self.assertEqual(rule.profile, "codex-review")
+        self.assertEqual(rule.match_implementer_provider, "claude")
+
+    def test_rejects_unknown_reviewer_routing_match_values(self) -> None:
+        cases = (
+            (
+                'match_implementer_profile = "missing"\n',
+                "match_implementer_profile 'missing' is not defined",
+            ),
+            (
+                'match_implementer_provider = "claud"\n',
+                "match_implementer_provider must be one of",
+            ),
+        )
+        for matcher, diagnostic in cases:
+            with self.subTest(matcher=matcher):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        "[agent.profiles.review]\n"
+                        'kind = "codex"\n'
+                        "\n[orchestration]\n"
+                        'reviewer_profile = "review"\n'
+                        "\n[[orchestration.reviewer_routing]]\n"
+                        'profile = "review"\n' + matcher,
+                        encoding="utf-8",
+                    )
+
+                    with self.assertRaisesRegex(ValueError, diagnostic):
+                        load_config(repo)
 
     def test_accepts_runtime_owned_mode(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -650,63 +702,105 @@ class RunContractResolverTests(unittest.TestCase):
                         AgentSelection(agent, "", "default")
                     )
 
-    def test_runtime_owned_contract_requires_independent_reviewer_profile(
-        self,
-    ) -> None:
+    def test_runtime_owned_contract_requires_reviewer_profile_fallback(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
-        task_source = TaskSourceConfig()
-        for orchestration, selection, diagnostic in (
-            (
-                OrchestrationConfig(
-                    mode="runtime-owned",
-                    task_provenance_mode="external-confirmed",
-                    explicit_keys=frozenset({"mode", "task_provenance_mode"}),
-                ),
-                AgentSelection(agent, "", "default"),
-                "requires an explicit independent.*reviewer_profile",
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=agent,
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                task_provenance_mode="external-confirmed",
+                explicit_keys=frozenset({"mode", "task_provenance_mode"}),
             ),
-            (
-                OrchestrationConfig(
-                    mode="runtime-owned",
-                    reviewer_profile="implementer",
-                    task_provenance_mode="external-confirmed",
-                    explicit_keys=frozenset(
-                        {"mode", "reviewer_profile", "task_provenance_mode"}
+            task_source=TaskSourceConfig(),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "requires an explicit fallback.*reviewer_profile",
+        ):
+            RunContractResolver(config).resolve(AgentSelection(agent, "", "default"))
+
+    def test_reviewer_routing_uses_actual_implementer_provider(self) -> None:
+        codex = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
+        claude = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=codex,
+            agent_profiles={
+                "claude-implementer": claude,
+                "claude-review": claude,
+                "codex-review": codex,
+            },
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="claude-review",
+                reviewer_routing=(
+                    ReviewerRoutingRule(
+                        profile="codex-review",
+                        match_implementer_provider="claude",
                     ),
                 ),
-                AgentSelection(agent, "implementer", "task.agent"),
-                "reviewer_profile must differ from the implementer profile",
+                task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
+                explicit_keys=frozenset(
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "reviewer_routing",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
+                ),
             ),
-        ):
-            with self.subTest(diagnostic=diagnostic):
-                config = VibeConfig(
-                    repo=Path("/repo"),
-                    agent=agent,
-                    agent_profiles={"implementer": agent},
-                    orchestration=orchestration,
-                    task_source=task_source,
-                )
-                with self.assertRaisesRegex(ValueError, diagnostic):
-                    RunContractResolver(config).resolve(selection)
+            task_source=TaskSourceConfig(),
+        )
 
-    def test_preflight_reports_reviewer_collision_in_static_routing(self) -> None:
-        implementer = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
-        reviewer = AgentConfig(command="claude -p {prompt}", agent_kind="claude")
+        routed = RunContractResolver(config).resolve(
+            AgentSelection(claude, "claude-implementer", "agent.routing[0]")
+        )
+        default = RunContractResolver(config).resolve(
+            AgentSelection(codex, "", "default")
+        )
+
+        self.assertEqual(routed.payload["implementer"]["profile"], "claude-implementer")
+        self.assertEqual(
+            routed.payload["implementer"]["selection_source"],
+            "agent.routing[0]",
+        )
+        self.assertEqual(routed.payload["reviewer"]["profile"], "codex-review")
+        self.assertEqual(
+            routed.payload["reviewer"]["selection_source"],
+            "orchestration.reviewer_routing[0]",
+        )
+        self.assertEqual(
+            routed.payload["reviewer"]["provider_relation"],
+            "cross-provider",
+        )
+        self.assertIs(routed.payload["reviewer"]["cross_provider"], True)
+        self.assertEqual(default.payload["reviewer"]["profile"], "claude-review")
+        self.assertEqual(
+            default.payload["reviewer"]["selection_source"],
+            "orchestration.reviewer_profile",
+        )
+
+    def test_same_provider_fallback_is_recorded_and_review_still_proceeds(
+        self,
+    ) -> None:
+        implementer = AgentConfig(
+            command="claude -p {prompt}",
+            agent_kind="claude",
+        )
+        reviewer = dataclasses.replace(implementer, profile_name="review")
         config = VibeConfig(
             repo=Path("/repo"),
             agent=implementer,
             agent_profiles={"review": reviewer},
-            agent_routing=(
-                AgentRoutingRule(
-                    profile="review",
-                    match_task_id_regex="^sec-",
-                ),
-            ),
             orchestration=OrchestrationConfig(
                 mode="runtime-owned",
                 reviewer_profile="review",
                 task_provenance_mode="external-confirmed",
-                external_completion_actor="operator",
+                external_completion_actor="external-system",
                 explicit_keys=frozenset(
                     {
                         "mode",
@@ -716,17 +810,79 @@ class RunContractResolverTests(unittest.TestCase):
                     }
                 ),
             ),
-            task_source=TaskSourceConfig(type="markdown-plan"),
+            task_source=TaskSourceConfig(),
         )
 
-        blockers = config_contract_blockers(config)
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(implementer, "", "default")
+        )
 
+        self.assertEqual(contract.payload["reviewer"]["profile"], "review")
         self.assertEqual(
-            [blocker.code for blocker in blockers],
-            ["config_contract_reviewer_not_independent"],
+            contract.payload["reviewer"]["provider_relation"],
+            "same-provider",
         )
-        self.assertEqual(blockers[0].key, "agent.routing[0].profile")
-        self.assertIn("agent.routing[0].profile", blockers[0].remedy)
+        self.assertIs(contract.payload["reviewer"]["cross_provider"], False)
+
+    def test_unavailable_routed_reviewer_falls_back_with_provenance(self) -> None:
+        implementer = AgentConfig(
+            command="claude -p {prompt}",
+            agent_kind="claude",
+        )
+        fallback = dataclasses.replace(implementer, profile_name="claude-review")
+        unavailable = AgentConfig(
+            agent_kind="codex",
+            profile_name="codex-review",
+        )
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=implementer,
+            agent_profiles={
+                "claude-review": fallback,
+                "codex-review": unavailable,
+            },
+            orchestration=OrchestrationConfig(
+                mode="runtime-owned",
+                reviewer_profile="claude-review",
+                reviewer_routing=(
+                    ReviewerRoutingRule(
+                        profile="codex-review",
+                        match_implementer_provider="claude",
+                    ),
+                ),
+                task_provenance_mode="external-confirmed",
+                external_completion_actor="external-system",
+                explicit_keys=frozenset(
+                    {
+                        "mode",
+                        "reviewer_profile",
+                        "reviewer_routing",
+                        "task_provenance_mode",
+                        "external_completion_actor",
+                    }
+                ),
+            ),
+            task_source=TaskSourceConfig(),
+        )
+
+        contract = RunContractResolver(config).resolve(
+            AgentSelection(implementer, "", "default")
+        )
+
+        self.assertEqual(contract.payload["reviewer"]["profile"], "claude-review")
+        self.assertEqual(
+            contract.payload["reviewer"]["selection_source"],
+            "orchestration.reviewer_profile",
+        )
+        self.assertEqual(
+            contract.payload["reviewer"]["provider_relation"],
+            "same-provider",
+        )
+        self.assertIs(contract.payload["reviewer"]["cross_provider"], False)
+        self.assertEqual(
+            contract.payload["reviewer"]["unavailable_routing_profiles"],
+            ["codex-review"],
+        )
 
     def test_runtime_owned_contract_records_allowlisted_source_adapters(self) -> None:
         agent = AgentConfig(command="codex exec {prompt}", agent_kind="codex")
