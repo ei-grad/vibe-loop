@@ -1923,8 +1923,8 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             lines.extend(f"  - {blocker}" for blocker in health_blockers)
         # A paused cycle keeps the plain "idle" status, so name the wall
         # explicitly: otherwise it is indistinguishable from a planning error.
-        if cycle.limit_wall_action:
-            lines.append(f"limit wall: {cycle.limit_wall_action}")
+        if cycle.provider_limit_action:
+            lines.append(f"provider limit: {cycle.provider_limit_action}")
         if cycle.planning_outcome:
             lines.append(f"planning outcome: {cycle.planning_outcome}")
         if cycle.planning_backoff_action:

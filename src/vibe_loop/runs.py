@@ -25,6 +25,10 @@ from vibe_loop.activity import (
 )
 from vibe_loop.locks import redact_exact_fencing_token, redact_fencing_token_payload
 from vibe_loop.orchestration import StageTransition, derive_stage_progress
+from vibe_loop.retry import (
+    is_provider_limit_classification,
+    normalize_provider_limit_classification,
+)
 from vibe_loop.telemetry import (
     ATTRIBUTION_DIAGNOSTIC_LIMIT,
     normalize_model_label,
@@ -225,7 +229,7 @@ LIFECYCLE_PROTECTED_KEYS = frozenset(
 # The settled outcome family a run finalizes into. It is deliberately coarser
 # than the classification vocabulary: external provenance backends record one
 # terminal outcome per run, while classifications such as "timed_out" and
-# "limit_wall" describe a run that ended without settling the task at all.
+# "provider_limit" describe a run that ended without settling the task at all.
 SETTLED_RUN_OUTCOMES = ("completed", "failed", "blocked", "unknown")
 UNKNOWN_RUN_OUTCOME = "unknown"
 
@@ -300,7 +304,7 @@ def settled_run_outcome(classification: str) -> str:
 
     Only a classification that is itself a settled outcome maps through
     verbatim. Everything else - an indeterminate probe, a wall-clock kill, a
-    provider limit wall, an interrupted supervisor - is genuinely unknown and
+    provider limit, an interrupted supervisor - is genuinely unknown and
     must not be promoted to a completion.
     """
 
@@ -411,7 +415,9 @@ class RunResult:
             "session_id": self.session_id or self.run_id,
             "session_id_source": self.session_id_source,
             "task_id": self.task_id,
-            "classification": self.classification,
+            "classification": normalize_provider_limit_classification(
+                self.classification
+            ),
             "exit_code": self.exit_code,
             "log": str(self.log_path),
             "start_main": self.start_main,
@@ -427,7 +433,9 @@ class RunResult:
             "agent_prompt_dialect_source": self.agent_prompt_dialect_source,
             "agent_skill_ref_prefix": self.agent_skill_ref_prefix,
             "agent_skill_ref_prefix_source": self.agent_skill_ref_prefix_source,
-            "classification_source": self.classification_source,
+            "classification_source": normalize_provider_limit_classification(
+                self.classification_source
+            ),
             "worker_report": self.worker_report,
             "restart_count": self.restart_count,
             "max_restarts": self.max_restarts,
@@ -1474,7 +1482,9 @@ class RunHistoryView:
                 valid_records,
                 "trailer_context_sources",
             ),
-            classification_source=latest_text(valid_records, "classification_source"),
+            classification_source=normalize_provider_limit_classification(
+                latest_text(valid_records, "classification_source")
+            ),
             worker_report=latest_worker_report_payload(valid_records),
             stats=latest_mapping(valid_records, "stats"),
             restart_count=latest_int(records, "restart_count") or 0,
@@ -1567,10 +1577,13 @@ def attempt_circuit_blocker_class(record: Mapping[str, object]) -> str:
     classification = string_value(record.get("classification") or record.get("status"))
     if not classification or classification == "completed":
         return ""
-    if classification == "limit_wall":
+    if is_provider_limit_classification(classification):
         return ""
     source = string_value(record.get("classification_source"))
-    if source in {"limit_wall", "provider_wall", "account_limit"}:
+    if is_provider_limit_classification(source) or source in {
+        "provider_wall",
+        "account_limit",
+    }:
         return ""
     return f"{classification}:{source or 'unspecified'}"
 
@@ -2452,7 +2465,7 @@ def record_status(record: dict[str, Any]) -> str:
         record.get("classification")
     )
     if status:
-        return status
+        return normalize_provider_limit_classification(status)
     record_type = record.get("record_type")
     if record_type == RUN_STATE_TRANSITION_RECORD_TYPE:
         return string_value(record.get("to_state"))

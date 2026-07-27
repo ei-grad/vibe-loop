@@ -53,7 +53,7 @@ from vibe_loop.orchestration import (
     ReviewDelegationPolicyError,
     ReviewExecutionError,
     ReviewFinding,
-    ReviewLimitWallError,
+    ReviewProviderLimitError,
     ReviewOutputMalformed,
     ReviewRouteMismatchError,
     ReviewRouter,
@@ -1359,7 +1359,7 @@ class RunLifecycleStateMachineTests(unittest.TestCase):
     def test_every_typed_failure_is_accepted_from_every_stage(self) -> None:
         self.assertEqual(
             set(STAGE_FAILURES),
-            {"limit_wall", "timed_out", "stage_failed", "blocked", "cancelled"},
+            {"provider_limit", "timed_out", "stage_failed", "blocked", "cancelled"},
         )
         for stage in RunStage:
             for failure in StageFailure:
@@ -5745,7 +5745,7 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertEqual(verdict["phase"], "targeted_closure")
         self.assertEqual(verdict["continuation_ordinal"], 1)
 
-    def test_limit_wall_is_typed_to_reviewer_route_without_reask(self) -> None:
+    def test_provider_limit_is_typed_to_reviewer_route_without_reask(self) -> None:
         outputs = iter(
             (
                 (1, "You've hit your usage limit; resets at 3pm UTC"),
@@ -5769,7 +5769,7 @@ class ReviewRouterTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, returncode, stdout=output)
 
         router = self.router("codex", execute)
-        with self.assertRaises(ReviewLimitWallError) as raised:
+        with self.assertRaises(ReviewProviderLimitError) as raised:
             router.review(self.gates)
 
         self.assertEqual(raised.exception.phase, "initial_review")
@@ -5780,13 +5780,39 @@ class ReviewRouterTests(unittest.TestCase):
             record
             for record in records
             if record.get("record_type") == "review_verdict"
-            and record.get("retry_classification") == "limit_wall"
+            and record.get("retry_classification") == "provider_limit"
         )
-        self.assertEqual(wall["retry_classification"], "limit_wall")
+        self.assertEqual(wall["retry_classification"], "provider_limit")
         self.assertEqual(wall["route"]["provider"], "codex")
 
-    def test_reviewer_that_read_limit_wall_fixtures_is_not_a_wall(self) -> None:
-        # The observed false positive. Reviewing a limit-wall slice means reading
+    def test_deprecated_retry_classification_is_canonicalized(self) -> None:
+        output = json.dumps(
+            {
+                "verdict": "error",
+                "findings": [],
+                "retry_classification": "limit_wall",
+                "session_id": "review-1",
+                "session_id_source": "provider",
+                "continuation_ordinal": 0,
+            }
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=output)
+
+        router = self.router("codex", execute)
+        with self.assertRaises(ReviewProviderLimitError):
+            router.review(self.gates)
+
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record.get("record_type") == "review_verdict"
+        )
+        self.assertEqual(verdict["retry_classification"], "provider_limit")
+
+    def test_reviewer_that_read_provider_limit_fixtures_is_not_a_wall(self) -> None:
+        # The observed false positive. Reviewing a provider-limit slice means reading
         # its classifier fixtures, so the reviewer transcript quotes the phrases
         # verbatim; the reviewer then finished and approved. Text below is
         # verbatim from run 20260725T192937Z-...-58298d25-remediation-1, which
@@ -5830,7 +5856,7 @@ class ReviewRouterTests(unittest.TestCase):
     def test_reviewer_wall_in_a_provider_envelope_still_pauses(self) -> None:
         # The real thing, in the shape the provider emits it: the reviewer
         # process failed and its terminal record carries the refusal. Matches
-        # tests/fixtures/provider_usage/claude-limit-wall.json.
+        # tests/fixtures/provider_usage/claude-provider-limit.json.
         envelope = json.dumps(
             {
                 "type": "result",
@@ -5845,7 +5871,7 @@ class ReviewRouterTests(unittest.TestCase):
         def execute(command: str, **kwargs):
             return subprocess.CompletedProcess(command, 1, stdout=transcript)
 
-        with self.assertRaises(ReviewLimitWallError) as raised:
+        with self.assertRaises(ReviewProviderLimitError) as raised:
             self.router("codex", execute).review(self.gates)
 
         message = str(raised.exception)

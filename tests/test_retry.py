@@ -10,21 +10,21 @@ from vibe_loop.retry import (
     DEFAULT_BASE_DELAY,
     DEFAULT_JITTER,
     DEFAULT_MAX_DELAY,
-    LIMIT_WALL_DEFAULT_BACKOFF_SECONDS,
-    LIMIT_WALL_TAIL_WINDOW_CHARS,
+    PROVIDER_LIMIT_DEFAULT_BACKOFF_SECONDS,
+    PROVIDER_LIMIT_TAIL_WINDOW_CHARS,
     QUOTA_RESET_MARGIN_SECONDS,
     QUOTA_RESET_MAX_DELAY_SECONDS,
-    LimitWallSignal,
+    ProviderLimitSignal,
     backoff_delay,
-    classify_limit_wall_result,
-    detect_limit_wall,
-    detect_provider_limit_wall,
+    classify_provider_limit_result,
+    detect_provider_limit,
+    detect_provider_limit_phrase,
     is_transient_oserror,
     is_transient_stderr,
     is_transient_subprocess_result,
-    limit_wall_backoff_seconds,
-    limit_wall_from_result,
-    parse_limit_wall_reset_delay,
+    provider_limit_backoff_seconds,
+    provider_limit_from_result,
+    parse_provider_limit_reset_delay,
     parse_quota_reset_delay,
     retry_subprocess_run,
 )
@@ -48,7 +48,7 @@ AGENT_AUTHORED_FIXTURE_SOURCE = (
 )
 
 # The envelopes the providers actually emit when they refuse further work,
-# matching tests/fixtures/provider_usage/*-limit-wall.json. The phrase alone is
+# matching tests/fixtures/provider_usage/*-provider-limit.json. The phrase alone is
 # what over-matches, so a wall must stay detectable in its real shape.
 CLAUDE_WALL_ENVELOPE = (
     '{"type":"result","subtype":"error_max_turns","is_error":true,'
@@ -106,9 +106,9 @@ class QuotaResetDelayTests(unittest.TestCase):
 UTC = datetime.timezone.utc
 
 
-class LimitWallDetectionTests(unittest.TestCase):
+class ProviderLimitDetectionTests(unittest.TestCase):
     def test_detects_usage_cap_message(self) -> None:
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "output...\nYou've reached your Fable 5 limit · switch models"
         )
         self.assertIsNotNone(signal)
@@ -116,19 +116,25 @@ class LimitWallDetectionTests(unittest.TestCase):
         self.assertEqual(signal.marker, "You've reached your Fable 5 limit")
 
     def test_detects_session_limit_message(self) -> None:
-        signal = detect_limit_wall("You've hit your session limit · resets 1am (UTC)")
+        signal = detect_provider_limit_phrase(
+            "You've hit your session limit · resets 1am (UTC)"
+        )
         self.assertIsNotNone(signal)
         assert signal is not None
         self.assertEqual(signal.marker, "You've hit your session limit")
 
     def test_ignores_non_limit_output(self) -> None:
-        self.assertIsNone(detect_limit_wall("worker completed the slice; all green"))
-        # A generic "rate limit" 429 is a transient failure, not a limit wall.
-        self.assertIsNone(detect_limit_wall("Error: 429 rate limit exceeded"))
+        self.assertIsNone(
+            detect_provider_limit_phrase("worker completed the slice; all green")
+        )
+        # A generic "rate limit" 429 is a transient failure, not a provider limit.
+        self.assertIsNone(
+            detect_provider_limit_phrase("Error: 429 rate limit exceeded")
+        )
 
     def test_reset_time_with_utc_is_parsed(self) -> None:
         now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=UTC)
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've hit your session limit · resets 1am (UTC)", now=now
         )
         assert signal is not None
@@ -139,7 +145,7 @@ class LimitWallDetectionTests(unittest.TestCase):
 
     def test_reset_time_without_utc_is_parsed(self) -> None:
         now = datetime.datetime(2026, 7, 13, 13, 0, tzinfo=UTC)
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've reached your limit. Your limit will reset at 3pm", now=now
         )
         assert signal is not None
@@ -149,7 +155,7 @@ class LimitWallDetectionTests(unittest.TestCase):
         )
 
     def test_unparseable_reset_leaves_delay_none(self) -> None:
-        signal = detect_limit_wall("You've hit your session limit")
+        signal = detect_provider_limit_phrase("You've hit your session limit")
         assert signal is not None
         self.assertEqual(signal.reset_text, "")
         self.assertIsNone(signal.reset_delay)
@@ -158,7 +164,7 @@ class LimitWallDetectionTests(unittest.TestCase):
         # An unrelated "reset at N" far from the limit phrase must not inflate
         # the pause: the reset search is scoped to a window after the marker.
         text = "You've hit your session limit " + ("x" * 300) + " reset at 3pm"
-        signal = detect_limit_wall(text)
+        signal = detect_provider_limit_phrase(text)
         assert signal is not None
         self.assertEqual(signal.reset_text, "")
         self.assertIsNone(signal.reset_delay)
@@ -167,7 +173,7 @@ class LimitWallDetectionTests(unittest.TestCase):
         # The wall that motivated this work: "usage limit" (not "session"), and
         # a reset given as a calendar instant days out rather than a wall clock.
         now = datetime.datetime(2026, 7, 20, 10, 19, tzinfo=datetime.timezone.utc)
-        signal = detect_limit_wall(OBSERVED_USAGE_WALL, now=now)
+        signal = detect_provider_limit_phrase(OBSERVED_USAGE_WALL, now=now)
         assert signal is not None
         self.assertIn("usage limit", signal.marker.lower())
         self.assertIn("Jul 25th", signal.reset_text)
@@ -190,7 +196,7 @@ class LimitWallDetectionTests(unittest.TestCase):
         # A near-term calendar reset must survive intact: it is under the cap,
         # so the supervisor sleeps to the real advertised instant.
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've hit your usage limit, try again at Jul 20th, 2026 1:30 PM",
             now=now,
         )
@@ -208,19 +214,21 @@ class LimitWallDetectionTests(unittest.TestCase):
         # be standing; it reports no usable reset so the caller backs off.
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
         self.assertIsNone(
-            parse_limit_wall_reset_delay("try again at Jul 20th, 2026 3:24 AM", now=now)
+            parse_provider_limit_reset_delay(
+                "try again at Jul 20th, 2026 3:24 AM", now=now
+            )
         )
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've hit your usage limit, try again at Jul 20th, 2026 3:24 AM",
             now=now,
         )
         assert signal is not None
         self.assertIsNone(signal.reset_delay)
-        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 1800.0)
+        self.assertEqual(provider_limit_backoff_seconds(signal, 1800.0), 1800.0)
 
     def test_iso_reset_timestamp_is_parsed(self) -> None:
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
-        delay = parse_limit_wall_reset_delay(
+        delay = parse_provider_limit_reset_delay(
             "try again at 2026-07-20T12:00:00Z", now=now
         )
         assert delay is not None
@@ -230,30 +238,32 @@ class LimitWallDetectionTests(unittest.TestCase):
         # A custom list fully replaces the defaults: the default phrases no
         # longer match, and the custom phrase does.
         self.assertIsNone(
-            detect_limit_wall(
+            detect_provider_limit_phrase(
                 "You've hit your session limit", ["provider wall reached"]
             )
         )
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "the provider wall reached for now", ["provider wall reached"]
         )
         self.assertIsNotNone(signal)
 
     def test_far_future_reset_is_capped(self) -> None:
         now = datetime.datetime(2026, 7, 13, 0, 0, tzinfo=UTC)
-        delay = parse_limit_wall_reset_delay("reset at 11:59pm", now=now)
+        delay = parse_provider_limit_reset_delay("reset at 11:59pm", now=now)
         self.assertEqual(delay, QUOTA_RESET_MAX_DELAY_SECONDS)
 
 
-class ProviderLimitWallGateTests(unittest.TestCase):
-    """detect_provider_limit_wall separates provider refusals from agent text."""
+class ProviderLimitGateTests(unittest.TestCase):
+    """detect_provider_limit separates provider refusals from agent text."""
 
     def test_agent_authored_fixtures_in_a_successful_run_are_not_a_wall(self) -> None:
         # The observed false positive: a worker authoring classifier test cases
         # printed both phrases and exited 0. The bare phrase matcher fires on it.
-        self.assertIsNotNone(detect_limit_wall(AGENT_AUTHORED_FIXTURE_SOURCE))
+        self.assertIsNotNone(
+            detect_provider_limit_phrase(AGENT_AUTHORED_FIXTURE_SOURCE)
+        )
         self.assertIsNone(
-            detect_provider_limit_wall(AGENT_AUTHORED_FIXTURE_SOURCE, exit_code=0)
+            detect_provider_limit(AGENT_AUTHORED_FIXTURE_SOURCE, exit_code=0)
         )
 
     def test_agent_authored_fixtures_are_not_a_wall_even_when_the_run_fails(
@@ -263,10 +273,10 @@ class ProviderLimitWallGateTests(unittest.TestCase):
         # quoted the phrases. The refusal would be at the end; this is not.
         transcript = (
             AGENT_AUTHORED_FIXTURE_SOURCE
-            + "x" * (LIMIT_WALL_TAIL_WINDOW_CHARS + 1)
+            + "x" * (PROVIDER_LIMIT_TAIL_WINDOW_CHARS + 1)
             + "\nFAILED tests/test_retry.py::test_classifier\n"
         )
-        self.assertIsNone(detect_provider_limit_wall(transcript, exit_code=1))
+        self.assertIsNone(detect_provider_limit(transcript, exit_code=1))
 
     def test_real_provider_envelope_on_a_failed_run_is_a_wall(self) -> None:
         for name, envelope in (
@@ -274,20 +284,20 @@ class ProviderLimitWallGateTests(unittest.TestCase):
             ("codex", CODEX_WALL_ENVELOPE),
         ):
             with self.subTest(provider=name):
-                signal = detect_provider_limit_wall(envelope, exit_code=1)
+                signal = detect_provider_limit(envelope, exit_code=1)
                 self.assertIsNotNone(signal)
                 assert signal is not None
                 self.assertEqual(signal.marker.lower(), "usage limit reached")
 
     def test_wall_survives_a_long_transcript_that_precedes_it(self) -> None:
         # The real shape: the reviewer worked for a while (quoting fixtures on a
-        # limit-wall slice), then the provider refused and the run stopped.
+        # provider-limit slice), then the provider refused and the run stopped.
         transcript = (
             AGENT_AUTHORED_FIXTURE_SOURCE
             + "reading src/vibe_loop/retry.py\n" * 500
             + CLAUDE_WALL_ENVELOPE
         )
-        signal = detect_provider_limit_wall(transcript, exit_code=1)
+        signal = detect_provider_limit(transcript, exit_code=1)
         self.assertIsNotNone(signal)
         assert signal is not None
         self.assertEqual(signal.marker.lower(), "usage limit reached")
@@ -296,28 +306,30 @@ class ProviderLimitWallGateTests(unittest.TestCase):
         # An operator reading a recorded pause must be able to tell a detected
         # wall from the phrase appearing in a transcript: the signal carries the
         # exit status and how much of the output was in scope.
-        signal = detect_provider_limit_wall(CLAUDE_WALL_ENVELOPE, exit_code=1)
+        signal = detect_provider_limit(CLAUDE_WALL_ENVELOPE, exit_code=1)
         assert signal is not None
         self.assertEqual(
             signal.evidence, f"exit=1; scanned all {len(CLAUDE_WALL_ENVELOPE)} chars"
         )
-        long_transcript = "n" * (LIMIT_WALL_TAIL_WINDOW_CHARS * 2) + OBSERVED_USAGE_WALL
-        windowed = detect_provider_limit_wall(long_transcript, exit_code=2)
+        long_transcript = (
+            "n" * (PROVIDER_LIMIT_TAIL_WINDOW_CHARS * 2) + OBSERVED_USAGE_WALL
+        )
+        windowed = detect_provider_limit(long_transcript, exit_code=2)
         assert windowed is not None
         self.assertEqual(
             windowed.evidence,
-            f"exit=2; scanned last {LIMIT_WALL_TAIL_WINDOW_CHARS} "
+            f"exit=2; scanned last {PROVIDER_LIMIT_TAIL_WINDOW_CHARS} "
             f"of {len(long_transcript)} chars",
         )
 
     def test_bare_phrase_matcher_keeps_no_evidence(self) -> None:
-        signal = detect_limit_wall(OBSERVED_USAGE_WALL)
+        signal = detect_provider_limit_phrase(OBSERVED_USAGE_WALL)
         assert signal is not None
         self.assertEqual(signal.evidence, "")
 
     def test_advertised_reset_survives_the_gate(self) -> None:
         now = datetime.datetime(2026, 7, 20, 10, 19, tzinfo=UTC)
-        signal = detect_provider_limit_wall(OBSERVED_USAGE_WALL, exit_code=1, now=now)
+        signal = detect_provider_limit(OBSERVED_USAGE_WALL, exit_code=1, now=now)
         assert signal is not None
         self.assertIn("Jul 25th", signal.reset_text)
         self.assertIsNotNone(signal.reset_delay)
@@ -326,22 +338,24 @@ class ProviderLimitWallGateTests(unittest.TestCase):
         authored = subprocess.CompletedProcess(
             "agent", 0, stdout=AGENT_AUTHORED_FIXTURE_SOURCE, stderr=""
         )
-        self.assertEqual(classify_limit_wall_result(authored), (None, False))
+        self.assertEqual(classify_provider_limit_result(authored), (None, False))
         # A live reset keeps the wall terminal; an elapsed one would fall through
         # to the pre-existing transient-collision branch instead.
         now = datetime.datetime(2026, 7, 20, 10, 19, tzinfo=UTC)
         refused = subprocess.CompletedProcess(
             "agent", 1, stdout="", stderr=OBSERVED_USAGE_WALL
         )
-        wall, retry_as_transient = classify_limit_wall_result(refused, now=now)
+        wall, retry_as_transient = classify_provider_limit_result(refused, now=now)
         self.assertIsNotNone(wall)
         self.assertFalse(retry_as_transient)
 
-    def test_successful_run_quoting_fixtures_never_reaches_on_limit_wall(self) -> None:
+    def test_successful_run_quoting_fixtures_never_reaches_on_provider_limit(
+        self,
+    ) -> None:
         # End to end through the retry driver: the callback the supervisor uses
         # to pause dispatch must not fire for a worker that merely wrote the
         # phrases and finished.
-        walls: list[LimitWallSignal] = []
+        walls: list[ProviderLimitSignal] = []
         completed = subprocess.CompletedProcess(
             "agent", 0, stdout=AGENT_AUTHORED_FIXTURE_SOURCE, stderr=""
         )
@@ -350,28 +364,29 @@ class ProviderLimitWallGateTests(unittest.TestCase):
                 "agent",
                 max_retries=1,
                 sleep=lambda _: None,
-                detect_limit_walls=True,
-                on_limit_wall=walls.append,
+                detect_provider_limits=True,
+                on_provider_limit=walls.append,
             )
         self.assertEqual(result.returncode, 0)
         self.assertEqual(walls, [])
 
 
-class LimitWallBackoffTests(unittest.TestCase):
+class ProviderLimitBackoffTests(unittest.TestCase):
     def test_uses_reset_delay_when_present(self) -> None:
-        signal = LimitWallSignal(
+        signal = ProviderLimitSignal(
             marker="wall", reset_text="resets 1am", reset_delay=900.0
         )
-        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 900.0)
+        self.assertEqual(provider_limit_backoff_seconds(signal, 1800.0), 900.0)
 
     def test_falls_back_to_default_backoff(self) -> None:
-        signal = LimitWallSignal(marker="wall")
-        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 1800.0)
+        signal = ProviderLimitSignal(marker="wall")
+        self.assertEqual(provider_limit_backoff_seconds(signal, 1800.0), 1800.0)
 
     def test_default_backoff_constant(self) -> None:
-        signal = LimitWallSignal(marker="wall")
+        signal = ProviderLimitSignal(marker="wall")
         self.assertEqual(
-            limit_wall_backoff_seconds(signal), LIMIT_WALL_DEFAULT_BACKOFF_SECONDS
+            provider_limit_backoff_seconds(signal),
+            PROVIDER_LIMIT_DEFAULT_BACKOFF_SECONDS,
         )
 
 
@@ -566,9 +581,9 @@ class RetrySubprocessRunTests(unittest.TestCase):
         on_retry.assert_called_once()
         self.assertEqual(on_retry.call_args[0][0], 1)
 
-    def test_limit_wall_is_not_retried_as_a_transient(self) -> None:
+    def test_provider_limit_is_not_retried_as_a_transient(self) -> None:
         # Regression: the observed wall matches the transient patterns
-        # ("usage limit"), so before limit-wall classification it burned all
+        # ("usage limit"), so before provider-limit classification it burned all
         # three jittered retries against a wall that could not clear for days.
         # OBSERVED_USAGE_WALL advertises a fixed calendar instant, so the delay
         # it yields shrinks as the ambient clock approaches it. Inject the
@@ -582,7 +597,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
             with self.subTest(now=now):
                 fake_sleep = MagicMock()
                 on_retry = MagicMock()
-                walls: list[LimitWallSignal] = []
+                walls: list[ProviderLimitSignal] = []
                 wall_result = subprocess.CompletedProcess(
                     args=["test"], returncode=1, stdout="", stderr=OBSERVED_USAGE_WALL
                 )
@@ -595,8 +610,8 @@ class RetrySubprocessRunTests(unittest.TestCase):
                         max_retries=3,
                         sleep=fake_sleep,
                         on_retry=on_retry,
-                        detect_limit_walls=True,
-                        on_limit_wall=walls.append,
+                        detect_provider_limits=True,
+                        on_provider_limit=walls.append,
                         now=now,
                     )
                 self.assertEqual(result.returncode, 1)
@@ -626,11 +641,11 @@ class RetrySubprocessRunTests(unittest.TestCase):
             QUOTA_RESET_MAX_DELAY_SECONDS,
         )
 
-    def test_limit_wall_on_stdout_is_detected(self) -> None:
+    def test_provider_limit_on_stdout_is_detected(self) -> None:
         # Agent CLIs differ on which stream carries the refusal notice.
         now = datetime.datetime(2026, 7, 24, 22, 46, tzinfo=datetime.timezone.utc)
         fake_sleep = MagicMock()
-        walls: list[LimitWallSignal] = []
+        walls: list[ProviderLimitSignal] = []
         wall_result = subprocess.CompletedProcess(
             args=["test"], returncode=1, stdout=OBSERVED_USAGE_WALL, stderr=""
         )
@@ -642,8 +657,8 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 text=True,
                 max_retries=3,
                 sleep=fake_sleep,
-                detect_limit_walls=True,
-                on_limit_wall=walls.append,
+                detect_provider_limits=True,
+                on_provider_limit=walls.append,
                 now=now,
             )
         self.assertEqual(mock_run.call_count, 1)
@@ -651,7 +666,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         self.assertEqual(len(walls), 1)
 
     def test_ordinary_transients_still_retry_with_wall_detection_on(self) -> None:
-        # Acceptance guard: limit-wall classification must not swallow the
+        # Acceptance guard: provider-limit classification must not swallow the
         # short-transient retries that 429/5xx/capacity failures depend on.
         for stderr, carries_wall_phrase in (
             ("429 Too Many Requests", False),
@@ -670,7 +685,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         ):
             with self.subTest(stderr=stderr):
                 fake_sleep = MagicMock()
-                walls: list[LimitWallSignal] = []
+                walls: list[ProviderLimitSignal] = []
                 transient = subprocess.CompletedProcess(
                     args=["test"], returncode=1, stdout="", stderr=stderr
                 )
@@ -682,8 +697,8 @@ class RetrySubprocessRunTests(unittest.TestCase):
                         text=True,
                         max_retries=2,
                         sleep=fake_sleep,
-                        detect_limit_walls=True,
-                        on_limit_wall=walls.append,
+                        detect_provider_limits=True,
+                        on_provider_limit=walls.append,
                     )
                 self.assertEqual(mock_run.call_count, 3)
                 self.assertEqual(fake_sleep.call_count, 2)
@@ -699,7 +714,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         # only on stdout is no less recoverable than one on stderr, and
         # classifying it as a terminal wall would cost it every retry.
         fake_sleep = MagicMock()
-        walls: list[LimitWallSignal] = []
+        walls: list[ProviderLimitSignal] = []
         stdout_only = subprocess.CompletedProcess(
             args=["test"],
             returncode=1,
@@ -714,8 +729,8 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 text=True,
                 max_retries=2,
                 sleep=fake_sleep,
-                detect_limit_walls=True,
-                on_limit_wall=walls.append,
+                detect_provider_limits=True,
+                on_provider_limit=walls.append,
             )
         self.assertEqual(mock_run.call_count, 3)
         self.assertEqual(fake_sleep.call_count, 2)
@@ -730,7 +745,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         # test_ordinary_transients_still_retry_with_wall_detection_on); this
         # one does not, so it is the branch that still short-circuits.
         fake_sleep = MagicMock()
-        walls: list[LimitWallSignal] = []
+        walls: list[ProviderLimitSignal] = []
         no_reset = subprocess.CompletedProcess(
             args=["test"],
             returncode=1,
@@ -745,15 +760,15 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 text=True,
                 max_retries=2,
                 sleep=fake_sleep,
-                detect_limit_walls=True,
-                on_limit_wall=walls.append,
+                detect_provider_limits=True,
+                on_provider_limit=walls.append,
             )
         self.assertEqual(mock_run.call_count, 1)
         fake_sleep.assert_not_called()
         self.assertEqual(len(walls), 1)
         self.assertIsNone(walls[0].reset_delay)
         self.assertEqual(
-            limit_wall_backoff_seconds(walls[0], 1800.0),
+            provider_limit_backoff_seconds(walls[0], 1800.0),
             1800.0,
         )
 
@@ -761,7 +776,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         # "Jan 2nd" read on Dec 31 must not parse as ~363 days in the past,
         # which previously collapsed to a zero pause and spun the supervisor.
         now = datetime.datetime(2026, 12, 31, 23, 0, tzinfo=datetime.timezone.utc)
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've hit your usage limit. try again at Jan 2nd 3:00 AM.", now=now
         )
         assert signal is not None
@@ -778,18 +793,18 @@ class RetrySubprocessRunTests(unittest.TestCase):
         # ~365-day wait, capped to a false seven-day pause, instead of falling
         # back to the configured backoff.
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've hit your usage limit. try again at Jul 20th 3:24 AM.", now=now
         )
         assert signal is not None
         self.assertIsNone(signal.reset_delay)
-        self.assertEqual(limit_wall_backoff_seconds(signal, 1800.0), 1800.0)
+        self.assertEqual(provider_limit_backoff_seconds(signal, 1800.0), 1800.0)
 
     def test_year_less_reset_months_in_the_past_is_elapsed(self) -> None:
         # Well short of the year boundary: rolling "Mar 1" seen in July into
-        # next March advertises a wait no limit wall ever means.
+        # next March advertises a wait no provider limit ever means.
         now = datetime.datetime(2026, 7, 20, 10, 0, tzinfo=datetime.timezone.utc)
-        signal = detect_limit_wall(
+        signal = detect_provider_limit_phrase(
             "You've hit your usage limit. try again at Mar 1 3:00 AM.", now=now
         )
         assert signal is not None
@@ -814,9 +829,9 @@ class RetrySubprocessRunTests(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 3)
         self.assertEqual(fake_sleep.call_count, 2)
 
-    def test_limit_wall_detection_can_be_disabled(self) -> None:
+    def test_provider_limit_detection_can_be_disabled(self) -> None:
         fake_sleep = MagicMock()
-        walls: list[LimitWallSignal] = []
+        walls: list[ProviderLimitSignal] = []
         wall_result = subprocess.CompletedProcess(
             args=["test"], returncode=1, stdout="", stderr=OBSERVED_USAGE_WALL
         )
@@ -828,8 +843,8 @@ class RetrySubprocessRunTests(unittest.TestCase):
                 text=True,
                 max_retries=2,
                 sleep=fake_sleep,
-                detect_limit_walls=False,
-                on_limit_wall=walls.append,
+                detect_provider_limits=False,
+                on_provider_limit=walls.append,
             )
         self.assertEqual(mock_run.call_count, 3)
         self.assertEqual(walls, [])
@@ -840,7 +855,7 @@ class RetrySubprocessRunTests(unittest.TestCase):
         success = subprocess.CompletedProcess(
             args=["test"], returncode=0, stdout=OBSERVED_USAGE_WALL, stderr=""
         )
-        self.assertIsNone(limit_wall_from_result(success))
+        self.assertIsNone(provider_limit_from_result(success))
 
     def test_returns_last_result_after_max_retries(self) -> None:
         fake_sleep = MagicMock()

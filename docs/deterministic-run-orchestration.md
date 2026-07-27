@@ -58,7 +58,7 @@ line-stable).
    lookup (`RunStore.latest_worker_report`), completion checks
    (`[completion].commands`) only when exit 0 and no report.
 10. **Classification** — `classify`: `timed_out` → worker report status →
-    limit-wall scan → exit code → task-source probe (`done` → `completed`,
+    provider-limit scan → exit code → task-source probe (`done` → `completed`,
     blocked family → `blocked`, main moved and task gone → `completed`) →
     `unknown`.
 11. **Settlement** — durable `RunResult` append, settled outcome published
@@ -67,7 +67,7 @@ line-stable).
 
 `run_until_done_serial`/`run_until_done_parallel` add: candidate listing and
 conflict-domain filtering, agent-assisted batch selection, restart budgets and
-cooldowns, limit-wall dispatch pause plus `task_source.reset` hook, timeout
+cooldowns, provider-limit dispatch pause plus `task_source.reset` hook, timeout
 skip, and bounded unknown-run recovery (`drive_unknown_recovery` →
 `recover_unknown_run` → continuation worker with `RecoveryContext`, resuming
 the prior Claude session when possible).
@@ -149,8 +149,8 @@ stateDiagram-v2
 
 Failure transitions exist from every stage and are typed, not collapsed:
 
-- `limit_wall(stage, route)` — provider wall on the implementer or reviewer
-  route; pauses only that route, never converts into blind retries.
+- `provider_limit(stage, route)` — provider quota exhaustion on the implementer
+  or reviewer route; pauses only that route, never converts into blind retries.
 - `timed_out(stage)` — stage wall-clock timeout; kills the stage process
   group, preserves the workspace, returns the task per current semantics.
 - `stage_failed(stage, reason)` — deterministic failure (gate exhausted,
@@ -170,9 +170,9 @@ generalizes the scheduler's `_reset_task_source_status` /
 lock with a typed intent and appends a durable `task_source_settled` record
 before the fenced release:
 
-- `requeue` — `limit_wall`, `timed_out`, `cancelled`, and `stage_failed`
+- `requeue` — `provider_limit`, `timed_out`, `cancelled`, and `stage_failed`
   outcomes classified retryable: the `task_source.reset` adapter returns the
-  task to its runnable state, preserving today's limit-wall/timeout
+  task to its runnable state, preserving today's provider-limit/timeout
   semantics.
 - `park` — `blocked` and `stage_failed` outcomes classified terminal
   (review or remediation budget exhausted, non-retryable failure): the
@@ -408,7 +408,7 @@ identity and body, run id, provisioned workspace path and branch, contract
 digest, stage (`implement` | `remediate:<n>`), open findings for remediation,
 resume session id when continuing.
 
-Collected output (typed, validated): exit class (ok / transient / limit-wall
+Collected output (typed, validated): exit class (ok / transient / provider-limit
 with reset evidence / timeout / fatal), session identity
 (`session_id`, `session_id_source`, transcript path), provider-native usage,
 worker report if filed, candidate declaration — via a new fenced
@@ -459,7 +459,7 @@ providers rather than silently changing configured command semantics.
 ### Retry classification (shared)
 
 Every stage subprocess result is classified once, in the runtime, into:
-`ok`, `transient` (bounded jittered retries), `limit_wall` (typed, reset
+`ok`, `transient` (bounded jittered retries), `provider_limit` (typed, reset
 evidence, no retries, per-route pause — reusing `retry.py`),
 `timeout`, `fatal`. A typed provider limit on the reviewer route must pause
 that route only; it must not consume the task restart budget or convert into
@@ -507,7 +507,7 @@ Usage stats (PRD-AUT-016) gain a runtime-assigned `phase` per stage:
 plus existing `discovery`/`planning`. The runtime stamps the phase from the
 state machine — it no longer trusts the worker report's self-declared phase in
 runtime-owned mode (the report value is kept as corroborating metadata).
-Limit walls are attributed to the route and phase that hit them, so rolling
+Provider limits are attributed to the route and phase that hit them, so rolling
 summaries can distinguish implementer spend from reviewer spend and a
 reviewer-route wall never reads as implementation failure.
 
@@ -728,7 +728,7 @@ re-scoped into this sequence rather than duplicated.
 | ORC-03 | `orc-lifecycle-state-machine` | ORC-02 | `orchestration.py` state machine + `stage_transition`/typed failure records in shadow mode around the existing lifecycle; `derive_run_lifecycle` extension; `runs inspect`/`workers` stage display. |
 | ORC-04 | `run-until-done-preprovision-worker-worktree` (re-scoped) | ORC-03 | `WorkspaceProvisioner`: provision/adopt + runtime claim before launch, fail-closed dirty/ambiguous preservation, unwind without lock leaks, jobs=2 distinct worktrees, primary-worktree invariant. Covers `PRD-ORC-003`. |
 | ORC-05 | `orc-runtime-gates` | ORC-04 | `GateRunner` + `gate_result` evidence, `CandidateCollector` + `worker candidate` fenced command, remediation loop budget for gate failures. |
-| ORC-06 | `run-until-done-supervisor-review-routing` (re-scoped) | ORC-05 | `ReviewRouter`: `[review]` route config, `ReviewRequest`/`ReviewResult` typed I/O, findings ledger records, verdict validation, reviewer concurrency budget, per-route limit walls, stage-phase usage attribution. Covers `PRD-ORC-005/006/008`. |
+| ORC-06 | `run-until-done-supervisor-review-routing` (re-scoped) | ORC-05 | `ReviewRouter`: `[review]` route config, `ReviewRequest`/`ReviewResult` typed I/O, findings ledger records, verdict validation, reviewer concurrency budget, per-route provider limits, stage-phase usage attribution. Covers `PRD-ORC-005/006/008`. |
 | ORC-07 | `orc-reviewer-continuation` | ORC-06 | Same-session remediation/closure resume where supported; provider capability table; `continuation_fallback` records; budget semantics for changed candidates. |
 | ORC-08 | `orc-runtime-integration` | ORC-05, ORC-06 | `Integrator`: integration-lock window, merge-from-main, verification, ff-merge, main verification, no-op merged case, `integration_result`. |
 | ORC-09 | `orc-task-provenance-completion` | ORC-08 | `task_source.complete` adapter + `TaskSourceCompleter`; `TaskSourceSettler` + `task_source_settled` failure settlement (requeue/park intents, park-to-requeue fallback, fail-closed contract validation on activation-capable sources, `task_source_settlement_attempted` + `settlement_pending` lock retention with fenced settlement recovery); ordering invariant (integration → provenance → report); compat when unconfigured. |

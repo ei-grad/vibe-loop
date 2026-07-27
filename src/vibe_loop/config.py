@@ -244,8 +244,8 @@ SUPERVISION_DEFAULT_MAX_RESTARTS = 3
 SUPERVISION_DEFAULT_COOLDOWN_SECONDS = 30.0
 SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS = True
 SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS = True
-SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION = True
-SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
+SUPERVISION_DEFAULT_PROVIDER_LIMIT_DETECTION = True
+SUPERVISION_DEFAULT_PROVIDER_LIMIT_BACKOFF_SECONDS = 1800.0
 # Wall-clock bound on a single worker's agent run. When the key is absent it
 # defaults to this 3-hour cap; a hung worker is force-killed at the deadline and
 # its task returns to runnable, so one stuck worker cannot freeze the whole
@@ -254,15 +254,21 @@ SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS = 1800.0
 SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS = 10800.0
 SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD = 100000
 SUPERVISION_DEFAULT_CROSS_RUN_ATTEMPT_THRESHOLD = 3
+SUPERVISION_PROVIDER_LIMIT_ALIASES = {
+    "provider_limit_detection": "limit_wall_detection",
+    "provider_limit_backoff_seconds": "limit_wall_backoff_seconds",
+    "provider_limit_patterns": "limit_wall_patterns",
+}
 SUPERVISION_CONFIG_KEYS = frozenset(
     {
         "max_restarts",
         "cooldown_seconds",
         "recover_unknown_runs",
         "resume_unknown_runs",
-        "limit_wall_detection",
-        "limit_wall_backoff_seconds",
-        "limit_wall_patterns",
+        "provider_limit_detection",
+        "provider_limit_backoff_seconds",
+        "provider_limit_patterns",
+        *SUPERVISION_PROVIDER_LIMIT_ALIASES.values(),
         "worker_timeout_seconds",
         "slice_token_threshold",
         "cross_run_attempt_threshold",
@@ -1103,20 +1109,26 @@ class SupervisionConfig:
     cooldown_seconds: float = SUPERVISION_DEFAULT_COOLDOWN_SECONDS
     recover_unknown_runs: bool = SUPERVISION_DEFAULT_RECOVER_UNKNOWN_RUNS
     resume_unknown_runs: bool = SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS
-    limit_wall_detection: bool = SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION
-    limit_wall_backoff_seconds: float = SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS
-    # Empty means "use the runner's built-in DEFAULT_LIMIT_WALL_PATTERNS"; a
+    provider_limit_detection: bool = SUPERVISION_DEFAULT_PROVIDER_LIMIT_DETECTION
+    provider_limit_backoff_seconds: float = (
+        SUPERVISION_DEFAULT_PROVIDER_LIMIT_BACKOFF_SECONDS
+    )
+    # Empty means "use the runner's built-in DEFAULT_PROVIDER_LIMIT_PATTERNS"; a
     # non-empty tuple fully overrides that default list.
-    limit_wall_patterns: tuple[str, ...] = ()
+    provider_limit_patterns: tuple[str, ...] = ()
     # 0.0 means unbounded (historical behavior); a positive value caps a single
     # worker's wall-clock runtime before its process group is force-killed.
     worker_timeout_seconds: float = SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS
     slice_token_threshold: int = SUPERVISION_DEFAULT_SLICE_TOKEN_THRESHOLD
     cross_run_attempt_threshold: int = SUPERVISION_DEFAULT_CROSS_RUN_ATTEMPT_THRESHOLD
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
+    compatibility_diagnostics: tuple[str, ...] = ()
 
     def is_explicit(self, key: str) -> bool:
         return key in self.explicit_keys
+
+    def diagnostics(self) -> list[str]:
+        return list(self.compatibility_diagnostics)
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -1124,13 +1136,14 @@ class SupervisionConfig:
             "cooldown_seconds": self.cooldown_seconds,
             "recover_unknown_runs": self.recover_unknown_runs,
             "resume_unknown_runs": self.resume_unknown_runs,
-            "limit_wall_detection": self.limit_wall_detection,
-            "limit_wall_backoff_seconds": self.limit_wall_backoff_seconds,
-            "limit_wall_patterns": list(self.limit_wall_patterns),
+            "provider_limit_detection": self.provider_limit_detection,
+            "provider_limit_backoff_seconds": self.provider_limit_backoff_seconds,
+            "provider_limit_patterns": list(self.provider_limit_patterns),
             "worker_timeout_seconds": self.worker_timeout_seconds,
             "slice_token_threshold": self.slice_token_threshold,
             "cross_run_attempt_threshold": self.cross_run_attempt_threshold,
             "explicit_keys": sorted(self.explicit_keys),
+            "diagnostics": self.diagnostics(),
         }
 
 
@@ -3075,8 +3088,30 @@ def default_completion_commands(repo: Path) -> tuple[str, ...]:
 
 def parse_supervision(data: object) -> SupervisionConfig:
     table = expect_table(data, "supervision")
-    explicit_keys = frozenset(str(key) for key in table)
     reject_unknown_config_keys(table, SUPERVISION_CONFIG_KEYS, "supervision")
+    for current, legacy in SUPERVISION_PROVIDER_LIMIT_ALIASES.items():
+        if current in table and legacy in table:
+            raise ValueError(
+                f"supervision.{current} and deprecated supervision.{legacy} "
+                "cannot both be set"
+            )
+    legacy_to_current = {
+        legacy: current
+        for current, legacy in SUPERVISION_PROVIDER_LIMIT_ALIASES.items()
+    }
+    explicit_keys = frozenset(
+        legacy_to_current.get(str(key), str(key)) for key in table
+    )
+    compatibility_diagnostics = tuple(
+        f"supervision.{legacy} is deprecated; use supervision.{current}"
+        for current, legacy in SUPERVISION_PROVIDER_LIMIT_ALIASES.items()
+        if legacy in table
+    )
+
+    def provider_limit_value(key: str) -> object:
+        legacy = SUPERVISION_PROVIDER_LIMIT_ALIASES[key]
+        return table.get(key) if key in table else table.get(legacy)
+
     return SupervisionConfig(
         max_restarts=nonnegative_int(
             table.get("max_restarts"),
@@ -3098,17 +3133,19 @@ def parse_supervision(data: object) -> SupervisionConfig:
             SUPERVISION_DEFAULT_RESUME_UNKNOWN_RUNS,
             "supervision.resume_unknown_runs",
         ),
-        limit_wall_detection=optional_bool(
-            table.get("limit_wall_detection"),
-            SUPERVISION_DEFAULT_LIMIT_WALL_DETECTION,
-            "supervision.limit_wall_detection",
+        provider_limit_detection=optional_bool(
+            provider_limit_value("provider_limit_detection"),
+            SUPERVISION_DEFAULT_PROVIDER_LIMIT_DETECTION,
+            "supervision.provider_limit_detection",
         ),
-        limit_wall_backoff_seconds=nonnegative_float(
-            table.get("limit_wall_backoff_seconds"),
-            SUPERVISION_DEFAULT_LIMIT_WALL_BACKOFF_SECONDS,
-            "supervision.limit_wall_backoff_seconds",
+        provider_limit_backoff_seconds=nonnegative_float(
+            provider_limit_value("provider_limit_backoff_seconds"),
+            SUPERVISION_DEFAULT_PROVIDER_LIMIT_BACKOFF_SECONDS,
+            "supervision.provider_limit_backoff_seconds",
         ),
-        limit_wall_patterns=parse_limit_wall_patterns(table.get("limit_wall_patterns")),
+        provider_limit_patterns=parse_provider_limit_patterns(
+            provider_limit_value("provider_limit_patterns")
+        ),
         worker_timeout_seconds=nonnegative_float(
             table.get("worker_timeout_seconds"),
             SUPERVISION_DEFAULT_WORKER_TIMEOUT_SECONDS,
@@ -3125,19 +3162,20 @@ def parse_supervision(data: object) -> SupervisionConfig:
             "supervision.cross_run_attempt_threshold",
         ),
         explicit_keys=explicit_keys,
+        compatibility_diagnostics=compatibility_diagnostics,
     )
 
 
-def parse_limit_wall_patterns(value: object) -> tuple[str, ...]:
+def parse_provider_limit_patterns(value: object) -> tuple[str, ...]:
     patterns = nonempty_string_tuple(
-        value, (), "supervision.limit_wall_patterns", allow_empty=True
+        value, (), "supervision.provider_limit_patterns", allow_empty=True
     )
     for pattern in patterns:
         try:
             re.compile(pattern)
         except re.error as exc:
             raise ValueError(
-                "supervision.limit_wall_patterns entry is not a valid regex "
+                "supervision.provider_limit_patterns entry is not a valid regex "
                 f"({pattern!r}): {exc}"
             ) from exc
     return patterns

@@ -650,15 +650,17 @@ performs any requested queue replenishment.
 
 Related implementation IDs: `AUTO-12`, `AUTO-18`.
 
-### Account Limit Walls At The Agent Subprocess Boundary
+### Provider Quota Exhaustion At The Agent Subprocess Boundary
 
-An agent refusal caused by an account usage/session/weekly limit is a *known
-duration* wall, not a short transport transient. Its text also matches the
+`provider_limit` means the provider refused more work because an account,
+usage, session, or weekly quota was exhausted. It is distinct from `timeout`,
+which means vibe-loop stopped a process at a local wall-clock deadline, and
+from a short transport transient. Provider-limit text also matches the
 transient patterns (it mentions "limit"/"quota"), so without separate
-classification the retry layer spends its whole jittered budget against a wall
-that cannot clear for hours or days.
+classification the retry layer spends its whole jittered budget against a
+quota that cannot clear for hours or days.
 
-The subprocess boundary must therefore classify a limit wall before transient
+The subprocess boundary must therefore classify a provider limit before transient
 classification and return immediately without consuming retry attempts, while
 ordinary 429, 5xx, capacity, network, and overload failures keep their bounded
 transient retries. Detection reads both stdout and stderr, because agent CLIs
@@ -697,8 +699,8 @@ already-elapsed reset reports no usable reset at all rather than a zero wait,
 so the caller falls back to its configured backoff instead of spinning.
 
 When native planning hits a wall, the decision is journaled with its own
-`limit_wall` status and pause rather than the generic `analysis_error` status,
-the cycle records a `native_planning_limit_wall:<seconds>s` action, and the
+`provider_limit` status and pause rather than the generic `analysis_error` status,
+the cycle records a `native_planning_provider_limit:<seconds>s` action, and the
 supervisor pauses dispatch until the reset. The journaled `next_wake` must be
 the reset the supervisor actually sleeps to, not the interval stamped before the
 cycle ran, and status output must name the wall so a paused cycle stays
@@ -725,7 +727,7 @@ Each launch must therefore be classified into exactly one outcome:
 | `invalid_plan` | the analysis agent returned an unusable decision | yes |
 | `no_tasks` | the analysis agent decided no plan was needed | yes |
 | `zero_created` | the authoring worker finished without creating a task | yes |
-| `limit_wall` | a provider wall stopped the launch | no |
+| `provider_limit` | a provider wall stopped the launch | no |
 | `analysis_error` | the analysis stage failed on infrastructure | no |
 | `worker_error` | the authoring worker never started or failed | no |
 | `task_source_error` | the task source could not be read after planning | no |
@@ -815,7 +817,7 @@ deadline and wall-clock adjustments cannot change the wait duration. A live
 supervisor reports `active_cycle` from the cycle-start record until the cycle
 record is appended, then `sleeping` while a non-empty `next_wake` is being
 honoured. Bounded and already-stopping paths record no next wake. A drain-mode
-cycle records and honours a positive limit-wall deadline, but records no
+cycle records and honours a positive provider-limit deadline, but records no
 ordinary interval wake.
 
 An ordinary restartable-backoff wait captures a complete task-source snapshot
@@ -827,8 +829,8 @@ must not reset the child-local retry budget or collapse exhausted-retry
 protection into a dispatch loop. The same rule applies when the child appended
 zero `run_started` records: the queue's runnable count does not account for
 child-local workspace and attempt deferrals, so only a material source change
-wakes the wait early. A zero-second limit-wall result falls back to the
-applicable ordinary wait. Positive limit-wall pauses retain their dedicated
+wakes the wait early. A zero-second provider-limit result falls back to the
+applicable ordinary wait. Positive provider-limit pauses retain their dedicated
 stop-responsive wait.
 
 ## PRD-AUT-010 Native Worktree Disposition Health Step
@@ -1229,7 +1231,7 @@ Comparable observations merge monotonically by provider and window, and
 summaries expose the latest observation for each window. These observations
 make account-wall evidence available but do not increment the historical
 account-wall count or last-hit timestamp, which remain limited to classified
-`limit_wall` runs. Percent-based quota evidence and exhaustion forecasts remain
+`provider_limit` runs. Percent-based quota evidence and exhaustion forecasts remain
 explicitly unavailable. Raw event payloads and arbitrary event text are never
 persisted.
 
@@ -1253,7 +1255,7 @@ attempts are avoidable-burn diagnostics. Same-session review continuation is a
 separate informational diagnostic. Telemetry does not switch providers or
 reset quota in response.
 
-Acceptance covers Claude and Codex present/missing/malformed/limit-wall
+Acceptance covers Claude and Codex present/missing/malformed/provider-limit
 fixtures, native Claude allowed/warning/rejected account-wall events,
 unknown-kind and reset-boundary events, cache-present/cache-absent and
 reported-cost cases, bounded quota snapshots, malformed snapshots,

@@ -66,10 +66,13 @@ from vibe_loop.processes import (
     read_process_node,
     read_process_table,
 )
-from vibe_loop.retry import parse_limit_wall_reset_delay
+from vibe_loop.retry import (
+    is_provider_limit_classification,
+    parse_provider_limit_reset_delay,
+)
 from vibe_loop.runtime_events import ACTIONABLE_RUNTIME_EVENT_KINDS
 from vibe_loop.runner import (
-    AgentLimitWallError,
+    AgentProviderLimitError,
     AgentRuntimeContext,
     ProviderUsageObserver,
     VibeRunner,
@@ -277,14 +280,14 @@ class SupervisorStatus:
         return redacted
 
 
-NATIVE_PLANNING_LIMIT_WALL_ACTION = "native_planning_limit_wall"
-CHILD_LIMIT_WALL_ACTION = "limit_wall_pause"
+NATIVE_PLANNING_PROVIDER_LIMIT_ACTION = "native_planning_provider_limit"
+CHILD_PROVIDER_LIMIT_ACTION = "provider_limit_pause"
 PLANNING_BACKOFF_ACTION = "planning_backoff"
 PLANNING_OUTCOME_ACTION_PREFIX = "native_planning_outcome:"
 DISPATCH_FLOOR_HOLD_ACTION = "dispatch_floor_hold"
-LIMIT_WALL_ACTION_PREFIXES = (
-    f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:",
-    f"{CHILD_LIMIT_WALL_ACTION}:",
+PROVIDER_LIMIT_ACTION_PREFIXES = (
+    f"{NATIVE_PLANNING_PROVIDER_LIMIT_ACTION}:",
+    f"{CHILD_PROVIDER_LIMIT_ACTION}:",
 )
 
 
@@ -299,15 +302,15 @@ class CycleSummary:
     record: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     @property
-    def limit_wall_action(self) -> str:
-        """The limit-wall action recorded for this cycle, if any.
+    def provider_limit_action(self) -> str:
+        """The provider-limit action recorded for this cycle, if any.
 
         Derived from the recorded actions so a paused cycle stays
         distinguishable from a generic planning-analysis error, which shares
         the same ``idle`` cycle status.
         """
         for action in self.actions:
-            if action.startswith(LIMIT_WALL_ACTION_PREFIXES):
+            if action.startswith(PROVIDER_LIMIT_ACTION_PREFIXES):
                 return action
         return ""
 
@@ -315,7 +318,7 @@ class CycleSummary:
     def planning_backoff_action(self) -> str:
         """The planning spend-backoff action recorded for this cycle, if any.
 
-        Like the limit wall, a backed-off cycle keeps the plain ``idle`` status,
+        Like the provider limit, a backed-off cycle keeps the plain ``idle`` status,
         so the reason has to be named explicitly or the cycle is
         indistinguishable from one that simply found nothing to do.
         """
@@ -484,7 +487,7 @@ class AutopilotCycleResult:
     child_pid: int | None = None
     child_log: Path | None = None
     next_wake: str = ""
-    limit_wall_pause_seconds: float | None = None
+    provider_limit_pause_seconds: float | None = None
     planning_backoff_seconds: float | None = None
     autopilot_run_id: str = ""
     dispatched_runs: int = 0
@@ -514,7 +517,7 @@ class AutopilotCycleResult:
             "child_pid": self.child_pid,
             "child_log": str(self.child_log) if self.child_log is not None else "",
             "next_wake": self.next_wake,
-            "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
+            "provider_limit_pause_seconds": self.provider_limit_pause_seconds,
             "planning_backoff_seconds": self.planning_backoff_seconds,
             "dispatched_runs": self.dispatched_runs,
         }
@@ -4378,33 +4381,35 @@ def classify_child_exit(exit_code: int) -> str:
     return "restartable"
 
 
-LIMIT_WALL_SCAN_MAX_RESULTS = 50
+PROVIDER_LIMIT_SCAN_MAX_RESULTS = 50
 
 
-def limit_wall_pause_seconds(
+def provider_limit_pause_seconds(
     run_store: RunStore,
     *,
     since: str,
     default_backoff: float,
     now: datetime | None = None,
 ) -> float | None:
-    """Dispatch backoff after a child stopped on a provider limit wall.
+    """Dispatch backoff after a child stopped on a provider limit.
 
-    Scans result records finished at or after ``since`` for a ``limit_wall``
+    Scans result records finished at or after ``since`` for a ``provider_limit``
     classification and returns the seconds to pause before the next cycle: the
     advertised reset delay when the recorded message carries one, otherwise
-    ``default_backoff``. Returns None when no limit wall occurred this cycle, so
+    ``default_backoff``. Returns None when no provider limit occurred this cycle, so
     the supervisor keeps its normal cadence. Pure decision function: it reads
     recorded state and never sleeps.
     """
     pause: float | None = None
-    for record in run_store.recent_result_records(max_runs=LIMIT_WALL_SCAN_MAX_RESULTS):
-        if record.get("classification") != "limit_wall":
+    for record in run_store.recent_result_records(
+        max_runs=PROVIDER_LIMIT_SCAN_MAX_RESULTS
+    ):
+        if not is_provider_limit_classification(record.get("classification")):
             continue
         finished_at = str(record.get("finished_at") or "")
         if since and finished_at and finished_at < since:
             continue
-        reset_delay = parse_limit_wall_reset_delay(
+        reset_delay = parse_provider_limit_reset_delay(
             str(record.get("message") or ""), now=now
         )
         candidate = (
@@ -5347,7 +5352,7 @@ NATIVE_PLANNING_TEXT_LIMIT = 4096
 NATIVE_PLANNING_EVIDENCE_TASK_LIMIT = 50
 NATIVE_PLANNING_EVIDENCE_WORKER_LIMIT = 50
 NATIVE_PLANNING_DECISION_KEYS = frozenset({"should_plan", "reason", "objective"})
-NATIVE_PLANNING_LIMIT_WALL_STATUS = "limit_wall"
+NATIVE_PLANNING_PROVIDER_LIMIT_STATUS = "provider_limit"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -5362,12 +5367,12 @@ class NativePlanningDecision:
     agent_invoked: bool
     agent_error: str = ""
     agent_error_kind: str = ""
-    limit_wall_reset_text: str = ""
-    limit_wall_pause_seconds: float | None = None
+    provider_limit_reset_text: str = ""
+    provider_limit_pause_seconds: float | None = None
 
     @property
-    def limit_wall(self) -> bool:
-        return self.status == NATIVE_PLANNING_LIMIT_WALL_STATUS
+    def provider_limit(self) -> bool:
+        return self.status == NATIVE_PLANNING_PROVIDER_LIMIT_STATUS
 
     def to_record(self, repo: Path) -> dict[str, object]:
         return {
@@ -5386,8 +5391,8 @@ class NativePlanningDecision:
             "agent_invoked": self.agent_invoked,
             "agent_error": self.agent_error,
             "agent_error_kind": self.agent_error_kind,
-            "limit_wall_reset_text": self.limit_wall_reset_text,
-            "limit_wall_pause_seconds": self.limit_wall_pause_seconds,
+            "provider_limit_reset_text": self.provider_limit_reset_text,
+            "provider_limit_pause_seconds": self.provider_limit_pause_seconds,
         }
 
 
@@ -5459,7 +5464,7 @@ PLANNING_OUTCOME_PRODUCTIVE = "productive"
 PLANNING_OUTCOME_INVALID_PLAN = "invalid_plan"
 PLANNING_OUTCOME_NO_TASKS = "no_tasks"
 PLANNING_OUTCOME_ZERO_CREATED = "zero_created"
-PLANNING_OUTCOME_LIMIT_WALL = "limit_wall"
+PLANNING_OUTCOME_PROVIDER_LIMIT = "provider_limit"
 PLANNING_OUTCOME_WORKER_ERROR = "worker_error"
 PLANNING_OUTCOME_TASK_SOURCE_ERROR = "task_source_error"
 PLANNING_OUTCOME_ANALYSIS_ERROR = "analysis_error"
@@ -5471,7 +5476,7 @@ PLANNING_ERROR_INVALID_PLAN = "invalid_plan"
 PLANNING_ERROR_EXECUTABLE_RESOLUTION = "executable_resolution"
 PLANNING_ERROR_OS_ERROR = "os_error"
 PLANNING_ERROR_SUBPROCESS = "subprocess_error"
-PLANNING_ERROR_LIMIT_WALL = "limit_wall"
+PLANNING_ERROR_PROVIDER_LIMIT = "provider_limit"
 # The three outcomes that spent provider budget and left the board no more
 # runnable than before. Everything else is either productive or inconclusive.
 PLANNING_UNPRODUCTIVE_OUTCOMES = frozenset(
@@ -5487,14 +5492,14 @@ def classify_planning_outcome(result: NativePlanningCycleResult) -> str:
     """Name what one native planning launch actually achieved.
 
     Ordered so the inconclusive outcomes win over the unproductive ones: a
-    limit wall, a crashed worker, or an unreadable task source says nothing
+    provider limit, a crashed worker, or an unreadable task source says nothing
     about whether planning *can* produce work, and must not be charged to the
     unproductive streak that gates the spend backoff.
     """
     decision = result.decision
     worker = result.worker
-    if decision.limit_wall or worker.status == "skipped_limit_wall":
-        return PLANNING_OUTCOME_LIMIT_WALL
+    if decision.provider_limit or worker.status == "skipped_provider_limit":
+        return PLANNING_OUTCOME_PROVIDER_LIMIT
     if decision.agent_error:
         if decision.agent_error_kind == PLANNING_ERROR_INVALID_PLAN:
             return PLANNING_OUTCOME_INVALID_PLAN
@@ -5518,7 +5523,7 @@ def planning_provider_launched(result: NativePlanningCycleResult) -> bool:
     The rolling-day ceiling is a spend ceiling, so it counts launches that
     reached a provider. Failing to resolve the agent executable never reaches
     one and must not consume a day's planning budget; everything else -
-    including a limit wall, a crash, or an unreadable task source - either
+    including a provider limit, a crash, or an unreadable task source - either
     reached the provider or cannot be proven not to have.
     """
     if result.worker.started:
@@ -5988,9 +5993,11 @@ def launch_native_planning_worker(
             ) from None
 
 
-def _native_planning_status(agent_error: str, limit_wall_pause: float | None) -> str:
-    if limit_wall_pause is not None:
-        return NATIVE_PLANNING_LIMIT_WALL_STATUS
+def _native_planning_status(
+    agent_error: str, provider_limit_pause: float | None
+) -> str:
+    if provider_limit_pause is not None:
+        return NATIVE_PLANNING_PROVIDER_LIMIT_STATUS
     return "analysis_error" if agent_error else "decided"
 
 
@@ -6044,23 +6051,23 @@ def run_native_planning(
     output_path = config.state_path / "autopilot" / f"{cycle_id}-planning-decision.json"
     agent_error = ""
     agent_error_kind = ""
-    limit_wall_reset_text = ""
-    limit_wall_pause: float | None = None
+    provider_limit_reset_text = ""
+    provider_limit_pause: float | None = None
     try:
         payload = runner(
             build_native_planning_decision_prompt(status, min_ready=min_ready),
             output_path,
         )
-    except AgentLimitWallError as exc:
-        # An account limit wall is not a planning failure: the analysis agent
+    except AgentProviderLimitError as exc:
+        # An account provider limit is not a planning failure: the analysis agent
         # never got to decide. Surface it as its own status so the supervisor
         # pauses until the advertised reset instead of re-running planning into
         # the same wall every cycle.
         payload = None
         agent_error = _bounded_planning_text(exc)
-        agent_error_kind = PLANNING_ERROR_LIMIT_WALL
-        limit_wall_reset_text = exc.signal.reset_text
-        limit_wall_pause = exc.pause_seconds
+        agent_error_kind = PLANNING_ERROR_PROVIDER_LIMIT
+        provider_limit_reset_text = exc.signal.reset_text
+        provider_limit_pause = exc.pause_seconds
     except AgentResolutionError as exc:
         payload = None
         agent_error = _bounded_planning_text(exc)
@@ -6098,15 +6105,15 @@ def run_native_planning(
         cycle_id=cycle_id,
         runnable=status.queue.runnable,
         min_ready=min_ready,
-        status=_native_planning_status(agent_error, limit_wall_pause),
+        status=_native_planning_status(agent_error, provider_limit_pause),
         should_plan=should_plan,
         reason=reason,
         objective=objective,
         agent_invoked=True,
         agent_error=agent_error,
         agent_error_kind=agent_error_kind,
-        limit_wall_reset_text=limit_wall_reset_text,
-        limit_wall_pause_seconds=limit_wall_pause,
+        provider_limit_reset_text=provider_limit_reset_text,
+        provider_limit_pause_seconds=provider_limit_pause,
     )
     run_store.append_record(decision.to_record(config.repo))
 
@@ -6115,8 +6122,8 @@ def run_native_planning(
             cycle_id=cycle_id,
             phase="terminal",
             status=(
-                "skipped_limit_wall"
-                if limit_wall_pause is not None
+                "skipped_provider_limit"
+                if provider_limit_pause is not None
                 else ("skipped_analysis_error" if agent_error else "skipped_not_needed")
             ),
             requested=False,
@@ -6340,7 +6347,7 @@ def execute_autopilot_cycle(
     child_pid: int | None = None
     child_log: Path | None = None
     cleanup_errors = 0
-    planning_limit_wall_pause: float | None = None
+    planning_provider_limit_pause: float | None = None
     planning_backoff_pause: float | None = None
     dispatched_runs = 0
 
@@ -6568,13 +6575,13 @@ def execute_autopilot_cycle(
                 )
             )
             actions.append(f"{PLANNING_OUTCOME_ACTION_PREFIX}{planning_outcome}")
-            if native_planning.decision.limit_wall:
-                planning_limit_wall_pause = (
-                    native_planning.decision.limit_wall_pause_seconds
+            if native_planning.decision.provider_limit:
+                planning_provider_limit_pause = (
+                    native_planning.decision.provider_limit_pause_seconds
                 )
                 actions.append(
-                    f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:"
-                    f"{planning_limit_wall_pause:.0f}s"
+                    f"{NATIVE_PLANNING_PROVIDER_LIMIT_ACTION}:"
+                    f"{planning_provider_limit_pause:.0f}s"
                 )
             elif native_planning.decision.agent_error:
                 actions.append("native_planning_analysis_error")
@@ -6621,7 +6628,7 @@ def execute_autopilot_cycle(
             if blockers_checked_after_planning
             else "blocked_preflight"
         )
-    elif planning_limit_wall_pause is not None:
+    elif planning_provider_limit_pause is not None:
         cycle_status = "idle"
     elif runnable < dispatch_min_ready:
         cycle_status = "idle"
@@ -6697,22 +6704,22 @@ def execute_autopilot_cycle(
         if cycle_status in {"restartable", "terminated"}:
             run_maintenance("troubleshoot")
 
-    pause_seconds = limit_wall_pause_seconds(
+    pause_seconds = provider_limit_pause_seconds(
         run_store,
         since=cycle_started_at,
-        default_backoff=config.supervision.limit_wall_backoff_seconds,
+        default_backoff=config.supervision.provider_limit_backoff_seconds,
     )
     # A planning wall and a dispatched-child wall can both land in one cycle;
     # the longer advertised reset governs, since resuming earlier only walks
     # into the wall that is still standing.
-    if planning_limit_wall_pause is not None:
+    if planning_provider_limit_pause is not None:
         pause_seconds = (
-            planning_limit_wall_pause
+            planning_provider_limit_pause
             if pause_seconds is None
-            else max(pause_seconds, planning_limit_wall_pause)
+            else max(pause_seconds, planning_provider_limit_pause)
         )
     if pause_seconds is not None:
-        actions.append(f"{CHILD_LIMIT_WALL_ACTION}:{pause_seconds:.0f}s")
+        actions.append(f"{CHILD_PROVIDER_LIMIT_ACTION}:{pause_seconds:.0f}s")
 
     return AutopilotCycleResult(
         cycle_id=cycle_id,
@@ -6724,7 +6731,7 @@ def execute_autopilot_cycle(
         blockers=blockers,
         child_pid=child_pid,
         child_log=child_log,
-        limit_wall_pause_seconds=pause_seconds,
+        provider_limit_pause_seconds=pause_seconds,
         planning_backoff_seconds=planning_backoff_pause,
         autopilot_run_id=autopilot_run_id,
         dispatched_runs=dispatched_runs,
@@ -6820,7 +6827,7 @@ def sleep_until_stop(
 ) -> bool:
     """Sleep ``total_seconds`` in stop-checkable slices.
 
-    A limit-wall pause can run for hours, so it must not become one
+    A provider-limit pause can run for hours, so it must not become one
     uninterruptible sleep: a cooperative stop would otherwise only be observed
     after the wall cleared. Signal-driven stops already unwind through
     ``sleeper``; this adds the cooperative ``should_stop`` path. Returns False
@@ -7730,7 +7737,7 @@ def run_autopilot(
                 not bounded_last
                 and interval > 0
                 and cycle_should_recheck(result)
-                and result.limit_wall_pause_seconds is None
+                and result.provider_limit_pause_seconds is None
             ):
                 planning_backoff_seconds = result.planning_backoff_seconds
                 # The backoff extends the idle wait budget rather than adding a
@@ -7750,15 +7757,15 @@ def run_autopilot(
                 and interval > 0
                 and "launched_run_until_done" in result.actions
                 and (
-                    result.limit_wall_pause_seconds is None
+                    result.provider_limit_pause_seconds is None
                     or (
                         result.status == "restartable"
-                        and result.limit_wall_pause_seconds <= 0
+                        and result.provider_limit_pause_seconds <= 0
                     )
                 )
             ):
                 post_cycle_queue = collect_task_queue_status(config)
-                if result.limit_wall_pause_seconds is None:
+                if result.provider_limit_pause_seconds is None:
                     post_cycle_runnable = (
                         0
                         if post_cycle_queue.source_error
@@ -7778,10 +7785,10 @@ def run_autopilot(
                     )
             stop_pending = should_stop is not None and should_stop()
             scheduled_wait_seconds: float | None = None
-            limit_wall_pause = result.limit_wall_pause_seconds
+            provider_limit_pause = result.provider_limit_pause_seconds
             if not bounded_last and not stop_pending:
-                if limit_wall_pause is not None and limit_wall_pause > 0:
-                    scheduled_wait_seconds = limit_wall_pause
+                if provider_limit_pause is not None and provider_limit_pause > 0:
+                    scheduled_wait_seconds = provider_limit_pause
                 elif interval > 0:
                     if cycle_should_recheck(result):
                         scheduled_wait_seconds = idle_wait_seconds
@@ -7803,19 +7810,19 @@ def run_autopilot(
                 break
             pause_seconds = (
                 scheduled_wait_seconds
-                if result.limit_wall_pause_seconds is not None
-                and result.limit_wall_pause_seconds > 0
+                if result.provider_limit_pause_seconds is not None
+                and result.provider_limit_pause_seconds > 0
                 else None
             )
             # A non-positive pause would skip the interval sleep entirely and
             # spin the cycle; treat it as no pause at all.
             if pause_seconds is not None and pause_seconds > 0:
-                # A child stopped on a provider limit wall. Pause dispatch until
+                # A child stopped on a provider limit. Pause dispatch until
                 # the advertised reset (or the configured backoff) instead of
                 # re-dispatching straight into the same wall, in both persistent
                 # and drain modes.
                 print(
-                    f"[vibe-loop] autopilot limit wall: pausing dispatch "
+                    f"[vibe-loop] autopilot provider limit: pausing dispatch "
                     f"{pause_seconds:.0f}s before the next cycle",
                     flush=True,
                 )

@@ -93,7 +93,7 @@ from vibe_loop.orchestration import (
     ReviewControlFenceError,
     ReviewExecutionError,
     ReviewFinding,
-    ReviewLimitWallError,
+    ReviewProviderLimitError,
     ReviewOutputMalformed,
     ReviewRouter,
     ReviewStageResultError,
@@ -125,10 +125,10 @@ from vibe_loop.processes import (
     read_process_table,
 )
 from vibe_loop.retry import (
-    LimitWallSignal,
-    detect_provider_limit_wall,
+    ProviderLimitSignal,
+    detect_provider_limit,
     is_transient_stderr,
-    limit_wall_backoff_seconds,
+    provider_limit_backoff_seconds,
     parse_quota_reset_delay,
     retry_subprocess_run,
 )
@@ -839,7 +839,7 @@ class ClassificationResult:
     status: str
     source: str
     # Optional human-readable context for the outcome (e.g. the advertised
-    # reset phrase for a limit_wall), persisted into the run result message.
+    # reset phrase for a provider_limit), persisted into the run result message.
     detail: str = ""
 
 
@@ -892,7 +892,7 @@ class ExplicitTaskDispatchError(RuntimeError):
     """A named task cannot enter the standard run lifecycle."""
 
 
-class AgentLimitWallError(RuntimeError):
+class AgentProviderLimitError(RuntimeError):
     """An agent subprocess refused work because an account limit was reached.
 
     Raised instead of returning a generic failure so callers can pause until
@@ -903,12 +903,12 @@ class AgentLimitWallError(RuntimeError):
     stay distinguishable from them.
     """
 
-    def __init__(self, signal: LimitWallSignal, *, default_backoff: float) -> None:
+    def __init__(self, signal: ProviderLimitSignal, *, default_backoff: float) -> None:
         self.signal = signal
-        self.pause_seconds = limit_wall_backoff_seconds(signal, default_backoff)
+        self.pause_seconds = provider_limit_backoff_seconds(signal, default_backoff)
         detail = f" ({signal.reset_text})" if signal.reset_text else ""
         evidence = f" [{signal.evidence}]" if signal.evidence else ""
-        super().__init__(f"agent limit wall: {signal.marker}{detail}{evidence}")
+        super().__init__(f"agent provider limit: {signal.marker}{detail}{evidence}")
 
 
 class AgentOutputObserver:
@@ -1844,11 +1844,11 @@ class VibeRunner:
             return None
         return next((task for task in candidates if task.task_id == task_id), None)
 
-    def _limit_wall_retry_options(self) -> dict[str, object]:
+    def _provider_limit_retry_options(self) -> dict[str, object]:
         supervision = self.config.supervision
         return {
-            "detect_limit_walls": supervision.limit_wall_detection,
-            "limit_wall_patterns": supervision.limit_wall_patterns or None,
+            "detect_provider_limits": supervision.provider_limit_detection,
+            "provider_limit_patterns": supervision.provider_limit_patterns or None,
         }
 
     def run_analysis_agent(
@@ -1875,7 +1875,7 @@ class VibeRunner:
             command_str
         )
         cmd, use_shell = prepare_shell_command(command_str)
-        walls: list[LimitWallSignal] = []
+        walls: list[ProviderLimitSignal] = []
         try:
             result = retry_subprocess_run(
                 cmd,
@@ -1889,8 +1889,8 @@ class VibeRunner:
                 timeout=900,
                 interrupt_process_group=True,
                 on_retry=_analysis_retry_callback,
-                on_limit_wall=walls.append,
-                **self._limit_wall_retry_options(),
+                on_provider_limit=walls.append,
+                **self._provider_limit_retry_options(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             report_status(f"analysis agent failed to start: {exc}")
@@ -1910,9 +1910,9 @@ class VibeRunner:
             usage_observer.observe_line(line)
         self.last_analysis_usage = usage_observer.usage
         if walls:
-            raise AgentLimitWallError(
+            raise AgentProviderLimitError(
                 walls[0],
-                default_backoff=self.config.supervision.limit_wall_backoff_seconds,
+                default_backoff=self.config.supervision.provider_limit_backoff_seconds,
             )
         if result.returncode != 0:
             stderr_tail = (result.stderr or "")[-500:]
@@ -3318,16 +3318,16 @@ class VibeRunner:
                         detail=str(exc),
                     )
                     message = str(exc)
-                except ReviewLimitWallError as exc:
+                except ReviewProviderLimitError as exc:
                     classification = ClassificationResult(
-                        "limit_wall",
-                        "reviewer_limit_wall",
+                        "provider_limit",
+                        "reviewer_provider_limit",
                         detail=str(exc),
                     )
                     message = str(exc)
                 except ReviewStageResultError as exc:
                     status = {
-                        "limit_wall": "limit_wall",
+                        "provider_limit": "provider_limit",
                         "timeout": "timed_out",
                     }.get(exc.retry_classification, "failed")
                     classification = ClassificationResult(
@@ -3472,12 +3472,12 @@ class VibeRunner:
                 else:
                     task_source_terminal_confirmed = True
             usage_phase, usage_work_kind = worker_usage_provenance(worker_report)
-            if classification.status == "limit_wall" and classification.detail:
+            if classification.status == "provider_limit" and classification.detail:
                 # Persist the advertised reset phrase so the supervisor can size
                 # its dispatch backoff from the recorded result alone.
                 message = classification.detail
             failure_by_classification = {
-                "limit_wall": StageFailure.LIMIT_WALL,
+                "provider_limit": StageFailure.PROVIDER_LIMIT,
                 "timed_out": StageFailure.TIMED_OUT,
                 "failed": StageFailure.STAGE_FAILED,
                 "blocked": StageFailure.BLOCKED,
@@ -3985,7 +3985,8 @@ class VibeRunner:
                 reviewer_contract if isinstance(reviewer_contract, Mapping) else None
             ),
             stage_machine=stage_machine,
-            limit_wall_patterns=self.config.supervision.limit_wall_patterns or None,
+            provider_limit_patterns=self.config.supervision.provider_limit_patterns
+            or None,
             budget=self.phase_budget,
         )
         review_result = router.review(gate_summary)
@@ -4973,11 +4974,11 @@ class VibeRunner:
                 if max_tasks > 0 and completed_count >= max_tasks:
                     break
                 continue
-            if result.classification == "limit_wall":
+            if result.classification == "provider_limit":
                 # The task stays runnable and keeps its restart budget; stop
                 # dispatching so the supervisor can back off until the reset
                 # instead of tight-looping into the same wall.
-                self._report_limit_wall_pause(result)
+                self._report_provider_limit_pause(result)
                 break
             if result.classification == "timed_out":
                 # A hung worker was killed. Return the task to runnable and skip
@@ -5248,11 +5249,11 @@ class VibeRunner:
                         if max_tasks > 0 and completed_count >= max_tasks:
                             stop_after_running = True
                         continue
-                    if result.classification == "limit_wall":
+                    if result.classification == "provider_limit":
                         # Keep the task runnable and its restart budget intact;
                         # stop scheduling new work and drain in-flight workers so
                         # the supervisor can back off before the next cycle.
-                        self._report_limit_wall_pause(result)
+                        self._report_provider_limit_pause(result)
                         stop_after_running = True
                         continue
                     if result.classification == "timed_out":
@@ -5412,7 +5413,7 @@ class VibeRunner:
         The condition mirrors ``drive_unknown_recovery`` exactly: an
         ``unknown`` run or a ``worker_report_missing`` failure re-enters
         recovery. Other unknown-settling classifications such as ``timed_out``
-        and ``limit_wall`` are terminal as themselves and must not be published
+        and ``provider_limit`` are terminal as themselves and must not be published
         as failed.
         """
 
@@ -5785,21 +5786,21 @@ class VibeRunner:
             return ClassificationResult("timed_out", "worker_timeout")
         if worker_report is not None:
             return ClassificationResult(worker_report.status, "worker_report")
-        # A provider limit wall exits nonzero, so it must be caught before the
+        # A provider limit exits nonzero, so it must be caught before the
         # exit_code branch downgrades it to "failed" and burns restart budget.
         # A worker that filed a terminal report above already made progress, so
-        # only wall-detect a report-less death. detect_provider_limit_wall keeps
+        # only wall-detect a report-less death. detect_provider_limit keeps
         # a successful run whose output merely quotes a limit phrase (e.g. a
         # worker implementing limit handling) on the normal completion path.
-        if self.config.supervision.limit_wall_detection and output_tail:
-            signal = detect_provider_limit_wall(
+        if self.config.supervision.provider_limit_detection and output_tail:
+            signal = detect_provider_limit(
                 output_tail,
-                self.config.supervision.limit_wall_patterns or None,
+                self.config.supervision.provider_limit_patterns or None,
                 exit_code=exit_code,
             )
             if signal is not None:
                 return ClassificationResult(
-                    "limit_wall", "limit_wall", detail=signal.reset_text
+                    "provider_limit", "provider_limit", detail=signal.reset_text
                 )
         if exit_code != 0 or message:
             return ClassificationResult("failed", "exit_code_or_completion_check")
@@ -5884,11 +5885,11 @@ class VibeRunner:
             process_alive=process_alive_locally,
         )
 
-    def _report_limit_wall_pause(self, result: RunResult) -> None:
+    def _report_provider_limit_pause(self, result: RunResult) -> None:
         detail = (result.message or "").strip()
         suffix = f" ({detail})" if detail else ""
         report_status(
-            f"limit wall hit for {result.task_id}{suffix}: stopping dispatch "
+            f"provider limit hit for {result.task_id}{suffix}: stopping dispatch "
             "without consuming restart budget; supervisor backs off before "
             "the next cycle"
         )
@@ -5914,7 +5915,7 @@ class VibeRunner:
         # worker was killed before any terminal transition. Its vibe-loop lock
         # is already released (run_task's finally), so the task now sits active
         # in the backend with no live lock and would never be re-dispatched. The
-        # reset hook returns it to its runnable state, mirroring the limit-wall
+        # reset hook returns it to its runnable state, mirroring the provider-limit
         # recovery path.
         if not self._run_uses_runtime_owned_orchestration(result.run_id):
             self._reset_task_source_status(

@@ -135,8 +135,8 @@ runtime-owned Claude implementation workers while preserving the configured
 shell template and any existing tool denials. Worker-owned Claude runs retain
 Agent and Task access because their contract requires in-process independent
 review; their prompt instead requires collecting all asynchronous work before
-returning. Provider limit-wall exits are separate: they exit nonzero and retain
-the existing `limit_wall` classification and reset evidence.
+returning. Provider limit exits are separate: they exit nonzero and retain
+the existing `provider_limit` classification and reset evidence.
 
 The 2026-07-24 historical measurement supports this mechanism rather than a
 wall-clock or repository-specific explanation. Across capOS, vibe-loop, and
@@ -144,8 +144,8 @@ loopyard, all 124 Claude `unknown` results were clean exits with classification
 source `fallback`. Of the 120 results with UUID session evidence, 103 launched
 background work and 42 ended on an explicit waiting message. The current
 session parser finds Agent calls in 60 of those sessions, so denying Agent alone
-does not cover the observed background Bash path. All 11 Claude `limit_wall`
-results were nonzero exits with source `limit_wall`, so they do not share the
+does not cover the observed background Bash path. All 11 Claude `provider_limit`
+results were nonzero exits with source `provider_limit`, so they do not share the
 clean-exit mechanism. These are baseline
 measurements from `runs.jsonl`; post-deployment rates must be measured from new
 run records rather than inferred from the regression suite.
@@ -156,7 +156,7 @@ is classified, the supervisor publishes a settled outcome — one of `completed`
 the lock, so a command lock backend that mirrors run provenance finalizes the
 run from the supervisor's own conclusion rather than inferring one at release.
 Classifications that do not settle the run, such as `timed_out` and
-`limit_wall`, publish `unknown`; so does any exit that never reached
+`provider_limit`, publish `unknown`; so does any exit that never reached
 classification. Finalization must not depend on the enclosing `run-until-done`
 process, whose next dispatch or idle transition would otherwise race it.
 
@@ -202,7 +202,7 @@ Four ordering rules keep the two stores in agreement:
   itself, before releasing its lock, and the recovery driver reuses it, so the
   external outcome is never published ahead of the durable local one. Runs
   classified `unknown` and failures specifically sourced from
-  `worker_report_missing` re-enter recovery; a `timed_out` or `limit_wall` run
+  `worker_report_missing` re-enter recovery; a `timed_out` or `provider_limit` run
   is terminal as itself and stays `unknown` externally.
 
 The gate would be worthless if stale recovery could undo it. A lock retained by

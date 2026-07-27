@@ -36,7 +36,11 @@ from vibe_loop.config import (
 )
 from vibe_loop.generated_discovery import redact_evidence_text
 from vibe_loop.locks import fencing_token_value, redact_fencing_token_diagnostic
-from vibe_loop.retry import LimitWallSignal, detect_provider_limit_wall
+from vibe_loop.retry import (
+    ProviderLimitSignal,
+    detect_provider_limit,
+    normalize_provider_limit_classification,
+)
 from vibe_loop.tasks import (
     BLOCKED_FAMILY_STATUSES,
     Task,
@@ -72,7 +76,7 @@ GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
 REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
 REVIEW_DIAGNOSTIC_OUTPUT_CLASSIFICATIONS = frozenset({"malformed", "unavailable"})
-REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
+REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "provider_limit", "timeout", "fatal")
 MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 # ``redact_evidence_text`` is superlinear in line length, so reviewer stdout is
 # bounded before redaction: each line is capped and only a tail window survives.
@@ -182,7 +186,7 @@ class RunStage(enum.StrEnum):
 
 
 class StageFailure(enum.StrEnum):
-    LIMIT_WALL = "limit_wall"
+    PROVIDER_LIMIT = "provider_limit"
     TIMED_OUT = "timed_out"
     STAGE_FAILED = "stage_failed"
     BLOCKED = "blocked"
@@ -335,10 +339,10 @@ class ReviewSessionExpired(ReviewExecutionError):
     pass
 
 
-class ReviewLimitWallError(ReviewExecutionError):
+class ReviewProviderLimitError(ReviewExecutionError):
     def __init__(
         self,
-        signal: LimitWallSignal,
+        signal: ProviderLimitSignal,
         *,
         route: str,
         phase: str,
@@ -349,7 +353,7 @@ class ReviewLimitWallError(ReviewExecutionError):
         detail = f" ({signal.reset_text})" if signal.reset_text else ""
         evidence = f" [{signal.evidence}]" if signal.evidence else ""
         super().__init__(
-            f"reviewer limit wall on {route}: {signal.marker}{detail}{evidence}"
+            f"reviewer provider limit on {route}: {signal.marker}{detail}{evidence}"
         )
 
 
@@ -1772,7 +1776,7 @@ class ReviewRouter:
         concurrency: ReviewConcurrencyBudget,
         expected_route: Mapping[str, object] | None = None,
         stage_machine: RunLifecycleStateMachine | None = None,
-        limit_wall_patterns: Sequence[str] | None = None,
+        provider_limit_patterns: Sequence[str] | None = None,
         executor: ReviewExecutor = subprocess.run,
         continuation_availability: ContinuationAvailability | None = None,
         session_id_factory: Callable[[], str] | None = None,
@@ -1794,7 +1798,7 @@ class ReviewRouter:
         self.concurrency = concurrency
         self.expected_route = dict(expected_route or {})
         self.stage_machine = stage_machine
-        self.limit_wall_patterns = limit_wall_patterns
+        self.provider_limit_patterns = provider_limit_patterns
         self.executor = executor
         self.continuation_availability = continuation_availability
         self.session_id_factory = session_id_factory or (lambda: str(uuid.uuid4()))
@@ -2055,14 +2059,14 @@ class ReviewRouter:
             )
             self._fail_stage_for_result("fatal")
             raise ReviewDelegationPolicyError(nested_launches)
-        # A reviewer reads the diff and the files it touches, so on a limit-wall
+        # A reviewer reads the diff and the files it touches, so on a provider-limit
         # slice its transcript quotes the wall phrases as ordinary content. Only
         # a failed reviewer whose trailing output carries the phrase is a wall;
         # a reviewer that finishes reports one through its typed
         # retry_classification below, not by mentioning it.
-        wall = detect_provider_limit_wall(
+        wall = detect_provider_limit(
             output,
-            self.limit_wall_patterns,
+            self.provider_limit_patterns,
             exit_code=completed.returncode,
         )
         if wall is not None:
@@ -2071,13 +2075,13 @@ class ReviewRouter:
                 route,
                 pass_ordinal,
                 attempt_ordinal,
-                "limit_wall",
+                "provider_limit",
                 duration,
                 usage,
                 continuation=continuation,
             )
-            self._fail_stage_for_result("limit_wall")
-            raise ReviewLimitWallError(
+            self._fail_stage_for_result("provider_limit")
+            raise ReviewProviderLimitError(
                 wall,
                 route=str(route["command_key"]),
                 phase=request.phase,
@@ -2138,9 +2142,9 @@ class ReviewRouter:
         )
         if result.verdict == "error":
             self._fail_stage_for_result(result.retry_classification)
-            if result.retry_classification == "limit_wall":
-                raise ReviewLimitWallError(
-                    LimitWallSignal(marker="reviewer reported limit wall"),
+            if result.retry_classification == "provider_limit":
+                raise ReviewProviderLimitError(
+                    ProviderLimitSignal(marker="reviewer reported provider limit"),
                     route=str(route["command_key"]),
                     phase=request.phase,
                 )
@@ -2226,6 +2230,10 @@ class ReviewRouter:
         retry_classification = payload.get(
             "retry_classification", "fatal" if verdict == "error" else "ok"
         )
+        if isinstance(retry_classification, str):
+            retry_classification = normalize_provider_limit_classification(
+                retry_classification
+            )
         if not isinstance(reported_session_id, str) or not isinstance(
             reported_session_id_source, str
         ):
@@ -3085,7 +3093,7 @@ class ReviewRouter:
         if self.stage_machine is None:
             return
         failure = {
-            "limit_wall": StageFailure.LIMIT_WALL,
+            "provider_limit": StageFailure.PROVIDER_LIMIT,
             "timeout": StageFailure.TIMED_OUT,
         }.get(retry_classification, StageFailure.STAGE_FAILED)
         self.stage_machine.fail(

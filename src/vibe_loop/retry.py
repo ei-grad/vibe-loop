@@ -46,6 +46,24 @@ TRANSIENT_OSERROR_ERRNOS: frozenset[int] = frozenset(
     }
 )
 
+PROVIDER_LIMIT_CLASSIFICATION = "provider_limit"
+LEGACY_PROVIDER_LIMIT_CLASSIFICATION = "limit_wall"
+
+
+def normalize_provider_limit_classification(value: str) -> str:
+    """Return the current token for a persisted provider-limit classification."""
+    if value == LEGACY_PROVIDER_LIMIT_CLASSIFICATION:
+        return PROVIDER_LIMIT_CLASSIFICATION
+    return value
+
+
+def is_provider_limit_classification(value: object) -> bool:
+    return value in {
+        PROVIDER_LIMIT_CLASSIFICATION,
+        LEGACY_PROVIDER_LIMIT_CLASSIFICATION,
+    }
+
+
 _RESET_CLOCK = r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?"
 _RESET_CLOCK_NAMED = r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<meridiem>am|pm)?"
 # Transient-path parser: requires an explicit UTC marker to avoid reading a
@@ -54,10 +72,10 @@ QUOTA_RESET_PATTERN = re.compile(
     rf"resets?\s+(?:at\s+)?{_RESET_CLOCK}\s*\(?UTC\)?",
     re.IGNORECASE,
 )
-# Limit-wall parser: the UTC marker is optional. Only run against text already
-# confirmed to carry a limit-wall phrase, so a bare "reset at 3pm" is safe to
+# Provider-limit parser: the UTC marker is optional. Only run against text
+# already confirmed to carry a provider-limit phrase, so a bare "reset at 3pm" is safe to
 # read as a wall-clock UTC reset.
-LIMIT_WALL_RESET_PATTERN = re.compile(
+PROVIDER_LIMIT_RESET_PATTERN = re.compile(
     rf"resets?\s+(?:at\s+)?{_RESET_CLOCK}\s*(?:\(?\s*UTC\s*\)?)?",
     re.IGNORECASE,
 )
@@ -125,7 +143,7 @@ _MONTH_NUMBERS: dict[str, int] = {
 # time, e.g. "try again at Jul 25th, 2026 3:24 AM" or "resets 2026-07-25T03:24Z".
 # These are only meaningful for multi-day account limits, where a clock-only
 # parse would land on the wrong day.
-LIMIT_WALL_RESET_DATE_PATTERN = re.compile(
+PROVIDER_LIMIT_RESET_DATE_PATTERN = re.compile(
     r"(?:try\s+again|resets?|available\s+again)\s+(?:at\s+|on\s+)?"
     r"(?P<month>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
     r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s*"
@@ -134,7 +152,7 @@ LIMIT_WALL_RESET_DATE_PATTERN = re.compile(
     r"\s*(?:\(?\s*UTC\s*\)?)?",
     re.IGNORECASE,
 )
-LIMIT_WALL_RESET_ISO_PATTERN = re.compile(
+PROVIDER_LIMIT_RESET_ISO_PATTERN = re.compile(
     r"(?:try\s+again|resets?|available\s+again)\s+(?:at\s+|on\s+)?"
     r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})"
     r"[T\s](?P<hour>\d{1,2}):(?P<minute>\d{2})(?::\d{2})?"
@@ -147,7 +165,7 @@ LIMIT_WALL_RESET_ISO_PATTERN = re.compile(
 # day is certainly a misparse; the calendar parser reads a full self-validating
 # date, so a multi-day account limit is a legitimate reading and must not be
 # truncated into an untruthful wake.
-LIMIT_WALL_RESET_MAX_DELAY_SECONDS = 7 * 24 * 3600.0
+PROVIDER_LIMIT_RESET_MAX_DELAY_SECONDS = 7 * 24 * 3600.0
 
 
 def _delay_until(
@@ -213,9 +231,9 @@ def _reset_delay_from_date_match(
             rolled = reset.replace(year=year + 1)
         except ValueError:
             return None
-        if (rolled - current).total_seconds() <= LIMIT_WALL_RESET_MAX_DELAY_SECONDS:
+        if (rolled - current).total_seconds() <= PROVIDER_LIMIT_RESET_MAX_DELAY_SECONDS:
             reset = rolled
-    return _delay_until(reset, now, max_delay=LIMIT_WALL_RESET_MAX_DELAY_SECONDS)
+    return _delay_until(reset, now, max_delay=PROVIDER_LIMIT_RESET_MAX_DELAY_SECONDS)
 
 
 def parse_quota_reset_delay(
@@ -235,42 +253,42 @@ def parse_quota_reset_delay(
     return _reset_delay_from_match(match, now)
 
 
-# Provider "limit wall" deaths: the worker process exits nonzero after the
+# Provider-limit deaths: the worker process exits nonzero after the
 # provider refuses further work for a usage/session cap (distinct from the
 # transient 429/overloaded errors above, which retry quickly). Re-dispatching
 # straight into the same wall burns restart budget and stalls the loop, so
 # these are classified separately and paused until the advertised reset.
 #
 # The phrases below are the wall's wording, not proof that a wall happened: an
-# agent writing or reviewing limit-wall handling emits them as ordinary content
+# agent writing or reviewing provider-limit handling emits them as ordinary content
 # (fixtures, diffs, quoted tool output) in a run that then succeeds. Matching a
 # phrase anywhere in a captured transcript is therefore not a detector -- see
-# detect_provider_limit_wall for the conditions that make a match provider
+# detect_provider_limit for the conditions that make a match provider
 # evidence.
-DEFAULT_LIMIT_WALL_PATTERNS: tuple[str, ...] = (
+DEFAULT_PROVIDER_LIMIT_PATTERNS: tuple[str, ...] = (
     # The bound and the sentence-boundary exclusion keep the marker inside one
     # clause, so a lazy match cannot run past a period into unrelated text.
     r"you'?ve (?:reached|hit) your [^.\n]{0,120}?\blimits?\b",
     r"\b(?:usage|session|weekly|5-hour)\s+limits?\s+(?:reached|exceeded)\b",
 )
-LIMIT_WALL_DEFAULT_BACKOFF_SECONDS = 1800.0
+PROVIDER_LIMIT_DEFAULT_BACKOFF_SECONDS = 1800.0
 # The advertised reset ("· resets 1am (UTC)") follows the limit phrase in the
 # same message. Scope the reset search to a window right after the matched
 # marker so an unrelated "reset at N" elsewhere in the tail cannot inflate the
 # pause.
-LIMIT_WALL_RESET_WINDOW_CHARS = 200
+PROVIDER_LIMIT_RESET_WINDOW_CHARS = 200
 # A provider refusal is the last thing the run emits: the process stops there.
 # Agent-authored occurrences of the same phrases sit wherever the agent happened
 # to read or write them, which on a long run is far from the end. Bounding the
 # marker search to the trailing window keeps a terminal refusal envelope (the
 # message plus its usage/session tail) in scope while leaving a mid-transcript
 # fixture out of it.
-LIMIT_WALL_TAIL_WINDOW_CHARS = 8000
+PROVIDER_LIMIT_TAIL_WINDOW_CHARS = 8000
 
 
 @dataclasses.dataclass(frozen=True)
-class LimitWallSignal:
-    """A detected provider limit wall in captured agent output.
+class ProviderLimitSignal:
+    """Detected provider quota exhaustion in captured agent output.
 
     ``marker`` is the matched limit phrase. ``reset_text`` is the advertised
     reset phrase (e.g. "resets 1am (UTC)") when present, and ``reset_delay`` is
@@ -286,29 +304,31 @@ class LimitWallSignal:
     evidence: str = ""
 
 
-def compile_limit_wall_patterns(
+def compile_provider_limit_patterns(
     patterns: Iterable[str] | None = None,
 ) -> tuple[re.Pattern[str], ...]:
-    source = tuple(patterns) if patterns is not None else DEFAULT_LIMIT_WALL_PATTERNS
+    source = (
+        tuple(patterns) if patterns is not None else DEFAULT_PROVIDER_LIMIT_PATTERNS
+    )
     return tuple(re.compile(pattern, re.IGNORECASE) for pattern in source)
 
 
-def parse_limit_wall_reset_delay(
+def parse_provider_limit_reset_delay(
     text: str,
     *,
     now: datetime.datetime | None = None,
 ) -> float | None:
-    """Seconds until a limit-wall reset (e.g. "resets 1am (UTC)", "reset at 3pm").
+    """Seconds until a provider-limit reset (e.g. "resets 1am (UTC)", "reset at 3pm").
 
     Unlike parse_quota_reset_delay, the UTC marker is optional here because the
-    caller has already confirmed a limit-wall phrase. Returns None when no reset
+    caller has already confirmed a provider-limit phrase. Returns None when no reset
     time is present, so the caller falls back to the configured backoff.
     """
-    found = search_limit_wall_reset(text, now=now)
+    found = search_provider_limit_reset(text, now=now)
     return None if found is None else found[1]
 
 
-def search_limit_wall_reset(
+def search_provider_limit_reset(
     text: str,
     *,
     now: datetime.datetime | None = None,
@@ -322,9 +342,9 @@ def search_limit_wall_reset(
     seconds until it, or None when no reset time is present.
     """
     for pattern, extract in (
-        (LIMIT_WALL_RESET_ISO_PATTERN, _reset_delay_from_date_match),
-        (LIMIT_WALL_RESET_DATE_PATTERN, _reset_delay_from_date_match),
-        (LIMIT_WALL_RESET_PATTERN, _reset_delay_from_match),
+        (PROVIDER_LIMIT_RESET_ISO_PATTERN, _reset_delay_from_date_match),
+        (PROVIDER_LIMIT_RESET_DATE_PATTERN, _reset_delay_from_date_match),
+        (PROVIDER_LIMIT_RESET_PATTERN, _reset_delay_from_match),
     ):
         match = pattern.search(text)
         if match is None:
@@ -336,25 +356,25 @@ def search_limit_wall_reset(
     return None
 
 
-def detect_limit_wall(
+def detect_provider_limit_phrase(
     text: str,
     patterns: Iterable[str] | None = None,
     *,
     now: datetime.datetime | None = None,
-) -> LimitWallSignal | None:
-    """Detect a provider limit wall in ``text``.
+) -> ProviderLimitSignal | None:
+    """Detect a provider-limit phrase in ``text`` without qualifying its source.
 
     ``patterns`` overrides the default limit-phrase patterns; None uses
-    DEFAULT_LIMIT_WALL_PATTERNS. Returns a LimitWallSignal with any advertised
+    DEFAULT_PROVIDER_LIMIT_PATTERNS. Returns a ProviderLimitSignal with any advertised
     reset time attached, or None when no limit phrase matches.
     """
-    for pattern in compile_limit_wall_patterns(patterns):
+    for pattern in compile_provider_limit_patterns(patterns):
         match = pattern.search(text)
         if match is None:
             continue
-        window = text[match.start() : match.end() + LIMIT_WALL_RESET_WINDOW_CHARS]
-        found = search_limit_wall_reset(window, now=now)
-        return LimitWallSignal(
+        window = text[match.start() : match.end() + PROVIDER_LIMIT_RESET_WINDOW_CHARS]
+        found = search_provider_limit_reset(window, now=now)
+        return ProviderLimitSignal(
             marker=match.group(0).strip(),
             reset_text=found[0] if found is not None else "",
             reset_delay=found[1] if found is not None else None,
@@ -362,25 +382,26 @@ def detect_limit_wall(
     return None
 
 
-def detect_provider_limit_wall(
+def detect_provider_limit(
     text: str,
     patterns: Iterable[str] | None = None,
     *,
     exit_code: int,
-    tail_chars: int = LIMIT_WALL_TAIL_WINDOW_CHARS,
+    tail_chars: int = PROVIDER_LIMIT_TAIL_WINDOW_CHARS,
     now: datetime.datetime | None = None,
-) -> LimitWallSignal | None:
-    """Detect a provider limit wall in the output of a *finished* agent run.
+) -> ProviderLimitSignal | None:
+    """Detect provider quota exhaustion in the output of a *finished* agent run.
 
-    Unlike detect_limit_wall, which only answers whether text contains a limit
-    phrase, this answers whether the provider refused this run. Two conditions
-    must hold, and each excludes a distinct source of agent-authored matches:
+    Unlike detect_provider_limit_phrase, which only answers whether text
+    contains a limit phrase, this answers whether the provider refused this
+    run. Two conditions must hold, and each excludes a distinct source of
+    agent-authored matches:
 
     * ``exit_code`` is nonzero. A provider that refuses further work stops the
       run; an agent that merely wrote or read a limit phrase goes on to finish.
       This is the condition the classification comment above has always
       described, and it alone clears the observed failure mode -- a worker
-      authoring limit-wall fixtures, or a reviewer reading them, exiting 0.
+      authoring provider-limit fixtures, or a reviewer reading them, exiting 0.
     * the match falls inside the trailing ``tail_chars`` of the output. A run
       can fail for an unrelated reason after quoting a limit phrase somewhere in
       a long transcript; the refusal itself is always at the end.
@@ -399,7 +420,7 @@ def detect_provider_limit_wall(
     if exit_code == 0:
         return None
     window = text[-tail_chars:] if tail_chars > 0 else text
-    signal = detect_limit_wall(window, patterns, now=now)
+    signal = detect_provider_limit_phrase(window, patterns, now=now)
     if signal is None:
         return None
     scanned = (
@@ -410,11 +431,11 @@ def detect_provider_limit_wall(
     return dataclasses.replace(signal, evidence=f"exit={exit_code}; {scanned}")
 
 
-def limit_wall_backoff_seconds(
-    signal: LimitWallSignal,
-    default_backoff: float = LIMIT_WALL_DEFAULT_BACKOFF_SECONDS,
+def provider_limit_backoff_seconds(
+    signal: ProviderLimitSignal,
+    default_backoff: float = PROVIDER_LIMIT_DEFAULT_BACKOFF_SECONDS,
 ) -> float:
-    """Seconds to pause dispatch after a limit wall.
+    """Seconds to pause dispatch after a provider limit.
 
     Uses the advertised reset delay when the wall carried one, otherwise the
     configured default backoff. The reset delay already includes a safety
@@ -452,21 +473,21 @@ def subprocess_result_output(result: subprocess.CompletedProcess[str]) -> str:
     """Combined stdout+stderr of a finished subprocess.
 
     Agent CLIs disagree about which stream carries a refusal notice, so
-    limit-wall detection must read both.
+    provider-limit detection must read both.
     """
     parts = [text for text in (result.stdout, result.stderr) if text]
     return "\n".join(parts)
 
 
-def classify_limit_wall_result(
+def classify_provider_limit_result(
     result: subprocess.CompletedProcess[str],
     patterns: Iterable[str] | None = None,
     *,
     now: datetime.datetime | None = None,
-) -> tuple[LimitWallSignal | None, bool]:
-    """Classify a finished subprocess as a limit wall or recoverable throttling.
+) -> tuple[ProviderLimitSignal | None, bool]:
+    """Classify a finished subprocess as a provider limit or recoverable throttling.
 
-    Returns ``(wall, retry_as_transient)``. A limit wall is terminal for the
+    Returns ``(wall, retry_as_transient)``. A provider limit is terminal for the
     advertised window: its text also matches the transient patterns (it
     mentions "limit"/"quota"), so it must be checked before transient
     classification or the caller burns its whole retry budget against a wall
@@ -488,7 +509,7 @@ def classify_limit_wall_result(
     output = subprocess_result_output(result)
     if not output:
         return None, False
-    signal = detect_provider_limit_wall(
+    signal = detect_provider_limit(
         output, patterns, exit_code=result.returncode, now=now
     )
     if signal is None:
@@ -498,17 +519,17 @@ def classify_limit_wall_result(
     return signal, False
 
 
-def limit_wall_from_result(
+def provider_limit_from_result(
     result: subprocess.CompletedProcess[str],
     patterns: Iterable[str] | None = None,
     *,
     now: datetime.datetime | None = None,
-) -> LimitWallSignal | None:
-    """The limit wall in a nonzero subprocess result, if any.
+) -> ProviderLimitSignal | None:
+    """The provider limit in a nonzero subprocess result, if any.
 
-    See classify_limit_wall_result for the classification rules.
+    See classify_provider_limit_result for the classification rules.
     """
-    return classify_limit_wall_result(result, patterns, now=now)[0]
+    return classify_provider_limit_result(result, patterns, now=now)[0]
 
 
 def backoff_delay(
@@ -532,9 +553,9 @@ def retry_subprocess_run(
     jitter: float = DEFAULT_JITTER,
     on_retry: RetryCallback | None = None,
     sleep: Callable[[float], None] = time.sleep,
-    detect_limit_walls: bool = False,
-    limit_wall_patterns: Iterable[str] | None = None,
-    on_limit_wall: Callable[[LimitWallSignal], None] | None = None,
+    detect_provider_limits: bool = False,
+    provider_limit_patterns: Iterable[str] | None = None,
+    on_provider_limit: Callable[[ProviderLimitSignal], None] | None = None,
     now: datetime.datetime | None = None,
     **subprocess_kwargs: Any,
 ) -> subprocess.CompletedProcess[str]:
@@ -572,13 +593,13 @@ def retry_subprocess_run(
             continue
 
         retry_as_transient = False
-        if detect_limit_walls:
-            wall, retry_as_transient = classify_limit_wall_result(
-                result, limit_wall_patterns, now=now
+        if detect_provider_limits:
+            wall, retry_as_transient = classify_provider_limit_result(
+                result, provider_limit_patterns, now=now
             )
             if wall is not None:
-                if on_limit_wall is not None:
-                    on_limit_wall(wall)
+                if on_provider_limit is not None:
+                    on_provider_limit(wall)
                 return result
 
         if result.returncode == 0 or not (
@@ -592,15 +613,15 @@ def retry_subprocess_run(
             # best remaining explanation, so surface it exactly once and let
             # the caller apply its configured backoff instead of redispatching
             # into the same refusal.
-            if detect_limit_walls and on_limit_wall is not None:
-                exhausted = detect_provider_limit_wall(
+            if detect_provider_limits and on_provider_limit is not None:
+                exhausted = detect_provider_limit(
                     subprocess_result_output(result),
-                    limit_wall_patterns,
+                    provider_limit_patterns,
                     exit_code=result.returncode,
                     now=now,
                 )
                 if exhausted is not None:
-                    on_limit_wall(exhausted)
+                    on_provider_limit(exhausted)
             return result
 
         delay = backoff_delay(attempt, base_delay, max_delay, jitter)

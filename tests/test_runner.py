@@ -70,7 +70,7 @@ from vibe_loop.runner import (
     RUNTIME_OWNED_WORKER_ADDENDUM,
     SPEC_WORKER_CONTEXT_MAX_TOTAL_CHARS,
     ActivityEvent,
-    AgentLimitWallError,
+    AgentProviderLimitError,
     AgentRuntimeContext,
     PostReportActivityMonitor,
     SchedulerLockBusy,
@@ -1528,7 +1528,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "unknown")
         self.assertEqual(result.source, "fallback")
 
-    def test_classify_detects_limit_wall_before_failed(self) -> None:
+    def test_classify_detects_provider_limit_before_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(VibeConfig(repo=Path(directory)))
             result = runner.classify(
@@ -1540,14 +1540,14 @@ class RunnerTests(unittest.TestCase):
                 None,
                 output_tail="You've hit your session limit · resets 1am (UTC)",
             )
-        self.assertEqual(result.status, "limit_wall")
-        self.assertEqual(result.source, "limit_wall")
+        self.assertEqual(result.status, "provider_limit")
+        self.assertEqual(result.source, "provider_limit")
         self.assertEqual(result.detail, "resets 1am (UTC)")
 
     def test_classify_successful_run_ignores_quoted_limit_phrase(self) -> None:
         # A completed run (exit 0, no worker report) whose captured output merely
         # quotes a limit phrase must proceed to the normal completion path, not
-        # be recorded as limit_wall and pause the whole supervisor.
+        # be recorded as provider_limit and pause the whole supervisor.
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(VibeConfig(repo=Path(directory)))
             source = MutableTaskSource(
@@ -1567,7 +1567,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.source, "task_probe")
 
-    def test_classify_worker_report_wins_over_limit_wall(self) -> None:
+    def test_classify_worker_report_wins_over_provider_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(VibeConfig(repo=Path(directory)))
             result = runner.classify(
@@ -1582,12 +1582,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.source, "worker_report")
 
-    def test_classify_limit_wall_disabled_falls_back_to_failed(self) -> None:
+    def test_classify_provider_limit_disabled_falls_back_to_failed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(
                 VibeConfig(
                     repo=Path(directory),
-                    supervision=SupervisionConfig(limit_wall_detection=False),
+                    supervision=SupervisionConfig(provider_limit_detection=False),
                 )
             )
             result = runner.classify(
@@ -1602,13 +1602,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.source, "exit_code_or_completion_check")
 
-    def test_classify_honors_custom_limit_wall_patterns(self) -> None:
+    def test_classify_honors_custom_provider_limit_patterns(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             runner = VibeRunner(
                 VibeConfig(
                     repo=Path(directory),
                     supervision=SupervisionConfig(
-                        limit_wall_patterns=("provider wall reached",)
+                        provider_limit_patterns=("provider wall reached",)
                     ),
                 )
             )
@@ -1632,7 +1632,7 @@ class RunnerTests(unittest.TestCase):
                 output_tail="the provider wall reached",
             )
         self.assertEqual(default_phrase.status, "failed")
-        self.assertEqual(custom_phrase.status, "limit_wall")
+        self.assertEqual(custom_phrase.status, "provider_limit")
 
     def test_inject_claude_resume_inserts_flag_before_prompt(self) -> None:
         self.assertEqual(
@@ -2298,7 +2298,9 @@ class RunnerTests(unittest.TestCase):
                     by_task["TASK-BAD"].message,
                 )
 
-    def test_task_agent_refusal_does_not_clear_parallel_limit_wall_stop(self) -> None:
+    def test_task_agent_refusal_does_not_clear_parallel_provider_limit_stop(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             runner = VibeRunner(
@@ -2347,7 +2349,7 @@ class RunnerTests(unittest.TestCase):
                 return RunResult(
                     run_id="run-wall",
                     task_id=task.task_id,
-                    classification="limit_wall",
+                    classification="provider_limit",
                     exit_code=1,
                     log_path=repo / "wall.log",
                     start_main="aaa",
@@ -4388,8 +4390,8 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("\ufffd", log_text)
 
 
-class LimitWallLoopTests(unittest.TestCase):
-    def _limit_wall_runner(
+class ProviderLimitLoopTests(unittest.TestCase):
+    def _provider_limit_runner(
         self,
         repo: Path,
         source: MutableTaskSource,
@@ -4403,7 +4405,7 @@ class LimitWallLoopTests(unittest.TestCase):
             return RunResult(
                 run_id=f"run-{task.task_id}-{len(calls)}",
                 task_id=task.task_id,
-                classification="limit_wall",
+                classification="provider_limit",
                 exit_code=1,
                 log_path=repo / f"{task.task_id}.log",
                 start_main="aaa",
@@ -4414,14 +4416,14 @@ class LimitWallLoopTests(unittest.TestCase):
         runner.run_task = run_task
         return runner
 
-    def test_serial_limit_wall_stops_without_consuming_budget(self) -> None:
+    def test_serial_provider_limit_stops_without_consuming_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             source = MutableTaskSource(
                 [Task(task_id="TASK-01", title="Task 1", status="Next", order=1)]
             )
             calls: list[str] = []
-            runner = self._limit_wall_runner(repo, source, calls)
+            runner = self._provider_limit_runner(repo, source, calls)
             restart_calls: list[object] = []
             runner.record_task_restart = (  # type: ignore[method-assign]
                 lambda *args, **kwargs: restart_calls.append((args, kwargs))
@@ -4429,7 +4431,9 @@ class LimitWallLoopTests(unittest.TestCase):
 
             results = runner.run_until_done()
 
-        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        self.assertEqual(
+            [result.classification for result in results], ["provider_limit"]
+        )
         # Dispatch stops instead of tight-looping into the same wall.
         self.assertEqual(calls, ["TASK-01"])
         # No restart/recovery budget is consumed.
@@ -4437,7 +4441,7 @@ class LimitWallLoopTests(unittest.TestCase):
         # The task remains runnable for the supervisor's next cycle.
         self.assertNotIn("TASK-01", source._done)
 
-    def test_parallel_limit_wall_stops_without_consuming_budget(self) -> None:
+    def test_parallel_provider_limit_stops_without_consuming_budget(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             source = MutableTaskSource(
@@ -4447,7 +4451,7 @@ class LimitWallLoopTests(unittest.TestCase):
                 ]
             )
             calls: list[str] = []
-            runner = self._limit_wall_runner(repo, source, calls)
+            runner = self._provider_limit_runner(repo, source, calls)
             restart_calls: list[object] = []
             runner.record_task_restart = (  # type: ignore[method-assign]
                 lambda *args, **kwargs: restart_calls.append((args, kwargs))
@@ -4457,12 +4461,12 @@ class LimitWallLoopTests(unittest.TestCase):
 
         self.assertTrue(results)
         self.assertTrue(
-            all(result.classification == "limit_wall" for result in results)
+            all(result.classification == "provider_limit" for result in results)
         )
         self.assertEqual(restart_calls, [])
         self.assertEqual(source._done, set())
 
-    def test_limit_wall_invokes_reset_hook_for_claimed_task(self) -> None:
+    def test_provider_limit_invokes_reset_hook_for_claimed_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             source = MutableTaskSource(
@@ -4470,19 +4474,21 @@ class LimitWallLoopTests(unittest.TestCase):
                 reset_hook=True,
             )
             calls: list[str] = []
-            runner = self._limit_wall_runner(repo, source, calls)
+            runner = self._provider_limit_runner(repo, source, calls)
 
             results = runner.run_until_done()
 
-        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        self.assertEqual(
+            [result.classification for result in results], ["provider_limit"]
+        )
         # The claimed task is handed back to the backend for re-dispatch.
         self.assertEqual(source.reset_calls, ["TASK-01"])
         # It stays runnable (never marked done), so the next cycle can pick it.
         self.assertNotIn("TASK-01", source._done)
 
-    def test_parallel_limit_wall_invokes_reset_hook_for_claimed_task(self) -> None:
+    def test_parallel_provider_limit_invokes_reset_hook_for_claimed_task(self) -> None:
         # The serial path is covered above; the parallel drain path reaches the
-        # same _report_limit_wall_pause chokepoint, so a reset hook must fire
+        # same _report_provider_limit_pause chokepoint, so a reset hook must fire
         # there too. Locks path-independence of the reset behavior.
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -4494,13 +4500,13 @@ class LimitWallLoopTests(unittest.TestCase):
                 reset_hook=True,
             )
             calls: list[str] = []
-            runner = self._limit_wall_runner(repo, source, calls)
+            runner = self._provider_limit_runner(repo, source, calls)
 
             results = runner.run_until_done(jobs=2)
 
         self.assertTrue(results)
         self.assertTrue(
-            all(result.classification == "limit_wall" for result in results)
+            all(result.classification == "provider_limit" for result in results)
         )
         # The claimed task(s) are handed back to the backend for re-dispatch and
         # never marked done, so the next cycle can pick them up.
@@ -4508,7 +4514,7 @@ class LimitWallLoopTests(unittest.TestCase):
         self.assertTrue(set(source.reset_calls) <= {"TASK-01", "TASK-02"})
         self.assertEqual(source._done, set())
 
-    def test_limit_wall_without_reset_hook_leaves_status_untouched(self) -> None:
+    def test_provider_limit_without_reset_hook_leaves_status_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             source = MutableTaskSource(
@@ -4516,7 +4522,7 @@ class LimitWallLoopTests(unittest.TestCase):
                 reset_hook=False,
             )
             calls: list[str] = []
-            runner = self._limit_wall_runner(repo, source, calls)
+            runner = self._provider_limit_runner(repo, source, calls)
             restart_calls: list[object] = []
             runner.record_task_restart = (  # type: ignore[method-assign]
                 lambda *args, **kwargs: restart_calls.append((args, kwargs))
@@ -4526,11 +4532,13 @@ class LimitWallLoopTests(unittest.TestCase):
 
         # Absent hook: dispatch still pauses without consuming budget, and the
         # source reports no reset (unchanged behavior).
-        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        self.assertEqual(
+            [result.classification for result in results], ["provider_limit"]
+        )
         self.assertEqual(restart_calls, [])
         self.assertEqual(source.reset_calls, ["TASK-01"])
 
-    def test_limit_wall_reset_hook_failure_is_non_fatal(self) -> None:
+    def test_provider_limit_reset_hook_failure_is_non_fatal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             source = MutableTaskSource(
@@ -4539,12 +4547,14 @@ class LimitWallLoopTests(unittest.TestCase):
                 reset_error=subprocess.CalledProcessError(3, "reset-hook"),
             )
             calls: list[str] = []
-            runner = self._limit_wall_runner(repo, source, calls)
+            runner = self._provider_limit_runner(repo, source, calls)
 
             # A failing reset hook must not crash the dispatch loop.
             results = runner.run_until_done()
 
-        self.assertEqual([result.classification for result in results], ["limit_wall"])
+        self.assertEqual(
+            [result.classification for result in results], ["provider_limit"]
+        )
         self.assertEqual(source.reset_calls, ["TASK-01"])
         self.assertEqual(calls, ["TASK-01"])
 
@@ -8067,7 +8077,9 @@ class AnalysisAgentTests(unittest.TestCase):
             self.assertIsNone(payload)
             self.assertFalse(output_path.exists())
 
-    def test_run_analysis_agent_raises_on_a_real_limit_wall_subprocess(self) -> None:
+    def test_run_analysis_agent_raises_on_a_real_provider_limit_subprocess(
+        self,
+    ) -> None:
         # End-to-end over a real subprocess: the observed Codex wall text must
         # travel from the agent's exit through the retry layer and surface as a
         # typed error carrying the reset, without spending any retry attempt.
@@ -8109,7 +8121,7 @@ class AnalysisAgentTests(unittest.TestCase):
             )
             output_path = repo / "decision.json"
 
-            with self.assertRaises(AgentLimitWallError) as caught:
+            with self.assertRaises(AgentProviderLimitError) as caught:
                 runner.run_analysis_agent("inspect", output_path)
 
             error = caught.exception
@@ -12113,7 +12125,7 @@ class SettledRunOutcomeTests(unittest.TestCase):
                 self.assertEqual(settled_run_outcome(classification), classification)
 
     def test_non_settling_classifications_are_unknown(self) -> None:
-        for classification in ("unknown", "timed_out", "limit_wall", "", "weird"):
+        for classification in ("unknown", "timed_out", "provider_limit", "", "weird"):
             with self.subTest(classification=classification):
                 self.assertEqual(settled_run_outcome(classification), "unknown")
 
@@ -12126,7 +12138,7 @@ class SettledRunOutcomeTests(unittest.TestCase):
             "blocked",
             "unknown",
             "timed_out",
-            "limit_wall",
+            "provider_limit",
         ):
             with self.subTest(classification=classification):
                 self.assertIn(settled_run_outcome(classification), SETTLED_RUN_OUTCOMES)

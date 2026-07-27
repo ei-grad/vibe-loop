@@ -1047,45 +1047,98 @@ class ConfigTests(unittest.TestCase):
             config = load_config(Path(directory))
         self.assertTrue(config.supervision.resume_unknown_runs)
 
-    def test_supervision_config_limit_wall_defaults(self) -> None:
+    def test_supervision_config_provider_limit_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(Path(directory))
-        self.assertTrue(config.supervision.limit_wall_detection)
-        self.assertEqual(config.supervision.limit_wall_backoff_seconds, 1800.0)
-        self.assertEqual(config.supervision.limit_wall_patterns, ())
+        self.assertTrue(config.supervision.provider_limit_detection)
+        self.assertEqual(config.supervision.provider_limit_backoff_seconds, 1800.0)
+        self.assertEqual(config.supervision.provider_limit_patterns, ())
         self.assertEqual(config.supervision.explicit_keys, frozenset())
 
-    def test_supervision_config_parses_limit_wall_overrides(self) -> None:
+    def test_supervision_config_parses_provider_limit_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[supervision]\n"
+                "provider_limit_detection = false\n"
+                "provider_limit_backoff_seconds = 600\n"
+                'provider_limit_patterns = ["custom wall", "another cap"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertFalse(config.supervision.provider_limit_detection)
+        self.assertEqual(config.supervision.provider_limit_backoff_seconds, 600.0)
+        self.assertEqual(
+            config.supervision.provider_limit_patterns,
+            ("custom wall", "another cap"),
+        )
+        self.assertEqual(
+            config.supervision.to_json()["provider_limit_patterns"],
+            ["custom wall", "another cap"],
+        )
+        self.assertEqual(
+            config.supervision.to_json()["explicit_keys"],
+            [
+                "provider_limit_backoff_seconds",
+                "provider_limit_detection",
+                "provider_limit_patterns",
+            ],
+        )
+
+    def test_supervision_config_accepts_deprecated_provider_limit_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             (repo / ".vibe-loop.toml").write_text(
                 "[supervision]\n"
                 "limit_wall_detection = false\n"
                 "limit_wall_backoff_seconds = 600\n"
-                'limit_wall_patterns = ["custom wall", "another cap"]\n',
+                'limit_wall_patterns = ["custom quota"]\n',
                 encoding="utf-8",
             )
 
             config = load_config(repo)
 
-        self.assertFalse(config.supervision.limit_wall_detection)
-        self.assertEqual(config.supervision.limit_wall_backoff_seconds, 600.0)
+        self.assertFalse(config.supervision.provider_limit_detection)
+        self.assertEqual(config.supervision.provider_limit_backoff_seconds, 600.0)
+        self.assertEqual(config.supervision.provider_limit_patterns, ("custom quota",))
         self.assertEqual(
-            config.supervision.limit_wall_patterns,
-            ("custom wall", "another cap"),
+            config.supervision.explicit_keys,
+            frozenset(
+                {
+                    "provider_limit_detection",
+                    "provider_limit_backoff_seconds",
+                    "provider_limit_patterns",
+                }
+            ),
         )
-        self.assertEqual(
-            config.supervision.to_json()["limit_wall_patterns"],
-            ["custom wall", "another cap"],
-        )
-        self.assertEqual(
-            config.supervision.to_json()["explicit_keys"],
-            [
-                "limit_wall_backoff_seconds",
-                "limit_wall_detection",
-                "limit_wall_patterns",
-            ],
-        )
+        diagnostics = "\n".join(config.supervision.diagnostics())
+        self.assertIn("limit_wall_detection is deprecated", diagnostics)
+        self.assertIn("limit_wall_backoff_seconds is deprecated", diagnostics)
+        self.assertIn("limit_wall_patterns is deprecated", diagnostics)
+
+    def test_supervision_config_rejects_current_and_deprecated_alias_together(
+        self,
+    ) -> None:
+        for current, legacy in (
+            ("provider_limit_detection", "limit_wall_detection"),
+            ("provider_limit_backoff_seconds", "limit_wall_backoff_seconds"),
+            ("provider_limit_patterns", "limit_wall_patterns"),
+        ):
+            value = '["quota"]' if current.endswith("patterns") else "false"
+            with self.subTest(current=current):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(
+                        f"[supervision]\n{current} = {value}\n{legacy} = {value}\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError,
+                        rf"supervision\.{current}.*supervision\.{legacy}",
+                    ):
+                        load_config(repo)
 
     def test_supervision_config_worker_timeout_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1159,15 +1212,21 @@ class ConfigTests(unittest.TestCase):
             ("cooldown_seconds = -0.1\n", "supervision.cooldown_seconds"),
             ('recover_unknown_runs = "yes"\n', "supervision.recover_unknown_runs"),
             ('resume_unknown_runs = "yes"\n', "supervision.resume_unknown_runs"),
-            ('limit_wall_detection = "yes"\n', "supervision.limit_wall_detection"),
             (
-                "limit_wall_backoff_seconds = -1\n",
-                "supervision.limit_wall_backoff_seconds",
+                'provider_limit_detection = "yes"\n',
+                "supervision.provider_limit_detection",
             ),
-            ('limit_wall_patterns = "wall"\n', "supervision.limit_wall_patterns"),
             (
-                'limit_wall_patterns = ["("]\n',
-                "supervision.limit_wall_patterns",
+                "provider_limit_backoff_seconds = -1\n",
+                "supervision.provider_limit_backoff_seconds",
+            ),
+            (
+                'provider_limit_patterns = "wall"\n',
+                "supervision.provider_limit_patterns",
+            ),
+            (
+                'provider_limit_patterns = ["("]\n',
+                "supervision.provider_limit_patterns",
             ),
             ("unsupported = true\n", "unsupported"),
         ]

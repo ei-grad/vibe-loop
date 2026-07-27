@@ -154,8 +154,8 @@ class RunStoreTests(unittest.TestCase):
                 result = RunResult(
                     run_id=run_id,
                     task_id="TASK-01",
-                    classification="limit_wall",
-                    classification_source="limit_wall",
+                    classification="provider_limit",
+                    classification_source="provider_limit",
                     exit_code=1,
                     log_path=Path("run.log"),
                     start_main="base",
@@ -171,8 +171,8 @@ class RunStoreTests(unittest.TestCase):
             after_wall = RunResult(
                 run_id="after-wall",
                 task_id="TASK-01",
-                classification="limit_wall",
-                classification_source="limit_wall",
+                classification="provider_limit",
+                classification_source="provider_limit",
                 exit_code=1,
                 log_path=Path("run.log"),
                 start_main="base",
@@ -1436,6 +1436,56 @@ class RunStoreTests(unittest.TestCase):
             [record["record_type"] for record in inspection.records],
             ["lock_acquired", "worker_report", "run_result"],
         )
+
+    def test_old_provider_limit_record_is_read_without_rewriting_history(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            legacy = {
+                "schema_version": RUN_SCHEMA_VERSION,
+                "record_type": RUN_RECORD_TYPE,
+                "run_id": "legacy-run",
+                "task_id": "TASK-01",
+                "classification": "limit_wall",
+                "classification_source": "limit_wall",
+                "exit_code": 1,
+                "log": "legacy.log",
+                "start_main": "aaa",
+                "end_main": "aaa",
+                "finished_at": "2026-07-24T00:00:00+00:00",
+            }
+            path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+            store = RunStore(path)
+
+            listed = store.list_runs()
+            inspected = store.inspect_run("legacy-run")
+
+            self.assertEqual(listed[0].status, "provider_limit")
+            self.assertEqual(listed[0].classification_source, "provider_limit")
+            self.assertIsNotNone(inspected)
+            assert inspected is not None
+            self.assertEqual(inspected.view.status, "provider_limit")
+            self.assertEqual(
+                inspected.records[0]["classification"],
+                "limit_wall",
+            )
+            self.assertIn('"classification": "limit_wall"', path.read_text())
+
+    def test_new_run_result_canonicalizes_legacy_provider_limit_token(self) -> None:
+        result = RunResult(
+            run_id="new-run",
+            task_id="TASK-01",
+            classification="limit_wall",
+            classification_source="limit_wall",
+            exit_code=1,
+            log_path=Path("run.log"),
+            start_main="aaa",
+            end_main="aaa",
+        )
+
+        payload = result.to_json()
+
+        self.assertEqual(payload["classification"], "provider_limit")
+        self.assertEqual(payload["classification_source"], "provider_limit")
 
     def test_list_runs_limit_zero_returns_no_runs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

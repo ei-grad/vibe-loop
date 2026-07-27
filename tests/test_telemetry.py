@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from vibe_loop.cli import main
-from vibe_loop.retry import detect_limit_wall
+from vibe_loop.retry import detect_provider_limit_phrase
 from vibe_loop.runs import RunResult, RunStore
 from vibe_loop.telemetry import (
     ProviderUsage,
@@ -87,12 +87,12 @@ def test_model_labels_require_bounded_native_identifiers(
         ("claude-present.json", parse_claude_result, True, False),
         ("claude-missing.json", parse_claude_result, False, True),
         ("claude-malformed.json", parse_claude_result, False, True),
-        ("claude-limit-wall.json", parse_claude_result, True, False),
+        ("claude-provider-limit.json", parse_claude_result, True, False),
         ("claude-no-cache.json", parse_claude_result, True, False),
         ("codex-present.json", parse_codex_event, True, False),
         ("codex-missing.json", parse_codex_event, False, True),
         ("codex-malformed.json", parse_codex_event, False, True),
-        ("codex-limit-wall.json", parse_codex_event, False, False),
+        ("codex-provider-limit.json", parse_codex_event, False, False),
         ("codex-quota-first.json", parse_codex_event, True, False),
         ("codex-quota-malformed.json", parse_codex_event, True, False),
     ],
@@ -158,9 +158,11 @@ def test_normalizes_claude_and_codex_native_fields() -> None:
     }
 
 
-@pytest.mark.parametrize("name", ["claude-limit-wall.json", "codex-limit-wall.json"])
-def test_provider_limit_wall_fixtures_remain_typed(name: str) -> None:
-    signal = detect_limit_wall(json.dumps(fixture(name)))
+@pytest.mark.parametrize(
+    "name", ["claude-provider-limit.json", "codex-provider-limit.json"]
+)
+def test_provider_limit_fixtures_remain_typed(name: str) -> None:
+    signal = detect_provider_limit_phrase(json.dumps(fixture(name)))
     assert signal is not None
     assert "usage limit" in signal.marker
 
@@ -493,16 +495,16 @@ def test_claude_account_wall_summary_has_evidence_without_percent_forecast() -> 
     ]
 
 
-def test_claude_account_wall_state_does_not_double_count_limit_wall_runs() -> None:
+def test_claude_account_wall_state_does_not_double_count_provider_limit_runs() -> None:
     observer = ProviderUsageObserver("anthropic")
     observer.observe_line(json.dumps(fixture("claude-rate-limit-rejected.json")))
     finished = datetime(2026, 7, 21, 12, 5, tzinfo=UTC)
     record = run_record(
-        "claude-limit-wall",
+        "claude-provider-limit",
         "task-account-wall",
         finished,
         provider="anthropic",
-        classification="limit_wall",
+        classification="provider_limit",
     )
     record["stats"] = observer.usage.to_stats(phase="implementation")
 
@@ -516,6 +518,29 @@ def test_claude_account_wall_state_does_not_double_count_limit_wall_runs() -> No
     assert provider["account_wall_evidence_available"] is True
     assert provider["account_wall_observations"] == 1
     assert provider["account_wall_last_observed_at"] == finished.isoformat()
+
+
+def test_telemetry_accepts_deprecated_provider_limit_classification() -> None:
+    finished = datetime(2026, 7, 21, 12, 5, tzinfo=UTC)
+    record = run_record(
+        "legacy-provider-limit",
+        "task-provider-limit",
+        finished,
+        provider="anthropic",
+        classification="limit_wall",
+    )
+
+    summary = rolling_usage_summary(
+        [record],
+        project="demo",
+        now=datetime(2026, 7, 21, 13, 0, tzinfo=UTC),
+    )
+    provider = summary["quota_account_wall"]["providers"][0]
+
+    assert provider["account_wall_observations"] == 1
+    assert "provider_limit" in {
+        diagnostic["type"] for diagnostic in summary["diagnostics"]
+    }
 
 
 def test_provider_usage_without_cache_fields_keeps_fresh_input() -> None:
@@ -684,7 +709,7 @@ def test_rolling_summary_groups_productivity_and_budget_diagnostics() -> None:
             "r2",
             "task-b",
             now - timedelta(minutes=5),
-            classification="limit_wall",
+            classification="provider_limit",
             duration=5,
             session_id="review-session",
             phase="review",
@@ -735,7 +760,7 @@ def test_rolling_summary_groups_productivity_and_budget_diagnostics() -> None:
     assert planning["tokens_per_completed_task"] == 157974
     diagnostic_types = {item["type"] for item in summary["diagnostics"]}
     assert {
-        "limit_wall",
+        "provider_limit",
         "rapid_provider_failures",
         "task_attempts",
         "planning_spend",
@@ -1272,12 +1297,12 @@ class TelemetryUnittestCoverage(unittest.TestCase):
             ("claude-present.json", parse_claude_result, True, False),
             ("claude-missing.json", parse_claude_result, False, True),
             ("claude-malformed.json", parse_claude_result, False, True),
-            ("claude-limit-wall.json", parse_claude_result, True, False),
+            ("claude-provider-limit.json", parse_claude_result, True, False),
             ("claude-no-cache.json", parse_claude_result, True, False),
             ("codex-present.json", parse_codex_event, True, False),
             ("codex-missing.json", parse_codex_event, False, True),
             ("codex-malformed.json", parse_codex_event, False, True),
-            ("codex-limit-wall.json", parse_codex_event, False, False),
+            ("codex-provider-limit.json", parse_codex_event, False, False),
             ("codex-quota-first.json", parse_codex_event, True, False),
             ("codex-quota-malformed.json", parse_codex_event, True, False),
         )
@@ -1285,11 +1310,11 @@ class TelemetryUnittestCoverage(unittest.TestCase):
             with self.subTest(fixture=case[0]):
                 test_provider_usage_fixtures(*case)
 
-    def test_native_normalization_and_limit_walls(self) -> None:
+    def test_native_normalization_and_provider_limits(self) -> None:
         test_normalizes_claude_and_codex_native_fields()
-        for name in ("claude-limit-wall.json", "codex-limit-wall.json"):
+        for name in ("claude-provider-limit.json", "codex-provider-limit.json"):
             with self.subTest(fixture=name):
-                test_provider_limit_wall_fixtures_remain_typed(name)
+                test_provider_limit_fixtures_remain_typed(name)
 
     def test_post_report_teardown_stats(self) -> None:
         test_stats_expose_post_report_teardown_breakdown()

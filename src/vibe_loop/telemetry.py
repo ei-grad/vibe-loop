@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Mapping
 
+from vibe_loop.retry import is_provider_limit_classification
+
 
 USAGE_SCHEMA_VERSION = 2
 SUMMARY_SCHEMA_VERSION = 2
@@ -1452,7 +1454,7 @@ def _quota_account_wall_summary(
             latest = account_group["latest_account_wall_observations"]
             assert isinstance(latest, list)
             latest.append(observation)
-        if record.get("classification") == "limit_wall":
+        if is_provider_limit_classification(record.get("classification")):
             group["account_wall_evidence_available"] = True
             group["account_wall_observations"] = (
                 int(group["account_wall_observations"]) + 1
@@ -1743,10 +1745,10 @@ def rolling_usage_summary(
                     "threshold_metric": "total_tokens",
                 }
             )
-        if record.get("classification") == "limit_wall":
+        if is_provider_limit_classification(record.get("classification")):
             diagnostics.append(
                 {
-                    "type": "limit_wall",
+                    "type": "provider_limit",
                     "severity": "warning",
                     "run_id": record.get("run_id"),
                     "task_id": task_id,

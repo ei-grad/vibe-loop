@@ -28,7 +28,7 @@ fencing token.
 Acceptance must cover: the stage set (activation, workspace, implementing,
 candidate, gates, review, remediation, closure, integration, provenance,
 classification, finalization) with legal-transition enforcement; typed failure
-transitions (`limit_wall`, `timed_out`, `stage_failed`, `blocked`,
+transitions (`provider_limit`, `timed_out`, `stage_failed`, `blocked`,
 `cancelled`) from every stage; journal-ahead recording so every transition is
 derivable after process death; rejection of lifecycle mutations attempted
 through model output text; a journaled task-source settlement step with a
@@ -378,9 +378,11 @@ Related implementation IDs: `ORC-08` (`orc-runtime-integration`), `ORC-09`
 ## PRD-ORC-008 Stage-Typed Quota And Retry Classification
 
 Every stage subprocess result must be classified once by the runtime into
-`ok`, `transient`, `limit_wall`, `timeout`, or `fatal`. A typed provider
-limit on one route pauses that route without consuming the task restart
-budget or triggering retries on another route. Usage is attributed by the
+`ok`, `transient`, `provider_limit`, `timeout`, or `fatal`. A typed provider
+limit means provider quota exhaustion; unlike `timeout`, it does not describe a
+local wall-clock deadline. A provider limit on one route pauses that route
+without consuming the task restart budget or triggering retries on another
+route. Usage is attributed by the
 runtime to `implementation`, `initial_review`, `remediation`, or
 `targeted_closure` phases from state-machine position, keeping worker-reported
 phase as corroboration only.

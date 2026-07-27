@@ -47,12 +47,12 @@ from vibe_loop.autopilot import (
     NativePlanningWorkerResult,
     PLANNING_ERROR_EXECUTABLE_RESOLUTION,
     PLANNING_ERROR_INVALID_PLAN,
-    PLANNING_ERROR_LIMIT_WALL,
+    PLANNING_ERROR_PROVIDER_LIMIT,
     PLANNING_ERROR_OS_ERROR,
     PLANNING_ERROR_SUBPROCESS,
     PLANNING_OUTCOME_ANALYSIS_ERROR,
     PLANNING_OUTCOME_INVALID_PLAN,
-    PLANNING_OUTCOME_LIMIT_WALL,
+    PLANNING_OUTCOME_PROVIDER_LIMIT,
     PLANNING_OUTCOME_NO_TASKS,
     PLANNING_OUTCOME_PRODUCTIVE,
     PLANNING_OUTCOME_TASK_SOURCE_ERROR,
@@ -81,7 +81,7 @@ from vibe_loop.autopilot import (
     cycle_should_poll_task_source,
     cycle_should_recheck,
     IdleWakeAdapterError,
-    limit_wall_pause_seconds,
+    provider_limit_pause_seconds,
     parse_wait_deadline,
     poll_wait_message_command,
     poll_idle_wake_command,
@@ -117,8 +117,8 @@ from vibe_loop.config import (
     load_config,
     normalize_registry_runtime_context,
 )
-from vibe_loop.retry import LimitWallSignal
-from vibe_loop.runner import AgentLimitWallError
+from vibe_loop.retry import ProviderLimitSignal
+from vibe_loop.runner import AgentProviderLimitError
 from vibe_loop.locks import (
     AUTOPILOT_LOCK_NAME,
     LockBackendError,
@@ -5350,21 +5350,22 @@ class OwnedProcessTreeIntegrationTests(unittest.TestCase):
                             process.wait(timeout=10)
 
 
-class LimitWallPauseTests(unittest.TestCase):
+class ProviderLimitPauseTests(unittest.TestCase):
     UTC = datetime.timezone.utc
 
-    def _limit_wall_result(
+    def _provider_limit_result(
         self,
         repo: Path,
         *,
         task_id: str = "TASK-01",
         message: str = "",
         finished_at: str = "",
+        classification: str = "provider_limit",
     ) -> RunResult:
         kwargs: dict[str, object] = {
             "run_id": f"run-{task_id}",
             "task_id": task_id,
-            "classification": "limit_wall",
+            "classification": classification,
             "exit_code": 1,
             "log_path": repo / f"{task_id}.log",
             "start_main": "aaa",
@@ -5375,10 +5376,12 @@ class LimitWallPauseTests(unittest.TestCase):
             kwargs["finished_at"] = finished_at
         return RunResult(**kwargs)  # type: ignore[arg-type]
 
-    def test_no_limit_wall_returns_none(self) -> None:
+    def test_no_provider_limit_returns_none(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = RunStore(Path(directory) / "runs.jsonl")
-            pause = limit_wall_pause_seconds(store, since="", default_backoff=1800.0)
+            pause = provider_limit_pause_seconds(
+                store, since="", default_backoff=1800.0
+            )
         self.assertIsNone(pause)
 
     def test_uses_reset_delay_from_recorded_message(self) -> None:
@@ -5387,9 +5390,9 @@ class LimitWallPauseTests(unittest.TestCase):
             repo = Path(directory)
             store = RunStore(repo / "runs.jsonl")
             store.append_result(
-                self._limit_wall_result(repo, message="resets 1am (UTC)")
+                self._provider_limit_result(repo, message="resets 1am (UTC)")
             )
-            pause = limit_wall_pause_seconds(
+            pause = provider_limit_pause_seconds(
                 store, since="", default_backoff=1800.0, now=now
             )
         self.assertIsNotNone(pause)
@@ -5399,8 +5402,30 @@ class LimitWallPauseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             store = RunStore(repo / "runs.jsonl")
-            store.append_result(self._limit_wall_result(repo, message=""))
-            pause = limit_wall_pause_seconds(store, since="", default_backoff=1234.0)
+            store.append_result(self._provider_limit_result(repo, message=""))
+            pause = provider_limit_pause_seconds(
+                store, since="", default_backoff=1234.0
+            )
+        self.assertEqual(pause, 1234.0)
+
+    def test_accepts_deprecated_provider_limit_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            legacy = self._provider_limit_result(
+                repo,
+                classification="limit_wall",
+                message="",
+            ).to_json()
+            legacy["classification"] = "limit_wall"
+            store.path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+
+            pause = provider_limit_pause_seconds(
+                store,
+                since="",
+                default_backoff=1234.0,
+            )
+
         self.assertEqual(pause, 1234.0)
 
     def test_ignores_records_finished_before_since(self) -> None:
@@ -5408,9 +5433,11 @@ class LimitWallPauseTests(unittest.TestCase):
             repo = Path(directory)
             store = RunStore(repo / "runs.jsonl")
             store.append_result(
-                self._limit_wall_result(repo, finished_at="2026-07-13T00:00:00+00:00")
+                self._provider_limit_result(
+                    repo, finished_at="2026-07-13T00:00:00+00:00"
+                )
             )
-            pause = limit_wall_pause_seconds(
+            pause = provider_limit_pause_seconds(
                 store,
                 since="2026-07-13T01:00:00+00:00",
                 default_backoff=1800.0,
@@ -5423,26 +5450,26 @@ class LimitWallPauseTests(unittest.TestCase):
             repo = Path(directory)
             store = RunStore(repo / "runs.jsonl")
             store.append_result(
-                self._limit_wall_result(repo, task_id="TASK-01", message="")
+                self._provider_limit_result(repo, task_id="TASK-01", message="")
             )
             store.append_result(
-                self._limit_wall_result(
+                self._provider_limit_result(
                     repo, task_id="TASK-02", message="resets 2am (UTC)"
                 )
             )
-            pause = limit_wall_pause_seconds(
+            pause = provider_limit_pause_seconds(
                 store, since="", default_backoff=1800.0, now=now
             )
         # 2am reset (2h + margin) beats the 1800s default from the other wall.
         self.assertAlmostEqual(pause, 2 * 3600 + 120.0, delta=1.0)
 
-    def test_run_autopilot_pauses_dispatch_on_limit_wall(self) -> None:
+    def test_run_autopilot_pauses_dispatch_on_provider_limit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(
                 repo,
                 [("TASK-01", "Next", "", "ready slice")],
-                extra_toml="[supervision]\nlimit_wall_backoff_seconds = 42\n",
+                extra_toml="[supervision]\nprovider_limit_backoff_seconds = 42\n",
             )
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
@@ -5450,7 +5477,7 @@ class LimitWallPauseTests(unittest.TestCase):
             def launcher(command, *, cwd, log_path, on_start=None):
                 if on_start is not None:
                     on_start(4242)
-                run_store.append_result(self._limit_wall_result(Path(cwd)))
+                run_store.append_result(self._provider_limit_result(Path(cwd)))
                 return 0
 
             sleeps: list[float] = []
@@ -5464,20 +5491,20 @@ class LimitWallPauseTests(unittest.TestCase):
 
         self.assertTrue(summary.started)
         self.assertEqual(sleeps, [42.0])
-        self.assertEqual(summary.cycles[0].limit_wall_pause_seconds, 42.0)
-        self.assertIn("limit_wall_pause:42s", summary.cycles[0].actions)
+        self.assertEqual(summary.cycles[0].provider_limit_pause_seconds, 42.0)
+        self.assertIn("provider_limit_pause:42s", summary.cycles[0].actions)
         wake = datetime.datetime.fromisoformat(summary.cycles[0].next_wake)
         occurred = datetime.datetime.fromisoformat(summary.cycles[0].occurred_at)
         self.assertGreater((wake - occurred).total_seconds(), 40.0)
 
     @unittest.skipUnless(hasattr(signal, "SIGHUP"), "reload signal requires SIGHUP")
-    def test_reload_does_not_cancel_limit_wall_pause(self) -> None:
+    def test_reload_does_not_cancel_provider_limit_pause(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(
                 repo,
                 [("TASK-01", "Next", "", "ready slice")],
-                extra_toml="[supervision]\nlimit_wall_backoff_seconds = 0.2\n",
+                extra_toml="[supervision]\nprovider_limit_backoff_seconds = 0.2\n",
             )
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
@@ -5488,7 +5515,7 @@ class LimitWallPauseTests(unittest.TestCase):
                 launches += 1
                 if on_start is not None:
                     on_start(4242)
-                run_store.append_result(self._limit_wall_result(Path(cwd)))
+                run_store.append_result(self._provider_limit_result(Path(cwd)))
                 if launches == 1:
                     supervisor = next(
                         record
@@ -5559,11 +5586,11 @@ class AutopilotRecheckTests(unittest.TestCase):
 
         return runner, kinds
 
-    def _future_limit_wall_result(self, repo: Path) -> RunResult:
+    def _future_provider_limit_result(self, repo: Path) -> RunResult:
         return RunResult(  # type: ignore[arg-type]
             run_id="run-limit",
             task_id="TASK-LW",
-            classification="limit_wall",
+            classification="provider_limit",
             exit_code=1,
             log_path=repo / "limit.log",
             start_main="aaa",
@@ -6026,7 +6053,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             ["restartable", "restartable"],
         )
 
-    def test_zero_limit_wall_uses_post_child_restartable_baseline(self) -> None:
+    def test_zero_provider_limit_uses_post_child_restartable_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(
@@ -6052,7 +6079,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                 return 1
 
             with mock.patch(
-                "vibe_loop.autopilot.limit_wall_pause_seconds",
+                "vibe_loop.autopilot.provider_limit_pause_seconds",
                 return_value=0.0,
             ):
                 summary = run_autopilot(
@@ -6390,7 +6417,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             self.assertEqual(kinds, ["planning"])
             self.assertEqual(launcher_calls, 1)
 
-    def test_limit_wall_pause_takes_precedence_over_recheck(self) -> None:
+    def test_provider_limit_pause_takes_precedence_over_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(
@@ -6400,12 +6427,12 @@ class AutopilotRecheckTests(unittest.TestCase):
                     "[autopilot]\n"
                     "planning_recheck_seconds = 10.0\n"
                     "[supervision]\n"
-                    "limit_wall_backoff_seconds = 42\n"
+                    "provider_limit_backoff_seconds = 42\n"
                 ),
             )
             config = load_config(repo)
             run_store = RunStore(config.state_path / "runs.jsonl")
-            run_store.append_result(self._future_limit_wall_result(repo))
+            run_store.append_result(self._future_provider_limit_result(repo))
             launcher, _launcher_calls = self._recording_launcher()
             sleeps: list[float] = []
 
@@ -6419,12 +6446,12 @@ class AutopilotRecheckTests(unittest.TestCase):
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertEqual(summary.cycles[0].limit_wall_pause_seconds, 42.0)
-        # Even though the cycle is idle, the limit-wall backoff replaces the
+        self.assertEqual(summary.cycles[0].provider_limit_pause_seconds, 42.0)
+        # Even though the cycle is idle, the provider-limit backoff replaces the
         # recheck loop entirely; the recheck slice size never appears.
         self.assertEqual(sleeps, [42.0])
 
-    def test_planning_limit_wall_pauses_and_reports_a_truthful_wake(self) -> None:
+    def test_planning_provider_limit_pauses_and_reports_a_truthful_wake(self) -> None:
         # The planner hitting a wall must pause dispatch like a child wall does,
         # and the journaled next wake must be the reset the supervisor actually
         # sleeps to, not the interval stamped before the cycle ran.
@@ -6437,7 +6464,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                     "[autopilot]\n"
                     "planning_recheck_seconds = 10.0\n"
                     "[supervision]\n"
-                    "limit_wall_backoff_seconds = 42\n"
+                    "provider_limit_backoff_seconds = 42\n"
                 ),
             )
             config = load_config(repo)
@@ -6452,8 +6479,8 @@ class AutopilotRecheckTests(unittest.TestCase):
                     min_ready=kwargs["min_ready"],
                     run_store=kwargs["run_store"],
                     analysis_runner=lambda prompt, output_path: (_ for _ in ()).throw(
-                        AgentLimitWallError(
-                            LimitWallSignal(
+                        AgentProviderLimitError(
+                            ProviderLimitSignal(
                                 marker="You've hit your usage limit",
                                 reset_text="try again at Jul 25th, 2026 3:24 AM",
                                 reset_delay=3600.0,
@@ -6475,8 +6502,8 @@ class AutopilotRecheckTests(unittest.TestCase):
         first = summary.cycles[0]
         self.assertEqual(first.status, "idle")
         # The advertised reset governs, not the 42s configured fallback.
-        self.assertEqual(first.limit_wall_pause_seconds, 3600.0)
-        self.assertIn("native_planning_limit_wall:3600s", first.actions)
+        self.assertEqual(first.provider_limit_pause_seconds, 3600.0)
+        self.assertIn("native_planning_provider_limit:3600s", first.actions)
         self.assertNotIn("native_planning_analysis_error", first.actions)
         self.assertEqual(sleeps, [3600.0])
         # A truthful wake: ~1h out, not the 100s interval.
@@ -6500,7 +6527,7 @@ class AutopilotRecheckTests(unittest.TestCase):
                     "[autopilot]\n"
                     "planning_recheck_seconds = 10.0\n"
                     "[supervision]\n"
-                    "limit_wall_backoff_seconds = 0\n"
+                    "provider_limit_backoff_seconds = 0\n"
                 ),
             )
             config = load_config(repo)
@@ -6515,8 +6542,8 @@ class AutopilotRecheckTests(unittest.TestCase):
                     min_ready=kwargs["min_ready"],
                     run_store=kwargs["run_store"],
                     analysis_runner=lambda prompt, output_path: (_ for _ in ()).throw(
-                        AgentLimitWallError(
-                            LimitWallSignal(
+                        AgentProviderLimitError(
+                            ProviderLimitSignal(
                                 marker="You've hit your usage limit",
                                 reset_text="",
                                 reset_delay=None,
@@ -6536,7 +6563,7 @@ class AutopilotRecheckTests(unittest.TestCase):
             )
 
         first = summary.cycles[0]
-        self.assertEqual(first.limit_wall_pause_seconds, 0.0)
+        self.assertEqual(first.provider_limit_pause_seconds, 0.0)
         # The ordinary interval sleep ran (sliced for planning rechecks), not a
         # zero-second wall pause, so the wake must describe that interval.
         self.assertEqual(sum(sleeps), 100.0)
@@ -6545,7 +6572,7 @@ class AutopilotRecheckTests(unittest.TestCase):
         self.assertGreater((wake - occurred).total_seconds(), 1.0)
 
 
-class CycleSummaryLimitWallTests(unittest.TestCase):
+class CycleSummaryProviderLimitTests(unittest.TestCase):
     def _summary(self, actions: tuple[str, ...]) -> CycleSummary:
         return CycleSummary(
             cycle_id="c1",
@@ -6555,21 +6582,23 @@ class CycleSummaryLimitWallTests(unittest.TestCase):
         )
 
     def test_planning_wall_is_distinguished_from_analysis_error(self) -> None:
-        wall = self._summary(("native_planning_limit_wall:3600s",))
+        wall = self._summary(("native_planning_provider_limit:3600s",))
         error = self._summary(("native_planning_analysis_error",))
-        self.assertEqual(wall.limit_wall_action, "native_planning_limit_wall:3600s")
-        self.assertEqual(error.limit_wall_action, "")
+        self.assertEqual(
+            wall.provider_limit_action, "native_planning_provider_limit:3600s"
+        )
+        self.assertEqual(error.provider_limit_action, "")
         # Both cycles carry the same status, which is exactly why the action
         # rather than the status has to carry the distinction.
         self.assertEqual(wall.status, error.status)
 
     def test_child_wall_is_also_surfaced(self) -> None:
-        summary = self._summary(("launched_run_until_done", "limit_wall_pause:42s"))
-        self.assertEqual(summary.limit_wall_action, "limit_wall_pause:42s")
+        summary = self._summary(("launched_run_until_done", "provider_limit_pause:42s"))
+        self.assertEqual(summary.provider_limit_action, "provider_limit_pause:42s")
 
     def test_unrelated_actions_report_no_wall(self) -> None:
         summary = self._summary(("launched_run_until_done", "child_exit:0"))
-        self.assertEqual(summary.limit_wall_action, "")
+        self.assertEqual(summary.provider_limit_action, "")
 
 
 class SleepUntilStopTests(unittest.TestCase):
@@ -7405,8 +7434,8 @@ class NativePlanningTests(unittest.TestCase):
                     self.assertEqual(records[-2]["status"], "analysis_error")
                     self.assertEqual(records[-1]["status"], "skipped_analysis_error")
 
-    def test_analysis_limit_wall_is_not_an_analysis_error(self) -> None:
-        # A limit wall means the analysis agent never got to decide. It must be
+    def test_analysis_provider_limit_is_not_an_analysis_error(self) -> None:
+        # A provider limit means the analysis agent never got to decide. It must be
         # journaled as its own status carrying the pause, not collapsed into the
         # generic analysis-error path that keeps re-planning every cycle.
         with tempfile.TemporaryDirectory() as directory:
@@ -7417,8 +7446,8 @@ class NativePlanningTests(unittest.TestCase):
             run_store = RunStore(config.state_path / "runs.jsonl")
 
             def wall_runner(prompt: str, output_path: Path) -> dict[str, object]:
-                raise AgentLimitWallError(
-                    LimitWallSignal(
+                raise AgentProviderLimitError(
+                    ProviderLimitSignal(
                         marker="You've hit your usage limit",
                         reset_text="try again at Jul 25th, 2026 3:24 AM",
                         reset_delay=7200.0,
@@ -7434,27 +7463,29 @@ class NativePlanningTests(unittest.TestCase):
                 run_store=run_store,
                 analysis_runner=wall_runner,
                 worker_launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
-                    AssertionError("a limit wall must not launch a worker")
+                    AssertionError("a provider limit must not launch a worker")
                 ),
             )
 
-            self.assertEqual(result.decision.status, "limit_wall")
-            self.assertTrue(result.decision.limit_wall)
-            self.assertEqual(result.decision.limit_wall_pause_seconds, 7200.0)
+            self.assertEqual(result.decision.status, "provider_limit")
+            self.assertTrue(result.decision.provider_limit)
+            self.assertEqual(result.decision.provider_limit_pause_seconds, 7200.0)
             self.assertEqual(
-                result.decision.limit_wall_reset_text,
+                result.decision.provider_limit_reset_text,
                 "try again at Jul 25th, 2026 3:24 AM",
             )
             self.assertFalse(result.worker.attempted)
-            self.assertEqual(result.worker.status, "skipped_limit_wall")
+            self.assertEqual(result.worker.status, "skipped_provider_limit")
             records = run_store.read_records()
-            self.assertEqual(records[-2]["status"], "limit_wall")
-            self.assertEqual(records[-2]["limit_wall_pause_seconds"], 7200.0)
-            self.assertEqual(records[-1]["status"], "skipped_limit_wall")
+            self.assertEqual(records[-2]["status"], "provider_limit")
+            self.assertEqual(records[-2]["provider_limit_pause_seconds"], 7200.0)
+            self.assertEqual(records[-1]["status"], "skipped_provider_limit")
 
-    def test_limit_wall_without_reset_falls_back_to_configured_backoff(self) -> None:
-        signal = LimitWallSignal(marker="You've hit your usage limit")
-        error = AgentLimitWallError(signal, default_backoff=1800.0)
+    def test_provider_limit_without_reset_falls_back_to_configured_backoff(
+        self,
+    ) -> None:
+        signal = ProviderLimitSignal(marker="You've hit your usage limit")
+        error = AgentProviderLimitError(signal, default_backoff=1800.0)
         self.assertEqual(error.pause_seconds, 1800.0)
 
     def test_decision_prompt_bounds_worker_evidence(self) -> None:
@@ -9803,21 +9834,23 @@ class PlanningOutcomeClassificationTests(unittest.TestCase):
         )
         self.assertFalse(planning_provider_launched(result))
 
-    def test_a_limit_wall_still_counts_as_provider_spend(self) -> None:
+    def test_a_provider_limit_still_counts_as_provider_spend(self) -> None:
         result = self._result(
-            status="limit_wall",
+            status="provider_limit",
             agent_error="usage limit",
-            agent_error_kind=PLANNING_ERROR_LIMIT_WALL,
+            agent_error_kind=PLANNING_ERROR_PROVIDER_LIMIT,
             attempted=False,
         )
         self.assertTrue(planning_provider_launched(result))
 
-    def test_a_limit_wall_outranks_the_analysis_error_it_produces(self) -> None:
+    def test_a_provider_limit_outranks_the_analysis_error_it_produces(self) -> None:
         # A wall stops the analysis agent, which also surfaces as an agent
         # error. Charging that to the unproductive streak would let provider
         # walls silently consume the planning budget.
-        result = self._result(status="limit_wall", agent_error="usage limit")
-        self.assertEqual(classify_planning_outcome(result), PLANNING_OUTCOME_LIMIT_WALL)
+        result = self._result(status="provider_limit", agent_error="usage limit")
+        self.assertEqual(
+            classify_planning_outcome(result), PLANNING_OUTCOME_PROVIDER_LIMIT
+        )
 
     def test_an_unreadable_task_source_is_not_charged_as_unproductive(self) -> None:
         result = self._result(task_source_error="adapter exited 1", runnable_after=None)
@@ -9998,7 +10031,7 @@ class PlanningOutcomeBackoffTests(unittest.TestCase):
         self.assertIsNone(self._backoff(records, repo=repo))
 
     def test_inconclusive_outcomes_neither_extend_nor_reset_the_streak(self) -> None:
-        # A limit wall or an unreadable source says nothing about whether
+        # A provider limit or an unreadable source says nothing about whether
         # planning can produce work, so it must not stand in for a productive
         # launch and reopen the gate.
         repo = Path("/repo")
@@ -10007,7 +10040,7 @@ class PlanningOutcomeBackoffTests(unittest.TestCase):
             [
                 (7200.0, "no_tasks", "10:0:0:10:0"),
                 (3600.0, "no_tasks", "10:0:0:10:0"),
-                (60.0, "limit_wall", "10:0:0:10:0"),
+                (60.0, "provider_limit", "10:0:0:10:0"),
             ],
             now=self.now,
         )
