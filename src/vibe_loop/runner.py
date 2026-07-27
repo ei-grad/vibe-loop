@@ -198,6 +198,12 @@ SESSION_ID_RE = re.compile(
     r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)\b",
     re.IGNORECASE,
 )
+STARTUP_SESSION_ID_RE = re.compile(
+    r"^\s*(?:session|thread)(?:[_ -]?id)[\"']?\s*[:=]\s*[\"']?"
+    r"(?P<session_id>[A-Za-z0-9](?:[A-Za-z0-9_.:/+-]*[A-Za-z0-9])?)"
+    r"[\"']?\s*$",
+    re.IGNORECASE,
+)
 SHA256_HEX_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 # Env names a task-source adapter reads to attribute a status transition to the
 # sessions that produced it. Absent means "the runtime cannot attest this"; the
@@ -909,6 +915,7 @@ class AgentOutputObserver:
         runtime_context = AgentRuntimeContext()
         with self._lock:
             self._line_count += 1
+            is_first_output_line = self._line_count == 1
             should_parse_context = (
                 self._line_count <= AGENT_STARTUP_OBSERVATION_LINE_LIMIT
             )
@@ -927,6 +934,13 @@ class AgentOutputObserver:
                 )
             if session_observation is None:
                 session_observation = startup_session
+            if session_observation is None and is_first_output_line:
+                startup_session_id = parse_startup_session_id(line)
+                if startup_session_id is not None:
+                    session_observation = SessionIdObservation(
+                        session_id=startup_session_id,
+                        source=f"native:{stream_name}",
+                    )
             runtime_context = runtime_context.prefer(startup_context)
         with self._lock:
             activity_emissions = self._activity_tracker.observe_line(
@@ -8250,6 +8264,13 @@ def build_run_context_payload(
 
 def parse_worker_session_id(line: str) -> str | None:
     match = SESSION_ID_RE.search(line)
+    if match is None:
+        return None
+    return match.group("session_id")
+
+
+def parse_startup_session_id(line: str) -> str | None:
+    match = STARTUP_SESSION_ID_RE.fullmatch(strip_ansi_control_sequences(line))
     if match is None:
         return None
     return match.group("session_id")

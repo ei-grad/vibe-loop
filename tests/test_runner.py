@@ -3788,6 +3788,27 @@ class RunnerTests(unittest.TestCase):
                 log_path.read_text(encoding="utf-8"),
             )
 
+    def test_streaming_command_preserves_first_line_session_id_compatibility(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import sys\n"
+                "print('session id: first-line-session', file=sys.stderr)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertEqual(result.session_id, "first-line-session")
+        self.assertEqual(result.session_id_source, "native:stderr")
+
     def test_streaming_command_captures_ansi_codex_startup_frame_only(self) -> None:
         session_id = "019c0104-6f6b-7cd1-ae1f-a7bdc01f24f9"
         frame = [
