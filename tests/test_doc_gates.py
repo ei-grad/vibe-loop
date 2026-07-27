@@ -7,7 +7,8 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from runpy import run_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -277,8 +278,28 @@ class CodeDocLinkageTrialTests(TemporaryGitRepository):
         )
         self.write(
             "src/vibe_loop/config.py",
-            '"""Implementation for docs/prd/autopilot.md#prd-aut-020."""\n',
+            textwrap.dedent(
+                '''\
+                """Project-binding resolution entry points.
+
+                ``resolve_project_binding`` and ``require_project_binding`` implement
+                docs/prd/autopilot.md#prd-aut-020.
+                """
+
+                def resolve_project_binding():
+                    pass
+
+                def require_project_binding():
+                    pass
+                '''
+            ),
         )
+        for implementation_path in (
+            "src/vibe_loop/cli.py",
+            "src/vibe_loop/runner.py",
+            "src/vibe_loop/autopilot.py",
+        ):
+            self.write(implementation_path, "")
         self.write(
             "docs/prd/autopilot.md",
             textwrap.dedent(
@@ -286,7 +307,10 @@ class CodeDocLinkageTrialTests(TemporaryGitRepository):
                 <a id="prd-aut-020"></a>
                 ## PRD-AUT-020 Command Backend Project Binding
 
-                Implementation: [`src/vibe_loop/config.py`](../../src/vibe_loop/config.py).
+                Resolution: [`config.py`](../../src/vibe_loop/config.py).
+                Enforcement: [`cli.py`](../../src/vibe_loop/cli.py) and
+                [`runner.py`](../../src/vibe_loop/runner.py).
+                Status and transport: [`autopilot.py`](../../src/vibe_loop/autopilot.py).
 
                 Contract.
 
@@ -313,8 +337,37 @@ class CodeDocLinkageTrialTests(TemporaryGitRepository):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout, "project_binding code/doc linkage: ok\n")
 
+    def test_path_rendering_is_platform_independent(self) -> None:
+        checker = run_path(
+            os.fspath(PROJECT_BINDING_LINK_SCRIPT),
+            run_name="test_project_binding_linkage",
+        )
+
+        self.assertEqual(
+            checker["anchored_reference"](
+                PureWindowsPath("docs/prd/autopilot.md"),
+                "prd-aut-020",
+            ),
+            "docs/prd/autopilot.md#prd-aut-020",
+        )
+        self.assertEqual(
+            checker["display_path"](PureWindowsPath("src/vibe_loop/config.py")),
+            "src/vibe_loop/config.py",
+        )
+
     def test_missing_code_reference_is_reported(self) -> None:
-        self.write("src/vibe_loop/config.py", '"""Configuration loading."""\n')
+        self.write(
+            "src/vibe_loop/config.py",
+            textwrap.dedent(
+                """\
+                def resolve_project_binding():
+                    pass
+
+                def require_project_binding():
+                    pass
+                """
+            ),
+        )
 
         result = self.run_linkage()
 
@@ -353,6 +406,54 @@ class CodeDocLinkageTrialTests(TemporaryGitRepository):
         self.assertEqual(result.returncode, 1)
         self.assertIn(
             "PRD-AUT-020 does not link to src/vibe_loop/config.py",
+            result.stdout,
+        )
+
+    def test_link_before_project_binding_section_does_not_satisfy_check(self) -> None:
+        self.write(
+            "docs/prd/autopilot.md",
+            textwrap.dedent(
+                """\
+                <a id="prd-aut-020"></a>
+                ## PRD-AUT-019 Unrelated Contract
+
+                Resolution: [`config.py`](../../src/vibe_loop/config.py).
+
+                ## PRD-AUT-020 Command Backend Project Binding
+
+                No implementation links.
+                """
+            ),
+        )
+
+        result = self.run_linkage()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "PRD-AUT-020 does not link to src/vibe_loop/config.py",
+            result.stdout,
+        )
+
+    def test_missing_enforcement_module_link_is_reported(self) -> None:
+        self.write(
+            "docs/prd/autopilot.md",
+            textwrap.dedent(
+                """\
+                <a id="prd-aut-020"></a>
+                ## PRD-AUT-020 Command Backend Project Binding
+
+                Resolution: [`config.py`](../../src/vibe_loop/config.py).
+                Enforcement: [`cli.py`](../../src/vibe_loop/cli.py).
+                Status: [`autopilot.py`](../../src/vibe_loop/autopilot.py).
+                """
+            ),
+        )
+
+        result = self.run_linkage()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "PRD-AUT-020 does not link to src/vibe_loop/runner.py",
             result.stdout,
         )
 

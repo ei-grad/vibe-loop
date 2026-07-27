@@ -1,4 +1,8 @@
-"""Implementation for docs/prd/autopilot.md#prd-aut-020."""
+"""Configuration loading and project-binding resolution.
+
+The ``resolve_project_binding`` and ``require_project_binding`` entry points
+implement docs/prd/autopilot.md#prd-aut-020.
+"""
 
 from __future__ import annotations
 
