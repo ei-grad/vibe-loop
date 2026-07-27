@@ -1899,12 +1899,16 @@ class VibeRunner:
         error: AgentResolutionError,
         *,
         classification_source: str = "agent_resolution",
+        run_id: str | None = None,
+        log_path: Path | None = None,
+        started_at: str | None = None,
+        start_main: str | None = None,
     ) -> RunResult:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
-        run_id = new_run_id(task.task_id)
-        log_path = self.runs_dir / f"{run_id}.log"
-        started_at = utc_now_iso()
-        start_main = git_rev_parse(self.config.repo, "HEAD")
+        run_id = run_id or new_run_id(task.task_id)
+        log_path = log_path or self.runs_dir / f"{run_id}.log"
+        started_at = started_at or utc_now_iso()
+        start_main = start_main or git_rev_parse(self.config.repo, "HEAD")
         message = str(error)
         with log_path.open("w", encoding="utf-8") as log:
             report_status(
@@ -2236,19 +2240,6 @@ class VibeRunner:
                 )
 
         try:
-            run_contract = RunContractResolver(self.config).resolve(agent_selection)
-            runtime_owned = run_contract.payload["mode"] == "runtime-owned"
-            self.run_store.append_lifecycle_event(
-                RunLifecycleEvent.run_contract_resolved(
-                    run_id=run_id,
-                    task_id=task.task_id,
-                    contract=run_contract.to_record_payload(),
-                )
-            )
-            stage_machine.transition(
-                RunStage.ACTIVATION,
-                reason="run_contract_resolved",
-            )
             circuit_inputs = attempt_circuit_inputs(
                 task,
                 self.config,
@@ -2264,6 +2255,19 @@ class VibeRunner:
             )
             if circuit_state.open:
                 raise AttemptCircuitOpen(circuit_state)
+            run_contract = RunContractResolver(self.config).resolve(agent_selection)
+            runtime_owned = run_contract.payload["mode"] == "runtime-owned"
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.run_contract_resolved(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    contract=run_contract.to_record_payload(),
+                )
+            )
+            stage_machine.transition(
+                RunStage.ACTIVATION,
+                reason="run_contract_resolved",
+            )
             if self.config.budget.enabled:
                 budget_decision = self.budget_store.reserve(
                     reservation_id=run_id,
@@ -2301,6 +2305,26 @@ class VibeRunner:
         except KeyboardInterrupt:
             finalize_pre_launch_failure(StageFailure.CANCELLED)
             raise
+        except AgentResolutionError as exc:
+            blocker = getattr(exc, "blocker", None)
+            classification_source = (
+                "task_agent_contract"
+                if isinstance(exc, TaskAgentResolutionError)
+                else blocker.code
+                if blocker is not None
+                else "agent_resolution"
+            )
+            pre_launch_failure_reason = classification_source
+            finalize_pre_launch_failure(StageFailure.STAGE_FAILED)
+            return self.record_agent_resolution_failure(
+                task,
+                exc,
+                classification_source=classification_source,
+                run_id=run_id,
+                log_path=log_path,
+                started_at=active_state.started_at,
+                start_main=start_main,
+            )
         except Exception:
             # Any ordinary pre-launch failure after acquisition must release
             # this run's exact task lock. Activation adapters are external and
@@ -9172,20 +9196,17 @@ def attempt_circuit_inputs(
     task_revision = _circuit_digest(task_payload)
     configuration_revision = _circuit_digest(
         {
+            "config_digest": config.config_digest,
             "supervision": config.supervision.to_json(),
-            "agent": {
-                "kind": agent.agent_kind,
-                "executable_kind": agent.executable_kind,
-                "model": agent.model,
-                "effort": agent.effort,
-                "prompt_dialect": agent.prompt_dialect,
-                "skill_ref_prefix": agent.skill_ref_prefix,
+            "orchestration": config.orchestration.to_json(),
+            "completion": list(config.completion.commands),
+            "agent": attempt_circuit_agent_payload(agent),
+            "agent_profiles": {
+                name: attempt_circuit_agent_payload(profile_config)
+                for name, profile_config in sorted(config.agent_profiles.items())
             },
             "profile": profile,
-            "task_source": {
-                "type": config.task_source.type,
-                "runnable_statuses": list(config.task_source.runnable_statuses),
-            },
+            "task_source": config.task_source.to_json(),
         }
     )
     route = ":".join(
@@ -9201,6 +9222,20 @@ def attempt_circuit_inputs(
         candidate=candidate,
         route=route,
     )
+
+
+def attempt_circuit_agent_payload(agent: AgentConfig) -> dict[str, object]:
+    return {
+        "command": agent.command,
+        "selection_command": agent.selection_command,
+        "analysis_command": agent.analysis_command,
+        "kind": agent.agent_kind,
+        "executable_kind": agent.executable_kind,
+        "model": agent.model,
+        "effort": agent.effort,
+        "prompt_dialect": agent.prompt_dialect,
+        "skill_ref_prefix": agent.skill_ref_prefix,
+    }
 
 
 def _circuit_digest(value: Mapping[str, object]) -> str:

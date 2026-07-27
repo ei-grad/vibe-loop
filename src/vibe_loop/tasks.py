@@ -6,7 +6,7 @@ import os
 import re
 import shlex
 import subprocess
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
@@ -206,6 +206,7 @@ class Task:
     agent: str = ""
     model: str = ""
     hazards: tuple[str, ...] = ()
+    status_reason: str = ""
 
     @property
     def done(self) -> bool:
@@ -241,6 +242,8 @@ class Task:
             "evidence": self.evidence,
             "source": self.source,
         }
+        if self.status_reason:
+            payload["status_reason"] = self.status_reason
         if self.requirement_ids:
             payload["requirement_ids"] = list(self.requirement_ids)
         if self.spec_paths:
@@ -2650,6 +2653,10 @@ def task_from_mapping(value: object, order: int) -> Task:
     agent = optional_task_string(value.get("agent"), "agent")
     model = optional_task_string(value.get("model"), "model")
     approval_state = optional_task_string(value.get("approval_state"), "approval_state")
+    status_reason = first_task_string(
+        value,
+        ("status_reason", "gating_reason", "reason", "blocker"),
+    )
     source_fingerprints = normalize_source_fingerprints(
         value.get("source_fingerprints"),
         "source_fingerprints",
@@ -2672,6 +2679,7 @@ def task_from_mapping(value: object, order: int) -> Task:
         acceptance=str(value.get("acceptance") or ""),
         evidence=str(value.get("evidence") or ""),
         source=str(value.get("source") or ""),
+        status_reason=status_reason,
         requirement_ids=dedupe_preserving_order(requirement_ids),
         spec_paths=dedupe_preserving_order(spec_paths),
         design_refs=dedupe_preserving_order(
@@ -2847,6 +2855,14 @@ def optional_task_string(value: object, name: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"task {name} must be a string")
     return value.strip()
+
+
+def first_task_string(value: Mapping[str, object], names: Sequence[str]) -> str:
+    for name in names:
+        candidate = value.get(name)
+        if isinstance(candidate, str) and (text := candidate.strip()):
+            return text
+    return ""
 
 
 def normalize_requirement_id(value: str) -> str:

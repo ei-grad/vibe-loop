@@ -1770,6 +1770,11 @@ def render_autopilot_status(status: ProjectStatus) -> str:
             f"queue: {queue.runnable} runnable / {queue.total} total "
             f"({queue.active} active, {queue.done} done, {queue.blocked} blocked)"
         )
+    if queue.gated_tasks:
+        lines.append("source-gated tasks:")
+        lines.extend(
+            f"  - {task['id']}: {task['reason']}" for task in queue.gated_tasks
+        )
     non_closure = status.non_closure
     rate = f"{non_closure.rate:.0%}" if non_closure.rate is not None else "n/a"
     reasons = (

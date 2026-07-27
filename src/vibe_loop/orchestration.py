@@ -5185,6 +5185,18 @@ class ConfigContractBlocker:
         }
 
 
+class ConfigContractResolutionError(AgentResolutionError):
+    def __init__(self, blocker: ConfigContractBlocker) -> None:
+        super().__init__(blocker.message)
+        self.blocker = blocker
+
+
+class TaskConfigContractResolutionError(TaskAgentResolutionError):
+    def __init__(self, blocker: ConfigContractBlocker) -> None:
+        super().__init__(blocker.message)
+        self.blocker = blocker
+
+
 def config_contract_blockers(
     config: VibeConfig,
     agent_selection: AgentSelection | None = None,
@@ -5475,14 +5487,12 @@ class RunContractResolver:
         )
         if blockers:
             first = blockers[0]
-            if first.code.startswith("config_contract_reviewer_"):
-                error_type = (
-                    TaskAgentResolutionError
-                    if first.key == "task.agent"
-                    else AgentResolutionError
-                )
-                raise error_type(first.message)
-            raise ValueError(first.message)
+            error_type = (
+                TaskConfigContractResolutionError
+                if first.key == "task.agent"
+                else ConfigContractResolutionError
+            )
+            raise error_type(first)
 
         probe_capability = task_source_probe_capability(self.config.task_source)
         completion_capability = task_source_completion_capability(

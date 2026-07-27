@@ -204,6 +204,57 @@ SUPERVISION_CONFIG_KEYS = frozenset(
         "cross_run_attempt_threshold",
     }
 )
+TOP_LEVEL_CONFIG_KEYS = frozenset(
+    {
+        "main_branch",
+        "state_dir",
+        "agent",
+        "task_source",
+        "completion",
+        "orchestration",
+        "supervision",
+        "locks",
+        "project_binding",
+        "autopilot",
+        "specs",
+        "budget",
+    }
+)
+AGENT_PROFILE_CONFIG_KEYS = frozenset(
+    {
+        "command",
+        "selection_command",
+        "analysis_command",
+        "model",
+        "effort",
+        "forward_stderr",
+        "kind",
+        "prompt_dialect",
+        "skill_ref_prefix",
+    }
+)
+AGENT_CONFIG_KEYS = AGENT_PROFILE_CONFIG_KEYS | frozenset(
+    {"profiles", "routing", "worker_prompt_extra"}
+)
+TASK_SOURCE_CONFIG_KEYS = frozenset(
+    {
+        "type",
+        "plan_path",
+        "plan_paths",
+        "list",
+        "next",
+        "probe",
+        "activate",
+        "complete",
+        "reset",
+        "park",
+        "profile",
+        "command_timeout_seconds",
+        "runnable_statuses",
+        "respect_source_order",
+    }
+)
+COMPLETION_CONFIG_KEYS = frozenset({"commands"})
 LOCK_BACKEND_TYPES = ("directory", "command")
 LOCKS_COMMAND_KEYS = frozenset(
     {"acquire_command", "release_command", "status_command", "list_command"}
@@ -1425,6 +1476,7 @@ def load_config(
     else:
         data = {}
         config_digest = ""
+    reject_unknown_config_keys(data, TOP_LEVEL_CONFIG_KEYS, "configuration")
     config_key_fingerprints = fingerprint_config_keys(data)
     task_source = parse_task_source(data.get("task_source", {}))
     completion = parse_completion(data.get("completion", {}), repo)
@@ -1682,6 +1734,7 @@ def fingerprint_config_value(value: object) -> str:
 
 def parse_agent(data: object) -> AgentConfig:
     table = expect_table(data, "agent")
+    reject_unknown_config_keys(table, AGENT_CONFIG_KEYS, "agent")
     detected = detect_agent_clis()
     model = optional_nonempty_string(table.get("model"))
     model_source = "explicit" if model is not None else "default:none"
@@ -1793,9 +1846,15 @@ def parse_agent_profiles(table: dict[str, Any]) -> dict[str, AgentConfig]:
         label = f"agent.profiles.{name}"
         if not isinstance(profile_table, dict):
             raise ValueError(f"{label} must be a table")
+        reject_unknown_config_keys(
+            profile_table,
+            AGENT_PROFILE_CONFIG_KEYS,
+            label,
+        )
         try:
-            # Each profile is a full [agent]-shaped table, so it resolves through
-            # the same command/kind/prompt-dialect machinery as the default.
+            # Each profile uses the agent execution fields, so it resolves
+            # through the same command/kind/prompt-dialect machinery as the
+            # default without accepting top-level routing or prompt policy.
             profiles[name] = dataclasses.replace(
                 parse_agent(profile_table), profile_name=name
             )
@@ -2356,6 +2415,7 @@ def unresolved_prompt_dialect_message(agent_kind: str, source: str) -> str:
 
 def parse_task_source(data: object) -> TaskSourceConfig:
     table = expect_table(data, "task_source")
+    reject_unknown_config_keys(table, TASK_SOURCE_CONFIG_KEYS, "task_source")
     explicit_keys = frozenset(str(key) for key in table)
     profile = optional_profile(table.get("profile"))
     statuses = table.get("runnable_statuses")
@@ -2465,6 +2525,7 @@ def find_forbidden_generated_command_keys(
 
 def parse_completion(data: object, repo: Path) -> CompletionConfig:
     table = expect_table(data, "completion")
+    reject_unknown_config_keys(table, COMPLETION_CONFIG_KEYS, "completion")
     commands = table.get("commands")
     if commands is None:
         return CompletionConfig(commands=default_completion_commands(repo))
@@ -3265,6 +3326,18 @@ def expect_table(value: object, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a TOML table")
     return value
+
+
+def reject_unknown_config_keys(
+    table: Mapping[str, object],
+    supported: frozenset[str],
+    path: str,
+) -> None:
+    unknown = sorted(str(key) for key in table if str(key) not in supported)
+    if not unknown:
+        return
+    paths = ", ".join(f"{path}.{key}" for key in unknown)
+    raise ValueError(f"{path} contains unsupported keys: {paths}")
 
 
 def optional_string(value: object) -> str | None:

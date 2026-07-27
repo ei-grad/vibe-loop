@@ -33,6 +33,60 @@ from vibe_loop.generated_profiles import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_load_config_rejects_unknown_keys_with_full_paths(self) -> None:
+        cases = (
+            (
+                '[planning_analytics]\nworklog_command = "loopyard vibe worklog"\n',
+                "configuration.planning_analytics",
+            ),
+            ('[agent]\ncommmand = "worker"\n', "agent.commmand"),
+            (
+                "[agent.profiles.review]\n"
+                'kind = "codex"\n'
+                'worker_prompt_extra = "not profile-local"\n',
+                "agent.profiles.review.worker_prompt_extra",
+            ),
+            (
+                '[task_source]\nrunable_statuses = ["ready"]\n',
+                "task_source.runable_statuses",
+            ),
+            ('[completion]\ncommand = ["test"]\n', "completion.command"),
+        )
+
+        for content, offending_path in cases:
+            with self.subTest(offending_path=offending_path):
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    (repo / ".vibe-loop.toml").write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, offending_path):
+                        load_config(repo)
+
+    def test_load_config_accepts_documented_dynamic_mapping_namespaces(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                "[task_source]\n"
+                'type = "markdown-profile"\n'
+                "[task_source.profile]\n"
+                'custom_parser_key = "value"\n'
+                "[project_binding]\n"
+                'require = ["LOOPYARD_PROJECT"]\n'
+                "[project_binding.context]\n"
+                'LOOPYARD_PROJECT = "vibe-loop"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(
+            config.task_source.profile,
+            {"custom_parser_key": "value"},
+        )
+        self.assertEqual(
+            dict(config.project_binding.context),
+            {"LOOPYARD_PROJECT": "vibe-loop"},
+        )
+
     def test_registry_runtime_context_is_bounded_and_literal(self) -> None:
         context = normalize_registry_runtime_context(
             {

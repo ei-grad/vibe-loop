@@ -981,14 +981,46 @@ class AutopilotStatusTests(unittest.TestCase):
                 ],
             )
             commit_all(repo)
-            config = load_config(repo)
+            config = dataclasses.replace(
+                load_config(repo),
+                orchestration=OrchestrationConfig(
+                    mode="worker-owned",
+                    explicit_keys=frozenset({"mode"}),
+                ),
+            )
 
             payload = collect_project_status(config).to_json()
+            rendered = render_autopilot_status(collect_project_status(config))
 
         self.assertEqual(payload["queue"]["active"], 1)
         self.assertEqual(payload["queue"]["blocked"], 3)
         self.assertEqual(payload["queue"]["done"], 1)
         self.assertEqual(payload["queue"]["statuses"]["on-hold"], 1)
+        self.assertEqual(
+            payload["queue"]["gated_tasks"],
+            [
+                {
+                    "id": "TASK-03",
+                    "title": "gated slice",
+                    "status": "gated",
+                    "priority": "P0",
+                    "source": str(repo / "PLAN.md") + ":line 7",
+                    "reason": "task source reported status 'gated'; the task is "
+                    "excluded from the runnable queue",
+                }
+            ],
+        )
+        self.assertIn("source-gated tasks:", rendered)
+        self.assertIn("TASK-03", rendered)
+        self.assertIn("excluded from the runnable queue", rendered)
+        self.assertEqual(payload["supervisor"]["dispatch_state"], "blocked")
+        self.assertTrue(
+            any(
+                blocker.startswith("source_gated_task:TASK-03:")
+                for blocker in payload["blockers"]
+            )
+        )
+        self.assertNotIn("no_runnable_work", payload["observations"])
 
     def test_collect_project_status_reports_task_source_errors_as_blockers(
         self,
