@@ -10,7 +10,7 @@ import time
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO, Iterator, Mapping
 
 from vibe_loop.activity import (
     ACTIONABLE_WORK_BLOCKED_REASON_CLASSES,
@@ -2154,24 +2154,50 @@ class RunStore:
         for line in self.path.read_text(
             encoding="utf-8", errors="replace"
         ).splitlines():
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(payload, dict) and is_known_record_type(payload):
-                redacted = redact_run_record(payload)
-                records.append(redacted)
+            record = _decode_record_line(line)
+            if record is not None:
+                records.append(record)
         return records
 
     def recent_records(self, max_runs: int = 5) -> list[dict[str, Any]]:
-        return self.read_records()[-max_runs:]
+        return self.recent_records_matching(record_types=None, max_runs=max_runs)
+
+    def recent_records_matching(
+        self,
+        *,
+        record_types: frozenset[str | None] | None,
+        max_runs: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Read recent known records from the journal tail.
+
+        ``record_types=None`` accepts every known record. A concrete set keeps
+        scanning backward until it finds ``max_runs`` matching records, so
+        unrelated lifecycle traffic cannot dilute an evidence window.
+        """
+
+        if max_runs <= 0 or not self.path.exists():
+            return []
+        records: list[dict[str, Any]] = []
+        for line in _reverse_file_lines(self.path):
+            record = _decode_record_line(line)
+            if record is None:
+                continue
+            if (
+                record_types is not None
+                and record.get("record_type") not in record_types
+            ):
+                continue
+            records.append(record)
+            if len(records) >= max_runs:
+                break
+        records.reverse()
+        return records
 
     def recent_result_records(self, max_runs: int = 5) -> list[dict[str, Any]]:
-        return [
-            record
-            for record in self.read_records()
-            if record.get("record_type") in {None, RUN_RECORD_TYPE}
-        ][-max_runs:]
+        return self.recent_records_matching(
+            record_types=frozenset({None, RUN_RECORD_TYPE}),
+            max_runs=max_runs,
+        )
 
     def latest_worker_report(
         self,
@@ -2666,6 +2692,37 @@ def tail(path: Path, line_count: int) -> list[str]:
     except OSError:
         return []
     return lines[-line_count:]
+
+
+def _reverse_file_lines(path: Path, *, chunk_bytes: int = 64 * 1024) -> Iterator[str]:
+    """Yield UTF-8 journal lines newest first without reading the whole file."""
+
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        remainder = b""
+        while position > 0:
+            size = min(chunk_bytes, position)
+            position -= size
+            handle.seek(position)
+            chunk = handle.read(size)
+            parts = (chunk + remainder).split(b"\n")
+            remainder = parts[0]
+            for line in reversed(parts[1:]):
+                if line:
+                    yield line.decode("utf-8", errors="replace")
+        if remainder:
+            yield remainder.decode("utf-8", errors="replace")
+
+
+def _decode_record_line(line: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not is_known_record_type(payload):
+        return None
+    return redact_run_record(payload)
 
 
 def string_value(value: object) -> str:

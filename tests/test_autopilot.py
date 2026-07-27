@@ -34,6 +34,8 @@ from vibe_loop.autopilot import (
     LandedCommit,
     NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
     NATIVE_TROUBLESHOOT_WINDOW_RECORDS,
+    NativeTroubleshootCycleResult,
+    NativeTroubleshootFinding,
     disk_health_thresholds_for,
     git_landed_commits,
     latest_cycle_main_ref,
@@ -8017,26 +8019,34 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 cycle_id="cycle-2",
                 run_store=store,
             )
+            legacy_record = result.to_record(repo)
+            legacy_record["findings"][1]["level"] = "blocker"
+            legacy = NativeTroubleshootCycleResult.from_record(legacy_record)
 
         self.assertEqual(
             result.observations,
             (
                 "recurring_task_failure:TASK-FAIL:failed",
+                "restart_budget_exhausted:TASK-RESTART",
                 "persistent_claim_mismatch:TASK-CLAIM:branch_worktree_mismatch",
             ),
         )
-        self.assertEqual(
-            result.blockers,
-            ("restart_budget_exhausted:TASK-RESTART",),
-        )
-        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.blockers, ())
+        self.assertEqual(result.status, "observed")
         self.assertEqual(
             result.action,
-            "native_troubleshoot:observations=2:blockers=1",
+            "native_troubleshoot:observations=3:blockers=0",
         )
         self.assertEqual(stored["record_type"], AUTOPILOT_TROUBLESHOOT_RECORD_TYPE)
         self.assertEqual(stored["window_records"], NATIVE_TROUBLESHOOT_WINDOW_RECORDS)
         self.assertEqual(recovered.findings, ())
+        self.assertIsNotNone(legacy)
+        assert legacy is not None
+        self.assertEqual(legacy.blockers, ())
+        self.assertIn(
+            "restart_budget_exhausted:TASK-RESTART",
+            legacy.observations,
+        )
 
     def test_native_troubleshoot_deduplicates_and_bounds_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8065,8 +8075,48 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 run_store=store,
             )
 
-        self.assertEqual(result.records_scanned, NATIVE_TROUBLESHOOT_WINDOW_RECORDS)
+        self.assertEqual(
+            result.records_scanned,
+            NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
+        )
         self.assertEqual(result.findings, ())
+
+    def test_native_troubleshoot_ignores_unrelated_journal_traffic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                store.append_result(
+                    RunResult(
+                        run_id=f"failure-{ordinal}",
+                        task_id="TASK-01",
+                        classification="failed",
+                        exit_code=1,
+                        log_path=Path(directory) / f"failure-{ordinal}.log",
+                        start_main="base",
+                        end_main="base",
+                    )
+                )
+            for ordinal in range(NATIVE_TROUBLESHOOT_WINDOW_RECORDS * 2):
+                store.append_record(
+                    {
+                        "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
+                        "cycle_id": f"cycle-{ordinal}",
+                    }
+                )
+
+            result = run_native_troubleshoot(
+                cycle_id="current-cycle",
+                run_store=store,
+            )
+
+        self.assertEqual(
+            result.observations,
+            ("recurring_task_failure:TASK-01:failed",),
+        )
+        self.assertEqual(
+            result.records_scanned,
+            NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
+        )
 
     def test_native_troubleshoot_surfaces_observations_in_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8097,10 +8147,16 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                 launcher=launcher,
             )
             records = run_store.read_records()
-            current_status = collect_project_status(
-                config,
-                process_exists=lambda pid: False,
-            )
+            with mock.patch(
+                "vibe_loop.autopilot.run_native_troubleshoot",
+                side_effect=AssertionError(
+                    "status must project the latest journaled result"
+                ),
+            ):
+                current_status = collect_project_status(
+                    config,
+                    process_exists=lambda pid: False,
+                )
 
         cycle = summary.cycles[0]
         self.assertIn(
@@ -8122,12 +8178,15 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             current_status.observations,
         )
 
-    def test_native_troubleshoot_restart_exhaustion_blocks_launch(self) -> None:
+    def test_native_troubleshoot_restart_exhaustion_does_not_block_launch(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
             config = load_config(repo)
-            RunStore(config.state_path / "runs.jsonl").append_lifecycle_event(
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
                 RunLifecycleEvent.task_restart(
                     run_id="restart-1",
                     task_id="TASK-01",
@@ -8139,24 +8198,78 @@ class AutopilotMaintenanceTests(unittest.TestCase):
                     attempted_restart_count=3,
                 )
             )
+            launched: list[object] = []
 
-            summary = run_autopilot(
-                config,
-                once=True,
-                launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
-                    AssertionError("restart exhaustion must withhold launch")
-                ),
-            )
+            def launcher(command, *, cwd, log_path, on_start=None):
+                launched.append(command)
+                record_test_dispatch(Path(cwd), len(launched))
+                return 0
+
+            summary = run_autopilot(config, max_cycles=2, launcher=launcher)
             current_status = collect_project_status(
                 config,
                 process_exists=lambda pid: False,
             )
 
-        cycle = summary.cycles[0]
-        self.assertEqual(cycle.status, "blocked")
-        self.assertIn("restart_budget_exhausted:TASK-01", cycle.blockers)
-        self.assertIn("restart_budget_exhausted:TASK-01", current_status.blockers)
-        self.assertEqual(current_status.supervisor.dispatch_state, "blocked")
+        self.assertEqual(len(launched), 2)
+        self.assertTrue(
+            all(
+                "restart_budget_exhausted:TASK-01" in cycle.project_status.observations
+                for cycle in summary.cycles
+            )
+        )
+        self.assertTrue(all(not cycle.blockers for cycle in summary.cycles))
+        self.assertIn(
+            "restart_budget_exhausted:TASK-01",
+            current_status.observations,
+        )
+        self.assertNotIn(
+            "restart_budget_exhausted:TASK-01",
+            current_status.blockers,
+        )
+
+    def test_run_autopilot_threads_native_troubleshoot_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            calls: list[str] = []
+
+            def troubleshoot_runner(*, cycle_id, run_store):
+                calls.append(cycle_id)
+                return NativeTroubleshootCycleResult(
+                    cycle_id=cycle_id,
+                    records_scanned=1,
+                    window_records=NATIVE_TROUBLESHOOT_WINDOW_RECORDS,
+                    findings=(
+                        NativeTroubleshootFinding(
+                            kind="recurring_task_failure",
+                            level="observation",
+                            code="recurring_task_failure:TASK-09:failed",
+                            task_id="TASK-09",
+                            count=3,
+                            threshold=3,
+                            reason="failed",
+                        ),
+                    ),
+                )
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                record_test_dispatch(Path(cwd))
+                return 0
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                native_troubleshoot_runner=troubleshoot_runner,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn(
+            "recurring_task_failure:TASK-09:failed",
+            summary.cycles[0].project_status.observations,
+        )
 
     def test_low_ready_runs_planning_command_and_records_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -553,7 +553,7 @@ def collect_project_status(
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
     non_closure = summarize_non_closures(run_store)
-    troubleshoot = run_native_troubleshoot(cycle_id="status", run_store=run_store)
+    troubleshoot = latest_native_troubleshoot(run_store)
     if disk_health_result is None:
         disk_health_result = run_disk_health(config, cycle_id="status")
     disk_headroom = disk_health_result.to_status_json()
@@ -5296,6 +5296,7 @@ def run_cycle_summary(
 
 
 NATIVE_TROUBLESHOOT_WINDOW_RECORDS = 200
+NATIVE_TROUBLESHOOT_STATUS_RECORDS = 100
 NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD = 3
 NATIVE_TROUBLESHOOT_ACTION_PREFIX = "native_troubleshoot:"
 TROUBLESHOOT_OBSERVATION = "observation"
@@ -5311,6 +5312,30 @@ class NativeTroubleshootFinding:
     count: int
     threshold: int
     reason: str
+
+    @classmethod
+    def from_json(cls, payload: object) -> NativeTroubleshootFinding | None:
+        if not isinstance(payload, Mapping):
+            return None
+        kind = str(payload.get("kind") or "")
+        code = str(payload.get("code") or "")
+        task_id = str(payload.get("task_id") or "")
+        if not kind or not code or not task_id:
+            return None
+        level = str(payload.get("level") or TROUBLESHOOT_OBSERVATION)
+        if kind == "restart_budget_exhausted":
+            level = TROUBLESHOOT_OBSERVATION
+        if level not in {TROUBLESHOOT_OBSERVATION, TROUBLESHOOT_BLOCKER}:
+            return None
+        return cls(
+            kind=kind,
+            level=level,
+            code=code,
+            task_id=task_id,
+            count=int_value(payload.get("count")) or 0,
+            threshold=int_value(payload.get("threshold")) or 0,
+            reason=str(payload.get("reason") or ""),
+        )
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -5330,6 +5355,29 @@ class NativeTroubleshootCycleResult:
     records_scanned: int
     window_records: int
     findings: tuple[NativeTroubleshootFinding, ...] = ()
+
+    @classmethod
+    def from_record(
+        cls, record: Mapping[str, object]
+    ) -> NativeTroubleshootCycleResult | None:
+        if record.get("record_type") != AUTOPILOT_TROUBLESHOOT_RECORD_TYPE:
+            return None
+        raw_findings = record.get("findings")
+        findings = (
+            tuple(
+                finding
+                for payload in raw_findings
+                if (finding := NativeTroubleshootFinding.from_json(payload)) is not None
+            )
+            if isinstance(raw_findings, list)
+            else ()
+        )
+        return cls(
+            cycle_id=str(record.get("cycle_id") or ""),
+            records_scanned=int_value(record.get("records_scanned")) or 0,
+            window_records=int_value(record.get("window_records")) or 0,
+            findings=findings,
+        )
 
     @property
     def observations(self) -> tuple[str, ...]:
@@ -5382,6 +5430,21 @@ class NativeTroubleshootCycleResult:
 NativeTroubleshootRunner = Callable[..., NativeTroubleshootCycleResult]
 
 
+def latest_native_troubleshoot(
+    run_store: RunStore,
+) -> NativeTroubleshootCycleResult:
+    records = run_store.recent_records(max_runs=NATIVE_TROUBLESHOOT_STATUS_RECORDS)
+    for record in reversed(records):
+        result = NativeTroubleshootCycleResult.from_record(record)
+        if result is not None:
+            return result
+    return NativeTroubleshootCycleResult(
+        cycle_id="",
+        records_scanned=0,
+        window_records=NATIVE_TROUBLESHOOT_WINDOW_RECORDS,
+    )
+
+
 def run_native_troubleshoot(
     *,
     cycle_id: str,
@@ -5396,7 +5459,18 @@ def run_native_troubleshoot(
     if recurrence_threshold <= 0:
         raise ValueError("troubleshoot recurrence threshold must be positive")
 
-    records = run_store.recent_records(max_runs=window_records)
+    records = run_store.recent_records_matching(
+        record_types=frozenset(
+            {
+                None,
+                RUN_RECORD_TYPE,
+                TASK_RESTART_RECORD_TYPE,
+                WORKSPACE_CLAIM_RECORD_TYPE,
+                WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
+            }
+        ),
+        max_runs=window_records,
+    )
     failures: dict[tuple[str, str], set[str]] = {}
     claim_mismatches: dict[tuple[str, str], set[str]] = {}
     exhausted_restarts: dict[str, str] = {}
@@ -5454,7 +5528,7 @@ def run_native_troubleshoot(
         findings.append(
             NativeTroubleshootFinding(
                 kind="restart_budget_exhausted",
-                level=TROUBLESHOOT_BLOCKER,
+                level=TROUBLESHOOT_OBSERVATION,
                 code=f"restart_budget_exhausted:{task_id}",
                 task_id=task_id,
                 count=1,
@@ -6865,6 +6939,7 @@ def execute_autopilot_cycle(
     run_store.append_record(cycle_summary.to_record(config.repo))
     actions.append(cycle_summary.action)
 
+    previous_troubleshoot = latest_native_troubleshoot(run_store)
     troubleshoot = native_troubleshoot_runner(
         cycle_id=cycle_id,
         run_store=run_store,
@@ -6875,11 +6950,19 @@ def execute_autopilot_cycle(
     def apply_troubleshoot_observations(
         project_status: ProjectStatus,
     ) -> ProjectStatus:
+        previous_observations = set(previous_troubleshoot.observations)
         return dataclasses.replace(
             project_status,
             observations=tuple(
                 dict.fromkeys(
-                    (*project_status.observations, *troubleshoot.observations)
+                    (
+                        *(
+                            observation
+                            for observation in project_status.observations
+                            if observation not in previous_observations
+                        ),
+                        *troubleshoot.observations,
+                    )
                 )
             ),
         )
@@ -7952,6 +8035,7 @@ def run_autopilot(
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     disk_health_runner: DiskHealthRunner = run_disk_health,
     cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
+    native_troubleshoot_runner: NativeTroubleshootRunner = run_native_troubleshoot,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     idle_waiter: Callable[..., IdleWaitResult] = wait_for_idle_change,
     idle_wake_command_runner: Callable[..., dict[str, object] | None] = (
@@ -8207,6 +8291,7 @@ def run_autopilot(
                 worktree_disposition_runner=worktree_disposition_runner,
                 disk_health_runner=disk_health_runner,
                 cycle_summary_runner=cycle_summary_runner,
+                native_troubleshoot_runner=native_troubleshoot_runner,
                 native_planning_runner=native_planning_runner,
                 supervisor_blockers=(
                     ("autopilot_config_reload_failed",) if config_reload_error else ()

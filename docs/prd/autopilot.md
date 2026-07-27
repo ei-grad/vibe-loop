@@ -948,21 +948,27 @@ The summary step appends
 `cycle_summary:landed|unchanged|bootstrap|unavailable:<COUNT>` to the cycle
 actions. A trailing `+` on the count means the commit span was truncated.
 
-The native troubleshoot step reads at most the 200 most recent known records
-through `RunStore`. Three distinct failed or blocked run results for one task
-and classification produce a `recurring_task_failure` observation; three
+The native troubleshoot step reads at most the 200 most recent
+troubleshoot-relevant records through `RunStore`'s reverse journal reader.
+Unrelated gate, stage, cycle, and troubleshoot records do not consume this
+evidence window. Three distinct failed or blocked run results for one task and
+classification produce a `recurring_task_failure` observation; three
 workspace-claim mismatches for one task and reason produce a
 `persistent_claim_mismatch` observation. A `task_restart` record whose restart
 budget is exhausted is already aggregate recurrence evidence and produces a
-`restart_budget_exhausted` blocker immediately. Run-result evidence is
-deduplicated by run ID. Every cycle journals one `autopilot_troubleshoot`
-record containing the bounded findings and appends
+`restart_budget_exhausted` observation immediately. These task-scoped
+diagnostics do not become project-global dispatch blockers. Run-result and
+claim-mismatch evidence is deduplicated by run ID. Every cycle journals one
+`autopilot_troubleshoot` record containing the bounded findings and appends
 `native_troubleshoot:observations=<COUNT>:blockers=<COUNT>` to its actions.
 Successful task completion clears prior failure and restart-exhaustion evidence
 for that task, and a successful workspace claim clears its prior claim-mismatch
 evidence, so resolved incidents do not remain persistent.
-These findings only withhold new dispatch when classified as blockers; the
-step does not kill processes, alter workspaces, or mutate task sources.
+Status collection searches only the 100-record journal tail for the latest
+journaled troubleshoot record instead of rerunning detection. Findings only
+withhold new dispatch when classified as blockers; the current task-scoped
+signatures are observations. The step does not kill processes, alter
+workspaces, or mutate task sources.
 Explicitly configured troubleshoot commands remain additional project-authored
 hooks.
 

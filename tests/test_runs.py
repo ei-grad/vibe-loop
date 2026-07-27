@@ -1824,6 +1824,41 @@ class RunStoreTests(unittest.TestCase):
             records[2]["record_type"], WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE
         )
 
+    def test_recent_matching_records_ignore_unrelated_tail_traffic(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "runs.jsonl"
+            store = RunStore(path)
+            for ordinal in range(3):
+                store.append_result(
+                    RunResult(
+                        run_id=f"run-{ordinal}",
+                        task_id="TASK-01",
+                        classification="failed",
+                        exit_code=1,
+                        log_path=Path(directory) / f"run-{ordinal}.log",
+                        start_main="base",
+                        end_main="base",
+                    )
+                )
+                for cycle in range(100):
+                    store.append_record(
+                        {
+                            "record_type": AUTOPILOT_CYCLE_RECORD_TYPE,
+                            "cycle_id": f"cycle-{ordinal}-{cycle}",
+                            "padding": "x" * 70000 if cycle == 50 else "",
+                        }
+                    )
+
+            records = store.recent_records_matching(
+                record_types=frozenset({RUN_RECORD_TYPE}),
+                max_runs=3,
+            )
+
+        self.assertEqual(
+            [record["run_id"] for record in records],
+            ["run-0", "run-1", "run-2"],
+        )
+
     def test_inspect_run_can_show_lifecycle_only_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
