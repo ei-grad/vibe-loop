@@ -101,6 +101,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+    AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     REVIEW_VERDICT_RECORD_TYPE,
     RUN_CONTRACT_RESOLVED_RECORD_TYPE,
@@ -110,6 +111,9 @@ from vibe_loop.runs import (
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
     TASK_ACTIVATION_FAILED_RECORD_TYPE,
     TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
+    TASK_RESTART_RECORD_TYPE,
+    WORKSPACE_CLAIM_RECORD_TYPE,
+    WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE,
     WORKSPACE_PREFLIGHT_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
@@ -549,6 +553,7 @@ def collect_project_status(
     contract_blockers = config_contract_blockers(config)
     run_store = RunStore(config.state_path / "runs.jsonl")
     non_closure = summarize_non_closures(run_store)
+    troubleshoot = run_native_troubleshoot(cycle_id="status", run_store=run_store)
     if disk_health_result is None:
         disk_health_result = run_disk_health(config, cycle_id="status")
     disk_headroom = disk_health_result.to_status_json()
@@ -587,7 +592,9 @@ def collect_project_status(
                 *(item.code for item in project_binding.diagnostics),
                 *(item.code for item in contract_blockers),
                 *((disk_health_result.blocker,) if disk_health_result.blocker else ()),
+                *troubleshoot.blockers,
             ),
+            observations=troubleshoot.observations,
             runtime_context=config.runtime_context,
             project_binding=project_binding,
             config_contract_blockers=contract_blockers,
@@ -671,6 +678,7 @@ def collect_project_status(
             "blocked"
             if contract_blockers
             or disk_health_result.blocker
+            or troubleshoot.blockers
             or queue_status.source_error
             or queue_has_no_launchable_task(queue_status)
             else "idle"
@@ -699,6 +707,7 @@ def collect_project_status(
     )
     if disk_health_result.blocker:
         blockers.append(disk_health_result.blocker)
+    blockers.extend(troubleshoot.blockers)
     if config.autopilot.require_upstream_sync:
         upstream = check_upstream_sync(
             config.repo,
@@ -716,7 +725,12 @@ def collect_project_status(
             )
         )
     observations = tuple(
-        project_observations(queue_status=queue_status, workers=workers)
+        dict.fromkeys(
+            (
+                *project_observations(queue_status=queue_status, workers=workers),
+                *troubleshoot.observations,
+            )
+        )
     )
     next_wake = (
         last_cycle.next_wake
@@ -5281,6 +5295,196 @@ def run_cycle_summary(
     )
 
 
+NATIVE_TROUBLESHOOT_WINDOW_RECORDS = 200
+NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD = 3
+NATIVE_TROUBLESHOOT_ACTION_PREFIX = "native_troubleshoot:"
+TROUBLESHOOT_OBSERVATION = "observation"
+TROUBLESHOOT_BLOCKER = "blocker"
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeTroubleshootFinding:
+    kind: str
+    level: str
+    code: str
+    task_id: str
+    count: int
+    threshold: int
+    reason: str
+
+    def to_json(self) -> dict[str, object]:
+        return {
+            "kind": self.kind,
+            "level": self.level,
+            "code": self.code,
+            "task_id": self.task_id,
+            "count": self.count,
+            "threshold": self.threshold,
+            "reason": self.reason,
+        }
+
+
+@dataclasses.dataclass(frozen=True)
+class NativeTroubleshootCycleResult:
+    cycle_id: str
+    records_scanned: int
+    window_records: int
+    findings: tuple[NativeTroubleshootFinding, ...] = ()
+
+    @property
+    def observations(self) -> tuple[str, ...]:
+        return tuple(
+            finding.code
+            for finding in self.findings
+            if finding.level == TROUBLESHOOT_OBSERVATION
+        )
+
+    @property
+    def blockers(self) -> tuple[str, ...]:
+        return tuple(
+            finding.code
+            for finding in self.findings
+            if finding.level == TROUBLESHOOT_BLOCKER
+        )
+
+    @property
+    def status(self) -> str:
+        if self.blockers:
+            return "blocked"
+        if self.observations:
+            return "observed"
+        return "ok"
+
+    @property
+    def action(self) -> str:
+        return (
+            f"{NATIVE_TROUBLESHOOT_ACTION_PREFIX}"
+            f"observations={len(self.observations)}:"
+            f"blockers={len(self.blockers)}"
+        )
+
+    def to_record(self, repo: Path) -> dict[str, object]:
+        return {
+            "schema_version": AUTOPILOT_RECORD_SCHEMA_VERSION,
+            "record_type": AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
+            "occurred_at": utc_now_iso(),
+            "repo": str(repo),
+            "cycle_id": self.cycle_id,
+            "status": self.status,
+            "records_scanned": self.records_scanned,
+            "window_records": self.window_records,
+            "observations": list(self.observations),
+            "blockers": list(self.blockers),
+            "findings": [finding.to_json() for finding in self.findings],
+        }
+
+
+NativeTroubleshootRunner = Callable[..., NativeTroubleshootCycleResult]
+
+
+def run_native_troubleshoot(
+    *,
+    cycle_id: str,
+    run_store: RunStore,
+    window_records: int = NATIVE_TROUBLESHOOT_WINDOW_RECORDS,
+    recurrence_threshold: int = NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
+) -> NativeTroubleshootCycleResult:
+    """Derive bounded, read-only trouble findings from recent journal records."""
+
+    if window_records <= 0:
+        raise ValueError("troubleshoot record window must be positive")
+    if recurrence_threshold <= 0:
+        raise ValueError("troubleshoot recurrence threshold must be positive")
+
+    records = run_store.recent_records(max_runs=window_records)
+    failures: dict[tuple[str, str], set[str]] = {}
+    claim_mismatches: dict[tuple[str, str], set[str]] = {}
+    exhausted_restarts: dict[str, str] = {}
+    for index, record in enumerate(records):
+        record_type = record.get("record_type")
+        task_id = str(record.get("task_id") or "")
+        if not task_id:
+            continue
+        if record_type in {None, RUN_RECORD_TYPE}:
+            classification = str(
+                record.get("classification") or record.get("status") or ""
+            )
+            if classification == "completed":
+                failures = {
+                    key: value for key, value in failures.items() if key[0] != task_id
+                }
+                exhausted_restarts.pop(task_id, None)
+            elif classification in {"failed", "blocked"}:
+                run_identity = str(record.get("run_id") or f"record:{index}")
+                failures.setdefault((task_id, classification), set()).add(run_identity)
+        elif record_type == TASK_RESTART_RECORD_TYPE:
+            if record.get("exhausted") is True:
+                exhausted_restarts[task_id] = str(
+                    record.get("reason") or "restart_budget_exhausted"
+                )
+        elif record_type == WORKSPACE_CLAIM_RECORD_TYPE:
+            claim_mismatches = {
+                key: value
+                for key, value in claim_mismatches.items()
+                if key[0] != task_id
+            }
+        elif record_type == WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE:
+            reason = str(record.get("reason") or "mismatch")
+            key = (task_id, reason)
+            run_identity = str(record.get("run_id") or f"record:{index}")
+            claim_mismatches.setdefault(key, set()).add(run_identity)
+
+    findings: list[NativeTroubleshootFinding] = []
+    for (task_id, classification), run_ids in sorted(failures.items()):
+        count = len(run_ids)
+        if count < recurrence_threshold:
+            continue
+        findings.append(
+            NativeTroubleshootFinding(
+                kind="recurring_task_failure",
+                level=TROUBLESHOOT_OBSERVATION,
+                code=f"recurring_task_failure:{task_id}:{classification}",
+                task_id=task_id,
+                count=count,
+                threshold=recurrence_threshold,
+                reason=classification,
+            )
+        )
+    for task_id, reason in sorted(exhausted_restarts.items()):
+        findings.append(
+            NativeTroubleshootFinding(
+                kind="restart_budget_exhausted",
+                level=TROUBLESHOOT_BLOCKER,
+                code=f"restart_budget_exhausted:{task_id}",
+                task_id=task_id,
+                count=1,
+                threshold=1,
+                reason=reason,
+            )
+        )
+    for (task_id, reason), run_ids in sorted(claim_mismatches.items()):
+        count = len(run_ids)
+        if count < recurrence_threshold:
+            continue
+        findings.append(
+            NativeTroubleshootFinding(
+                kind="persistent_claim_mismatch",
+                level=TROUBLESHOOT_OBSERVATION,
+                code=f"persistent_claim_mismatch:{task_id}:{reason}",
+                task_id=task_id,
+                count=count,
+                threshold=recurrence_threshold,
+                reason=reason,
+            )
+        )
+    return NativeTroubleshootCycleResult(
+        cycle_id=cycle_id,
+        records_scanned=len(records),
+        window_records=window_records,
+        findings=tuple(findings),
+    )
+
+
 # Returns the parsed JSON decision payload (or ``None``) for a disposition
 # prompt. Defaults to ``VibeRunner.run_analysis_agent`` (PRD-AUT-009); injected
 # in tests so the read-only analysis agent never runs as a real subprocess.
@@ -6511,6 +6715,7 @@ def execute_autopilot_cycle(
     worktree_disposition_runner: WorktreeDispositionRunner = run_worktree_disposition,
     disk_health_runner: DiskHealthRunner = run_disk_health,
     cycle_summary_runner: CycleSummaryRunner = run_cycle_summary,
+    native_troubleshoot_runner: NativeTroubleshootRunner = run_native_troubleshoot,
     native_planning_runner: NativePlanningRunner = run_native_planning,
     command_timeout: float = AUTOPILOT_COMMAND_TIMEOUT_SECONDS,
     command_max_output_bytes: int = AUTOPILOT_COMMAND_MAX_OUTPUT_BYTES,
@@ -6660,8 +6865,37 @@ def execute_autopilot_cycle(
     run_store.append_record(cycle_summary.to_record(config.repo))
     actions.append(cycle_summary.action)
 
+    troubleshoot = native_troubleshoot_runner(
+        cycle_id=cycle_id,
+        run_store=run_store,
+    )
+    run_store.append_record(troubleshoot.to_record(config.repo))
+    actions.append(troubleshoot.action)
+
+    def apply_troubleshoot_observations(
+        project_status: ProjectStatus,
+    ) -> ProjectStatus:
+        return dataclasses.replace(
+            project_status,
+            observations=tuple(
+                dict.fromkeys(
+                    (*project_status.observations, *troubleshoot.observations)
+                )
+            ),
+        )
+
+    status = apply_troubleshoot_observations(status)
+
     def current_blockers(project_status: ProjectStatus) -> list[str]:
-        current = [*project_status.blockers, *supervisor_blockers]
+        current = list(
+            dict.fromkeys(
+                (
+                    *project_status.blockers,
+                    *supervisor_blockers,
+                    *troubleshoot.blockers,
+                )
+            )
+        )
         if not config.autopilot.require_clean_repo and "repo_dirty" in current:
             current.remove("repo_dirty")
             if "repo_dirty_ignored" not in actions:
@@ -6824,13 +7058,15 @@ def execute_autopilot_cycle(
                 actions.append("no_runnable_work")
             else:
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
-        status = apply_fresh_upstream_sync(
-            collect_project_status(
-                config,
-                process_exists=process_exists,
-                disk_health_result=disk_health,
-            ),
-            record_action=False,
+        status = apply_troubleshoot_observations(
+            apply_fresh_upstream_sync(
+                collect_project_status(
+                    config,
+                    process_exists=process_exists,
+                    disk_health_result=disk_health,
+                ),
+                record_action=False,
+            )
         )
         runnable = status.queue.runnable
         blocker_list = current_blockers(status)

@@ -16,6 +16,7 @@ from vibe_loop.runs import (
     AUTOPILOT_PLANNING_DECISION_RECORD_TYPE,
     AUTOPILOT_PLANNING_WORKER_RECORD_TYPE,
     AUTOPILOT_RECORD_TYPES,
+    AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     KNOWN_RECORD_TYPES,
     LIFECYCLE_EVENT_SCHEMA_VERSION,
@@ -1792,6 +1793,13 @@ class RunStoreTests(unittest.TestCase):
                         '{"record_type":"future_record","task_id":"SKIP"}',
                         '{"task_id":"TASK-01","log":"/tmp/missing.log"}',
                         json.dumps(
+                            {
+                                "record_type": AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
+                                "cycle_id": "cycle-1",
+                                "status": "observed",
+                            }
+                        ),
+                        json.dumps(
                             RunLifecycleEvent.workspace_claim_mismatch(
                                 run_id="run-1",
                                 task_id="TASK-02",
@@ -1808,10 +1816,12 @@ class RunStoreTests(unittest.TestCase):
             records = RunStore(path).recent_records()
 
         self.assertEqual(
-            [record["task_id"] for record in records], ["TASK-01", "TASK-02"]
+            [record.get("task_id") for record in records],
+            ["TASK-01", None, "TASK-02"],
         )
+        self.assertEqual(records[1]["record_type"], AUTOPILOT_TROUBLESHOOT_RECORD_TYPE)
         self.assertEqual(
-            records[1]["record_type"], WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE
+            records[2]["record_type"], WORKSPACE_CLAIM_MISMATCH_RECORD_TYPE
         )
 
     def test_inspect_run_can_show_lifecycle_only_run(self) -> None:

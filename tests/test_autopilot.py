@@ -32,6 +32,8 @@ from vibe_loop.autopilot import (
     DiskHealthCycleResult,
     LANDED_SUMMARY_MAX_COMMITS,
     LandedCommit,
+    NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD,
+    NATIVE_TROUBLESHOOT_WINDOW_RECORDS,
     disk_health_thresholds_for,
     git_landed_commits,
     latest_cycle_main_ref,
@@ -97,6 +99,7 @@ from vibe_loop.autopilot import (
     launch_native_planning_worker,
     launch_run_until_done,
     run_native_planning,
+    run_native_troubleshoot,
     run_worktree_disposition,
     sleep_until_stop,
     start_detached_autopilot,
@@ -143,6 +146,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_OBSERVED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STARTED_RECORD_TYPE,
     AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
+    AUTOPILOT_TROUBLESHOOT_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     RunLifecycleEvent,
     RunResult,
@@ -7936,6 +7940,223 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             for record in records
             if record["record_type"] == AUTOPILOT_COMMAND_RESULT_RECORD_TYPE
         ]
+
+    def test_native_troubleshoot_detects_bounded_recurring_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            store = RunStore(repo / "runs.jsonl")
+            for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                store.append_result(
+                    RunResult(
+                        run_id=f"failure-{ordinal}",
+                        task_id="TASK-FAIL",
+                        classification="failed",
+                        exit_code=1,
+                        log_path=repo / f"failure-{ordinal}.log",
+                        start_main="base",
+                        end_main="base",
+                    )
+                )
+                store.append_lifecycle_event(
+                    RunLifecycleEvent.workspace_claim_mismatch(
+                        run_id=f"claim-{ordinal}",
+                        task_id="TASK-CLAIM",
+                        reason="branch_worktree_mismatch",
+                        message="workspace claim refused",
+                    )
+                )
+            store.append_lifecycle_event(
+                RunLifecycleEvent.task_restart(
+                    run_id="restart-1",
+                    task_id="TASK-RESTART",
+                    restart_count=2,
+                    max_restarts=2,
+                    cooldown_seconds=0.0,
+                    reason="restart_budget_exhausted",
+                    exhausted=True,
+                    attempted_restart_count=3,
+                )
+            )
+
+            result = run_native_troubleshoot(
+                cycle_id="cycle-1",
+                run_store=store,
+            )
+            store.append_record(result.to_record(repo))
+            stored = store.read_records()[-1]
+            store.append_result(
+                RunResult(
+                    run_id="failure-recovered",
+                    task_id="TASK-FAIL",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "failure-recovered.log",
+                    start_main="base",
+                    end_main="head",
+                )
+            )
+            store.append_result(
+                RunResult(
+                    run_id="restart-recovered",
+                    task_id="TASK-RESTART",
+                    classification="completed",
+                    exit_code=0,
+                    log_path=repo / "restart-recovered.log",
+                    start_main="base",
+                    end_main="head",
+                )
+            )
+            store.append_record(
+                {
+                    "record_type": "workspace_claim",
+                    "run_id": "claim-recovered",
+                    "task_id": "TASK-CLAIM",
+                }
+            )
+            recovered = run_native_troubleshoot(
+                cycle_id="cycle-2",
+                run_store=store,
+            )
+
+        self.assertEqual(
+            result.observations,
+            (
+                "recurring_task_failure:TASK-FAIL:failed",
+                "persistent_claim_mismatch:TASK-CLAIM:branch_worktree_mismatch",
+            ),
+        )
+        self.assertEqual(
+            result.blockers,
+            ("restart_budget_exhausted:TASK-RESTART",),
+        )
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(
+            result.action,
+            "native_troubleshoot:observations=2:blockers=1",
+        )
+        self.assertEqual(stored["record_type"], AUTOPILOT_TROUBLESHOOT_RECORD_TYPE)
+        self.assertEqual(stored["window_records"], NATIVE_TROUBLESHOOT_WINDOW_RECORDS)
+        self.assertEqual(recovered.findings, ())
+
+    def test_native_troubleshoot_deduplicates_and_bounds_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = RunStore(Path(directory) / "runs.jsonl")
+            duplicate = RunResult(
+                run_id="same-run",
+                task_id="TASK-01",
+                classification="failed",
+                exit_code=1,
+                log_path=Path(directory) / "same-run.log",
+                start_main="base",
+                end_main="base",
+            )
+            for _ in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                store.append_result(duplicate)
+            for ordinal in range(NATIVE_TROUBLESHOOT_WINDOW_RECORDS):
+                store.append_record(
+                    {
+                        "record_type": AUTOPILOT_CYCLE_STARTED_RECORD_TYPE,
+                        "cycle_id": f"cycle-{ordinal}",
+                    }
+                )
+
+            result = run_native_troubleshoot(
+                cycle_id="current-cycle",
+                run_store=store,
+            )
+
+        self.assertEqual(result.records_scanned, NATIVE_TROUBLESHOOT_WINDOW_RECORDS)
+        self.assertEqual(result.findings, ())
+
+    def test_native_troubleshoot_surfaces_observations_in_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            for ordinal in range(NATIVE_TROUBLESHOOT_RECURRENCE_THRESHOLD):
+                run_store.append_result(
+                    RunResult(
+                        run_id=f"failure-{ordinal}",
+                        task_id="TASK-FAIL",
+                        classification="failed",
+                        exit_code=1,
+                        log_path=config.state_path / f"failure-{ordinal}.log",
+                        start_main="base",
+                        end_main="base",
+                    )
+                )
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                record_test_dispatch(Path(cwd))
+                return 0
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+            )
+            records = run_store.read_records()
+            current_status = collect_project_status(
+                config,
+                process_exists=lambda pid: False,
+            )
+
+        cycle = summary.cycles[0]
+        self.assertIn(
+            "recurring_task_failure:TASK-FAIL:failed",
+            cycle.project_status.observations,
+        )
+        self.assertIn(
+            "native_troubleshoot:observations=1:blockers=0",
+            cycle.actions,
+        )
+        self.assertTrue(
+            any(
+                record.get("record_type") == AUTOPILOT_TROUBLESHOOT_RECORD_TYPE
+                for record in records
+            )
+        )
+        self.assertIn(
+            "recurring_task_failure:TASK-FAIL:failed",
+            current_status.observations,
+        )
+
+    def test_native_troubleshoot_restart_exhaustion_blocks_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            RunStore(config.state_path / "runs.jsonl").append_lifecycle_event(
+                RunLifecycleEvent.task_restart(
+                    run_id="restart-1",
+                    task_id="TASK-01",
+                    restart_count=2,
+                    max_restarts=2,
+                    cooldown_seconds=0.0,
+                    reason="restart_budget_exhausted",
+                    exhausted=True,
+                    attempted_restart_count=3,
+                )
+            )
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda *args, **kwargs: (_ for _ in ()).throw(
+                    AssertionError("restart exhaustion must withhold launch")
+                ),
+            )
+            current_status = collect_project_status(
+                config,
+                process_exists=lambda pid: False,
+            )
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertIn("restart_budget_exhausted:TASK-01", cycle.blockers)
+        self.assertIn("restart_budget_exhausted:TASK-01", current_status.blockers)
+        self.assertEqual(current_status.supervisor.dispatch_state, "blocked")
 
     def test_low_ready_runs_planning_command_and_records_result(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
