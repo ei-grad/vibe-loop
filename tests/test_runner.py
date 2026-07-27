@@ -2049,6 +2049,40 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertFalse(runner.lock_manager.is_locked(task.task_id))
 
+    def test_attempt_circuit_ignores_source_status_and_reason_text(self) -> None:
+        config = VibeConfig(
+            repo=Path("/repo"),
+            agent=AgentConfig(command="worker {prompt}"),
+        )
+        task = Task(
+            task_id="TASK-RETRY",
+            title="Retry",
+            status="ready",
+            status_reason="retry 1: worker timed out at 10:00",
+        )
+        inputs = runner_module.attempt_circuit_inputs(
+            task,
+            config,
+            base="aaa",
+            candidate="aaa",
+            agent=config.agent,
+            profile="",
+        )
+        updated_inputs = runner_module.attempt_circuit_inputs(
+            dataclasses.replace(
+                task,
+                status="active",
+                status_reason="retry 2: worker timed out at 11:00",
+            ),
+            config,
+            base="aaa",
+            candidate="aaa",
+            agent=config.agent,
+            profile="",
+        )
+
+        self.assertEqual(inputs.task_revision, updated_inputs.task_revision)
+
     def test_reviewer_agent_override_fails_task_without_aborting_batch(self) -> None:
         for jobs in (1, 2):
             with self.subTest(jobs=jobs):

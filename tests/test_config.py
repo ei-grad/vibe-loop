@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -51,6 +52,41 @@ class ConfigTests(unittest.TestCase):
                 "task_source.runable_statuses",
             ),
             ('[completion]\ncommand = ["test"]\n', "completion.command"),
+            (
+                '[orchestration]\nreviewer_profle = "review"\n',
+                "orchestration.reviewer_profle",
+            ),
+            (
+                "[supervision]\nmax_restart = 1\n",
+                "supervision.max_restart",
+            ),
+            (
+                '[autopilot]\nhealth_commmand = "check"\n',
+                "autopilot.health_commmand",
+            ),
+            (
+                "[autopilot.disk_reserve]\nunsupported = 1\n",
+                "autopilot.disk_reserve.unsupported",
+            ),
+            ("[locks]\nlease_second = 30\n", "locks.lease_second"),
+            (
+                '[project_binding]\nrequires = ["PROJECT"]\n',
+                "project_binding.requires",
+            ),
+            ("[specs]\nrequire_approve = true\n", "specs.require_approve"),
+            ("[budget]\nenable = true\n", "budget.enable"),
+            (
+                "[agent.profiles.review]\n"
+                'kind = "codex"\n'
+                "[[agent.routing]]\n"
+                'profile = "review"\n'
+                'match_hazard = ["abi"]\n',
+                "agent.routing[0].match_hazard",
+            ),
+            (
+                "[[budget.limits]]\nlimt = 100\n",
+                "budget.limits[0].limt",
+            ),
         )
 
         for content, offending_path in cases:
@@ -58,7 +94,7 @@ class ConfigTests(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as directory:
                     repo = Path(directory)
                     (repo / ".vibe-loop.toml").write_text(content, encoding="utf-8")
-                    with self.assertRaisesRegex(ValueError, offending_path):
+                    with self.assertRaisesRegex(ValueError, re.escape(offending_path)):
                         load_config(repo)
 
     def test_load_config_accepts_documented_dynamic_mapping_namespaces(self) -> None:
@@ -815,7 +851,8 @@ class ConfigTests(unittest.TestCase):
             ),
             (
                 "unsupported = 1\n",
-                "autopilot.disk_reserve contains unsupported keys: unsupported",
+                "autopilot.disk_reserve contains unsupported keys: "
+                "autopilot.disk_reserve.unsupported",
             ),
             (
                 "min_free_bytes = 8589934592\nmin_free_fraction = 0.0\n",
@@ -2053,7 +2090,13 @@ class AgentProfileRoutingTests(unittest.TestCase):
             self._load_with_both_clis('[[agent.routing]]\nprofile = "missing"\n')
 
     def test_routing_rule_rejects_unknown_predicate_keys(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unsupported keys: match_hazard"):
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                "agent.routing[0] contains unsupported keys: "
+                "agent.routing[0].match_hazard"
+            ),
+        ):
             self._load_with_both_clis(
                 "[agent.profiles.opus]\n"
                 'kind = "claude"\n\n'

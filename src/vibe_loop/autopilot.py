@@ -1649,14 +1649,7 @@ def project_blockers(
         blockers.append("repo_dirty")
     if queue_status.source_error:
         blockers.append(f"task_source_unavailable: {queue_status.source_error}")
-    if queue_status.runnable == 0 and queue_status.gated_tasks:
-        blockers.extend(
-            "source_gated_task:"
-            f"{task.get('id') or task.get('task_id')}: "
-            f"{str(task.get('reason') or 'no reason reported')[:512]}"
-            for task in queue_status.gated_tasks
-        )
-    elif queue_has_no_launchable_task(queue_status):
+    if queue_status.runnable > 0 and queue_has_no_launchable_task(queue_status):
         blockers.extend(
             "task_dispatch_blocked:"
             f"{blocker.get('task_id')}: "
@@ -1690,12 +1683,13 @@ def project_observations(
     queue_status: TaskQueueStatus,
     workers: tuple[WorkerView, ...] = (),
 ) -> list[str]:
-    observations: list[str] = []
-    if (
-        not queue_status.source_error
-        and queue_status.runnable == 0
-        and not queue_status.gated_tasks
-    ):
+    observations = [
+        "source_gated_task:"
+        f"{task.get('id') or task.get('task_id')}: "
+        f"{str(task.get('reason') or 'no reason reported')[:512]}"
+        for task in queue_status.gated_tasks
+    ]
+    if not queue_status.source_error and queue_status.runnable == 0:
         running_workers = active_conflict_worker_count(workers)
         if running_workers:
             observations.append(f"waiting_for_active_workers:{running_workers}")

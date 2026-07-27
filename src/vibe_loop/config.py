@@ -1877,10 +1877,7 @@ def parse_agent_routing(
         label = f"agent.routing[{index}]"
         if not isinstance(entry, dict):
             raise ValueError(f"{label} must be a table")
-        keys = frozenset(str(key) for key in entry)
-        unknown = sorted(keys - AGENT_ROUTING_RULE_KEYS)
-        if unknown:
-            raise ValueError(f"{label} contains unsupported keys: {', '.join(unknown)}")
+        reject_unknown_config_keys(entry, AGENT_ROUTING_RULE_KEYS, label)
         profile = optional_nonempty_string(entry.get("profile"))
         if profile is None:
             raise ValueError(f"{label}.profile is required")
@@ -2542,11 +2539,7 @@ def parse_orchestration(
 ) -> OrchestrationConfig:
     table = expect_table(data, "orchestration")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - ORCHESTRATION_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            "orchestration contains unsupported keys: " + ", ".join(unknown_keys)
-        )
+    reject_unknown_config_keys(table, ORCHESTRATION_CONFIG_KEYS, "orchestration")
 
     mode = orchestration_enum_value(
         table,
@@ -2712,11 +2705,7 @@ def default_completion_commands(repo: Path) -> tuple[str, ...]:
 def parse_supervision(data: object) -> SupervisionConfig:
     table = expect_table(data, "supervision")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - SUPERVISION_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            f"supervision contains unsupported keys: {', '.join(unknown_keys)}"
-        )
+    reject_unknown_config_keys(table, SUPERVISION_CONFIG_KEYS, "supervision")
     return SupervisionConfig(
         max_restarts=nonnegative_int(
             table.get("max_restarts"),
@@ -2786,11 +2775,7 @@ def parse_limit_wall_patterns(value: object) -> tuple[str, ...]:
 def parse_autopilot(data: object) -> AutopilotConfig:
     table = expect_table(data, "autopilot")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - AUTOPILOT_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            f"autopilot contains unsupported keys: {', '.join(unknown_keys)}"
-        )
+    reject_unknown_config_keys(table, AUTOPILOT_CONFIG_KEYS, "autopilot")
     worktree_disposition = table.get("worktree_disposition", "report-only")
     if (
         not isinstance(worktree_disposition, str)
@@ -2859,12 +2844,11 @@ def parse_autopilot(data: object) -> AutopilotConfig:
 def parse_disk_reserve(data: object) -> DiskReserveConfig:
     table = expect_table(data, "autopilot.disk_reserve")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - DISK_RESERVE_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            "autopilot.disk_reserve contains unsupported keys: "
-            + ", ".join(unknown_keys)
-        )
+    reject_unknown_config_keys(
+        table,
+        DISK_RESERVE_CONFIG_KEYS,
+        "autopilot.disk_reserve",
+    )
     min_free_bytes = optional_nonnegative_int(
         table.get("min_free_bytes"), "autopilot.disk_reserve.min_free_bytes"
     )
@@ -2917,9 +2901,7 @@ def reject_contradictory_reserve_pair(
 def parse_locks(data: object) -> LockConfig:
     table = expect_table(data, "locks")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - LOCKS_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"locks contains unsupported keys: {', '.join(unknown_keys)}")
+    reject_unknown_config_keys(table, LOCKS_CONFIG_KEYS, "locks")
     lock_type = optional_nonempty_string(table.get("type")) or "directory"
     if lock_type not in LOCK_BACKEND_TYPES:
         allowed = ", ".join(LOCK_BACKEND_TYPES)
@@ -2957,11 +2939,11 @@ def parse_locks(data: object) -> LockConfig:
 def parse_project_binding(data: object) -> ProjectBindingConfig:
     table = expect_table(data, "project_binding")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - PROJECT_BINDING_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(
-            f"project_binding contains unsupported keys: {', '.join(unknown_keys)}"
-        )
+    reject_unknown_config_keys(
+        table,
+        PROJECT_BINDING_CONFIG_KEYS,
+        "project_binding",
+    )
     require = parse_project_binding_require(table.get("require"))
     try:
         context = normalize_registry_runtime_context(table.get("context"))
@@ -3140,9 +3122,7 @@ def require_project_binding(
 def parse_specs(data: object) -> SpecDiagnosticsConfig:
     table = expect_table(data, "specs")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - SPEC_DIAGNOSTICS_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"specs contains unsupported keys: {', '.join(unknown_keys)}")
+    reject_unknown_config_keys(table, SPEC_DIAGNOSTICS_CONFIG_KEYS, "specs")
     return SpecDiagnosticsConfig(
         require_approved=optional_bool(
             table.get("require_approved"), False, "specs.require_approved"
@@ -3180,9 +3160,7 @@ def parse_specs(data: object) -> SpecDiagnosticsConfig:
 def parse_budget(data: object) -> BudgetConfig:
     table = expect_table(data, "budget")
     explicit_keys = frozenset(str(key) for key in table)
-    unknown_keys = sorted(explicit_keys - BUDGET_CONFIG_KEYS)
-    if unknown_keys:
-        raise ValueError(f"budget contains unsupported keys: {', '.join(unknown_keys)}")
+    reject_unknown_config_keys(table, BUDGET_CONFIG_KEYS, "budget")
     enabled = optional_bool(table.get("enabled"), False, "budget.enabled")
     metric = optional_nonempty_string(table.get("metric")) or "total_tokens"
     if metric not in BUDGET_METRICS:
@@ -3264,10 +3242,7 @@ def parse_budget_limits(value: object) -> tuple[BudgetLimit, ...]:
         label = f"budget.limits[{index}]"
         if not isinstance(entry, dict):
             raise ValueError(f"{label} must be a table")
-        keys = frozenset(str(key) for key in entry)
-        unknown = sorted(keys - BUDGET_LIMIT_KEYS)
-        if unknown:
-            raise ValueError(f"{label} contains unsupported keys: {', '.join(unknown)}")
+        reject_unknown_config_keys(entry, BUDGET_LIMIT_KEYS, label)
         limit_value = optional_positive_number(entry.get("limit"), f"{label}.limit")
         if limit_value is None:
             raise ValueError(f"{label}.limit is required and must be a positive number")

@@ -9192,6 +9192,7 @@ def attempt_circuit_inputs(
 
     task_payload = task.to_json()
     task_payload.pop("status", None)
+    task_payload.pop("status_reason", None)
     task_payload.pop("order", None)
     task_revision = _circuit_digest(task_payload)
     configuration_revision = _circuit_digest(
