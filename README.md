@@ -64,16 +64,23 @@ vibe-loop run-next --repo .
 ```
 
 > [!NOTE]
-> If agent permission prompts are disabled, isolate the session in a container
-> or VM with only the required repository, tools, network, and credentials.
+> Routine agent work is smoother with a narrowly scoped allowlist and permission
+> prompts disabled.
+
+> [!WARNING]
+> Any Codex or Claude session with permission prompts disabled — whether
+> launched directly or by a worker command — MUST run in a container or VM with
+> only the required repository, tools, network, and credentials.
 
 ## Skills
 
 The package ships four skills: `vibe-loop` for one bounded slice,
 `infinite-vibe-loop` for unattended finite slices, `orchestrated-vibe-loop` for
 role-separated multi-agent work, and `autopilot` for supervising a persistent
-worker pool. See the authoritative [Skills PRD](docs/prd/skills.md) and
-[work-mode guide](docs/skill-work-modes.md).
+worker pool. The [Skills PRD](docs/prd/skills.md) owns finite, infinite, and
+shared workflow contracts; the [Autopilot PRD](docs/prd/autopilot.md) owns
+supervision. Exact instructions live under `src/vibe_loop/skills/`; the
+[work-mode guide](docs/skill-work-modes.md) compares all four.
 
 Install them into Codex and/or Claude:
 
@@ -183,9 +190,19 @@ runtime-owned reviewer configuration.
 - [CLI reference](docs/cli-reference.md) — commands, flags, and output.
 - [Configuration reference](docs/configuration.md) — setup and option index.
 
-The PRDs own the former README detail for [skills](docs/prd/skills.md),
-[local run orchestration](docs/prd/run-orchestration.md), and
-[spec-driven execution](docs/prd/spec-driven-execution.md).
+The PRDs own the former README detail for [skills](docs/prd/skills.md) and
+[local run orchestration](docs/prd/run-orchestration.md).
+
+## Spec-driven workflow execution
+
+`vibe-loop` executes task artifacts produced by Spec Kit, Kiro, OpenSpec, and
+repository-specific planning systems. Those tools own requirements, design,
+and approval; `vibe-loop` owns bounded task execution and evidence. A spec or
+PRD alone is not proof of implementation.
+
+In this repository, `PROMPT.md` sets philosophy, `docs/prd/` holds stable
+contracts, and the configured task source holds runnable slices. The
+[Spec-Driven Execution PRD](docs/prd/spec-driven-execution.md) is authoritative.
 
 ## Relationship to ralphex
 
@@ -220,8 +237,8 @@ Install repository hooks with:
 make install-hooks
 ```
 
-See the [release checklist](docs/release-checklist.md) for versioning, skill
-readiness, TestPyPI staging, and publishing.
+The [release checklist](docs/release-checklist.md) owns versioning, installed
+hook behavior, skill readiness, TestPyPI staging, and publishing.
 
 ## License
 
