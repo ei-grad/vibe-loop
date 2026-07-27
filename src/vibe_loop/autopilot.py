@@ -6492,10 +6492,13 @@ def execute_autopilot_cycle(
         actions.append(f"ran_{kind}_command:exit={result.exit_code}")
         return result
 
-    if not blocker_list:
-        health = run_maintenance("health")
-        if health is not None and not health.succeeded:
-            blocker_list.append("autopilot_health_failed")
+    health = run_maintenance("health")
+    if (
+        health is not None
+        and not health.succeeded
+        and "autopilot_health_failed" not in blocker_list
+    ):
+        blocker_list.append("autopilot_health_failed")
 
     blockers = tuple(blocker_list)
     blockers_checked_after_planning = False
