@@ -14,6 +14,7 @@ from runpy import run_path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOC_BUDGET_SCRIPT = REPO_ROOT / "scripts/check-doc-budgets.py"
 MD_LINK_SCRIPT = REPO_ROOT / "scripts/check-md-links.py"
+DOC_COMMAND_SCRIPT = REPO_ROOT / "scripts/check-doc-commands.py"
 PROJECT_BINDING_LINK_SCRIPT = REPO_ROOT / "scripts/check-project-binding-doc-linkage.py"
 
 
@@ -263,6 +264,151 @@ class MarkdownLinkHookTests(TemporaryGitRepository):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(hook_log.read_text(encoding="utf-8"), "doc-budget\n")
+
+
+class DocumentedCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.checker = run_path(
+            os.fspath(DOC_COMMAND_SCRIPT),
+            run_name="test_documented_commands",
+        )
+
+    def test_extracts_inline_and_fenced_commands_without_matching_prose(self) -> None:
+        references = self.checker["documented_commands"](
+            Path("docs/example.md"),
+            textwrap.dedent(
+                """\
+                Use `vibe-loop runs inspect RUN-ID` for one result.
+                The vibe-loop lifecycle is bounded.
+
+                ```bash
+                $ uv run vibe-loop eval release-gate --repo .
+                printf 'vibe-loop not-a-command'
+                ```
+
+                ```mermaid
+                Slice: vibe-loop lifecycle
+                ```
+                """
+            ),
+        )
+
+        self.assertEqual(
+            [(reference.line, reference.tokens) for reference in references],
+            [
+                (1, ("runs", "inspect")),
+                (5, ("eval", "release-gate")),
+            ],
+        )
+
+    def test_unknown_inline_command_is_rejected(self) -> None:
+        unresolved = self.checker["unresolved_references"](
+            {Path("README.md"): "Use `vibe-loop vanished` here.\n"},
+            {("run",), ("run-next",)},
+            set(),
+        )
+
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0].path, Path("README.md"))
+        self.assertEqual(unresolved[0].line, 1)
+        self.assertEqual(unresolved[0].command, "vanished")
+
+    def test_uv_run_wrapped_unknown_command_is_rejected(self) -> None:
+        unresolved = self.checker["unresolved_references"](
+            {
+                Path("docs/release.md"): textwrap.dedent(
+                    """\
+                    ```bash
+                    uv run vibe-loop ghostcmd release-gate --repo .
+                    ```
+                    """
+                )
+            },
+            {("eval",), ("eval", "release-gate")},
+            {("eval",)},
+        )
+
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0].command, "ghostcmd")
+
+    def test_nested_parser_surface_rejects_unknown_child(self) -> None:
+        from vibe_loop.cli import build_parser
+
+        paths, parents = self.checker["command_paths"](build_parser())
+        unresolved = self.checker["unresolved_references"](
+            {Path("README.md"): "`vibe-loop runs vanished RUN-ID`\n"},
+            paths,
+            parents,
+        )
+
+        self.assertIn(("run",), paths)
+        self.assertIn(("runs", "inspect"), paths)
+        self.assertIn(("runs",), parents)
+        self.assertEqual(unresolved[0].command, "runs vanished")
+
+    def test_commonmark_nested_fences_do_not_flip_scanning_state(self) -> None:
+        references = self.checker["documented_commands"](
+            Path("docs/example.md"),
+            textwrap.dedent(
+                """\
+                ````text
+                Quoted Markdown:
+                ```bash
+                vibe-loop ghost-inner
+                ```
+                ````
+                Use `vibe-loop vanished` after the outer fence.
+                """
+            ),
+        )
+
+        self.assertEqual(
+            [(reference.line, reference.command) for reference in references],
+            [(7, "vanished")],
+        )
+
+    def test_historical_command_requires_explicit_allow_removed_directive(
+        self,
+    ) -> None:
+        paths = {("run",)}
+        documents = {
+            Path("docs/history.md"): textwrap.dedent(
+                """\
+                <!-- doc-command: allow-removed planning -->
+                The removed command was `vibe-loop planning timeline --json`.
+                """
+            )
+        }
+
+        unresolved = self.checker["unresolved_references"](
+            documents,
+            paths,
+            set(),
+        )
+        without_directive = self.checker["unresolved_references"](
+            {
+                Path("docs/history.md"): (
+                    "The removed command was `vibe-loop planning timeline --json`.\n"
+                )
+            },
+            paths,
+            set(),
+        )
+
+        self.assertEqual(unresolved, [])
+        self.assertEqual(without_directive[0].command, "planning")
+
+    def test_current_documentation_resolves(self) -> None:
+        result = subprocess.run(
+            [sys.executable, os.fspath(DOC_COMMAND_SCRIPT)],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "documented command paths: ok\n")
 
 
 class CodeDocLinkageTrialTests(TemporaryGitRepository):

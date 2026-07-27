@@ -37,9 +37,14 @@ defines their authority and density rules.
 ## Documentation checks
 
 `make doc-budget` checks the `README.md` and repository-root Markdown size
-budgets, structural prose runs across all Markdown files, links, and
-reachability. CI, release builds, and the installed pre-commit hook run this
-gate.
+budgets, structural prose runs across all Markdown files, links, reachability,
+and inline or shell-fenced `vibe-loop` command paths against the actual CLI
+parser. CI, release builds, and the installed pre-commit hook run this gate.
+
+Superseded documentation may retain an exact removed command spelling by adding
+`<!-- doc-command: allow-removed COMMAND [SUBCOMMAND ...] -->` to that Markdown
+file. Keep the exemption as narrow as the removed parser path; it does not
+suppress unrelated command references.
 
 Before each budget's deadline, content above its target but no larger than its
 baseline passes with a warning. After the deadline, the target is the hard

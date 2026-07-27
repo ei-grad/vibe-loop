@@ -1,11 +1,14 @@
 # Planning Analytics PRD
 
+<!-- doc-command: allow-removed planning -->
+
 > **Superseded (removed from vibe-loop).** PRD-ANL-001..004 described the in-tree
-> planning-analytics feature (`vibe-loop planning ...`, `[planning_analytics]`
-> config, timeline/Gantt artifacts). That feature was removed; timeline and Gantt
-> reporting now live in the [loopyard](https://github.com/ei-grad/loopyard) web UI
-> over the read-only `autopilot status --json` boundary. This PRD is retained for
-> historical reference only.
+> planning-analytics feature (the removed `vibe-loop planning` subcommands,
+> `[planning_analytics]` config, timeline/Gantt artifacts). That feature was
+> removed; timeline and Gantt reporting now live in the
+> [loopyard](https://github.com/ei-grad/loopyard) web UI over the read-only
+> `autopilot status --json` boundary. This PRD is retained for historical
+> reference only.
 
 This PRD owns Level 2 contracts for planning evidence, coverage checks,
 timeline/Gantt artifacts, duration benchmarking, and analytics readiness.
