@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import shlex
@@ -10,6 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import vibe_loop.tasks as tasks_module
 from vibe_loop.config import TaskSourceConfig, shell_quote
 from vibe_loop.tasks import (
     WITHHELD_ADAPTER_ENV,
@@ -1108,6 +1110,114 @@ class MarkdownPlanTests(unittest.TestCase):
                 json.loads(captured.read_text(encoding="utf-8")),
                 [task_id],
             )
+
+    @unittest.skipIf(
+        sys.platform == "win32",
+        "POSIX shell injection matrix; Windows adapters fail closed below",
+    )
+    def test_command_task_source_adapters_do_not_execute_hostile_task_ids(
+        self,
+    ) -> None:
+        recorder_program = (
+            "import json, sys; from pathlib import Path; "
+            "Path(sys.argv[1]).write_text("
+            "json.dumps(sys.argv[2:]), encoding='utf-8'); "
+            "print(json.dumps(dict(id=sys.argv[2], status='Next')))"
+        )
+        marker_program = (
+            "from pathlib import Path; import sys; "
+            "Path(sys.argv[1]).write_text('injected', encoding='utf-8')"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            captured = repo / "captured.json"
+            injected = repo / "injected"
+            injected_command = (
+                f"{shell_quote(sys.executable)} -c {shell_quote(marker_program)} "
+                f"{shell_quote(str(injected))}"
+            )
+            task_ids = (
+                f"TASK; {injected_command}",
+                f"TASK && {injected_command}",
+                f"TASK `{injected_command}`",
+                f"TASK $({injected_command})",
+                "TASK 'single' \"double\"",
+                f"TASK\n{injected_command}",
+            )
+            command = (
+                f"{shell_quote(sys.executable)} -c "
+                f"{shell_quote(recorder_program)} "
+                f"{shell_quote(str(captured))} {{task_id}}"
+            )
+
+            for adapter in ("probe", "activate", "reset", "transition"):
+                for task_id in task_ids:
+                    with self.subTest(adapter=adapter, task_id=task_id):
+                        source = CommandTaskSource(
+                            repo,
+                            TaskSourceConfig(
+                                type="command",
+                                list_command="echo '[]'",
+                                probe_command=command,
+                                activate_command=command,
+                                reset_command=command,
+                                complete_command=command,
+                            ),
+                        )
+
+                        if adapter == "probe":
+                            source.probe(task_id)
+                        elif adapter == "activate":
+                            source.activate(task_id, "run-1")
+                        elif adapter == "reset":
+                            source.reset(task_id)
+                        else:
+                            source.complete(task_id, "run-1")
+
+                        self.assertEqual(
+                            json.loads(captured.read_text(encoding="utf-8")),
+                            [task_id],
+                        )
+                        self.assertFalse(injected.exists())
+
+    def test_command_task_source_does_not_format_command_variables_directly(
+        self,
+    ) -> None:
+        module = ast.parse(Path(tasks_module.__file__).read_text(encoding="utf-8"))
+        command_source = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "CommandTaskSource"
+        )
+        unsafe_lines: list[int] = []
+        for node in ast.walk(command_source):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else (node.target,)
+            target_names = {
+                target.id for target in targets if isinstance(target, ast.Name)
+            }
+            if not any(name.endswith("command") for name in target_names):
+                continue
+            value = node.value
+            if any(
+                isinstance(child, ast.JoinedStr)
+                or (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "format"
+                )
+                for child in ast.walk(value)
+            ):
+                unsafe_lines.append(node.lineno)
+
+        self.assertEqual(
+            unsafe_lines,
+            [],
+            "task-source command variables must use _format_command; "
+            f"unsafe construction at lines {unsafe_lines}",
+        )
 
     def test_command_task_source_probe_and_reset_reject_unsafe_templates(
         self,
