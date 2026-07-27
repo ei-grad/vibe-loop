@@ -1591,6 +1591,32 @@ class ConfigTests(unittest.TestCase):
 
         self.assertIsNone(config.task_source.activate_command)
 
+    def test_task_source_health_hook_is_parsed_without_selecting_a_source(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text(
+                '[task_source]\nhealth = "tracker db verify"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(repo)
+
+        self.assertEqual(config.task_source.health_command, "tracker db verify")
+        self.assertTrue(config.task_source.allows_generated_cache)
+        self.assertNotIn("health", config.task_source.explicit_source_keys)
+        self.assertTrue(config.task_source.is_explicit("health"))
+
+    def test_task_source_health_hook_defaults_to_none(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop.toml").write_text("[task_source]\n", encoding="utf-8")
+
+            config = load_config(repo)
+
+        self.assertIsNone(config.task_source.health_command)
+
     def test_task_source_completion_and_park_hooks_are_explicit_only(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
