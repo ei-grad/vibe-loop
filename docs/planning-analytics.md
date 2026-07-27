@@ -1,7 +1,9 @@
 # Planning Analytics Contract
 
+<!-- doc-command: allow-removed planning -->
+
 > **Superseded (removed from vibe-loop).** The in-tree planning-analytics
-> commands (`planning timeline/artifacts/benchmark-duration`),
+> commands (`vibe-loop planning timeline/artifacts/benchmark-duration`),
 > `[planning_analytics]` config, and the timeline/Gantt artifact generators were
 > removed. Timeline and Gantt reporting now live in the
 > [loopyard](https://github.com/ei-grad/loopyard) web UI over the read-only
@@ -163,14 +165,14 @@ plan order. Generated timeline JSON must serialize the selected
 
 ## Timeline JSON
 
-The removed `planning timeline --json` command emitted a versioned JSON document
-with source provenance, sections, task rows, schedule policy, and warnings.
-Completed tasks with authoritative commit mappings receive an `actual` span
-built from mapped commit author times. The elapsed gap assigned to each mapped
-commit is clipped to eight hours; the first mapped commit uses a one-minute
-floor because there is no prior mapped author time. The output preserves both
-`raw_duration_minutes` and `idle_gap_clipped_minutes` so long idle periods are
-visible without inflating projected durations.
+The removed `vibe-loop planning timeline --json` command emitted a versioned
+JSON document with source provenance, sections, task rows, schedule policy, and
+warnings. Completed tasks with authoritative commit mappings receive an
+`actual` span built from mapped commit author times. The elapsed gap assigned to
+each mapped commit is clipped to eight hours; the first mapped commit uses a
+one-minute floor because there is no prior mapped author time. The output
+preserves both `raw_duration_minutes` and `idle_gap_clipped_minutes` so long idle
+periods are visible without inflating projected durations.
 
 The timeline JSON also includes `requirements`, a requirement coverage ledger
 with linked task ids, satisfied or attempted task ids, missing-evidence task ids,
@@ -194,9 +196,10 @@ title, scope, and acceptance.
 
 ## Timeline And Gantt Artifacts
 
-The removed `planning artifacts` command wrote the timeline JSON plus a static
-Gantt HTML report. Defaults use `<state_dir>/planning-analytics/timeline.json`
-and `<state_dir>/planning-analytics/gantt.html`. `--output` and `--html-output`
+The removed `vibe-loop planning artifacts` command wrote the timeline JSON plus
+a static Gantt HTML report. Defaults use
+`<state_dir>/planning-analytics/timeline.json` and
+`<state_dir>/planning-analytics/gantt.html`. `--output` and `--html-output`
 accept repo-relative paths for repositories that intentionally commit generated
 planning docs.
 
@@ -211,11 +214,11 @@ version and warning count without executing analytics.
 
 ## Duration Benchmark
 
-The removed `planning benchmark-duration` command evaluated duration-estimator
-candidates against completed tasks with authoritative actual spans. It assigns
-stable validation folds from task ids and mapped commit ids, keeps tasks that
-share a validation commit out of that fold's training set, and reports the
-leakage checks in the generated JSON.
+The removed `vibe-loop planning benchmark-duration` command evaluated
+duration-estimator candidates against completed tasks with authoritative actual
+spans. It assigns stable validation folds from task ids and mapped commit ids,
+keeps tasks that share a validation commit out of that fold's training set, and
+reports the leakage checks in the generated JSON.
 
 The JSON and Markdown reports include MAE, MAPE, mean log error, interval
 coverage, signed bias, and worst misses for each candidate. Reports are written

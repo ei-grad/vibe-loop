@@ -1,7 +1,9 @@
 # Planning Analytics PRD
 
+<!-- doc-command: allow-removed planning -->
+
 > **Superseded (removed from vibe-loop).** PRD-ANL-001..004 described the in-tree
-> planning-analytics feature (the removed `planning` subcommands,
+> planning-analytics feature (the removed `vibe-loop planning` subcommands,
 > `[planning_analytics]` config, timeline/Gantt artifacts). That feature was
 > removed; timeline and Gantt reporting now live in the
 > [loopyard](https://github.com/ei-grad/loopyard) web UI over the read-only
