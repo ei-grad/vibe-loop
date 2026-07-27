@@ -3491,6 +3491,75 @@ class WorktreeDispositionEvidenceTests(unittest.TestCase):
         self.assertEqual(effects.removed, [worktree.resolve()])
         self.assertEqual(effects.deleted, [branch])
 
+    def test_evidence_keeps_head_that_does_not_contain_declared_candidate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            repo = base / "repo"
+            init_git_repo(repo)
+            manager = LockManager(repo / ".vibe-loop" / "locks")
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+
+            worktree = base / "mismatched"
+            branch = "worker/MISMATCHED"
+            git(repo, "worktree", "add", "-b", branch, str(worktree), "main")
+            (worktree / "feature.txt").write_text("done\n", encoding="utf-8")
+            git(worktree, "add", "feature.txt")
+            git(worktree, "commit", "-m", "declared candidate")
+            candidate = git(worktree, "rev-parse", "HEAD").stdout.strip()
+            tree = git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip()
+            replacement = git(
+                worktree,
+                "commit-tree",
+                tree,
+                "-p",
+                "main",
+                "-m",
+                "replacement head",
+            ).stdout.strip()
+            git(worktree, "update-ref", f"refs/heads/{branch}", replacement)
+            git(repo, "merge", "--ff-only", branch)
+            git(repo, "update-ref", "refs/remotes/origin/main", "main")
+
+            run_store.append_record(
+                WorkspaceClaim(
+                    task_id="MISMATCHED",
+                    run_id="run-mismatched",
+                    branch=branch,
+                    worktree=worktree,
+                    base_commit=candidate,
+                    head_commit=candidate,
+                    current_branch=branch,
+                    dirty=False,
+                    dirty_summary=(),
+                ).to_json()
+            )
+            run_store.append_report(
+                WorkerReport(
+                    task_id="MISMATCHED",
+                    run_id="run-mismatched",
+                    status="completed",
+                    commit=candidate,
+                )
+            )
+
+            evidence = collect_worktree_disposition_evidence(
+                manager,
+                run_store,
+                repo=repo,
+                main_branch="main",
+                current_host="test-host",
+                process_exists=lambda _pid: False,
+            )
+
+        item = {entry.path: entry for entry in evidence}[worktree.resolve()]
+        self.assertEqual(item.head_commit, replacement)
+        self.assertEqual(item.terminal_commit, candidate)
+        self.assertFalse(item.terminal_commit_contained)
+        self.assertIn(KEEP_TERMINAL_COMMIT_MISMATCH, item.keep_guardrails)
+        self.assertFalse(item.reapable)
+
     def test_evidence_preserves_crash_windows_before_completed_remote_success(
         self,
     ) -> None:

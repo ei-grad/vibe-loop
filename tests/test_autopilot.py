@@ -39,6 +39,7 @@ from vibe_loop.autopilot import (
     disk_health_thresholds_for,
     git_landed_commits,
     latest_cycle_main_ref,
+    latest_worktree_disposition,
     run_cycle_summary,
     run_disk_health,
     statvfs_capacity_probe,
@@ -9206,6 +9207,25 @@ class AutopilotWaitTests(unittest.TestCase):
 
 
 class WorktreeDispositionCycleTests(unittest.TestCase):
+    def test_latest_status_projection_uses_bounded_tail_read(self) -> None:
+        record = {
+            "record_type": AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+            "cycle_id": "cycle-1",
+            "evidence": [],
+            "outcomes": [],
+        }
+        run_store = mock.Mock(spec=RunStore)
+        run_store.recent_records_matching.return_value = [record]
+
+        result = latest_worktree_disposition(run_store)
+
+        self.assertEqual(result["cycle_id"], "cycle-1")
+        run_store.recent_records_matching.assert_called_once_with(
+            record_types=frozenset({AUTOPILOT_WORKTREE_REAP_RECORD_TYPE}),
+            max_runs=1,
+        )
+        run_store.read_records.assert_not_called()
+
     def _orphan_repo(
         self,
         directory: str,

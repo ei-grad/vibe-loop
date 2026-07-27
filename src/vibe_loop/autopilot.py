@@ -171,6 +171,11 @@ AUTOPILOT_RUNTIME_CONTEXT_MAX_BYTES = (
 )
 NON_CLOSURE_WINDOW_RUNS = 20
 NON_CLOSURE_ALARM_THRESHOLD = 2
+WORKTREE_DISPOSITION_STATUS_WORKTREE_LIMIT = 20
+WORKTREE_DISPOSITION_STATUS_TEXT_LIMIT = 512
+WORKTREE_DISPOSITION_STATUS_PATH_LIMIT = 4096
+WORKTREE_DISPOSITION_STATUS_ACTION_ERROR_LIMIT = 4
+WORKTREE_DISPOSITION_STATUS_GUARDRAIL_LIMIT = 16
 ACTIVE_QUEUE_STATUSES = frozenset({"active"})
 REVIEW_QUEUE_STATUSES = frozenset({"review"})
 BLOCKED_QUEUE_STATUSES = BLOCKED_FAMILY_STATUSES
@@ -1708,10 +1713,146 @@ def latest_cycle_summary(run_store: RunStore) -> CycleSummary | None:
 
 
 def latest_worktree_disposition(run_store: RunStore) -> dict[str, object]:
-    for record in reversed(run_store.read_records()):
-        if record.get("record_type") == AUTOPILOT_WORKTREE_REAP_RECORD_TYPE:
-            return dict(record)
-    return {}
+    records = run_store.recent_records_matching(
+        record_types=frozenset({AUTOPILOT_WORKTREE_REAP_RECORD_TYPE}),
+        max_runs=1,
+    )
+    if not records:
+        return {}
+    return project_worktree_disposition_status(records[-1])
+
+
+def project_worktree_disposition_status(
+    record: Mapping[str, object],
+) -> dict[str, object]:
+    raw_evidence = record.get("evidence")
+    evidence = raw_evidence if isinstance(raw_evidence, list) else []
+    raw_outcomes = record.get("outcomes")
+    outcomes = raw_outcomes if isinstance(raw_outcomes, list) else []
+    outcome_by_path = {
+        str(outcome.get("worktree") or ""): outcome
+        for outcome in outcomes
+        if isinstance(outcome, Mapping)
+    }
+
+    ranked: list[tuple[int, int, Mapping[str, object]]] = []
+    for index, item in enumerate(evidence):
+        if not isinstance(item, Mapping):
+            continue
+        outcome = outcome_by_path.get(str(item.get("path") or ""), {})
+        applied = str(outcome.get("applied") or "unrecorded")
+        priority = (
+            0 if applied in {"failed", "refused"} else 1 if item.get("reapable") else 2
+        )
+        ranked.append((priority, index, item))
+    ranked.sort(key=lambda entry: (entry[0], entry[1]))
+    selected = ranked[:WORKTREE_DISPOSITION_STATUS_WORKTREE_LIMIT]
+    worktrees = [
+        project_worktree_disposition_item(item, outcome_by_path)
+        for _, _, item in selected
+    ]
+    total_worktrees = len(ranked)
+    return {
+        "schema_version": int_value(record.get("schema_version")) or 1,
+        "cycle_id": bounded_worktree_disposition_text(record.get("cycle_id")),
+        "occurred_at": bounded_worktree_disposition_text(record.get("occurred_at")),
+        "policy": bounded_worktree_disposition_text(record.get("policy")),
+        "status": bounded_worktree_disposition_text(record.get("status")),
+        "candidates": int_value(record.get("candidates")) or 0,
+        "reaped": int_value(record.get("reaped")) or 0,
+        "kept": int_value(record.get("kept")) or 0,
+        "refused": int_value(record.get("refused")) or 0,
+        "errors": int_value(record.get("errors")) or 0,
+        "agent_invoked": bool(record.get("agent_invoked")),
+        "agent_error": bounded_worktree_disposition_text(record.get("agent_error")),
+        "total_worktrees": total_worktrees,
+        "worktrees_truncated": max(0, total_worktrees - len(worktrees)),
+        "worktrees": worktrees,
+    }
+
+
+def project_worktree_disposition_item(
+    item: Mapping[str, object],
+    outcome_by_path: Mapping[str, Mapping[str, object]],
+) -> dict[str, object]:
+    path = bounded_worktree_disposition_text(
+        item.get("path"),
+        limit=WORKTREE_DISPOSITION_STATUS_PATH_LIMIT,
+    )
+    outcome = outcome_by_path.get(str(item.get("path") or ""), {})
+    keep_guardrails = bounded_worktree_disposition_strings(
+        item.get("keep_guardrails"),
+        limit=WORKTREE_DISPOSITION_STATUS_GUARDRAIL_LIMIT,
+    )
+    outcome_guardrails = bounded_worktree_disposition_strings(
+        outcome.get("guardrails"),
+        limit=WORKTREE_DISPOSITION_STATUS_GUARDRAIL_LIMIT,
+    )
+    raw_actions = outcome.get("actions")
+    actions = raw_actions if isinstance(raw_actions, list) else []
+    action_errors = [
+        bounded_worktree_disposition_text(action.get("error"))
+        for action in actions
+        if isinstance(action, Mapping) and action.get("error")
+    ][:WORKTREE_DISPOSITION_STATUS_ACTION_ERROR_LIMIT]
+    applied = bounded_worktree_disposition_text(outcome.get("applied")) or "unrecorded"
+    decision_reason = bounded_worktree_disposition_text(outcome.get("reason"))
+    if applied == "failed":
+        non_removal_reason = " | ".join(action_errors or outcome_guardrails) or (
+            "reap action failed without a recorded diagnostic"
+        )
+    elif applied == "refused":
+        non_removal_reason = " | ".join(outcome_guardrails or keep_guardrails) or (
+            "reap was refused without a recorded guardrail"
+        )
+    elif applied == "kept":
+        non_removal_reason = (
+            decision_reason
+            or " | ".join(keep_guardrails)
+            or ("worktree was kept without a recorded reason")
+        )
+    elif applied == "unrecorded":
+        non_removal_reason = " | ".join(keep_guardrails) or (
+            "no disposition outcome was recorded"
+        )
+    else:
+        non_removal_reason = ""
+    return {
+        "path": path,
+        "branch": bounded_worktree_disposition_text(item.get("branch")),
+        "reapable": bool(item.get("reapable")),
+        "keep_guardrails": keep_guardrails,
+        "requested": bounded_worktree_disposition_text(outcome.get("requested"))
+        or "none",
+        "applied": applied,
+        "decision_reason": decision_reason,
+        "outcome_guardrails": outcome_guardrails,
+        "action_errors": action_errors,
+        "non_removal_reason": bounded_worktree_disposition_text(non_removal_reason),
+    }
+
+
+def bounded_worktree_disposition_strings(
+    value: object,
+    *,
+    limit: int,
+) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value[:limit]:
+        text = bounded_worktree_disposition_text(item)
+        if text:
+            result.append(text)
+    return result
+
+
+def bounded_worktree_disposition_text(
+    value: object,
+    *,
+    limit: int = WORKTREE_DISPOSITION_STATUS_TEXT_LIMIT,
+) -> str:
+    return str(value or "")[:limit]
 
 
 def recent_cycle_summaries(

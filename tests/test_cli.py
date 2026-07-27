@@ -24,6 +24,7 @@ import vibe_loop.cli as cli_module
 from vibe_loop.autopilot import (
     AUTOPILOT_RECORD_SCHEMA_VERSION,
     DiskCapacitySample,
+    WORKTREE_DISPOSITION_STATUS_WORKTREE_LIMIT,
     collect_supervisor_status,
     run_autopilot,
     stop_detached_autopilot,
@@ -9397,7 +9398,8 @@ class AutopilotCliTests(unittest.TestCase):
             repo = Path(directory) / "project"
             init_planning_repo(repo, THREE_TASK_PLAN)
             run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
-            worktree = repo.parent / "completed-worktree"
+            refused_worktree = repo.parent / "refused-worktree"
+            failed_worktree = repo.parent / "failed-worktree"
             run_store.append_record(
                 {
                     "schema_version": 1,
@@ -9407,31 +9409,53 @@ class AutopilotCliTests(unittest.TestCase):
                     "cycle_id": "cycle-1",
                     "policy": "reap",
                     "status": "ok",
-                    "candidates": 1,
+                    "candidates": 2,
                     "reaped": 0,
-                    "kept": 1,
-                    "refused": 0,
-                    "errors": 0,
+                    "kept": 0,
+                    "refused": 1,
+                    "errors": 1,
                     "agent_invoked": True,
                     "agent_error": "",
                     "evidence": [
                         {
-                            "path": str(worktree),
-                            "branch": "worker/completed",
+                            "path": str(refused_worktree),
+                            "branch": "worker/refused",
                             "reapable": True,
                             "keep_guardrails": [],
-                        }
+                        },
+                        {
+                            "path": str(failed_worktree),
+                            "branch": "worker/failed",
+                            "reapable": True,
+                            "keep_guardrails": [],
+                        },
                     ],
                     "outcomes": [
                         {
-                            "worktree": str(worktree),
-                            "branch": "worker/completed",
-                            "requested": "keep",
-                            "applied": "kept",
-                            "reason": "operator retained candidate",
-                            "guardrails": [],
+                            "worktree": str(refused_worktree),
+                            "branch": "worker/refused",
+                            "requested": "reap",
+                            "applied": "refused",
+                            "reason": "completed and merged; safe to reap",
+                            "guardrails": ["evidence_changed"],
                             "actions": [],
-                        }
+                        },
+                        {
+                            "worktree": str(failed_worktree),
+                            "branch": "worker/failed",
+                            "requested": "reap",
+                            "applied": "failed",
+                            "reason": "completed and merged; safe to reap",
+                            "guardrails": [],
+                            "actions": [
+                                {
+                                    "kind": "worktree_remove",
+                                    "target": str(failed_worktree),
+                                    "ok": False,
+                                    "error": "git worktree remove failed",
+                                }
+                            ],
+                        },
                     ],
                 }
             )
@@ -9448,21 +9472,99 @@ class AutopilotCliTests(unittest.TestCase):
         output = text_stdout.getvalue()
         self.assertIn(
             "latest worktree disposition: cycle=cycle-1 status=ok "
-            "candidates=1 reaped=0 errors=0",
+            "candidates=2 reaped=0 errors=1",
             output,
         )
         self.assertIn(
-            f"  - {worktree}: reapable=true guardrails=none "
-            "outcome=kept reason=operator retained candidate",
+            f"  - {refused_worktree}: reapable=true guardrails=none "
+            "outcome=refused non_removal_reason=evidence_changed "
+            "decision_reason=completed and merged; safe to reap",
+            output,
+        )
+        self.assertIn(
+            f"  - {failed_worktree}: reapable=true guardrails=none "
+            "outcome=failed non_removal_reason=git worktree remove failed "
+            "decision_reason=completed and merged; safe to reap",
             output,
         )
         payload = json.loads(json_stdout.getvalue())
         disposition = payload["worktree_disposition"]
         self.assertEqual(disposition["cycle_id"], "cycle-1")
-        self.assertEqual(disposition["evidence"][0]["keep_guardrails"], [])
+        self.assertEqual(disposition["worktrees"][0]["keep_guardrails"], [])
         self.assertEqual(
-            disposition["outcomes"][0]["reason"],
-            "operator retained candidate",
+            disposition["worktrees"][0]["outcome_guardrails"],
+            ["evidence_changed"],
+        )
+        self.assertEqual(
+            disposition["worktrees"][0]["non_removal_reason"],
+            "evidence_changed",
+        )
+        self.assertEqual(
+            disposition["worktrees"][1]["action_errors"],
+            ["git worktree remove failed"],
+        )
+
+    def test_status_bounds_latest_worktree_disposition_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "project"
+            init_planning_repo(repo, THREE_TASK_PLAN)
+            run_store = RunStore(repo / ".vibe-loop" / "runs.jsonl")
+            total = WORKTREE_DISPOSITION_STATUS_WORKTREE_LIMIT + 5
+            refused_worktree = repo.parent / f"worktree-{total - 1}"
+            run_store.append_record(
+                {
+                    "schema_version": 1,
+                    "record_type": AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
+                    "occurred_at": "2026-07-27T16:00:00+00:00",
+                    "repo": str(repo),
+                    "cycle_id": "cycle-many",
+                    "policy": "reap",
+                    "status": "ok",
+                    "candidates": 1,
+                    "reaped": 0,
+                    "kept": total - 1,
+                    "refused": 1,
+                    "errors": 0,
+                    "evidence": [
+                        {
+                            "path": str(repo.parent / f"worktree-{index}"),
+                            "branch": f"worker/{index}",
+                            "reapable": index == total - 1,
+                            "keep_guardrails": (
+                                [] if index == total - 1 else ["unmerged_worktree"]
+                            ),
+                        }
+                        for index in range(total)
+                    ],
+                    "outcomes": [
+                        {
+                            "worktree": str(refused_worktree),
+                            "requested": "reap",
+                            "applied": "refused",
+                            "reason": "safe at decision time",
+                            "guardrails": ["evidence_changed"],
+                            "actions": [],
+                        }
+                    ],
+                }
+            )
+
+            stdout = StringIO()
+            with redirect_stdout(stdout), redirect_stderr(StringIO()):
+                exit_code = main(["autopilot", "status", "--repo", str(repo), "--json"])
+
+        self.assertEqual(exit_code, 0)
+        disposition = json.loads(stdout.getvalue())["worktree_disposition"]
+        self.assertEqual(disposition["total_worktrees"], total)
+        self.assertEqual(disposition["worktrees_truncated"], 5)
+        self.assertEqual(
+            len(disposition["worktrees"]),
+            WORKTREE_DISPOSITION_STATUS_WORKTREE_LIMIT,
+        )
+        self.assertEqual(disposition["worktrees"][0]["path"], str(refused_worktree))
+        self.assertEqual(
+            disposition["worktrees"][0]["non_removal_reason"],
+            "evidence_changed",
         )
 
     def test_status_does_not_start_worker_or_record_state(self) -> None:
