@@ -10987,6 +10987,93 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertEqual(replaced_code, 0)
         self.assertEqual(json.loads(replaced_out)["wake_reason"], "deadline")
 
+    def test_wait_helper_tail_bootstrap_validates_deadline_before_checkpoint(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "runs.jsonl"
+            cursor = root / "cursor.json"
+            journal.write_text("{}\n", encoding="utf-8")
+
+            code, _out = self._wait_helper(
+                "--deadline",
+                "not-a-time",
+                "--runtime-event-journal",
+                str(journal),
+                "--runtime-event-cursor",
+                str(cursor),
+                "--runtime-event-project",
+                "alpha",
+                "--runtime-event-start-at-tail",
+                "--json",
+            )
+            cursor_created = cursor.exists()
+
+        self.assertEqual(code, 2)
+        self.assertFalse(cursor_created)
+
+    def test_wait_helper_tail_bootstrap_replaces_corrupt_cursor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / "runs.jsonl"
+            cursor = root / "cursor.json"
+            journal.write_text("{}\n", encoding="utf-8")
+            cursor.write_text("corrupt", encoding="utf-8")
+
+            code, out = self._wait_helper(
+                "--deadline",
+                "2000-01-01T00:00:00Z",
+                "--runtime-event-journal",
+                str(journal),
+                "--runtime-event-cursor",
+                str(cursor),
+                "--runtime-event-project",
+                "alpha",
+                "--runtime-event-start-at-tail",
+                "--runtime-event-replace-cursor",
+                "--json",
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["wake_reason"], "deadline")
+
+    def test_wait_helper_tail_bootstrap_usage_guards(self) -> None:
+        base = (
+            "--runtime-event-cursor",
+            "cursor.json",
+            "--runtime-event-project",
+            "alpha",
+            "--json",
+        )
+        cases = (
+            ("missing_source", (*base, "--runtime-event-start-at-tail")),
+            (
+                "command_source",
+                (
+                    "--runtime-event-command",
+                    "adapter",
+                    *base,
+                    "--runtime-event-start-at-tail",
+                ),
+            ),
+            (
+                "replace_without_start",
+                (
+                    "--runtime-event-journal",
+                    "runs.jsonl",
+                    *base,
+                    "--runtime-event-replace-cursor",
+                ),
+            ),
+        )
+
+        for name, arguments in cases:
+            with self.subTest(name=name):
+                code, out = self._wait_helper(*arguments)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+
     def test_wait_helper_runtime_adapter_error_is_safe_json(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cursor = Path(directory) / "cursor.json"

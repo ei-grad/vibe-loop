@@ -1924,18 +1924,6 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if args.runtime_event_start_at_tail and args.runtime_event_journal is None:
-        print(
-            "--runtime-event-start-at-tail requires --runtime-event-journal",
-            file=sys.stderr,
-        )
-        return 2
-    if args.runtime_event_replace_cursor and not args.runtime_event_start_at_tail:
-        print(
-            "--runtime-event-replace-cursor requires --runtime-event-start-at-tail",
-            file=sys.stderr,
-        )
-        return 2
     if not runtime_event_enabled and any(
         (
             args.runtime_event_cursor is not None,
@@ -1949,6 +1937,18 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
         print(
             "runtime-event scope options require --runtime-event-command or "
             "--runtime-event-journal",
+            file=sys.stderr,
+        )
+        return 2
+    if args.runtime_event_start_at_tail and args.runtime_event_journal is None:
+        print(
+            "--runtime-event-start-at-tail requires --runtime-event-journal",
+            file=sys.stderr,
+        )
+        return 2
+    if args.runtime_event_replace_cursor and not args.runtime_event_start_at_tail:
+        print(
+            "--runtime-event-replace-cursor requires --runtime-event-start-at-tail",
             file=sys.stderr,
         )
         return 2
@@ -1971,6 +1971,21 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             )
 
         message_poller = poll_message
+    now = time.time()
+    if args.deadline is not None:
+        deadline_text = args.deadline
+        try:
+            deadline_epoch = parse_wait_deadline(args.deadline)
+        except ValueError as exc:
+            print(f"invalid --deadline: {exc}", file=sys.stderr)
+            return 2
+    else:
+        interval = (
+            args.cycle_schedule
+            if args.cycle_schedule is not None
+            else DEFAULT_WAIT_CYCLE_SECONDS
+        )
+        deadline_text, deadline_epoch = cycle_schedule_deadline(interval, now=now)
     runtime_event_poller = None
     if runtime_event_enabled:
         assert args.runtime_event_cursor is not None
@@ -2037,21 +2052,6 @@ def dispatch_wait_helper(args: argparse.Namespace) -> int:
             return event
 
         runtime_event_poller = poll_runtime_event
-    now = time.time()
-    if args.deadline is not None:
-        deadline_text = args.deadline
-        try:
-            deadline_epoch = parse_wait_deadline(args.deadline)
-        except ValueError as exc:
-            print(f"invalid --deadline: {exc}", file=sys.stderr)
-            return 2
-    else:
-        interval = (
-            args.cycle_schedule
-            if args.cycle_schedule is not None
-            else DEFAULT_WAIT_CYCLE_SECONDS
-        )
-        deadline_text, deadline_epoch = cycle_schedule_deadline(interval, now=now)
     try:
         result = wait_for_processes(
             pids=args.pid,

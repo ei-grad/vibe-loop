@@ -192,6 +192,24 @@ def test_tail_bootstrap_refuses_existing_cursor_without_explicit_replace(
     assert load_runtime_event_cursor(checkpoint, project="alpha") == "1"
 
 
+def test_tail_bootstrap_explicitly_replaces_corrupt_cursor(tmp_path: Path) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    append_records(journal, {"record_type": "stage_transition"})
+    checkpoint.write_text("corrupt", encoding="utf-8")
+
+    assert (
+        bootstrap_run_journal_cursor(
+            journal,
+            checkpoint,
+            project="alpha",
+            replace=True,
+        )
+        == "1"
+    )
+    assert load_runtime_event_cursor(checkpoint, project="alpha") == "1"
+
+
 def test_tail_bootstrap_rejects_existing_cursor_for_another_project(
     tmp_path: Path,
 ) -> None:
@@ -206,6 +224,14 @@ def test_tail_bootstrap_rejects_existing_cursor_for_another_project(
             project="alpha",
             replace=True,
         )
+
+
+def test_tail_bootstrap_rejects_journal_as_cursor_path(tmp_path: Path) -> None:
+    journal = tmp_path / "runs.jsonl"
+    journal.write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeEventAdapterError, match="invalid_cursor_path"):
+        bootstrap_run_journal_cursor(journal, journal, project="alpha")
 
 
 @pytest.mark.parametrize(
@@ -227,6 +253,26 @@ def test_tail_bootstrap_rejects_invalid_journal_without_checkpoint(
     with pytest.raises(RuntimeEventAdapterError, match=category):
         bootstrap_run_journal_cursor(journal, checkpoint, project="alpha")
     assert not checkpoint.exists()
+
+
+def test_tail_bootstrap_and_poll_share_validated_record_framing(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "runs.jsonl"
+    checkpoint = tmp_path / "cursor.json"
+    append_records(
+        journal,
+        {"record_type": "stage_transition"},
+        {"record_type": "worker_report"},
+        {"record_type": "autopilot_disk_health", "status": "ok"},
+    )
+
+    assert poll_run_journal_event(
+        journal,
+        cursor="",
+        project="alpha",
+    ) == ("3", None)
+    assert bootstrap_run_journal_cursor(journal, checkpoint, project="alpha") == "3"
 
 
 def test_tail_bootstrap_serializes_concurrent_append_before_checkpoint(
