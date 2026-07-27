@@ -360,6 +360,12 @@ def _journal_actionable_kind(record: Mapping[str, Any]) -> str | None:
     record_type = _string(record.get("record_type"))
     if record_type == "run_result" and isinstance(record.get("recovery_intent"), dict):
         return "recovery_pending"
+    if record_type == "work_blocked" and record.get("reason_class") in {
+        "needs_decision",
+        "authorization",
+        "non_retryable_policy",
+    }:
+        return "operator_action_required"
     if record_type in ACTIONABLE_RUNTIME_EVENT_KINDS:
         if record_type.startswith("provider_") and record.get("verified") is not True:
             return None

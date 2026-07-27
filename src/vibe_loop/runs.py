@@ -76,6 +76,7 @@ CANDIDATE_BASE_ANCHOR_RECORD_TYPE = "candidate_base_anchor"
 GATE_RESULT_RECORD_TYPE = "gate_result"
 REVIEW_STARTED_RECORD_TYPE = "review_started"
 REVIEW_VERDICT_RECORD_TYPE = "review_verdict"
+SUPERVISOR_INCONSISTENT_RECORD_TYPE = "supervisor_inconsistent"
 REVIEW_WAIT_INCOMPLETE_RECORD_TYPE = "review_wait_incomplete"
 REVIEW_BUDGET_RECORD_TYPE = "review_budget"
 CONTINUATION_FALLBACK_RECORD_TYPE = "continuation_fallback"
@@ -162,6 +163,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         GATE_RESULT_RECORD_TYPE,
         REVIEW_STARTED_RECORD_TYPE,
         REVIEW_VERDICT_RECORD_TYPE,
+        SUPERVISOR_INCONSISTENT_RECORD_TYPE,
         REVIEW_WAIT_INCOMPLETE_RECORD_TYPE,
         REVIEW_BUDGET_RECORD_TYPE,
         CONTINUATION_FALLBACK_RECORD_TYPE,
@@ -875,6 +877,21 @@ class RunLifecycleEvent:
     ) -> RunLifecycleEvent:
         return cls(
             record_type=REVIEW_VERDICT_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload=payload,
+        )
+
+    @classmethod
+    def supervisor_inconsistent(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        payload: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=SUPERVISOR_INCONSISTENT_RECORD_TYPE,
             run_id=run_id,
             task_id=task_id,
             payload=payload,
@@ -1990,7 +2007,8 @@ class RunStore:
                         ordinal = record.get("pass_ordinal")
                         if (
                             recorded_family == family
-                            and record.get("verdict") in {"approve", "findings"}
+                            and record.get("verdict")
+                            in {"approve", "clean", "findings"}
                             and isinstance(ordinal, int)
                             and not isinstance(ordinal, bool)
                             and ordinal > 0

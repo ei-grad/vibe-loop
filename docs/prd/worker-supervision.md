@@ -330,6 +330,32 @@ tool arguments and output, commands, credentials, and review prose remain
 opaque and are neither persisted nor used as identifiers. Unknown/custom
 envelope types preserve the existing ignored-record behavior.
 
+Runtime-owned review emits a separate bounded `review_verdict` control
+projection. It carries the candidate fingerprint, pass identity, reviewer
+role/purpose, actual resolved provider/model/effort provenance, canonical
+`clean | findings | blocked` verdict, bounded severity counts, duration, and
+normalized usage. It excludes review prose. Integration requires `clean`
+evidence for the exact candidate. Missing or stale evidence cannot authorize
+integration, and any `findings` or `blocked` verdict permanently fences that
+candidate fingerprint; remediation must produce a new fingerprint.
+
+The reviewer route is resolved from the selected profile and command
+configuration before launch and compared with the frozen run contract. A
+profile, provider, model, effort, or reviewer-role mismatch emits
+`supervisor_inconsistent` with bounded route metadata and fails closed before
+reviewer execution. Agent narration cannot supply, repair, or override launch
+identity.
+
+`last_activity_at` is observation evidence, separate from process-control
+timeouts. Status consumers may compare it with an operator-defined warning
+threshold to classify recent activity, an in-flight tool or gate, quiet work,
+or missing activity. Crossing that threshold does not authorize automatic kill
+or restart; fenced process identity and child-operation evidence remain
+mandatory. A `work_blocked` record becomes an actionable steward wake only for
+`needs_decision`, `authorization`, or `non_retryable_policy`. Transient
+dependency, gate, and provider progress remains observational, while verified
+provider quota/account-wall events retain their existing typed authority.
+
 Records must be additive — unknown types are ignored on read, consistent with
 the existing invalid JSON line tolerance. Each record carries `schema_version`,
 `record_type`, `occurred_at`, and a type-specific payload. Records for the same

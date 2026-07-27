@@ -2025,6 +2025,36 @@ class AgentProfileRoutingTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentResolutionError, "cannot safely receive"):
             model_only.require_reviewer_command()
 
+    def test_reviewer_model_must_be_bound_by_the_explicit_command(self) -> None:
+        missing = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'model = "gpt-5.6-terra"\n'
+            'command = "codex exec review {prompt}"\n'
+        ).agent_profiles["review"]
+        with self.assertRaisesRegex(AgentResolutionError, "cannot receive.*model"):
+            missing.require_reviewer_command()
+
+        embedded = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'model = "gpt-5.6-terra"\n'
+            'command = "codex exec review -m gpt-5.6-terra {prompt}"\n'
+        ).agent_profiles["review"]
+        with self.assertRaisesRegex(AgentResolutionError, "already embeds"):
+            embedded.require_reviewer_command()
+
+        bound = self._load_with_both_clis(
+            "[agent.profiles.review]\n"
+            'kind = "codex"\n'
+            'model = "gpt-5.6-terra"\n'
+            'command = "codex exec review -m {model} {prompt}"\n'
+        ).agent_profiles["review"]
+        self.assertEqual(
+            bound.require_reviewer_command(),
+            "codex exec review -m {model} {prompt}",
+        )
+
     def test_custom_reviewer_keeps_placeholder_validation(self) -> None:
         custom = self._load_with_both_clis(
             "[agent.profiles.review]\n"

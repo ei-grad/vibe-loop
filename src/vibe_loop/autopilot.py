@@ -1570,10 +1570,9 @@ def summarize_non_closures(
         if run_id not in selected_run_ids:
             continue
         identity = (run_id, str(record.get("task_id") or ""))
-        if (
-            record.get("record_type") == REVIEW_VERDICT_RECORD_TYPE
-            and record.get("verdict") == "approve"
-        ):
+        if record.get("record_type") == REVIEW_VERDICT_RECORD_TYPE and record.get(
+            "verdict"
+        ) in {"approve", "clean"}:
             approved.add(identity)
         elif record.get("record_type") == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
             closed.add(identity)

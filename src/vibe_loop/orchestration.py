@@ -68,6 +68,7 @@ CANDIDATE_BASE_ANCHOR_OUTCOMES = (
 )
 GATE_EXIT_CLASSES = ("passed", "failed", "candidate_changed", "execution_error")
 REVIEW_VERDICTS = ("approve", "findings", "error")
+REVIEW_CONTROL_VERDICTS = ("clean", "findings", "blocked")
 REVIEW_RETRY_CLASSIFICATIONS = ("ok", "transient", "limit_wall", "timeout", "fatal")
 MALFORMED_REVIEW_OUTPUT_MAX_CHARS = 4096
 # ``redact_evidence_text`` is superlinear in line length, so reviewer stdout is
@@ -255,6 +256,21 @@ class GateExecutionError(RuntimeError):
 
 class ReviewExecutionError(RuntimeError):
     pass
+
+
+class ReviewControlFenceError(ReviewExecutionError):
+    def __init__(self, reason_class: str) -> None:
+        self.reason_class = reason_class
+        super().__init__(f"review control fence rejected integration: {reason_class}")
+
+
+class ReviewRouteMismatchError(ReviewExecutionError):
+    def __init__(self, mismatch_fields: Sequence[str]) -> None:
+        self.mismatch_fields = tuple(mismatch_fields)
+        super().__init__(
+            "reviewer route differs from the resolved run contract: "
+            + ", ".join(self.mismatch_fields)
+        )
 
 
 class ReviewClosureUnavailable(ReviewExecutionError):
@@ -1751,6 +1767,7 @@ class ReviewRouter:
         max_initial_passes: int,
         max_closure_passes: int,
         concurrency: ReviewConcurrencyBudget,
+        expected_route: Mapping[str, object] | None = None,
         stage_machine: RunLifecycleStateMachine | None = None,
         limit_wall_patterns: Sequence[str] | None = None,
         executor: ReviewExecutor = subprocess.run,
@@ -1772,6 +1789,7 @@ class ReviewRouter:
         self.max_initial_passes = max_initial_passes
         self.max_closure_passes = max_closure_passes
         self.concurrency = concurrency
+        self.expected_route = dict(expected_route or {})
         self.stage_machine = stage_machine
         self.limit_wall_patterns = limit_wall_patterns
         self.executor = executor
@@ -1875,7 +1893,10 @@ class ReviewRouter:
                 pass_ordinal=pass_ordinal,
                 limit=limit,
             )
-            self._transition_from_review(result)
+            self._transition_from_review(
+                result,
+                candidate_fingerprint=request.candidate.fingerprint,
+            )
             return result
         assert malformed is not None
         raise malformed
@@ -1911,6 +1932,12 @@ class ReviewRouter:
             profile=self.reviewer_profile,
         )
         route = self._route_payload()
+        self._require_expected_route(
+            request,
+            route=route,
+            pass_ordinal=pass_ordinal,
+            attempt_ordinal=attempt_ordinal,
+        )
         # Reserve the phase budget before claiming a review pass, so a denial
         # launches no reviewer process and consumes no review-budget slot.
         budget_reservation = self._reserve_review_budget(request, route)
@@ -2460,7 +2487,7 @@ class ReviewRouter:
                 record.get("record_type") != "review_verdict"
                 or record.get("run_id") != self.run_id
                 or record.get("task_id") != self.task_id
-                or record.get("verdict") not in {"approve", "findings"}
+                or record.get("verdict") not in {"approve", "clean", "findings"}
                 or not isinstance(route, Mapping)
                 or route.get("provider") != provider
             ):
@@ -2514,7 +2541,7 @@ class ReviewRouter:
                     "attempt_ordinal": attempt_ordinal,
                     "candidate_fingerprint": request.candidate.fingerprint,
                     "phase": request.phase,
-                    "route": dict(route),
+                    "route": _review_route_projection(route),
                     "session_id": continuation.session_id,
                     "session_id_source": continuation.session_id_source,
                     "continuation_ordinal": continuation.continuation_ordinal,
@@ -2743,7 +2770,7 @@ class ReviewRouter:
                 record.get("record_type") == "review_verdict"
                 and record.get("run_id") == self.run_id
                 and record.get("task_id") == self.task_id
-                and record.get("verdict") in {"approve", "findings"}
+                and record.get("verdict") in {"approve", "clean", "findings"}
             ):
                 recorded_kind = record.get("pass_kind")
                 family = (
@@ -2836,14 +2863,29 @@ class ReviewRouter:
         request: ReviewRequest,
         route: Mapping[str, object],
     ) -> dict[str, object]:
+        control_verdict = {
+            "approve": "clean",
+            "findings": "findings",
+            "error": "blocked",
+        }[result.verdict]
+        severity_counts = {
+            severity: sum(finding.severity == severity for finding in result.findings)
+            for severity in FINDING_SEVERITIES
+        }
         payload: dict[str, object] = {
+            "telemetry_schema_version": 1,
+            "role": "reviewer",
+            "purpose": "independent_review",
             "pass_kind": result.pass_kind,
             "pass_ordinal": result.pass_ordinal,
             "attempt_ordinal": result.attempt_ordinal,
             "candidate_fingerprint": request.candidate.fingerprint,
-            "verdict": result.verdict,
+            "verdict": control_verdict,
+            "engine_verdict": result.verdict,
+            "control_verdict": control_verdict,
             "output_classification": "parsed",
             "findings_count": len(result.findings),
+            "severity_counts": severity_counts,
             "session_id": result.session_id,
             "session_id_source": result.session_id_source,
             "continuation_ordinal": result.continuation_ordinal,
@@ -2853,7 +2895,7 @@ class ReviewRouter:
             "nested_launches": result.nested_launches,
             "duration_seconds": result.duration_seconds,
             "phase": request.phase,
-            "route": dict(route),
+            "route": _review_route_projection(route),
             "stats": result.usage.to_stats(
                 phase=request.phase,
                 wall_time_seconds=result.duration_seconds,
@@ -2872,6 +2914,8 @@ class ReviewRouter:
             self.reviewer.executable_kind or self.reviewer.agent_kind,
         )
         payload: dict[str, object] = {
+            "role": "reviewer",
+            "purpose": "independent_review",
             "profile": self.reviewer_profile,
             "provider": provider or "unknown",
             "model": self.reviewer.model,
@@ -2885,6 +2929,46 @@ class ReviewRouter:
             ),
         }
         return payload
+
+    def _require_expected_route(
+        self,
+        request: ReviewRequest,
+        *,
+        route: Mapping[str, object],
+        pass_ordinal: int,
+        attempt_ordinal: int,
+    ) -> None:
+        if not self.expected_route:
+            return
+        compared_fields = ("role", "profile", "provider", "model", "effort")
+        mismatch_fields = tuple(
+            field
+            for field in compared_fields
+            if self.expected_route.get(field) != route.get(field)
+        )
+        if not mismatch_fields:
+            return
+        expected_projection = _review_route_projection(self.expected_route)
+        observed_projection = _review_route_projection(route)
+        self._append_event(
+            "supervisor_inconsistent",
+            {
+                "reason_class": "reviewer_route_mismatch",
+                "candidate_fingerprint": request.candidate.fingerprint,
+                "pass_kind": request.pass_kind,
+                "pass_ordinal": pass_ordinal,
+                "attempt_ordinal": attempt_ordinal,
+                "mismatch_fields": list(mismatch_fields),
+                "expected_route": {
+                    field: expected_projection.get(field) for field in compared_fields
+                },
+                "observed_route": {
+                    field: observed_projection.get(field) for field in compared_fields
+                },
+            },
+        )
+        self._fail_stage_for_result("fatal")
+        raise ReviewRouteMismatchError(mismatch_fields)
 
     def _reviewer_provenance(
         self,
@@ -2951,13 +3035,24 @@ class ReviewRouter:
             stage, reason=f"review_started:{request.pass_kind}"
         )
 
-    def _transition_from_review(self, result: ReviewResult) -> None:
+    def _transition_from_review(
+        self,
+        result: ReviewResult,
+        *,
+        candidate_fingerprint: str,
+    ) -> None:
         if self.stage_machine is None:
             return
+        eligible_for_integration = result.approved and not self.ledger.open()
+        if eligible_for_integration:
+            require_candidate_review_clear(
+                self.run_store.read_records(),
+                run_id=self.run_id,
+                task_id=self.task_id,
+                candidate_fingerprint=candidate_fingerprint,
+            )
         destination = (
-            RunStage.INTEGRATION
-            if result.approved and not self.ledger.open()
-            else RunStage.REMEDIATION
+            RunStage.INTEGRATION if eligible_for_integration else RunStage.REMEDIATION
         )
         self.stage_machine.transition(
             destination,
@@ -5701,7 +5796,12 @@ class RunContractResolver:
             primary_source = contributors[-1]
 
         implementer = {
-            **route_payload(agent_selection.config, agent_selection.profile),
+            **route_payload(
+                agent_selection.config,
+                agent_selection.profile,
+                role="implementer",
+                purpose="implementation",
+            ),
             "selection_source": agent_selection.source,
         }
         reviewer_profile, reviewer_selection_source, unavailable_profiles = (
@@ -5768,7 +5868,12 @@ class RunContractResolver:
                 }
             )
 
-        reviewer_route = route_payload(reviewer_agent, reviewer_profile)
+        reviewer_route = route_payload(
+            reviewer_agent,
+            reviewer_profile,
+            role="reviewer",
+            purpose="independent_review",
+        )
         implementer_provider = str(implementer["provider"])
         reviewer_provider = str(reviewer_route["provider"])
         if "unknown" in {implementer_provider, reviewer_provider}:
@@ -6872,19 +6977,111 @@ def config_source_identity(
     return {"kind": "config", "id": source_id, "digest": digest}
 
 
-def route_payload(agent: AgentConfig, profile: str) -> dict[str, object]:
+def route_payload(
+    agent: AgentConfig,
+    profile: str,
+    *,
+    role: str = "",
+    purpose: str = "",
+) -> dict[str, object]:
     provider = agent_command_provider(
         agent.command or "",
         agent.executable_kind or agent.agent_kind,
     )
     command_key = f"agent.profiles.{profile}.command" if profile else "agent.command"
-    return {
+    payload: dict[str, object] = {
         "profile": profile,
         "provider": provider or "unknown",
         "model": agent.model,
         "effort": agent.effort,
         "command_key": command_key,
     }
+    if role:
+        payload["role"] = role
+    if purpose:
+        payload["purpose"] = purpose
+    return payload
+
+
+def require_candidate_review_clear(
+    records: Sequence[Mapping[str, object]],
+    *,
+    run_id: str,
+    task_id: str,
+    candidate_fingerprint: str,
+) -> None:
+    clean_observed = False
+    for record in records:
+        if (
+            record.get("run_id") != run_id
+            or record.get("task_id") != task_id
+            or record.get("candidate_fingerprint") != candidate_fingerprint
+        ):
+            continue
+        if (
+            record.get("record_type") == "supervisor_inconsistent"
+            and record.get("reason_class") == "reviewer_route_mismatch"
+        ):
+            raise ReviewControlFenceError("reviewer_route_mismatch")
+        if record.get("record_type") != "review_verdict":
+            continue
+        control_verdict = record.get("control_verdict")
+        if control_verdict not in REVIEW_CONTROL_VERDICTS:
+            control_verdict = {
+                "approve": "clean",
+                "findings": "findings",
+                "error": "blocked",
+            }.get(record.get("verdict"))
+        if control_verdict in {"findings", "blocked"}:
+            raise ReviewControlFenceError(f"review_verdict_{control_verdict}")
+        if control_verdict == "clean":
+            clean_observed = True
+    if not clean_observed:
+        raise ReviewControlFenceError("review_verdict_missing")
+
+
+def _review_route_projection(route: Mapping[str, object]) -> dict[str, object]:
+    provider = route.get("provider")
+    effort = route.get("effort")
+    return {
+        "role": "reviewer" if route.get("role") == "reviewer" else "unknown",
+        "purpose": (
+            "independent_review"
+            if route.get("purpose") == "independent_review"
+            else "unknown"
+        ),
+        "profile": _bounded_route_reference(route.get("profile")),
+        "provider": provider if provider in {"claude", "codex"} else "unknown",
+        "model": _bounded_route_reference(route.get("model")),
+        "effort": (
+            effort if effort in {"minimal", "low", "medium", "high", "xhigh"} else None
+        ),
+        "command_key": _bounded_route_reference(route.get("command_key")),
+        "model_source": _bounded_route_reference(route.get("model_source")),
+        "effort_source": _bounded_route_reference(route.get("effort_source")),
+    }
+
+
+def _bounded_route_reference(value: object) -> str:
+    if (
+        isinstance(value, str)
+        and len(value.encode("utf-8")) <= 160
+        and re.fullmatch(r"[A-Za-z0-9_.:/\[\]-]*", value)
+        and not any(
+            marker in value.casefold()
+            for marker in (
+                "credential",
+                "fencing",
+                "password",
+                "prompt",
+                "secret",
+                "token",
+                "transcript",
+            )
+        )
+    ):
+        return value
+    return "unknown"
 
 
 def sha256_digest(value: object) -> str:

@@ -186,6 +186,17 @@ audit, and replace an existing cursor only as an explicit reset action. Keep
 harness-specific wake signals, such as completion of one of your own subagents,
 in the agent environment.
 
+Typed agent activity is observation, not general wake input. Do not wake for
+ordinary checkpoints, gate progress, reviewer verdicts, completion, or
+transient provider/dependency errors. Treat `work_blocked` as
+`operator_action_required` only when its typed reason is `needs_decision`,
+`authorization`, or `non_retryable_policy`; verified provider quota/account
+walls retain their existing actionable kinds. Use `last_activity_at` to report
+quiet or missing activity, never as authority to kill or restart without fenced
+process and child-operation evidence. The repository's
+`docs/prd/worker-supervision.md#prd-wrk-009-runtime-lifecycle-events` section
+owns the product contract.
+
 ## Investigate Loop Termination
 
 Answer from evidence, not process absence alone.

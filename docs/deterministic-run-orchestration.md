@@ -298,9 +298,12 @@ New record types:
   exit class, duration, log reference, evidence digest.
 - `candidate_recorded` — head commit, base main, changed paths summary,
   declaration source (`worker_command` | `derived`).
-- `review_started` / `review_verdict` — pass kind (`initial` |
-  `closure:<n>`), route (provider/model/effort/source), session identity and
-  continuation info, verdict, findings count, usage stats.
+- `review_started` / `review_verdict` — bounded review identity and control
+  evidence. [PRD-WRK-009](prd/worker-supervision.md#prd-wrk-009-runtime-lifecycle-events)
+  owns the exact telemetry, privacy, and integration-fence contract.
+- `supervisor_inconsistent` — bounded runtime-contract mismatch evidence;
+  reviewer-route mismatch behavior is owned by
+  [PRD-WRK-009](prd/worker-supervision.md#prd-wrk-009-runtime-lifecycle-events).
 - `finding_recorded` — one entry per finding: stable finding id, severity,
   summary, files, state (`open` | `remediated` | `accepted` | `rejected`),
   closure evidence reference. The set of these records for a run is the

@@ -109,6 +109,7 @@ from vibe_loop.orchestration import (
     inject_claude_session,
     inject_provider_continuation,
     plan_session_continuation,
+    require_candidate_review_clear,
     run_configured_command,
     settlement_intent,
 )
@@ -3943,6 +3944,9 @@ class VibeRunner:
                 else 0
             ),
             concurrency=self._review_concurrency,
+            expected_route=(
+                reviewer_contract if isinstance(reviewer_contract, Mapping) else None
+            ),
             stage_machine=stage_machine,
             limit_wall_patterns=self.config.supervision.limit_wall_patterns or None,
             budget=self.phase_budget,
@@ -3985,6 +3989,12 @@ class VibeRunner:
                 prior_findings=open_findings,
             )
 
+        require_candidate_review_clear(
+            self.run_store.read_records(),
+            run_id=run_id,
+            task_id=task.task_id,
+            candidate_fingerprint=gate_summary.candidate.fingerprint,
+        )
         integration = contract.get("integration")
         if not isinstance(integration, Mapping) or not integration.get("enabled"):
             stage_machine.fail(
@@ -8435,7 +8445,7 @@ def reviewer_session_from_records(
             continue
         if record.get("run_id") != run_id or record.get("task_id") != task_id:
             continue
-        if record.get("verdict") != "approve":
+        if record.get("verdict") not in {"approve", "clean"}:
             continue
         session_id = exportable_session_id(record, run_id=run_id)
     return session_id

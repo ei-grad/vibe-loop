@@ -49,11 +49,13 @@ from vibe_loop.orchestration import (
     ReviewBudgetExhausted,
     ReviewClosureUnavailable,
     ReviewConcurrencyBudget,
+    ReviewControlFenceError,
     ReviewDelegationPolicyError,
     ReviewExecutionError,
     ReviewFinding,
     ReviewLimitWallError,
     ReviewOutputMalformed,
+    ReviewRouteMismatchError,
     ReviewRouter,
     ReviewStageResultError,
     ReviewWaitIncomplete,
@@ -76,6 +78,7 @@ from vibe_loop.orchestration import (
     inject_provider_continuation,
     plan_session_continuation,
     provider_capabilities,
+    require_candidate_review_clear,
 )
 from vibe_loop.runner import VibeRunner
 from vibe_loop.locks import (
@@ -371,6 +374,8 @@ class RunContractResolverTests(unittest.TestCase):
         reviewer_route = contract.payload["reviewer"]
         assert isinstance(reviewer_route, dict)
         self.assertEqual(reviewer_route["provider"], "codex")
+        self.assertEqual(reviewer_route["role"], "reviewer")
+        self.assertEqual(reviewer_route["purpose"], "independent_review")
         self.assertIsNone(reviewer_route["model"])
         self.assertIsNone(reviewer_route["effort"])
 
@@ -4837,6 +4842,285 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertNotIn("--effort", str(observed["command"]))
         self.assertEqual(observed["cwd"], self.repo)
 
+    def test_resolved_route_mismatch_is_typed_and_prevents_launch(self) -> None:
+        launches: list[str] = []
+        expected = {
+            "role": "reviewer",
+            "profile": "review",
+            "provider": "codex",
+            "model": "review-model",
+            "effort": "high",
+        }
+        cases = {
+            "role": "implementer",
+            "profile": "other",
+            "provider": "claude",
+            "model": "sk-secret-canary",
+            "effort": "low",
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                store = RunStore(self.repo / f"{field}.jsonl")
+                router = ReviewRouter(
+                    reviewer=self.agent("codex"),
+                    reviewer_profile="review",
+                    run_store=store,
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    worktree=self.repo,
+                    policy_references=("REVIEW.md",),
+                    max_initial_passes=1,
+                    max_closure_passes=0,
+                    concurrency=ReviewConcurrencyBudget(1),
+                    expected_route={**expected, field: value},
+                    executor=lambda command, **_kwargs: launches.append(command),
+                )
+
+                with self.assertRaises(ReviewRouteMismatchError) as raised:
+                    router.review(self.gates)
+
+                self.assertEqual(raised.exception.mismatch_fields, (field,))
+                record = store.read_records()[-1]
+                self.assertEqual(record["record_type"], "supervisor_inconsistent")
+                self.assertEqual(record["reason_class"], "reviewer_route_mismatch")
+                self.assertEqual(
+                    record["candidate_fingerprint"], self.candidate.fingerprint
+                )
+                self.assertEqual(record["mismatch_fields"], [field])
+                self.assertNotIn("command", record)
+                self.assertNotIn("sk-secret-canary", store.path.read_text())
+        self.assertEqual(launches, [])
+
+    def test_verdict_telemetry_is_bounded_control_metadata(self) -> None:
+        def execute(command: str, **_kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [
+                            {
+                                "id": "F1",
+                                "severity": "P1",
+                                "summary": "first",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["1"],
+                                "state": "open",
+                            },
+                            {
+                                "id": "F2",
+                                "severity": "P3",
+                                "summary": "second",
+                                "evidence": "reproduction",
+                                "files": ["src/example.py"],
+                                "lines": ["2"],
+                                "state": "open",
+                            },
+                        ],
+                    }
+                ),
+            )
+
+        result = self.router("codex", execute).review(self.gates)
+
+        self.assertEqual(result.verdict, "findings")
+        verdict = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(verdict["control_verdict"], "findings")
+        self.assertEqual(verdict["verdict"], "findings")
+        self.assertEqual(verdict["engine_verdict"], "findings")
+        self.assertEqual(verdict["role"], "reviewer")
+        self.assertEqual(verdict["purpose"], "independent_review")
+        self.assertEqual(
+            verdict["severity_counts"],
+            {"P0": 0, "P1": 1, "P2": 0, "P3": 1},
+        )
+        self.assertNotIn("summary", verdict)
+        self.assertNotIn("evidence", verdict)
+
+    def test_provider_qualified_model_is_preserved_in_review_route(self) -> None:
+        model = "openrouter/anthropic/claude-3.7"
+        reviewer = dataclasses.replace(self.agent("codex"), model=model)
+        router = ReviewRouter(
+            reviewer=reviewer,
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=0,
+            concurrency=ReviewConcurrencyBudget(1),
+            executor=lambda command, **_kwargs: subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps({"verdict": "approve", "findings": []}),
+            ),
+        )
+
+        router.review(self.gates)
+
+        records = self.store.read_records()
+        started = next(
+            record for record in records if record["record_type"] == "review_started"
+        )
+        verdict = next(
+            record for record in records if record["record_type"] == "review_verdict"
+        )
+        self.assertEqual(started["route"]["model"], model)
+        self.assertEqual(verdict["route"]["model"], model)
+
+    def test_candidate_review_fence_rejects_stale_and_adverse_verdicts(self) -> None:
+        current = self.candidate.fingerprint
+        stale = "sha256:" + "d" * 64
+        clean = {
+            "record_type": "review_verdict",
+            "run_id": "run-1",
+            "task_id": "TASK-01",
+            "candidate_fingerprint": current,
+            "control_verdict": "clean",
+        }
+
+        require_candidate_review_clear(
+            [clean],
+            run_id="run-1",
+            task_id="TASK-01",
+            candidate_fingerprint=current,
+        )
+        cases = (
+            (
+                [{**clean, "candidate_fingerprint": stale}],
+                "review_verdict_missing",
+            ),
+            (
+                [{**clean, "control_verdict": "findings"}],
+                "review_verdict_findings",
+            ),
+            (
+                [{**clean, "control_verdict": "blocked"}, clean],
+                "review_verdict_blocked",
+            ),
+            (
+                [
+                    clean,
+                    {
+                        "record_type": "supervisor_inconsistent",
+                        "run_id": "run-1",
+                        "task_id": "TASK-01",
+                        "candidate_fingerprint": current,
+                        "reason_class": "reviewer_route_mismatch",
+                    },
+                ],
+                "reviewer_route_mismatch",
+            ),
+        )
+        for records, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaises(ReviewControlFenceError) as raised:
+                    require_candidate_review_clear(
+                        records,
+                        run_id="run-1",
+                        task_id="TASK-01",
+                        candidate_fingerprint=current,
+                    )
+                self.assertEqual(raised.exception.reason_class, reason)
+
+    def test_unchanged_findings_candidate_never_transitions_to_integration(
+        self,
+    ) -> None:
+        transitions: list[dict[str, object]] = []
+        machine = RunLifecycleStateMachine(
+            lambda transition: transitions.append(transition.to_payload())
+        )
+        for stage in (
+            RunStage.ACTIVATION,
+            RunStage.WORKSPACE,
+            RunStage.IMPLEMENTING,
+            RunStage.CANDIDATE,
+            RunStage.GATES,
+        ):
+            machine.transition(stage, reason="setup")
+        outputs = iter(
+            (
+                {
+                    "verdict": "findings",
+                    "findings": [
+                        {
+                            "id": "F1",
+                            "severity": "P1",
+                            "summary": "candidate bypass",
+                            "evidence": "reproduction",
+                            "files": ["src/example.py"],
+                            "lines": ["1"],
+                            "state": "open",
+                        }
+                    ],
+                },
+                {
+                    "verdict": "approve",
+                    "findings": [
+                        {
+                            "id": "F1",
+                            "severity": "P1",
+                            "summary": "candidate bypass",
+                            "evidence": "focused check passes",
+                            "files": ["src/example.py"],
+                            "lines": ["1"],
+                            "state": "remediated",
+                        }
+                    ],
+                },
+            )
+        )
+
+        def execute(command: str, **_kwargs):
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=json.dumps(next(outputs)),
+            )
+
+        router = ReviewRouter(
+            reviewer=self.agent("codex"),
+            reviewer_profile="review",
+            run_store=self.store,
+            run_id="run-1",
+            task_id="TASK-01",
+            worktree=self.repo,
+            policy_references=("REVIEW.md",),
+            max_initial_passes=1,
+            max_closure_passes=1,
+            concurrency=ReviewConcurrencyBudget(1),
+            stage_machine=machine,
+            executor=execute,
+        )
+        router.review(self.gates)
+        machine.transition(RunStage.CANDIDATE, reason="unchanged_remediation")
+        machine.transition(RunStage.GATES, reason="unchanged_regate")
+
+        with self.assertRaises(ReviewControlFenceError) as raised:
+            router.review(self.gates, pass_kind="closure:1")
+
+        self.assertEqual(
+            raised.exception.reason_class,
+            "review_verdict_findings",
+        )
+        self.assertEqual(machine.stage, RunStage.CLOSURE)
+        self.assertNotIn(
+            "integration",
+            [
+                transition["to_stage"]
+                for transition in transitions
+                if transition["accepted"]
+            ],
+        )
+
     def test_exact_codex_review_route_rejects_before_provider_disclosure(self) -> None:
         codex_home = self.repo / "codex-home"
         codex_home.mkdir()
@@ -5999,7 +6283,7 @@ class ReviewRouterTests(unittest.TestCase):
             for record in records
             if record["record_type"] == "review_verdict"
             and record["pass_kind"] == "closure:1"
-            and record["verdict"] == "approve"
+            and record["verdict"] == "clean"
         )
         self.assertFalse(closure_verdict["continuation_resumed"])
         self.assertFalse(closure_verdict["stats"]["session_continuation"])

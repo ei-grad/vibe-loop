@@ -78,6 +78,21 @@ def test_actionable_allowlist_is_small_and_explicit() -> None:
             {"record_type": "provider_account_wall", "verified": True},
             "provider_account_wall",
         ),
+        (
+            {"record_type": "work_blocked", "reason_class": "needs_decision"},
+            "operator_action_required",
+        ),
+        (
+            {"record_type": "work_blocked", "reason_class": "authorization"},
+            "operator_action_required",
+        ),
+        (
+            {
+                "record_type": "work_blocked",
+                "reason_class": "non_retryable_policy",
+            },
+            "operator_action_required",
+        ),
     ],
 )
 def test_journal_record_allowlisting(
@@ -107,6 +122,9 @@ def test_journal_record_allowlisting(
         {"record_type": "provider_quota_wall", "verified": False},
         {"record_type": "provider_account_wall"},
         {"record_type": "autopilot_disk_health", "status": "ok"},
+        {"record_type": "work_blocked", "reason_class": "provider_error"},
+        {"record_type": "work_blocked", "reason_class": "transient_dependency"},
+        {"record_type": "gate_result", "exit_class": "failed"},
     ],
 )
 def test_journal_record_excludes_non_actionable_events(

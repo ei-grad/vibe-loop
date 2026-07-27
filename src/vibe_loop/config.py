@@ -674,6 +674,25 @@ class AgentConfig:
                 "repository-permitted command with explicit {model}/{effort} "
                 "delivery, or unset the first-class route settings."
             )
+        if (
+            self.command
+            and self.command_source == "explicit"
+            and self.model is not None
+        ):
+            setting = (
+                f"agent.profiles.{self.profile_name}" if self.profile_name else "agent"
+            )
+            if command_embeds_native_model(self.command):
+                raise AgentResolutionError(
+                    f"{setting}.command already embeds a provider-specific model "
+                    f"while {setting}.model is set; remove the embedded flag and "
+                    "use {model}, or unset the first-class setting."
+                )
+            if not command_template_uses_field(self.command, "model"):
+                raise AgentResolutionError(
+                    f"{setting}.command cannot receive {setting}.model; add a "
+                    "validated {model} placeholder or unset the first-class setting."
+                )
         return self.require_command()
 
     def require_effort_delivery(self, key: str) -> None:
@@ -2288,6 +2307,36 @@ def command_embeds_native_effort(command: str) -> bool:
                 "model_reasoning_effort",
                 "reasoning_effort",
             }
+        ):
+            return True
+    return False
+
+
+def command_embeds_native_model(command: str) -> bool:
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return False
+    for index, token in enumerate(argv):
+        if token in {"--model", "-m"}:
+            if index + 1 < len(argv) and "{model}" not in argv[index + 1]:
+                return True
+            continue
+        if token.startswith("--model="):
+            if "{model}" not in token.split("=", 1)[1]:
+                return True
+            continue
+        if token in {"-c", "--config"} and index + 1 < len(argv):
+            token = argv[index + 1]
+        elif token.startswith(("-c=", "--config=")):
+            token = token.split("=", 1)[1]
+        else:
+            continue
+        key, separator, value = token.partition("=")
+        if (
+            separator
+            and "{model}" not in value
+            and key.replace("-", "_") in {"model", "model_id"}
         ):
             return True
     return False
