@@ -30,49 +30,63 @@ not revert peer or user changes.
 
 Assume an unattended session. Do not stop voluntarily: keep a background wait
 running so you wake on the next UTC 30-minute cycle boundary or when
-`run-until-done` exits, then run the cycle and continue. Stop only on explicit
-instruction or session end.
+`run-until-done` exits, then run the operator cycle below and continue. Stop
+only on explicit instruction or session end.
 
-## Cycle
+## Operator Cycle
 
-Each supervisor cycle performs these native steps without requiring
+After every wake:
+
+1. State the exact `wake_reason` and `wake_summary`.
+2. Run `vibe-loop autopilot status --json`, `vibe-loop doctor`, `vibe-loop
+   workers`, and `vibe-loop main-integration status`. Cross-check the recorded
+   autopilot and `run-until-done` process identities against actual liveness.
+3. Inspect the latest cycle actions and their typed worktree, disk, landed
+   summary, troubleshooting, and planning records. Report their conclusions;
+   do not rerun native summary, troubleshooting, or planning outside the
+   supervisor.
+4. For `pid`, a missing supervisor, or an inconsistent state, use
+   [Investigate Loop Termination](#investigate-loop-termination), correct only
+   the evidenced cause, and relaunch through
+   [Launch The Supervisor](#launch-the-supervisor) when its preconditions hold.
+   For `deadline` or `runtime_event`, address recorded blockers or confirm that
+   the supervisor continues to advance. Treat `message` as a user redirect
+   before taking another action.
+5. Resume [Wake / Wait](#wake--wait) unless an explicit stop instruction or a
+   blocker requires a status report.
+
+## Native Supervisor Cycle
+
+The
+[Autopilot PRD](../../../../docs/prd/autopilot.md#prd-aut-012-configuration-free-generic-cycle)
+owns the native generic-cycle product contract. The following is the
+operator-facing map of the shipped behavior, not a second contract account.
+Each supervisor cycle provides these behaviors without requiring
 repository-specific maintenance commands:
 
-1. **Inspect and recover safely**: collect queue, worker, lock, git, and
-   supervisor status; settle only terminal stale locks that satisfy the runtime's
-   ownership and task-source checks; refresh required upstream-sync evidence.
-2. **Disposition worktrees**: gather mechanical ownership, liveness, dirty-state,
-   and merged-state evidence. The default `report-only` policy journals eligible
-   candidates without mutation. An explicit `reap` policy asks the read-only
-   analysis agent for a reasoned keep-or-reap decision, then code applies the
-   ownership, liveness, cleanliness, merged-state, and task-state guardrails
-   before any removal.
-3. **Check disk capacity**: measure the filesystem that holds native worker
-   worktrees and build output. Warnings remain observations; a critical byte or
-   inode verdict blocks new launches without terminating existing workers.
-4. **Summarize what landed**: derive the `main` commit span from the previous
-   recorded cycle anchor to the current ref and append a bounded read-only
-   summary. Bootstrap, unchanged, unavailable, and truncated spans remain
-   explicit.
-5. **Troubleshoot recent runs**: inspect a bounded, record-aware journal tail for
-   recurring task failures, exhausted restart budgets, and persistent workspace
-   claim mismatches. Journal observations and blockers without killing
-   processes, changing workspaces, or mutating the task source.
-6. **Run explicit hooks**: apply any repository-authored health hook as an
-   additional gate. Explicit summary and troubleshoot hooks augment their native
-   steps; an explicit planning hook overrides native planning.
-7. **Plan when the queue is shallow**: if no blocker or planning budget/backoff
-   prevents it, pass bounded queue, worker, and repository-planning evidence to
-   the read-only analysis agent. Validate its structured plan-or-no-plan
-   decision. Only a separately supervised read-write worker launched through
-   the configured worker command may author tasks. Re-read the authoritative
-   task source afterward; the supervisor never edits it directly. Invalid
-   decisions fail closed, and planning launches, outcomes, provider limits,
-   worker lifecycle, and before/after task identities are journaled.
-8. **Dispatch or wait**: re-collect status after planning, honor blockers,
-   dispatch floors, provider pauses, and outcome budgets, then observe an
-   existing child or launch `run-until-done`. Record the child identity before
-   waiting on it and record its exit and dispatch count afterward.
+1. It collects queue, worker, lock, git, and supervisor status; performs only
+   evidence-gated stale-lock settlement; refreshes required upstream-sync
+   evidence; and runs configured health and task-source-health hooks as
+   additional preflight gates.
+2. It inspects worktree ownership, liveness, dirty state, and merge state. The
+   default `report-only` policy records candidates without mutation. Explicit
+   `reap` uses a reasoned decision from the read-only analysis agent, while code
+   enforces the ownership, liveness, cleanliness, merge, and task-state
+   guardrails before removal.
+3. It measures disk capacity on native worktree storage, records a bounded
+   read-only `main` summary from the prior cycle anchor, and derives recurring
+   trouble from the bounded run journal. These native steps run every cycle;
+   warnings and task-scoped observations do not terminate existing workers.
+4. When the queue is shallow, an explicit planning hook takes precedence.
+   Otherwise the read-only analysis agent returns a structured plan-or-no-plan
+   decision from bounded evidence. Only a separate supervised read-write worker
+   may author tasks, invalid decisions fail closed, and the supervisor re-reads
+   rather than edits the authoritative task source.
+5. It re-collects status, honors blockers, dispatch floors, provider pauses, and
+   planning budgets, then observes an existing child or launches
+   `run-until-done`. A configured summary hook runs only in that observe/launch
+   branch; a configured troubleshoot hook additionally requires a
+   restartable-or-terminated child exit.
 
 The contract is **agent decides, code executes, guardrails constrain, every
 action is logged**. Judgement is isolated in the read-only analysis agent;
@@ -185,22 +199,20 @@ wall-clock cadence.
 Wake results report `wake_reason`:
 
 - `pid`: the supervisor exited — investigate and likely recover.
-- `deadline`: the cycle boundary arrived — run the full cycle.
+- `deadline`: the cycle boundary arrived — run the operator cycle.
 - `message`: a user instruction arrived — read the structured `user_message`
   event and apply it as a redirect before continuing the cycle.
 - `runtime_event`: an authoritative, allowlisted operator-action condition was
   recorded — inspect the event kind and scoped project/run/task identity, then
-  run the health cycle before deciding whether recovery or escalation is safe.
+  run the operator cycle before deciding whether recovery or escalation is safe.
 - `adapter_error`: message polling failed — inspect the adapter directly before
   waiting again; `runtime_event_adapter_error` identifies the separate runtime
   source. Do not silently disable either adapter.
 
-After every wake, state the exact `wake_reason`/`wake_summary`, run the health
-checks, then decide whether to recover, summarize, troubleshoot, plan, or keep
-waiting. A direct `message` is a user redirect and may change the task; a
-`runtime_event` contains no message content and only signals that the scoped
-runtime needs operator action. Run the same full health cycle after either
-wake. When the repository exposes a trusted direct-message adapter, add
+After every wake, follow the [Operator Cycle](#operator-cycle). A direct
+`message` is a user redirect and may change the task; a `runtime_event` contains
+no message content and only signals that the scoped runtime needs operator
+action. When the repository exposes a trusted direct-message adapter, add
 `--message-command` and identify the recipient with `--session-ref` (or
 `VIBE_LOOP_RUN_ID`). When it exposes typed lifecycle events, add a trusted
 `--runtime-event-command` or `--runtime-event-journal` with a project-scoped
