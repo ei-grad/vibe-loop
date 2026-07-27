@@ -1792,6 +1792,13 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         guidance = project_binding_guidance(status.project_binding)
         if guidance:
             lines.append(f"  {guidance}")
+    elif queue.dispatch_blockers:
+        lines.append("task dispatch blockers:")
+        lines.extend(
+            f"  - {blocker['task_id']}: {blocker['message']}; "
+            f"remedy: {blocker['remedy']}"
+            for blocker in queue.dispatch_blockers
+        )
     elif status.observations:
         lines.append("observations:")
         lines.extend(f"  - {observation}" for observation in status.observations)

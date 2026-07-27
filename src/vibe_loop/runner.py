@@ -18,7 +18,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO, TextIO
+from typing import Any, BinaryIO, TextIO
 
 from vibe_loop.activity import ActivityEmission, AgentActivityTracker
 from vibe_loop.budget import (
@@ -36,6 +36,7 @@ from vibe_loop.config import (
     AgentConfig,
     AgentDetection,
     AgentResolutionError,
+    TaskAgentResolutionError,
     VibeConfig,
     agent_command_provider,
     command_template_uses_field,
@@ -43,6 +44,7 @@ from vibe_loop.config import (
     require_project_binding,
     resolve_task_agent,
     prepare_shell_command,
+    validate_worker_prompt_delivery,
 )
 from vibe_loop.generated_profiles import (
     RuntimeTaskSourceResolution,
@@ -1438,6 +1440,29 @@ class PostReportActivityMonitor:
         )
 
 
+def task_agent_operation(task: Task, operation: Callable[[], Any]) -> Any:
+    try:
+        return operation()
+    except TaskAgentResolutionError:
+        raise
+    except AgentResolutionError as exc:
+        if not (task.agent or "").strip():
+            raise
+        raise TaskAgentResolutionError(str(exc)) from exc
+
+
+def task_agent_failure_stops_dispatch(
+    result: RunResult,
+    *,
+    continue_on_failure: bool,
+) -> bool:
+    return (
+        not continue_on_failure
+        and result.classification in {"failed", "unknown"}
+        and result.classification_source != "task_agent_contract"
+    )
+
+
 class VibeRunner:
     def __init__(self, config: VibeConfig):
         self.config = config
@@ -1808,11 +1833,12 @@ class VibeRunner:
                 return self.run_task(task)
             except SkillDeploymentError as exc:
                 return self.record_skill_verification_failure(task, exc)
-            except AgentResolutionError as exc:
-                explicit_agent = (task.agent or "").strip()
-                if not explicit_agent or explicit_agent in self.config.agent_profiles:
-                    raise
-                return self.record_agent_resolution_failure(task, exc)
+            except TaskAgentResolutionError as exc:
+                return self.record_agent_resolution_failure(
+                    task,
+                    exc,
+                    classification_source="task_agent_contract",
+                )
         finally:
             if previous_restart is None:
                 try:
@@ -1870,6 +1896,8 @@ class VibeRunner:
         self,
         task: Task,
         error: AgentResolutionError,
+        *,
+        classification_source: str = "agent_resolution",
     ) -> RunResult:
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         run_id = new_run_id(task.task_id)
@@ -1892,7 +1920,7 @@ class VibeRunner:
             end_main=git_rev_parse(self.config.repo, "HEAD"),
             message=message,
             started_at=started_at,
-            classification_source="agent_resolution",
+            classification_source=classification_source,
             restart_count=self.current_restart_count(task.task_id),
             max_restarts=self.config.supervision.max_restarts,
         )
@@ -1930,10 +1958,13 @@ class VibeRunner:
                 diagnostics=render_verification_reports(blocking_reports),
             )
         self.ensure_spec_execution_gate()
-        agent_selection = resolve_task_agent(self.config, task)
+        agent_selection = task_agent_operation(
+            task,
+            lambda: resolve_task_agent(self.config, task),
+        )
         agent = agent_selection.config
         agent_profile = agent_selection.profile
-        command_template = agent.require_command()
+        command_template = task_agent_operation(task, agent.require_command)
         agent_kind = agent.executable_kind or agent.agent_kind
         if agent_kind == "auto":
             inferred_kind = agent_command_provider(command_template, None)
@@ -1994,7 +2025,7 @@ class VibeRunner:
         effective_template = inject_structured_usage_output(
             effective_template, agent_kind
         )
-        skill_prefix = agent.require_skill_ref_prefix()
+        skill_prefix = task_agent_operation(task, agent.require_skill_ref_prefix)
         worker_prompt = build_run_worker_prompt(
             skill_prefix,
             task,
@@ -2002,16 +2033,22 @@ class VibeRunner:
             recovery=recovery,
             resuming=resuming,
         )
-        validate_worker_prompt_delivery(command_template, task)
-        command = format_agent_command(
-            effective_template,
-            prompt=worker_prompt,
-            model=agent.model,
-            effort=agent.effort,
-            task=task,
-            profile=agent_profile,
-            task_id=task.task_id,
-            run_id=run_id,
+        task_agent_operation(
+            task,
+            lambda: validate_worker_prompt_delivery(command_template, task),
+        )
+        command = task_agent_operation(
+            task,
+            lambda: format_agent_command(
+                effective_template,
+                prompt=worker_prompt,
+                model=agent.model,
+                effort=agent.effort,
+                task=task,
+                profile=agent_profile,
+                task_id=task.task_id,
+                run_id=run_id,
+            ),
         )
         command_env = worker_command_env(
             run_id=run_id,
@@ -4689,10 +4726,10 @@ class VibeRunner:
                         break
                     continue
                 skipped.add(result.task_id)
-                if not continue_on_failure and result.classification in {
-                    "failed",
-                    "unknown",
-                }:
+                if task_agent_failure_stops_dispatch(
+                    result,
+                    continue_on_failure=continue_on_failure,
+                ):
                     break
                 continue
             result = self.run_next(
@@ -4764,10 +4801,10 @@ class VibeRunner:
                         break
                     continue
             skipped.add(result.task_id)
-            if not continue_on_failure and result.classification in {
-                "failed",
-                "unknown",
-            }:
+            if task_agent_failure_stops_dispatch(
+                result,
+                continue_on_failure=continue_on_failure,
+            ):
                 break
         return results
 
@@ -4817,10 +4854,10 @@ class VibeRunner:
                     return results
             else:
                 skipped.add(result.task_id)
-                if not continue_on_failure and result.classification in {
-                    "failed",
-                    "unknown",
-                }:
+                if task_agent_failure_stops_dispatch(
+                    result,
+                    continue_on_failure=continue_on_failure,
+                ):
                     return results
 
         with ThreadPoolExecutor(
@@ -5054,8 +5091,13 @@ class VibeRunner:
                                 stop_after_running = True
                             continue
                     skipped.add(result.task_id)
-                    if result.classification in {"failed", "unknown"}:
-                        stop_after_running = not continue_on_failure
+                    stop_after_running = (
+                        stop_after_running
+                        or task_agent_failure_stops_dispatch(
+                            result,
+                            continue_on_failure=continue_on_failure,
+                        )
+                    )
         return results
 
     def require_worker_launch_config(self) -> None:
@@ -5406,6 +5448,12 @@ class VibeRunner:
             result = self.run_task(task, recovery=recovery)
         except SkillDeploymentError as exc:
             result = self.record_skill_verification_failure(task, exc)
+        except TaskAgentResolutionError as exc:
+            result = self.record_agent_resolution_failure(
+                task,
+                exc,
+                classification_source="task_agent_contract",
+            )
         except AttemptCircuitOpen as exc:
             report_status(str(exc))
             self.record_recovery_phase(
@@ -6977,19 +7025,6 @@ def required_worker_verification_gates(
             }
         )
     return gates
-
-
-def validate_worker_prompt_delivery(command_template: str, task: Task) -> None:
-    if not task.has_traceability:
-        return
-    if command_template_uses_field(command_template, "prompt"):
-        return
-    raise AgentResolutionError(
-        "agent.command must include {prompt} for tasks with traceability "
-        "metadata; otherwise the worker prompt addendum and spec context cannot "
-        "be delivered. Set agent.command to a prompt-mode template such as "
-        "`codex exec {prompt}` or `claude -p {prompt}`."
-    )
 
 
 def validate_analysis_prompt_delivery(command_template: str) -> None:

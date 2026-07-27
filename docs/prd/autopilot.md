@@ -74,6 +74,12 @@ work, and `available` otherwise.
 This preserves liveness evidence while preventing a permanently undispatchable
 supervisor from looking like an empty queue.
 
+Status reports unsatisfiable per-task agent routes under
+`task dispatch blockers`, naming the task and route diagnostic instead of
+rendering `blockers: none`. These task-scoped diagnostics do not become project
+blockers and do not change `dispatch_state` to `blocked` while other candidates
+can dispatch.
+
 Status must also derive a bounded recent non-closure summary from the runtime
 journal. A non-closure is a terminal run that recorded an approving review
 verdict but did not record task-source completion. The summary reports the
