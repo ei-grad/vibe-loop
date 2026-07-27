@@ -33,3 +33,9 @@ component contracts.
 
 The [PRD index](prd/README.md) links every product-requirement document and
 defines their authority and density rules.
+
+## Documentation checks
+
+`make doc-budget` checks Markdown size budgets, structural prose runs, links,
+and reachability. `make doc-budget-refresh` explicitly lowers baselines after
+documentation shrinks; normal checks never rewrite `doc-budgets.toml`.

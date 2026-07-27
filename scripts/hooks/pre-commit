@@ -6,6 +6,8 @@ fail() {
   exit 1
 }
 
+make doc-budget DOC_BUDGET_ARGS=--staged || fail "documentation gate failed"
+
 command -v ruff >/dev/null 2>&1 || fail "ruff is not on PATH"
 
 ruff check || fail "ruff check failed"
