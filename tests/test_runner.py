@@ -7956,6 +7956,71 @@ class AgentCommandModelTests(unittest.TestCase):
             f"worker --effort high {shell_quote('inspect repo')}",
         )
 
+    def test_format_agent_command_shell_quotes_task_and_run_ids(self) -> None:
+        task_id = "TASK; $(command) 'quoted'\nspace &|<>()^%!"
+        run_id = 'run "quoted"; command'
+
+        command = format_agent_command(
+            "worker --task {task_id} --run {run_id} {prompt}",
+            prompt="inspect repo",
+            model=None,
+            task_id=task_id,
+            run_id=run_id,
+        )
+
+        self.assertEqual(
+            command,
+            f"worker --task {shell_quote(task_id)} --run {shell_quote(run_id)} "
+            f"{shell_quote('inspect repo')}",
+        )
+
+    def test_format_agent_command_preserves_windows_trailing_backslash(self) -> None:
+        with patch("vibe_loop.config.sys.platform", "win32"):
+            command = format_agent_command(
+                "worker --task {task_id} --run {run_id} {prompt}",
+                prompt="inspect repo",
+                model=None,
+                task_id="TASK-1\\",
+                run_id="run-1",
+            )
+
+        self.assertEqual(
+            command,
+            'worker --task "TASK-1\\\\" --run "run-1" "inspect repo"',
+        )
+
+    def test_format_agent_command_rejects_unsafe_windows_nonprompt_value(
+        self,
+    ) -> None:
+        with patch("vibe_loop.config.sys.platform", "win32"):
+            with self.assertRaisesRegex(ValueError, "cmd.exe"):
+                format_agent_command(
+                    "worker --task {task_id} --run {run_id} {prompt}",
+                    prompt='prompt may contain "quotes"',
+                    model=None,
+                    task_id='TASK" & calc & "X',
+                    run_id="run-1",
+                )
+
+    def test_format_agent_command_rejects_unsafe_template_fields(self) -> None:
+        templates = (
+            "worker {unsupported}",
+            "worker {task_id!r}",
+            "worker {task_id:>10}",
+            "worker {task_id",
+        )
+
+        for template in templates:
+            with self.subTest(template=template):
+                with self.assertRaises(ValueError):
+                    format_agent_command(
+                        template,
+                        prompt="inspect repo",
+                        model=None,
+                        task_id="TASK-01",
+                        run_id="run-1",
+                    )
+
     def test_format_agent_command_without_model_field_is_unchanged(self) -> None:
         expected = f"worker {shell_quote('inspect repo')}"
         for model in (None, "opus"):

@@ -18,7 +18,12 @@ from pathlib import Path
 from typing import Any
 
 from vibe_loop.autopilot import execute_autopilot_cycle, run_maintenance_command
-from vibe_loop.config import VibeConfig, load_config, prepare_shell_command, shell_quote
+from vibe_loop.config import (
+    VibeConfig,
+    format_shell_command_template,
+    load_config,
+    prepare_shell_command,
+)
 from vibe_loop.locks import LockManager, build_lock_manager
 
 from vibe_loop.eval_examples import (
@@ -982,17 +987,23 @@ def format_agent_command(
     task_id: str,
 ) -> str:
     values = {
-        "prompt": shell_quote(prompt),
-        "prompt_path": shell_quote(prompt_path),
-        "repo": shell_quote(str(repo)),
-        "artifact_dir": shell_quote(str(artifact_dir)),
-        "case_id": shell_quote(case_id),
-        "condition": shell_quote(condition),
+        "prompt": prompt,
+        "prompt_path": prompt_path,
+        "repo": str(repo),
+        "artifact_dir": str(artifact_dir),
+        "case_id": case_id,
+        "condition": condition,
         "trial": str(trial),
-        "run_id": shell_quote(run_id),
-        "task_id": shell_quote(task_id),
+        "run_id": run_id,
+        "task_id": task_id,
     }
-    return template.format(**values)
+    return format_shell_command_template(
+        template,
+        values,
+        windows_shell_fields=tuple(
+            field for field in values if field not in {"prompt", "prompt_path"}
+        ),
+    )
 
 
 def execute_agent_command(

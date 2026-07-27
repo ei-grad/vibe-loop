@@ -27,7 +27,7 @@ from vibe_loop.locks import (
     redact_fencing_token_payload,
     validate_lock_fencing_token,
 )
-from vibe_loop.config import TaskSourceConfig
+from vibe_loop.config import TaskSourceConfig, format_shell_command_template
 from vibe_loop.processes import process_birth_identity
 from vibe_loop.tasks import BLOCKED_FAMILY_STATUSES, Task, TaskSource
 from vibe_loop.runs import (
@@ -2493,9 +2493,13 @@ class TaskSourceSettlementRecovery:
         if not template:
             return ""
         try:
-            return template.format(task_id=task_id, run_id="")
-        except (KeyError, IndexError, ValueError):
-            return template
+            return format_shell_command_template(
+                template,
+                {"task_id": task_id, "run_id": ""},
+                windows_shell_fields=("task_id", "run_id"),
+            )
+        except ValueError:
+            return ""
 
 
 @dataclasses.dataclass(frozen=True)

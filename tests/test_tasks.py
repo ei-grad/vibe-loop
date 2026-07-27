@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from vibe_loop.config import TaskSourceConfig
+from vibe_loop.config import TaskSourceConfig, shell_quote
 from vibe_loop.tasks import (
     WITHHELD_ADAPTER_ENV,
     CommandTaskSource,
@@ -979,6 +979,204 @@ class MarkdownPlanTests(unittest.TestCase):
 
             self.assertTrue(invoked)
             self.assertEqual(marker.read_text(encoding="utf-8"), "TASK-42")
+
+    def test_command_task_source_probe_preserves_untrusted_task_id_argument(
+        self,
+    ) -> None:
+        probe_program = (
+            "import json, sys; print(json.dumps(dict(id=sys.argv[1], status='Next')))"
+        )
+        probe_command = (
+            f"{shell_quote(sys.executable)} -c {shell_quote(probe_program)} {{task_id}}"
+        )
+        task_ids = (
+            "TASK; echo injected",
+            "TASK$(echo injected)",
+            "TASK 'single' \"double\" whitespace",
+            "TASK\nnewline",
+            "TASK & | < > ( ) ^ % !",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="echo '[]'",
+                    probe_command=probe_command,
+                ),
+            )
+
+            for task_id in task_ids:
+                with self.subTest(task_id=task_id):
+                    task = source.probe(task_id)
+                    self.assertIsNotNone(task)
+                    self.assertEqual(task.task_id, task_id)
+
+    def test_command_task_source_probe_does_not_execute_injected_command(
+        self,
+    ) -> None:
+        probe_program = (
+            "import json, sys; print(json.dumps(dict(id=sys.argv[1], status='Next')))"
+        )
+        write_marker_program = (
+            "from pathlib import Path; import sys; "
+            "Path(sys.argv[1]).write_text('injected', encoding='utf-8')"
+        )
+        separator = "&" if sys.platform == "win32" else ";"
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            marker = repo / "injected"
+            probe_command = (
+                f"{shell_quote(sys.executable)} -c {shell_quote(probe_program)} "
+                "{task_id}"
+            )
+            injected_task_id = (
+                f"TASK-42 {separator} {shell_quote(sys.executable)} "
+                f"-c {shell_quote(write_marker_program)} {shell_quote(str(marker))}"
+            )
+            source = CommandTaskSource(
+                repo,
+                TaskSourceConfig(
+                    type="command",
+                    list_command="echo '[]'",
+                    probe_command=probe_command,
+                ),
+            )
+
+            task = source.probe(injected_task_id)
+
+            self.assertIsNotNone(task)
+            self.assertEqual(task.task_id, injected_task_id)
+            self.assertFalse(marker.exists())
+
+    def test_command_task_source_probe_preserves_configured_pipeline(self) -> None:
+        probe_program = (
+            "import json, sys; print(json.dumps(dict(id=sys.argv[1], status='Next')))"
+        )
+        passthrough_program = "import sys; sys.stdout.write(sys.stdin.read())"
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="echo '[]'",
+                    probe_command=(
+                        f"{shell_quote(sys.executable)} -c "
+                        f"{shell_quote(probe_program)} {{task_id}} | "
+                        f"{shell_quote(sys.executable)} -c "
+                        f"{shell_quote(passthrough_program)}"
+                    ),
+                ),
+            )
+
+            task = source.probe("TASK-42")
+
+            self.assertIsNotNone(task)
+            self.assertEqual(task.task_id, "TASK-42")
+
+    def test_command_task_source_reset_preserves_untrusted_task_id_argument(
+        self,
+    ) -> None:
+        reset_program = (
+            "import json, sys; "
+            "open(sys.argv[1], 'w', encoding='utf-8').write(json.dumps(sys.argv[2:]))"
+        )
+        task_id = "TASK; $(command) 'single' \"double\"\nspace &|<>()^%!"
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            captured = repo / "reset-argv.json"
+            source = CommandTaskSource(
+                repo,
+                TaskSourceConfig(
+                    type="command",
+                    list_command="echo '[]'",
+                    reset_command=(
+                        f"{shell_quote(sys.executable)} -c "
+                        f"{shell_quote(reset_program)} "
+                        f"{shell_quote(str(captured))} {{task_id}}"
+                    ),
+                ),
+            )
+
+            self.assertTrue(source.reset(task_id))
+
+            self.assertEqual(
+                json.loads(captured.read_text(encoding="utf-8")),
+                [task_id],
+            )
+
+    def test_command_task_source_probe_and_reset_reject_unsafe_templates(
+        self,
+    ) -> None:
+        templates = (
+            "adapter {unsupported}",
+            "adapter {task_id!r}",
+            "adapter {task_id:>10}",
+            "adapter {task_id",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            for template in templates:
+                with self.subTest(template=template):
+                    source = CommandTaskSource(
+                        Path(directory),
+                        TaskSourceConfig(
+                            type="command",
+                            list_command="echo '[]'",
+                            probe_command=template,
+                            reset_command=template,
+                        ),
+                    )
+                    with self.assertRaisesRegex(ValueError, "may only use"):
+                        source.probe("TASK-42")
+                    with self.assertRaisesRegex(ValueError, "may only use"):
+                        source.reset("TASK-42")
+
+    def test_windows_command_task_source_adapters_fail_closed_on_unsafe_ids(
+        self,
+    ) -> None:
+        unsafe_task_ids = (
+            'TASK" & calc & "X',
+            "TASK%USERPROFILE%",
+            "TASK!delayed!",
+            "TASK\ncommand",
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = CommandTaskSource(
+                Path(directory),
+                TaskSourceConfig(
+                    type="command",
+                    list_command="list-tasks",
+                    probe_command="probe {task_id}",
+                    activate_command="activate {task_id} {run_id}",
+                    complete_command="complete {task_id} {run_id}",
+                    reset_command="reset {task_id}",
+                    park_command="park {task_id} {run_id}",
+                ),
+            )
+            with mock.patch("vibe_loop.config.sys.platform", "win32"):
+                with mock.patch("vibe_loop.tasks.subprocess.run") as run:
+                    for task_id in unsafe_task_ids:
+                        with self.subTest(task_id=task_id):
+                            adapter_calls = (
+                                lambda: source.probe(task_id),
+                                lambda: source.activate(task_id, "run-1"),
+                                lambda: source.activate("TASK-1", task_id),
+                                lambda: source.complete(task_id, "run-1"),
+                                lambda: source.complete("TASK-1", task_id),
+                                lambda: source.reset(task_id),
+                                lambda: source.park(task_id, "run-1"),
+                                lambda: source.park("TASK-1", task_id),
+                            )
+                            for call in adapter_calls:
+                                with self.assertRaisesRegex(ValueError, "cmd.exe"):
+                                    call()
+                    run.assert_not_called()
 
     def test_command_task_source_activate_returns_confirmed_task(self) -> None:
         captured: dict[str, object] = {}
