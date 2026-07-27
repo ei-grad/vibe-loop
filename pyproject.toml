@@ -51,3 +51,7 @@ exclude = [
     "scripts/check-doc-budgets.py",
     "scripts/check-md-links.py",
 ]
+
+[tool.pytest.ini_options]
+norecursedirs = ["eval/examples/*/cases/*/repo"]
+testpaths = ["tests"]

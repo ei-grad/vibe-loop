@@ -1894,6 +1894,45 @@ def render_autopilot_status(status: ProjectStatus) -> str:
                 )
             )
     lines.append(f"worktree disposition: {status.worktree_disposition_policy}")
+    disposition = status.worktree_disposition
+    if disposition:
+        lines.append(
+            "latest worktree disposition: "
+            f"cycle={disposition.get('cycle_id') or 'unknown'} "
+            f"status={disposition.get('status') or 'unknown'} "
+            f"candidates={disposition.get('candidates', 0)} "
+            f"reaped={disposition.get('reaped', 0)} "
+            f"errors={disposition.get('errors', 0)}"
+        )
+        raw_worktrees = disposition.get("worktrees")
+        worktrees = raw_worktrees if isinstance(raw_worktrees, list) else []
+        for item in worktrees:
+            if not isinstance(item, Mapping):
+                continue
+            path = str(item.get("path") or "unknown")
+            raw_guardrails = item.get("keep_guardrails")
+            guardrails = (
+                ", ".join(str(reason) for reason in raw_guardrails)
+                if isinstance(raw_guardrails, list) and raw_guardrails
+                else "none"
+            )
+            applied = str(item.get("applied") or "unrecorded")
+            non_removal_reason = str(item.get("non_removal_reason") or "")
+            decision_reason = str(item.get("decision_reason") or "")
+            lines.append(
+                f"  - {path}: "
+                f"reapable={str(bool(item.get('reapable'))).lower()} "
+                f"guardrails={guardrails} outcome={applied}"
+                + (
+                    f" non_removal_reason={non_removal_reason}"
+                    if non_removal_reason
+                    else ""
+                )
+                + (f" decision_reason={decision_reason}" if decision_reason else "")
+            )
+        truncated = disposition.get("worktrees_truncated")
+        if isinstance(truncated, int) and truncated > 0:
+            lines.append(f"  ... {truncated} additional worktrees omitted")
     if supervisor.log is not None:
         lines.append(f"log: {supervisor.log}")
     project_blockers = tuple(

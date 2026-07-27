@@ -1472,6 +1472,19 @@ def git_ref_commit(repo: Path, ref: str) -> str:
     return result.stdout.strip()
 
 
+def git_commit_is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    if not ancestor or not descendant:
+        return False
+    result = run_git_result(
+        repo,
+        "merge-base",
+        "--is-ancestor",
+        ancestor,
+        descendant,
+    )
+    return result is not None and result.returncode == 0
+
+
 def merged_branch_targets(
     repo: Path,
     branch: str,
@@ -2822,6 +2835,7 @@ class WorktreeDispositionEvidence:
     ownership_error: str
     terminal_status: str
     terminal_commit: str
+    terminal_commit_contained: bool = False
 
     @property
     def merged(self) -> bool:
@@ -2858,6 +2872,7 @@ class WorktreeDispositionEvidence:
             "ownership_error": self.ownership_error,
             "terminal_status": self.terminal_status,
             "terminal_commit": self.terminal_commit,
+            "terminal_commit_contained": self.terminal_commit_contained,
             "keep_guardrails": list(self.keep_guardrails),
             "reapable": self.reapable,
         }
@@ -2895,7 +2910,7 @@ def worktree_keep_guardrails(
         reasons.append(KEEP_STALE_CLAIM)
     if evidence.terminal_status != "completed":
         reasons.append(KEEP_TERMINAL_STATUS_UNSUCCESSFUL)
-    if evidence.terminal_commit != evidence.head_commit:
+    if not evidence.terminal_commit_contained:
         reasons.append(KEEP_TERMINAL_COMMIT_MISMATCH)
     return tuple(reasons)
 
@@ -2968,6 +2983,10 @@ def collect_worktree_disposition_evidence(
                 ownership_error=ownership_error,
                 terminal_status=owner.terminal_status if owner is not None else "",
                 terminal_commit=owner.terminal_commit if owner is not None else "",
+                terminal_commit_contained=(
+                    owner is not None
+                    and git_commit_is_ancestor(repo, owner.terminal_commit, entry.head)
+                ),
             )
         )
     return evidence
