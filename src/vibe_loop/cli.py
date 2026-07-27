@@ -105,6 +105,7 @@ from vibe_loop.runtime_events import (
     save_runtime_event_cursor,
 )
 from vibe_loop.runs import (
+    CANDIDATE_RECORDED_RECORD_TYPE,
     LOCK_ACQUIRED_RECORD_TYPE,
     LOCK_RELEASED_RECORD_TYPE,
     RunLifecycleEvent,
@@ -116,6 +117,7 @@ from vibe_loop.runs import (
     record_status,
     utc_now_iso,
 )
+from vibe_loop.upstream import check_upstream_sync
 from vibe_loop.skill_deployment import (
     SkillDeploymentError,
     render_verification_reports,
@@ -2439,6 +2441,40 @@ def dispatch_main_integration(args: argparse.Namespace, config) -> int:
 
     if args.main_integration_command == "release":
         before_status = manager.main_integration_status()
+        if config.autopilot.require_upstream_sync:
+            reviewed_commit = ""
+            for record in reversed(run_store.read_records()):
+                if (
+                    record.get("record_type") == CANDIDATE_RECORDED_RECORD_TYPE
+                    and record.get("run_id") == run_id
+                    and record.get("task_id") == task_id
+                ):
+                    reviewed_commit = str(record.get("head_commit") or "")
+                    break
+            upstream = check_upstream_sync(
+                config.repo,
+                config.main_branch,
+                required=True,
+                reviewed_commit=reviewed_commit,
+                require_reviewed_commit=True,
+                refresh=True,
+            )
+            if not upstream.satisfied:
+                assert upstream.blocker is not None
+                payload = {
+                    "released": False,
+                    "error": "upstream_sync_blocked",
+                    "blocker": upstream.blocker.to_json(),
+                    "status": before_status.to_json(),
+                }
+                if json_requested(args):
+                    print(json.dumps(payload, indent=2))
+                else:
+                    print(
+                        f"main-integration release refused: {upstream.blocker.code}",
+                        file=sys.stderr,
+                    )
+                return 1
         try:
             released = manager.release_main_integration(
                 task_id=task_id,

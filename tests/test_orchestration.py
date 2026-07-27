@@ -2004,6 +2004,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         max_lock_attempts: int = 1,
         stage_machine: RunLifecycleStateMachine | None = None,
         conflict_resolver=None,
+        completion_fence=None,
     ) -> Integrator:
         return Integrator(
             repo=self.repo,
@@ -2030,6 +2031,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             executor=executor,
             stage_machine=stage_machine,
             conflict_resolver=conflict_resolver,
+            completion_fence=completion_fence,
         )
 
     def advance_main(self, *, content: str = "main\n") -> str:
@@ -2080,6 +2082,31 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(provenance["outcome"], "settled-directly")
         self.assertEqual(provenance["candidate_commit"], self.candidate_head)
         self.assertEqual(provenance["target_commit"], result.main_after)
+
+    def test_completion_fence_retains_lock_and_withholds_success_evidence(
+        self,
+    ) -> None:
+        result = self.integrator(
+            completion_fence=lambda _result: {
+                "code": "upstream_ahead",
+                "relation": "ahead",
+                "reviewed_commit_contained": False,
+                "unmet_prerequisite": "upstream_equality",
+            }
+        ).run()
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.reason, "upstream_ahead")
+        self.assertTrue(self.manager.main_integration_status().locked)
+        records = self.store.read_records()
+        self.assertNotIn(
+            "integration_provenance",
+            {record["record_type"] for record in records},
+        )
+        self.assertNotIn(
+            "lock_released",
+            {record["record_type"] for record in records},
+        )
 
     def test_exact_already_merged_branch_is_no_commit_noop(self) -> None:
         git(self.repo, "merge", "--ff-only", "worker/TASK-01")

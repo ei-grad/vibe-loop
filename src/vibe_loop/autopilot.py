@@ -95,6 +95,7 @@ from vibe_loop.runs import (
     AUTOPILOT_SUPERVISOR_STOPPED_RECORD_TYPE,
     AUTOPILOT_WORKTREE_REAP_RECORD_TYPE,
     REVIEW_VERDICT_RECORD_TYPE,
+    RUN_CONTRACT_RESOLVED_RECORD_TYPE,
     RUN_RECORD_TYPE,
     RUN_STARTED_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
@@ -113,6 +114,7 @@ from vibe_loop.telemetry import (
     merge_provider_usage,
     unavailable_usage,
 )
+from vibe_loop.upstream import check_upstream_sync
 from vibe_loop.workers import (
     ActiveRunState,
     KEEP_EVIDENCE_CHANGED,
@@ -610,6 +612,22 @@ def collect_project_status(
         supervisor=supervisor,
         config_contract_blockers=contract_blockers,
     )
+    if config.autopilot.require_upstream_sync:
+        upstream = check_upstream_sync(
+            config.repo,
+            config.main_branch,
+            required=True,
+            refresh=False,
+        )
+        assert upstream.blocker is not None
+        blockers.append(f"upstream_sync:{upstream.blocker.code}")
+        blockers.extend(
+            active_unlocked_task_blockers(
+                queue_status,
+                workers,
+                run_store.read_records(),
+            )
+        )
     observations = tuple(
         project_observations(queue_status=queue_status, workers=workers)
     )
@@ -1524,6 +1542,74 @@ def project_observations(
         else:
             observations.append("no_runnable_work")
     return observations
+
+
+def active_unlocked_task_blockers(
+    queue_status: TaskQueueStatus,
+    workers: tuple[WorkerView, ...],
+    records: Sequence[Mapping[str, object]],
+) -> list[str]:
+    locked_task_ids = {worker.active.task_id for worker in workers}
+    latest_run_ids: dict[str, str] = {}
+    classifications: dict[tuple[str, str], str] = {}
+    runtime_owned_runs: set[tuple[str, str]] = set()
+    provenance_committed_runs: set[tuple[str, str]] = set()
+    for record in records:
+        task_id = str(record.get("task_id") or "")
+        run_id = str(record.get("run_id") or "")
+        if not task_id or not run_id:
+            continue
+        if record.get("record_type") == RUN_STARTED_RECORD_TYPE:
+            latest_run_ids[task_id] = run_id
+        elif (
+            record.get("record_type") == RUN_CONTRACT_RESOLVED_RECORD_TYPE
+            and record.get("mode") == "runtime-owned"
+        ):
+            runtime_owned_runs.add((task_id, run_id))
+        elif record.get("record_type") == RUN_RECORD_TYPE and str(
+            record.get("classification") or ""
+        ):
+            latest_run_ids[task_id] = run_id
+            classifications[(task_id, run_id)] = str(record["classification"])
+        elif record.get("record_type") == TASK_PROVENANCE_COMMITTED_RECORD_TYPE:
+            provenance_committed_runs.add((task_id, run_id))
+    blockers: list[str] = []
+    source_tasks: dict[str, Mapping[str, object]] = {}
+    for task in queue_status.source_tasks:
+        task_id = str(task.get("id") or task.get("task_id") or "")
+        source_tasks[task_id] = task
+        if str(task.get("status") or "").casefold() not in ACTIVE_QUEUE_STATUSES:
+            continue
+        if task_id in locked_task_ids:
+            continue
+        latest_run_id = latest_run_ids.get(task_id, "")
+        if not latest_run_id:
+            continue
+        classification = classifications.get((task_id, latest_run_id), "")
+        if classification and classification != "completed":
+            continue
+        code = (
+            "active_unlocked_task_completion_unsettled"
+            if classification == "completed"
+            else "active_unlocked_without_terminal_classification"
+        )
+        blockers.append(f"{code}:{task_id}")
+    for task_id, run_id in latest_run_ids.items():
+        if classifications.get((task_id, run_id)) != "completed":
+            continue
+        if (task_id, run_id) not in runtime_owned_runs:
+            continue
+        task = source_tasks.get(task_id, {})
+        task_done = task.get("done") is True or str(
+            task.get("status") or ""
+        ).casefold() in {"done", "completed"}
+        if not task_done:
+            blocker = f"task_completion_unsettled:{task_id}:{run_id}"
+            if blocker not in blockers:
+                blockers.append(blocker)
+        if (task_id, run_id) not in provenance_committed_runs:
+            blockers.append(f"task_provenance_unsettled:{task_id}:{run_id}")
+    return blockers
 
 
 def active_conflict_worker_count(workers: tuple[WorkerView, ...]) -> int:
@@ -6051,6 +6137,32 @@ def execute_autopilot_cycle(
             actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")
         status = collect_project_status(config, process_exists=process_exists)
         runnable = status.queue.runnable
+
+    if config.autopilot.require_upstream_sync:
+        upstream = check_upstream_sync(
+            config.repo,
+            config.main_branch,
+            required=True,
+            refresh=True,
+        )
+        retained_blockers = tuple(
+            blocker
+            for blocker in status.blockers
+            if not blocker.startswith("upstream_sync:")
+        )
+        if upstream.satisfied:
+            status = dataclasses.replace(status, blockers=retained_blockers)
+            actions.append("upstream_sync:equal")
+        else:
+            assert upstream.blocker is not None
+            status = dataclasses.replace(
+                status,
+                blockers=(
+                    *retained_blockers,
+                    f"upstream_sync:{upstream.blocker.code}",
+                ),
+            )
+            actions.append(f"upstream_sync:{upstream.blocker.code}")
 
     disposition = worktree_disposition_runner(
         config,

@@ -98,6 +98,7 @@ type = "directory"
 # planning_max_launches_per_day = 4   # set 0 to disable the rolling-day limit
 # planning_unproductive_threshold = 2 # launches before backoff engages
 require_clean_repo = true
+require_upstream_sync = false
 worktree_disposition = "report-only"
 # health_command = "scripts/health.sh"
 # summary_command = "scripts/summary.sh"
@@ -295,9 +296,10 @@ worker timeout, low-change/high-token diagnostics, and repeated unchanged
 attempt suppression.
 
 `[autopilot]` controls worker count, cycle interval, ready-queue floor, planning
-poll/backoff limits, repository cleanliness, worktree disposition, disk reserve,
-and optional maintenance commands. Generated profiles cannot introduce those
-commands. Configuration reload and supervisor/run pinning are defined by
+poll/backoff limits, repository cleanliness, required upstream synchronization,
+worktree disposition, disk reserve, and optional maintenance commands. Generated
+profiles cannot introduce those commands. Configuration reload and
+supervisor/run pinning are defined by
 [Supervisor Configuration Lifetime](prd/autopilot.md#prd-aut-002b-supervisor-configuration-lifetime).
 
 `[project_binding]` and `[project_binding.context]` bind command adapters to an
@@ -327,7 +329,7 @@ configuration section now lives.
 | `supervision.max_restarts`, `cooldown_seconds`, `recover_unknown_runs`, `worker_timeout_seconds`, `slice_token_threshold`, `cross_run_attempt_threshold` | Annotated and other groups above; supervision contracts in [Worker Supervision PRD](prd/worker-supervision.md). |
 | `locks.type`, `acquire_command`, `release_command`, `status_command`, `list_command`, `lease_seconds` | [PRD-WRK-011 and PRD-WRK-012](prd/worker-supervision.md#prd-wrk-011-pluggable-lock-backends). |
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |
-| `autopilot.jobs`, `interval_seconds`, `min_ready`, `planning_recheck_seconds`, `idle_poll_max_seconds`, `planning_backoff_seconds`, `planning_max_launches_per_day`, `planning_unproductive_threshold`, `require_clean_repo`, `worktree_disposition`, `health_command`, `summary_command`, `troubleshoot_command`, `planning_command`, `idle_wake_command` | Annotated and other groups above. |
+| `autopilot.jobs`, `interval_seconds`, `min_ready`, `planning_recheck_seconds`, `idle_poll_max_seconds`, `planning_backoff_seconds`, `planning_max_launches_per_day`, `planning_unproductive_threshold`, `require_clean_repo`, `require_upstream_sync`, `worktree_disposition`, `health_command`, `summary_command`, `troubleshoot_command`, `planning_command`, `idle_wake_command` | Annotated and other groups above. |
 | `project_binding.require`, `project_binding.context.*` | [Command backend project binding](../README.md#command-backend-project-binding). |
 | `autopilot.disk_reserve.min_free_bytes`, `min_free_fraction`, `min_free_inodes`, `min_free_inode_fraction` | [Autopilot disk-reserve reference](../README.md#autopilot). |
 | `specs.require_approved`, `require_current_fingerprints`, `require_requirement_coverage`, `require_completion_evidence`, `approved_states`, `override_commands` | [Task Discovery PRD](prd/task-discovery.md) and other groups above. |
