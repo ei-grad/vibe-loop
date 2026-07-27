@@ -1,3 +1,5 @@
+"""Implementation for docs/prd/autopilot.md#prd-aut-020."""
+
 from __future__ import annotations
 
 import dataclasses

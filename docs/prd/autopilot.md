@@ -508,7 +508,10 @@ diagnostics.
 
 Related implementation IDs: `AUTO-01`, `AUTO-02`, `AUTO-06`.
 
+<a id="prd-aut-020"></a>
 ## PRD-AUT-020 Command Backend Project Binding
+
+Implementation: [`src/vibe_loop/config.py`](../../src/vibe_loop/config.py).
 
 A command-backed task source or lock adapter that routes by an ambient
 environment selector binds repository A to project B whenever that selector is

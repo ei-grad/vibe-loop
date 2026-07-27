@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -12,6 +13,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DOC_BUDGET_SCRIPT = REPO_ROOT / "scripts/check-doc-budgets.py"
 MD_LINK_SCRIPT = REPO_ROOT / "scripts/check-md-links.py"
+PROJECT_BINDING_LINK_SCRIPT = REPO_ROOT / "scripts/check-project-binding-doc-linkage.py"
 
 
 class TemporaryGitRepository(unittest.TestCase):
@@ -260,6 +262,99 @@ class MarkdownLinkHookTests(TemporaryGitRepository):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(hook_log.read_text(encoding="utf-8"), "doc-budget\n")
+
+
+class CodeDocLinkageTrialTests(TemporaryGitRepository):
+    def setUp(self) -> None:
+        super().setUp()
+        self.write(
+            "scripts/check-project-binding-doc-linkage.py",
+            PROJECT_BINDING_LINK_SCRIPT.read_text(encoding="utf-8"),
+        )
+        self.write(
+            "scripts/check-md-links.py",
+            MD_LINK_SCRIPT.read_text(encoding="utf-8"),
+        )
+        self.write(
+            "src/vibe_loop/config.py",
+            '"""Implementation for docs/prd/autopilot.md#prd-aut-020."""\n',
+        )
+        self.write(
+            "docs/prd/autopilot.md",
+            textwrap.dedent(
+                """\
+                <a id="prd-aut-020"></a>
+                ## PRD-AUT-020 Command Backend Project Binding
+
+                Implementation: [`src/vibe_loop/config.py`](../../src/vibe_loop/config.py).
+
+                Contract.
+
+                ## PRD-AUT-021 Another Contract
+                """
+            ),
+        )
+
+    def run_linkage(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                os.fspath(self.repo / "scripts/check-project-binding-doc-linkage.py"),
+            ],
+            cwd=self.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_reciprocal_references_resolve(self) -> None:
+        result = self.run_linkage()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "project_binding code/doc linkage: ok\n")
+
+    def test_missing_code_reference_is_reported(self) -> None:
+        self.write("src/vibe_loop/config.py", '"""Configuration loading."""\n')
+
+        result = self.run_linkage()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "module docstring does not reference docs/prd/autopilot.md#prd-aut-020",
+            result.stdout,
+        )
+
+    def test_missing_anchor_is_reported(self) -> None:
+        self.write(
+            "docs/prd/autopilot.md",
+            "## PRD-AUT-020 Command Backend Project Binding\n",
+        )
+
+        result = self.run_linkage()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('missing <a id="prd-aut-020"></a>', result.stdout)
+
+    def test_missing_reciprocal_module_link_is_reported(self) -> None:
+        self.write(
+            "docs/prd/autopilot.md",
+            textwrap.dedent(
+                """\
+                <a id="prd-aut-020"></a>
+                ## PRD-AUT-020 Command Backend Project Binding
+
+                Contract without an implementation link.
+                """
+            ),
+        )
+
+        result = self.run_linkage()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "PRD-AUT-020 does not link to src/vibe_loop/config.py",
+            result.stdout,
+        )
 
 
 class VendorIdentityTests(unittest.TestCase):
