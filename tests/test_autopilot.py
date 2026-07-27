@@ -5084,6 +5084,25 @@ class OwnedProcessTreeIntegrationTests(unittest.TestCase):
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.kill(node.pid, signal.SIGKILL)
 
+    def _await_reaped(self, nodes: list[ProcessNode]) -> None:
+        deadline = time.monotonic() + 30.0
+        pending = list(nodes)
+        while pending:
+            pending = [
+                node
+                for node in pending
+                if (current := read_process_node(node.pid)) is not None
+                and current.process_birth_id == node.process_birth_id
+            ]
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                self.fail(
+                    "fixture processes were not reaped: "
+                    + ", ".join(str(node.pid) for node in pending)
+                )
+            time.sleep(0.05)
+
     def test_drains_only_the_recorded_tree_and_spares_an_owned_peer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "fixture_tree.py"
@@ -5138,15 +5157,9 @@ class OwnedProcessTreeIntegrationTests(unittest.TestCase):
                 # /proc until reaped here; the deeper levels were reparented to
                 # init, which reaps them.
                 self.assertEqual(root_process.wait(timeout=30), -signal.SIGTERM)
-                for node in tree_nodes:
-                    if node.pid == root_pid:
-                        continue
-                    current = read_process_node(node.pid)
-                    self.assertTrue(
-                        current is None
-                        or current.process_birth_id != node.process_birth_id,
-                        f"fixture process {node.pid} survived the drain",
-                    )
+                self._await_reaped(
+                    [node for node in tree_nodes if node.pid != root_pid]
+                )
                 surviving = read_process_node(sentinel_pid)
                 self.assertIsNotNone(surviving, "owned peer must survive the drain")
                 self.assertEqual(
