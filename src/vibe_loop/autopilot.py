@@ -277,6 +277,7 @@ NATIVE_PLANNING_LIMIT_WALL_ACTION = "native_planning_limit_wall"
 CHILD_LIMIT_WALL_ACTION = "limit_wall_pause"
 PLANNING_BACKOFF_ACTION = "planning_backoff"
 PLANNING_OUTCOME_ACTION_PREFIX = "native_planning_outcome:"
+DISPATCH_FLOOR_HOLD_ACTION = "dispatch_floor_hold"
 LIMIT_WALL_ACTION_PREFIXES = (
     f"{NATIVE_PLANNING_LIMIT_WALL_ACTION}:",
     f"{CHILD_LIMIT_WALL_ACTION}:",
@@ -321,8 +322,9 @@ class CycleSummary:
 
     @property
     def dispatch_floor_action(self) -> str:
+        """The explicit dispatch-floor hold recorded for this cycle, if any."""
         for action in self.actions:
-            if action.startswith("dispatch_floor_hold:"):
+            if action.startswith(f"{DISPATCH_FLOOR_HOLD_ACTION}:"):
                 return action
         return ""
 
@@ -6306,7 +6308,13 @@ def execute_autopilot_cycle(
         status = collect_project_status(config, process_exists=process_exists)
         runnable = status.queue.runnable
 
-    if config.autopilot.require_upstream_sync:
+    def apply_fresh_upstream_sync(
+        project_status: ProjectStatus,
+        *,
+        record_action: bool,
+    ) -> ProjectStatus:
+        if not config.autopilot.require_upstream_sync:
+            return project_status
         upstream = check_upstream_sync(
             config.repo,
             config.main_branch,
@@ -6315,22 +6323,30 @@ def execute_autopilot_cycle(
         )
         retained_blockers = tuple(
             blocker
-            for blocker in status.blockers
+            for blocker in project_status.blockers
             if not blocker.startswith("upstream_sync:")
         )
         if upstream.satisfied:
-            status = dataclasses.replace(status, blockers=retained_blockers)
-            actions.append("upstream_sync:equal")
+            updated = dataclasses.replace(
+                project_status,
+                blockers=retained_blockers,
+            )
+            action = "upstream_sync:equal"
         else:
             assert upstream.blocker is not None
-            status = dataclasses.replace(
-                status,
+            updated = dataclasses.replace(
+                project_status,
                 blockers=(
                     *retained_blockers,
                     f"upstream_sync:{upstream.blocker.code}",
                 ),
             )
-            actions.append(f"upstream_sync:{upstream.blocker.code}")
+            action = f"upstream_sync:{upstream.blocker.code}"
+        if record_action:
+            actions.append(action)
+        return updated
+
+    status = apply_fresh_upstream_sync(status, record_action=True)
 
     disposition = worktree_disposition_runner(
         config,
@@ -6404,6 +6420,7 @@ def execute_autopilot_cycle(
             blocker_list.append("autopilot_health_failed")
 
     blockers = tuple(blocker_list)
+    blockers_checked_after_planning = False
     if not blockers and runnable < min_ready:
         active_conflict_workers = active_conflict_worker_count(status.workers)
         planning = run_maintenance("planning")
@@ -6505,20 +6522,30 @@ def execute_autopilot_cycle(
                 actions.append("no_runnable_work")
             else:
                 actions.append(f"low_runnable_work:{runnable}/{min_ready}")
-        status = collect_project_status(config, process_exists=process_exists)
+        status = apply_fresh_upstream_sync(
+            collect_project_status(config, process_exists=process_exists),
+            record_action=False,
+        )
         runnable = status.queue.runnable
         blocker_list = current_blockers(status)
         blockers = tuple(blocker_list)
+        blockers_checked_after_planning = True
 
     if blockers:
         cycle_status = "blocked"
-        actions.append("blocked_preflight")
+        actions.append(
+            "blocked_post_planning"
+            if blockers_checked_after_planning
+            else "blocked_preflight"
+        )
     elif planning_limit_wall_pause is not None:
         cycle_status = "idle"
     elif runnable < dispatch_min_ready:
         cycle_status = "idle"
         if runnable > 0:
-            actions.append(f"dispatch_floor_hold:{runnable}/{dispatch_min_ready}")
+            actions.append(
+                f"{DISPATCH_FLOOR_HOLD_ACTION}:{runnable}/{dispatch_min_ready}"
+            )
     elif (
         external_pid := collect_external_run_supervisor(
             run_store, process_exists=process_exists

@@ -2906,6 +2906,68 @@ class AutopilotRunTests(unittest.TestCase):
             any(blocker.startswith("active_unlocked_") for blocker in cycle.blockers)
         )
 
+    def test_upstream_fence_survives_post_planning_status_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            configured_repo(
+                repo,
+                [("TASK-01", "Next", "", "ready slice")],
+                extra_toml="[autopilot]\nrequire_upstream_sync = true\n",
+            )
+            remote = repo.parent / "remote.git"
+            run(repo.parent, "git", "init", "--bare", str(remote))
+            run(repo, "git", "remote", "add", "origin", str(remote))
+            run(repo, "git", "push", "-u", "origin", "main")
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                dispatch_min_ready=1,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
+
+        self.assertEqual(len(calls), 1)
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "completed")
+        self.assertIn("upstream_sync:equal", cycle.actions)
+        self.assertNotIn("upstream_sync:stale_ref", cycle.blockers)
+        self.assertNotIn("blocked_preflight", cycle.actions)
+
+    def test_planning_blocker_is_reported_as_post_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            def dirty_planning(config, **kwargs):
+                (config.repo / "planning-artifact.txt").write_text(
+                    "dirty\n",
+                    encoding="utf-8",
+                )
+                return native_no_plan(config, **kwargs)
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                dispatch_min_ready=1,
+                launcher=launcher,
+                native_planning_runner=dirty_planning,
+            )
+
+        self.assertEqual(calls, [])
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "blocked")
+        self.assertIn("repo_dirty", cycle.blockers)
+        self.assertIn("blocked_post_planning", cycle.actions)
+        self.assertNotIn("blocked_preflight", cycle.actions)
+
     @unittest.skipUnless(sys.platform == "linux", "birth identity requires Linux")
     def test_does_not_clean_worker_lock_before_pid_is_observed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
