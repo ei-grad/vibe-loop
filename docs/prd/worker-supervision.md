@@ -360,8 +360,11 @@ commits.
 Codex identity capture is restricted to native structured startup events. When
 structured startup metadata is unavailable, the runtime may parse the bounded
 ANSI-aware `OpenAI Codex` startup frame and records a field-specific
-`startup_frame` source. Prompt, source, diff, test, tool, and final-answer prose
-never establish or replace session, model, provider, or reasoning provenance.
+`startup_frame` source. The fallback requires an exact banner header, accepts
+only adjacent known banner fields, and closes at the session field, footer,
+blank line, unknown content, duplicate field, or frame bound. Prompt, source,
+diff, test, tool, and final-answer prose never establish or replace session,
+model, provider, or reasoning provenance.
 
 Acceptance must cover new record types appended without breaking existing
 readers, unknown type tolerance, correlation by `run_id` and `task_id`, payload

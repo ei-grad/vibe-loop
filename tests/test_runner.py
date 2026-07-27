@@ -3809,6 +3809,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.session_id, "first-line-session")
         self.assertEqual(result.session_id_source, "native:stderr")
 
+    def test_first_line_session_compatibility_is_scoped_per_stream(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                "import sys\n"
+                "import time\n"
+                "print('starting worker', flush=True)\n"
+                "time.sleep(0.05)\n"
+                "print('session id: stderr-startup-session', "
+                "file=sys.stderr, flush=True)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertEqual(result.session_id, "stderr-startup-session")
+        self.assertEqual(result.session_id_source, "native:stderr")
+
     def test_streaming_command_captures_ansi_codex_startup_frame_only(self) -> None:
         session_id = "019c0104-6f6b-7cd1-ae1f-a7bdc01f24f9"
         frame = [
@@ -3861,6 +3884,90 @@ class RunnerTests(unittest.TestCase):
             result.runtime_context.reasoning_effort_source,
             "native:stdout:startup_frame.reasoning_effort",
         )
+
+    def test_codex_name_in_prose_does_not_open_startup_frame(self) -> None:
+        lines = [
+            "Reading task: migrate the launcher to OpenAI Codex v2",
+            "user",
+            "model: attacker-model",
+            "provider: anthropic",
+            "reasoning effort: minimal",
+            "session id: attacker-session",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                f"lines = {lines!r}\nfor line in lines:\n    print(line)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertIsNone(result.session_id)
+        self.assertTrue(result.runtime_context.empty)
+
+    def test_startup_session_closes_frame_without_trailing_separator(self) -> None:
+        lines = [
+            "OpenAI Codex v0.9",
+            "model: gpt-5.6-sol",
+            "provider: openai",
+            "reasoning effort: high",
+            "session id: real-session-1",
+            "",
+            "thinking about the plan",
+            "model: gpt-3.5",
+            "provider: anthropic",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                f"lines = {lines!r}\nfor line in lines:\n    print(line)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertEqual(result.session_id, "real-session-1")
+        self.assertEqual(result.runtime_context.model_id, "gpt-5.6-sol")
+        self.assertEqual(result.runtime_context.model_provider, "openai")
+        self.assertEqual(result.runtime_context.reasoning_effort, "high")
+
+    def test_boxed_startup_footer_closes_frame(self) -> None:
+        lines = [
+            "╭──────────────────────────╮",
+            "│ OpenAI Codex v0.9        │",
+            "│ model: gpt-5.6-sol       │",
+            "│ provider: openai         │",
+            "╰──────────────────────────╯",
+            "model: gpt-3.5",
+            "provider: anthropic",
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "cmd.py"
+            script.write_text(
+                f"lines = {lines!r}\nfor line in lines:\n    print(line)\n",
+                encoding="utf-8",
+            )
+            log_path = Path(directory) / "run.log"
+            with log_path.open("w", encoding="utf-8") as log:
+                result = run_streaming_command(
+                    f"{sys.executable} cmd.py",
+                    Path(directory),
+                    log,
+                )
+
+        self.assertEqual(result.runtime_context.model_id, "gpt-5.6-sol")
+        self.assertEqual(result.runtime_context.model_provider, "openai")
 
     def test_streaming_command_does_not_capture_session_id_from_later_prose(
         self,
@@ -11861,7 +11968,21 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
             }
         )
 
-        self.assertIsNone(runner_module.observe_worker_session_id(line))
+        self.assertIsNone(runner_module.observe_worker_session(line, "stdout"))
+
+    def test_typeless_structured_attribution_is_not_runtime_identity(self) -> None:
+        context = parse_agent_runtime_context_from_line(
+            json.dumps(
+                {
+                    "model_provider": "openai",
+                    "model_id": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                }
+            ),
+            "stdout",
+        )
+
+        self.assertTrue(context.empty)
 
     def test_claude_init_event_still_supplies_model_identity(self) -> None:
         context = parse_agent_runtime_context_from_line(
@@ -12029,6 +12150,24 @@ class AgentRuntimeContextPrecedenceTests(unittest.TestCase):
         self.assertEqual(
             effective.model_provider_source, "native:stdout:json.model_provider"
         )
+
+    def test_startup_frame_provider_refines_executable_inference(self) -> None:
+        command_context = parse_agent_runtime_context_from_command("codex exec")
+        observed = AgentRuntimeContext(
+            model_provider="oss",
+            model_provider_source="native:stdout:startup_frame.provider",
+            model_id="qwen3-coder",
+            model_id_source="native:stdout:startup_frame.model",
+        )
+
+        effective = command_context.prefer(observed)
+
+        self.assertEqual(effective.model_provider, "oss")
+        self.assertEqual(
+            effective.model_provider_source,
+            "native:stdout:startup_frame.provider",
+        )
+        self.assertEqual(effective.model_id, "qwen3-coder")
 
     def test_same_value_structured_event_upgrades_weak_source(self) -> None:
         weak = AgentRuntimeContext(

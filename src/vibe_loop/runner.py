@@ -285,6 +285,8 @@ AGENT_CONTEXT_SOURCE_RANKS = (
     ("command_config:", 35),
     ("native:stdout:json.", 32),
     ("native:stderr:json.", 32),
+    ("native:stdout:startup_frame.", 30),
+    ("native:stderr:startup_frame.", 30),
     ("native:", 30),
     ("command_executable:", 10),
 )
@@ -305,18 +307,29 @@ SECRET_LIKE_CONTEXT_TOKENS = (
 )
 AGENT_STARTUP_OBSERVATION_LINE_LIMIT = 80
 AGENT_CONTEXT_VALUE_MAX_CHARS = 160
+CODEX_STARTUP_FRAME_LINE_LIMIT = 20
 ANSI_ESCAPE_RE = re.compile(
     r"(?:\x1b\][^\x07\x1b]*(?:\x07|\x1b\\))"
     r"|(?:\x1b\[[0-?]*[ -/]*[@-~])"
     r"|(?:\x1b[@-_])"
 )
-CODEX_STARTUP_HEADER_RE = re.compile(r"\bOpenAI\s+Codex\b", re.IGNORECASE)
-CODEX_STARTUP_SEPARATOR_RE = re.compile(r"^[\s─━═╌╍┄┅┈┉-]{3,}$")
+CODEX_STARTUP_HEADER_RE = re.compile(
+    r"^(?:[│┃|]\s*)?(?:>_\s+)?OpenAI\s+Codex"
+    r"(?:\s+[A-Za-z0-9()._+/-]+){0,4}\s*(?:[│┃|])?$",
+    re.IGNORECASE,
+)
+CODEX_STARTUP_SEPARATOR_RE = re.compile(r"^[\s─━═╌╍┄┅┈┉┌┐└┘╭╮╰╯┏┓┗┛+_-]{3,}$")
 CODEX_STARTUP_FIELD_RE = re.compile(
     r"(?:^|[\s│┃|])"
     r"(?P<label>model|provider|reasoning effort|session id)"
     r"\s*:\s*(?P<value>[A-Za-z0-9][A-Za-z0-9._:/+-]{0,254})"
     r"(?:$|[\s│┃|])",
+    re.IGNORECASE,
+)
+CODEX_STARTUP_METADATA_RE = re.compile(
+    r"(?:^|[\s│┃|])"
+    r"(?:workdir|approval|sandbox|reasoning summaries)"
+    r"\s*:\s*\S.*?(?:$|[\s│┃|])",
     re.IGNORECASE,
 )
 RESOURCE_SCHEDULER_LOCK_NAME = "resource-scheduler"
@@ -530,7 +543,8 @@ class CodexStartupFrameObserver:
     def __init__(self) -> None:
         self._active = False
         self._closed = False
-        self._saw_field = False
+        self._frame_line_count = 0
+        self._seen_fields: set[str] = set()
         self._stream_name = ""
 
     def observe_line(
@@ -553,20 +567,38 @@ class CodexStartupFrameObserver:
                 continue
             if stream_name != self._stream_name:
                 continue
-            if self._saw_field and CODEX_STARTUP_SEPARATOR_RE.fullmatch(segment):
+            self._frame_line_count += 1
+            if self._frame_line_count > CODEX_STARTUP_FRAME_LINE_LIMIT:
                 self._closed = True
                 break
+            if not segment:
+                if self._seen_fields:
+                    self._closed = True
+                    break
+                continue
+            if CODEX_STARTUP_SEPARATOR_RE.fullmatch(segment):
+                if self._seen_fields:
+                    self._closed = True
+                    break
+                continue
             match = CODEX_STARTUP_FIELD_RE.search(segment)
             if match is None:
-                continue
+                if CODEX_STARTUP_METADATA_RE.search(segment) is not None:
+                    continue
+                self._closed = True
+                break
             label = normalize_agent_context_key(match.group("label"))
+            if label in self._seen_fields:
+                self._closed = True
+                break
+            self._seen_fields.add(label)
             value = match.group("value")
             source = f"native:{stream_name}:startup_frame.{label}"
-            self._saw_field = True
             if label == "session_id":
                 session_id = parse_worker_session_id(f"session id: {value}")
                 if session_id is not None:
                     session_observation = SessionIdObservation(session_id, source)
+                self._closed = True
             elif label == "model":
                 model_id, rejected = clean_model_attribution_value(value)
                 context = context.overlay(
@@ -877,6 +909,7 @@ class AgentOutputObserver:
         self._session_observation: SessionIdObservation | None = None
         self._runtime_context = AgentRuntimeContext()
         self._line_count = 0
+        self._stream_line_counts: dict[str, int] = {}
         self._source_generation = source_generation
         self._codex_startup_frame = CodexStartupFrameObserver()
         self._usage_observer = ProviderUsageObserver(provider)
@@ -915,7 +948,9 @@ class AgentOutputObserver:
         runtime_context = AgentRuntimeContext()
         with self._lock:
             self._line_count += 1
-            is_first_output_line = self._line_count == 1
+            stream_line_count = self._stream_line_counts.get(stream_name, 0) + 1
+            self._stream_line_counts[stream_name] = stream_line_count
+            is_first_stream_output_line = stream_line_count == 1
             should_parse_context = (
                 self._line_count <= AGENT_STARTUP_OBSERVATION_LINE_LIMIT
             )
@@ -934,7 +969,7 @@ class AgentOutputObserver:
                 )
             if session_observation is None:
                 session_observation = startup_session
-            if session_observation is None and is_first_output_line:
+            if session_observation is None and is_first_stream_output_line:
                 startup_session_id = parse_startup_session_id(line)
                 if startup_session_id is not None:
                     session_observation = SessionIdObservation(
@@ -7934,7 +7969,7 @@ def agent_context_source_rank(source: str) -> int:
         return 0
     for prefix, rank in AGENT_CONTEXT_SOURCE_RANKS:
         if source.startswith(prefix):
-            if prefix == "native:" and ":json." not in source:
+            if prefix == "native:":
                 return 0
             return rank
     return 0
@@ -8311,15 +8346,6 @@ def observe_worker_session(
                 source=f"native:{stream_name}:json.{key}",
             )
     return None
-
-
-def observe_worker_session_id(line: str) -> str | None:
-    """Compatibility parser for one line; stream capture uses stricter framing."""
-    payload = agent_context_json_payload(line)
-    if payload is None:
-        return parse_worker_session_id(line)
-    observation = observe_worker_session(line, "stdout")
-    return observation.session_id if observation is not None else None
 
 
 def exportable_session_id(record: Mapping[str, object], *, run_id: str) -> str:
