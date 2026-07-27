@@ -2910,7 +2910,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
         )
         self.assertFalse(self.manager.main_integration_status().locked)
 
-    def test_main_verification_failure_records_moved_ref_for_recovery(self) -> None:
+    def test_main_verification_failure_restores_main_and_records_recovery(self) -> None:
         main_before = self.advance_main()
 
         result = self.integrator(
@@ -2919,20 +2919,94 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.reason, "main_verification_failed")
-        self.assertNotEqual(result.main_after, main_before)
+        self.assertTrue(result.recovered)
+        self.assertEqual(result.main_after, main_before)
+        self.assertEqual(result.diagnostics["main_recovery"], "restored")
         self.assertEqual(
-            git(self.repo, "rev-parse", "HEAD").stdout.strip(), result.main_after
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(), main_before
         )
-        self.assertTrue(
+        self.assertEqual(
+            git(self.repo, "status", "--short").stdout,
+            "",
+        )
+        self.assertFalse(self.manager.main_integration_status().locked)
+
+    def test_main_verification_is_isolated_from_sibling_repository_activity(
+        self,
+    ) -> None:
+        main_before = self.advance_main()
+        sibling_worktree = Path(self.directory.name) / "sibling-worktree"
+        verification_worktree = None
+
+        def repository_sensitive_check(command, **kwargs):
+            nonlocal verification_worktree
+            if command == "integration-check":
+                return subprocess.CompletedProcess(command, 0)
+            verification_worktree = Path(kwargs["cwd"])
+            isolated_common_dir = git(
+                verification_worktree,
+                "rev-parse",
+                "--git-common-dir",
+            ).stdout.strip()
+            primary_common_dir = git(
+                self.repo,
+                "rev-parse",
+                "--git-common-dir",
+            ).stdout.strip()
+            self.assertNotEqual(
+                (verification_worktree / isolated_common_dir).resolve(),
+                (self.repo / primary_common_dir).resolve(),
+            )
+            refs_before = git(
+                verification_worktree,
+                "show-ref",
+            ).stdout
+            worktrees_before = git(
+                verification_worktree,
+                "worktree",
+                "list",
+                "--porcelain",
+            ).stdout
             git(
                 self.repo,
-                "merge-base",
-                "--is-ancestor",
-                result.refreshed_head,
-                "main",
-            ).returncode
-            == 0
+                "worktree",
+                "add",
+                "-b",
+                "sibling-run-active",
+                str(sibling_worktree),
+                main_before,
+            )
+            refs_after = git(
+                verification_worktree,
+                "show-ref",
+            ).stdout
+            worktrees_after = git(
+                verification_worktree,
+                "worktree",
+                "list",
+                "--porcelain",
+            ).stdout
+            return subprocess.CompletedProcess(
+                command,
+                0
+                if (refs_before, worktrees_before) == (refs_after, worktrees_after)
+                else 1,
+            )
+
+        result = self.integrator(
+            commands=("integration-check", "repository-sensitive-check"),
+            executor=repository_sensitive_check,
+        ).run()
+
+        self.assertTrue(result.completed)
+        self.assertIsNotNone(verification_worktree)
+        self.assertNotEqual(verification_worktree, self.repo)
+        self.assertEqual(result.main_before, main_before)
+        self.assertEqual(
+            git(self.repo, "rev-parse", "HEAD").stdout.strip(),
+            result.main_after,
         )
+        self.assertTrue(sibling_worktree.exists())
         self.assertFalse(self.manager.main_integration_status().locked)
 
     def test_non_main_checkout_is_blocked_without_moving_configured_ref(self) -> None:

@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -3648,10 +3649,9 @@ class Integrator:
                     verification=integration_checks,
                     recovered=recovered_lock,
                 )
-            main_checks = self._run_checks(
-                phase="main",
+            main_checks = self._run_main_checks(
                 keys=self.verify_on_main_keys,
-                worktree=self.repo,
+                commit=main_before,
             )
             checks = (*integration_checks, *main_checks)
             if not all(check.passed for check in main_checks):
@@ -3770,21 +3770,31 @@ class Integrator:
                     recovered=recovered_lock,
                 )
         main_after = self._rev_parse(self.repo, self.main_branch)
-        main_checks = self._run_checks(
-            phase="main",
+        main_checks = self._run_main_checks(
             keys=self.verify_on_main_keys,
-            worktree=self.repo,
+            commit=main_after,
         )
         checks = (*integration_checks, *main_checks)
         if not all(check.passed for check in main_checks):
+            restored, current_main, recovery_diagnostics = self._restore_main(
+                main_before=main_before,
+                main_after=main_after,
+            )
+            diagnostics = {
+                **resolution_diagnostics,
+                **recovery_diagnostics,
+            }
+            if recovered_lock:
+                diagnostics["integration_lock_recovered"] = True
             return self._record_failure(
                 "main_verification_failed",
                 status="failed",
                 main_before=main_before,
-                main_after=main_after,
+                main_after=current_main,
                 refreshed_head=branch_head,
                 verification=checks,
-                recovered=recovered_lock,
+                recovered=restored,
+                diagnostics=diagnostics,
             )
         return self._record_completed_result(
             IntegrationResult(
@@ -4121,6 +4131,115 @@ class Integrator:
             if not result.passed:
                 break
         return tuple(results)
+
+    def _run_main_checks(
+        self,
+        *,
+        keys: Sequence[str],
+        commit: str,
+    ) -> tuple[IntegrationCheckResult, ...]:
+        if not keys:
+            return ()
+        with tempfile.TemporaryDirectory(
+            prefix="vibe-loop-main-verification-"
+        ) as directory:
+            checkout = Path(directory) / "repo"
+            clone = self._git(
+                self.repo,
+                "clone",
+                "--no-local",
+                "--no-checkout",
+                "--quiet",
+                str(self.repo),
+                str(checkout),
+            )
+            if clone.returncode != 0:
+                return self._verification_setup_failure(
+                    command_key=keys[0],
+                    detail=self._bounded_git_output(clone),
+                )
+            checked_out = self._git(
+                checkout,
+                "checkout",
+                "--detach",
+                "--quiet",
+                commit,
+            )
+            if checked_out.returncode != 0:
+                return self._verification_setup_failure(
+                    command_key=keys[0],
+                    detail=self._bounded_git_output(checked_out),
+                )
+            return self._run_checks(
+                phase="main",
+                keys=keys,
+                worktree=checkout,
+            )
+
+    def _verification_setup_failure(
+        self,
+        *,
+        command_key: str,
+        detail: str,
+    ) -> tuple[IntegrationCheckResult, ...]:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = self.log_dir / "main-1.log"
+        message = "isolated main verification checkout could not be prepared"
+        if detail:
+            message += f": {detail}"
+        log_path.write_text(message + "\n", encoding="utf-8")
+        return (
+            IntegrationCheckResult(
+                phase="main",
+                command_key=command_key,
+                exit_class="execution_error",
+                exit_code=None,
+                duration_seconds=0.0,
+                log_reference=str(log_path),
+                evidence_digest=(
+                    "sha256:" + hashlib.sha256(log_path.read_bytes()).hexdigest()
+                ),
+            ),
+        )
+
+    def _restore_main(
+        self,
+        *,
+        main_before: str,
+        main_after: str,
+    ) -> tuple[bool, str, dict[str, object]]:
+        restored_ref = self._git(
+            self.repo,
+            "update-ref",
+            f"refs/heads/{self.main_branch}",
+            main_before,
+            main_after,
+        )
+        if restored_ref.returncode != 0:
+            return (
+                False,
+                self._rev_parse(self.repo, self.main_branch),
+                {
+                    "main_recovery": "ref_restore_failed",
+                    "git_output": self._bounded_git_output(restored_ref),
+                },
+            )
+        restored_checkout = self._git(self.repo, "reset", "--hard", main_before)
+        current_main = self._rev_parse(self.repo, self.main_branch)
+        if restored_checkout.returncode != 0:
+            return (
+                False,
+                current_main,
+                {
+                    "main_recovery": "checkout_restore_failed",
+                    "git_output": self._bounded_git_output(restored_checkout),
+                },
+            )
+        return (
+            current_main == main_before,
+            current_main,
+            {"main_recovery": "restored"},
+        )
 
     def _tracked_state(self, worktree: Path) -> tuple[str, str]:
         return (
