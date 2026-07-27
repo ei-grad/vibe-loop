@@ -1418,6 +1418,7 @@ def redact_task_source_payload(payload: dict[str, object]) -> dict[str, object]:
         "next_command",
         "probe_command",
         "activate_command",
+        "health_command",
         "reset_command",
     ):
         configured = bool(redacted.pop(key, None))
@@ -1946,6 +1947,15 @@ def render_autopilot_status(status: ProjectStatus) -> str:
         if health_blockers:
             lines.append("last cycle health blockers:")
             lines.extend(f"  - {blocker}" for blocker in health_blockers)
+        task_source_blockers = tuple(
+            blocker
+            for blocker in cycle.blockers
+            if blocker == "task_source_health_failed"
+            or blocker.startswith("task_source_activation_failed:")
+        )
+        if task_source_blockers:
+            lines.append("last cycle task-source blockers:")
+            lines.extend(f"  - {blocker}" for blocker in task_source_blockers)
         # A paused cycle keeps the plain "idle" status, so name the wall
         # explicitly: otherwise it is indistinguishable from a planning error.
         if cycle.provider_limit_action:

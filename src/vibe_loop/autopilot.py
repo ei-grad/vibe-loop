@@ -108,6 +108,7 @@ from vibe_loop.runs import (
     RUN_STARTED_RECORD_TYPE,
     RUN_SUPERVISOR_EXITED_RECORD_TYPE,
     RUN_SUPERVISOR_STARTED_RECORD_TYPE,
+    TASK_ACTIVATION_FAILED_RECORD_TYPE,
     TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
     WORKSPACE_PREFLIGHT_RECORD_TYPE,
     RunLifecycleEvent,
@@ -6662,19 +6663,34 @@ def execute_autopilot_cycle(
 
     blocker_list = current_blockers(status)
 
-    def run_maintenance(kind: str) -> MaintenanceCommandResult | None:
-        command = config.autopilot.maintenance_command(kind)
+    def run_maintenance(
+        kind: str,
+        *,
+        command_override: str | None = None,
+        runtime_context: Mapping[str, str] | None = None,
+        timeout_override: float | None = None,
+    ) -> MaintenanceCommandResult | None:
+        command = (
+            command_override
+            if command_override is not None
+            else config.autopilot.maintenance_command(kind)
+        )
         if not command:
             return None
+        command_environment = maintenance_command_env(
+            config, kind=kind, cycle_id=cycle_id, runnable=runnable
+        )
+        if runtime_context is not None:
+            command_environment.update(runtime_context)
         result = maintenance_runner(
             command,
             kind,
             cycle_id,
             cwd=config.repo,
-            env_extra=maintenance_command_env(
-                config, kind=kind, cycle_id=cycle_id, runnable=runnable
+            env_extra=command_environment,
+            timeout=(
+                timeout_override if timeout_override is not None else command_timeout
             ),
-            timeout=command_timeout,
             max_output_bytes=command_max_output_bytes,
         )
         run_store.append_record(result.to_record(config.repo))
@@ -6684,6 +6700,14 @@ def execute_autopilot_cycle(
     health = run_maintenance("health")
     if health is not None and not health.succeeded:
         blocker_list.append("autopilot_health_failed")
+    task_source_health = run_maintenance(
+        "task_source_health",
+        command_override=config.task_source.health_command,
+        runtime_context=config.runtime_environment,
+        timeout_override=config.task_source.command_timeout_seconds,
+    )
+    if task_source_health is not None and not task_source_health.succeeded:
+        blocker_list.append("task_source_health_failed")
 
     blockers = tuple(blocker_list)
     blockers_checked_after_planning = False
@@ -6855,9 +6879,10 @@ def execute_autopilot_cycle(
                 )
             )
 
+        records_before_launch = run_store.read_records()
         run_started_before = sum(
             1
-            for record in run_store.read_records()
+            for record in records_before_launch
             if record.get("record_type") == RUN_STARTED_RECORD_TYPE
         )
         actions.append("launched_run_until_done")
@@ -6868,12 +6893,21 @@ def execute_autopilot_cycle(
             on_start=_on_start,
         )
         child_pid = observed_pid.get("pid")
+        records_after_launch = run_store.read_records()
         run_started_after = sum(
             1
-            for record in run_store.read_records()
+            for record in records_after_launch
             if record.get("record_type") == RUN_STARTED_RECORD_TYPE
         )
         dispatched_runs = max(0, run_started_after - run_started_before)
+        activation_blockers = task_activation_failure_blockers(
+            records_after_launch[len(records_before_launch) :]
+        )
+        if activation_blockers:
+            blockers = tuple(dict.fromkeys((*blockers, *activation_blockers)))
+            actions.append(
+                f"task_source_activation_failures:{len(activation_blockers)}"
+            )
         cycle_status = classify_child_exit(exit_code)
         actions.append(f"child_exit:{exit_code}")
         actions.append(f"dispatched_runs:{dispatched_runs}")
@@ -6916,6 +6950,25 @@ def execute_autopilot_cycle(
         autopilot_run_id=autopilot_run_id,
         dispatched_runs=dispatched_runs,
     )
+
+
+def task_activation_failure_blockers(
+    records: Sequence[Mapping[str, object]],
+) -> tuple[str, ...]:
+    blockers: list[str] = []
+    for record in records:
+        if record.get("record_type") != TASK_ACTIVATION_FAILED_RECORD_TYPE:
+            continue
+        task_id = str(record.get("task_id") or "unknown")
+        blocker = f"task_source_activation_failed:{task_id}"
+        exit_code = record.get("exit_code")
+        if isinstance(exit_code, int):
+            blocker += f":exit={exit_code}"
+        diagnostic = record.get("stderr_last_line") or record.get("message")
+        if not isinstance(diagnostic, str) or not diagnostic:
+            diagnostic = str(record.get("error_class") or "adapter failed")
+        blockers.append(f"{blocker}: {diagnostic[:500]}")
+    return tuple(dict.fromkeys(blockers))
 
 
 _RECHECK_EPSILON = 1e-9

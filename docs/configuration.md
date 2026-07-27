@@ -43,6 +43,7 @@ type = "markdown-plan"
 plan_path = "PLAN.md"
 plan_paths = ["PLAN.md", "docs/PLAN.md", "ROADMAP.md", "TODO.md"]
 runnable_statuses = ["Active", "Next", "Planned"]
+# health = "tracker db verify"
 
 [completion]
 commands = [
@@ -304,6 +305,10 @@ heartbeat command are authoritative in
 source. Setting any of them disables generated cache as the active source.
 `runnable_statuses` is a non-source override and can replace generated runnable
 statuses without disabling a generated parser.
+`task_source.health` independently checks an external source backend and does
+not select a source or disable generated discovery; its cycle behavior is
+authoritative in
+[PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks).
 
 The generated `markdown-profile` source type is emitted by `tasks configure
 --promotion-toml`; see
@@ -366,7 +371,7 @@ configuration section now lives.
 | `main_branch`, `state_dir` | Annotated configuration above; configuration authority in [CLI Runtime PRD](prd/cli-runtime.md). |
 | `agent.kind`, `model`, `effort`, `command`, `selection_command`, `analysis_command`, `prompt_dialect`, `skill_ref_prefix`, `worker_prompt_extra`, `forward_stderr` | [CLI Runtime PRD](prd/cli-runtime.md). |
 | `agent.profiles.*`; routing `profile`, `match_hazards_any`, `match_paths_glob`, `match_task_id_regex`, `match_title_regex`, `match_priority`; per-task `agent`, `model`, `hazards` | Per-task agent routing above. |
-| `task_source.type`, `plan_path`, `plan_paths`, `profile`, `runnable_statuses`, `list`, `next`, `probe`, `activate`, `complete`, `reset`, `park` | [Generated Task Discovery](generated-task-discovery.md) and [Task Discovery PRD](prd/task-discovery.md). |
+| `task_source.type`, `plan_path`, `plan_paths`, `profile`, `runnable_statuses`, `list`, `next`, `probe`, `activate`, `health`, `complete`, `reset`, `park` | [Generated Task Discovery](generated-task-discovery.md), [Task Discovery PRD](prd/task-discovery.md), and [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks). |
 | Profile fields `resources`, `paths`, `column`, `none_values`; ralphex conflict surfaces; `spec-kit`, `kiro`, `openspec` | [Generated Task Discovery](generated-task-discovery.md) and the [ralphex example](examples/ralphex-markdown-plan.md). |
 | `completion.commands` | Other configuration groups above and [PRD-CLI-003](prd/cli-runtime.md#prd-cli-003-completion-checks). |
 | `orchestration.mode`, `reviewer_profile`; reviewer routing `profile`, `match_implementer_profile`, `match_implementer_provider`; `task_provenance_mode`, `external_completion_actor`, `max_initial_review_passes`, `max_closure_review_passes`, `reviewer_concurrency_budget`, `max_candidate_reanchors`, `integration_lock_timeout_seconds` | Reviewer routing above, [PRD-ORC-005](prd/run-orchestration.md#prd-orc-005-reviewer-routing-identity-and-continuation), and [runtime integration](prd/run-orchestration.md#prd-orc-007-runtime-integration-and-task-provenance). |

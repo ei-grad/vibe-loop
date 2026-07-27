@@ -418,6 +418,14 @@ Autopilot may run optional project-configured health, summary, troubleshoot, or
 planning commands, but only when those commands are explicitly user-authored in
 `.vibe-loop.toml`.
 
+An external task-source backend may additionally define `task_source.health`.
+Every repository that configures the hook runs it independently on every cycle;
+a failing hook blocks that repository as `task_source_health_failed`, even when
+a sibling repository checks the same backend. The hook is operational metadata,
+not source selection, so it does not disable generated task-source discovery.
+Unlike general maintenance hooks, it receives the same validated project
+binding/runtime selector context as the task-source adapters it checks.
+
 Acceptance must cover an `[autopilot]` config section, bounded command output,
 safe environment variables, command-result records, command redaction in status
 JSON, low-ready queue handling, and the rule that generated task-source
@@ -426,6 +434,12 @@ profiles cannot introduce maintenance commands. An explicitly configured
 runs even when another cycle blocker is already present. Human status reports
 the latest cycle's health failures beside its timestamped cycle summary and
 separately from current task-scoped dispatch blockers.
+
+A failed `task_source.activate` writes a bounded, redacted lifecycle diagnostic
+with the adapter exit status and stderr. The enclosing autopilot cycle reports
+that attempt as `task_source_activation_failed:<task-id>:exit=<status>` with the
+adapter's last diagnostic line, and human status retains it beside the latest
+cycle even though the current project blocker list may be empty.
 
 Related implementation IDs: `AUTO-04`.
 

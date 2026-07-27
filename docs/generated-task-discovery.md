@@ -237,9 +237,11 @@ Precedence is resolved before cache loading performs parser validation:
 3. Default config values are not explicit. Omitted `task_source.plan_path`,
    default `plan_paths`, and default runnable statuses do not block a generated
    cache.
-4. User-authored non-source settings override generated fields without disabling
-   the generated source. The current example is `task_source.runnable_statuses`,
-   which replaces `profile.status_map.runnable` during normalization.
+4. User-authored non-source settings do not disable the generated source.
+   `task_source.runnable_statuses` replaces `profile.status_map.runnable` during
+   normalization. `task_source.health` is also non-source operational metadata;
+   its behavior is owned by
+   [PRD-AUT-005](prd/autopilot.md#prd-aut-005-configured-maintenance-hooks).
 5. Generated profile fields fill only unset behavior. They never override a
    present `.vibe-loop.toml` key.
 

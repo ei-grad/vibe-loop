@@ -97,6 +97,7 @@ INTEGRATION_PROVENANCE_OUTCOMES = frozenset(
     }
 )
 TASK_PROVENANCE_COMMITTED_RECORD_TYPE = "task_provenance_committed"
+TASK_ACTIVATION_FAILED_RECORD_TYPE = "task_activation_failed"
 TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE = "task_source_settlement_attempted"
 TASK_SOURCE_SETTLED_RECORD_TYPE = "task_source_settled"
 WORKER_PROCESS_STARTED_RECORD_TYPE = "worker_process_started"
@@ -177,6 +178,7 @@ LIFECYCLE_RECORD_TYPES = frozenset(
         INTEGRATION_RESULT_RECORD_TYPE,
         INTEGRATION_PROVENANCE_RECORD_TYPE,
         TASK_PROVENANCE_COMMITTED_RECORD_TYPE,
+        TASK_ACTIVATION_FAILED_RECORD_TYPE,
         TASK_SOURCE_SETTLEMENT_ATTEMPTED_RECORD_TYPE,
         TASK_SOURCE_SETTLED_RECORD_TYPE,
         WORKER_PROCESS_STARTED_RECORD_TYPE,
@@ -717,6 +719,25 @@ class RunLifecycleEvent:
             run_id=run_id,
             task_id=task_id,
             payload=contract,
+        )
+
+    @classmethod
+    def task_activation_failed(
+        cls,
+        *,
+        run_id: str,
+        task_id: str,
+        diagnostics: Mapping[str, Any],
+    ) -> RunLifecycleEvent:
+        return cls(
+            record_type=TASK_ACTIVATION_FAILED_RECORD_TYPE,
+            run_id=run_id,
+            task_id=task_id,
+            payload={
+                "task_id": task_id,
+                "adapter": "task_source.activate",
+                **dict(diagnostics),
+            },
         )
 
     @classmethod

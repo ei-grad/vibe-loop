@@ -10989,6 +10989,57 @@ class SettledOutcomeFinalizationTests(unittest.TestCase):
             self.assertEqual(clean_result.cleaned, [])
             self.assertFalse(lock_manager.is_locked("T-1"))
 
+    def test_runtime_owned_activation_failure_records_adapter_diagnostic(
+        self,
+    ) -> None:
+        task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
+        with tempfile.TemporaryDirectory() as directory:
+            runner, _, _ = self._build_runner(directory, [task], {})
+            source = self._enable_runtime_owned_task_source(runner, task)
+            observed_tokens = []
+
+            def failing_activate(*args, **kwargs):
+                fencing_token = kwargs["runtime_context"]["VIBE_LOOP_FENCING_TOKEN"]
+                observed_tokens.append(fencing_token)
+                raise subprocess.CalledProcessError(
+                    7,
+                    "activate",
+                    stderr=(
+                        f"activation token {fencing_token}\n"
+                        "database verification failed (11 findings)\n"
+                    ),
+                )
+
+            source.activate = failing_activate  # type: ignore[method-assign]
+
+            with self.assertRaises(TaskActivationError):
+                self._run_task(
+                    runner,
+                    task,
+                    self._reporting_worker(runner, "completed"),
+                )
+
+            failures = [
+                record
+                for record in runner.run_store.read_records()
+                if record.get("record_type") == "task_activation_failed"
+            ]
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["task_id"], "T-1")
+        self.assertEqual(failures[0]["adapter"], "task_source.activate")
+        self.assertEqual(failures[0]["exit_code"], 7)
+        self.assertEqual(
+            failures[0]["stderr_last_line"],
+            "database verification failed (11 findings)",
+        )
+        self.assertEqual(len(observed_tokens), 1)
+        self.assertIn("activation token <redacted>", failures[0]["stderr"])
+        self.assertNotIn(
+            f"activation token {observed_tokens[0]}\n",
+            failures[0]["stderr"],
+        )
+
     def test_recovery_prelaunch_exits_leave_no_task_lock(self) -> None:
         task = Task(task_id="T-1", title="Task", status="ready", agent="worker")
 

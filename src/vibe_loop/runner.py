@@ -178,6 +178,7 @@ from vibe_loop.tasks import (
     TaskSource,
     build_task_source,
     runnable_tasks_from_snapshot,
+    task_source_error_diagnostics,
 )
 from vibe_loop.upstream import check_upstream_sync
 from vibe_loop.workers import (
@@ -3905,6 +3906,26 @@ class VibeRunner:
                 runtime_context=runtime_context,
             )
         except (OSError, subprocess.SubprocessError, ValueError) as exc:
+            fencing_token = fencing_token_value(
+                runtime_context.get("VIBE_LOOP_FENCING_TOKEN"),
+            )
+            diagnostics = task_source_error_diagnostics(
+                exc,
+                fencing_token,
+            )
+            if not diagnostics.get("stderr_last_line"):
+                message = redact_evidence_text(str(exc))
+                diagnostics["message"] = redact_fencing_token_text(
+                    message,
+                    fencing_token,
+                )[:500]
+            self.run_store.append_lifecycle_event(
+                RunLifecycleEvent.task_activation_failed(
+                    run_id=run_id,
+                    task_id=task.task_id,
+                    diagnostics=diagnostics,
+                )
+            )
             mode = "continuation confirmation" if continuation else "activation"
             raise TaskActivationError(
                 f"task-source {mode} failed for {task.task_id}: {exc}; "

@@ -7885,7 +7885,12 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             command, kind, cycle_id, *, cwd, env_extra, timeout, max_output_bytes
         ):
             calls.append(
-                {"command": command, "kind": kind, "env_extra": dict(env_extra)}
+                {
+                    "command": command,
+                    "kind": kind,
+                    "env_extra": dict(env_extra),
+                    "timeout": timeout,
+                }
             )
             return MaintenanceCommandResult(
                 kind=kind,
@@ -7991,6 +7996,109 @@ class AutopilotMaintenanceTests(unittest.TestCase):
         self.assertIn("autopilot_health_failed", cycle.blockers)
         self.assertEqual(len(launched), 0)
         self.assertEqual([call["kind"] for call in calls], ["health"])
+
+    def test_shared_task_source_health_failure_blocks_every_configured_board(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cycles = []
+            calls_by_board = []
+            launched = []
+            for name in ("alpha", "beta"):
+                repo = root / name
+                repo.mkdir()
+                configured_repo(
+                    repo,
+                    [("TASK-01", "Next", "", "ready slice")],
+                    extra_toml=(
+                        '[task_source]\nhealth = "shared-backend-health"\n'
+                        "command_timeout_seconds = 37\n"
+                    ),
+                )
+                config = load_config(
+                    repo,
+                    runtime_context={"LOOPYARD_PROJECT": name},
+                )
+                runner, calls = self._stub_runner({"task_source_health": 11})
+                summary = run_autopilot(
+                    config,
+                    once=True,
+                    launcher=lambda command, **kwargs: launched.append(command) or 0,
+                    maintenance_runner=runner,
+                )
+                cycles.append(summary.cycles[0])
+                calls_by_board.append(calls)
+
+        self.assertEqual(
+            [cycle.status for cycle in cycles],
+            ["blocked", "blocked"],
+        )
+        self.assertTrue(
+            all("task_source_health_failed" in cycle.blockers for cycle in cycles)
+        )
+        self.assertEqual(launched, [])
+        self.assertEqual(
+            [[call["kind"] for call in calls] for calls in calls_by_board],
+            [["task_source_health"], ["task_source_health"]],
+        )
+        self.assertEqual(
+            [calls[0]["env_extra"]["LOOPYARD_PROJECT"] for calls in calls_by_board],
+            ["alpha", "beta"],
+        )
+        self.assertEqual(
+            [calls[0]["timeout"] for calls in calls_by_board],
+            [37.0, 37.0],
+        )
+
+    def test_activation_failure_record_becomes_visible_cycle_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+
+            def launcher(command, *, cwd, log_path, on_start=None):
+                RunStore(config.state_path / "runs.jsonl").append_record(
+                    {
+                        "schema_version": 1,
+                        "record_type": "task_activation_failed",
+                        "occurred_at": "2026-07-27T13:30:00+00:00",
+                        "run_id": "run-activation-failed",
+                        "task_id": "TASK-01",
+                        "adapter": "task_source.activate",
+                        "error_class": "TaskSourceCommandError",
+                        "exit_code": 7,
+                        "stderr": "database verification failed (11 findings)",
+                        "stderr_last_line": (
+                            "database verification failed (11 findings)"
+                        ),
+                    }
+                )
+                return 1
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+            )
+            rendered = render_autopilot_status(
+                collect_project_status(config, process_exists=lambda pid: False)
+            )
+
+        cycle = summary.cycles[0]
+        self.assertEqual(cycle.status, "restartable")
+        self.assertIn(
+            "task_source_activation_failed:TASK-01:exit=7: "
+            "database verification failed (11 findings)",
+            cycle.blockers,
+        )
+        self.assertIn("blockers: none", rendered)
+        self.assertIn(
+            "last cycle task-source blockers:\n"
+            "  - task_source_activation_failed:TASK-01:exit=7: "
+            "database verification failed (11 findings)",
+            rendered,
+        )
 
     def test_failed_health_command_is_reported_with_dispatch_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

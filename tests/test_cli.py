@@ -7382,6 +7382,7 @@ class CliTests(unittest.TestCase):
                 "attempt_circuit_attempt",
                 "run_contract_resolved",
                 "stage_transition",
+                "task_activation_failed",
                 "stage_transition",
                 "stage_transition",
                 "lock_released",
@@ -7406,6 +7407,7 @@ class CliTests(unittest.TestCase):
         for case, restart_count in (
             ("invalid-template", 0),
             ("missing-continuation", 1),
+            ("nonzero-adapter", 0),
         ):
             with self.subTest(case=case):
                 with tempfile.TemporaryDirectory() as directory:
@@ -7422,6 +7424,11 @@ class CliTests(unittest.TestCase):
                         "    print(json.dumps([task]))\n"
                         "elif sys.argv[1] == 'probe':\n"
                         "    print('null')\n"
+                        "elif sys.argv[1] == 'show':\n"
+                        "    print(json.dumps(task))\n"
+                        "elif sys.argv[1] == 'fail':\n"
+                        "    print('database verification failed', file=sys.stderr)\n"
+                        "    raise SystemExit(7)\n"
                         "else:\n"
                         "    task['status'] = 'active'\n"
                         "    print(json.dumps(task))\n",
@@ -7441,11 +7448,18 @@ class CliTests(unittest.TestCase):
                     probe_command = shell_command(
                         sys.executable,
                         str(source_script),
-                        "probe",
+                        "probe" if case == "missing-continuation" else "show",
                         "{task_id}",
                     )
                     if case == "invalid-template":
                         activate_command = "activate {unsupported}"
+                    elif case == "nonzero-adapter":
+                        activate_command = shell_command(
+                            sys.executable,
+                            str(source_script),
+                            "fail",
+                            "{task_id}",
+                        )
                     else:
                         activate_command = shell_command(
                             sys.executable,
@@ -7501,12 +7515,24 @@ class CliTests(unittest.TestCase):
                         "attempt_circuit_attempt",
                         "run_contract_resolved",
                         "stage_transition",
+                        "task_activation_failed",
                         "stage_transition",
                         "stage_transition",
                         "lock_released",
                     ],
                 )
                 self.assertEqual(records[-1]["reason"], "task_activation_failed")
+                if case == "nonzero-adapter":
+                    failure = next(
+                        record
+                        for record in records
+                        if record["record_type"] == "task_activation_failed"
+                    )
+                    self.assertEqual(failure["exit_code"], 7)
+                    self.assertEqual(
+                        failure["stderr_last_line"],
+                        "database verification failed",
+                    )
 
     def test_main_integration_rejects_merged_branch_behind_main(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -10366,7 +10392,8 @@ class AutopilotCliTests(unittest.TestCase):
             init_planning_repo(repo, THREE_TASK_PLAN)
             (repo / ".vibe-loop.toml").write_text(
                 '[autopilot]\njobs = 2\nhealth_command = "secret-health --token abc"\n'
-                'idle_wake_command = "secret-wake --token def"\n',
+                'idle_wake_command = "secret-wake --token def"\n'
+                '[task_source]\nhealth = "secret-backend-health --token ghi"\n',
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
@@ -10398,6 +10425,11 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertNotIn("idle_wake_command", autopilot)
         self.assertNotIn("secret-health", raw)
         self.assertNotIn("secret-wake", raw)
+        task_source = payload["task_source"]
+        self.assertTrue(task_source["health_command_configured"])
+        self.assertTrue(task_source["health_command_redacted"])
+        self.assertNotIn("health_command", task_source)
+        self.assertNotIn("secret-backend-health", raw)
 
     def test_config_contract_blockers_match_status_doctor_and_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
