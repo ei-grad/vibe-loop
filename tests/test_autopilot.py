@@ -164,6 +164,7 @@ from vibe_loop.workers import (
     WorkerView,
     WorkspaceClaim,
     collect_worktree_disposition_evidence,
+    workspace_state_fingerprint,
 )
 
 
@@ -705,6 +706,54 @@ class AutopilotStatusTests(unittest.TestCase):
             payload = collect_project_status(config).to_json()
 
         self.assertEqual(payload["queue"]["dispatch_blockers"], [])
+
+    def test_removed_deferred_workspace_is_dispatched_next_cycle(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            branch = "vibe-loop/task-01"
+            worktree = Path(directory) / "task-worktree"
+            run(repo, "git", "worktree", "add", "-b", branch, str(worktree))
+            config = load_config(repo)
+            selected_base = git_text(repo, "rev-parse", "main")
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.workspace_preflight(
+                    run_id="run-1",
+                    task_id="TASK-01",
+                    decision="rejected",
+                    reason="workspace_refresh_conflict",
+                    retry_disposition="defer_until_workspace_changes",
+                    worker_launch_allowed=False,
+                    branch=branch,
+                    worktree=worktree,
+                    selected_base=selected_base,
+                    workspace_state_fingerprint=workspace_state_fingerprint(
+                        repo=repo,
+                        main_branch="main",
+                        branch=branch,
+                        worktree=worktree,
+                        expected_base=selected_base,
+                    ),
+                )
+            )
+
+            blocked = collect_project_status(config)
+            run(repo, "git", "worktree", "remove", str(worktree))
+            run(repo, "git", "branch", "-D", branch)
+            launched: list[object] = []
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=lambda command, **kwargs: launched.append(command) or 0,
+            )
+            refreshed = collect_project_status(config)
+
+        self.assertEqual(len(blocked.queue.dispatch_blockers), 1)
+        self.assertEqual(refreshed.queue.dispatch_blockers, ())
+        self.assertEqual(len(launched), 1)
+        self.assertIn("launched_run_until_done", summary.cycles[0].actions)
 
     def test_collect_project_status_keeps_nonblocking_agent_diagnostics(
         self,
