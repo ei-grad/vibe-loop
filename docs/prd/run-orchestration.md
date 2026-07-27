@@ -325,6 +325,15 @@ the fenced lock release. On an activation-capable task source the contract must
 include a settlement path; contract validation fails closed before any mutation
 when `task_source.reset` is absent.
 
+Review-remediation budget exhaustion carries its open finding ledger through
+that settlement boundary. The runtime supplies canonical finding JSON in
+`VIBE_LOOP_PRIOR_FINDINGS` and the incremented consecutive exhaustion count in
+`VIBE_LOOP_REVIEW_BUDGET_EXHAUSTIONS`; the reset or park adapter persists both
+onto the authoritative task. Settlement is not confirmed until a probe returns
+the requested values. The next worker prompt labels them as prior findings, and
+task status surfaces counts greater than one. A subsequent non-budget terminal
+failure resets the consecutive count to zero while retaining the findings.
+
 Integration-lock contention does not consume a second implementation or review
 pass. The runtime records each expired acquisition attempt against the approved
 candidate, including the holder task and run identities, then retries the

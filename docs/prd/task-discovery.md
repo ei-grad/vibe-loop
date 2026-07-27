@@ -81,7 +81,12 @@ park = "my-task-tool park {task_id} --run {run_id} --json"
 Optional `resources` and `paths` arrays declare scheduling conflicts. Optional
 `requirement_ids`, `spec_paths`, `design_refs`, `approval_state`, and
 `source_fingerprints` preserve traceability through task JSON, worker prompts,
-and promotion.
+and promotion. Command task objects may also provide `prior_findings` and
+`review_budget_exhaustions`. `prior_findings` uses the review finding wire shape
+(`id`, `severity`, `summary`, `evidence`, `files`, `lines`, and `state`);
+`review_budget_exhaustions` is the non-negative count of consecutive runs that
+exhausted the review-remediation budget. These values may be top-level task
+properties or members of a top-level `fields` object.
 
 Runtime-owned command sources with activation must also configure `reset`, and
 adapter-owned completion requires `complete`. `complete` must return a terminal
