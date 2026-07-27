@@ -372,7 +372,6 @@ DISK_RESERVE_CONFIG_KEYS = frozenset(
         "warn_free_bytes",
         "hard_stop_free_bytes",
         "min_free_bytes",
-        "min_free_fraction",
         "min_free_inodes",
         "min_free_inode_fraction",
     }
@@ -382,7 +381,6 @@ DISK_RESERVE_CONFIG_KEYS = frozenset(
 DISK_RESERVE_DEFAULT_WARN_FREE_BYTES = 50 * 1024 * 1024 * 1024
 DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES = 10 * 1024 * 1024 * 1024
 DISK_RESERVE_DEFAULT_MIN_FREE_BYTES = DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES
-DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION = 0.02
 DISK_RESERVE_DEFAULT_MIN_FREE_INODES = 10_000
 DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION = 0.02
 # Six hours between planning attempts once planning stops producing actionable
@@ -1161,7 +1159,6 @@ class DiskReserveConfig:
     warn_free_bytes: int | None = None
     hard_stop_free_bytes: int | None = None
     min_free_bytes: int | None = None
-    min_free_fraction: float | None = None
     min_free_inodes: int | None = None
     min_free_inode_fraction: float | None = None
     explicit_keys: frozenset[str] = dataclasses.field(default_factory=frozenset)
@@ -1171,9 +1168,12 @@ class DiskReserveConfig:
 
     @property
     def effective_warn_free_bytes(self) -> int:
-        if self.warn_free_bytes is None:
-            return DISK_RESERVE_DEFAULT_WARN_FREE_BYTES
-        return self.warn_free_bytes
+        if self.warn_free_bytes is not None:
+            return self.warn_free_bytes
+        return max(
+            DISK_RESERVE_DEFAULT_WARN_FREE_BYTES,
+            self.effective_hard_stop_free_bytes,
+        )
 
     @property
     def effective_hard_stop_free_bytes(self) -> int:
@@ -1182,16 +1182,6 @@ class DiskReserveConfig:
         if self.min_free_bytes is not None:
             return self.min_free_bytes
         return DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES
-
-    @property
-    def effective_min_free_bytes(self) -> int:
-        return self.effective_hard_stop_free_bytes
-
-    @property
-    def effective_min_free_fraction(self) -> float:
-        if self.min_free_fraction is None:
-            return DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
-        return self.min_free_fraction
 
     @property
     def effective_min_free_inodes(self) -> int:
@@ -1210,7 +1200,6 @@ class DiskReserveConfig:
             "warn_free_bytes": self.warn_free_bytes,
             "hard_stop_free_bytes": self.hard_stop_free_bytes,
             "min_free_bytes": self.min_free_bytes,
-            "min_free_fraction": self.min_free_fraction,
             "min_free_inodes": self.min_free_inodes,
             "min_free_inode_fraction": self.min_free_inode_fraction,
             # Effective floors actually enforced by the cycle: the configured
@@ -1219,8 +1208,6 @@ class DiskReserveConfig:
             "effective": {
                 "warn_free_bytes": self.effective_warn_free_bytes,
                 "hard_stop_free_bytes": self.effective_hard_stop_free_bytes,
-                "min_free_bytes": self.effective_min_free_bytes,
-                "min_free_fraction": self.effective_min_free_fraction,
                 "min_free_inodes": self.effective_min_free_inodes,
                 "min_free_inode_fraction": self.effective_min_free_inode_fraction,
             },
@@ -3289,9 +3276,6 @@ def parse_disk_reserve(data: object) -> DiskReserveConfig:
     min_free_bytes = optional_nonnegative_int(
         table.get("min_free_bytes"), "autopilot.disk_reserve.min_free_bytes"
     )
-    min_free_fraction = optional_fraction(
-        table.get("min_free_fraction"), "autopilot.disk_reserve.min_free_fraction"
-    )
     min_free_inodes = optional_nonnegative_int(
         table.get("min_free_inodes"), "autopilot.disk_reserve.min_free_inodes"
     )
@@ -3303,7 +3287,6 @@ def parse_disk_reserve(data: object) -> DiskReserveConfig:
         warn_free_bytes=warn_free_bytes,
         hard_stop_free_bytes=hard_stop_free_bytes,
         min_free_bytes=min_free_bytes,
-        min_free_fraction=min_free_fraction,
         min_free_inodes=min_free_inodes,
         min_free_inode_fraction=min_free_inode_fraction,
         explicit_keys=explicit_keys,

@@ -2574,6 +2574,8 @@ class CliTests(unittest.TestCase):
         )
         self.assertEqual(reserve["effective"]["warn_free_bytes"], 32212254720)
         self.assertEqual(reserve["effective"]["hard_stop_free_bytes"], 21474836480)
+        self.assertNotIn("min_free_bytes", reserve["effective"])
+        self.assertNotIn("min_free_fraction", reserve["effective"])
         self.assertEqual(reserve["effective"]["min_free_inodes"], 10000)
         self.assertEqual(reserve["effective"]["min_free_inode_fraction"], 0.02)
 

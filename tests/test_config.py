@@ -830,7 +830,6 @@ class ConfigTests(unittest.TestCase):
                 "[autopilot.disk_reserve]\n"
                 "warn_free_bytes = 32212254720\n"
                 "hard_stop_free_bytes = 21474836480\n"
-                "min_free_fraction = 0.05\n"
                 "min_free_inodes = 50000\n"
                 "min_free_inode_fraction = 0.03\n",
                 encoding="utf-8",
@@ -841,21 +840,20 @@ class ConfigTests(unittest.TestCase):
         reserve = config.autopilot.disk_reserve
         self.assertEqual(reserve.warn_free_bytes, 32212254720)
         self.assertEqual(reserve.hard_stop_free_bytes, 21474836480)
-        self.assertEqual(reserve.min_free_fraction, 0.05)
         self.assertEqual(reserve.min_free_inodes, 50000)
         self.assertEqual(reserve.min_free_inode_fraction, 0.03)
         payload = config.autopilot.to_json()["disk_reserve"]
         self.assertEqual(payload["warn_free_bytes"], 32212254720)
         self.assertEqual(payload["hard_stop_free_bytes"], 21474836480)
-        self.assertEqual(payload["min_free_fraction"], 0.05)
         self.assertEqual(payload["effective"]["warn_free_bytes"], 32212254720)
         self.assertEqual(payload["effective"]["hard_stop_free_bytes"], 21474836480)
+        self.assertNotIn("min_free_bytes", payload["effective"])
+        self.assertNotIn("min_free_fraction", payload["effective"])
         self.assertEqual(payload["effective"]["min_free_inodes"], 50000)
         self.assertEqual(
             sorted(payload["explicit_keys"]),
             [
                 "hard_stop_free_bytes",
-                "min_free_fraction",
                 "min_free_inode_fraction",
                 "min_free_inodes",
                 "warn_free_bytes",
@@ -873,7 +871,6 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(reserve.warn_free_bytes)
         self.assertIsNone(reserve.hard_stop_free_bytes)
         self.assertIsNone(reserve.min_free_bytes)
-        self.assertIsNone(reserve.min_free_fraction)
         self.assertIsNone(reserve.min_free_inodes)
         self.assertIsNone(reserve.min_free_inode_fraction)
         self.assertEqual(reserve.explicit_keys, frozenset())
@@ -881,8 +878,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(
             reserve.effective_hard_stop_free_bytes, 10 * 1024 * 1024 * 1024
         )
-        self.assertEqual(reserve.effective_min_free_bytes, 10 * 1024 * 1024 * 1024)
-        self.assertEqual(reserve.effective_min_free_fraction, 0.02)
         self.assertEqual(reserve.effective_min_free_inodes, 10_000)
         self.assertEqual(reserve.effective_min_free_inode_fraction, 0.02)
 
@@ -897,16 +892,8 @@ class ConfigTests(unittest.TestCase):
                 "autopilot.disk_reserve.min_free_bytes",
             ),
             (
-                "min_free_fraction = -0.1\n",
+                "min_free_fraction = 0.02\n",
                 "autopilot.disk_reserve.min_free_fraction",
-            ),
-            (
-                "min_free_fraction = 1.5\n",
-                "autopilot.disk_reserve.min_free_fraction must be between 0.0 and 1.0",
-            ),
-            (
-                "min_free_fraction = nan\n",
-                "autopilot.disk_reserve.min_free_fraction must be finite",
             ),
             (
                 "min_free_inodes = -5\n",
@@ -946,22 +933,37 @@ class ConfigTests(unittest.TestCase):
                         load_config(repo)
                     self.assertIn(expected, str(caught.exception))
 
-    def test_autopilot_disk_reserve_allows_fully_disabled_axis(self) -> None:
-        # Both floors of an axis set to zero is a consistent (fully disabled)
-        # configuration, not a contradiction.
+    def test_autopilot_disk_reserve_allows_disabled_byte_hard_stop(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             (repo / ".vibe-loop.toml").write_text(
-                "[autopilot.disk_reserve]\n"
-                "min_free_bytes = 0\n"
-                "min_free_fraction = 0.0\n",
+                "[autopilot.disk_reserve]\nhard_stop_free_bytes = 0\n",
                 encoding="utf-8",
             )
 
             config = load_config(repo)
 
-        self.assertEqual(config.autopilot.disk_reserve.min_free_bytes, 0)
-        self.assertEqual(config.autopilot.disk_reserve.min_free_fraction, 0.0)
+        self.assertEqual(config.autopilot.disk_reserve.hard_stop_free_bytes, 0)
+
+    def test_hard_stop_above_default_warn_derives_matching_warning(self) -> None:
+        for key in ("hard_stop_free_bytes", "min_free_bytes"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                repo = Path(directory)
+                (repo / ".vibe-loop.toml").write_text(
+                    f"[autopilot.disk_reserve]\n{key} = 107374182400\n",
+                    encoding="utf-8",
+                )
+
+                reserve = load_config(repo).autopilot.disk_reserve
+
+            self.assertEqual(
+                reserve.effective_hard_stop_free_bytes,
+                100 * 1024 * 1024 * 1024,
+            )
+            self.assertEqual(
+                reserve.effective_warn_free_bytes,
+                100 * 1024 * 1024 * 1024,
+            )
 
     def test_autopilot_maintenance_keys_are_forbidden_in_generated_profiles(
         self,

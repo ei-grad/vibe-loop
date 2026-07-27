@@ -18,7 +18,6 @@ from vibe_loop.activity import ACTIONABLE_WORK_BLOCKED_REASON_CLASSES
 ACTIONABLE_RUNTIME_EVENT_KINDS = frozenset(
     {
         "disk_blocked",
-        "disk_warning",
         "lock_finalization_failed",
         "operator_action_required",
         "provider_account_wall",
@@ -373,8 +372,6 @@ def _journal_actionable_kind(record: Mapping[str, Any]) -> str | None:
         return record_type
     if record_type == "autopilot_disk_health" and record.get("status") == "critical":
         return "disk_blocked"
-    if record_type == "autopilot_disk_health" and record.get("status") == "warning":
-        return "disk_warning"
     if (
         record_type in {"task_restart", "task_recovery"}
         and record.get("exhausted") is True

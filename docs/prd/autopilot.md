@@ -939,11 +939,13 @@ outputs are provisioned, including when that filesystem differs from the
 repository checkout.
 
 Below the warning threshold, the cycle journals a typed
-`autopilot_disk_health` warning and continues dispatch. Below the hard-stop
-threshold, it withholds new launches with `autopilot_disk_capacity_low` while
-the supervisor remains alive. The blocker evidence names the mount, measured
-path, and free bytes. Existing workers are never terminated by this gate. Every
-cycle records one `autopilot_disk_health` record and a
+`autopilot_disk_health` warning observation and continues dispatch. Repeated
+warning observations are not actionable `wait-helper` runtime events. Below
+the hard-stop threshold, the cycle withholds new launches with
+`autopilot_disk_capacity_low` while the supervisor remains alive. The blocker
+evidence names the pressure axes, mount, measured path, free bytes, and free
+inodes. Existing workers are never terminated by this gate. Every cycle records
+one `autopilot_disk_health` record and a
 `disk_health:ok|warning|critical` action tag. `vibe-loop doctor` and
 `autopilot status --json` use the same live measurement and verdict schema.
 
@@ -961,14 +963,16 @@ These thresholds are configuration-free by default but project-tunable through
 | `min_free_inodes` | Absolute free-inode floor | `10000` |
 | `min_free_inode_fraction` | Free-inode fraction in `[0.0, 1.0]` | `0.02` (2%) |
 
-`warn_free_bytes` must be greater than or equal to
-`hard_stop_free_bytes`. Values must be non-negative and finite; inode fractions
-must be within `[0.0, 1.0]`. `min_free_bytes` remains accepted as a compatibility
-alias for `hard_stop_free_bytes`, but configuring both is rejected.
-`min_free_fraction` remains readable for configuration compatibility and is not
-part of the byte-headroom verdict. To disable inode capacity checks, set both
-inode floors to zero. The effective thresholds and live reading are journaled
-in every `autopilot_disk_health` record and surfaced in project status.
+An explicit `warn_free_bytes` must be greater than or equal to the effective
+hard stop. When warning is unset and the hard stop exceeds 50 GiB, the warning
+threshold rises to the hard stop so a hard-stop-only override remains valid.
+Values must be non-negative and finite; inode fractions must be within
+`[0.0, 1.0]`. `min_free_bytes` remains accepted as a compatibility alias for
+`hard_stop_free_bytes`, but configuring both is rejected. The obsolete
+`min_free_fraction` option is rejected because byte verdicts are absolute. To
+disable inode capacity checks, set both inode floors to zero. The effective
+thresholds and live reading are journaled in every `autopilot_disk_health`
+record and surfaced in project status.
 
 ### Generic Cycle Acceptance
 
@@ -1092,8 +1096,7 @@ opaque `id`, an allowlisted `kind`, and bounded opaque `project`, `run_id`, and
 return so identifier-shaped sensitive text is never emitted. The initial kinds
 are `operator_action_required`,
 `supervisor_inconsistent`, `recovery_exhausted`, `lock_finalization_failed`,
-`disk_warning`, `disk_blocked`, `provider_quota_wall`, and
-`provider_account_wall`. Provider
+`disk_blocked`, `provider_quota_wall`, and `provider_account_wall`. Provider
 wall records must carry explicit verified evidence. Progress, tool activity,
 reviewer chatter or findings, ordinary lifecycle transitions, and successful
 completion are not actionable runtime events.

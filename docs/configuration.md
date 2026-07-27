@@ -375,7 +375,7 @@ configuration section now lives.
 | `budget.enabled`, `metric`, `fail_safe`, `fail_safe_amount`, `default_declared`, `on_insufficient`, `declared.*`; limit `project`, `provider`, `phase`, `model`, `effort`, `limit`, `warn_at`, `window_hours` | Usage budgets and reservations above. |
 | `autopilot.jobs`, `interval_seconds`, `min_ready`, `dispatch_min_ready`, `planning_recheck_seconds`, `idle_poll_max_seconds`, `planning_backoff_seconds`, `planning_max_launches_per_day`, `planning_unproductive_threshold`, `require_clean_repo`, `require_upstream_sync`, `worktree_disposition`, `health_command`, `summary_command`, `troubleshoot_command`, `planning_command`, `idle_wake_command` | Annotated and other groups above. |
 | `project_binding.require`, `project_binding.context.*` | [Command Backend Project Binding](prd/autopilot.md#prd-aut-020-command-backend-project-binding). |
-| `autopilot.disk_reserve.warn_free_bytes`, `hard_stop_free_bytes`, compatibility keys `min_free_bytes`, `min_free_fraction`, `min_free_inodes`, `min_free_inode_fraction` | [Native Disk Health Defaults](prd/autopilot.md#native-disk-health-defaults). |
+| `autopilot.disk_reserve.warn_free_bytes`, `hard_stop_free_bytes`, compatibility key `min_free_bytes`, `min_free_inodes`, `min_free_inode_fraction` | [Native Disk Health Defaults](prd/autopilot.md#native-disk-health-defaults). |
 | `specs.require_approved`, `require_current_fingerprints`, `require_requirement_coverage`, `require_completion_evidence`, `approved_states`, `override_commands` | [Task Discovery PRD](prd/task-discovery.md) and other groups above. |
 
 ## Reconciliation record

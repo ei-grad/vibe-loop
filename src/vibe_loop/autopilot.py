@@ -24,8 +24,6 @@ from vibe_loop.config import (
     AgentResolutionError,
     AUTOPILOT_MIN_INTERVAL_SECONDS,
     DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES,
-    DISK_RESERVE_DEFAULT_MIN_FREE_BYTES,
-    DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION,
     DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION,
     DISK_RESERVE_DEFAULT_MIN_FREE_INODES,
     DISK_RESERVE_DEFAULT_WARN_FREE_BYTES,
@@ -4710,8 +4708,6 @@ def run_maintenance_command(
 # proportional floors to avoid false positives across filesystem sizes.
 AUTOPILOT_DISK_WARN_FREE_BYTES = DISK_RESERVE_DEFAULT_WARN_FREE_BYTES
 AUTOPILOT_DISK_HARD_STOP_FREE_BYTES = DISK_RESERVE_DEFAULT_HARD_STOP_FREE_BYTES
-AUTOPILOT_DISK_MIN_FREE_BYTES = DISK_RESERVE_DEFAULT_MIN_FREE_BYTES
-AUTOPILOT_DISK_MIN_FREE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_FRACTION
 AUTOPILOT_DISK_MIN_FREE_INODES = DISK_RESERVE_DEFAULT_MIN_FREE_INODES
 AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION = DISK_RESERVE_DEFAULT_MIN_FREE_INODE_FRACTION
 DISK_HEALTH_OK = "ok"
@@ -4726,8 +4722,6 @@ class DiskHealthThresholds:
 
     warn_free_bytes: int = AUTOPILOT_DISK_WARN_FREE_BYTES
     hard_stop_free_bytes: int = AUTOPILOT_DISK_HARD_STOP_FREE_BYTES
-    min_free_bytes: int = AUTOPILOT_DISK_MIN_FREE_BYTES
-    min_free_fraction: float = AUTOPILOT_DISK_MIN_FREE_FRACTION
     min_free_inodes: int = AUTOPILOT_DISK_MIN_FREE_INODES
     min_free_inode_fraction: float = AUTOPILOT_DISK_MIN_FREE_INODE_FRACTION
 
@@ -4735,8 +4729,6 @@ class DiskHealthThresholds:
         return {
             "warn_free_bytes": self.warn_free_bytes,
             "hard_stop_free_bytes": self.hard_stop_free_bytes,
-            "min_free_bytes": self.min_free_bytes,
-            "min_free_fraction": self.min_free_fraction,
             "min_free_inodes": self.min_free_inodes,
             "min_free_inode_fraction": self.min_free_inode_fraction,
         }
@@ -4756,8 +4748,6 @@ def disk_health_thresholds_for(config: VibeConfig) -> DiskHealthThresholds:
     return DiskHealthThresholds(
         warn_free_bytes=reserve.effective_warn_free_bytes,
         hard_stop_free_bytes=reserve.effective_hard_stop_free_bytes,
-        min_free_bytes=reserve.effective_min_free_bytes,
-        min_free_fraction=reserve.effective_min_free_fraction,
         min_free_inodes=reserve.effective_min_free_inodes,
         min_free_inode_fraction=reserve.effective_min_free_inode_fraction,
     )
@@ -4960,12 +4950,13 @@ class DiskHealthCycleResult:
                 "code": AUTOPILOT_DISK_CAPACITY_BLOCKER,
                 "mount": target.sample.mount or target.sample.path,
                 "free_bytes": target.sample.free_bytes,
+                "free_inodes": target.sample.free_inodes,
                 "path": target.path,
+                "measured_path": target.sample.path,
+                "pressure": list(target.pressure),
             }
             for target in self.targets
-            if target.critical
-            and "free_bytes" in target.pressure
-            and target.sample is not None
+            if target.critical and target.sample is not None
         )
 
     def to_status_json(self) -> dict[str, object]:
@@ -6519,12 +6510,7 @@ def execute_autopilot_cycle(
     min_ready = require_positive_min_ready(min_ready)
     dispatch_min_ready = require_positive_dispatch_min_ready(dispatch_min_ready)
     cycle_started_at = utc_now_iso()
-    disk_health = disk_health_runner(config, cycle_id=cycle_id)
-    status = collect_project_status(
-        config,
-        process_exists=process_exists,
-        disk_health_result=disk_health,
-    )
+    status = collect_project_status(config, process_exists=process_exists)
     runnable = status.queue.runnable
     actions: list[str] = []
     child_pid: int | None = None
@@ -6579,11 +6565,7 @@ def execute_autopilot_cycle(
         if clean_result.errors:
             cleanup_errors = len(clean_result.errors)
             actions.append(f"stale_lock_cleanup_errors:{cleanup_errors}")
-        status = collect_project_status(
-            config,
-            process_exists=process_exists,
-            disk_health_result=disk_health,
-        )
+        status = collect_project_status(config, process_exists=process_exists)
         runnable = status.queue.runnable
 
     def apply_fresh_upstream_sync(
@@ -6641,6 +6623,16 @@ def execute_autopilot_cycle(
     if disposition.agent_error:
         actions.append("worktree_disposition_agent_error")
 
+    disk_health = disk_health_runner(config, cycle_id=cycle_id)
+    status = apply_fresh_upstream_sync(
+        collect_project_status(
+            config,
+            process_exists=process_exists,
+            disk_health_result=disk_health,
+        ),
+        record_action=False,
+    )
+    runnable = status.queue.runnable
     run_store.append_record(disk_health.to_record(config.repo))
     actions.append(f"disk_health:{disk_health.status}")
     if disk_health.probe_errors:

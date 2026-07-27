@@ -69,6 +69,7 @@ from vibe_loop.autopilot import (
     ProjectEntry,
     ProjectRegistry,
     TaskQueueStatus,
+    WorktreeDispositionCycleResult,
     apply_autopilot_reload_request,
     autopilot_child_command,
     autopilot_termination_signals,
@@ -9386,6 +9387,9 @@ class DiskHealthCheckTests(unittest.TestCase):
 
         self.assertEqual(result.status, DISK_HEALTH_CRITICAL)
         self.assertIn("free_inodes", result.targets[0].pressure)
+        self.assertEqual(result.blocker_details[0]["pressure"], ["free_inodes"])
+        self.assertEqual(result.blocker_details[0]["free_inodes"], 5_000)
+        self.assertEqual(result.blocker_details[0]["free_bytes"], 50 * GIB)
 
     def test_filesystem_without_inode_accounting_ignores_inode_pressure(self) -> None:
         result = self._run(
@@ -9465,7 +9469,8 @@ class DiskHealthCheckTests(unittest.TestCase):
 
         self.assertEqual(thresholds.warn_free_bytes, 32212254720)
         self.assertEqual(thresholds.hard_stop_free_bytes, 21474836480)
-        self.assertEqual(thresholds.min_free_fraction, 0.02)
+        self.assertNotIn("min_free_bytes", thresholds.to_json())
+        self.assertNotIn("min_free_fraction", thresholds.to_json())
         self.assertEqual(thresholds.min_free_inodes, 10_000)
         self.assertEqual(thresholds.min_free_inode_fraction, 0.02)
 
@@ -9635,6 +9640,60 @@ class DiskHealthCycleTests(unittest.TestCase):
         self.assertIn(f"disk_health:{DISK_HEALTH_WARNING}", cycle.actions)
         self.assertEqual(len(launched), 1)
         self.assertEqual(disk_records[0]["status"], DISK_HEALTH_WARNING)
+
+    def test_disk_health_is_measured_after_worktree_disposition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            events: list[str] = []
+            launched: list[object] = []
+            disposition_finished = False
+
+            def disposition(config, *, cycle_id, run_store, process_exists):
+                nonlocal disposition_finished
+                events.append("disposition")
+                disposition_finished = True
+                return WorktreeDispositionCycleResult(
+                    cycle_id=cycle_id,
+                    policy="reap",
+                    evidence=(),
+                    outcomes=(),
+                    agent_invoked=False,
+                    agent_error="",
+                )
+
+            def probe(path):
+                free_bytes = 60 * GIB if disposition_finished else 9 * GIB
+                events.append(f"probe:{free_bytes // GIB}")
+                return DiskCapacitySample(
+                    path=str(path),
+                    mount="/worktrees",
+                    total_bytes=100 * GIB,
+                    free_bytes=free_bytes,
+                    total_inodes=1_000_000,
+                    free_inodes=800_000,
+                )
+
+            with mock.patch(
+                "vibe_loop.autopilot.statvfs_capacity_probe",
+                side_effect=probe,
+            ):
+                summary = run_autopilot(
+                    config,
+                    once=True,
+                    launcher=lambda command, **kwargs: launched.append(command) or 0,
+                    worktree_disposition_runner=disposition,
+                )
+            disk_records = self._disk_records(config)
+
+        self.assertEqual(events, ["probe:9", "disposition", "probe:60"])
+        self.assertNotIn(AUTOPILOT_DISK_CAPACITY_BLOCKER, summary.cycles[0].blockers)
+        self.assertEqual(disk_records[0]["status"], DISK_HEALTH_OK)
+        self.assertEqual(
+            disk_records[0]["targets"][0]["sample"]["free_bytes"], 60 * GIB
+        )
+        self.assertEqual(len(launched), 1)
 
 
 class CycleSummaryUnitTests(unittest.TestCase):
