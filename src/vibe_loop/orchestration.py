@@ -3662,6 +3662,11 @@ class Integrator:
                     main_after=main_before,
                     refreshed_head=branch_head,
                     verification=checks,
+                    diagnostics={
+                        "candidate_already_merged": True,
+                        "integration_lock_recovered": recovered_lock,
+                        "main_recovery": "not_required",
+                    },
                     recovered=recovered_lock,
                 )
             return self._record_completed_result(
@@ -3783,9 +3788,8 @@ class Integrator:
             diagnostics = {
                 **resolution_diagnostics,
                 **recovery_diagnostics,
+                "integration_lock_recovered": recovered_lock,
             }
-            if recovered_lock:
-                diagnostics["integration_lock_recovered"] = True
             return self._record_failure(
                 "main_verification_failed",
                 status="failed",
@@ -4147,7 +4151,6 @@ class Integrator:
             clone = self._git(
                 self.repo,
                 "clone",
-                "--no-local",
                 "--no-checkout",
                 "--quiet",
                 str(self.repo),
@@ -4170,11 +4173,52 @@ class Integrator:
                     command_key=keys[0],
                     detail=self._bounded_git_output(checked_out),
                 )
+            local_state_error = self._link_ignored_verification_state(checkout)
+            if local_state_error:
+                return self._verification_setup_failure(
+                    command_key=keys[0],
+                    detail=local_state_error,
+                )
             return self._run_checks(
                 phase="main",
                 keys=keys,
                 worktree=checkout,
             )
+
+    def _link_ignored_verification_state(self, checkout: Path) -> str:
+        ignored = self._git(
+            self.repo,
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--no-empty-directory",
+            "-z",
+        )
+        if ignored.returncode != 0:
+            return "ignored local verification state could not be enumerated"
+        try:
+            for raw_path in ignored.stdout.split("\0"):
+                if not raw_path:
+                    continue
+                relative = Path(raw_path.rstrip("/"))
+                if (
+                    relative.is_absolute()
+                    or ".." in relative.parts
+                    or relative.parts[0] == ".vibe-loop"
+                ):
+                    continue
+                source = self.repo / relative
+                target = checkout / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.symlink_to(source, target_is_directory=source.is_dir())
+        except OSError as exc:
+            return (
+                "ignored local verification state could not be linked: "
+                f"{type(exc).__name__}"
+            )
+        return ""
 
     def _verification_setup_failure(
         self,
@@ -4208,30 +4252,24 @@ class Integrator:
         main_before: str,
         main_after: str,
     ) -> tuple[bool, str, dict[str, object]]:
-        restored_ref = self._git(
-            self.repo,
-            "update-ref",
-            f"refs/heads/{self.main_branch}",
-            main_before,
-            main_after,
-        )
-        if restored_ref.returncode != 0:
+        current_main = self._rev_parse(self.repo, self.main_branch)
+        if current_main != main_after:
             return (
                 False,
-                self._rev_parse(self.repo, self.main_branch),
+                current_main,
                 {
-                    "main_recovery": "ref_restore_failed",
-                    "git_output": self._bounded_git_output(restored_ref),
+                    "main_recovery": "main_changed_before_restore",
+                    "expected_main": main_after,
                 },
             )
-        restored_checkout = self._git(self.repo, "reset", "--hard", main_before)
+        restored_checkout = self._git(self.repo, "reset", "--keep", main_before)
         current_main = self._rev_parse(self.repo, self.main_branch)
         if restored_checkout.returncode != 0:
             return (
                 False,
                 current_main,
                 {
-                    "main_recovery": "checkout_restore_failed",
+                    "main_recovery": "worktree_restore_refused",
                     "git_output": self._bounded_git_output(restored_checkout),
                 },
             )
