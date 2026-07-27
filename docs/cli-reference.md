@@ -122,8 +122,11 @@ vibe-loop autopilot run --repo . --interval 60 --max-cycles 10 --jobs 2
 - `--max-cycles N` caps cycles; `0` means unlimited.
 - `--ask-agent`, `--continue-on-failure`, `--max-slices N`, and
   `--max-tasks N` are forwarded to each `run-until-done` child.
-- `--min-ready N` requires a positive runnable depth before child launch and
-  overrides `[autopilot].min_ready`; the default is `1`.
+- `--min-ready N` sets the positive runnable depth below which planning refill
+  runs and overrides `[autopilot].min_ready`; the default is `1`.
+- `--dispatch-min-ready N` sets the independent positive runnable depth
+  required before child launch and overrides
+  `[autopilot].dispatch_min_ready`; the default is `1`.
 - `--worktree-disposition report-only|reap` overrides the configured policy;
   the default is `report-only`.
 

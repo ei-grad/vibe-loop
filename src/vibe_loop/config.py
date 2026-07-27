@@ -341,6 +341,7 @@ AUTOPILOT_CONFIG_KEYS = (
             "jobs",
             "interval_seconds",
             "min_ready",
+            "dispatch_min_ready",
             "require_clean_repo",
             "require_upstream_sync",
             "planning_recheck_seconds",
@@ -1106,6 +1107,7 @@ class AutopilotConfig:
     jobs: int | None = None
     interval_seconds: float | None = None
     min_ready: int | None = None
+    dispatch_min_ready: int | None = None
     require_clean_repo: bool = True
     require_upstream_sync: bool = False
     planning_recheck_seconds: float = 60.0
@@ -1142,6 +1144,7 @@ class AutopilotConfig:
             "jobs": self.jobs,
             "interval_seconds": self.interval_seconds,
             "min_ready": self.min_ready,
+            "dispatch_min_ready": self.dispatch_min_ready,
             "require_clean_repo": self.require_clean_repo,
             "require_upstream_sync": self.require_upstream_sync,
             "planning_recheck_seconds": self.planning_recheck_seconds,
@@ -2854,6 +2857,10 @@ def parse_autopilot(data: object) -> AutopilotConfig:
             "autopilot.interval_seconds",
         ),
         min_ready=optional_positive_int(table.get("min_ready"), "autopilot.min_ready"),
+        dispatch_min_ready=optional_positive_int(
+            table.get("dispatch_min_ready"),
+            "autopilot.dispatch_min_ready",
+        ),
         planning_recheck_seconds=positive_float(
             table.get("planning_recheck_seconds"),
             60.0,

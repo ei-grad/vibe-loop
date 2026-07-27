@@ -10468,14 +10468,16 @@ class AutopilotCliTests(unittest.TestCase):
         self.assertIn("advisories:", status_text)
         self.assertIn("supervisor_config_stale: autopilot.jobs", status_text)
 
-    def test_run_once_honors_config_min_ready_without_launching(self) -> None:
+    def test_run_reports_configured_dispatch_floor_hold(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "project"
             init_planning_repo(repo, PLAN)
             (repo / ".vibe-loop.toml").write_text(
                 '[agent]\ncommand = "codex exec {prompt}"\n'
                 '[orchestration]\nmode = "worker-owned"\n'
-                "[autopilot]\nmin_ready = 5\n",
+                "[autopilot]\n"
+                "min_ready = 5\n"
+                "dispatch_min_ready = 5\n",
                 encoding="utf-8",
             )
             subprocess.run(["git", "add", ".vibe-loop.toml"], cwd=repo, check=True)
@@ -10504,11 +10506,21 @@ class AutopilotCliTests(unittest.TestCase):
                 exit_code = main(["autopilot", "run", "--repo", str(repo), "--once"])
 
             summary = json.loads(stdout.getvalue())
+            status_stdout = StringIO()
+            with redirect_stdout(status_stdout):
+                status_exit_code = main(["autopilot", "status", "--repo", str(repo)])
 
         self.assertEqual(exit_code, 0)
         cycle = summary["cycles"][0]
         self.assertEqual(cycle["status"], "idle")
         self.assertEqual(cycle["child_log"], "")
+        self.assertIn("dispatch_floor_hold:1/5", cycle["actions"])
+
+        self.assertEqual(status_exit_code, 0)
+        self.assertIn(
+            "dispatch floor: dispatch_floor_hold:1/5",
+            status_stdout.getvalue(),
+        )
 
     def test_projects_register_list_and_remove(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

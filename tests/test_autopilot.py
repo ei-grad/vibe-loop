@@ -3032,7 +3032,7 @@ class AutopilotRunTests(unittest.TestCase):
             )
         )
 
-    def test_low_ready_queue_is_idle_without_launch(self) -> None:
+    def test_runnable_below_dispatch_floor_is_reported_without_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
@@ -3043,6 +3043,7 @@ class AutopilotRunTests(unittest.TestCase):
                 config,
                 once=True,
                 min_ready=2,
+                dispatch_min_ready=2,
                 launcher=launcher,
                 native_planning_runner=native_no_plan,
             )
@@ -3052,6 +3053,34 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertEqual(summary.cycles[0].status, "idle")
         self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
+        self.assertIn("dispatch_floor_hold:1/2", summary.cycles[0].actions)
+
+    def test_runnable_at_dispatch_floor_launches_after_planning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                min_ready=2,
+                dispatch_min_ready=1,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(summary.cycles[0].status, "completed")
+        self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
+        self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
+        self.assertFalse(
+            any(
+                action.startswith("dispatch_floor_hold:")
+                for action in summary.cycles[0].actions
+            )
+        )
 
     def test_zero_min_ready_is_rejected_without_launch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3064,6 +3093,26 @@ class AutopilotRunTests(unittest.TestCase):
                 ValueError, "min_ready must be a positive integer"
             ):
                 run_autopilot(config, once=True, min_ready=0, launcher=launcher)
+
+        self.assertEqual(calls, [])
+
+    def test_zero_dispatch_min_ready_is_rejected_without_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(repo, [("TASK-01", "Next", "", "ready slice")])
+            config = load_config(repo)
+            launcher, calls = self._recording_launcher()
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "dispatch_min_ready must be a positive integer",
+            ):
+                run_autopilot(
+                    config,
+                    once=True,
+                    dispatch_min_ready=0,
+                    launcher=launcher,
+                )
 
         self.assertEqual(calls, [])
 
@@ -5321,12 +5370,13 @@ class AutopilotRecheckTests(unittest.TestCase):
                 max_cycles=2,
                 interval=100.0,
                 min_ready=2,
+                dispatch_min_ready=2,
                 launcher=launcher,
                 maintenance_runner=runner,
                 sleep=sleeps.append,
             )
 
-        # One ready task with min_ready=2 stays idle: the cycle never dispatches.
+        # One ready task below dispatch_min_ready=2 stays idle.
         self.assertEqual(summary.cycles[0].status, "idle")
         self.assertEqual(len(launcher_calls), 0)
         # Planning fires on every idle cycle (it is never starved) ...
@@ -7362,7 +7412,8 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             command_records = self._command_records(config)
 
         self.assertEqual(summary.cycles[0].status, "idle")
-        self.assertEqual(len(launcher_calls), 0)
+        self.assertEqual(len(launcher_calls), 1)
+        self.assertIn("launched_run_until_done", summary.cycles[0].actions)
         self.assertIn("ran_planning_command:exit=0", summary.cycles[0].actions)
         self.assertEqual([call["kind"] for call in calls], ["planning"])
         self.assertEqual(
@@ -7387,6 +7438,7 @@ class AutopilotMaintenanceTests(unittest.TestCase):
             )
 
         self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertIn("launched_run_until_done", summary.cycles[0].actions)
         self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertIn("low_runnable_work:1/2", summary.cycles[0].actions)
         self.assertEqual(calls, [])
