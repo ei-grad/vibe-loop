@@ -2244,6 +2244,7 @@ class VibeRunner:
             log_path=log_path,
             agent_kind=agent_kind,
             agent_profile=agent_profile,
+            bound_names=self.config.project_binding.require,
             disable_background_tasks=runtime_owned_mode and agent_kind == "claude",
         )
         claude_home: Path | None = None
@@ -9231,10 +9232,13 @@ def worker_command_env(
     log_path: Path,
     agent_kind: str,
     agent_profile: str,
+    bound_names: Sequence[str] = (),
     disable_background_tasks: bool = False,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.pop("VIBE_LOOP_PRIMARY_REPO", None)
+    for name in bound_names:
+        env.pop(name, None)
     env.update(
         {
             "VIBE_LOOP_RUN_ID": run_id,

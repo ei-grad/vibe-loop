@@ -8492,6 +8492,32 @@ class SessionIdInjectionTests(unittest.TestCase):
 
         self.assertEqual(environment["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "0")
 
+    def test_worker_process_does_not_observe_bound_selector_names(self) -> None:
+        selector_name = "LOOPYARD_PROJECT"
+        with patch.dict(os.environ, {selector_name: "ambient-project"}):
+            environment = worker_command_env(
+                run_id="run-1",
+                task_id="TASK-01",
+                log_path=Path("/tmp/run.log"),
+                agent_kind="codex",
+                agent_profile="codex",
+                bound_names=(selector_name,),
+            )
+
+        observed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os; print(os.environ.get('LOOPYARD_PROJECT', 'absent'))",
+            ],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(observed.stdout.strip(), "absent")
+
     def test_worker_usage_provenance_is_allowlisted(self) -> None:
         report = WorkerReport(
             run_id="run-1",
