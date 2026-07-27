@@ -53,4 +53,5 @@ exclude = [
 ]
 
 [tool.pytest.ini_options]
+norecursedirs = ["eval/examples/*/cases/*/repo"]
 testpaths = ["tests"]

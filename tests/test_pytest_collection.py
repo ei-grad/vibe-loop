@@ -16,9 +16,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 class PytestCollectionTests(unittest.TestCase):
     def test_bare_collection_matches_explicit_project_suite(self) -> None:
         bare = collect_node_ids(REPO_ROOT)
+        explicit_root = collect_node_ids(REPO_ROOT, ".")
         explicit = collect_node_ids(REPO_ROOT, "tests")
 
         self.assertEqual(bare, explicit)
+        self.assertEqual(explicit_root, explicit)
         self.assertTrue(bare)
 
     def test_materialized_eval_fixture_collects_from_its_own_root(self) -> None:
