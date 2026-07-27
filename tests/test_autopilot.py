@@ -3630,6 +3630,58 @@ class AutopilotRunTests(unittest.TestCase):
         self.assertIn("native_planning_decision:no_plan", summary.cycles[0].actions)
         self.assertNotIn("no_runnable_work", summary.cycles[0].actions)
 
+    def test_gated_task_does_not_promote_live_task_lock_to_project_blocker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [
+                    ("TASK-01", "Next", "", "locked ready slice"),
+                    ("TASK-02", "Gated", "", "source-gated slice"),
+                ],
+            )
+            config = load_config(repo)
+            manager = build_lock_manager(
+                config.repo,
+                config.state_path / "locks",
+                config.locks,
+            )
+            active = ActiveRunState.new(
+                task_id="TASK-01",
+                run_id="run-active",
+                log_path=config.state_path / "runs" / "run-active.log",
+                base_main=git_text(repo, "rev-parse", "HEAD"),
+                command="codex",
+            ).with_worker_pid(os.getpid())
+            manager.acquire(
+                active.task_id,
+                active.run_id,
+                metadata=active.to_lock_metadata(),
+            )
+            launcher, calls = self._recording_launcher()
+            status = collect_project_status(config)
+
+            summary = run_autopilot(
+                config,
+                once=True,
+                launcher=launcher,
+                native_planning_runner=native_no_plan,
+            )
+
+        self.assertEqual(calls, [])
+        self.assertEqual(status.queue.runnable, 0)
+        self.assertEqual(status.queue.ready, 1)
+        self.assertEqual(status.blockers, ())
+        self.assertEqual(summary.cycles[0].status, "idle")
+        self.assertNotIn("blocked_preflight", summary.cycles[0].actions)
+        self.assertIn(
+            "native_planning_decision:no_plan",
+            summary.cycles[0].actions,
+        )
+        self.assertIn("waiting_for_active_workers:1", summary.cycles[0].actions)
+
     def test_observes_live_supervisor_without_duplicating(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

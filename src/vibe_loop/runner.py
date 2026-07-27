@@ -1822,7 +1822,10 @@ class VibeRunner:
             for task in dependency_candidates
             if task.task_id in locked_ids
         )
-        enforce_conflicts = resource_conflicts_enabled(unlocked, active_domains)
+        enforce_conflicts = resource_conflicts_enabled(
+            dependency_candidates,
+            active_domains,
+        )
         runnable = tuple(
             task
             for task in unlocked

@@ -6623,6 +6623,57 @@ class StaleLockSelectionDrainingTests(unittest.TestCase):
 
             self.assertEqual(candidate_ids, {"disjoint"})
 
+    def test_locked_declared_task_keeps_unknown_domain_enforcement_enabled(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".vibe-loop").mkdir(parents=True, exist_ok=True)
+            tasks = [
+                Task(
+                    task_id="active",
+                    title="active task",
+                    status="Next",
+                    paths=("src",),
+                    conflict_domains_known=True,
+                ),
+                Task(
+                    task_id="undeclared",
+                    title="undeclared ready task",
+                    status="Next",
+                ),
+            ]
+            runner = self._runner(repo, tasks)
+            live = dataclasses.replace(
+                _active_run_state(
+                    task_id="active",
+                    run_id="run-active",
+                    worker_pid=os.getpid(),
+                    host=socket.gethostname(),
+                    repo=repo,
+                ),
+                conflict_domains_known=False,
+            )
+            runner.lock_manager.acquire(
+                live.task_id,
+                live.run_id,
+                metadata=live.to_lock_metadata(),
+            )
+
+            snapshot = runner.candidate_snapshot_from_tasks(tasks)
+
+        self.assertEqual(snapshot.runnable, ())
+        self.assertEqual(
+            {
+                exclusion.task.task_id: exclusion.mechanism
+                for exclusion in snapshot.exclusions
+            },
+            {
+                "active": "lock",
+                "undeclared": "domain",
+            },
+        )
+
 
 class FakeWatchdogProcess:
     """Minimal Popen stand-in for watchdog tests.

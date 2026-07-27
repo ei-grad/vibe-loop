@@ -921,7 +921,7 @@ def queue_has_no_launchable_task(queue_status: TaskQueueStatus) -> bool:
         if blocker.get("mechanism") not in {"dependency", "lock", "domain"}
     )
     return queue_status.runnable == 0 and bool(
-        queue_status.gated_tasks or operational_blockers
+        operational_blockers or (queue_status.gated_tasks and queue_status.ready == 0)
     )
 
 

@@ -113,8 +113,10 @@ This preserves liveness evidence while preventing a permanently undispatchable
 supervisor from looking like an empty queue.
 
 Status reports unsatisfiable per-task agent routes under
-`task dispatch blockers`, naming the task and route diagnostic instead of
-rendering `blockers: none`. These task-scoped diagnostics do not become project
+`task dispatch blockers`, naming the task, exclusion mechanism, and route
+diagnostic. The project-level `blockers` field renders `none` when it is empty,
+including when task-scoped dispatch blockers are present, so its shape is stable
+in every supervisor state. Task-scoped diagnostics do not become project
 blockers and do not change `dispatch_state` to `blocked` while other candidates
 can dispatch.
 
