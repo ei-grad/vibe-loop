@@ -47,6 +47,7 @@ from vibe_loop.orchestration import (
     LEGAL_STAGE_TRANSITIONS,
     RuntimeGateController,
     ReviewBudgetExhausted,
+    ReviewClosureUnavailable,
     ReviewConcurrencyBudget,
     ReviewDelegationPolicyError,
     ReviewExecutionError,
@@ -5173,6 +5174,7 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertTrue(result.approved)
         self.assertNotIn("--resume", shlex.split(commands[1]))
         self.assertNotIn("exec resume", commands[1])
+        self.assertIn("targeted closure pass, not a fresh full review", commands[1])
         records = self.store.read_records()
         fallback_index = next(
             index
@@ -5202,6 +5204,81 @@ class ReviewRouterTests(unittest.TestCase):
         )
         self.assertFalse(closure_verdict["continuation_resumed"])
         self.assertFalse(closure_verdict["stats"]["session_continuation"])
+        self.assertEqual(closure_verdict["reviewer_provenance"], "fresh_closure")
+        self.assertEqual(
+            closure_verdict["prior_reviewer_session_id"],
+            "codex-old",
+        )
+        initial_verdict = next(
+            record
+            for record in records
+            if record["record_type"] == "review_verdict"
+            and record["pass_kind"] == "initial"
+            and record["verdict"] == "findings"
+        )
+        self.assertEqual(initial_verdict["reviewer_provenance"], "initial")
+        self.assertNotIn("prior_reviewer_session_id", initial_verdict)
+
+    def test_unavailable_fresh_closure_reviewer_blocks_with_open_findings(
+        self,
+    ) -> None:
+        launches = 0
+
+        def execute(command: str, **kwargs):
+            nonlocal launches
+            launches += 1
+            if launches == 1:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "verdict": "findings",
+                            "findings": [
+                                {
+                                    "id": "F1",
+                                    "severity": "P1",
+                                    "summary": "unsafe completion",
+                                    "evidence": "reproduction",
+                                    "files": ["src/example.py"],
+                                    "lines": ["12"],
+                                    "state": "open",
+                                }
+                            ],
+                            "session_id": "codex-old",
+                            "session_id_source": "provider",
+                        }
+                    ),
+                )
+            raise FileNotFoundError("reviewer unavailable")
+
+        router = self.router("codex", execute)
+        router.review(self.gates)
+
+        with self.assertRaises(ReviewClosureUnavailable) as caught:
+            router.review(
+                self.gates_for(
+                    dataclasses.replace(self.candidate, head_commit="f" * 40)
+                ),
+                pass_kind="closure:1",
+            )
+
+        self.assertEqual(
+            [finding.finding_id for finding in caught.exception.findings],
+            ["F1"],
+        )
+        self.assertIn("F1 [P1] unsafe completion", str(caught.exception))
+        closure_start = next(
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_started"
+            and record["pass_kind"] == "closure:1"
+        )
+        self.assertEqual(closure_start["reviewer_provenance"], "fresh_closure")
+        self.assertEqual(
+            closure_start["prior_reviewer_session_id"],
+            "codex-old",
+        )
 
     def test_continuation_fallback_reasons_are_runtime_owned(self) -> None:
         missing = plan_session_continuation(

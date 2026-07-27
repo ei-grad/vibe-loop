@@ -819,6 +819,69 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertEqual(payload["workers"][0]["process_state"], "missing")
         self.assertEqual(payload["workers"][0]["stale_reason"], "missing_lock")
 
+    def test_status_surfaces_review_task_without_live_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Review", "", "candidate awaiting closure")],
+            )
+            config = load_config(repo)
+            run_store = RunStore(config.state_path / "runs.jsonl")
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.review_verdict(
+                    run_id="run-review",
+                    task_id="TASK-01",
+                    payload={
+                        "verdict": "findings",
+                        "pass_kind": "initial",
+                    },
+                )
+            )
+            run_store.append_lifecycle_event(
+                RunLifecycleEvent.finding_recorded(
+                    run_id="run-review",
+                    task_id="TASK-01",
+                    payload={
+                        "finding_id": "F1",
+                        "severity": "P1",
+                        "summary": "unsafe completion",
+                        "evidence": "reproduction",
+                        "files": ["src/example.py"],
+                        "lines": ["12"],
+                        "state": "open",
+                    },
+                )
+            )
+
+            status = collect_project_status(config)
+            payload = status.to_json()
+            rendered = render_autopilot_status(status)
+
+        self.assertEqual(
+            payload["stranded_review_tasks"],
+            [
+                {
+                    "task_id": "TASK-01",
+                    "title": "candidate awaiting closure",
+                    "status": "Review",
+                    "run_id": "run-review",
+                    "reason": "no_live_worker_or_reviewer",
+                    "unresolved_findings": [
+                        {
+                            "id": "F1",
+                            "severity": "P1",
+                            "summary": "unsafe completion",
+                            "state": "open",
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertIn("stranded_review_task:TASK-01", payload["blockers"])
+        self.assertIn("TASK-01 [Review]", rendered)
+        self.assertIn("unresolved=F1", rendered)
+
     def test_status_names_a_legacy_pre_worker_lock_without_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

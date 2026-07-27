@@ -253,6 +253,24 @@ class ReviewExecutionError(RuntimeError):
     pass
 
 
+class ReviewClosureUnavailable(ReviewExecutionError):
+    def __init__(
+        self,
+        reason: str,
+        findings: Sequence[ReviewFinding],
+    ) -> None:
+        self.reason = reason
+        self.findings = tuple(findings)
+        rendered = "; ".join(
+            f"{finding.finding_id} [{finding.severity}] {finding.summary}"
+            for finding in self.findings
+        )
+        super().__init__(
+            "independent closure reviewer unavailable; unresolved findings: "
+            f"{rendered or '<none recorded>'}; reason: {reason}"
+        )
+
+
 class ReviewBudgetExhausted(ReviewExecutionError):
     def __init__(self, pass_kind: str, limit: int) -> None:
         self.pass_kind = pass_kind
@@ -1599,6 +1617,8 @@ class ReviewResult:
     attempt_ordinal: int
     continuation_resumed: bool = False
     nested_launches: int = 0
+    reviewer_provenance: str = ""
+    prior_reviewer_session_id: str = ""
 
     @property
     def approved(self) -> bool:
@@ -1929,6 +1949,16 @@ class ReviewRouter:
                 ),
                 continuation=continuation,
             )
+            if request.family == "closure":
+                if self.stage_machine is not None:
+                    self.stage_machine.fail(
+                        StageFailure.BLOCKED,
+                        reason="closure_reviewer_unavailable",
+                    )
+                raise ReviewClosureUnavailable(
+                    type(exc).__name__,
+                    request.prior_findings,
+                ) from exc
             self._fail_stage_for_result("fatal")
             raise ReviewExecutionError(
                 f"reviewer command could not be executed: {type(exc).__name__}"
@@ -2206,6 +2236,16 @@ class ReviewRouter:
             and reported_session_id_source
             else continuation.session_id_source or reported_session_id_source
         )
+        if (
+            request.family == "closure"
+            and continuation.fallback_reason
+            and continuation.prior_session_id
+            and session_id == continuation.prior_session_id
+        ):
+            raise ReviewExecutionError(
+                "malformed review output: fresh closure reviewer identity "
+                "matches the original reviewer"
+            )
         return ReviewResult(
             verdict=str(verdict),
             findings=findings,
@@ -2219,6 +2259,8 @@ class ReviewRouter:
             pass_ordinal=pass_ordinal,
             attempt_ordinal=attempt_ordinal,
             continuation_resumed=continuation.resumed,
+            reviewer_provenance=self._reviewer_provenance(request, continuation),
+            prior_reviewer_session_id=continuation.prior_session_id,
         )
 
     def _prompt(
@@ -2240,7 +2282,9 @@ class ReviewRouter:
             instruction += "Return only one JSON object. "
         if request.family == "closure":
             family_contract = (
-                "This is a closure pass. Return every finding listed in "
+                "This is a targeted closure pass, not a fresh full review. Verify "
+                "only the recorded closure checks and evidence for the findings "
+                "listed in prior_findings. Return every finding listed in "
                 "prior_findings exactly once, keyed by the same id, and return no "
                 "other finding: the id set of your findings must equal the id set "
                 "of prior_findings. Carry a finding forward by repeating its id "
@@ -2466,6 +2510,10 @@ class ReviewRouter:
                     "session_id_source": continuation.session_id_source,
                     "continuation_ordinal": continuation.continuation_ordinal,
                     "continuation_resumed": continuation.resumed,
+                    "reviewer_provenance": self._reviewer_provenance(
+                        request, continuation
+                    ),
+                    "prior_reviewer_session_id": continuation.prior_session_id,
                 },
             ).to_record(),
             max_initial_passes=self.max_initial_passes,
@@ -2755,6 +2803,8 @@ class ReviewRouter:
             attempt_ordinal=attempt_ordinal,
             continuation_resumed=context.resumed,
             nested_launches=nested_launches,
+            reviewer_provenance=self._reviewer_provenance(request, context),
+            prior_reviewer_session_id=context.prior_session_id,
         )
         payload = self._result_payload(result, request, route)
         payload["output_classification"] = output_classification
@@ -2777,7 +2827,7 @@ class ReviewRouter:
         request: ReviewRequest,
         route: Mapping[str, object],
     ) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "pass_kind": result.pass_kind,
             "pass_ordinal": result.pass_ordinal,
             "attempt_ordinal": result.attempt_ordinal,
@@ -2789,6 +2839,7 @@ class ReviewRouter:
             "session_id_source": result.session_id_source,
             "continuation_ordinal": result.continuation_ordinal,
             "continuation_resumed": result.continuation_resumed,
+            "reviewer_provenance": result.reviewer_provenance,
             "retry_classification": result.retry_classification,
             "nested_launches": result.nested_launches,
             "duration_seconds": result.duration_seconds,
@@ -2802,6 +2853,9 @@ class ReviewRouter:
                 work_kind="review",
             ),
         }
+        if result.prior_reviewer_session_id:
+            payload["prior_reviewer_session_id"] = result.prior_reviewer_session_id
+        return payload
 
     def _route_payload(self) -> dict[str, object]:
         provider = agent_command_provider(
@@ -2822,6 +2876,17 @@ class ReviewRouter:
             ),
         }
         return payload
+
+    def _reviewer_provenance(
+        self,
+        request: ReviewRequest,
+        continuation: ContinuationContext,
+    ) -> str:
+        if request.family == "initial":
+            return "initial"
+        if continuation.resumed:
+            return "resumed_closure"
+        return "fresh_closure"
 
     def _usage_provider(self) -> str:
         provider = self._route_payload()["provider"]

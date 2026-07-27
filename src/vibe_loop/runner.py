@@ -85,6 +85,7 @@ from vibe_loop.orchestration import (
     Integrator,
     IntegrationResult,
     ReviewBudgetExhausted,
+    ReviewClosureUnavailable,
     ReviewConcurrencyBudget,
     ReviewExecutionError,
     ReviewFinding,
@@ -3088,6 +3089,13 @@ class VibeRunner:
                     classification = ClassificationResult(
                         "blocked",
                         "review_budget_exhausted",
+                        detail=str(exc),
+                    )
+                    message = str(exc)
+                except ReviewClosureUnavailable as exc:
+                    classification = ClassificationResult(
+                        "blocked",
+                        "closure_reviewer_unavailable",
                         detail=str(exc),
                     )
                     message = str(exc)

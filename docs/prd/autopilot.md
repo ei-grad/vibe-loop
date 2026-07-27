@@ -80,6 +80,14 @@ rendering `blockers: none`. These task-scoped diagnostics do not become project
 blockers and do not change `dispatch_state` to `blocked` while other candidates
 can dispatch.
 
+Status also reports a task whose source status is `review` when no live worker
+or reviewer remains, including its latest run identity and any recorded open
+findings. Such a task is a project blocker because the normal runnable selector
+cannot redispatch it. `autopilot status` derives this from the current task
+source snapshot. For a command-backed task source, `doctor` reports the latest
+autopilot-cycle snapshot rather than invoking the configured command as a
+diagnostic side effect; other task sources are inspected directly.
+
 Status must also derive a bounded recent non-closure summary from the runtime
 journal. A non-closure is a terminal run that recorded an approving review
 verdict but did not record task-source completion. The summary reports the

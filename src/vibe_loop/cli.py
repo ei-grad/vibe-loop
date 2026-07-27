@@ -25,9 +25,11 @@ from vibe_loop.autopilot import (
     collect_project_status,
     collect_registry_status,
     collect_supervisor_status,
+    collect_task_queue_status,
     config_snapshot_fingerprint,
     cycle_schedule_deadline,
     load_registry_entry_config,
+    latest_stranded_review_tasks,
     default_registry_path,
     parse_wait_deadline,
     poll_wait_message_command,
@@ -36,6 +38,7 @@ from vibe_loop.autopilot import (
     reload_detached_autopilot,
     run_autopilot,
     start_detached_autopilot,
+    stranded_review_tasks,
     stop_detached_autopilot,
     wait_for_processes,
     WaitMessageAdapterError,
@@ -1160,6 +1163,16 @@ def dispatch(args: argparse.Namespace) -> int:
             supervisor_lock=runner.lock_manager.autopilot_status(),
             current_config=config,
         )
+        if config.task_source.type == "command":
+            stranded_reviews = latest_stranded_review_tasks(runner.run_store)
+            stranded_review_source = "latest_autopilot_cycle"
+        else:
+            stranded_reviews = stranded_review_tasks(
+                collect_task_queue_status(config),
+                workers,
+                runner.run_store.read_records(),
+            )
+            stranded_review_source = "current_task_source"
         config_report = config.config_report()
         config_report.update(
             {
@@ -1197,6 +1210,11 @@ def dispatch(args: argparse.Namespace) -> int:
                     "stale_locks": stale_report,
                     "concurrency_diagnostics": concurrency_diagnostics_report(workers),
                     "workspace_diagnostics": workspace_diagnostics_report(workers),
+                    "stranded_review_tasks": {
+                        "count": len(stranded_reviews),
+                        "tasks": [dict(task) for task in stranded_reviews],
+                        "source": stranded_review_source,
+                    },
                     "config_contract_blockers": [
                         blocker.to_json() for blocker in contract_blockers
                     ],
@@ -1752,6 +1770,24 @@ def render_autopilot_status(status: ProjectStatus) -> str:
     if status.alarms:
         lines.append("alarms:")
         lines.extend(f"  - {alarm}" for alarm in status.alarms)
+    if status.stranded_review_tasks:
+        lines.append("stranded review tasks:")
+        for task in status.stranded_review_tasks:
+            findings = task.get("unresolved_findings")
+            finding_ids = (
+                ", ".join(
+                    str(finding.get("id") or "")
+                    for finding in findings
+                    if isinstance(finding, Mapping)
+                )
+                if isinstance(findings, list)
+                else ""
+            )
+            suffix = f" unresolved={finding_ids}" if finding_ids else ""
+            lines.append(
+                f"  - {task['task_id']} [{task['status']}] "
+                f"{task.get('title') or ''}{suffix}"
+            )
     supervisor = status.supervisor
     supervisor_line = (
         f"supervisor: {supervisor.state} dispatch={supervisor.dispatch_state}"
