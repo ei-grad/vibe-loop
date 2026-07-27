@@ -82,11 +82,14 @@ can dispatch.
 
 Status also reports a task whose source status is `review` when no live worker
 or reviewer remains, including its latest run identity and any recorded open
-findings. Such a task is a project blocker because the normal runnable selector
-cannot redispatch it. `autopilot status` derives this from the current task
-source snapshot. For a command-backed task source, `doctor` reports the latest
-autopilot-cycle snapshot rather than invoking the configured command as a
-diagnostic side effect; other task sources are inspected directly.
+findings. It does not classify a `review` task as stranded when that exact status
+is in the configured runnable-status set. A non-runnable stranded task is a
+project blocker because the normal selector cannot redispatch it. `autopilot
+status` derives this from the current task source snapshot. For a command-backed
+task source, `doctor` reports the latest autopilot-cycle snapshot rather than
+invoking the configured command as a diagnostic side effect; the diagnostic
+includes snapshot availability, cycle identity, and occurrence time so cached
+state is attributable. Other task sources are inspected directly.
 
 Status must also derive a bounded recent non-closure summary from the runtime
 journal. A non-closure is a terminal run that recorded an approving review

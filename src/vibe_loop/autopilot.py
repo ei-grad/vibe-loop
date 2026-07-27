@@ -229,6 +229,14 @@ class TaskQueueStatus:
 
 
 @dataclasses.dataclass(frozen=True)
+class StrandedReviewSnapshot:
+    tasks: tuple[dict[str, object], ...] = ()
+    cycle_id: str = ""
+    occurred_at: str = ""
+    available: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
 class SupervisorStatus:
     state: str = "idle"
     dispatch_state: str = "idle"
@@ -579,7 +587,12 @@ def collect_project_status(
     )
     queue_status = collect_task_queue_status(config)
     records = run_store.read_records()
-    stranded_reviews = stranded_review_tasks(queue_status, workers, records)
+    stranded_reviews = stranded_review_tasks(
+        queue_status,
+        workers,
+        records,
+        runnable_statuses=config.task_source.runnable_statuses,
+    )
     agent = config.agent.to_json()
     agent_blockers = agent_blocking_diagnostics(config)
     last_cycle = latest_cycle_summary(run_store)
@@ -786,6 +799,8 @@ def stranded_review_tasks(
     queue_status: TaskQueueStatus,
     workers: Sequence[WorkerView],
     records: Sequence[Mapping[str, object]],
+    *,
+    runnable_statuses: Sequence[str],
 ) -> tuple[dict[str, object], ...]:
     live_task_ids = {
         worker.active.task_id for worker in workers if worker_view_is_live(worker)
@@ -821,6 +836,7 @@ def stranded_review_tasks(
         if (
             not task_id
             or status.casefold() not in REVIEW_QUEUE_STATUSES
+            or status in runnable_statuses
             or task_id in live_task_ids
         ):
             continue
@@ -849,17 +865,22 @@ def stranded_review_tasks(
     return tuple(stranded)
 
 
-def latest_stranded_review_tasks(
+def latest_stranded_review_snapshot(
     run_store: RunStore,
-) -> tuple[dict[str, object], ...]:
+) -> StrandedReviewSnapshot:
     for record in reversed(run_store.read_records()):
         if record.get("record_type") != AUTOPILOT_CYCLE_RECORD_TYPE:
             continue
         raw_tasks = record.get("stranded_review_tasks")
         if not isinstance(raw_tasks, list):
-            return ()
-        return tuple(dict(task) for task in raw_tasks if isinstance(task, Mapping))
-    return ()
+            raw_tasks = []
+        return StrandedReviewSnapshot(
+            tasks=tuple(dict(task) for task in raw_tasks if isinstance(task, Mapping)),
+            cycle_id=str(record.get("cycle_id") or ""),
+            occurred_at=str(record.get("occurred_at") or ""),
+            available=True,
+        )
+    return StrandedReviewSnapshot()
 
 
 def agent_blocking_diagnostics(config: VibeConfig) -> tuple[str, ...]:

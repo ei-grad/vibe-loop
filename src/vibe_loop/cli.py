@@ -29,7 +29,7 @@ from vibe_loop.autopilot import (
     config_snapshot_fingerprint,
     cycle_schedule_deadline,
     load_registry_entry_config,
-    latest_stranded_review_tasks,
+    latest_stranded_review_snapshot,
     default_registry_path,
     parse_wait_deadline,
     poll_wait_message_command,
@@ -1164,14 +1164,17 @@ def dispatch(args: argparse.Namespace) -> int:
             current_config=config,
         )
         if config.task_source.type == "command":
-            stranded_reviews = latest_stranded_review_tasks(runner.run_store)
+            stranded_snapshot = latest_stranded_review_snapshot(runner.run_store)
+            stranded_reviews = stranded_snapshot.tasks
             stranded_review_source = "latest_autopilot_cycle"
         else:
             stranded_reviews = stranded_review_tasks(
                 collect_task_queue_status(config),
                 workers,
                 runner.run_store.read_records(),
+                runnable_statuses=config.task_source.runnable_statuses,
             )
+            stranded_snapshot = None
             stranded_review_source = "current_task_source"
         config_report = config.config_report()
         config_report.update(
@@ -1214,6 +1217,21 @@ def dispatch(args: argparse.Namespace) -> int:
                         "count": len(stranded_reviews),
                         "tasks": [dict(task) for task in stranded_reviews],
                         "source": stranded_review_source,
+                        "snapshot_available": (
+                            stranded_snapshot.available
+                            if stranded_snapshot is not None
+                            else True
+                        ),
+                        "source_cycle_id": (
+                            stranded_snapshot.cycle_id
+                            if stranded_snapshot is not None
+                            else ""
+                        ),
+                        "source_occurred_at": (
+                            stranded_snapshot.occurred_at
+                            if stranded_snapshot is not None
+                            else ""
+                        ),
                     },
                     "config_contract_blockers": [
                         blocker.to_json() for blocker in contract_blockers

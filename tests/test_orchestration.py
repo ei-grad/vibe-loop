@@ -5219,6 +5219,83 @@ class ReviewRouterTests(unittest.TestCase):
         self.assertEqual(initial_verdict["reviewer_provenance"], "initial")
         self.assertNotIn("prior_reviewer_session_id", initial_verdict)
 
+    def test_fresh_closure_reask_retains_original_reviewer_identity(self) -> None:
+        finding = {
+            "id": "F1",
+            "severity": "P2",
+            "summary": "missing guard",
+            "evidence": "reproduction",
+            "files": ["src/example.py"],
+            "lines": [],
+            "state": "open",
+        }
+        outputs = iter(
+            (
+                json.dumps(
+                    {
+                        "verdict": "findings",
+                        "findings": [finding],
+                        "session_id": "codex-old",
+                        "session_id_source": "provider",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                **finding,
+                                "evidence": "guard now passes",
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "codex-old",
+                        "session_id_source": "provider",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "verdict": "approve",
+                        "findings": [
+                            {
+                                **finding,
+                                "evidence": "guard now passes",
+                                "state": "remediated",
+                            }
+                        ],
+                        "session_id": "codex-old",
+                        "session_id_source": "provider",
+                    }
+                ),
+            )
+        )
+
+        def execute(command: str, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout=next(outputs))
+
+        router = self.router("codex", execute)
+        router.review(self.gates)
+
+        with self.assertRaises(ReviewOutputMalformed):
+            router.review(
+                self.gates_for(
+                    dataclasses.replace(self.candidate, head_commit="9" * 40)
+                ),
+                pass_kind="closure:1",
+            )
+
+        closure_starts = [
+            record
+            for record in self.store.read_records()
+            if record["record_type"] == "review_started"
+            and record["pass_kind"] == "closure:1"
+        ]
+        self.assertEqual(len(closure_starts), 2)
+        self.assertEqual(
+            {record["prior_reviewer_session_id"] for record in closure_starts},
+            {"codex-old"},
+        )
+
     def test_unavailable_fresh_closure_reviewer_blocks_with_open_findings(
         self,
     ) -> None:

@@ -2681,6 +2681,9 @@ class CliTests(unittest.TestCase):
                     }
                 ],
                 "source": "latest_autopilot_cycle",
+                "snapshot_available": True,
+                "source_cycle_id": "cycle-1",
+                "source_occurred_at": "2026-07-27T00:00:00+00:00",
             },
         )
         self.assertEqual(
@@ -2718,6 +2721,17 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["specs"]["status"], "not_configured")
         self.assertEqual(payload["specs"]["diagnostics"], [])
         self.assertEqual(payload["task_source_runtime"]["origin"], "command_output")
+        self.assertEqual(
+            payload["stranded_review_tasks"],
+            {
+                "count": 0,
+                "tasks": [],
+                "source": "latest_autopilot_cycle",
+                "snapshot_available": False,
+                "source_cycle_id": "",
+                "source_occurred_at": "",
+            },
+        )
 
     def test_specs_check_advisory_diagnostics_do_not_fail_without_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

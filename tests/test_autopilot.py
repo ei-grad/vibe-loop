@@ -882,6 +882,25 @@ class AutopilotStatusTests(unittest.TestCase):
         self.assertIn("TASK-01 [Review]", rendered)
         self.assertIn("unresolved=F1", rendered)
 
+    def test_status_does_not_block_review_when_review_is_runnable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            configured_repo(
+                repo,
+                [("TASK-01", "Review", "", "candidate can be redispatched")],
+                extra_toml=(
+                    "[task_source]\n"
+                    'runnable_statuses = ["Active", "Next", "Planned", "Review"]\n'
+                ),
+            )
+            config = load_config(repo)
+
+            payload = collect_project_status(config).to_json()
+
+        self.assertEqual(payload["queue"]["runnable"], 1)
+        self.assertEqual(payload["stranded_review_tasks"], [])
+        self.assertNotIn("stranded_review_task:TASK-01", payload["blockers"])
+
     def test_status_names_a_legacy_pre_worker_lock_without_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

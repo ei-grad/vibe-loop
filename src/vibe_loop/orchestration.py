@@ -2375,15 +2375,20 @@ class ReviewRouter:
 
         prior_session_id = ""
         prior_ordinal = 0
+        fallback_reason = ""
         if previous is not None:
-            prior_session_id = previous.session_id
-            prior_ordinal = previous.continuation_ordinal
+            if previous.fallback_reason:
+                prior_session_id = previous.prior_session_id
+                prior_ordinal = max(0, previous.continuation_ordinal - 1)
+                fallback_reason = previous.fallback_reason
+            else:
+                prior_session_id = previous.session_id
+                prior_ordinal = previous.continuation_ordinal
         else:
             prior = self._latest_review_session(provider)
             if prior is not None:
                 prior_session_id, prior_ordinal = prior
-        fallback_reason = ""
-        if prior_session_id:
+        if prior_session_id and not fallback_reason:
             availability = (
                 self.continuation_availability
                 or self._default_continuation_availability
